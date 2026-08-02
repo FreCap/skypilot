@@ -1840,9 +1840,33 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler.get_decision_interval.return_value = 0
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
 
+        call_order = []
+
+        def _clear_reconciliation_signal():
+            call_order.append('clear')
+
+        def _get_replica_infos(_service_name):
+            call_order.append('replica-read')
+            return []
+
+        def _get_runtime_snapshot(_service_name, *, require_version):
+            assert require_version
+            call_order.append('runtime-read')
+            return {'active_versions': [2]}
+
+        def _wait_for_reconciliation(interval):
+            call_order.append('wait')
+            assert interval == 0
+            raise StopIteration
+
+        ctrl._replica_manager.clear_scale_reconciliation_signal.side_effect = (  # pylint: disable=line-too-long
+            _clear_reconciliation_signal)
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            _wait_for_reconciliation)
+
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
-                               return_value=[]), \
+                               side_effect=_get_replica_infos), \
              mock.patch.object(
                  controller.serve_state,
                  'get_service_from_name',
@@ -1851,19 +1875,19 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [2]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
-            try:
+                 side_effect=_get_runtime_snapshot):
+            with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
-            except StopIteration:
-                pass
 
         ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
                                                                             [2])
         ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
             0, expected_version=2)
+        assert call_order == ['clear', 'replica-read', 'runtime-read', 'wait']
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
     def test_run_autoscaler_withholds_rebuilt_blind_target(self):
         ctrl = _make_controller()
@@ -1875,6 +1899,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
         ctrl._autoscaler.get_decision_interval.return_value = 0
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -1882,16 +1908,17 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [2]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={'active_versions': [2]}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
         ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
             None, expected_version=2)
         ctrl._autoscaler.get_final_target_num_replicas.assert_not_called()
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
     def test_run_autoscaler_publishes_fill_capacity_target(self):
         ctrl = _make_controller()
@@ -1904,6 +1931,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
         ctrl._autoscaler.get_decision_interval.return_value = 0
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -1911,15 +1940,16 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [2]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={'active_versions': [2]}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
         ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
             3, expected_version=2)
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
     def test_run_autoscaler_ignores_disabled_stale_fill_target(self):
         ctrl = _make_controller()
@@ -1932,6 +1962,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
         ctrl._autoscaler.get_decision_interval.return_value = 0
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -1939,15 +1971,65 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [2]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={'active_versions': [2]}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
         ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
             0, expected_version=2)
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
+
+    def test_feedback_during_tick_is_observed_by_interval_wait(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = False
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = False
+        ctrl._autoscaler.get_decision_interval.return_value = 60
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        reconciliation_signal = threading.Event()
+        call_order = []
+
+        def _clear_reconciliation_signal():
+            call_order.append('clear')
+            reconciliation_signal.clear()
+
+        def _record_feedback(_service_name):
+            call_order.append('feedback')
+            reconciliation_signal.set()
+            return []
+
+        def _wait_for_reconciliation(interval):
+            call_order.append('wait')
+            assert interval == 60
+            assert reconciliation_signal.wait(timeout=0)
+            raise StopIteration
+
+        ctrl._replica_manager.clear_scale_reconciliation_signal.side_effect = (  # pylint: disable=line-too-long
+            _clear_reconciliation_signal)
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            _wait_for_reconciliation)
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               side_effect=_record_feedback), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        assert call_order == ['clear', 'feedback', 'wait']
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            60)
 
     def test_incomplete_exact_logical_tick_revokes_prior_target(self):
         ctrl = _make_controller()
@@ -1963,6 +2045,8 @@ class TestAutoscalerRuntimeSnapshot:
         decision_autoscaler.get_decision_interval.return_value = 0
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -1970,15 +2054,16 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [1]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={'active_versions': [1]}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
         ctrl._replica_manager.invalidate_logical_target.assert_called_once_with(  # pylint: disable=line-too-long
         )
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
     def test_logical_scale_down_waves_are_batched_without_reordering(self):
         ctrl = _make_controller()
@@ -2008,6 +2093,8 @@ class TestAutoscalerRuntimeSnapshot:
         ]
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -2015,10 +2102,7 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [1]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={'active_versions': [1]}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
@@ -2036,6 +2120,10 @@ class TestAutoscalerRuntimeSnapshot:
             mock.call.scale_down(99, wait_for_idle=False, expected_version=1),
             mock.call.scale_down_logically_batch([4], 4, 1, 8),
         ]
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
     def test_instance_aware_physical_batches_keep_per_card_priority(self):
         ctrl = _make_controller()
@@ -2072,6 +2160,8 @@ class TestAutoscalerRuntimeSnapshot:
         decision_autoscaler.get_decision_interval = mock.Mock(return_value=0)
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -2083,10 +2173,7 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  ctrl,
                  '_get_free_reserved_slots_by_accelerator',
-                 return_value={}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
@@ -2096,6 +2183,10 @@ class TestAutoscalerRuntimeSnapshot:
         ]
         decision_autoscaler.current_launch_priorities_by_accelerator.assert_called_once_with(  # pylint: disable=line-too-long
             ['L4', 'A100'])
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
 
 class TestTranslateInFlight:

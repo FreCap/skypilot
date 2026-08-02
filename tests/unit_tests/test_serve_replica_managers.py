@@ -14,6 +14,7 @@ Covers:
 # pylint: disable=unused-argument,invalid-name,line-too-long
 # pylint: disable=missing-class-docstring,unnecessary-dunder-call
 import dataclasses
+import json
 import logging
 import threading
 import types
@@ -33,6 +34,15 @@ from sky.serve import serve_utils
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import thread_utils
+
+
+def _canonical_paid_pool_key(region='us-east-1'):
+    location = make_location(region,
+                             accelerators={'L4': 1},
+                             use_spot=True,
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+    return paid_capacity.pool_key(location, workspace='w', num_nodes=1)
 
 
 def test_replica_manager_rejects_legacy_service_without_workspace():
@@ -539,9 +549,15 @@ class TestBackgroundDutyOwnershipLifecycle:
 
     def test_ownership_loss_interrupts_interval_before_next_round(self):
         mgr = self._stopped_manager()
-        mgr._ownership_lost = mock.Mock(spec=threading.Event)
-        mgr._ownership_lost.is_set.return_value = False
-        mgr._ownership_lost.wait.return_value = True
+        mgr._ownership_lost = threading.Event()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._launch_completion_event = mock.Mock(spec=threading.Event)
+
+        def _stop_after_wait(_timeout):
+            mgr._ownership_lost.set()
+            return True
+
+        mgr._launch_completion_event.wait.side_effect = _stop_after_wait
         mgr._refresh_thread_pool = mock.Mock()
 
         with mock.patch.object(
@@ -551,8 +567,65 @@ class TestBackgroundDutyOwnershipLifecycle:
             mgr._thread_pool_refresher()
 
         mgr._refresh_thread_pool.assert_called_once_with()
-        mgr._ownership_lost.wait.assert_called_once_with(
+        mgr._launch_completion_event.clear.assert_called_once_with()
+        mgr._launch_completion_event.wait.assert_called_once_with(
             replica_managers._PROCESS_POOL_REFRESH_INTERVAL)
+
+    def test_launch_completion_is_joined_before_refresh_reduction(self):
+        mgr = self._stopped_manager()
+        mgr._ownership_lost = threading.Event()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+
+        completion_event = threading.Event()
+        completion_notified = threading.Event()
+        release_completion_callback = threading.Event()
+
+        def _publish_then_block():
+            completion_event.set()
+            completion_notified.set()
+            assert release_completion_callback.wait(timeout=5)
+
+        callback_event = mock.Mock(spec=threading.Event)
+        callback_event.set.side_effect = _publish_then_block
+        callback_event.clear.side_effect = completion_event.clear
+        callback_event.wait.side_effect = completion_event.wait
+        mgr._launch_completion_event = callback_event
+        completion_queue, _ = mgr._launch_completion_state()
+
+        refresh_finished = threading.Event()
+
+        def _refresh_after_join():
+            # The launch callback publishes while Thread.is_alive() is still
+            # true. The queued notification must therefore be joined before
+            # the reducer scans the pool.
+            assert not launch_worker.is_alive()
+            refresh_finished.set()
+            mgr._ownership_lost.set()
+
+        mgr._refresh_thread_pool = mock.Mock(side_effect=_refresh_after_join)
+        launch_worker = replica_managers._ReplicaLaunchThread(
+            target=lambda: None,
+            replica_id=7,
+            completion_queue=completion_queue,
+            completion_event=callback_event)
+        mgr._launch_thread_pool[7] = launch_worker
+        launch_worker.start()
+        refresher = threading.Thread(target=mgr._thread_pool_refresher)
+
+        try:
+            assert completion_notified.wait(timeout=5)
+            assert launch_worker.is_alive()
+            refresher.start()
+            assert not refresh_finished.wait(timeout=0.1)
+        finally:
+            release_completion_callback.set()
+
+        assert refresh_finished.wait(timeout=5)
+        launch_worker.join(timeout=5)
+        refresher.join(timeout=5)
+        assert not launch_worker.is_alive()
+        assert not refresher.is_alive()
+        mgr._refresh_thread_pool.assert_called_once_with()
 
 
 class TestGetResourcesPorts:
@@ -1354,6 +1427,7 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         if with_placer:
             placer = mock.Mock()
             placer.active_locations.return_value = []
+            placer.ranked_active_locations.return_value = []
             placer.zero_cost_locations.return_value = []
             location = mock.Mock()
             location.to_dict.return_value = {'zone': 'z'}
@@ -1375,7 +1449,7 @@ class TestLaunchReplicaAvailabilityMaxRetry:
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
              mock.patch('sky.serve.replica_managers.ReplicaInfo'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'
                        ) as mock_thread:
             manager._launch_replica(replica_id=1)
         return mock_thread.call_args
@@ -3339,6 +3413,7 @@ class TestScaleUpBatch:
         mgr.lock = self._CountingLock()
         mgr._spot_placer = mock.Mock()
         mgr._spot_placer.active_locations.return_value = []
+        mgr._spot_placer.ranked_active_locations.return_value = []
         mgr._spot_placer.zero_cost_locations.return_value = []
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         mgr.yaml_content = 'dummy: yaml'
@@ -3385,6 +3460,69 @@ class TestScaleUpBatch:
         for info in initial:
             info.get_spot_location.assert_not_called()
         mgr._spot_placer.refresh_workspace_policy.assert_called_once_with()
+
+    def test_productive_profile_raises_physical_window_without_crossing_cap(
+            self, monkeypatch):
+        location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        mgr = _make_manager(next_replica_id=1)
+        mgr._spot_placer = make_placer({location: 1.0})
+        mgr._workspace = 'w'
+        mgr._service_hash = 'hash'
+        mgr._controller_owner = (1, '10.0.0.1')
+        mgr._pending_version = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        mgr.yaml_content = 'resources:\n  use_spot: true\n'
+        mgr._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        mgr._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        key = paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        monkeypatch.setenv(
+            paid_capacity._SERVICE_LIMIT_PROFILES_ENV_VAR,
+            json.dumps({
+                'version': 1,
+                'profiles': [{
+                    'workspace': 'w',
+                    'service_name': 'svc',
+                    'service_hash': 'hash',
+                    'max_launch_window': 24,
+                }],
+            }))
+
+        with mock.patch.object(
+                paid_capacity, 'central_authority_available',
+                return_value=True), mock.patch.object(
+                    replica_managers.serve_state,
+                    'get_replica_infos',
+                    return_value=[]), mock.patch.object(
+                        replica_managers.serve_state,
+                        'get_paid_capacity_pool_states',
+                        return_value={
+                            key: {
+                                'remaining': 32,
+                                'admission_state': 'active',
+                                'admission_limit': 32,
+                                'last_success_at': 100,
+                            }
+                        }), mock.patch.object(
+                            paid_capacity,
+                            'try_persist_claim',
+                            return_value=paid_capacity.ClaimResult.ACQUIRED
+                        ) as claim, mock.patch(
+                            'sky.serve.replica_managers._should_use_spot',
+                            return_value=True), mock.patch(
+                                'sky.serve.replica_managers.'
+                                '_get_resources_ports',
+                                return_value='8080'), mock.patch.object(
+                                    replica_managers, '_ReplicaLaunchThread'):
+            mgr._scale_up_batch_locked([{'use_spot': True}] * 30)
+
+        budget = claim.call_args.kwargs['budget']
+        assert budget.service_claim_limit == 24
+        assert budget.service_remaining == 0
+        assert claim.call_count == 24
+        assert mgr._next_replica_id == 25
+        assert len(mgr._launch_thread_pool) == 24
 
     def test_spot_batch_defers_when_shared_reservation_lock_is_busy(self):
         mgr = _make_manager(next_replica_id=1)
@@ -3949,6 +4087,93 @@ class TestLogicalCapacityPlanning:
         assert planned == [8, 4]
         assert build_zero_cost_budget.call_args.kwargs[
             'demand_count_override'] == 9
+
+    def test_productive_profile_raises_logical_window_without_crossing_cap(
+            self, monkeypatch):
+        location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._spot_placer = make_placer({location: 1.0})
+        mgr._workspace = 'w'
+        mgr._service_hash = 'hash'
+        mgr._controller_owner = (1, '10.0.0.1')
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(1, 7, 30, (('L4', 30),), (('L4', 1),))
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        key = paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        monkeypatch.setenv(
+            paid_capacity._SERVICE_LIMIT_PROFILES_ENV_VAR,
+            json.dumps({
+                'version': 1,
+                'profiles': [{
+                    'workspace': 'w',
+                    'service_name': 'svc',
+                    'service_hash': 'hash',
+                    'max_launch_window': 24,
+                }],
+            }))
+        launched = []
+        seen_budgets = []
+
+        def _append_one(resources_override, _used_ids, existing,
+                        _zero_cost_budget, *, paid_location_launch_budget,
+                        **_kwargs):
+            selected = paid_capacity.select_location(
+                mgr._spot_placer,
+                paid_location_launch_budget,
+                allowed_locations={location})
+            assert selected is location
+            paid_capacity.debit(paid_location_launch_budget, selected)
+            info = mock.Mock(replica_id=len(existing) + 1,
+                             is_terminal=False,
+                             is_ready=False,
+                             version=1,
+                             planned_capacity=1,
+                             resources_override=resources_override)
+            info.status_property.is_scale_down = False
+            info.get_spot_location.return_value = location
+            existing.append(info)
+            launched.append(info)
+            seen_budgets.append(paid_location_launch_budget)
+            return True
+
+        with mock.patch.object(paid_capacity,
+                               'central_authority_available',
+                               return_value=True), mock.patch.object(
+                                   replica_managers.serve_state,
+                                   'get_replica_infos',
+                                   return_value=[]), mock.patch.object(
+                                       replica_managers.serve_state,
+                                       'get_paid_capacity_pool_states',
+                                       return_value={
+                                           key: {
+                                               'remaining': 32,
+                                               'admission_state': 'active',
+                                               'admission_limit': 32,
+                                               'last_success_at': 100,
+                                           }
+                                       }), mock.patch.object(
+                                           mgr,
+                                           '_scale_up_one_locked',
+                                           side_effect=_append_one):
+            mgr.scale_up_to_logical_capacity(
+                target_capacity=30,
+                version=1,
+                reconcile_generation=7,
+                target_capacity_by_accelerator={'L4': 30},
+                accelerator_shapes={'L4': 1})
+
+        assert len(launched) == 24
+        assert len({id(budget) for budget in seen_budgets}) == 1
+        assert seen_budgets[0].service_claim_limit == 24
+        assert seen_budgets[0].service_remaining == 0
 
     def test_paid_only_logical_scale_up_skips_shared_capacity_lock(self):
         mgr = _make_manager()
@@ -7529,6 +7754,7 @@ class TestLaunchReplicaSnapshotAccumulation:
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
         placer.active_locations.return_value = []
+        placer.ranked_active_locations.return_value = []
         placer.zero_cost_locations.return_value = []
         manager._spot_placer = placer
         return manager
@@ -7561,7 +7787,7 @@ class TestLaunchReplicaSnapshotAccumulation:
                  return_value='/tmp/launch.log'), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._launch_replica(replica_id=1,
                                     existing_replica_infos=shared_snapshot)
             manager._launch_replica(replica_id=2,
@@ -7597,7 +7823,7 @@ class TestLaunchReplicaSnapshotAccumulation:
                  return_value='/tmp/launch.log'), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._launch_replica(replica_id=1)
         # Without a caller-provided snapshot each launch scans fresh state.
         assert mock_scan.call_count == 1
@@ -7631,7 +7857,7 @@ class TestLaunchReplicaSnapshotAccumulation:
                  return_value='/tmp/launch.log'), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._launch_replica(replica_id=1463,
                                     resources_override=resources_override,
                                     existing_replica_infos=[],
@@ -7675,7 +7901,7 @@ class TestLaunchReplicaSnapshotAccumulation:
                  return_value='/tmp/launch.log'), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._launch_replica(replica_id=1,
                                     resources_override=resources_override,
                                     existing_replica_infos=[],
@@ -7709,7 +7935,7 @@ class TestLaunchReplicaSnapshotAccumulation:
                  return_value='/tmp/launch.log'), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080') as get_ports, \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread',
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread',
                         return_value=thread) as safe_thread:
             manager._launch_replica(
                 replica_id=1,
@@ -8293,7 +8519,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{'use_spot': True}] * 5)
 
         assert [info.get_spot_location().region for info in persisted
@@ -8342,7 +8568,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{'use_spot': True}] * 5)
 
         assert [
@@ -8395,7 +8621,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{'use_spot': True}] * 400)
 
         claimed_locations = [
@@ -8467,7 +8693,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{'use_spot': True}] * 400)
 
         assert [call.kwargs['location'] for call in claim.call_args_list
@@ -8510,7 +8736,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{'use_spot': True}] * 400)
 
         assert budget.feedback_deferred_frontiers == {('l4',)}
@@ -8569,7 +8795,7 @@ class TestPaidLocationLaunchBudget:
                                return_value=1), \
              mock.patch('sky.serve.replica_managers._should_use_spot',
                         return_value=True), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'
                        ) as safe_thread:
             budget = paid_capacity.build_launch_budget(
                 manager._spot_placer,
@@ -8628,7 +8854,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{
                 'use_spot': True
             }] * 2,
@@ -8675,8 +8901,8 @@ class TestPaidLocationLaunchBudget:
                     return_value=True), mock.patch(
                         'sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), mock.patch(
-                            'sky.serve.replica_managers.thread_utils.SafeThread'
-                        ) as safe_thread:
+                            'sky.serve.replica_managers._ReplicaLaunchThread'
+                        ) as launch_thread:
             launched = manager._scale_up_one_locked(
                 None,
                 set(), [],
@@ -8690,7 +8916,7 @@ class TestPaidLocationLaunchBudget:
                                              budget) is None
         assert manager._next_replica_id == 1
         assert not manager._launch_thread_pool
-        safe_thread.assert_called_once()
+        launch_thread.assert_called_once()
 
     def test_service_envelope_stops_large_physical_wave(self):
         cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
@@ -8733,7 +8959,7 @@ class TestPaidLocationLaunchBudget:
                                                return_value='8080'), mock.patch(
                                                    'sky.serve.'
                                                    'replica_managers.'
-                                                   'thread_utils.SafeThread'):
+                                                   '_ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{'use_spot': True}] * 20)
 
         assert claim.call_count == 2
@@ -8799,7 +9025,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             resources_override = {'use_spot': True}
             if reserved_fill:
                 resources_override = {
@@ -8948,7 +9174,7 @@ class TestPaidLocationLaunchBudget:
                                 return_value='8080'), mock.patch(
                                     'sky.serve.'
                                     'replica_managers.'
-                                    'thread_utils.SafeThread'):
+                                    '_ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{'use_spot': True}] * 2)
 
         claim.assert_not_called()
@@ -9014,7 +9240,7 @@ class TestPaidLocationLaunchBudget:
                                 return_value='8080'), mock.patch(
                                     'sky.serve.'
                                     'replica_managers.'
-                                    'thread_utils.SafeThread'):
+                                    '_ReplicaLaunchThread'):
             manager._scale_up_batch_locked([paid_only, exempt])
 
         if exempt_kind == 'reserved_fill':
@@ -9087,9 +9313,8 @@ class TestPaidLocationLaunchBudget:
                                 'sky.serve.replica_managers.'
                                 '_get_resources_ports',
                                 return_value='8080'), mock.patch(
-                                    'sky.serve.'
-                                    'replica_managers.'
-                                    'thread_utils.SafeThread') as safe_thread:
+                                    'sky.serve.replica_managers.'
+                                    '_ReplicaLaunchThread') as launch_thread:
             manager._scale_up_batch_locked([{'use_spot': True}, fill])
 
         claim.assert_called_once()
@@ -9101,7 +9326,7 @@ class TestPaidLocationLaunchBudget:
             persisted.get_spot_location(), zero)
         assert manager._next_replica_id == 2
         assert len(manager._launch_thread_pool) == 1
-        safe_thread.assert_called()
+        launch_thread.assert_called()
         if claim_result == paid_capacity.ClaimResult.FEEDBACK_PENDING:
             assert budget.feedback_deferred_frontiers == {('l4',)}
             assert not budget.priority_deferred_pool_keys
@@ -9155,7 +9380,7 @@ class TestPaidLocationLaunchBudget:
                                                return_value='8080'), mock.patch(
                                                    'sky.serve.'
                                                    'replica_managers.'
-                                                   'thread_utils.SafeThread'):
+                                                   '_ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{'use_spot': True}, pinned])
 
         # The first generic demand and the later fresh pinned replacement
@@ -9199,7 +9424,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             launched = manager._scale_up_one_locked(
                 None,
                 set(), [],
@@ -9255,7 +9480,7 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             manager._scale_up_batch_locked([{
                 'use_spot': True
             }] * 300,
@@ -9273,7 +9498,7 @@ class TestPaidLocationLaunchBudget:
 
         with mock.patch('sky.serve.replica_managers._should_use_spot',
                         return_value=True), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'
                        ) as safe_thread, \
              pytest.raises(ValueError,
                            match='matches exact accelerator override'):
@@ -9829,7 +10054,7 @@ class TestRecoveryRetryAndIsolation:
                  'add_or_update_replica',
                  side_effect=lambda _svc, rid, info: persisted.__setitem__(
                      rid, info)), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             mgr._recover_replica_operations()
         assert persisted[1].reserved_fill is True
         assert persisted[2].reserved_fill is False
@@ -9870,7 +10095,7 @@ class TestRecoveryRetryAndIsolation:
                  'add_or_update_replica',
                  side_effect=lambda _svc, rid, info: persisted.__setitem__(
                      rid, info)), \
-             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
             mgr._recover_replica_operations()
 
         recovered = persisted[1]
@@ -10051,7 +10276,11 @@ class TestRefreshThreadPoolUnfencedLaunch:
 
         persist_paid_outcomes.assert_not_called()
 
-    def _run(self, thread_exception):
+    def _run(self,
+             thread_exception,
+             *,
+             paid_pool_key=None,
+             paid_persist_result=None):
         replica_id = 7
         manager = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
@@ -10062,6 +10291,7 @@ class TestRefreshThreadPoolUnfencedLaunch:
         manager._down_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
+        manager._scale_reconciliation_event = mock.Mock(spec=threading.Event)
 
         launch_thread = mock.Mock()
         launch_thread.is_alive.return_value = False
@@ -10080,6 +10310,7 @@ class TestRefreshThreadPoolUnfencedLaunch:
         info.status_property = replica_managers.ReplicaStatusProperty()
         info.get_spot_location.return_value = location
         info.created_at = 100.0
+        info.paid_capacity_pool_key = paid_pool_key
 
         persisted = []
         terminated = []
@@ -10090,46 +10321,58 @@ class TestRefreshThreadPoolUnfencedLaunch:
 
         def _persist_paid_outcomes(**_kwargs):
             events.append('persist_outcome')
-            return None
+            return paid_persist_result
+
+        def _wake_reconciliation():
+            events.append('wake')
 
         def _terminate(rid, **_kwargs):
             events.append('terminate')
             terminated.append(rid)
 
-        with mock.patch.object(
-                manager, '_reconcile_legacy_uncertain_logical_retirements'), \
-             mock.patch.object(
-                 manager, '_reconcile_recovering_logical_retirements'), \
-             mock.patch.object(manager, '_refresh_wait_for_idle'), \
-             mock.patch.object(
-                 manager, '_clear_known_unknown_capacity_replacements'), \
-             mock.patch.object(
-                 manager, '_persist_replicas',
-                 side_effect=_persist), \
-             mock.patch.object(
-                 replica_managers.paid_capacity,
-                 'persist_completed_launches',
-                 side_effect=_persist_paid_outcomes) as persist_paid_outcomes, \
-             mock.patch.object(
-                 manager, '_terminate_replica',
-                 side_effect=_terminate), \
-             mock.patch.object(manager, '_reconcile_failed_cleanup'), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.get_replica_infos',
-                 return_value=[]), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state'
-                 '.get_replica_infos_from_ids',
-                 return_value={replica_id: info}), \
-             mock.patch.object(replica_managers.logger, 'warning') as warning:
-            manager._refresh_thread_pool()
+        manager._scale_reconciliation_event.set.side_effect = (
+            _wake_reconciliation)
+        refresh_error = None
+        try:
+            with mock.patch.object(
+                    manager,
+                    '_reconcile_legacy_uncertain_logical_retirements'), \
+                 mock.patch.object(
+                     manager, '_reconcile_recovering_logical_retirements'), \
+                 mock.patch.object(manager, '_refresh_wait_for_idle'), \
+                 mock.patch.object(
+                     manager, '_clear_known_unknown_capacity_replacements'), \
+                 mock.patch.object(
+                     manager, '_persist_replicas',
+                     side_effect=_persist), \
+                 mock.patch.object(
+                     replica_managers.paid_capacity,
+                     'persist_completed_launches',
+                     side_effect=_persist_paid_outcomes) as persist_paid_outcomes, \
+                 mock.patch.object(
+                     manager, '_terminate_replica',
+                     side_effect=_terminate), \
+                 mock.patch.object(manager, '_reconcile_failed_cleanup'), \
+                 mock.patch(
+                     'sky.serve.replica_managers.serve_state.get_replica_infos',
+                     return_value=[]), \
+                 mock.patch(
+                     'sky.serve.replica_managers.serve_state'
+                     '.get_replica_infos_from_ids',
+                     return_value={replica_id: info}), \
+                 mock.patch.object(replica_managers.logger,
+                                   'warning') as warning:
+                manager._refresh_thread_pool()
+        except RuntimeError as e:
+            refresh_error = e
 
         return (info, placer, terminated, persist_paid_outcomes, warning,
-                events)
+                events, manager._scale_reconciliation_event, refresh_error)
 
     def test_unfenced_failure_is_unrecoverable_and_not_benched(self):
-        info, placer, terminated, persist_paid_outcomes, _, events = self._run(
-            replica_managers._UnfencedExternalLbLaunchError('no fence'))
+        (info, placer, terminated, persist_paid_outcomes, _, events,
+         reconciliation_event, refresh_error) = self._run(
+             replica_managers._UnfencedExternalLbLaunchError('no fence'))
         # Unrecoverable so the autoscaler stops recreating replica rows.
         assert info.status_property.user_app_failed is True
         assert info.status_property.unrecoverable_failure() is True
@@ -10142,10 +10385,13 @@ class TestRefreshThreadPoolUnfencedLaunch:
         }
         assert terminated == [7]
         assert events == ['persist_outcome', 'terminate']
+        reconciliation_event.set.assert_not_called()
+        assert refresh_error is None
 
     def test_generic_failure_does_not_bench_location(self):
-        info, placer, terminated, persist_paid_outcomes, _, events = self._run(
-            RuntimeError('transient'))
+        (info, placer, terminated, persist_paid_outcomes, _, events,
+         reconciliation_event,
+         refresh_error) = self._run(RuntimeError('transient'))
         # An ordinary launch failure remains recoverable but says nothing
         # about provider inventory.
         assert info.status_property.user_app_failed is False
@@ -10157,10 +10403,12 @@ class TestRefreshThreadPoolUnfencedLaunch:
         }
         assert terminated == [7]
         assert events == ['persist_outcome', 'terminate']
+        reconciliation_event.set.assert_not_called()
+        assert refresh_error is None
 
     def test_typed_capacity_failure_resets_shared_pool_evidence(self):
-        (info, placer, terminated, persist_paid_outcomes, warning,
-         events) = self._run(
+        (info, placer, terminated, persist_paid_outcomes, warning, events,
+         reconciliation_event, refresh_error) = self._run(
              replica_managers._ReplicaLaunchCapacityError('exhausted',
                                                           reason='capacity'))
         assert info.status_property.user_app_failed is False
@@ -10177,10 +10425,12 @@ class TestRefreshThreadPoolUnfencedLaunch:
         assert 'boom traceback' not in message
         assert terminated == [7]
         assert events == ['persist_outcome', 'terminate']
+        reconciliation_event.set.assert_not_called()
+        assert refresh_error is None
 
     def test_typed_quota_failure_uses_regional_bench(self):
-        (info, placer, terminated, persist_paid_outcomes, warning,
-         events) = self._run(
+        (info, placer, terminated, persist_paid_outcomes, warning, events,
+         reconciliation_event, refresh_error) = self._run(
              replica_managers._ReplicaLaunchCapacityError('quota exhausted',
                                                           reason='quota'))
 
@@ -10193,3 +10443,88 @@ class TestRefreshThreadPoolUnfencedLaunch:
         warning.assert_called_once()
         assert terminated == [7]
         assert events == ['persist_outcome', 'terminate']
+        reconciliation_event.set.assert_not_called()
+        assert refresh_error is None
+
+    @pytest.mark.parametrize('reason', ['capacity', 'quota'])
+    def test_committed_typed_paid_failure_wakes_after_persistence(self, reason):
+        pool_key = _canonical_paid_pool_key()
+        (info, _, terminated, _, warning, events, reconciliation_event,
+         refresh_error) = self._run(
+             replica_managers._ReplicaLaunchCapacityError('unavailable',
+                                                          reason=reason),
+             paid_pool_key=pool_key,
+             paid_persist_result=paid_capacity.CompletedLaunchPersistence(
+                 ownership_valid=True, applied_pool_keys=frozenset({pool_key})))
+
+        assert info.paid_capacity_pool_key == pool_key
+        warning.assert_called_once()
+        assert 'exact_pools=1' in warning.call_args.args[0]
+        reconciliation_event.set.assert_called_once_with()
+        assert terminated == [7]
+        assert events == ['persist_outcome', 'wake', 'terminate']
+        assert refresh_error is None
+
+    @pytest.mark.parametrize(
+        ('thread_exception', 'paid_pool_key', 'paid_persist_result'), [
+            (RuntimeError('generic'), 'paid-pool',
+             paid_capacity.CompletedLaunchPersistence(
+                 ownership_valid=True,
+                 applied_pool_keys=frozenset({'paid-pool'}))),
+            (replica_managers._ReplicaLaunchCapacityError(
+                'unpaid capacity', reason='capacity'), None,
+             paid_capacity.CompletedLaunchPersistence(ownership_valid=True)),
+            (replica_managers._ReplicaLaunchCapacityError(
+                'legacy capacity', reason='capacity'), 'paid-pool', None),
+        ],
+        ids=['generic', 'unpaid', 'legacy-persistence'])
+    def test_non_authoritative_outcome_does_not_wake(self, thread_exception,
+                                                     paid_pool_key,
+                                                     paid_persist_result):
+        (_, _, terminated, _, _, events, reconciliation_event,
+         refresh_error) = self._run(thread_exception,
+                                    paid_pool_key=paid_pool_key,
+                                    paid_persist_result=paid_persist_result)
+
+        reconciliation_event.set.assert_not_called()
+        assert terminated == [7]
+        assert events == ['persist_outcome', 'terminate']
+        assert refresh_error is None
+
+    @pytest.mark.parametrize(
+        ('paid_pool_key', 'applied_pool_keys'), [
+            ('paid-pool', frozenset({'paid-pool'})),
+            (_canonical_paid_pool_key(), frozenset()),
+            (_canonical_paid_pool_key(),
+             frozenset({_canonical_paid_pool_key('us-west-2')})),
+        ],
+        ids=['malformed-identity', 'missing-claim', 'different-claim'])
+    def test_unapplied_or_noncanonical_paid_failure_does_not_wake(
+            self, paid_pool_key, applied_pool_keys):
+        (_, _, terminated, _, _, events, reconciliation_event,
+         refresh_error) = self._run(
+             replica_managers._ReplicaLaunchCapacityError('unavailable',
+                                                          reason='capacity'),
+             paid_pool_key=paid_pool_key,
+             paid_persist_result=paid_capacity.CompletedLaunchPersistence(
+                 ownership_valid=True, applied_pool_keys=applied_pool_keys))
+
+        reconciliation_event.set.assert_not_called()
+        assert terminated == [7]
+        assert events == ['persist_outcome', 'terminate']
+        assert refresh_error is None
+
+    def test_failed_paid_outcome_persistence_does_not_wake(self):
+        (_, _, terminated, _, _, events, reconciliation_event,
+         refresh_error) = self._run(
+             replica_managers._ReplicaLaunchCapacityError('ownership changed',
+                                                          reason='capacity'),
+             paid_pool_key='paid-pool',
+             paid_persist_result=paid_capacity.CompletedLaunchPersistence(
+                 ownership_valid=False))
+
+        reconciliation_event.set.assert_not_called()
+        assert not terminated
+        assert events == ['persist_outcome']
+        assert isinstance(refresh_error, RuntimeError)
+        assert 'ownership changed' in str(refresh_error)

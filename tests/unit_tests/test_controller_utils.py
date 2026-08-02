@@ -19,6 +19,7 @@ from sky.serve import constants as serve_constants
 from sky.skylet import constants
 from sky.skylet import log_lib
 from sky.utils import common
+from sky.utils import common_utils
 from sky.utils import controller_dependency_installation
 from sky.utils import controller_mount_translation
 from sky.utils import controller_utils
@@ -1052,6 +1053,75 @@ def test_controller_envs_forward_usage_run_id(controller_type: str,
 
     if 'local_user_config_path' in result and result['local_user_config_path']:
         os.unlink(result['local_user_config_path'])
+
+
+def test_serve_paid_window_config_is_forwarded_to_dedicated_controller(
+        monkeypatch):
+    profile_document = '{"version":1,"profiles":[]}'
+    monkeypatch.setenv(constants.SERVE_PAID_SERVICE_MAX_LAUNCH_WINDOW, '24')
+    monkeypatch.setenv(constants.SERVE_PAID_SERVICE_LAUNCH_WINDOW_PROFILES,
+                       profile_document)
+    monkeypatch.setenv(constants.SERVE_PAID_LOCATION_MAX_EXPLORATION_FRONTIER,
+                       '2')
+    monkeypatch.setattr(
+        'sky.utils.controller_utils._get_cloud_dependencies_installation_commands',
+        lambda _controller: [])
+
+    result = controller_utils.controller_only_vars_to_fill(
+        controller_utils.Controllers.SKY_SERVE_CONTROLLER)
+
+    envs = result['controller_envs']
+    assert envs[constants.SERVE_PAID_SERVICE_MAX_LAUNCH_WINDOW] == '24'
+    assert envs[constants.SERVE_PAID_SERVICE_LAUNCH_WINDOW_PROFILES] == (
+        profile_document)
+    assert envs[constants.SERVE_PAID_LOCATION_MAX_EXPLORATION_FRONTIER] == '2'
+
+    jobs_result = controller_utils.controller_only_vars_to_fill(
+        controller_utils.Controllers.JOBS_CONTROLLER)
+    assert (constants.SERVE_PAID_LOCATION_MAX_EXPLORATION_FRONTIER
+            not in jobs_result['controller_envs'])
+
+
+def test_serve_controller_template_preserves_json_profile_string(tmp_path):
+    profile_document = (
+        '{"version":1,"profiles":[{"workspace":"w",'
+        '"service_name":"svc","service_hash":"hash",'
+        '"max_launch_window":24,"max_exploration_frontier":3}]}')
+    rendered_path = tmp_path / 'serve-controller.yaml'
+    common_utils.fill_template(serve_constants.CONTROLLER_TEMPLATE, {
+        'service_name': 'svc',
+        'sky_activate_python_env': 'source /tmp/venv/bin/activate',
+        'cloud_dependencies_installation_commands': [],
+        'controller_envs': {
+            constants.SERVE_PAID_SERVICE_LAUNCH_WINDOW_PROFILES: profile_document,
+        },
+        'remote_task_yaml_path': '/tmp/task.yaml',
+        'local_task_yaml_path': '/tmp/local-task.yaml',
+        'remote_submitted_task_yaml_path': None,
+        'local_submitted_task_yaml_path': None,
+        'remote_user_config_path': '/tmp/config.yaml',
+        'local_user_config_path': None,
+        'modified_catalogs': {},
+        'local_to_controller_file_mounts': {},
+        'plugin_wheel_file_mounts': {},
+        'local_plugins_config_path': None,
+        'remote_plugins_config_path': '/tmp/plugins.yaml',
+        'plugins_wheel_install_commands': [],
+        'consolidation_mode_job_id': None,
+        'sky_python_cmd': 'python',
+        'service_incarnation': 'hash',
+        'created_by': 'user',
+        'lifecycle_epoch': None,
+        'controller_log_file': '/tmp/controller.log',
+        'workspace': 'w',
+        'entrypoint': 'sky serve up',
+    },
+                               output_path=str(rendered_path))
+
+    task = task_lib.Task.from_yaml(str(rendered_path))
+
+    assert task.envs[
+        constants.SERVE_PAID_SERVICE_LAUNCH_WINDOW_PROFILES] == profile_document
 
 
 @pytest.mark.parametrize('controller_type', ['jobs', 'serve'])

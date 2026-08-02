@@ -3488,6 +3488,11 @@ class SkyServeController:
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
         while True:
+            # Clear before reading durable replica and placement state. Typed
+            # feedback that arrived before this point is consumed by this tick;
+            # feedback that arrives during the tick leaves the signal set and
+            # makes the interval wait below return immediately.
+            self._replica_manager.clear_scale_reconciliation_signal()
             try:
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
@@ -3562,7 +3567,8 @@ class SkyServeController:
                         # reads the durable quarantine and active-version
                         # fallback before constructing any runtime objects.
                         os._exit(1)  # pylint: disable=protected-access
-                    time.sleep(self._autoscaler.get_decision_interval())
+                    self._replica_manager.wait_for_scale_reconciliation(
+                        self._autoscaler.get_decision_interval())
                     continue
                 if (isinstance(decision_autoscaler,
                                autoscalers.ConcurrencyAutoscaler) and
@@ -3754,7 +3760,8 @@ class SkyServeController:
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            time.sleep(self._autoscaler.get_decision_interval())
+            self._replica_manager.wait_for_scale_reconciliation(
+                self._autoscaler.get_decision_interval())
 
     def run(self, controller_socket: socket.socket | None = None) -> None:
 
@@ -3806,7 +3813,9 @@ class SkyServeController:
                                           constants.SKYPILOT_DEFAULT_WORKSPACE),
                         existing_replica_infos=replica_infos,
                         globally_managed=getattr(self, '_service_hash',
-                                                 None) is not None)
+                                                 None) is not None,
+                        service_name=self._service_name,
+                        service_hash=getattr(self, '_service_hash', None))
                     paid_admission = (
                         paid_capacity.admission_snapshot_by_location(budget))
                 except Exception as e:  # pylint: disable=broad-except

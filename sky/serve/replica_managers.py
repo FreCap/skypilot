@@ -1,5 +1,6 @@
 """ReplicaManager: handles the creation and deletion of endpoint replicas."""
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Mapping
 import contextlib
 import dataclasses
@@ -7,6 +8,7 @@ import functools
 from multiprocessing import pool as mp_pool
 import os
 import pathlib
+import queue
 import threading
 import time
 import traceback
@@ -161,6 +163,28 @@ class _ZeroCostDemandBudget:
 
     remaining_by_pool: dict[tuple[str, str], int]
     measured_by_pool: dict[tuple[str, str], int | None]
+
+
+class _ReplicaLaunchThread(thread_utils.SafeThread):
+    """Launch worker that publishes a joinable completion notification."""
+
+    def __init__(self, *args: Any, replica_id: int,
+                 completion_queue: 'queue.SimpleQueue[int]',
+                 completion_event: threading.Event, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._completion_replica_id = replica_id
+        self._completion_queue = completion_queue
+        self._completion_event = completion_event
+
+    def run(self) -> None:
+        try:
+            super().run()
+        finally:
+            # This callback runs just before Thread.run returns, so the receiver
+            # joins the notified worker before relying on is_alive(). The queue
+            # preserves completion across Event coalescing and clear races.
+            self._completion_queue.put(self._completion_replica_id)
+            self._completion_event.set()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1523,6 +1547,14 @@ class ReplicaManager:
     def clear_pending_version(self, version: int) -> None:
         """Clear a previously announced pending version."""
 
+    def clear_scale_reconciliation_signal(self) -> None:
+        """Prepare an ordinary autoscaler tick to consume prior feedback."""
+
+    def wait_for_scale_reconciliation(self, timeout_seconds: float) -> bool:
+        """Wait for feedback or the ordinary autoscaler interval."""
+        time.sleep(timeout_seconds)
+        return False
+
     def scale_down(self,
                    replica_id: int,
                    purge: bool = False,
@@ -1612,6 +1644,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             whether it is still responding to requests.
     """
 
+    _launch_completion_queue: queue.SimpleQueue[int]
+    _launch_completion_event: threading.Event
+    _scale_reconciliation_event: threading.Event
+
     def _restore_spot_placement_state(self) -> None:
         """Restore durable exact-location benches once per manager process."""
         if getattr(self, '_spot_placement_state_restored', False):
@@ -1641,6 +1677,45 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'Service {self._service_name!r} controller ownership changed '
                 'while persisting placement retry state.')
         placer.mark_retry_state_persisted()
+
+    def _launch_completion_state(
+        self,) -> tuple['queue.SimpleQueue[int]', threading.Event]:
+        """Return lazily compatible completion state for launch workers."""
+        completion_queue = getattr(self, '_launch_completion_queue', None)
+        if completion_queue is None:
+            completion_queue = queue.SimpleQueue()
+            self._launch_completion_queue = completion_queue
+        completion_event = getattr(self, '_launch_completion_event', None)
+        if completion_event is None:
+            completion_event = threading.Event()
+            self._launch_completion_event = completion_event
+        return completion_queue, completion_event
+
+    def _join_notified_launch_workers(self) -> None:
+        """Join completion callbacks before the reducer checks is_alive()."""
+        completion_queue, _ = self._launch_completion_state()
+        while True:
+            try:
+                replica_id = completion_queue.get_nowait()
+            except queue.Empty:
+                return
+            worker = self._launch_thread_pool.get(replica_id)
+            if worker is not None and worker is not threading.current_thread():
+                worker.join()
+
+    def clear_scale_reconciliation_signal(self) -> None:
+        """Clear feedback before a tick that will read durable state."""
+        event = getattr(self, '_scale_reconciliation_event', None)
+        if event is not None:
+            event.clear()
+
+    def wait_for_scale_reconciliation(self, timeout_seconds: float) -> bool:
+        """Wait interruptibly for committed typed provider feedback."""
+        event = getattr(self, '_scale_reconciliation_event', None)
+        if event is None:
+            time.sleep(timeout_seconds)
+            return False
+        return event.wait(timeout_seconds)
 
     def _db_fence_kwargs(self) -> dict[str, Any]:
         """Exact owner predicates, omitted for legacy/direct test managers."""
@@ -1718,6 +1793,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
         if not authorized and ownership_lost is not None:
             ownership_lost.set()
+            completion_event = getattr(self, '_launch_completion_event', None)
+            if completion_event is not None:
+                completion_event.set()
         return authorized
 
     def _service_is_launch_authorized(self) -> bool:
@@ -1978,6 +2056,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # individual launch watchdogs poll the event rather than multiplying
         # ownership queries by the number of in-flight replicas.
         self._ownership_lost = threading.Event()
+        self._launch_completion_queue = queue.SimpleQueue()
+        self._launch_completion_event = threading.Event()
+        self._scale_reconciliation_event = threading.Event()
         self._down_thread_pool: thread_utils.ThreadSafeDict[
             int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
         self._failed_cleanup_retry_attempts = {}
@@ -2626,7 +2707,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 constants.SKYPILOT_DEFAULT_WORKSPACE),
                             existing_replica_infos=existing_replica_infos,
                             globally_managed=(getattr(self, '_service_hash',
-                                                      None) is not None)))
+                                                      None) is not None),
+                            service_name=self._service_name,
+                            service_hash=getattr(self, '_service_hash', None),
+                            requested_frontier_keys={
+                                paid_capacity.frontier_key(location)
+                            }))
                 if location in (
                         paid_location_launch_budget.remaining_by_location):
                     if (paid_location_launch_budget.
@@ -2731,7 +2817,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 constants.SKYPILOT_DEFAULT_WORKSPACE),
                             existing_replica_infos=existing_replica_infos,
                             globally_managed=(getattr(self, '_service_hash',
-                                                      None) is not None)))
+                                                      None) is not None),
+                            service_name=self._service_name,
+                            service_hash=getattr(self, '_service_hash', None),
+                            requested_frontier_keys=(
+                                None if allowed_locations is None else {
+                                    paid_capacity.frontier_key(candidate)
+                                    for candidate in allowed_locations
+                                })))
                 assert paid_location_launch_budget is not None
                 if self._demand_should_skip_zero_cost(existing_replica_infos):
                     # The broker grant or speculative-probe budget says this
@@ -2859,8 +2952,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 not prior_unknown_capacity_replacement):
             logical_cloud_launch_guard = lambda: (
                 self._queued_logical_launch_fence_decision(replica_id)[:2])
-        t = thread_utils.SafeThread(
+        completion_queue, completion_event = self._launch_completion_state()
+        t = _ReplicaLaunchThread(
             target=launch_cluster,
+            replica_id=replica_id,
+            completion_queue=completion_queue,
+            completion_event=completion_event,
             args=(replica_id, launch_yaml_content, cluster_name, log_file_name,
                   self._replica_to_request_id,
                   self._replica_to_launch_cancelled, resources_override,
@@ -3141,6 +3238,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                 for name, count in location.accelerators.items()
             } == requested_shape
         }
+
+    def _requested_paid_frontier_keys(
+        self, resources_overrides: Iterable[dict[str, Any] | None]
+    ) -> set[paid_capacity.FrontierKey] | None:
+        """Return exact cards targeted by a batch, or None for task defaults."""
+        requested_frontiers: set[paid_capacity.FrontierKey] = set()
+        for resources_override in resources_overrides:
+            if resources_override is None:
+                return None
+            allowed = self._locations_for_accelerator_override(
+                resources_override)
+            if allowed is None:
+                return None
+            requested_frontiers.update(
+                paid_capacity.frontier_key(location) for location in allowed)
+        return requested_frontiers
 
     def _build_zero_cost_demand_budget(
         self,
@@ -3497,7 +3610,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                                   constants.SKYPILOT_DEFAULT_WORKSPACE),
                 existing_replica_infos=existing_replica_infos,
                 globally_managed=(getattr(self, '_service_hash', None)
-                                  is not None)))
+                                  is not None),
+                service_name=self._service_name,
+                service_hash=getattr(self, '_service_hash', None),
+                requested_frontier_keys=self._requested_paid_frontier_keys(
+                    resources_overrides)))
         deferred_paid_overrides: list[dict[str, Any] | None] = []
         for resources_override in resources_overrides:
             pending_version = getattr(self, '_pending_version', None)
@@ -3788,9 +3905,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             workspace=getattr(self, '_workspace',
                               constants.SKYPILOT_DEFAULT_WORKSPACE),
             existing_replica_infos=existing_replica_infos,
-            globally_managed=(getattr(self, '_service_hash', None) is not None))
-                                       if self._spot_placer is not None else
-                                       None)
+            globally_managed=(getattr(self, '_service_hash', None) is not None),
+            service_name=self._service_name,
+            service_hash=getattr(self, '_service_hash', None),
+            requested_frontier_keys=(None if not card_targets else {
+                (str(card).casefold(),)
+                for card, target in card_targets.items()
+                if committed_by_card.get(card, 0) < target
+            })) if self._spot_placer is not None else None)
         deferred_cards: set[str] = set()
         launched_capacity = 0
         while True:
@@ -6301,12 +6423,15 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         availability_launch_failures = (capacity_launch_failures |
                                         quota_launch_failures)
+        affected_pool_keys: set[str] = set()
         if availability_launch_failures:
             affected_pool_keys = {
                 info.paid_capacity_pool_key
                 for replica_id, info, _ in completed_launches
                 if replica_id in availability_launch_failures and
-                isinstance(info.paid_capacity_pool_key, str)
+                isinstance(info.paid_capacity_pool_key, str) and
+                paid_capacity.frontier_key_from_pool_key(
+                    info.paid_capacity_pool_key) is not None
             }
             pool_count = len(affected_pool_keys)
             pool_count_text = str(pool_count) if pool_count else 'unknown'
@@ -6346,10 +6471,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                 outcomes=outcomes)
             if paid_outcome_persisted is None:
                 self._persist_replicas(completed_replica_infos)
-            elif paid_outcome_persisted is False:
+            elif not paid_outcome_persisted.ownership_valid:
                 raise RuntimeError(
                     f'Service {self._service_name!r} controller ownership '
                     'changed while persisting paid-capacity launch outcomes.')
+            elif (availability_launch_failures and affected_pool_keys &
+                  set(paid_outcome_persisted.applied_pool_keys)):
+                # The PostgreSQL transaction above is the authorization
+                # boundary. Wake only after it applied the typed failure to a
+                # matching exact paid pool and released that claim; the
+                # controller then performs one ordinary target-fenced
+                # autoscaler tick.
+                reconciliation_event = getattr(self,
+                                               '_scale_reconciliation_event',
+                                               None)
+                if reconciliation_event is not None:
+                    reconciliation_event.set()
         for replica_id, info, error_in_sky_launch in completed_launches:
             self._launch_thread_pool.pop(replica_id)
             self._replica_to_request_id.pop(replica_id)
@@ -6668,6 +6805,12 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _thread_pool_refresher(self) -> None:
         """Periodically refresh the launch/down thread pool."""
         while not self._ownership_lost.is_set():
+            _, completion_event = self._launch_completion_state()
+            # Clear before draining the durable-in-process queue. A completion
+            # racing after this clear is either drained now or leaves the event
+            # set so the wait below returns immediately.
+            completion_event.clear()
+            self._join_notified_launch_workers()
             logger.debug('Refreshing thread pool.')
             try:
                 self._refresh_thread_pool()
@@ -6678,8 +6821,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            if self._ownership_lost.wait(_PROCESS_POOL_REFRESH_INTERVAL):
+            if self._ownership_lost.is_set():
                 return
+            completion_event.wait(_PROCESS_POOL_REFRESH_INTERVAL)
 
     def _fetch_job_status(self) -> None:
         """Fetch the service job status of all replicas.

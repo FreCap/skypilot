@@ -310,6 +310,14 @@ def controller_only_vars_to_fill(controller: Controllers) -> dict[str, str]:
     if override_concurrent_launches is not None:
         env_vars[constants.SERVE_OVERRIDE_CONCURRENT_LAUNCHES] = str(
             int(override_concurrent_launches))
+    if controller == Controllers.SKY_SERVE_CONTROLLER:
+        for paid_service_window_variable in (
+                constants.SERVE_PAID_SERVICE_MAX_LAUNCH_WINDOW,
+                constants.SERVE_PAID_SERVICE_LAUNCH_WINDOW_PROFILES,
+                constants.SERVE_PAID_LOCATION_MAX_EXPLORATION_FRONTIER):
+            value = os.environ.get(paid_service_window_variable)
+            if value is not None:
+                env_vars[paid_service_window_variable] = value
     # Forward the client's usage run id so the controller (and the worker
     # clusters it provisions) report heartbeats under the same run id as
     # the originating launch operation. Without this, in consolidation mode
