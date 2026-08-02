@@ -180,16 +180,25 @@ ProviderLifecyclePlanV1 = {
   resources_snapshot_sha256: Sha256,
   workspace_identity_sha256: Sha256,
   requested_target: ProviderLocatorV1,
-  prior_launch_basis: null | PriorLaunchBasisV1,
-  prior_cleanup_target: null | ProviderKubernetesCleanupTargetV1,
+  prior_launch_basis_sha256: null | Sha256,
+  prior_cleanup_target_sha256: null | Sha256,
   request_payload_sha256: Sha256,
   redaction_profile: "provider_lifecycle_redaction_v1"
 }
 ```
 
-The plan embeds or references the complete bounded normalized preimage for each
-hash in the action descriptor; a hash-only provider-private interpretation is
-not authoritative. It contains no secret bytes.
+The plan is the indexed identity projection, not a second copy of the provider
+execution document. For launch, both prior hashes are null. For down, the full
+typed prior basis appears exactly once in `invocation.down` and the full cleanup
+target appears exactly once in that invocation's execution capsule; the basis
+retains that cleanup target's hash and the two plan hashes equal the complete
+in-spec basis and capsule preimages. A hash-only provider-private interpretation
+is not authoritative. Admission externally validates each basis cleanup-target
+hash against its retained source and the sole capsule copy. The partial basis's
+cursor and quiescence preimages likewise already exist in locked, typed API006
+action/attempt rows and are not provider execution inputs. No retained-source
+hash authorizes a handler lookup or provider call. The graph contains no secret
+bytes.
 
 For action-aware SkyServe rows, `service_hash` is the canonical UUID text
 already stored in `services.hash`, and `service_incarnation` is that same value
@@ -225,7 +234,6 @@ CompletedLaunchBasisV1 = {
   launch_resolved_target_sha256: Sha256,
   launch_handle: ProviderKubernetesHandleV1,
   launch_handle_sha256: Sha256,
-  launch_cleanup_target: ProviderKubernetesCleanupTargetV1,
   launch_cleanup_target_sha256: Sha256,
   launch_immutable_spec_sha256: Sha256,
   exact_resources_override: true
@@ -407,17 +415,59 @@ PartialLaunchCleanupBasisV1 = {
   launch_requested_target: ProviderLocatorV1,
   launch_resources: ProviderPodResourceSnapshotV1,
   launch_workspace_identity: ProviderWorkspaceIdentityV1,
-  launch_provider_cursor: ProviderLaunchProgressV1,
   launch_provider_cursor_sha256: Sha256,
   launch_provider_progress_revision: PositiveInteger,
-  launch_quiescence: ProviderLaunchSupersessionQuiescenceV1,
   launch_quiescence_sha256: Sha256,
-  launch_cleanup_target: ProviderKubernetesCleanupTargetV1,
   launch_cleanup_target_sha256: Sha256,
   launch_immutable_spec_sha256: Sha256,
   exact_resources_override: true
 }
 ```
+
+`PartialLaunchCleanupBasisV1` is a retained-source reference, not a truncated
+proof. Its full `launch_provider_cursor` and `launch_quiescence` are deliberately
+not copied into the down spec. They remain in, respectively, the exact settled
+source attempt's API006 progress envelope and the exact reducer-owned source
+outcome named by `(source_store, launch_action_id, launch_attempt)`. The basis
+retains their canonical hashes and the exact progress revision, immutable-spec
+hash, resource/target/workspace preimages, and derived cleanup-target hash. The
+complete cleanup target appears only in the down execution capsule. V1 retains
+all API resource actions and attempts indefinitely because it has no generic
+action/attempt garbage collection. A future GC must first add a typed persisted
+reverse-reference relation and migration before either source row may be
+removed; scanning hashes or JSON during deletion is insufficient. Request GC
+remains safe only after the final progress and outcome preimages have been
+snapshotted into the settled attempt.
+
+Partial-down admission performs the external validation that the standalone
+value parser cannot. It first constructs an optimistic candidate, then acquires
+the sorted union of source-launch and deterministic-down action IDs; only after
+all action keys are acquired does it lock the named source attempt. In the
+first-settlement branch the unsettled locked attempt protects its request from
+GC; admission nonlocking-reads and validates the terminal request, complete
+typed API006 cursor, and terminal handler DTO, then constructs and persists reducer-owned quiescence,
+terminalizes the source as exact `SUPERSEDED_TO_DOWN`, and inserts/adopts and
+links the down in one commit. Its lost-ack branch requires the already-settled
+attempt's retained request snapshot and source outcome/quiescence byte-for-byte
+and exact-adopts the same down/link; the original request may be GCed, while a
+surviving row is only compared nonlocking. Both
+branches re-derive the cleanup target, require it byte-equal to the sole capsule
+copy, and verify the retained cursor hash, progress revision, quiescence hash,
+cleanup-target hash, immutable-spec hash, and every local basis projection.
+Concretely they require `source_action.current_attempt ==
+basis.launch_attempt`; deterministic source action and request IDs; a `SETTLED`
+source attempt; valid API006 progress JSON/hash/revision and nested cursor hash;
+source attempt outcome/hash byte-equal to source action `last_result`/hash; exact
+Q disposition and quiescence action/attempt/request/cursor bindings; and exact
+source spec identity/resource/target/workspace projections. The cleanup target
+is derived only from that locked spec/cursor and exact same-UUID cluster-row
+disposition. Any absent preimage, hash/revision mismatch, wrong attempt, changed
+cleanup projection, or retention violation rolls back the whole transaction.
+The source may never be terminalized in one transaction and handed to a later
+down-admission transaction.
+The down handler needs none of the omitted provenance to mutate: it executes
+only the full cleanup target and current authority material frozen in its own
+capsule.
 
 `PriorLaunchBasisV1` intentionally has no `NOT_STARTED` variant. The parent's
 reducer maintains a closed monotonic `ServeLaunchNoIoPrefixV1` in each settled
@@ -503,7 +553,8 @@ the evidence-commit origin cannot precede its intent origin, and origins for a
 later effect cannot precede the preceding committed effect's evidence origin.
 Execution generation may restart at one for a new attempt.
 
-A launch has `prior_launch_basis=null` and `prior_cleanup_target=null`. Its
+A launch has `prior_launch_basis_sha256=null` and
+`prior_cleanup_target_sha256=null`. Its
 resource hash is the canonical
 SHA-256 of `resources`; its placement hash is the canonical SHA-256 of
 `{version: 1, launch_resource_identity: resource_identity,
@@ -511,8 +562,13 @@ launch_requested_target: requested_target, launch_resources: resources,
 exact_resources_override: true}`; and its workspace hash is the canonical
 SHA-256 of `ProviderWorkspaceIdentityV1`.
 
-A primary down requires a `PriorLaunchBasisV1` and a byte-equal
-`prior_cleanup_target`. The basis action ID must be the UUID derived from its
+A primary down requires a full `PriorLaunchBasisV1` in its invocation and a
+full cleanup target in its execution capsule. The plan retains only their
+canonical hashes, and the basis retains only the cleanup-target hash. Admission
+re-derives the target from the locked retained launch evidence, requires that
+target byte-equal to the capsule copy, and requires both retained hashes and
+both plan hashes to equal their complete validated preimages. The
+basis action ID must be the UUID derived from its
 launch identity/spec. Admission loads and locks that exact retained launch row
 and applicable attempt evidence from `source_store`, plus the exact
 global-user-state cluster row disposition named by the cleanup target. It
@@ -523,26 +579,35 @@ For `completed_launch`, the retained launch is terminal-successful. An API
 launch's final API006 cursor supplies the resolved target and handle; a shadow
 launch's completed child supplies the exact resolved-target observation and
 the same-UUID cluster row supplies the handle. Both must agree on cluster UUID,
-all three object UIDs, Pod UID, provider scope, and the complete cleanup target.
-The cluster row's provider block is byte-equal to `launch_handle`.
+all three object UIDs, Pod UID, provider scope, and the complete re-derived
+cleanup target. The cluster row's provider block is byte-equal to
+`launch_handle`; the re-derived cleanup target hash equals the basis commitment
+and its bytes equal the sole capsule copy.
 
-`partial_launch_cleanup` is allowed only for a settled API-action launch that
-did not succeed, satisfies the action-wide `launch_io_started` predicate above,
-and whose exact final outcome contains
-`ProviderLaunchSupersessionQuiescenceV1`. Admission first
-holds the exact service/replica-incarnation fence and constructs the complete
-candidate down identity/spec from a read-only source snapshot. It then visits
+`partial_launch_cleanup` is allowed only for an API-action launch that did not
+succeed and satisfies the action-wide `launch_io_started` predicate above. The
+first-settlement branch starts from a terminal request and unsettled source;
+the replay branch starts from the exact settled source outcome containing
+`ProviderLaunchSupersessionQuiescenceV1`. Admission first holds the exact
+service/replica-incarnation fence and constructs the complete candidate down
+identity/spec from a read-only source snapshot. It then visits
 the sorted union of source-launch and deterministic down action IDs in canonical
 action-ID order. At each key it locks and validates the existing row, or
 inserts/exactly adopts the allowed new down row at that key. An insert or
 conflict adoption is an action-row-class acquisition at its sorted position; the
 transaction never locks a higher action ID and later inserts a lower one. After
-all action keys are acquired it locks the source attempt and revalidates every
-source cursor, quiescence, cleanup-target, and immutable-spec byte used to
-construct the candidate. Any mismatch rolls back the entire transaction,
-including a newly inserted down row. It derives the three-slot cleanup target
+all action keys are acquired it locks the source attempt. The first-settlement
+branch nonlocking-reads the still-retained terminal request, then constructs/
+persists quiescence and source terminal state in the same transaction that
+inserts/adopts and links the down. The lost-ack branch revalidates the already-
+settled byte-equal request snapshot/outcome/quiescence without requiring the
+original request row and adopts that same down/link. Both revalidate every retained source
+cursor/quiescence preimage and every cleanup-target and immutable-spec byte used
+to construct the candidate. Any mismatch rolls back the entire transaction,
+including a newly inserted down row. They derive the three-slot cleanup target
 from the retained launch object plans, every committed UID/allocation, and an
-exact same-UUID cluster-row read.
+exact same-UUID cluster-row read. No transaction may settle the source without
+also committing the matching down/link.
 
 The progress and quiescence prefixes are also literal protocol constants. In
 the following table, `C<i>` is the complete immutable committed-effect record
@@ -1425,10 +1490,11 @@ the retained launch evidence and current same-UUID cluster-row read.
 The profile defines which resolved fields are required for authoritative
 present/absence proof. A caller loads this object from prior attempt evidence
 and passes it to later `observe()` calls. A launch plan starts with
-`prior_cleanup_target=null`; discovery is written to the attempt, leaving that
-plan immutable. Down admission derives and stores exactly one matching launch
-cleanup target, complete or partial, in the new down plan. A conflicting
-second value is corruption and cannot replace the first.
+`prior_cleanup_target_sha256=null`; discovery is written to the attempt,
+leaving that plan immutable. Down admission derives and stores exactly one
+matching launch cleanup target, complete or partial, in the new down execution
+capsule and stores its hash in the indexed plan. A conflicting second value is
+corruption and cannot replace the first.
 
 For `pod_cluster_v1`, every resolved or partial object collection contains
 exactly three role-keyed entries in canonical order
@@ -2503,7 +2569,7 @@ that scaffold in place. There is no dual reader, backfill, or
 optional-execution-config form.
 
 The one-time first-deployment gate keeps every API, worker, and controller on
-the proven baseline image while the additive migrations reach API006,
+the proven baseline image while the additive migrations reach API007,
 Serve033, and global-user-state 028. In one consistent read-only PostgreSQL
 snapshot it then requires zero Serve replica rows in `api_resource_actions`,
 their attempts and correlated `api_requests`; zero rows in all six Serve033
@@ -3828,17 +3894,18 @@ preimages. Two pure nonrecursive projectors are the only constructors:
   to the displayed literals; computes `prior_launch_basis_sha256` from the
   complete typed basis; computes the input cleanup-target hash from the complete
   `prior_cleanup_target`; and computes `execution_capsule_sha256` from the full
-  capsule. The outer nonnull `prior_cleanup_target`, the basis's complete
-  `launch_cleanup_target`, the preflight cleanup target, and the capsule cleanup
-  target are byte-equal. The basis's `launch_cleanup_target_sha256`, preflight
+  capsule. The target re-derived from the locked basis source, the preflight
+  cleanup target, and the capsule cleanup target are byte-equal. The basis's
+  `launch_cleanup_target_sha256`, preflight
   `cleanup_target_sha256`, capsule `cleanup_target_sha256`, and projected-subject
   `cleanup_target_sha256` all equal that recomputed input hash. No input includes
   or dereferences `down.execution_config`.
 
 Execution-config/spec admission calls the kind-matched projector and requires
 its complete canonical result to be byte-equal to the embedded policy subject.
-It also requires every projector input to equal the corresponding plan,
-invocation, retained basis, and preflight field. For launch, it additionally
+It also requires every projector input to equal the corresponding invocation,
+retained basis, and preflight field and to hash to the corresponding indexed
+plan commitment. For launch, it additionally
 compares the outer invocation field-for-field with the projected subject:
 source, requested target, resources, topology, replica environment,
 security-group scope, policy and managed-secret modes, retry flag, exact-resource
@@ -3847,8 +3914,8 @@ mount-blob value, and TLS-material value must equal the projector input or its
 displayed fixed result. The invocation's execution-config field is compared to
 the complete enclosing config but is not a projector input. For down, requested
 target, workspace, cluster name, expected cluster-record UUID, complete prior
-basis, purge/graceful flags, and timeout are bound to the plan, cleanup target,
-projected subject, and enclosing config; both basis and cleanup hashes are
+basis, purge/graceful flags, and timeout are bound to the plan hashes, cleanup
+target, projected subject, and enclosing config; both basis and cleanup hashes are
 recomputed from their complete typed preimages. A self-consistent subject/hash
 graph with one changed target, retry flag, replica value, option, cleanup target,
 cluster identity, or prior-basis hash is therefore invalid.
@@ -4459,9 +4526,10 @@ the plan and invocation derive the enclosing action ID, and
 `provider_plan.request_payload_sha256` equals `invocation.sha256`. The shadow
 parent's separately indexed `provider_plan` and hash are an exact byte-equal
 copy of the wrapper member, and a primary child's invocation is an exact
-byte-equal copy of the wrapper invocation. For primary down, the plan and down
-invocation carry byte-equal `PriorLaunchBasisV1` values and admission validates
-the referenced retained row before accepting either. A
+byte-equal copy of the wrapper invocation. For primary down, the plan carries
+only `prior_launch_basis_sha256` and `prior_cleanup_target_sha256`; each equals
+the complete basis or capsule cleanup-target preimage in the invocation.
+Admission validates the referenced retained source before accepting either. A
 `LAUNCH_CLEANUP_DOWN` child is the sole exception: it uses
 `ServeLegacyLaunchCleanupDownInvocationV1`, derived byte-for-byte from the
 parent launch spec by `launch_cleanup_down_invocation()`. Its parent action ID,
@@ -4553,13 +4621,27 @@ three complete requested/semantic object bodies, the full kind-specific
 principal/authorization inventory, and all 12 prerequisite role records. The
 launch golden additionally includes the exact five-role endpoint projection,
 six runtime artifacts, and both endpoint callers with their complete live
-Deployment projections. The down golden contains none of those launch-only
-endpoint/runtime/job fields, and insertion of any one rejects. Tests
-record each full `ServeReplicaActionSpecV1` byte length, require
+Deployment projections. Down goldens contain none of those launch-only
+endpoint/runtime/job fields, and insertion of any one rejects. Tests separately
+cover completed-launch down and every legal partial-launch down, including
+maximal committed-cleanup and legal null-slot/null-handle shapes. They record
+each full `ServeReplicaActionSpecV1` byte length, require
 it to be at most 60,000 bytes (preserving at least 5,536 bytes of rollout
 headroom), and still enforce the absolute 65,536-byte parser bound. Failure is
-`NOT_REPRESENTABLE`; no truncation, compression, omitted preimage, or external
-hash-only lookup is allowed.
+`NOT_REPRESENTABLE`; no truncation, compression, or unverified external
+hash-only lookup is allowed. Initial implementation measurement activated this
+gate: a realistic completed-launch down spec was 72,567 bytes, and a legal
+`HANDLE_COMMITTED` partial-launch down was 183,137 bytes (28,716-byte cursor,
+27,607-byte quiescence, 70,057-byte basis, and 100,781-byte invocation). The
+cause was structural duplication, not an unbounded leaf. The corrected wire
+contract stores the full basis only in the invocation, the full cleanup target
+only in the execution capsule, retains its hash in the basis, and retains plan
+hashes for both; the partial basis additionally references its locked cursor/
+quiescence preimages by exact source key, revision, and hash as specified above.
+Authority remains disabled until launch, completed-down, every legal partial-
+down, and realistic/candidate-maximal full-spec goldens prove the revised shape
+is at most 60,000 bytes and capped preflight request/response goldens satisfy
+their independent 65,536-byte transport limits.
 
 The `source` object contains a `content` reference to an immutable retained
 `version_specs` row plus the closed server-effective identity proof;
@@ -5080,6 +5162,12 @@ Contract tests must cover:
   namespaced/cluster RBAC
   grants and forbidden verbs, plus API -> new worker cohort -> controller
   rollout and current-chart rollback while both cohorts remain claimable;
+- API006 -> API007 migration preserves every existing request, queue, action,
+  attempt, and server-instance row while widening only the named role CHECK;
+  downgrade rejects any remaining `authority-worker` instance; ordinary API007
+  roles remain operational before Serve033 and exclude all four private names;
+  authority startup against Serve032 or an incomplete private-handler inventory
+  fails before a queue claim;
 - atomic `PREPARING -> SHADOW_ACTIVE|ACTION_ACTIVE` binding with admission;
   active-cohort switches between preflight/admission; retirement between zero-
   reference discovery/admission; stale preparation owners; a nonterminal
@@ -5105,8 +5193,9 @@ paths, and no false teardown completion.
 
 Provider changes ship dark, then shadow, then per-service authoritative. The
 blocking migration job must converge all three independent additive
-heads—global-user-state 028, Serve033, and API005 for shadow; API006 replaces
-API005 as the required API head before provider dispatch or authority. There is
+heads—global-user-state 028, Serve033, and API005 for legacy-only shadow; API007
+(including the API006 progress substrate) is the required API head before any
+private-handler shadow, provider dispatch, or authority. There is
 no cross-lineage Alembic dependency. No provider profile is enabled globally by
 schema migration. Application rollback retains all three heads and
 uses only a compatible image that preserves nonnull cluster-record UUIDs as
@@ -5178,9 +5267,12 @@ Only the typed two-worker/Deployment-readiness transaction changes it to
 preparations first create a `PREPARING` reference under that `ACCEPTING`
 identity and then freeze the same resolved cohort returned by preflight.
 Kubernetes readiness during `REGISTERING` proves only the self-attestation/
-health contract; the existing queue claim predicate remains disabled until
-both `ACCEPTING` and active selection hold, so activation has no readiness
-cycle.
+health contract. `ACCEPTING` plus active selection gates creation of new
+`PREPARING` references, not claims. The existing queue claim predicate binds
+each worker's own immutable cohort and an existing `SHADOW_ACTIVE` or
+`ACTION_ACTIVE` reference; it remains enabled for that cohort in either
+`ACCEPTING` or `DRAINING`, independent of later active selection, so activation
+has no readiness cycle and frozen old work remains recoverable.
 
 Moving active selection away does not remove the old cohort. The typed
 retirement helper first locks it and commits `DRAINING`, which rejects new
@@ -5206,8 +5298,9 @@ never recreated.
 
 Claim filtering is by a closed server-owned handler allowlist plus frozen
 cohort predicate in the existing queue query. For action requests the query
-joins the existing action/attempt correlation and matches the immutable spec's
-cohort ID/Deployment UID; for private shadow-candidate requests it matches the
+joins the existing action/current-attempt correlation, requires the action to
+remain `QUEUED`, and matches the immutable spec's cohort ID/Deployment UID; for
+private shadow-candidate requests it matches the
 same closed cohort fields in their internal payload. A cohort admits only its
 matching private shadow/resource-action handlers; ordinary normal executors
 exclude them, and every cohort excludes unrelated public handlers. A
@@ -5219,6 +5312,15 @@ Action claims additionally require the same decision's `ACTION_ACTIVE`
 reference; private shadow claims require its `SHADOW_ACTIVE` reference. A
 `DRAINING` cohort does not invalidate either. A released, missing,
 cross-decision, or cross-Deployment reference rejects the claim.
+
+API-request revision 007 only admits `authority-worker` as a durable
+`api_server_instances.role`; it changes no queue or request shape and preserves
+ordinary API006 rows. General-role query construction excludes the four private
+names without a Serve import or Serve033 relation, while authority startup
+requires the exact registered handler inventory and resolves its immutable
+cohort identity against Serve033 before starting workers. The role therefore
+fails closed on an API007/Serve032 mixed deployment, and ordinary API007
+executors remain operational during the staged Serve033 rollout.
 
 Deployment precreates and freezes the namespace, a no-permission workload
 ServiceAccount with token automount disabled and no image pull secrets, the

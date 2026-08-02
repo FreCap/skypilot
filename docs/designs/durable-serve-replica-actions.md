@@ -373,6 +373,23 @@ needed to collect M2 legacy shadow evidence. It is PostgreSQL-only, preserves
 ordinary attempts, and refuses schema down once present; application rollback
 keeps the additive head.
 
+Additive API-request revision 007 changes no request, queue, action, or attempt
+shape. It widens only the named `api_server_instances.role` CHECK from the
+API006 set to include `authority-worker`, preserving all existing instance
+rows. Downgrade is permitted only when no authority-worker instance row
+remains. Ordinary `all`, `executor`, and `controller` queue views exclude the
+four closed private Serve handlers by handler name without importing Serve or
+referencing Serve033 tables, so an API007 process remains compatible before
+Serve033 exists. An `authority-worker` process is PostgreSQL-only and fails
+before claiming if its exact four-handler inventory, mounted immutable cohort
+routing document, configured active cohort row, or any required Serve033
+cohort/reference/coverage table is absent. Active selection gates only creation
+of new `PREPARING` references. A worker whose own frozen cohort is `DRAINING`
+may continue to claim existing references for that cohort after another cohort
+becomes active. Its existing PR #1070 claim query then adds the complete
+action/current-attempt/reference/own-cohort or shadow/reference/coverage/
+own-cohort predicate; it does not add a queue or lease.
+
 The 65,536-byte column check is not a late runtime escape hatch. Before
 authoritative admission creates or binds an action request, a pure companion-
 owned representability enumerator renders the exact frozen spec/cohort and each
@@ -403,6 +420,30 @@ attestations. If either realistic or candidate-maximal evidence exceeds the
 limit, authority stays disabled until the canonical design deduplicates
 provenance or tightens an explicit bound; the gate does not assume a passing
 measurement.
+
+The initial down-spec implementation activated that gate. A realistic
+completed-launch down rendered to 72,567 canonical bytes, while a legal
+`HANDLE_COMMITTED` partial-launch down rendered to 183,137 bytes. The latter
+contained a 28,716-byte cursor and 27,607-byte reducer quiescence twice through
+the prior-basis/plan graph; increasing the generic 65,536-byte bound would only
+hide that structural duplication. The accepted correction keeps one full prior
+basis in the down invocation and one full cleanup target only in its execution
+capsule, while the basis and indexed provider plan store the cleanup target's
+recomputed hash and the plan stores the basis hash. For a partial launch, the
+basis retains the exact source action/attempt key, progress revision,
+cursor/quiescence/spec/cleanup-target hashes, and full
+resource/target/workspace preimages, but not a second copy of the cursor,
+quiescence, or cleanup target. Down admission locks their retained API006
+preimages, re-derives the complete cleanup target, requires it byte-equal to the
+sole capsule copy, revalidates the complete typed source outcome and every
+hash/projection in the same transaction, and rolls back on absence or mismatch.
+V1 retains every API resource action and attempt indefinitely because it has no
+generic action/attempt GC; a future GC must first add a typed persisted reverse-
+reference relation and migration. The handler executes only the complete
+cleanup target in its own immutable capsule. This is verified retained-source
+deduplication, not provenance truncation or an unverified hash-only provider
+lookup. Authority remains disabled until full realistic and candidate-maximal
+specs measure at most 60,000 bytes.
 
 Provider progress is attempt-local storage for one action-wide monotonic
 provider cursor. Materializing attempt `n+1` locks the action and settled
@@ -1321,12 +1362,21 @@ against the cursor's immutable intent origin, copies the request envelope's
 exact `terminal_result_sha256`, and constructs
 `ProviderLaunchSupersessionQuiescenceV1` inside the owner-fenced attempt-
 outcome transaction. External terminalization or a missing/invalid DTO is
-ineligible. Only then does the Serve transaction set
-the old launch to `kernel_state='TERMINAL'` with
-`terminal_disposition='SUPERSEDED_TO_DOWN'`, commits the teardown generation
-and real down action link, and freezes either the completed-launch basis or the
-typed partial-launch cleanup basis from the exact API006 cursor and quiescence
-evidence. The down uses
+ineligible. First settlement and lost-ack replay are two branches of the same
+transaction and lock program. Both acquire the sorted union of source-launch
+and deterministic-down action IDs before locking the named source attempt. In
+the first branch that unsettled locked attempt protects its request from GC;
+the reducer then nonlocking-reads and validates the terminal request and its
+no-active-claim facts, constructs and persists quiescence, terminalizes the
+source as `SUPERSEDED_TO_DOWN`, and inserts/adopts and links the down action in
+one commit. The replay branch requires the already-settled attempt's retained
+request snapshot, outcome, and quiescence to be byte-equal, then exact-adopts
+that same down action and link; the original request may already be GCed, and a
+surviving row is compared nonlocking but is not required.
+No branch may terminalize the source in one transaction and admit the down in a
+later transaction. Both freeze the typed partial-launch basis from the exact
+API006 cursor and quiescence hashes and require the re-derived cleanup target to
+equal the sole copy in the down capsule. The down uses
 the normal PR #1070 request/claim path to exact-read all three names, extend
 only unknown UID commitments, UID-precondition-delete matching objects, prove
 all three absent, and remove any byte-equal same-UUID cluster row. There is no
@@ -2160,8 +2210,9 @@ replica launched in shadow
 later enters authoritative down, down admission loads the matching completed
 launch child, revalidates its canonical observation and
 `ResolvedProviderTargetV1`, exact-reads the same-UUID global-user-state cluster
-row and its full provider handle, and copies both typed preimages and hashes
-into the immutable down plan's `PriorLaunchBasisV1`. The admission transaction
+row and its full provider handle, and copies the typed basis into the immutable
+down invocation, the cleanup target into that invocation's execution capsule,
+and only their hashes into the indexed provider plan. The admission transaction
 then owns that frozen handle; action-aware cluster-row removal is legal only
 through the down attempt's expected-UUID, post-absence seam. Missing,
 hash-only, incomplete, unsupported, or mismatched launch/handle evidence keeps
@@ -2191,7 +2242,7 @@ Promotion requires:
 - every remaining controller/API running the approved active digest and every
   versioned authority-worker cohort referenced by a preparation, nonterminal
   private shadow request/evidence row, or nonterminal action running its own
-  approved immutable digest, all at API006, Serve033, and
+  approved immutable digest, all at API007, Serve033, and
   global-user-state 028; each dedicated attested cohort includes the private
   handlers only for actions frozen to that cohort, while every ordinary
   executor excludes them;
@@ -2209,7 +2260,7 @@ the database timestamp that opened the current shadow window. It carries the
 three independent schema heads, approved image and named inventory
 fingerprints, and a database-clock `verified_at`. `legacy -> shadow` requires
 `API005`, `Serve033`, and global-user-state `028`; `shadow -> authoritative`
-requires `API006`, `Serve033`, and global-user-state `028`. The transition
+requires `API007`, `Serve033`, and global-user-state `028`. The transition
 rejects evidence for another fence/window,
 evidence from the database future, or evidence older than five minutes. A
 `legacy -> shadow` transition requires a null candidate-window binding and no
@@ -2445,10 +2496,10 @@ Deployment order is:
    controller role to its prior immutable digest, and letting the API's blocking
    additive migration hook reach the required heads;
 3. verify all independent milestone-specific heads: M1a is API005 with
-   unchanged Serve031/global-user-state 027; M2 shadow requires API005,
-   Serve033, and global-user-state 028; M3 provider dispatch and M4 authority
-   require API006, Serve033, and global-user-state 028, with no cross-lineage
-   Alembic dependency;
+   unchanged Serve031/global-user-state 027; legacy-controller-only M2 shadow
+   requires API005, Serve033, and global-user-state 028; any private-handler
+   shadow, M3 provider dispatch, and M4 authority require API007, Serve033, and
+   global-user-state 028, with no cross-lineage Alembic dependency;
 4. deploy a new immutable versioned authority-worker cohort at the new digest
    while retaining/pinning every cohort with a `PREPARING`, `SHADOW_ACTIVE`, or
    `ACTION_ACTIVE` reference and pinning API/controller roles, then prove its
@@ -2565,7 +2616,10 @@ Tests must prove:
   return envelopes, E-only/E+N reducer quiescence, handler-domain `S` and every
   legal phase/category `R`/`U`/`B` tuple, all three direct no-effect bases and
   empty/one/max-count prefix shapes, and request-fallback `P0`/`O`/`S`/`X`
-  outcomes remains at most 65,536 canonical UTF-8 bytes with its golden hash; an
+  outcomes remains at most 65,536 canonical UTF-8 bytes with its golden hash;
+  additionally, completed-launch down, every legal partial-launch down full-
+  spec shape, and capped preflight request/response envelopes are pinned by
+  exact byte count/hash and every full action spec is at most 60,000 bytes; an
   oversized/unbounded candidate is rejected by admission and the immediate
   pre-I/O recheck before any intent/watermark;
 - effect provenance survives generation reset across attempts: intent origins
@@ -2617,8 +2671,10 @@ Tests must prove:
   the provisional row/count exactly once without a down; prefix-link tampering,
   inherited cursors, and crossed predecessors reject;
 - a superseded effectful launch is fenced and terminalized as
-  `SUPERSEDED_TO_DOWN`, hands its exact partial cursor to one normally queued
-  down action, and cannot run hidden cleanup or another launch request;
+  `SUPERSEDED_TO_DOWN` in the same sorted-lock transaction that inserts/adopts
+  and links one normally queued down action; the down basis retains the exact
+  source key/revision/hashes while the cursor and quiescence remain in their
+  locked source rows, and no hidden cleanup or another launch request can run;
 - partial-launch cleanup exact-reads all three frozen roles, rejects every
   same-name replacement, uses UID-preconditioned deletes, proves three exact
   NotFound results, and removes or adopts only the exact cluster row before
@@ -2706,7 +2762,9 @@ write typed outcomes.
   on top of the implemented generic API006 progress journal, including
   immutable cross-attempt effect origins, per-attempt worker re-attestation,
   the dedicated closed return encoder/decoder, candidate-maximal 65,536-byte
-  representability fixtures/preflight, reducer-owned quiescence, and
+  progress/outcome fixtures, at-most-60,000-byte completed and every-legal-
+  partial down full-spec goldens plus capped preflight envelopes,
+  reducer-owned quiescence, and
   partial-launch cleanup. Authority remains disabled until realistic and
   candidate-maximal fixture measurements both pass.
 - Rendered and live verification of the dedicated versioned authority-worker
