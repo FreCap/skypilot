@@ -213,6 +213,110 @@ def _wait_for_initial_log_stream_snapshot(
         _sleep_log_follow_wait(1)
 
 
+def _render_stopped_snapshot_logs(
+    job_id: int,
+    managed_job_status: managed_job_state.ManagedJobStatus,
+    *,
+    task_filter: str | int | None,
+    filtered_task_id: int | None,
+    num_tasks: int,
+    tail: int | None,
+    tail_offset: int | None,
+) -> tuple[str, int]:
+    """Render cached logs for a snapshot that should stop active following."""
+    job_msg = ''
+    if managed_job_status.is_failed():
+        job_msg = ('\nFailure reason: '
+                   f'{managed_job_state.get_failure_reason(job_id)}')
+    log_file_ever_existed = False
+    if filtered_task_id is not None:
+        terminal_task_row = managed_job_state.get_task_id_name_status_log(
+            job_id, filtered_task_id)
+        if terminal_task_row is None:
+            valid_range = f'0-{num_tasks - 1}' if num_tasks > 1 else '0'
+            return (f'No task found matching {task_filter!r} in job {job_id}. '
+                    f'Valid task IDs are {valid_range}.',
+                    exceptions.JobExitCode.NOT_FOUND)
+        terminal_task_info = [terminal_task_row]
+    else:
+        terminal_task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
+            job_id)
+        assert terminal_task_info is not None, job_id
+
+    num_terminal_tasks = len(terminal_task_info)
+    for (task_id, task_name, task_status, log_file,
+         logs_cleaned_at) in terminal_task_info:
+        if log_file:
+            log_file_ever_existed = True
+            if logs_cleaned_at is not None:
+                ts_str = datetime.fromtimestamp(logs_cleaned_at).strftime(
+                    '%Y-%m-%d %H:%M:%S')
+                print(f'Task {task_name}({task_id}) log has been '
+                      f'cleaned at {ts_str}.')
+                continue
+            task_str = (f'Task {task_name}({task_id})'
+                        if task_name else f'Task {task_id}')
+            # Show task header when multiple tasks OR when filtering
+            if num_terminal_tasks > 1 or task_filter is not None:
+                print(f'=== {task_str} ===')
+            log_path = os.path.expanduser(log_file)
+            if tail is not None:
+                assert tail > 0
+                # Backward-seek tail: O(tail × line) instead of
+                # scanning the whole file. The previous
+                # `collections.deque(f, maxlen=tail)` scanned every
+                # byte of the cached log, making dashboard log
+                # loading 10+ s for multi-GB cancelled jobs.
+                offset = max(tail_offset or 0, 0)
+                lines, _ = log_lib.tail_lines_from_end(log_path, tail, offset)
+                # Apply the same start-stream-marker filter that
+                # log_lib.tail_logs_iter uses: when the marker
+                # appears in both the head of the file and the
+                # tail window (small log fully covered), filter
+                # so pre-marker boilerplate (Ray INFO lines etc.)
+                # is hidden.
+                with open(log_path, encoding='utf-8') as peek_f:
+                    head_lines = log_lib._peek_head_lines(peek_f)  # type: ignore[attr-defined] # pylint: disable=protected-access
+                start_streaming = (
+                    log_lib._should_stream_the_whole_tail_lines(  # type: ignore[attr-defined] # pylint: disable=protected-access
+                        head_lines, lines, log_lib.LOG_FILE_START_STREAMING_AT))
+                for line in lines:
+                    if log_lib.LOG_FILE_START_STREAMING_AT in line:
+                        start_streaming = True
+                    if start_streaming:
+                        print(line, end='', flush=True)
+            else:
+                with open(log_path, encoding='utf-8') as f:
+                    start_streaming = False
+                    for line in f:
+                        if log_lib.LOG_FILE_START_STREAMING_AT in line:
+                            start_streaming = True
+                        if start_streaming:
+                            print(line, end='', flush=True)
+            # Show task finished message for multi-task or filtering
+            if num_terminal_tasks > 1 or task_filter is not None:
+                # Add the "Task finished" message for terminal states
+                if task_status.is_terminal():
+                    print(ux_utils.finishing_message(
+                        f'{task_str} finished (status: {task_status.value}).'),
+                          flush=True)
+    if log_file_ever_existed:
+        # Add the "Job finished" message for terminal states
+        if managed_job_status.is_terminal():
+            print(ux_utils.finishing_message(
+                f'Job finished (status: {managed_job_status.value}).'),
+                  flush=True)
+        return '', exceptions.JobExitCode.from_managed_job_status(
+            managed_job_status)
+    return (f'{colorama.Fore.YELLOW}'
+            f'Job {job_id} is already in terminal state '
+            f'{managed_job_status.value}. For more details, run: '
+            f'sky jobs logs --controller {job_id}'
+            f'{colorama.Style.RESET_ALL}'
+            f'{job_msg}',
+            exceptions.JobExitCode.from_managed_job_status(managed_job_status))
+
+
 def stream_logs_by_id(job_id: int,
                       follow: bool = True,
                       tail: int | None = None,
@@ -400,102 +504,14 @@ def stream_logs_by_id(job_id: int,
                   f'{colorama.Style.RESET_ALL}')
 
         if not _should_keep_logging(managed_job_status):
-            job_msg = ''
-            if managed_job_status.is_failed():
-                job_msg = ('\nFailure reason: '
-                           f'{managed_job_state.get_failure_reason(job_id)}')
-            log_file_ever_existed = False
-            if filtered_task_id is not None:
-                terminal_task_row = managed_job_state.get_task_id_name_status_log(
-                    job_id, filtered_task_id)
-                if terminal_task_row is None:
-                    valid_range = f'0-{num_tasks - 1}' if num_tasks > 1 else '0'
-                    return (f'No task found matching {task!r} in job {job_id}. '
-                            f'Valid task IDs are {valid_range}.',
-                            exceptions.JobExitCode.NOT_FOUND)
-                terminal_task_info = [terminal_task_row]
-            else:
-                terminal_task_info = (
-                    managed_job_state.get_all_task_ids_names_statuses_logs(
-                        job_id))
-                assert terminal_task_info is not None, job_id
-            num_tasks = len(terminal_task_info)
-            for (task_id, task_name, task_status, log_file,
-                 logs_cleaned_at) in terminal_task_info:
-                if log_file:
-                    log_file_ever_existed = True
-                    if logs_cleaned_at is not None:
-                        ts_str = datetime.fromtimestamp(
-                            logs_cleaned_at).strftime('%Y-%m-%d %H:%M:%S')
-                        print(f'Task {task_name}({task_id}) log has been '
-                              f'cleaned at {ts_str}.')
-                        continue
-                    task_str = (f'Task {task_name}({task_id})'
-                                if task_name else f'Task {task_id}')
-                    # Show task header when multiple tasks OR when filtering
-                    if num_tasks > 1 or task is not None:
-                        print(f'=== {task_str} ===')
-                    log_path = os.path.expanduser(log_file)
-                    if tail is not None:
-                        assert tail > 0
-                        # Backward-seek tail: O(tail × line) instead of
-                        # scanning the whole file. The previous
-                        # `collections.deque(f, maxlen=tail)` scanned every
-                        # byte of the cached log, making dashboard log
-                        # loading 10+ s for multi-GB cancelled jobs.
-                        offset = max(tail_offset or 0, 0)
-                        lines, _ = log_lib.tail_lines_from_end(
-                            log_path, tail, offset)
-                        # Apply the same start-stream-marker filter that
-                        # log_lib.tail_logs_iter uses: when the marker
-                        # appears in both the head of the file and the
-                        # tail window (small log fully covered), filter
-                        # so pre-marker boilerplate (Ray INFO lines etc.)
-                        # is hidden.
-                        with open(log_path, encoding='utf-8') as peek_f:
-                            head_lines = log_lib._peek_head_lines(peek_f)  # type: ignore[attr-defined] # pylint: disable=protected-access
-                        start_streaming = (
-                            log_lib._should_stream_the_whole_tail_lines(  # type: ignore[attr-defined] # pylint: disable=protected-access
-                                head_lines, lines,
-                                log_lib.LOG_FILE_START_STREAMING_AT))
-                        for line in lines:
-                            if log_lib.LOG_FILE_START_STREAMING_AT in line:
-                                start_streaming = True
-                            if start_streaming:
-                                print(line, end='', flush=True)
-                    else:
-                        with open(log_path, encoding='utf-8') as f:
-                            start_streaming = False
-                            for line in f:
-                                if (log_lib.LOG_FILE_START_STREAMING_AT
-                                        in line):
-                                    start_streaming = True
-                                if start_streaming:
-                                    print(line, end='', flush=True)
-                    # Show task finished message for multi-task or filtering
-                    if num_tasks > 1 or task is not None:
-                        # Add the "Task finished" message for terminal states
-                        if task_status.is_terminal():
-                            print(ux_utils.finishing_message(
-                                f'{task_str} finished '
-                                f'(status: {task_status.value}).'),
-                                  flush=True)
-            if log_file_ever_existed:
-                # Add the "Job finished" message for terminal states
-                if managed_job_status.is_terminal():
-                    print(ux_utils.finishing_message(
-                        f'Job finished (status: {managed_job_status.value}).'),
-                          flush=True)
-                return '', exceptions.JobExitCode.from_managed_job_status(
-                    managed_job_status)
-            return (f'{colorama.Fore.YELLOW}'
-                    f'Job {job_id} is already in terminal state '
-                    f'{managed_job_status.value}. For more details, run: '
-                    f'sky jobs logs --controller {job_id}'
-                    f'{colorama.Style.RESET_ALL}'
-                    f'{job_msg}',
-                    exceptions.JobExitCode.from_managed_job_status(
-                        managed_job_status))
+            return _render_stopped_snapshot_logs(
+                job_id,
+                managed_job_status,
+                task_filter=task,
+                filtered_task_id=filtered_task_id,
+                num_tasks=num_tasks,
+                tail=tail,
+                tail_offset=tail_offset)
         # Batch coordinator jobs run inline on the controller — no
         # separate cluster is provisioned. Stream controller logs instead
         # of trying to find a worker cluster handle.
@@ -546,6 +562,21 @@ def stream_logs_by_id(job_id: int,
             if (handle is None or managed_job_status
                     != managed_job_state.ManagedJobStatus.RUNNING):
                 if not follow:
+                    if (handle is None and managed_job_status
+                            == managed_job_state.ManagedJobStatus.RUNNING):
+                        refreshed_snapshot = get_stream_target_snapshot()
+                        refreshed_status = refreshed_snapshot.status
+                        assert refreshed_status is not None, (
+                            job_id, refreshed_snapshot)
+                        if not _should_keep_logging(refreshed_status):
+                            return _render_stopped_snapshot_logs(
+                                job_id,
+                                refreshed_status,
+                                task_filter=task,
+                                filtered_task_id=filtered_task_id,
+                                num_tasks=num_tasks,
+                                tail=tail,
+                                tail_offset=tail_offset)
                     return '', exceptions.JobExitCode.SUCCEEDED
                 status_str = ''
                 if (managed_job_status is not None and managed_job_status
