@@ -4674,6 +4674,67 @@ def get_version_yaml_contents(service_name: str) -> dict[int, str]:
     return {row[0]: row[1] for row in rows if row[1] is not None}
 
 
+def get_system_recovery_authorization_snapshot(
+        service_name: str) -> dict[str, Any] | None:
+    """Read one elected service/task snapshot for authorization bootstrap.
+
+    The single statement prevents a generator from pairing one incarnation's
+    hash or elected version with another version's spec/YAML.  This helper is
+    deliberately read-only; the caller applies the PostgreSQL, zero-replica,
+    and recovery-eligibility gates before producing any authorization bytes.
+    """
+    replica_count = (
+        sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                         ).select_from(replicas_table).where(
+                             replicas_table.c.service_name ==
+                             services_table.c.name).scalar_subquery())
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                services_table.c.name,
+                services_table.c.hash,
+                services_table.c.workspace,
+                services_table.c.current_version,
+                services_table.c.status,
+                services_table.c.pool,
+                services_table.c.resource_action_mode,
+                version_specs_table.c.spec,
+                version_specs_table.c.yaml_content,
+                version_specs_table.c.quarantined_at,
+                replica_count.label('replica_count'),
+            ).select_from(
+                services_table.join(
+                    version_specs_table,
+                    sqlalchemy.and_(
+                        version_specs_table.c.service_name ==
+                        services_table.c.name,
+                        version_specs_table.c.version ==
+                        services_table.c.current_version,
+                    ))).where(
+                        services_table.c.name == service_name)).fetchone()
+    if row is None:
+        return None
+    spec = pickle.loads(row.spec) if row.spec is not None else None
+    try:
+        status = ServiceStatus[row.status]
+    except (KeyError, TypeError):
+        status = None
+    return {
+        'service_name': row.name,
+        'service_hash': row.hash,
+        'workspace': row.workspace,
+        'version': row.current_version,
+        'status': status,
+        'pool': None if row.pool is None else bool(row.pool),
+        'resource_action_mode': row.resource_action_mode,
+        'spec': spec,
+        'yaml_content': row.yaml_content,
+        'quarantined_at': row.quarantined_at,
+        'replica_count': row.replica_count,
+    }
+
+
 def get_version_records(service_name: str) -> list[dict[str, Any]]:
     """Gets committed version contents and provenance in one query."""
     engine = _db_manager.get_engine()

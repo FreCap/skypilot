@@ -33,6 +33,18 @@ def _owned_spec() -> runtime_recovery.OwnedContainerSpec:
         inherited_environment_names=('MODEL',))
 
 
+def _v3_task(run: str | None = None) -> sky.Task:
+    task = sky.Task(run=run or _owned_spec().render(), envs={'MODEL': 'boltz'})
+    task.set_resources(
+        sky.Resources(cloud=clouds.AWS(),
+                      instance_type='g6.xlarge',
+                      region='us-east-1',
+                      zone='us-east-1a',
+                      memory='16',
+                      use_spot=False))
+    return task
+
+
 def _profile(task: sky.Task,
              profile_version: int = 1,
              profile_id: str | None = None) -> dict[str, object]:
@@ -83,7 +95,7 @@ def _v3_authorization(task: sky.Task) -> dict[str, object]:
                 'region': 'us-east-1',
                 'availability_zones': ['us-east-1a'],
             }],
-            'allowed_market_types': ['on_demand', 'spot'],
+            'allowed_market_types': ['on_demand'],
             'allowed_instance_types': ['g6.xlarge'],
             'max_host_memory_gib': 16,
             'num_nodes': 1,
@@ -382,7 +394,7 @@ def test_invalid_server_profile_document_fails_closed(monkeypatch, document):
 
 
 def test_authorization_v3_maps_explicitly_to_runtime_profile_two(monkeypatch):
-    task = _task(_owned_spec().render())
+    task = _v3_task()
     _install_v3(monkeypatch, task)
 
     requested = system_oom_recovery.resolve_requested_authorization_v3(
@@ -410,7 +422,7 @@ def test_authorization_v3_maps_explicitly_to_runtime_profile_two(monkeypatch):
 
 
 def test_v3_context_is_closed_and_nonce_becomes_server_request_id(monkeypatch):
-    task = _task(_owned_spec().render())
+    task = _v3_task()
     _install_v3(monkeypatch, task)
     requested = system_oom_recovery.resolve_requested_authorization_v3(
         task, service_name=_SERVICE_NAME, service_hash=_SERVICE_HASH)
@@ -443,7 +455,7 @@ def test_v3_context_is_closed_and_nonce_becomes_server_request_id(monkeypatch):
 
 
 def test_v3_context_preserves_empty_workspace_text(monkeypatch):
-    task = _task(_owned_spec().render())
+    task = _v3_task()
     authorization = _v3_authorization(task)
     authorization['workspace'] = ''
     _install_profiles(monkeypatch, 3, authorization)
@@ -477,8 +489,8 @@ def test_v3_detector_preserves_exact_legacy_context():
     })
 
 
-def test_v3_candidate_prefilter_rejects_exact_non_aws_override(monkeypatch):
-    gcp_task = _task(_owned_spec().render())
+def test_v3_candidate_requires_exact_singleton_aws_resource(monkeypatch):
+    gcp_task = _v3_task()
     gcp_task.set_resources(
         sky.Resources(cloud=clouds.GCP(), instance_type='g2-standard-4'))
     _install_v3(monkeypatch, gcp_task)
@@ -487,7 +499,7 @@ def test_v3_candidate_prefilter_rejects_exact_non_aws_override(monkeypatch):
         gcp_task, service_name=_SERVICE_NAME,
         service_hash=_SERVICE_HASH) is None
 
-    mixed_task = _task(_owned_spec().render())
+    mixed_task = _v3_task()
     mixed_task.set_resources({
         sky.Resources(cloud=clouds.GCP(), instance_type='g2-standard-4'),
         sky.Resources(cloud=clouds.AWS(), instance_type='g6.xlarge'),
@@ -497,4 +509,55 @@ def test_v3_candidate_prefilter_rejects_exact_non_aws_override(monkeypatch):
     _install_v3(monkeypatch, mixed_task)
     assert system_oom_recovery.resolve_requested_authorization_v3(
         mixed_task, service_name=_SERVICE_NAME,
-        service_hash=_SERVICE_HASH) is not None
+        service_hash=_SERVICE_HASH) is None
+
+    provider_unset_task = _v3_task()
+    provider_unset_task.set_resources(
+        sky.Resources(instance_type='g6.xlarge',
+                      region='us-east-1',
+                      zone='us-east-1a',
+                      use_spot=False))
+    _install_v3(monkeypatch, provider_unset_task)
+    assert system_oom_recovery.resolve_requested_authorization_v3(
+        provider_unset_task,
+        service_name=_SERVICE_NAME,
+        service_hash=_SERVICE_HASH) is None
+
+    stale_multivalue_task = _v3_task()
+    stale_multivalue_authorization = _v3_authorization(stale_multivalue_task)
+    stale_resource_envelope = stale_multivalue_authorization[
+        'resource_envelope']
+    assert isinstance(stale_resource_envelope, dict)
+    stale_resource_envelope['allowed_market_types'] = ['on_demand', 'spot']
+    _install_profiles(monkeypatch, 3, stale_multivalue_authorization)
+    assert system_oom_recovery.resolve_requested_authorization_v3(
+        stale_multivalue_task,
+        service_name=_SERVICE_NAME,
+        service_hash=_SERVICE_HASH) is None
+
+    for stale_resource in (sky.Resources(cloud=clouds.AWS(),
+                                         instance_type='g5.xlarge',
+                                         region='us-east-1',
+                                         zone='us-east-1a',
+                                         use_spot=False),
+                           sky.Resources(cloud=clouds.AWS(),
+                                         instance_type='g6.xlarge',
+                                         region='us-west-2',
+                                         zone='us-west-2a',
+                                         use_spot=False),
+                           sky.Resources(cloud=clouds.AWS(),
+                                         instance_type='g6.xlarge',
+                                         region='us-east-1',
+                                         zone='us-east-1b',
+                                         use_spot=False),
+                           sky.Resources(cloud=clouds.AWS(),
+                                         instance_type='g6.xlarge',
+                                         region='us-east-1',
+                                         zone='us-east-1a',
+                                         use_spot=True)):
+        stale_task = _v3_task()
+        stale_task.set_resources(stale_resource)
+        _install_v3(monkeypatch, stale_task)
+        assert system_oom_recovery.resolve_requested_authorization_v3(
+            stale_task, service_name=_SERVICE_NAME,
+            service_hash=_SERVICE_HASH) is None

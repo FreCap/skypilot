@@ -4,8 +4,14 @@ _Status: #1182 is merged; exact release 1.1.1061 was dark-deployed and then
 superseded by observed descendant releases 1.1.1064 and 1.1.1067, the latter
 from exact release source `7deb033019c322c844f205c1e26d0d6f703df9df`.
 Repository-wide required CI, including the real-PostgreSQL suites and exact
-paid-capacity retry, passed, and the external control-plane endpoint now
-repeatedly reports both healthy status and the exact 1.1.1067 identity.
+paid-capacity retry, passed. Production Helm revision 318 now runs that exact
+1.1.1067 image with `Recreate` strategy and the metrics listener on port 9090.
+The revision-318 audit found recovery authorization absent, the central Serve
+database PostgreSQL-backed and at head when the server-selection marker is set,
+the separate API-request backend still SQLite, all 5,195 persisted replica rows
+across seven services `ORDINARY` with zero quarantine, and `boltz-l4-fleet`
+version 50 `READY`. The exact Datadog scrape is healthy; zero recovery-counter
+samples are expected until the first counter label is instantiated.
 Platform #7732 reconciled the Git/Terraform desired-state pin, but it ran no
 Helm/Terragrunt apply and did not complete the live workload audit. Its
 post-merge test-fleet update passed the exact client-pin and authenticated
@@ -13,19 +19,24 @@ healthy-server guard plus dry-run, then observed no committed successor version
 because configured `aws/eu-central-2` was rejected during placement validation.
 Platform #7779 merged the narrow placement-matrix correction. Its post-merge
 workflow then committed and elected test-service version 43 in an intentional
-zero-demand state without changing the endpoint.
-No profile was intentionally configured by the recorded rollout, but only
-direct omission of the authorization variable was observed on the inspected
-revision-310 API deployment. Complete absence was not established; 1.1.1067
-must be audited and production activation remains blocked. Published releases
-1.1.1068 through 1.1.1073 have not been observed live or qualified for this
-rollout. The restacked #1183 steady-state removal remains draft and blocked on
-all seven removal gates._
+zero-demand state without changing the endpoint. Platform #7788 subsequently
+merged as `5b46ef6`; it does not close an OOM-recovery rollout or removal gate.
+Revision 318 incurred a separately explained approximately 106-second API gap:
+about 60 seconds waiting for the logrotate shutdown hold plus about 40 seconds
+of API startup. It is not retroactively grouped with the five earlier rollout-
+correlated HTTP-503 windows. Authorization-v3 activation is limited to
+dedicated canonical AWS-only canaries; the unchanged mixed production task is
+structurally ineligible and requires a future authorization-v4 migration.
+Published releases 1.1.1068 through 1.1.1078 have not been qualified for this
+rollout. #1246 fixes the observed logrotate-sidecar shutdown hold, and #1247
+adds complete split-role metrics serving; both are present in published exact
+release 1.1.1078 but have not yet been deployed. The restacked #1183 steady-
+state removal remains draft and blocked on all seven removal gates._
 
 _Last updated: 2026-08-03_
 
 _Design baseline: `origin/improvements` at
-`1bd4fa24146c60ec3c9d972d21ec845afefbc5d7`_
+`d5b1ea56cff198604ef2f89479bd9b6d6b11e8a8`_
 
 ## Context and decision
 
@@ -125,7 +136,7 @@ header, application contract, cloud authority, or public API.
 
 ## Behavior contract
 
-### Per-job eligibility in the mixed fleet
+### Per-job eligibility and the current mixed-fleet boundary
 
 The service itself remains on legacy lifecycle authority. Before launch, the
 controller may resolve one authorization-v3 entry against the service
@@ -137,11 +148,13 @@ lease and makes the final actual-result decision after the post-policy task and
 successful handle exist. Recovery is armed only when all of the following are
 true:
 
-An exact pre-policy resource override that excludes AWS (for example, an
-explicit GCP/Kubernetes/Slurm-only launch) never creates a candidate intent.
-It follows ordinary lifecycle immediately. Mixed-provider resources that still
-permit AWS remain candidates because their final provider is not yet known;
-backend rejection is resolved by the bounded protocol below.
+Only a task with exactly one pre-policy resource can create a v3 candidate.
+That resource must explicitly name AWS and its instance type, region, zone, and
+`use_spot` value must exactly equal the authorization's singleton envelope.
+Provider-unset, mixed-provider, multi-resource, fallback, partially placed, or
+mismatched tasks never create a candidate intent and follow ordinary lifecycle
+immediately. The same restriction is enforced again by the production matcher,
+so a stale installed document cannot widen candidacy.
 
 - the workload is a non-pool SkyServe service launched through the existing
   `CloudVmRayBackend` path on one dedicated Linux VM;
@@ -184,17 +197,23 @@ backend rejection is resolved by the bounded protocol below.
   2, which publishes `subreaper-v2+owned-local-docker-v1` for the exact
   original attempt.
 
-The live `boltz-l4-fleet` task remains representable without a service split:
+The unchanged live `boltz-l4-fleet` task is **not** representable by
+authorization v3. Its Kubernetes alternative carries task-level
+`container_image`, which makes the complete pre-policy task ineligible before
+provider selection, including for an eventual AWS result. Its provider-
+conditional 358-line shell is also not the byte-exact canonical render of one
+`OwnedContainerSpec`. Installing a hand-authored v3 profile cannot override
+either check; every current fleet replica remains ordinary. Earlier revisions
+of this design incorrectly claimed that v3 could activate only the AWS subset
+without a service split. That rollout claim is withdrawn.
 
-- a fresh AWS 16-GiB Spot replica may be recovery-capable after the Spot gates;
-- a dedicated fresh AWS 16-GiB on-demand canary may be recovery-capable for the
-  deterministic initial safety smoke;
-- GCP, Kubernetes, a larger VM, an unsupported provider, or any mismatched actual
-  result receives an unarmed/ordinary job and current replacement behavior;
-  and
-- a failed candidate followed by another provider/result cannot reuse the
-  first attempt's consumed fresh-provision proof. The final actual result must
-  independently match the authorization-v3 envelope.
+V3 activation is now limited to dedicated, canonical, AWS-only canary
+services: one on-demand canary for the deterministic safety sequence and one
+Spot canary for Spot recovery plus the termination race. A failed canary
+candidate followed by another result cannot reuse the first attempt's consumed
+fresh-provision proof. Supporting provider-resolved typed execution for the
+unchanged mixed fleet requires a separately designed authorization-v4/task-
+representation migration; it is not inferred or added by this initiative.
 
 Production uses authorization document v3. Shipped authorization documents v1
 and v2 remain transition readers only until draft #1183; runtime profile 2,
@@ -262,10 +281,15 @@ consider generating one runtime-profile-2 plan. GCP cannot be added without a
 new authorization-document version or an exact v3-compatible
 immutable-identity extension reviewed before rollout.
 
-The document cannot name an EC2 instance before provisioning. Its AWS account
-list, location list, each location's availability-zone list, and instance-type
-list are nonempty, duplicate-free, and canonical-sorted. Region/AZ authorization
-is by an exact pair from one location entry, never an independent cross-product.
+The underlying v3 reader retains its closed list-shaped schema for already
+shipped documents, but this bootstrap and production candidate contract use a
+strict singleton subset: exactly one AWS account, one location containing one
+region and one availability zone, one market, and one instance type. The
+single pre-policy resource must explicitly match the same instance type,
+region, zone, and `use_spot` market, so these dedicated canaries have no
+optimizer/provider/shape/location/market fallback. The configured account must
+equal the active AWS identity resolved inside the target workspace. The
+document cannot name an EC2 instance before provisioning.
 After the actual result exists, the backend verifies immutable EC2 instance ID,
 AWS account, region, availability zone, market, instance type, and resolved
 catalog memory against those exact allowlists and the authorization. The
@@ -278,6 +302,72 @@ provider, market, and profile-version values. Service/job/request/session,
 account, instance, location, and free-form evidence values remain in their
 existing owner-fenced state or provider records; they are not copied into this
 new log, metric labels, or user-visible output.
+
+Authorization bootstrap is fail closed and is not performed by hand. It is
+scoped only to a dedicated canonical AWS-only canary; any resource alternative
+without an explicit AWS provider, any generic outer `container_image`, or any
+noncanonical provider-conditional shell is rejected. An
+internal API-server-side command requires a configured central database URI.
+Its supported invocation is the installed, standard-library-only top-level
+module `python -m skypilot_serve_system_oom_recovery_authorization`; invoking
+the implementation as `python -m sky.serve...` is unsupported because Python
+imports `sky/__init__.py` before that submodule can establish the trust
+boundary. The top-level entrypoint sets the process-local server-selection
+marker and forces read-only schema-revision verification before the first
+`sky` import, including API-server configuration loading. Configuration-schema
+initialization honors that same `verify` mode. It redirects Python streams,
+process stdout/stderr descriptors, and logging across the complete import and
+operation, restores the descriptors only after a closed result exists, and
+then proves that the selected central Serve database is PostgreSQL; the URI is
+never printed and bootstrap cannot run an automatic migration. A single
+read-only SELECT joins the durable service incarnation and elected committed
+version to its immutable service spec and effective task YAML and counts
+replica rows.
+This is one statement-consistent result, not a transaction spanning later
+operator review or configuration installation; validation re-runs the SELECT
+immediately before installation.
+The command accepts only a non-pool, legacy-mode
+service whose elected spec has `min_replicas: 0`, whose durable status is
+`NO_REPLICA`, and whose replica table is empty. The command builds the same
+pre-policy replica task as the controller, including the server-assigned
+replica-ID normalization and controller-owned TLS/security-group mutations. It
+never accepts a caller-supplied service hash, task digest, runtime-image digest,
+owned-container digest, or execution-envelope digest.
+
+The operator supplies only the profile ID and the singleton closed AWS
+allowance: one account ID, one region/AZ pair, one market, and one instance
+type. Generation and validation enter the target workspace before resolving
+the active AWS identity or consulting the catalog. The command requires the
+account to equal that identity, requires the exact task resource to match the
+singleton placement/market envelope, rejects an instance type whose catalog
+memory is unknown, non-positive, or above 16 GiB, and verifies the exact
+type/location/market offering against the AWS catalog. It then constructs the
+typed authorization-v3 object, emits sorted-key compact
+ASCII JSON, reparses those exact bytes with the production v3 document parser,
+and proves a complete owner-fenced v3 launch context matches through the
+production trusted-profile matcher. Validation rejects noncanonical JSON,
+stale service incarnation/task/profile identity, malformed or non-v3 documents,
+and any envelope that no longer satisfies the AWS <=16-GiB checks.
+
+Successful output necessarily contains the reviewed service/profile identity,
+digests, resource envelope, and `OwnedContainerSpec`, including its image,
+create options, argv, and inherited environment names. It does not emit the
+complete task YAML or environment values. Untyped literals hard-coded in argv
+cannot be classified as secrets by this mechanism and must be caught during
+review, except that the bootstrap process separately knows and semantically
+rejects its configured database URI anywhere in the parsed document. For typed
+task secrets, bootstrap traverses every parsed JSON string leaf and key
+semantically and rejects any secret substring, so JSON escaping of quotes,
+backslashes, newlines, or non-ASCII cannot bypass the check. Managed-secret
+references remain ineligible. During bootstrap, internal builder,
+parser, identity, and catalog logging/stdout/stderr are suppressed. Success
+emits only canonical JSON (or the canonical validation receipt); failure emits
+only a stable value-free error, including for parse-time invalid arguments,
+and never the database URI, rejected argument, rejected document,
+task/YAML/environment values, credentials, or exception cause. The generated
+document is configuration input only: the command does not mutate PostgreSQL,
+install the environment variable, scale the service, launch a replica, or
+activate recovery.
 
 The task digest is the SHA-256 of canonical sorted-key compact JSON produced
 from the effective task's redacted YAML form after removing only `name`,
@@ -715,8 +805,8 @@ cannot make it early. At or after both gates, one new readiness probe begun
 after the persisted deadline and monotonic guard must succeed, and the same
 reconciliation cycle must re-read the exact job as nonterminal plus recovery
 detail `ABSENT`. Only that conjunction atomically persists `ORDINARY` and
-releases a mixed-fleet GCP, Kubernetes, larger AWS, or other backend rejection
-to current behavior. Because the driver's captured arm-window start precedes
+releases a post-policy or actual-result admission rejection to current
+ordinary behavior. Because the driver's captured arm-window start precedes
 original task submission and successful application readiness, the combined
 controller hold cannot finish before the driver's fixed arm deadline. A prior
 `ABSENT` followed by any late valid `PRESENT` phase therefore becomes
@@ -730,9 +820,9 @@ does not tear down an application that already proved ready. Ordinary
 post-ready consecutive-failure handling continues during the hold. A
 `MALFORMED` or `UNSPECIFIED` candidate remains off-route and schedules/adopts
 legacy teardown; neither status can release to ordinary. Missing request/job
-association does the same. Exact pre-launch non-AWS overrides skipped
-candidacy entirely, so they incur no arm-resolution hold. No latest-job lookup
-is permitted.
+association does the same. Provider-unset, mixed-provider, fallback,
+multi-resource, and stale-placement tasks skipped candidacy entirely, so they
+incur no arm-resolution hold. No latest-job lookup is permitted.
 
 At controller startup, only a previously persisted `CAPABLE` row enters the
 recovery-specific forced-off-route 35-second exact-status barrier. An unresolved
@@ -1160,7 +1250,8 @@ candidate authorization-v3 intent -> ordinary legacy launch request ID
   -> exact service job ID -> driver cgroup total <=16 GiB
   -> runtime-profile-2 capability-v2 ARMED -> CAPABLE -> application READY
 
-mixed candidate -> backend generates ordinary job -> first ready stays off-route
+stale/mismatched exact-AWS candidate -> backend generates ordinary job
+  -> first ready stays off-route
   -> persisted ready+35-second release deadline -> fresh post-deadline ready
   -> exact nonterminal status + exact ABSENT re-read -> ORDINARY -> route
 
@@ -1246,8 +1337,10 @@ claim, request, provider journal, or absence inference.
   port replacement exists while any conforming old-route lease or lease-
   admitted transport attempt can remain live.
 - Ambiguous supervisor/container cleanup is failure, not permission to replay.
-- GCP/Kubernetes/Slurm, unsupported providers, and nonmatching AWS jobs remain
-  ordinary within the same mixed-provider service.
+- The unchanged mixed-provider production service, including all of its AWS,
+  GCP, and Kubernetes results, remains ordinary because its complete task is
+  not authorization-v3 representable. Dedicated AWS-only canaries alone may
+  enter v3 candidacy.
 - Controllers that do not share the API server's central PostgreSQL Serve state
   or do not enforce the existing durable launch fence remain ordinary and never
   send a recovery context.
@@ -1376,11 +1469,35 @@ Merge gates include reducer property tables, version-12/13 serialization,
 intent/request-ID/job-ID owner fencing, exact request-result recovery with no
 latest-job fallback, candidate-to-ordinary/capable reduction, controller
 restart, launch-result/teardown races, legacy cleanup adoption, mixed
-AWS/GCP/Kubernetes eligibility, fail-closed GCP identity, on-demand/Spot
+AWS/GCP/Kubernetes and provider-unset v3 rejection, fail-closed GCP identity,
+on-demand/Spot
 classification, unchanged API-v1/marker-v2 schemas, old/new gRPC/SSH
 combinations, fresh probe fencing, and proof that existing legacy
 request/provider semantics are unchanged. It deploys with the server
 authorization document absent.
+
+### PR 2a / #1248: authorization-v3 bootstrap and AWS-only canary hardening
+
+_[PR #1248](https://github.com/boltz-bio/skypilot/pull/1248), submitted for
+review and pre-deployment validation._
+
+This implementation adds the internal generator/validator used by rollout
+steps 3 and 4. It reads one statement-consistent elected-service snapshot from
+the central PostgreSQL Serve database, reconstructs the controller's exact
+pre-policy replica task, binds the active AWS account and singleton catalog
+offering inside the target workspace, derives every digest through the
+production implementations, and round-trips the canonical bytes through the
+production v3 parser and matcher. It also makes the production candidate
+resolver enforce the same explicit singleton AWS resource, placement, market,
+and instance-type contract, so an installed stale document cannot make a
+provider-unset, mixed, fallback, or differently placed task a candidate.
+
+The command is read-only and forces schema verification; it does not install
+authorization, update the service, create a replica, or mutate PostgreSQL.
+Only dedicated zero-replica canaries may pass its gates. The rollout still
+installs reviewed canonical output through the owning platform configuration,
+and #1183 remains the already-authored removal PR for the deprecated v1/v2
+readers and other transition paths.
 
 ### PR 3 / #1183: `[Serve] Remove deprecated direct-shell OOM recovery`
 
@@ -1545,14 +1662,17 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    workload restart/replacement occurred remain unknown. Continuous external
    probes remained HTTP 200 through the 1.1.1067 desired-state merge below.
 
-   Releases `1.1.1068` through `1.1.1073`, ending at
-   `1bd4fa24146c60ec3c9d972d21ec845afefbc5d7`, were fully published but were
+   Releases `1.1.1068` through `1.1.1078`, ending at
+   `d5b1ea56cff198604ef2f89479bd9b6d6b11e8a8`, were fully published but were
    not observed live and were not adopted by this rollout. 1.1.1068 and
    1.1.1070 change shared Skylet tunnel/channel metadata used indirectly by
    recovery submissions and need separate test-cluster qualification; 1.1.1069
    is a dashboard refresh-ownership fix; 1.1.1071 through 1.1.1073 are managed-
    job filtering, shutdown-fanout, Python-floor, and Batch facade/cleanup
-   corrections. The 1.1.1067 source change instead keeps its probe-persistence
+   corrections. Exact release 1.1.1078 additionally contains #1246's
+   interruptible logrotate-sidecar shutdown and #1247's split-role metrics
+   lifecycle. Neither changes recovery authorization or closes a canary gate.
+   The 1.1.1067 source change instead keeps its probe-persistence
    optimization default-off/unset and explicitly preserves typed recovery,
    quarantine, teardown, and route-suspension writes; the OOM classifier,
    profile, budget, and recovery modules are unchanged.
@@ -1626,31 +1746,48 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    independently confirms that 1.1.1067 remains the live control-plane release;
    it does not establish the unaudited Helm workload/configuration state.
 
-   Expired hub SSO still leaves the current 1.1.1067 Helm revision/chart,
-   workload/init/load-balancer digests, rendered values, schema and migration
-   state, workload readiness/restarts, recovery-authorization absence,
-   port-4517 absence, and rollout actor unverified. The revision-310 direct
-   authorization-variable omission must not be inherited by either later
-   release. Before any step-2 validation or activation, audit the current
-   1.1.1067 rendered configuration, secret/config sources, and live API/
-   controller environment and prove recovery authorization is absent.
+   Platform #7788 subsequently merged as `5b46ef6`. Production Helm revision
+   318 was then inspected directly: it runs the exact 1.1.1067 image under
+   `Recreate`, exposes the intended metrics listener on port 9090, and has no
+   recovery-authorization variable. With `IS_SKYPILOT_SERVER` set before lazy
+   state initialization, the central Serve database is PostgreSQL and at the
+   expected schema head; the separate API-request backend remains SQLite and
+   is not an authorization-bootstrap source. The complete persistence audit
+   counted 5,195 replica rows across seven services, all `ORDINARY`, with zero
+   quarantined version rows; `boltz-l4-fleet` version 50 was `READY`. Datadog's
+   exact scrape target is healthy. Its recovery-counter query has zero samples
+   because no counter label exists before the first event, not because scraping
+   is broken.
+
+   Revision 318 also produced an approximately 106-second externally observed
+   API gap. Deployment timing accounts separately for about 60 seconds in the
+   logrotate shutdown hold and about 40 seconds of API startup. Record this as
+   a revision-318 replacement/startup gap, not a sixth member of the five
+   earlier rollout-correlated windows. This direct audit closes current-release
+   authorization absence and the present all-row ordinary/quarantine count; it
+   does not complete the LB process/runtime inventory, canary authorization,
+   OOM/preemption smoke, rollback, or compatibility-duration gates.
 2. Inventory every live external-LB process that can make a replica-bound
    choice, including ACTIVE, STANDBY, DRAINING, terminating, and processes with
    already-admitted retry handlers. Prove each runs the v1 route-token/lease
    reader, per-attempt role/drain fence, and atomic client checkout, and that the
    authenticated lease heartbeat is healthy through the stable API proxy.
-   After the current release passes the complete authorization-absence audit,
-   inject a synthetic marked route in the test fleet and prove no process
+   Revision 318 has passed the current authorization-absence audit. Inject a
+   synthetic marked route in the test fleet and prove no process
    selects it without a fresh exact token lease. Terminate and drain every old
    or uninventoryable process before proceeding. Only then verify all API/
    controllers and candidate images expose supervisor-marker-v2, controller-
    contract-v2, and job-detail-v1. Existing replicas remain ordinary;
    authorization affects only newly launched jobs.
-3. Install an exact authorization-v3 entry for a dedicated fresh AWS on-demand
-   16-GB canary through the owning deployment configuration.
-   Replace only that canary replica and run first-OOM same-machine recovery,
-   second-OOM legacy teardown/replacement, controller restart, and
-   authorization-removal rollback with Ray's threshold unchanged.
+3. While the dedicated canary is durably `min_replicas: 0`/`NO_REPLICA` with
+   no replica rows, run the internal bootstrap generator in the API-server
+   environment and review its canonical authorization-v3 output. Revalidate
+   the exact bytes against the same durable incarnation immediately before
+   installing the entry through the owning deployment configuration. Then
+   replace only that canary with a fresh AWS on-demand 16-GB replica.
+   Run first-OOM same-machine recovery, second-OOM legacy teardown/replacement,
+   controller restart, and authorization-removal rollback with Ray's threshold
+   unchanged.
 4. Install a separate exact AWS Spot 16-GB authorization-v3 entry. Verify the
    legacy launch remains Spot with its existing no-on-demand-fallback
    configuration and run first/second OOM. For the terminal-loss race, invoke
@@ -1658,23 +1795,25 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    inducing the OOM; after the existing liveness path has durably recorded
    preemption/down, prove no reducer transition or probe can route/recover it
    and legacy replacement wins. This test makes no early-notice claim.
-5. Enable the reviewed production authorization only for newly launched AWS
-   Spot 16-GB replicas in `boltz-l4-fleet`. GCP, Kubernetes, larger AWS, and
-   any fallback/mismatch must persist `ORDINARY` without entering the CAPABLE
-   startup barrier. No service split or authority-mode change occurs.
-6. Complete one inventoried eligible AWS Spot fleet rollout. Start #1183's
-   seven-day clock only after every eligible process/replica is on the approved
-   digest and the last authorization-document-v1/v2, runtime-marker-v1, and
-   status-only reader is drained. #1183 stays draft.
+5. Keep `boltz-l4-fleet` authorization absent and prove its AWS, GCP, and
+   Kubernetes launches remain `ORDINARY`. Do not hand-author a v3 document for
+   it: task-wide outer-container and noncanonical-shell checks make the current
+   task ineligible. Any provider-resolved typed execution/auth-v4 initiative
+   requires its own canonical design, migration, and stacked cleanup PRs.
+6. Complete one inventoried rollout of the dedicated AWS-only Spot canary
+   cohort. Start #1183's seven-day clock only after every eligible canary
+   process/replica is on the approved digest and the last authorization-
+   document-v1/v2, runtime-marker-v1, and status-only reader is drained. The
+   mixed production fleet remains ordinary and #1183 stays draft.
 
-The initial dark rollout, all five externally observed HTTP-503 windows, #7725
-and #7732 Git desired-state reconciliations, the run-30785990709 placement-
-validation failure, #7779 correction, and both successful zero-replica test-
-fleet workflows do not advance steps 2-6. Current-release authorization re-
-audit, external-LB process and route-lease inventory, exact eligible-image
-inventory, on-demand and Spot authorization activation, both real OOM
-sequences, the provider-termination race, production Spot rollout, rollback/
-re-upgrade, and the seven-day removal clock all remain open.
+The initial dark rollout, all five earlier externally observed HTTP-503
+windows, #7725/#7732 desired-state reconciliations, run-30785990709 placement
+failure, #7779 correction, #7788 merge, both successful zero-replica test-fleet
+workflows, and revision-318 audit do not advance steps 2-6. External-LB process
+and route-lease inventory, exact eligible-image inventory, dedicated on-demand
+and Spot canary activation, both real OOM sequences, the provider-termination
+race, canary-cohort rollout, rollback/re-upgrade, and the seven-day removal
+clock all remain open.
 
 Rollback requires no public endpoint or security-group change, but the v1 LB
 lease reader and controller heartbeat must remain deployed until recovery state
@@ -1714,6 +1853,32 @@ action evidence, because this feature creates none.
 
 ### Runtime and driver
 
+- Authorization-bootstrap tests start with only a configured database URI in
+  a fresh process through the top-level pre-import entrypoint and instrument
+  the first `sky` import to prove the command sets `IS_SKYPILOT_SERVER` and
+  forces migration mode `verify` first. They run with `SKYPILOT_DEBUG=1` and
+  inject Python-stream, raw-file-descriptor, and logging noise during both
+  import and operation, proving that only the closed result escapes.
+  Separate fail-closed cases reject a missing URI or non-PostgreSQL selection,
+  restore the inherited environment, and never print the URI. A PostgreSQL
+  statement counter proves the elected incarnation/version/spec/YAML and
+  replica count come from exactly one SELECT. The shared controller task
+  builder produces the pre-policy replica task; in-process CLI generation and
+  validation-receipt tests prove generated canonical bytes round-trip through
+  the production v3 parser and complete owner-fenced matcher. Negative cases
+  cover an unelected, stale, noncanonical, nonzero-
+  replica, non-legacy, pool, mixed-provider, provider-unset, outer-container,
+  or provider-conditional task; non-singleton or task-mismatched account/
+  region/AZ/market/type envelopes; wrong-workspace or wrong-account identity;
+  malformed envelopes; unknown or greater-than-16-GiB memory; and a missing
+  exact AWS catalog offering. Parametrized typed secrets containing quotes,
+  backslashes, newlines, and non-ASCII plus a secret matching a JSON key prove
+  semantic parsed-JSON traversal, not serialized-byte matching. A real shared-
+  builder/catalog failure test, including logging above `CRITICAL`, proves
+  internal stdout/stderr/logging is suppressed; fresh-process selection and
+  parse-time argument failures prove the CLI emits only canonical success
+  bytes or stable value-free errors. Successful output is allowed to contain
+  the reviewed `OwnedContainerSpec` argv.
 - Generated-code tests prove the recovery closure appears only for the exact
   internal intent + consumed fresh AWS evidence, catches only Ray OOM, sets
   `max_retries=0`, creates one new ObjectRef, and makes no API/cloud call.
@@ -1783,9 +1948,9 @@ action evidence, because this feature creates none.
   states; and only a fresh post-deadline ready probe plus same-cycle
   nonterminal/`ABSENT` re-read persists `ORDINARY`. Forward/backward wall-clock
   jumps and controller restart cannot satisfy the process-monotonic guard
-  early. `MALFORMED`/`UNSPECIFIED` schedule teardown. Exact non-AWS overrides
-  bypass candidacy, while mixed-fleet GCP/Kubernetes/larger-AWS results use the
-  bounded release protocol and never enter the CAPABLE startup barrier. A
+  early. `MALFORMED`/`UNSPECIFIED` schedule teardown. Non-AWS, provider-unset,
+  mixed-provider, fallback, multi-resource, and stale singleton-placement tasks
+  fail the production v3 matcher before candidacy and remain ordinary. A
   low-initial-delay candidate that succeeds before its application deadline
   remains alive but off-route through the bounded admission hold.
 - Topology tests prove a non-consolidated/local-state controller and any
@@ -2001,13 +2166,19 @@ authority.
   replica results exercised no live replica or probe. A parallel 40-sample
   external monitor from 16:15:33 through 16:35:09 UTC
   observed only HTTP 200 responses, continuously healthy plain status, and
-  unchanged exact 1.1.1067/`7deb033019c`/API-69/build-8449 identity. No recovery
-  authorization was intentionally activated by these recorded rollout steps,
-  but only direct variable omission was observed on the inspected revision-310
-  API deployment. Complete absence was not established and must be audited on
-  1.1.1067. No real AWS OOM injection or provider-termination race has been
-  performed. The deep deployment and state inventories, both 16-GB cloud smoke
-  sequences, rollback/re-upgrade exercise, and seven continuous UTC days of
+  unchanged exact 1.1.1067/`7deb033019c`/API-69/build-8449 identity. Platform
+  #7788 later merged as `5b46ef6`. Direct revision-318 evidence now proves the
+  exact 1.1.1067 image, `Recreate`, metrics port 9090, authorization absence,
+  central Serve PostgreSQL/head selection under `IS_SKYPILOT_SERVER`, the
+  separate SQLite API-request backend, 5,195/5,195 `ORDINARY` replica rows
+  across seven services, zero quarantine, and fleet version 50 `READY`.
+  Datadog's exact scrape is healthy and has zero recovery-counter samples only
+  because no label has yet been instantiated. Its separately recorded
+  approximately 106-second replacement gap consists of the 60-second logrotate
+  hold plus roughly 40 seconds of startup and is not grouped with the five
+  earlier rollout-correlated windows. No real AWS OOM injection or provider-
+  termination race has been performed. LB runtime inventory, both 16-GB cloud
+  smoke sequences, rollback/re-upgrade, and seven continuous UTC days of
   compatibility telemetry remain blocking evidence below.
 
 ## PR 3 removal gates
@@ -2015,14 +2186,16 @@ authority.
 #1183 may merge only after all seven gates are true and exact evidence is
 recorded here and in both stacked PR descriptions:
 
-The initial 1.1.1061 dark deployment, all five externally observed HTTP-503
-windows, #7725 and #7732 Git desired-state reconciliations, the later run-
-30785990709 placement-validation failure, #7779 correction, and both successful
-zero-replica workflows close none of these removal gates, and #1183 remains
-draft. The revision-310 direct authorization-variable observation is only
-partial input to gate 2 and the complete audit must be performed on 1.1.1067;
-the all-row audit (gate 1), complete configuration/
-source audit (gate 2), live eligible-runtime inventory (gate 3),
+The initial 1.1.1061 dark deployment, all five earlier externally observed
+HTTP-503 windows, #7725 and #7732 Git desired-state reconciliations, the later
+run-30785990709 placement-validation failure, #7779 correction, #7788 merge,
+both successful zero-replica workflows, and revision-318 audit do not complete
+any removal gate, and #1183 remains draft. Revision 318 establishes current
+authorization absence and an all-ordinary/zero-quarantine state count, but gate
+1 additionally requires every ambiguity and compatibility shape below and gate
+2 includes every rendered/config/runtime source. The all-row audit (gate 1),
+complete configuration/source audit (gate 2), live eligible-runtime inventory
+(gate 3),
 seven-day telemetry window (gate 4), two-pass marker inventory (gate 5), real
 on-demand/Spot smoke matrix (gate 6), and rollback/re-upgrade proof (gate 7)
 all remain open.
@@ -2043,7 +2216,8 @@ all remain open.
    controller/job-detail/Skylet/library versions and emits only controller
    contract 2 plus unchanged `JOB_SYSTEM_RECOVERY_API_VERSION == 1` and runtime
    profile/marker capability v2. No status-only eligible runtime remains.
-4. From completion of one full eligible AWS Spot fleet rollout, compatibility
+4. From completion of one full eligible AWS-only Spot canary-cohort rollout,
+   compatibility
    telemetry reports zero authorization-document-v1/v2 selection,
    exact runtime-capability-v1 observation, and status-only recovery read for
    seven continuous 24-hour periods. Any hit or eligible image change resets
@@ -2059,8 +2233,9 @@ all remain open.
    cleanup receipt is never inferred as evidence. Both timestamped inventories
    and every per-target result are attached to the PR evidence. Age pruning
    alone is not evidence.
-6. Both real 16-GB authorization-v3/runtime-profile-2/supervisor-v2 smoke
-   sequences pass with the Ray threshold unchanged: on-demand first-OOM
+6. Both real dedicated AWS-only 16-GB authorization-v3/runtime-profile-2/
+   supervisor-v2 smoke sequences pass with the Ray threshold unchanged:
+   on-demand first-OOM
    recovery plus second-OOM legacy replacement, and Spot OOM recovery plus the
    exact `TerminateInstances`/OOM race where, from durable preemption/down
    observation onward, legacy replacement wins. GCP and Kubernetes negative
@@ -2074,15 +2249,26 @@ all remain open.
 
 ## Open gates and unresolved decisions
 
+- The unchanged `boltz-l4-fleet` task cannot activate authorization v3: one
+  Kubernetes alternative's outer `container_image` makes eligibility fail
+  task-wide, and the provider-conditional shell cannot equal one canonical
+  `OwnedContainerSpec`. Production activation is therefore out of scope for
+  v3. A future provider-resolved typed execution/authorization-v4 migration
+  must define its own public contract, mixed-provider policy boundary, rollout,
+  rollback, and stacked removal change before implementation.
+
 - Identify the owner and trigger for the out-of-band production release
   advances to 1.1.1064 and 1.1.1067. Repository workflows publish immutable
   artifacts and update only the test fleet; none owns the production Helm
   release. Separately determine the causes of the five externally observed
-  HTTP-503 windows rather than inferring that every window was a rollout or
-  workload restart. Before another production upgrade, establish one deployment
-  authority, compare desired and live identity, and coalesce superseded releases
-  through a reviewed quiet-window policy. This operational gate does not
-  authorize an ad hoc Helm/Terragrunt apply from this design.
+  rollout-correlated HTTP-503 windows rather than inferring that every window
+  was a workload restart. Revision 318's approximately 106-second gap is
+  separately attributed to the 60-second logrotate hold plus roughly 40-second
+  startup and is not evidence about those five earlier windows. Before another
+  production upgrade, establish one deployment authority, compare desired and
+  live identity, and coalesce superseded releases through a reviewed quiet-
+  window policy. This operational gate does not authorize an ad hoc Helm/
+  Terragrunt apply from this design.
 - Freeze the exact on-demand and Spot 16-GB instance types and actual-memory
   observation used by the server authorization. A catalog-only `memory` hint
   is not sufficient if runtime reports more than 16 GB.

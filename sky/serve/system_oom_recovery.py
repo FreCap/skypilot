@@ -489,17 +489,27 @@ def _uses_generic_container_image(task: task_lib.Task) -> bool:
     return False
 
 
-def _prepolicy_task_excludes_aws(task: task_lib.Task) -> bool:
+def _matches_singleton_aws_authorization_resource(
+        task: task_lib.Task, envelope: AWSRecoveryResourceEnvelope) -> bool:
+    """Match the exact no-fallback pre-policy resource allowed by v3."""
     resources = tuple(task.resources)
-    if not resources:
+    if (len(resources) != 1 or len(envelope.allowed_aws_account_ids) != 1 or
+            len(envelope.allowed_locations) != 1 or
+            len(envelope.allowed_market_types) != 1 or
+            len(envelope.allowed_instance_types) != 1):
         return False
-    for resource in resources:
-        cloud = resource.cloud
-        if cloud is None:
-            return False
-        if cloud.canonical_name() == 'aws':
-            return False
-    return True
+    location = envelope.allowed_locations[0]
+    if len(location.availability_zones) != 1:
+        return False
+    resource = resources[0]
+    cloud = resource.cloud
+    market_type = envelope.allowed_market_types[0]
+    return (cloud is not None and cloud.canonical_name() == 'aws' and
+            resource.instance_type == envelope.allowed_instance_types[0] and
+            resource.region == location.region and
+            resource.zone == location.availability_zones[0] and
+            resource.use_spot_specified and
+            resource.use_spot == (market_type == 'spot'))
 
 
 def _docker_run_image_digest(tokens: list[str]) -> str | None:
@@ -740,6 +750,48 @@ def safety_profile_digest(task: task_lib.Task) -> str:
     return hashlib.sha256(_canonical_json(config).encode('utf-8')).hexdigest()
 
 
+def create_authorization_v3(
+    task: task_lib.Task,
+    *,
+    profile_id: str,
+    workspace: str,
+    service_name: str,
+    service_hash: str,
+    resource_envelope: AWSRecoveryResourceEnvelope,
+) -> TrustedRecoveryAuthorizationV3:
+    """Construct one authorization from an exact effective replica task.
+
+    All derived digests come from the same typed implementations used by the
+    production matcher.  Callers cannot provide or override those digests.
+    """
+    if (not isinstance(resource_envelope, AWSRecoveryResourceEnvelope) or
+            not _matches_singleton_aws_authorization_resource(
+                task, resource_envelope) or task.num_nodes != 1 or
+            task.managed_secret_refs or _uses_generic_container_image(task)):
+        raise ValueError('effective task is not eligible for authorization-v3')
+    if not isinstance(task.run, str):
+        raise ValueError('effective run command is not canonical')
+    owned_spec = runtime_recovery.OwnedContainerSpec.parse(task.run)
+    runtime_digest = runtime_image_digest(task)
+    if runtime_digest is None:
+        raise ValueError('effective runtime image is not an immutable digest')
+    _, separator, owned_digest = owned_spec.image.rpartition('@')
+    if not separator or owned_digest != runtime_digest:
+        raise ValueError('owned runtime image does not match effective task')
+    execution_envelope = runtime_recovery.RecoveryExecutionEnvelope.standard()
+    return TrustedRecoveryAuthorizationV3(
+        profile_id=profile_id,
+        workspace=workspace,
+        service_name=service_name,
+        service_hash=service_hash,
+        task_sha256=safety_profile_digest(task),
+        runtime_image_digest=runtime_digest,
+        owned_container_spec=owned_spec,
+        owned_container_spec_sha256=_sha256_json(owned_spec.to_dict()),
+        execution_envelope_sha256=_sha256_json(execution_envelope.to_dict()),
+        resource_envelope=resource_envelope)
+
+
 def _profile_from_dict(value: object,
                        profile_version: int) -> TrustedRecoveryProfile:
     if not isinstance(value, dict):
@@ -838,25 +890,55 @@ def _authorization_v3_from_dict(
             value['resource_envelope']))
 
 
+def parse_authorization_document_v3(
+        raw: str) -> tuple[TrustedRecoveryAuthorizationV3, ...]:
+    """Parse the exact closed authorization-v3 document contract."""
+    if not isinstance(raw, str):
+        raise TypeError('authorization-v3 document must be text')
+    document = json.loads(raw)
+    if (not isinstance(document, dict) or
+            set(document) != {'version', 'profiles'} or
+            type(document['version']) is not int or  # pylint: disable=unidiomatic-typecheck
+            document['version'] != AUTHORIZATION_VERSION_V3
+            or not isinstance(document['profiles'], list)):
+        raise ValueError('authorization-v3 document is invalid')
+    profiles = tuple(
+        _authorization_v3_from_dict(value) for value in document['profiles'])
+    profile_ids = [profile.profile_id for profile in profiles]
+    if len(profile_ids) != len(set(profile_ids)):
+        raise ValueError('profile IDs must be unique')
+    return profiles
+
+
+def canonical_authorization_document_v3(
+        profiles: tuple[TrustedRecoveryAuthorizationV3, ...]) -> str:
+    """Encode nonempty typed profiles as canonical authorization-v3 JSON."""
+    if (not isinstance(profiles, tuple) or not profiles or
+            any(not isinstance(profile, TrustedRecoveryAuthorizationV3)
+                for profile in profiles)):
+        raise ValueError('authorization-v3 profiles must be a nonempty tuple')
+    ordered = tuple(sorted(profiles, key=lambda profile: profile.profile_id))
+    profile_ids = [profile.profile_id for profile in ordered]
+    if len(profile_ids) != len(set(profile_ids)):
+        raise ValueError('profile IDs must be unique')
+    raw = _canonical_json({
+        'version': AUTHORIZATION_VERSION_V3,
+        'profiles': [profile.to_dict() for profile in ordered],
+    })
+    # Keep the encoder and production parser coupled. Any future schema change
+    # that updates only one side makes generation fail instead of emitting an
+    # authorization the server will silently ignore.
+    if parse_authorization_document_v3(raw) != ordered:
+        raise ValueError('authorization-v3 canonical round trip failed')
+    return raw
+
+
 def _load_authorizations_v3() -> tuple[TrustedRecoveryAuthorizationV3, ...]:
     raw = os.environ.get(constants.SYSTEM_OOM_RECOVERY_PROFILES_ENV_VAR)
     if not raw:
         return ()
     try:
-        document = json.loads(raw)
-        if (not isinstance(document, dict) or
-                set(document) != {'version', 'profiles'} or
-                type(document['version']) is not int or  # pylint: disable=unidiomatic-typecheck
-                document['version'] != AUTHORIZATION_VERSION_V3
-                or not isinstance(document['profiles'], list)):
-            raise ValueError('authorization-v3 document is invalid')
-        profiles = tuple(
-            _authorization_v3_from_dict(value)
-            for value in document['profiles'])
-        profile_ids = [profile.profile_id for profile in profiles]
-        if len(profile_ids) != len(set(profile_ids)):
-            raise ValueError('profile IDs must be unique')
-        return profiles
+        return parse_authorization_document_v3(raw)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         logger.warning('Ignoring invalid internal system-OOM recovery '
                        f'authorization-v3 document: {error}')
@@ -963,8 +1045,7 @@ def _resolve_authorization_v3(
     if (not isinstance(service_name, str) or not service_name or
             not isinstance(service_hash, str) or not service_hash or
             task.num_nodes != 1 or task.managed_secret_refs or
-            _uses_generic_container_image(task) or
-            _prepolicy_task_excludes_aws(task)):
+            _uses_generic_container_image(task)):
         return None
     image_digest = runtime_image_digest(task)
     if image_digest is None:
@@ -972,6 +1053,9 @@ def _resolve_authorization_v3(
     task_digest = safety_profile_digest(task)
     workspace = skypilot_config.get_active_workspace()
     for authorization in _load_authorizations_v3():
+        if not _matches_singleton_aws_authorization_resource(
+                task, authorization.resource_envelope):
+            continue
         if (authorization.workspace != workspace or
                 authorization.service_name != service_name or
                 authorization.service_hash != service_hash or

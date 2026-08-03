@@ -895,8 +895,10 @@ def _reload_config_from_internal_file(internal_config_path: str) -> None:
 def _create_table(engine: sqlalchemy.engine.Engine):
     """Initialize the config database with migrations."""
     migration_utils.safe_alembic_upgrade(
-        engine, migration_utils.SKYPILOT_CONFIG_DB_NAME,
-        migration_utils.SKYPILOT_CONFIG_VERSION)
+        engine,
+        migration_utils.SKYPILOT_CONFIG_DB_NAME,
+        migration_utils.SKYPILOT_CONFIG_VERSION,
+        mode=migration_utils.configured_migration_mode())
 
 
 # We only store config in the DB when using Postgres,

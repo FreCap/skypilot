@@ -146,6 +146,108 @@ def _assert_json_pickle_parity(engine, replica_id: int) -> None:
     assert pickle_info.to_storage_dict() == json_info.to_storage_dict()
 
 
+def test_authorization_snapshot_pairs_elected_version_and_incarnation(
+        recovery_database) -> None:
+    engine = recovery_database
+    other_service_name = 'other-svc'
+    other_service_hash = 'other-service-hash'
+    other_lifecycle_epoch = 1
+    elected_spec = {'identity': 'elected'}
+    newer_spec = {'identity': 'newer-not-elected'}
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert(), [
+            {
+                'service_name': _SERVICE_NAME,
+                'version': 3,
+                'spec': pickle.dumps(elected_spec),
+                'yaml_content': 'run: elected\n',
+            },
+            {
+                'service_name': _SERVICE_NAME,
+                'version': 4,
+                'spec': pickle.dumps(newer_spec),
+                'yaml_content': 'run: newer\n',
+            },
+        ])
+        connection.execute(serve_state.services_table.update().where(
+            serve_state.services_table.c.name == _SERVICE_NAME).values(
+                current_version=3,
+                status=serve_state.ServiceStatus.NO_REPLICA.value))
+        connection.execute(serve_state.replicas_table.delete().where(
+            serve_state.replicas_table.c.service_name == _SERVICE_NAME))
+        connection.execute(
+            serve_state.service_lifecycle_fences_table.insert().values(
+                name=other_service_name, epoch=other_lifecycle_epoch))
+        connection.execute(serve_state.services_table.insert().values(
+            name=other_service_name,
+            workspace=_WORKSPACE,
+            hash=other_service_hash,
+            status=serve_state.ServiceStatus.READY.value,
+            controller_pid=_OWNER[0],
+            controller_ip=_OWNER[1],
+            lifecycle_epoch=other_lifecycle_epoch,
+            pool=0,
+            resource_action_mode='legacy'))
+    assert serve_state.add_or_update_replica(
+        other_service_name,
+        8,
+        _replica(8),
+        expected_service_hash=other_service_hash,
+        expected_lifecycle_epoch=other_lifecycle_epoch,
+        expected_controller_owner=_OWNER)
+
+    with _capture_sql(engine) as statements:
+        snapshot = serve_state.get_system_recovery_authorization_snapshot(
+            _SERVICE_NAME)
+
+    selects = [
+        statement for statement in statements
+        if statement.lstrip().startswith('select ')
+    ]
+    assert len(selects) == 1
+    assert statements == selects
+    assert snapshot == {
+        'service_name': _SERVICE_NAME,
+        'service_hash': _SERVICE_HASH,
+        'workspace': _WORKSPACE,
+        'version': 3,
+        'status': serve_state.ServiceStatus.NO_REPLICA,
+        'pool': False,
+        'resource_action_mode': 'legacy',
+        'spec': elected_spec,
+        'yaml_content': 'run: elected\n',
+        'quarantined_at': None,
+        'replica_count': 0,
+    }
+
+
+def test_authorization_snapshot_counts_same_service_stale_version_replica(
+        recovery_database) -> None:
+    engine = recovery_database
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert().values(
+            service_name=_SERVICE_NAME,
+            version=3,
+            spec=pickle.dumps({'identity': 'elected'}),
+            yaml_content='run: elected\n'))
+        connection.execute(serve_state.services_table.update().where(
+            serve_state.services_table.c.name == _SERVICE_NAME).values(
+                current_version=3,
+                status=serve_state.ServiceStatus.NO_REPLICA.value))
+        # Replica rows are incarnation-wide, not elected-version-scoped.  A
+        # stale version must still make zero-replica bootstrap ineligible.
+        connection.execute(serve_state.replicas_table.update().where(
+            serve_state.replicas_table.c.service_name == _SERVICE_NAME).values(
+                version=2))
+
+    snapshot = serve_state.get_system_recovery_authorization_snapshot(
+        _SERVICE_NAME)
+
+    assert snapshot is not None
+    assert snapshot['version'] == 3
+    assert snapshot['replica_count'] == 1
+
+
 @contextlib.contextmanager
 def _capture_sql(engine):
     statements: list[str] = []

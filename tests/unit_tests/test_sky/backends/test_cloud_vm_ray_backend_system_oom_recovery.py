@@ -26,9 +26,15 @@ _SERVICE_HASH = 'service-hash-1'
 _OWNER_IDENTITY = ('aws-user-id', '123456789012')
 
 
-def _task() -> sky.Task:
+def _task(market_type: str = 'on_demand') -> sky.Task:
     task = sky.Task(run=_owned_spec().render(), envs={'MODEL': 'boltz'})
-    task.set_resources(sky.Resources(instance_type='g2-standard-4'))
+    task.set_resources(
+        sky.Resources(cloud=clouds.AWS(),
+                      instance_type='g6.xlarge',
+                      region='us-east-1',
+                      zone='us-east-1a',
+                      memory='16',
+                      use_spot=market_type == 'spot'))
     return task
 
 
@@ -38,6 +44,8 @@ def _owned_spec() -> runtime_recovery.OwnedContainerSpec:
 
 def _authorization(task: sky.Task) -> dict[str, object]:
     spec = _owned_spec()
+    resource, = task.resources
+    market_type = 'spot' if resource.use_spot else 'on_demand'
     return {
         'authorization_version': 3,
         'profile_id': 'boltz-l4-v3',
@@ -60,7 +68,7 @@ def _authorization(task: sky.Task) -> dict[str, object]:
                 'region': 'us-east-1',
                 'availability_zones': ['us-east-1a'],
             }],
-            'allowed_market_types': ['on_demand', 'spot'],
+            'allowed_market_types': [market_type],
             'allowed_instance_types': ['g6.xlarge'],
             'max_host_memory_gib': 16,
             'num_nodes': 1,
@@ -74,9 +82,11 @@ def _authorization(task: sky.Task) -> dict[str, object]:
     }
 
 
-def _context(*, include_contract: bool = True) -> dict[str, object]:
+def _context(*,
+             include_contract: bool = True,
+             market_type: str = 'on_demand') -> dict[str, object]:
     trusted = serve_recovery._authorization_v3_from_dict(  # pylint: disable=protected-access
-        _authorization(_task()))
+        _authorization(_task(market_type)))
     requested = serve_recovery.RequestedRecoveryAuthorizationV3.from_authorization(
         trusted)
     intent = requested.to_intent_fields()
@@ -247,9 +257,9 @@ def _request_and_generation(monkeypatch):
 @pytest.mark.parametrize('market_type', ['on_demand', 'spot'])
 def test_exact_profile_and_handle_produce_typed_launch_plan(
         monkeypatch, market_type):
-    task = _task()
+    task = _task(market_type)
     _install_profile(monkeypatch, task)
-    backend = _backend()
+    backend = _backend(_context(market_type=market_type))
     alias = _bind(backend, _evidence(market_type=market_type))
 
     plan = _decide(backend, _handle(), task)
@@ -685,7 +695,7 @@ def test_new_grpc_response_reports_positive_absence():
                                                         stream_logs=False))
 
     assert statuses == {7: job_lib.JobStatus.RUNNING}
-    assert infos == {}
+    assert not infos
     assert detail_statuses == {7: job_lib.JobSystemRecoveryDetailStatus.ABSENT}
 
 
@@ -708,7 +718,7 @@ def test_unknown_grpc_detail_status_is_malformed():
                                                         stream_logs=False))
 
     assert statuses == {7: job_lib.JobStatus.RUNNING}
-    assert infos == {}
+    assert not infos
     assert detail_statuses == {
         7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
     }
