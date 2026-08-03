@@ -295,6 +295,47 @@ This kernel reuses mechanics without defining a universal resource status enum
 or a universal reducer. Volumes, clusters, Serve, pools, managed jobs, and
 managed images retain their legal domain transitions and generation fences.
 
+### PostgreSQL session advisory-lock lifecycle kernel
+
+The controller currently has two independent owners of PostgreSQL
+session-advisory-lock mechanics. `PostgresLock` owns the synchronous path,
+while `run_distributed_singleton()` independently owns an async connection,
+acquisition transaction, standby retry, liveness transaction, task
+cancellation, unlock, and close. The async implementation omits transaction
+closure and has produced process-lifetime `idle in transaction` snapshots that
+block concurrent migration DDL.
+
+M3-PG0 first fixes the active defect without changing abstraction boundaries:
+it commits immediately after every acquisition probe, health probe, and
+successful unlock, and closes a nonwinning connection before retry sleep. It
+preserves the existing server-side `hashtextextended(name, 0)` key, exact lock
+and retry ordering, and mixed-version behavior.
+
+M3-PG1 then introduces one provider- and domain-neutral PostgreSQL session-lock
+contract. A versioned identity retains the current key strategy rather than
+normalizing it: async controller singleton names remain
+`PG_HASHTEXTEXTENDED_SEED0_V1`, while existing `PostgresLock` callers remain
+`SHA256_POSITIVE_INT63_V1`. The shared owner controls dedicated connection
+acquisition, try-lock and unlock statement plans, transaction closure after
+every statement, close-before-retry, same-session health, loss cleanup, and
+bounded redacted identity. Thin sync and async transports own only their I/O
+syntax. A shared pure lifecycle reducer owns the legal session-state ordering,
+while the sync facade retains blocking and timeout scheduling and the async
+coordinator retains task and timer scheduling. One generated event-trace corpus
+prevents either transport or coordinator from acquiring independent SQL,
+transaction, or session-close policy.
+
+The synchronous `PostgresLock` API remains a compatibility facade, including
+shared mode, blocking and timeout behavior, force-unlock administration, and
+same-session fenced callbacks. The async API retains owned-coroutine
+start/cancel/retry semantics. Neither facade directly owns a raw connection or
+transaction after migration.
+
+This session-lock kernel is not the durable lifecycle action lease. A session
+lock can elect a process singleton, but it cannot prove that a provider effect
+ran once, fence a process after external I/O, or replace an action claim,
+generation, intent, readback, or quarantine record.
+
 ### Provider registration projection, descriptor, and generated conformance
 
 M1 still leaves provider identity represented in parallel places:
@@ -4535,8 +4576,16 @@ Lease issue, renewal, expiry, and due-time comparisons use a fresh
 transaction-start time, application wall clocks, and a timestamp read before a
 lock wait are forbidden for lease safety.
 
-No database transaction or connection is held across provider or nested API
-I/O. The `IN_FLIGHT` intent transaction commits before bytes may be sent.
+No ordinary pooled database connection and no database transaction is held
+across provider or nested API I/O. The `IN_FLIGHT` intent transaction commits
+before bytes may be sent. A separately budgeted, direct PostgreSQL session may
+span only process-singleton or election ownership through the shared
+session-advisory-lock kernel. That session must be transaction-idle before and
+after owned work, must not come from an action worker's ordinary pool, and is
+not an action lease or provider-effect fence. Existing legacy lifecycle callers
+that hold such a session across provider work remain explicitly legacy until
+their removal rows close; new action-runtime code may not introduce this shape.
+
 Heartbeats and synchronous fences use a reserved connection budget or
 dedicated bounded pool that worker concurrency cannot consume. If that reserve
 cannot obtain a connection before the lease safety margin, the worker stops
@@ -5912,6 +5961,23 @@ rollback, and cleanup on the exact image digest.
 
 ### M3: Durable action runtime and volume pilot
 
+- land M3-PG0 first as an independently deployable async singleton
+  transaction-hygiene hotfix with no schema, key, retry, ownership, or daemon
+  change; prove all eight controller singleton owners are transaction-idle and
+  concurrent-index canary DDL completes without restarting a controller;
+- in M3-PG1 add the inert shared session-lock identity, statement-plan,
+  lifecycle-reducer, sync/async transport contracts, and generated trace
+  conformance with no caller routed to them;
+- in M3-PG2 route the eight async controller singletons through the shared
+  kernel while preserving `PG_HASHTEXTEXTENDED_SEED0_V1`, then remove
+  `run_distributed_singleton()` only after old/new mutual exclusion, standby
+  promotion, cancellation, and rollback-image qualification pass;
+- in M3-PG3 retain the `PostgresLock` public facade but move its direct
+  connection, acquisition, health, unlock, force-unlock, and same-session
+  callback mechanics into the shared kernel under
+  `SHA256_POSITIVE_INT63_V1`; remove its private connection fields and helper
+  bodies only after the complete synchronous corpus and all existing Jobs,
+  Serve, daemon, and controller-leader consumers pass;
 - land M3-S0 first: the domain-local pure volume refresh projection and
   shadow-only wiring, with the current reducer and writer still authoritative;
 - deploy M3-S0 without a schema migration, prove mismatch, projector,
@@ -5948,6 +6014,11 @@ legacy until its separate deprecation gate.
 
 Deployment exercises create, refresh, delete, lost worker, stale lease,
 ambiguous provider response, readback, and cleanup.
+
+M3-PG0 is a prerequisite for later M3 database migrations, but it grants no
+action-writer or provider-effect authority. M3-PG1 through M3-PG3 require a
+dedicated adversarial review of the exact shared interface before
+implementation.
 
 ### M4: Cluster provisioning and teardown
 
@@ -12546,6 +12617,8 @@ still incomplete until the code is deleted and the row reaches `removed`.
 | direct child status transport in `SkyPilotReplicaManager._fetch_job_status()` | `ChildWorkloadObservationV1` owns the read-only child-status call while Serve retains replica health and rollout policy | the exact replica status, preemption, pool, timeout, and lock-free polling corpus passes, and the method contains no direct `backend.get_job_status` call outside the adapter |
 | duplicate managed-image worker lease, heartbeat, retry, and provider-call mechanics | the shared kernel executes already-admitted image actions while image domain admission retains shard fairness and reservations | shard `max_in_flight`, two-level due rotation, fresh-versus-recovery accounting, publication reservations, `COPY`/`VERIFY`/`EVICT`/`READBACK` crash recovery, fencing, quarantine, exact absence, and canary qualification pass with zero dual due or lease owner |
 | `api_controller_action_reservations` and `_reserve_controller_action()` / `_mark_controller_action_state()` | generalized action ledger preserves controller-generation fencing and active reservations are backfilled | compatibility reconciler observes zero unmigrated active reservations and rollback qualification passes |
+| `run_distributed_singleton()` and `_singleton_task()` direct request-PostgreSQL call | shared async session-lock kernel is authoritative for all eight controller maintenance daemons | exact legacy key contention works in both mixed-version ownership orders, transaction-idle and standby-promotion tests pass, one compatibility window records zero legacy route, and rollback-image qualification passes |
+| direct PostgreSQL session fields, SQL, transaction closure, health, unlock, close, force-unlock, and callback ownership inside `PostgresLock` | the compatibility facade delegates to the shared sync session-lock kernel | existing shared/exclusive, blocking, timeout, cancellation, connection-loss, controller-generation, Jobs, Serve, and daemon corpora pass; one compatibility window records zero direct legacy owner; repository search and manifest locators prove the old bodies absent |
 
 The fleet-gated M5 compatibility paths in
 `docs/designs/multi-replica-api-server.md` are outside this migration's deletion
@@ -12660,6 +12733,36 @@ owned by the named test rather than left implicit:
     classifiers cover the supported 3.10 through 3.14 range.
 14. `test_placement_types_are_not_publicly_reexported`.
 15. `test_cloud_offer_source_default_is_none_and_side_effect_free`.
+
+### PostgreSQL session advisory locks
+
+- a real-PostgreSQL async singleton test maps the exact
+  `hashtextextended(lock_name, 0)` advisory key through `pg_locks` to its owner
+  and proves `state = 'idle'`, `xact_start IS NULL`, and
+  `backend_xmin IS NULL` after acquisition and after at least one `SELECT 1`
+  health probe;
+- the same test cancels the owner, proves exactly one standby promotion, proves
+  the old backend and granted lock disappear, and repeats the transaction-idle
+  assertions for the successor;
+- mock event-order tests prove acquire commit precedes task creation,
+  nonwinner close precedes retry sleep, health commit follows every successful
+  probe, owned task cancellation precedes unlock and connection close, unlock
+  commit occurs when possible, and query or commit failure cannot start work;
+- a shared sync/async trace corpus covers acquire false/true, shared and
+  exclusive mode, timeout, nonblocking failure, task success and failure,
+  cancellation, connection loss, failed commit, failed unlock, and close or
+  invalidation;
+- key goldens preserve `SHA256_POSITIVE_INT63_V1`, statement-shape tests
+  preserve `PG_HASHTEXTEXTENDED_SEED0_V1`, and old/new implementations contend
+  for one real lock in both ownership orders;
+- same-session callback tests prove success leaves no transaction open and any
+  exception rolls back before propagation or session invalidation;
+- repository checks prove the shared leaf imports no server, Jobs, Serve,
+  provider, or action-domain module and prove migrated facades contain no
+  direct connection checkout, SQL advisory-lock statement, commit, rollback,
+  or close lifecycle;
+- a bounded `CREATE INDEX CONCURRENTLY` canary runs while all eight controller
+  singleton locks are held and cleans up its exact table and index afterward.
 
 ### Action runtime
 
@@ -12880,6 +12983,17 @@ identity evidence.
 
 ## Rollback
 
+- M3-PG0 is schema-free and can roll back by image, but the prior image
+  reintroduces process-lifetime singleton transactions. Before any migration
+  DDL after such a rollback, preflight must prove no SkyPilot advisory-lock
+  session is idle in transaction. Restarting a controller is incident
+  remediation, not qualification or a permanent workaround.
+- M3-PG2 and M3-PG3 preserve each caller's exact old lock-key strategy, so old
+  and new images remain mutually exclusive. Rollback is allowed only while the
+  shared implementation has introduced no new key strategy or externally
+  persisted contract. Any future key migration needs a separately reviewed
+  dual-acquire or durable-generation protocol and cannot infer safety from a
+  quiet telemetry window.
 - M1 is code-only additive and rolls back by image. M2 adds no database schema,
   but image rollback is permitted only after the current-image preflight proves
   every `placement_attempt_fence` is null.
