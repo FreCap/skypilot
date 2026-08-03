@@ -3691,6 +3691,7 @@ def add_or_update_replicas(
     expected_controller_owner: tuple[int | None, str | None] | None = None,
     *,
     expected_replica_exists: bool = False,
+    validate_fence_on_empty: bool = False,
 ) -> bool:
     """Persist a batch of replicas in one transaction.
 
@@ -3700,10 +3701,23 @@ def add_or_update_replicas(
     on Postgres that alone exceeds the probe period). The expected-existing
     path locks every requested row before its first write, aborts the whole
     batch if one is absent or has a different record identity, and executes
-    UPDATE only. Explicit initial admission is INSERT-only.
+    UPDATE only. Explicit initial admission is INSERT-only. Empty batches are
+    normally no-ops; callers that transfer an in-memory authority-sensitive
+    side effect may request an owner-fence transaction before committing it.
     """
     if not replica_infos:
-        return True
+        if not validate_fence_on_empty:
+            return True
+        if (not isinstance(expected_service_hash, str) or
+                not expected_service_hash or
+                not isinstance(expected_controller_owner, tuple) or
+                len(expected_controller_owner) != 2):
+            return False
+        expected_pid, expected_ip = expected_controller_owner
+        if (isinstance(expected_pid, bool) or
+                not isinstance(expected_pid, int) or expected_pid < 1 or
+                not isinstance(expected_ip, str) or not expected_ip):
+            return False
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         _begin_immediate_if_sqlite(

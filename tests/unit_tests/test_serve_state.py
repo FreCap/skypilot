@@ -3263,6 +3263,36 @@ class TestBatchReplicaUpsert:
         serve_state.add_or_update_replicas('svc', [])
         assert not serve_state.get_replica_infos('svc')
 
+    def test_empty_batch_fence_requires_and_validates_owner_identity(
+            self, _mock_serve_db):
+        incomplete_fences = ({}, {
+            'expected_service_hash': 'incarnation-a'
+        }, {
+            'expected_controller_owner': (200, '10.0.0.2')
+        }, {
+            'expected_service_hash': 'incarnation-a',
+            'expected_controller_owner': (None, None)
+        })
+        for fence in incomplete_fences:
+            assert not serve_state.add_or_update_replicas(
+                'svc', [], validate_fence_on_empty=True, **fence)
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a')
+        assert serve_state.add_or_update_replicas(
+            'svc', [],
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=(200, '10.0.0.2'),
+            expected_replica_exists=True,
+            validate_fence_on_empty=True)
+        assert not serve_state.add_or_update_replicas(
+            'svc', [],
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=(100, '10.0.0.1'),
+            expected_replica_exists=True,
+            validate_fence_on_empty=True)
+
     def test_batch_larger_than_chunk_size(self, _mock_serve_db):
         chunk_size = (serve_state._SQLITE_MAX_BIND_PARAMS //
                       len(serve_state.replicas_table.c))

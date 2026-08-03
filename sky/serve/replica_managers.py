@@ -131,6 +131,8 @@ _FAILED_CLEANUP_RETRY_MAX_SECONDS = 15 * 60
 # queued intent, but bound live worker threads so one controller process cannot
 # exhaust its memory or refresh-loop CPU while the global budget is spacious.
 _MAX_CONCURRENT_DOWNS_PER_SERVICE = 64
+_CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR = (
+    'SKYPILOT_SERVE_CHANGED_ONLY_READINESS_PERSISTENCE')
 # An autoscaler tick can place a full wave before any sky.launch result benches
 # an unavailable location. Without a bound, a zero-cost-first placer can pin
 # hundreds of replicas to one full Kubernetes pool. Demand placement consumes
@@ -142,6 +144,18 @@ _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
 # is a real batched result: the cluster has no resolvable endpoint and the
 # bounded deadline must remain the only completion path.
 _REPLICA_URL_NOT_PROVIDED: Any = object()
+
+
+def _changed_only_readiness_persistence_enabled() -> bool:
+    value = os.environ.get(_CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR)
+    if value is None or value.lower() == 'false':
+        return False
+    if value.lower() == 'true':
+        return True
+    logger.warning(
+        f'Invalid {_CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR} value '
+        f'{value!r}; changed-only readiness persistence remains disabled.')
+    return False
 
 
 def load_task_with_service_spec(
@@ -1370,6 +1384,8 @@ class ReplicaManager:
         self.lock = threading.Lock()
         self._next_replica_id: int = 1
         self._service_name: str = service_name
+        self._changed_only_readiness_persistence = (
+            _changed_only_readiness_persistence_enabled())
         service_record = serve_state.get_service_from_name(service_name)
         if service_record is not None:
             self._workspace = serve_utils.resolve_service_workspace(
@@ -2591,10 +2607,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._rollback_system_recovery_route_suspensions(suspensions)
             raise
         try:
+            fence_kwargs = self._db_fence_kwargs()
+            if not replica_infos and suspensions:
+                fence_kwargs['validate_fence_on_empty'] = True
             persisted = serve_state.add_or_update_replicas(
                 self._service_name,
                 replica_infos,
-                **self._db_fence_kwargs(),
+                **fence_kwargs,
                 expected_replica_exists=True)
         except BaseException:
             self._resolve_ambiguous_system_recovery_route_suspensions(
@@ -8808,6 +8827,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             mark_ready=False)
         return updated, reduction
 
+    @staticmethod
+    def _readiness_persistence_fingerprint(
+        info: ReplicaInfo,
+    ) -> tuple[bool, float | None, float | None, float | None]:
+        """Return exactly the probe-mutated ordinary readiness fields."""
+        return (info.status_property.service_ready_now,
+                info.status_property.first_ready_time,
+                getattr(info, 'first_not_ready_time', None),
+                getattr(info, 'first_consecutive_failure_time', None))
+
+    @staticmethod
+    def _is_changed_only_readiness_persistence_eligible(
+            info: ReplicaInfo) -> bool:
+        """Whether recovery state permits readiness-only write filtering."""
+        return (getattr(info, 'system_recovery_disposition', None)
+                == system_recovery_state.SystemRecoveryDisposition.ORDINARY and
+                getattr(info, 'system_recovery', None) is None and
+                getattr(info, 'system_recovery_quarantine', None) is None)
+
     @with_lock
     def _probe_all_replicas(self) -> list[ReplicaInfo]:
         """Readiness probe replicas.
@@ -9242,6 +9280,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         failed_interruptible_infos, alive_flags) if not alive
                 }
 
+            changed_only_readiness_persistence = getattr(
+                self, '_changed_only_readiness_persistence', False)
             pending_writes: list[tuple[int, ReplicaInfo]] = []
             replicas_to_teardown: list[int] = []
             preempted_replica_ids: set[int] = set()
@@ -9249,6 +9289,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             for future_result in probe_results:
                 (info, probe_succeeded, probe_time, probe_monotonic_started_at,
                  _, _) = future_result
+                readiness_fingerprint_before = None
+                changed_only_eligible_before = False
+                if changed_only_readiness_persistence:
+                    readiness_fingerprint_before = (
+                        self._readiness_persistence_fingerprint(info))
+                    changed_only_eligible_before = (
+                        self._is_changed_only_readiness_persistence_eligible(
+                            info))
                 should_teardown = False
                 if (not probe_succeeded and
                         info.replica_id in possibly_preempted_ids):
@@ -9437,7 +9485,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 info))
                         if suspension is not None:
                             pending_route_suspensions.append(suspension)
-                pending_writes.append((info.replica_id, info))
+                should_persist_readiness = (
+                    not changed_only_readiness_persistence)
+                if changed_only_readiness_persistence:
+                    changed_only_eligible_after = (
+                        self._is_changed_only_readiness_persistence_eligible(
+                            info))
+                    readiness_fingerprint_after = (
+                        self._readiness_persistence_fingerprint(info))
+                    should_persist_readiness = (
+                        not changed_only_eligible_before or
+                        not changed_only_eligible_after or
+                        readiness_fingerprint_before
+                        != readiness_fingerprint_after)
+                if should_persist_readiness:
+                    pending_writes.append((info.replica_id, info))
                 if should_teardown:
                     replicas_to_teardown.append(info.replica_id)
 
@@ -9454,7 +9516,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._persist_replicas(
                     pending_writes,
                     route_suspensions=transferred_route_suspensions)
-            else:
+            elif pending_writes or not changed_only_readiness_persistence:
                 # Preserve the ordinary call shape for paths that do not
                 # participate in the route-lease protocol.
                 self._persist_replicas(pending_writes)
