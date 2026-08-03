@@ -27,6 +27,9 @@ cancellation actions after `handle_superseded()` returns.
   targets a replacement coordinator's token or an inferred job ID.
 - Each snapshotted worker begins cleanup independently. One blocked or failed
   worker must not prevent a sibling worker from starting cleanup.
+- Active and durable cleanup keep at most the default thread-executor width of
+  worker pipelines runnable at once. Worker records beyond that bound remain
+  unscheduled until an earlier pipeline settles.
 - Within one worker, ordering remains shutdown request, shutdown completion
   when the request succeeded, exact job-ID cancellation, cancellation
   completion, and durable-record removal after confirmed cancellation.
@@ -57,7 +60,9 @@ cancellation actions after `handle_superseded()` returns.
 
 Keep `_run_call()` and `_cancel_exact()` as the shared deadline and exact-ID
 primitives. Extract the existing active-worker sequence into one local async
-pipeline, then run all snapshotted pipelines with `asyncio.gather()`.
+pipeline, then feed the snapshots through a fixed-width async worker pool. The
+pool width matches Python's default thread executor because each pipeline
+delegates its synchronous external calls through `asyncio.to_thread()`.
 
 Each pipeline catches ordinary SDK failures through `_run_call()` and returns a
 boolean indicating whether it stayed within the global deadline. After all
@@ -65,18 +70,21 @@ pipelines settle, return immediately if any timed out; otherwise continue into
 the existing durable-record recovery and final active-worker drain.
 
 For durable recovery, retain the asynchronous sequence of individually guarded
-external calls and reuse `_matching_worker_job_ids()` for the pure exact-name
-decision. Do not add a pass-local queue snapshot map: after filtering by the
-current coordinator token, the durable primary key makes a second record for
-the same cluster unrepresentable. The synchronous replacement-owner cleanup
-path is different because it intentionally walks several stale coordinator
-tokens; its cross-token queue memo remains valid.
+external calls, reuse `_matching_worker_job_ids()` for the pure exact-name
+decision, and feed owned records through the same worker pool. Do not add a
+pass-local queue snapshot map: after filtering by the current coordinator
+token, the durable primary key makes a second record for the same cluster
+unrepresentable. The synchronous replacement-owner cleanup path is different
+because it intentionally walks several stale coordinator tokens; its
+cross-token queue memo remains valid.
 
 This does not add retries, polls, database reads, provider calls, or durable
 state. Successful active cleanup keeps the same per-worker call count.
-Coordination adds one coroutine/task per active worker and keeps O(worker count)
-memory. Superseded durable recovery remains O(owned worker clusters) in queue
-calls and uses O(1) additional collection memory.
+Coordination keeps O(executor width) cleanup tasks instead of one task per
+record, plus the input and ordered result collections. Superseded durable
+recovery remains O(owned worker clusters) in queue calls. An unexpected worker
+exception cancels and settles the bounded worker set before propagating, so a
+partially consumed queue cannot deadlock cleanup.
 
 ## Alternatives considered
 
@@ -91,9 +99,10 @@ Giving each worker an independent full timeout can make total cleanup exceed
 the controller's 60-second lifecycle bound. The single shared deadline remains
 the correct outer budget.
 
-Running all durable-record recovery concurrently is broader and can duplicate
-work against active records. The high-value liveness gap is limited to the
-already-owned active snapshot, so unresolved-record recovery remains serial.
+Running one durable-record coroutine per worker preserves throughput only until
+the default thread executor saturates, after which it adds queued coroutine
+state without adding useful parallelism. A worker pool at that executor width
+keeps the same throughput ceiling with bounded scheduling overhead.
 
 Calling the synchronous `_resolve_worker_job_id()` once through
 `asyncio.to_thread()` is smaller in line count, but that resolver performs
@@ -111,6 +120,8 @@ state and failure semantics without changing a representable production path.
 | Changed path or invariant | Test file | Command |
 | --- | --- | --- |
 | `sky/batch/coordinator.py::handle_superseded`: sibling active cleanup starts while another shutdown call is blocked | `tests/unit_tests/test_batch_recovery.py` | `python -m pytest -q -o addopts='' tests/unit_tests/test_batch_recovery.py -k 'superseded_cleanup'` |
+| Active and durable cleanup never exceed the thread-executor-width worker bound | `tests/unit_tests/test_batch_recovery.py` | same focused command |
+| An unexpected bounded-worker exception propagates promptly without leaving queue completion blocked | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | Per-worker shutdown-before-cancel ordering and exact job-ID targeting | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | Shutdown failure containment and sibling liveness | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | One global deadline, no post-timeout calls after active-worker or durable launch-recovery timeouts, and cancellation shielding | `tests/unit_tests/test_batch_recovery.py` | same focused command |
@@ -152,6 +163,13 @@ unreachable asymptotic improvement. A deadline regression blocks
 launch-request recovery, waits for `handle_superseded()` to return, then
 releases the blocking call and proves that no queue, persistence, cancellation,
 or removal action starts afterward.
+
+A 64-record launch-recovery probe measured peak `sdk.get()` concurrency at 22
+before and after bounding the coroutine fan-out, matching the default executor
+width on the test host. Elapsed time remained within measurement noise while
+the number of active cleanup coroutines became independent of record count.
+Focused tests force the bound to two and prove that a third active or durable
+pipeline cannot start until one of the first two settles.
 
 ## Rollout and rollback
 
