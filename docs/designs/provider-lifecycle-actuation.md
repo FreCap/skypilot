@@ -181,7 +181,7 @@ signatures:
 
 ```text
 discover(scope, expected_incarnation) -> NodeInventoryV1
-prepare(exact_action, inventory) -> ProviderEffectPlanV1
+prepare(exact_action, inventory, actuation_binding) -> ProviderEffectPlanV1
 submit_effect(exact_effect, persisted_locator) -> EffectEvidenceV1
 observe_effect(effect_handle_ref, persisted_locator) -> EffectObservationV1
 prove_absent(persisted_locator) -> AbsenceEvidenceV1
@@ -201,16 +201,31 @@ an empty string, and skipping observation are invalid.
 `ClusterEffectReconcilerV1` is the sole cluster-domain adapter admitted to the
 durable action runtime for this facet. For one already-admitted
 `ClusterNextActionPlanV1`, it pins one exact `ActuationBindingV1`, invokes the
-bound facet's pure `prepare()`, validates the returned DAG and complete locator
-set, and writes the plan through the generic action and effect transaction. A
-failed effect-free transaction may recompute the pure plan, but only one
-byte-identical plan digest may commit for one plan revision; different bytes
-require a new revision. The generic runtime alone selects and claims a due
-effect, fences it, calls `submit_effect()`, schedules later `observe_effect()`
-or `prove_absent()` work, and journals every transition. The cluster adapter
-reduces that durable evidence into the next domain action or terminal
-`ProvisionRecord`; it owns no worker, queue, lease, heartbeat, retry clock,
-provider client, or second effect store.
+bound facet's pure `prepare(exact_action, inventory, actuation_binding)`,
+validates the returned DAG and complete locator set, and writes the plan
+through the generic action and effect transaction. The exact binding passed to
+`prepare()` is the recursively immutable value already persisted with that
+admitted action, not a reconstructed descriptor, request, configuration, or
+provider lookup. A failed effect-free transaction may recompute the pure plan,
+but only one byte-identical plan digest may commit for one plan revision;
+different bytes require a new revision. The generic runtime alone selects and
+claims a due effect, fences it, calls `submit_effect()`, schedules later
+`observe_effect()` or `prove_absent()` work, and journals every transition. The
+cluster adapter reduces that durable evidence into the next domain action or
+terminal `ProvisionRecord`; it owns no worker, queue, lease, heartbeat, retry
+clock, provider client, or second effect store.
+
+`ActuationBindingV1` has closed common fields for descriptor implementation
+digest, descriptor and facet contract versions, canonical provider, realized
+provider mode, control-plane and store identities and modes, resource-support
+decision digest, cluster incarnation, action ID, binding generation, and one
+closed provider-projection tag. The provider projection is never an arbitrary
+mapping or live object. Its bytes and digest commit in the domain admission
+transaction before the action is runnable and are copied unchanged into every
+effect plan. The descriptor registrar owns the projection schema; domain
+admission owns selecting and persisting an eligible observed binding; the
+provider facet owns only pure projection from those bytes into provider request
+plans. Neither the planner nor provider facet may manufacture a missing field.
 
 `discover()` performs one bounded provider-native traversal and preserves
 canonical provider IDs, duplicate and completeness evidence, provider scope,
@@ -246,10 +261,12 @@ The runtime, not an in-memory provider call, journals progress between those
 effects.
 
 `exact_action` has a closed operation kind and the exact deterministic names,
-roles, identities, or requested create count chosen by the core planner.
-`prepare()` emits a bounded deterministic DAG of exact provider effects,
-identities, and dependencies. The runtime persists that whole plan before
-external I/O, then persists each effect intent and locator before calling
+roles, identities, or requested create count chosen by the core planner. The
+separately supplied `actuation_binding` carries every admitted provider input
+that is not planner policy. `prepare()` is a pure function of exactly those
+three arguments and emits a bounded deterministic DAG of exact provider
+effects, identities, and dependencies. The runtime persists that whole plan
+before external I/O, then persists each effect intent and locator before calling
 `submit_effect()`. A returned effect may use a provider-supported batch only
 when every target has deterministic identity and per-target evidence. The
 facet cannot own cluster target-count policy, select a head, choose a new
@@ -7376,16 +7393,34 @@ bounded account-scoped SSH-key traversal, hashes each returned public key with
 SHA-256, and returns `EXACT_ONE` only for one key whose digest matches the
 request. Admission persists the numeric key ID, provider fingerprint, requested
 public-key digest, account-scope digest, observation time, freshness deadline,
-and descriptor implementation digest in `ActuationBindingV1` before the node
-action is runnable. Immediately before `CREATE_DROPLET`, a read-only exact-ID
-lookup must reproduce the ID, fingerprint, public-key digest, and account scope.
-The droplet request uses only that pinned fingerprint. V1 never calls
+and descriptor implementation digest inside the binding's exact DigitalOcean
+projection before the node action is runnable. Immediately before
+`CREATE_DROPLET`, a read-only exact-ID lookup must reproduce the ID,
+fingerprint, public-key digest, and account scope. The droplet request uses only
+that pinned fingerprint. V1 never calls
 `ssh_keys.create`; `MISSING`, duplicate matches, incomplete pagination,
 authorization failure, stale evidence, or changed binding makes create
 ineligible. A later key-creation feature requires its own separately journaled,
 replay-safe provider effect and cleanup policy.
 `PLA-M4-118` tracks the current process cache, list-and-create helper, create
 callsite, and raw `ssh_keys.create` effect until that binding is authoritative.
+
+The provider projection for create is exactly
+`DigitalOceanNodeCreateBindingV1`. It contains schema version 1, account-scope
+digest, region, selected size slug, resolved image ID, disk size in GiB, frozen
+ordered base-tag tuple, `DigitalOceanSshKeyBindingV1`, random UUIDv4
+`provider_create_attempt_id`, and the tag-projection contract version. Selected
+placement and normalized request configuration supply the size, image, disk,
+region, and base tags; the exact `NodeAccessBindingObservationV1` supplies the
+SSH-key binding; domain admission generates the create-attempt UUID; and the
+common `ActuationBindingV1` supplies store UUID, action UUID, descriptor digest,
+and cluster incarnation. Admission validates all sources and commits this
+projection and its canonical digest with the action. The reconciler later
+loads those exact bytes and passes the same `ActuationBindingV1` to
+`prepare()`. The DigitalOcean facet derives names, both request tag tuples,
+request bodies, effects, and locators only from `exact_action`, `inventory`, and
+that binding. It cannot reread `ProvisionConfig`, choose an image default,
+resolve an SSH key, generate a UUID, or consult provider state while preparing.
 
 For one new node, the descriptor-bound facet's `prepare()` emits this exact
 deterministic effect DAG, and `ClusterEffectReconcilerV1` persists it through
@@ -7398,12 +7433,12 @@ CREATE_DROPLET -> CREATE_VOLUME -> ATTACH_VOLUME
 The whole DAG, every logical effect ID, and every base readback locator commit
 before `CREATE_DROPLET` can issue provider I/O. The deterministic droplet and
 volume names derive from cluster incarnation plus stable planner slot and role,
-not UUID or provider page order. Admission assigns one random UUIDv4
-`provider_create_attempt_id` per planned node create and persists it in the
-action and all three base locators before `prepare()` output can commit. It is
-not the worker attempt number. It is never regenerated after claim loss,
-timeout, response loss, or readback, and a later create receives a new value
-only after the prior action's cleanup proof closes.
+not UUID or provider page order. Admission assigns the binding's random UUIDv4
+`provider_create_attempt_id` once per planned node create and persists it before
+the action is runnable. `prepare()` copies it into all three base locators in
+the atomic effect-plan write. It is not the worker attempt number. It is never
+regenerated after claim loss, timeout, response loss, or readback, and a later
+create receives a new value only after the prior action's cleanup proof closes.
 
 DigitalOcean exposes that identity through exactly one managed tag on both the
 droplet-create and volume-create requests. If `LP(x)` is the ASCII decimal

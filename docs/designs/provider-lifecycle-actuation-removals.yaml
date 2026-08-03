@@ -16506,6 +16506,9 @@ artifacts:
   locators:
   - kind: python_symbol
     path: sky/provision/do/utils.py
+    symbol: SSH_KEY_NAME_ON_DO_PREFIX
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
     symbol: _ssh_key_id
   - kind: python_symbol
     path: sky/provision/do/utils.py
@@ -16522,7 +16525,7 @@ artifacts:
     path: sky/provision/do/utils.py
     symbol: create_instance
     call: ssh_key_id
-  replacement: Descriptor-bound NodeAccessBindingFacetV1 and durable preexisting DigitalOceanSshKeyBindingV1 with no V1 key creation
+  replacement: Descriptor-bound NodeAccessBindingFacetV1 and durable preexisting DigitalOceanSshKeyBindingV1 with no V1 key creation or generated legacy key name
   dependencies: []
   status: present
   status_history:
@@ -16530,11 +16533,11 @@ artifacts:
   - present
   gates:
     source:
-    - id: zero_digitalocean_process_cached_ssh_key_lookup_or_create_effect
+    - id: zero_digitalocean_legacy_ssh_key_name_cache_lookup_or_create_effect
       satisfied: false
       evidence: []
     test:
-    - id: digitalocean_preexisting_ssh_key_unique_binding_revalidation_missing_duplicate_stale_and_no_create_conformance
+    - id: digitalocean_preexisting_ssh_key_unique_binding_revalidation_missing_duplicate_stale_no_generated_name_and_no_create_conformance
       satisfied: false
       evidence: []
     telemetry:
