@@ -18,7 +18,10 @@ def _provision_record(
     head_instance_id: str = 'i-head',
     resumed_instance_ids: list[str] | None = None,
     created_instance_ids: list[str] | None = None,
+    include_identity: bool = True,
 ) -> provision_common.ProvisionRecord:
+    created_ids = (['i-head']
+                   if created_instance_ids is None else created_instance_ids)
     return provision_common.ProvisionRecord(
         provider_name=provider_name,
         region='us-east-1',
@@ -26,7 +29,14 @@ def _provision_record(
         cluster_name=cluster_name,
         head_instance_id=head_instance_id,
         resumed_instance_ids=(resumed_instance_ids or []),
-        created_instance_ids=(created_instance_ids or ['i-worker', 'i-head']))
+        created_instance_ids=created_ids,
+        fresh_aws_instance_identity=(provision_common.AWSInstanceIdentity(
+            aws_account_id='123456789012',
+            region='us-east-1',
+            availability_zone='us-east-1a',
+            ec2_instance_id=head_instance_id,
+            instance_type='g6.xlarge',
+            market_type='on_demand') if include_identity else None))
 
 
 def _evidence(
@@ -40,9 +50,12 @@ def _evidence(
         'cluster_name_on_cloud': 'provider-cluster',
         'cluster_hash': 'cluster-generation-1',
         'provider_name': 'aws',
-        'requested_node_count': 2,
+        'requested_node_count': 1,
         'service_name': 'boltz-l4-fleet',
         'service_hash': 'service-hash-1',
+        'cloud_user_identity': ['aws-user-id', '123456789012'],
+        'catalog_instance_type': 'g6.xlarge',
+        'catalog_memory_gib': 16.0,
         'cluster_existed': False,
         'dryrun': False,
         'provisioning_skipped': False,
@@ -55,16 +68,22 @@ def _evidence(
 def test_fresh_provision_evidence_is_immutable_and_canonical():
     evidence = _evidence()
 
-    assert evidence.created_instance_ids == ('i-head', 'i-worker')
+    assert evidence.created_instance_ids == ('i-head',)
+    assert evidence.provision_owner_identity == ('aws-user-id', '123456789012')
     with pytest.raises(dataclasses.FrozenInstanceError):
         evidence.cluster_hash = 'changed'  # type: ignore[misc]
 
 
+def test_fresh_provision_evidence_preserves_empty_workspace_text():
+    assert _evidence(workspace='').workspace == ''
+
+
 @pytest.mark.parametrize(('record', 'overrides'), [
     (_provision_record(resumed_instance_ids=['i-head']), {}),
-    (_provision_record(created_instance_ids=['i-head']), {}),
+    (_provision_record(created_instance_ids=[]), {}),
     (_provision_record(created_instance_ids=['i-head', 'i-head']), {}),
     (_provision_record(head_instance_id='i-missing'), {}),
+    (_provision_record(include_identity=False), {}),
     (_provision_record(provider_name='gcp'), {}),
     (_provision_record(cluster_name='other'), {}),
     (_provision_record(), {
@@ -78,6 +97,15 @@ def test_fresh_provision_evidence_is_immutable_and_canonical():
     }),
     (_provision_record(), {
         'requested_node_count': True
+    }),
+    (_provision_record(), {
+        'requested_node_count': 2
+    }),
+    (_provision_record(), {
+        'cloud_user_identity': None
+    }),
+    (_provision_record(), {
+        'cloud_user_identity': ['aws-user-id', '999999999999']
     }),
 ])
 def test_fresh_provision_evidence_rejects_ambiguous_results(record, overrides):

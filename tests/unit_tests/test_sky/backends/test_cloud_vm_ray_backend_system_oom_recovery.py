@@ -23,25 +23,79 @@ _IMAGE_DIGEST = 'sha256:' + 'a' * 64
 _PINNED_IMAGE = f'example.invalid/model@{_IMAGE_DIGEST}'
 _SERVICE_NAME = 'boltz-l4-fleet'
 _SERVICE_HASH = 'service-hash-1'
+_OWNER_IDENTITY = ('aws-user-id', '123456789012')
 
 
 def _task() -> sky.Task:
-    task = sky.Task(run=f'exec docker run --rm {_PINNED_IMAGE}',
-                    envs={'MODEL': 'boltz'})
+    task = sky.Task(run=_owned_spec().render(), envs={'MODEL': 'boltz'})
     task.set_resources(sky.Resources(instance_type='g2-standard-4'))
     return task
 
 
-def _context(*, include_contract: bool = True) -> dict[str, object]:
-    context: dict[str, object] = {
-        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: _SERVICE_NAME,
-        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: _SERVICE_HASH,
-        serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY: 'boltz-l4-v1',
-        serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY: 1,
+def _owned_spec() -> runtime_recovery.OwnedContainerSpec:
+    return runtime_recovery.OwnedContainerSpec(image=_PINNED_IMAGE)
+
+
+def _authorization(task: sky.Task) -> dict[str, object]:
+    spec = _owned_spec()
+    return {
+        'authorization_version': 3,
+        'profile_id': 'boltz-l4-v3',
+        'workspace': 'default',
+        'service_name': _SERVICE_NAME,
+        'service_hash': _SERVICE_HASH,
+        'task_sha256': serve_recovery.safety_profile_digest(task),
+        'runtime_image_digest': _IMAGE_DIGEST,
+        'runtime_profile_version': 2,
+        'required_runtime_capability': runtime_recovery.CAPABILITY_V2,
+        'owned_container_spec': spec.to_dict(),
+        'owned_container_spec_sha256': serve_recovery._sha256_json(  # pylint: disable=protected-access
+            spec.to_dict()),
+        'execution_envelope_sha256': serve_recovery._sha256_json(  # pylint: disable=protected-access
+            runtime_recovery.RecoveryExecutionEnvelope.standard().to_dict()),
+        'resource_envelope': {
+            'provider': 'aws',
+            'allowed_aws_account_ids': ['123456789012'],
+            'allowed_locations': [{
+                'region': 'us-east-1',
+                'availability_zones': ['us-east-1a'],
+            }],
+            'allowed_market_types': ['on_demand', 'spot'],
+            'allowed_instance_types': ['g6.xlarge'],
+            'max_host_memory_gib': 16,
+            'num_nodes': 1,
+            'dedicated': True,
+            'require_new_create': True,
+            'required_identity': [
+                'aws_account_id', 'region', 'availability_zone',
+                'ec2_instance_id'
+            ],
+        },
     }
-    if include_contract:
-        context[serve_constants.
-                SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY] = 1
+
+
+def _context(*, include_contract: bool = True) -> dict[str, object]:
+    trusted = serve_recovery._authorization_v3_from_dict(  # pylint: disable=protected-access
+        _authorization(_task()))
+    requested = serve_recovery.RequestedRecoveryAuthorizationV3.from_authorization(
+        trusted)
+    intent = requested.to_intent_fields()
+    intent.update({
+        'service_hash': _SERVICE_HASH,
+        'replica_id': 7,
+        'launch_generation': 2,
+        'launch_nonce': 'b' * 64,
+    })
+    context = serve_recovery.create_unbound_launch_context(
+        intent,
+        service_name=_SERVICE_NAME,
+        service_version=4,
+        controller_pid=123,
+        controller_ip='10.0.0.2')
+    context = serve_recovery.bind_launch_context(context, 'request-1')
+    if not include_contract:
+        context.pop(
+            serve_constants.SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY)
     return context
 
 
@@ -49,15 +103,8 @@ def _install_profile(monkeypatch, task: sky.Task) -> None:
     monkeypatch.setenv(
         serve_constants.SYSTEM_OOM_RECOVERY_PROFILES_ENV_VAR,
         json.dumps({
-            'version': 1,
-            'profiles': [{
-                'profile_id': 'boltz-l4-v1',
-                'workspace': 'default',
-                'service_name': _SERVICE_NAME,
-                'service_hash': _SERVICE_HASH,
-                'task_digest': serve_recovery.safety_profile_digest(task),
-                'runtime_image_digest': _IMAGE_DIGEST,
-            }],
+            'version': 3,
+            'profiles': [_authorization(task)],
         }))
 
 
@@ -91,7 +138,10 @@ def _handle(*,
         cluster_name_on_cloud=cluster_name_on_cloud,
         launched_nodes=launched_nodes,
         num_ips_per_node=num_ips_per_node,
-        launched_resources=types.SimpleNamespace(cloud=provider),
+        launched_resources=types.SimpleNamespace(cloud=provider,
+                                                 instance_type='g6.xlarge',
+                                                 region='us-east-1',
+                                                 zone='us-east-1a'),
         cached_cluster_info=cluster_info or _cluster_info(),
         provision_runtime_metadata=types.SimpleNamespace(has_ray=True,
                                                          has_job_queue=True))
@@ -108,6 +158,13 @@ def _evidence(**overrides) -> backend_recovery.FreshProvisionEvidence:
         'requested_node_count': 1,
         'head_instance_id': 'i-head',
         'created_instance_ids': ('i-head',),
+        'aws_account_id': '123456789012',
+        'provision_owner_identity': _OWNER_IDENTITY,
+        'region': 'us-east-1',
+        'availability_zone': 'us-east-1a',
+        'instance_type': 'g6.xlarge',
+        'market_type': 'on_demand',
+        'catalog_memory_gib': 16.0,
         'service_name': _SERVICE_NAME,
         'service_hash': _SERVICE_HASH,
     }
@@ -167,7 +224,7 @@ def _decide(backend: cloud_vm_ray_backend.CloudVmRayBackend, handle,
             task: sky.Task):
     with backend._system_oom_recovery_submission_lock:  # pylint: disable=protected-access
         return backend._consume_system_oom_recovery_plan_no_lock(  # pylint: disable=protected-access
-            handle, task)
+            handle, task, 7)
 
 
 @pytest.fixture(autouse=True)
@@ -177,37 +234,53 @@ def _request_and_generation(monkeypatch):
     monkeypatch.setattr(cloud_vm_ray_backend.global_user_state,
                         'get_cluster_hash_for_name',
                         lambda _: 'cluster-generation-1')
+    monkeypatch.setattr(
+        cloud_vm_ray_backend.global_user_state, 'get_cluster_from_name',
+        lambda *_args, **_kwargs: {
+            'cluster_hash': 'cluster-generation-1',
+            'owner': list(_OWNER_IDENTITY),
+        })
+    monkeypatch.setattr(clouds.AWS, 'get_vcpus_mem_from_instance_type',
+                        lambda _self, _instance_type: (4.0, 16.0))
 
 
-def test_exact_profile_and_handle_produce_typed_launch_plan(monkeypatch):
+@pytest.mark.parametrize('market_type', ['on_demand', 'spot'])
+def test_exact_profile_and_handle_produce_typed_launch_plan(
+        monkeypatch, market_type):
     task = _task()
     _install_profile(monkeypatch, task)
     backend = _backend()
-    alias = _bind(backend, _evidence())
+    alias = _bind(backend, _evidence(market_type=market_type))
 
     plan = _decide(backend, _handle(), task)
 
-    assert plan == runtime_recovery.RecoveryLaunchPlan.direct_shell()
-    assert plan.capability == runtime_recovery.CAPABILITY_V1
+    assert plan == runtime_recovery.RecoveryLaunchPlan.owned_container(
+        _owned_spec())
+    assert plan.capability == runtime_recovery.CAPABILITY_V2
     assert alias.take() is None
 
 
 def test_provisioner_moves_exact_record_into_one_shot_lease():
     provisioner = _provisioner()
-    record = provision_common.ProvisionRecord(provider_name='aws',
-                                              region='us-east-1',
-                                              zone='us-east-1a',
-                                              cluster_name='provider-cluster',
-                                              head_instance_id='i-head',
-                                              resumed_instance_ids=[],
-                                              created_instance_ids=['i-head'])
+    record = provision_common.ProvisionRecord(
+        provider_name='aws',
+        region='us-east-1',
+        zone='us-east-1a',
+        cluster_name='provider-cluster',
+        head_instance_id='i-head',
+        resumed_instance_ids=[],
+        created_instance_ids=['i-head'],
+        fresh_aws_instance_identity=(provision_common.AWSInstanceIdentity(
+            '123456789012', 'us-east-1', 'us-east-1a', 'i-head', 'g6.xlarge',
+            'on_demand')))
 
     provisioner._record_fresh_provision_evidence(  # pylint: disable=protected-access
         record,
         _handle(),
         requested_node_count=1,
         cluster_existed=False,
-        dryrun=False)
+        dryrun=False,
+        cloud_user_identity=list(_OWNER_IDENTITY))
     lease = provisioner.release_fresh_provision_evidence_lease()
 
     assert lease is not None
@@ -220,20 +293,25 @@ def test_provisioner_moves_exact_record_into_one_shot_lease():
 
 def test_provisioner_repeated_record_invalidates_the_first_lease():
     provisioner = _provisioner()
-    record = provision_common.ProvisionRecord(provider_name='aws',
-                                              region='us-east-1',
-                                              zone='us-east-1a',
-                                              cluster_name='provider-cluster',
-                                              head_instance_id='i-head',
-                                              resumed_instance_ids=[],
-                                              created_instance_ids=['i-head'])
+    record = provision_common.ProvisionRecord(
+        provider_name='aws',
+        region='us-east-1',
+        zone='us-east-1a',
+        cluster_name='provider-cluster',
+        head_instance_id='i-head',
+        resumed_instance_ids=[],
+        created_instance_ids=['i-head'],
+        fresh_aws_instance_identity=(provision_common.AWSInstanceIdentity(
+            '123456789012', 'us-east-1', 'us-east-1a', 'i-head', 'g6.xlarge',
+            'on_demand')))
 
     provisioner._record_fresh_provision_evidence(  # pylint: disable=protected-access
         record,
         _handle(),
         requested_node_count=1,
         cluster_existed=False,
-        dryrun=False)
+        dryrun=False,
+        cloud_user_identity=list(_OWNER_IDENTITY))
     first_alias = provisioner._fresh_provision_evidence_lease  # pylint: disable=protected-access
     assert first_alias is not None
 
@@ -242,7 +320,8 @@ def test_provisioner_repeated_record_invalidates_the_first_lease():
         _handle(),
         requested_node_count=1,
         cluster_existed=False,
-        dryrun=False)
+        dryrun=False,
+        cloud_user_identity=list(_OWNER_IDENTITY))
 
     assert first_alias.take() is None
     assert provisioner.release_fresh_provision_evidence_lease() is not None
@@ -250,13 +329,17 @@ def test_provisioner_repeated_record_invalidates_the_first_lease():
 
 def test_optional_evidence_failure_does_not_fail_provisioning(monkeypatch):
     provisioner = _provisioner()
-    record = provision_common.ProvisionRecord(provider_name='aws',
-                                              region='us-east-1',
-                                              zone='us-east-1a',
-                                              cluster_name='provider-cluster',
-                                              head_instance_id='i-head',
-                                              resumed_instance_ids=[],
-                                              created_instance_ids=['i-head'])
+    record = provision_common.ProvisionRecord(
+        provider_name='aws',
+        region='us-east-1',
+        zone='us-east-1a',
+        cluster_name='provider-cluster',
+        head_instance_id='i-head',
+        resumed_instance_ids=[],
+        created_instance_ids=['i-head'],
+        fresh_aws_instance_identity=(provision_common.AWSInstanceIdentity(
+            '123456789012', 'us-east-1', 'us-east-1a', 'i-head', 'g6.xlarge',
+            'on_demand')))
     monkeypatch.setattr(
         backend_recovery.FreshProvisionEvidence, 'from_provision_record',
         mock.MagicMock(side_effect=RuntimeError('optional evidence failure')))
@@ -266,7 +349,8 @@ def test_optional_evidence_failure_does_not_fail_provisioning(monkeypatch):
         _handle(),
         requested_node_count=1,
         cluster_existed=False,
-        dryrun=False)
+        dryrun=False,
+        cloud_user_identity=list(_OWNER_IDENTITY))
 
     assert provisioner.release_fresh_provision_evidence_lease() is None
 
@@ -277,13 +361,17 @@ def test_provisioner_does_not_create_ambiguous_evidence(failure_kind):
     provisioner = _provisioner()
     created_ids = [] if failure_kind == 'partial' else ['i-head']
     resumed_ids = ['i-head'] if failure_kind == 'resumed' else []
-    record = provision_common.ProvisionRecord(provider_name='aws',
-                                              region='us-east-1',
-                                              zone='us-east-1a',
-                                              cluster_name='provider-cluster',
-                                              head_instance_id='i-head',
-                                              resumed_instance_ids=resumed_ids,
-                                              created_instance_ids=created_ids)
+    record = provision_common.ProvisionRecord(
+        provider_name='aws',
+        region='us-east-1',
+        zone='us-east-1a',
+        cluster_name='provider-cluster',
+        head_instance_id='i-head',
+        resumed_instance_ids=resumed_ids,
+        created_instance_ids=created_ids,
+        fresh_aws_instance_identity=(provision_common.AWSInstanceIdentity(
+            '123456789012', 'us-east-1', 'us-east-1a', 'i-head', 'g6.xlarge',
+            'on_demand')))
     if failure_kind == 'legacy':
         provisioner._workload_type = 'cluster'  # pylint: disable=protected-access
 
@@ -292,7 +380,8 @@ def test_provisioner_does_not_create_ambiguous_evidence(failure_kind):
         _handle(),
         requested_node_count=1,
         cluster_existed=failure_kind == 'existing',
-        dryrun=failure_kind == 'dryrun')
+        dryrun=failure_kind == 'dryrun',
+        cloud_user_identity=list(_OWNER_IDENTITY))
 
     assert provisioner.release_fresh_provision_evidence_lease() is None
 
@@ -316,7 +405,7 @@ def test_first_submission_decision_does_not_assume_job_id_one(monkeypatch):
     assert backend._execute(handle, task) == 73  # pylint: disable=protected-access
     assert execute_one.call_args.args[2] == 73
     assert (execute_one.call_args.kwargs['recovery_plan'] ==
-            runtime_recovery.RecoveryLaunchPlan.direct_shell())
+            runtime_recovery.RecoveryLaunchPlan.owned_container(_owned_spec()))
 
 
 def test_concurrent_submission_decisions_share_one_consumption(monkeypatch):
@@ -331,7 +420,7 @@ def test_concurrent_submission_decisions_share_one_consumption(monkeypatch):
             executor.map(lambda _: _decide(backend, handle, task), range(2)))
 
     assert results.count(
-        runtime_recovery.RecoveryLaunchPlan.direct_shell()) == 1
+        runtime_recovery.RecoveryLaunchPlan.owned_container(_owned_spec())) == 1
     assert results.count(None) == 1
 
 
@@ -392,16 +481,47 @@ def test_matcher_exception_consumes_lease_and_fails_closed(monkeypatch):
     assert alias.take() is None
 
 
+def test_missing_v3_evidence_records_bounded_evidence_loss(monkeypatch):
+    backend = _backend()
+    record = mock.MagicMock()
+    monkeypatch.setattr(cloud_vm_ray_backend.system_oom_recovery_observability,
+                        'record', record)
+
+    assert _decide(backend, _handle(), _task()) is None
+    record.assert_called_once_with('evidence_lost',
+                                   provider='aws',
+                                   market='unknown')
+
+
+def test_actual_catalog_memory_above_envelope_is_ordinary(monkeypatch):
+    task = _task()
+    _install_profile(monkeypatch, task)
+    backend = _backend()
+    record = mock.MagicMock()
+    monkeypatch.setattr(cloud_vm_ray_backend.system_oom_recovery_observability,
+                        'record', record)
+    monkeypatch.setattr(clouds.AWS, 'get_vcpus_mem_from_instance_type',
+                        lambda _self, _instance_type: (4.0, 32.0))
+    alias = _bind(backend, _evidence(catalog_memory_gib=32.0))
+
+    assert _decide(backend, _handle(), task) is None
+    assert alias.take() is None
+    record.assert_called_once_with('authorization_v3_ordinary',
+                                   provider='aws',
+                                   market='on_demand')
+
+
 @pytest.mark.parametrize('changed_evidence', [
     _evidence(request_id='other-request'),
     _evidence(workspace='other-workspace'),
     _evidence(cluster_name='other-cluster'),
     _evidence(cluster_name_on_cloud='other-provider-cluster'),
     _evidence(cluster_hash='other-generation'),
-    _evidence(provider_name='gcp'),
-    _evidence(requested_node_count=2,
-              head_instance_id='i-head',
-              created_instance_ids=('i-head', 'i-worker')),
+    _evidence(aws_account_id='999999999999',
+              provision_owner_identity=('other-user', '999999999999')),
+    _evidence(provision_owner_identity=('other-user', '123456789012')),
+    _evidence(region='us-west-2'),
+    _evidence(instance_type='g5.xlarge'),
     _evidence(head_instance_id='i-worker', created_instance_ids=('i-worker',)),
     _evidence(service_name='other-service'),
     _evidence(service_hash='other-service-hash'),
@@ -411,6 +531,22 @@ def test_every_evidence_identity_is_revalidated(monkeypatch, changed_evidence):
     _install_profile(monkeypatch, task)
     backend = _backend()
     alias = _bind(backend, changed_evidence)
+
+    assert _decide(backend, _handle(), task) is None
+    assert alias.take() is None
+
+
+def test_persisted_cluster_owner_must_match_provision_owner(monkeypatch):
+    task = _task()
+    _install_profile(monkeypatch, task)
+    backend = _backend()
+    alias = _bind(backend, _evidence())
+    monkeypatch.setattr(
+        cloud_vm_ray_backend.global_user_state, 'get_cluster_from_name',
+        lambda *_args, **_kwargs: {
+            'cluster_hash': 'cluster-generation-1',
+            'owner': ['different-user', '123456789012'],
+        })
 
     assert _decide(backend, _handle(), task) is None
     assert alias.take() is None

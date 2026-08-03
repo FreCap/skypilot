@@ -103,6 +103,8 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/api/internal/serve/{service_name}/controller/load_balancer_role',
      'POST'),
     ('/api/internal/serve/{service_name}/controller/'
+     'system_recovery_route_lease', 'POST'),
+    ('/api/internal/serve/{service_name}/controller/'
      'load_balancer_request_history_sync', 'POST'),
     # --- Volumes writes ---
     ('/volumes/apply', 'POST'),

@@ -15,6 +15,7 @@ counts needed by that one read are also computed from one shared table scan.
 These tests fail on the pre-fix code (the per-replica predicate has no
 ``in_flight`` parameter and the loop scans K times) and pass after it.
 """
+# pylint: disable=protected-access,unnecessary-lambda
 import threading
 from unittest import mock
 
@@ -50,6 +51,17 @@ def _pending_replica(replica_id: int) -> replica_managers.ReplicaInfo:
                                         location=None,
                                         version=1,
                                         resources_override=None)
+
+
+def _existing_replica_writer(replicas):
+
+    def _write(_service_name, replica_id, info, *, expected_replica_exists,
+               **_fence_kwargs):
+        assert expected_replica_exists is True
+        replicas[replica_id] = info
+        return True
+
+    return _write
 
 
 def _build_manager(num_launching: int):
@@ -88,7 +100,7 @@ def test_refresh_thread_pool_scans_budget_once_per_tick(monkeypatch, tmp_path):
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas.values()))
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
-                        lambda svc, rid, info: replicas.__setitem__(rid, info))
+                        _existing_replica_writer(replicas))
     # Ample budget so every pending replica is allowed to launch; also avoids
     # the memory-probing path inside _get_request_parallelism.
     monkeypatch.setattr(controller_utils, '_get_request_parallelism',
@@ -133,7 +145,7 @@ def test_down_admission_is_capped_and_uses_hoisted_budget(
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas.values()))
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
-                        lambda svc, rid, info: replicas.__setitem__(rid, info))
+                        _existing_replica_writer(replicas))
     monkeypatch.setattr(controller_utils, '_get_request_parallelism',
                         lambda pool: 10_000)
     monkeypatch.setattr(replica_managers, '_MAX_CONCURRENT_DOWNS_PER_SERVICE',
@@ -199,7 +211,7 @@ def test_refresh_thread_pool_batches_replica_row_reads(monkeypatch, tmp_path):
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas.values()))
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
-                        lambda svc, rid, info: replicas.__setitem__(rid, info))
+                        _existing_replica_writer(replicas))
     monkeypatch.setattr(controller_utils, '_get_request_parallelism',
                         lambda pool: 10_000)
     monkeypatch.setattr(controller_utils, 'get_resources_lock_path',

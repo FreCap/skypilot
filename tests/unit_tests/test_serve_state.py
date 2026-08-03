@@ -22,8 +22,12 @@ from sqlalchemy.dialects import postgresql
 
 from sky import clouds
 from sky.serve import constants as serve_constants
+from sky.serve import paid_capacity
+from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import system_oom_recovery
+from sky.serve import system_recovery_state as recovery_state
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
@@ -161,6 +165,95 @@ def _insert_orphan_service_row(engine, name: str, pool: bool = False):
             hash='orphan',
             entrypoint='entry'))
         session.commit()
+
+
+def test_system_recovery_persistence_fails_closed_on_sqlite(_mock_serve_db):
+    assert not serve_state.system_recovery_persistence_available()
+    with pytest.raises(serve_state.ReplicaSystemRecoveryMutationRejected,
+                       match='PostgreSQL'):
+        serve_state.patch_replica_system_recovery(
+            'svc',
+            1,
+            _replica(1),
+            expected_service_hash='hash',
+            expected_lifecycle_epoch=1,
+            expected_controller_owner=(123, '10.0.0.1'),
+            expected_revision=0)
+
+
+def test_system_recovery_transaction_advances_revision_once(
+        _mock_serve_db, monkeypatch):
+    """Exercise the reducer transaction independent of PostgreSQL syntax."""
+    engine = _mock_serve_db
+    owner = (123, '10.0.0.1')
+    with engine.begin() as connection:
+        connection.execute(
+            serve_state.service_lifecycle_fences_table.insert().values(
+                name='svc', epoch=1))
+    assert _add_minimal_service('svc',
+                                controller_pid=owner[0],
+                                controller_ip=owner[1],
+                                service_hash='service-hash',
+                                lifecycle_epoch=1,
+                                workspace='default')
+    ordinary = _replica(7, version=3)
+    assert serve_state.add_or_update_replica(
+        'svc',
+        7,
+        ordinary,
+        expected_service_hash='service-hash',
+        expected_lifecycle_epoch=1,
+        expected_controller_owner=owner)
+
+    # PostgreSQL row-lock behavior is covered in the real-PG companion suite.
+    # Bypass only the dialect admission guard here to keep transition logic
+    # executable on every developer machine.
+    monkeypatch.setattr(serve_state, '_require_system_recovery_postgres',
+                        lambda: engine)
+    digest = 'a' * 64
+    intent = recovery_state.SystemRecoveryLaunchIntent(
+        version=1,
+        controller_contract_version=2,
+        recovery_authorization_version=3,
+        recovery_authorization_profile_id='boltz-l4-v3',
+        recovery_authorization_sha256=digest,
+        runtime_profile_version=2,
+        expected_runtime_capability=recovery_state.SYSTEM_RECOVERY_CAPABILITY,
+        service_hash='service-hash',
+        replica_id=7,
+        launch_generation=7,
+        launch_nonce='b' * 64,
+        workspace='default',
+        resource_envelope_sha256=digest,
+        task_sha256=digest,
+        runtime_image_digest=f'sha256:{digest}',
+        owned_container_spec_sha256=digest,
+        execution_envelope_sha256=digest)
+    desired = serve_state.get_replica_info_from_id('svc', 7)
+    assert desired is not None
+    desired.system_recovery_launch_intent = intent
+    desired.system_recovery_disposition = (
+        recovery_state.SystemRecoveryDisposition.CANDIDATE)
+    candidate = serve_state.create_replica_system_recovery_candidate(
+        'svc',
+        7,
+        desired,
+        expected_service_hash='service-hash',
+        expected_lifecycle_epoch=1,
+        expected_controller_owner=owner,
+        expected_revision=0)
+    assert candidate.system_recovery_revision == 1
+
+    unbound = system_oom_recovery.create_unbound_launch_context(
+        intent,
+        service_name='svc',
+        service_version=3,
+        controller_pid=owner[0],
+        controller_ip=owner[1])
+    bound = serve_state.bind_replica_system_recovery_launch_request(
+        unbound, 'request-1')
+    assert bound.launch_request_id == 'request-1'
+    assert bound.system_recovery_revision == 2
 
 
 def test_placement_policy_state_is_separate_and_owner_fenced(_mock_serve_db):
@@ -505,7 +598,7 @@ def test_replica_teardown_snapshot_rejects_divergent_physical_column(
         serve_state.get_replica_info_with_resource_action_identity('svc', 1)
 
 
-def test_all_generic_replica_upserts_preserve_action_owned_columns(
+def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
         _mock_serve_db):
     service_hash = 'incarnation-a'
     _add_minimal_service('svc', service_hash=service_hash)
@@ -542,28 +635,37 @@ def test_all_generic_replica_upserts_preserve_action_owned_columns(
                     replica_id).values(**action_values))
             session.commit()
 
-    # Ordinary and batch persistence use different statement builders.
-    assert serve_state.add_or_update_replica('svc', 1, _replica(1, version=2))
-    assert serve_state.add_or_update_replicas('svc',
-                                              [(2, _replica(2, version=2))])
+    # Ordinary and batch bookkeeping use different UPDATE builders.
+    first = serve_state.get_replica_info_from_id('svc', 1)
+    second = serve_state.get_replica_info_from_id('svc', 2)
+    assert first is not None and second is not None
+    first.version = 2
+    second.version = 2
+    assert serve_state.add_or_update_replica('svc',
+                                             1,
+                                             first,
+                                             expected_replica_exists=True)
+    assert serve_state.add_or_update_replicas('svc', [(2, second)],
+                                              expected_replica_exists=True)
 
-    # Paid-capacity admission persists the replica and claim atomically.
-    assert serve_state.try_add_replica_with_paid_capacity_claim(
-        'svc',
-        service_hash,
-        3,
-        _replica(3, version=2),
-        pool_key='test-paid-pool',
-        priority=1,
-        base_limit=1,
-        max_limit=2,
-        now=100.0,
-        success_ttl_seconds=60.0,
-        waiter_ttl_seconds=60.0,
-        expected_controller_owner=None) == 'acquired'
+    # Paid-capacity admission is INSERT-only and cannot adopt an action row.
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            service_hash,
+            3,
+            _replica(3, version=2),
+            pool_key='test-paid-pool',
+            priority=1,
+            base_limit=1,
+            max_limit=2,
+            now=100.0,
+            success_ttl_seconds=60.0,
+            waiter_ttl_seconds=60.0,
+            expected_controller_owner=None)
 
-    # Reserved-fill admission has separate PostgreSQL and SQLite upsert
-    # statements. This fixture exercises the SQLite INSERT ... SELECT path.
+    # Reserved-fill admission is also INSERT-only. This exercises SQLite's
+    # conditional INSERT ... SELECT path against a conflicting key.
     with orm.Session(_mock_serve_db) as session:
         session.execute(serve_state.reserved_fill_claims_table.insert().values(
             service_name='svc',
@@ -574,11 +676,12 @@ def test_all_generic_replica_upserts_preserve_action_owned_columns(
             holdings_fill=1,
             heartbeat_ts=100.0))
         session.commit()
-    assert serve_state.add_replica_if_round_epoch('svc',
-                                                  4,
-                                                  _replica(4, version=2),
-                                                  pool_key='test-fill-pool',
-                                                  expected_epoch=1)
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        serve_state.add_replica_if_round_epoch('svc',
+                                               4,
+                                               _replica(4, version=2),
+                                               pool_key='test-fill-pool',
+                                               expected_epoch=1)
 
     with orm.Session(_mock_serve_db) as session:
         rows = session.execute(
@@ -1728,10 +1831,11 @@ class TestServiceLifecycleEpoch:
                                     service_hash='incarnation-a',
                                     lifecycle_epoch=epoch_a,
                                     resource_scope='incarnation-a')
+        replica_a = _replica(1, cluster_name='replica-a')
         assert serve_state.add_or_update_replica(
             'svc',
             1,
-            _replica(1, cluster_name='replica-a'),
+            replica_a,
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch_a)
 
@@ -1754,11 +1858,13 @@ class TestServiceLifecycleEpoch:
             'svc',
             1,
             expected_service_hash='incarnation-a',
-            expected_lifecycle_epoch=epoch_delete)
+            expected_lifecycle_epoch=epoch_delete,
+            expected_replica_record_id=replica_a.replica_record_id)
         assert not serve_state.remove_replicas(
             'svc', [1],
             expected_service_hash='incarnation-a',
-            expected_lifecycle_epoch=epoch_delete)
+            expected_lifecycle_epoch=epoch_delete,
+            expected_replica_record_ids={1: replica_a.replica_record_id})
         replica = serve_state.get_replica_info_from_id('svc', 1)
         assert replica is not None
         assert replica.cluster_name == 'replica-b'
@@ -1774,7 +1880,9 @@ class TestServiceLifecycleEpoch:
         assert serve_state.remove_replica('svc',
                                           99,
                                           expected_service_hash='incarnation-a',
-                                          expected_lifecycle_epoch=epoch)
+                                          expected_lifecycle_epoch=epoch,
+                                          expected_replica_record_id=str(
+                                              uuid.uuid4()))
 
     def test_exact_owner_bulk_replica_cleanup_is_atomic_and_idempotent(
             self, _mock_serve_db):
@@ -1786,11 +1894,14 @@ class TestServiceLifecycleEpoch:
                                     resource_scope='incarnation-a',
                                     controller_pid=owner[0],
                                     controller_ip=owner[1])
+        expected_record_ids = {}
         for replica_id in range(1200):
+            info = _replica(replica_id)
+            expected_record_ids[replica_id] = info.replica_record_id
             assert serve_state.add_or_update_replica(
                 'svc',
                 replica_id,
-                _replica(replica_id),
+                info,
                 expected_service_hash='incarnation-a',
                 expected_lifecycle_epoch=epoch)
 
@@ -1799,14 +1910,16 @@ class TestServiceLifecycleEpoch:
             list(range(1200)),
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch,
-            expected_controller_owner=(456, '10.0.0.2'))
+            expected_controller_owner=(456, '10.0.0.2'),
+            expected_replica_record_ids=expected_record_ids)
         assert len(serve_state.get_replica_infos('svc')) == 1200
         assert serve_state.remove_replicas(
             'svc',
             list(range(1200)),
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch,
-            expected_controller_owner=owner)
+            expected_controller_owner=owner,
+            expected_replica_record_ids=expected_record_ids)
         assert serve_state.get_replica_infos('svc') == []
         assert _read_row(_mock_serve_db, 'svc') is not None
         assert _read_version_row(_mock_serve_db, 'svc', 1) is not None
@@ -1815,7 +1928,8 @@ class TestServiceLifecycleEpoch:
             list(range(1200)),
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch,
-            expected_controller_owner=owner)
+            expected_controller_owner=owner,
+            expected_replica_record_ids=expected_record_ids)
 
     def test_stale_recovery_script_and_version_claims_fail(
             self, _mock_serve_db):
@@ -3131,9 +3245,15 @@ class TestBatchReplicaUpsert:
         }
         assert all(rows[i].version == 1 for i in range(1, 4))
 
-        # Conflict path: same keys must update in place, not duplicate.
-        updated = [(i, _replica(i, version=2)) for i in range(1, 4)]
-        serve_state.add_or_update_replicas('svc', updated)
+        # Bookkeeping carries each immutable record identity and updates in
+        # place without an insert-capable conflict path.
+        updated = []
+        for replica_id, info in rows.items():
+            info.version = 2
+            updated.append((replica_id, info))
+        serve_state.add_or_update_replicas('svc',
+                                           updated,
+                                           expected_replica_exists=True)
         assert all(
             serve_state.get_replica_info_from_id('svc', i).version == 2
             for i in range(1, 4))
@@ -3163,6 +3283,336 @@ class TestBatchReplicaUpsert:
         infos = [(i, _replica(i)) for i in range(1, 91)]
         serve_state.add_or_update_replicas('svc', infos)
         assert len(serve_state.get_replica_infos('svc')) == 90
+
+
+class TestExpectedExistingReplicaPersistence:
+    """Terminal deletes are absorbing for stale bookkeeping snapshots."""
+
+    def test_delete_first_rejects_stale_single_update(self, _mock_serve_db):
+        assert serve_state.add_or_update_replica('svc', 1, _replica(1))
+        stale = serve_state.get_replica_info_from_id('svc', 1)
+        assert stale is not None
+        stale.version = 2
+
+        assert serve_state.remove_replica(
+            'svc', 1, expected_replica_record_id=stale.replica_record_id)
+        assert not serve_state.add_or_update_replica(
+            'svc', 1, stale, expected_replica_exists=True)
+        assert serve_state.get_replica_info_from_id('svc', 1) is None
+
+    def test_delete_first_rejects_entire_stale_batch(self, _mock_serve_db):
+        assert serve_state.add_or_update_replicas('svc', [(1, _replica(1)),
+                                                          (2, _replica(2))])
+        stale = serve_state.get_replica_info_from_id('svc', 1)
+        survivor_update = serve_state.get_replica_info_from_id('svc', 2)
+        assert stale is not None and survivor_update is not None
+        stale.version = 2
+        survivor_update.version = 2
+        assert serve_state.remove_replica(
+            'svc', 1, expected_replica_record_id=stale.replica_record_id)
+
+        assert not serve_state.add_or_update_replicas(
+            'svc', [(1, stale), (2, survivor_update)],
+            expected_replica_exists=True)
+        assert serve_state.get_replica_info_from_id('svc', 1) is None
+        survivor = serve_state.get_replica_info_from_id('svc', 2)
+        assert survivor is not None
+        assert survivor.version == 1
+
+    def test_write_first_then_delete_leaves_no_row(self, _mock_serve_db):
+        assert serve_state.add_or_update_replica('svc', 1, _replica(1))
+        update = serve_state.get_replica_info_from_id('svc', 1)
+        assert update is not None
+        update.version = 2
+        assert serve_state.add_or_update_replica('svc',
+                                                 1,
+                                                 update,
+                                                 expected_replica_exists=True)
+        assert serve_state.remove_replica(
+            'svc', 1, expected_replica_record_id=update.replica_record_id)
+        assert serve_state.get_replica_info_from_id('svc', 1) is None
+
+    def test_delete_fence_rejects_malformed_and_inexact_batch_inputs(
+            self, _mock_serve_db):
+        info = _replica(1)
+        assert serve_state.add_or_update_replica('svc', 1, info)
+
+        with pytest.raises(ValueError, match='canonical UUID'):
+            serve_state.remove_replica('svc',
+                                       1,
+                                       expected_replica_record_id='INVALID')
+        with pytest.raises(ValueError, match='duplicates'):
+            serve_state.remove_replicas(
+                'svc', [1, 1],
+                expected_service_hash='incarnation-a',
+                expected_replica_record_ids={1: info.replica_record_id})
+        with pytest.raises(ValueError, match='cover every replica'):
+            serve_state.remove_replicas(
+                'svc', [],
+                expected_service_hash='incarnation-a',
+                expected_replica_record_ids={1: info.replica_record_id})
+        with pytest.raises(ValueError, match='canonical UUID'):
+            serve_state.remove_replicas(
+                'svc', [1],
+                expected_service_hash='incarnation-a',
+                expected_replica_record_ids={1: 'INVALID'})
+
+        persisted = serve_state.get_replica_info_from_id('svc', 1)
+        assert persisted is not None
+        assert persisted.replica_record_id == info.replica_record_id
+
+    def test_physical_replica_key_must_match_payload_before_writes(
+            self, _mock_serve_db):
+        with pytest.raises(ValueError, match='row key must match'):
+            serve_state.add_or_update_replica('svc', 1, _replica(2))
+        with pytest.raises(ValueError, match='row key must match'):
+            serve_state.add_or_update_replicas('svc', [(1, _replica(1)),
+                                                       (2, _replica(3))])
+        assert serve_state.get_replica_infos('svc') == []
+
+        assert _add_minimal_service('svc', service_hash='incarnation-a')
+        with pytest.raises(ValueError, match='row key must match'):
+            serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'incarnation-a',
+                1,
+                _replica(2),
+                pool_key='paid-pool',
+                priority=1,
+                base_limit=1,
+                max_limit=2,
+                now=1.0,
+                success_ttl_seconds=60.0,
+                waiter_ttl_seconds=60.0,
+                expected_controller_owner=None)
+        with orm.Session(_mock_serve_db) as session:
+            assert session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_pools_table)).first() is None
+        assert serve_state.get_replica_infos('svc') == []
+
+    def test_paid_outcomes_cannot_mutate_unfenced_extra_replica(
+            self, _mock_serve_db):
+        assert _add_minimal_service('svc', service_hash='incarnation-a')
+        first = _replica(1)
+        second = _replica(2)
+        second.paid_capacity_pool_key = 'paid-pool'
+        assert serve_state.add_or_update_replicas('svc', [(1, first),
+                                                          (2, second)])
+        update = serve_state.get_replica_info_from_id('svc', 1)
+        assert update is not None
+        update.version = 9
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                serve_state.paid_capacity_pools_table.insert().values(
+                    pool_key='paid-pool',
+                    current_limit=1,
+                    successes_since_resize=0,
+                    updated_at=1.0))
+            session.execute(
+                serve_state.paid_capacity_claims_table.insert().values(
+                    service_name='svc',
+                    service_hash='incarnation-a',
+                    replica_id=2,
+                    pool_key='paid-pool',
+                    priority=1,
+                    claimed_at=1.0))
+            session.commit()
+
+        with pytest.raises(ValueError, match='outcomes must identify'):
+            serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+                'svc',
+                'incarnation-a', [(1, update)],
+                {2: paid_capacity.LaunchOutcome.SUCCESS},
+                base_limit=1,
+                max_limit=2,
+                now=2.0,
+                success_ttl_seconds=60.0,
+                expected_controller_owner=None)
+
+        persisted = serve_state.get_replica_info_from_id('svc', 1)
+        assert persisted is not None
+        assert persisted.version == 1
+        with orm.Session(_mock_serve_db) as session:
+            claim = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table)).first()
+        assert claim is not None
+
+    def test_v12_transition_identity_can_fence_terminal_delete(
+            self, _mock_serve_db):
+        info = _replica(1)
+        info.created_at = 123.5
+        assert serve_state.add_or_update_replica('svc', 1, info)
+        with orm.Session(_mock_serve_db) as session:
+            row = session.execute(
+                sqlalchemy.select(
+                    serve_state.replicas_table.c.replica_state).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        1)).scalar_one()
+            row['replica_info_version'] = 12
+            for field_name in replica_info_lib.V13_ADDITIVE_STORAGE_FIELDS:
+                row.pop(field_name)
+            session.execute(
+                sqlalchemy.update(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id == 1).values(
+                        replica_state=row))
+            session.commit()
+
+        transitioned = serve_state.get_replica_info_from_id('svc', 1)
+        assert transitioned is not None
+        assert transitioned.replica_record_id == (
+            '5b71cc7f-a36e-5c16-a0c7-de59389ead0e')
+        assert serve_state.remove_replica(
+            'svc', 1, expected_replica_record_id=transitioned.replica_record_id)
+        assert serve_state.get_replica_info_from_id('svc', 1) is None
+
+    def test_recreated_numeric_id_rejects_stale_updates_and_deletes(
+            self, _mock_serve_db):
+        assert _add_minimal_service('svc', service_hash='incarnation-a')
+        assert serve_state.add_or_update_replicas('svc', [(1, _replica(1)),
+                                                          (2, _replica(2))])
+        stale = serve_state.get_replica_info_from_id('svc', 1)
+        survivor_update = serve_state.get_replica_info_from_id('svc', 2)
+        assert stale is not None and survivor_update is not None
+        assert serve_state.remove_replica(
+            'svc', 1, expected_replica_record_id=stale.replica_record_id)
+
+        replacement = _replica(1, version=10)
+        assert replacement.replica_record_id != stale.replica_record_id
+        assert serve_state.add_or_update_replica('svc', 1, replacement)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                serve_state.paid_capacity_pools_table.insert().values(
+                    pool_key='replacement-pool',
+                    current_limit=1,
+                    successes_since_resize=0,
+                    updated_at=1.0))
+            session.execute(
+                serve_state.paid_capacity_claims_table.insert().values(
+                    service_name='svc',
+                    service_hash='incarnation-a',
+                    replica_id=1,
+                    pool_key='replacement-pool',
+                    priority=1,
+                    claimed_at=1.0))
+            session.commit()
+        with orm.Session(_mock_serve_db) as session:
+            claim_before = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.paid_capacity_claims_table)).
+                mappings().one())
+        stale.version = 99
+        survivor_update.version = 99
+
+        assert not serve_state.add_or_update_replica(
+            'svc', 1, stale, expected_replica_exists=True)
+        assert not serve_state.add_or_update_replicas(
+            'svc', [(1, stale), (2, survivor_update)],
+            expected_replica_exists=True)
+        assert not serve_state.remove_replica(
+            'svc',
+            1,
+            expected_service_hash='incarnation-a',
+            expected_replica_record_id=stale.replica_record_id)
+        assert not serve_state.remove_replicas(
+            'svc', [1, 2],
+            expected_service_hash='incarnation-a',
+            expected_replica_record_ids={
+                1: stale.replica_record_id,
+                2: survivor_update.replica_record_id,
+            })
+        persisted = serve_state.get_replica_info_from_id('svc', 1)
+        survivor = serve_state.get_replica_info_from_id('svc', 2)
+        assert persisted is not None and survivor is not None
+        assert persisted.replica_record_id == replacement.replica_record_id
+        assert persisted.version == 10
+        assert survivor.version == 1
+        with orm.Session(_mock_serve_db) as session:
+            claim_after = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.paid_capacity_claims_table)).
+                mappings().one())
+        assert claim_after == claim_before
+
+        with orm.Session(_mock_serve_db) as session:
+            row = session.execute(
+                sqlalchemy.select(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id ==
+                    1)).mappings().one()
+        from_json = replica_managers.ReplicaInfo.from_storage_dict(
+            row['replica_state'])
+        from_pickle = pickle.loads(row['replica_info'])
+        assert from_json.replica_record_id == replacement.replica_record_id
+        assert from_pickle.replica_record_id == replacement.replica_record_id
+        assert from_pickle.to_storage_dict() == from_json.to_storage_dict()
+
+    def test_initial_single_and_batch_insert_conflicts_are_atomic(
+            self, _mock_serve_db):
+        initial = _replica(1)
+        assert serve_state.add_or_update_replica('svc', 1, initial)
+
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            serve_state.add_or_update_replica('svc', 1, _replica(1, version=2))
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            serve_state.add_or_update_replicas('svc',
+                                               [(2, _replica(2)),
+                                                (1, _replica(1, version=3))])
+
+        persisted = serve_state.get_replica_info_from_id('svc', 1)
+        assert persisted is not None
+        assert persisted.replica_record_id == initial.replica_record_id
+        assert persisted.version == 1
+        assert serve_state.get_replica_info_from_id('svc', 2) is None
+
+    def test_recreated_numeric_id_rejects_paid_capacity_completion(
+            self, _mock_serve_db):
+        del _mock_serve_db
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service('svc',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    service_hash='incarnation-a')
+        assert serve_state.add_or_update_replica(
+            'svc',
+            1,
+            _replica(1),
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner)
+        stale = serve_state.get_replica_info_from_id('svc', 1)
+        assert stale is not None
+        stale.version = 2
+        assert serve_state.remove_replica(
+            'svc',
+            1,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            expected_replica_record_id=(stale.replica_record_id))
+        replacement = _replica(1, version=10)
+        assert replacement.replica_record_id != stale.replica_record_id
+        assert serve_state.add_or_update_replica(
+            'svc',
+            1,
+            replacement,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner)
+
+        assert not serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'incarnation-a', [(1, stale)],
+            {1: paid_capacity.LaunchOutcome.SUCCESS},
+            base_limit=1,
+            max_limit=1,
+            now=1.0,
+            success_ttl_seconds=60.0,
+            expected_controller_owner=owner)
+        persisted = serve_state.get_replica_info_from_id('svc', 1)
+        assert persisted is not None
+        assert persisted.replica_record_id == replacement.replica_record_id
+        assert persisted.version == 10
 
 
 class TestGroupedReplicaSnapshot:

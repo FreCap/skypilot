@@ -47,7 +47,9 @@ from sky.recipes import server as recipes_rest
 from sky.schemas.api import responses
 from sky.serve import constants as serve_constants
 from sky.serve import lb_rbac_preflight
+from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.serve.server import controller_proxy as serve_controller_proxy
 from sky.serve.server import server as serve_rest
 from sky.server import common
@@ -892,9 +894,38 @@ async def launch(launch_body: payloads.LaunchBody,
     """Launches a cluster or task."""
     request_id = request.state.request_id
     logger.info(f'Launching request: {request_id}')
+    launch_context = launch_body.extra_launch_context
+    has_system_recovery_context = (
+        serve_system_oom_recovery.has_v3_system_oom_recovery_context(
+            launch_context))
+    if has_system_recovery_context:
+        if not launch_body.is_launched_by_sky_serve_controller:
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail='System-recovery launches require a valid durable '
+                'SkyServe launch intent.')
+        try:
+            # Constructing the replacement first proves that the exact closed
+            # context has a valid bound form.  The update-only PostgreSQL
+            # transaction then consumes the nonce under lifecycle, service,
+            # and replica row locks before any request is scheduled.
+            bound_context = serve_system_oom_recovery.bind_launch_context(
+                launch_context, request_id)
+            await asyncio.to_thread(
+                serve_state.bind_replica_system_recovery_launch_request,
+                launch_context, request_id)
+        except (ValueError,
+                serve_state.ReplicaSystemRecoveryStateError) as error:
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail='System-recovery launches require a valid durable '
+                'SkyServe launch intent.') from error
+        # Never mutate the caller-provided dictionary in place.  Downstream
+        # execution sees the server-known request association and no nonce.
+        launch_body.extra_launch_context = bound_context
+        launch_context = bound_context
     launch_precondition = None
     if launch_body.is_launched_by_sky_serve_controller:
-        launch_context = launch_body.extra_launch_context
         has_launch_fence = any(
             key in launch_context
             for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS)
@@ -935,7 +966,8 @@ async def launch(launch_body: payloads.LaunchBody,
         schedule_type=requests_lib.ScheduleType.LONG,
         request_cluster_name=launch_body.cluster_name,
         precondition=launch_precondition,
-        retryable=launch_body.retry_until_up,
+        retryable=(False if has_system_recovery_context else
+                   launch_body.retry_until_up),
         auth_user=request.state.auth_user,
     )
 

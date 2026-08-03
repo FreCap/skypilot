@@ -138,10 +138,14 @@ def test_background_loops_are_owned_until_completion():
                                side_effect=_loop) as role, \
              mock.patch.object(lb,
                                '_probe_occupancy_loop',
-                               side_effect=_loop) as occupancy:
+                               side_effect=_loop) as occupancy, \
+             mock.patch.object(
+                 lb,
+                 '_sync_system_recovery_route_lease',
+                 side_effect=_loop) as recovery_lease:
             lb._start_background_loops()
             await asyncio.sleep(0)
-            assert len(lb._background_tasks) == 3
+            assert len(lb._background_tasks) == 4
             release.set()
             await asyncio.gather(*tuple(lb._background_tasks))
             await asyncio.sleep(0)
@@ -150,6 +154,7 @@ def test_background_loops_are_owned_until_completion():
         sync.assert_awaited_once_with()
         role.assert_awaited_once_with()
         occupancy.assert_awaited_once_with()
+        recovery_lease.assert_awaited_once_with()
 
     asyncio.run(_scenario())
 
@@ -183,7 +188,11 @@ def test_background_loop_failure_is_reported_and_released():
                                    side_effect=_finish), \
                  mock.patch.object(lb,
                                    '_probe_occupancy_loop',
-                                   side_effect=_finish):
+                                   side_effect=_finish), \
+                 mock.patch.object(
+                     lb,
+                     '_sync_system_recovery_route_lease',
+                     side_effect=_finish):
                 lb._start_background_loops()
                 await asyncio.wait_for(reported.wait(), timeout=1)
                 await asyncio.sleep(0)
@@ -226,11 +235,15 @@ def test_background_loop_cancellation_is_quiet_and_released():
                                    side_effect=_loop), \
                  mock.patch.object(lb,
                                    '_probe_occupancy_loop',
-                                   side_effect=_loop):
+                                   side_effect=_loop), \
+                 mock.patch.object(
+                     lb,
+                     '_sync_system_recovery_route_lease',
+                     side_effect=_loop):
                 lb._start_background_loops()
                 await asyncio.wait_for(started.wait(), timeout=1)
                 tasks = tuple(lb._background_tasks)
-                assert len(tasks) == 3
+                assert len(tasks) == 4
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)

@@ -68,6 +68,7 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
 from sky.serve import system_oom_recovery as serve_system_oom_recovery
+from sky.serve import system_oom_recovery_observability
 from sky.server import common as server_common
 from sky.server.requests import requests as requests_lib
 from sky.skylet import autostop_lib
@@ -802,6 +803,7 @@ class RetryingVmProvisioner:
         requested_node_count: int,
         cluster_existed: bool,
         dryrun: bool,
+        cloud_user_identity: list[str] | None,
     ) -> None:
         """Capture one exact full-create result in a one-shot lease."""
         self._reset_fresh_provision_evidence()
@@ -819,6 +821,13 @@ class RetryingVmProvisioner:
         try:
             evidence_factory = (backend_system_oom_recovery.
                                 FreshProvisionEvidence.from_provision_record)
+            instance_type = handle.launched_resources.instance_type
+            if instance_type is None:
+                return
+            _, catalog_memory_gib = cloud.get_vcpus_mem_from_instance_type(
+                instance_type)
+            if catalog_memory_gib is None:
+                return
             evidence = evidence_factory(
                 provision_record,
                 request_id=common_utils.get_current_request_id(),
@@ -830,6 +839,9 @@ class RetryingVmProvisioner:
                 requested_node_count=requested_node_count,
                 service_name=service_name,
                 service_hash=service_hash,
+                cloud_user_identity=cloud_user_identity,
+                catalog_instance_type=instance_type,
+                catalog_memory_gib=catalog_memory_gib,
                 cluster_existed=cluster_existed,
                 dryrun=dryrun,
                 provisioning_skipped=False)
@@ -1417,7 +1429,8 @@ class RetryingVmProvisioner:
                             handle,
                             requested_node_count=num_nodes,
                             cluster_existed=cluster_exists,
-                            dryrun=dryrun)
+                            dryrun=dryrun,
+                            cloud_user_identity=cloud_user_identity)
                         # A full fresh create proves that this exact demand can
                         # launch now. Reusing orphaned/resumed nodes, or only
                         # creating the missing subset, proves neither the
@@ -2979,7 +2992,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                 not isinstance(self.launched_resources.cloud, clouds.Slurm))
 
     to_dict = cloud_vm_resource_handle_serialization.to_dict
-    from_dict = classmethod(cloud_vm_resource_handle_serialization.from_dict)
+    from_dict: Any = classmethod(
+        cloud_vm_resource_handle_serialization.from_dict)
     __getstate__ = cloud_vm_resource_handle_serialization.__getstate__
     __setstate__ = cloud_vm_resource_handle_serialization.__setstate__
 
@@ -3153,16 +3167,46 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     ) -> bool:
         """Revalidate one consumed payload against the submission handle."""
         cloud = handle.launched_resources.cloud
-        if (evidence.request_id != common_utils.get_current_request_id() or
+        current_request_id = common_utils.get_current_request_id()
+        bound_request_id = self._extra_launch_context.get(
+            serve_constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY)
+        try:
+            cluster_record = global_user_state.get_cluster_from_name(
+                handle.cluster_name,
+                include_user_info=False,
+                summary_response=True)
+        except Exception:  # pylint: disable=broad-except
+            return False
+        if cluster_record is None:
+            return False
+        cluster_owner_identity = cluster_record.get('owner')
+        if (not isinstance(cluster_owner_identity, list) or
+                tuple(cluster_owner_identity)
+                != evidence.provision_owner_identity):
+            return False
+        if (evidence.request_id != current_request_id or
+                bound_request_id != current_request_id or
                 evidence.workspace != skypilot_config.get_active_workspace() or
                 evidence.cluster_name != handle.cluster_name or
                 evidence.cluster_name_on_cloud != handle.cluster_name_on_cloud
-                or evidence.cluster_hash
-                != global_user_state.get_cluster_hash_for_name(
-                    handle.cluster_name) or
+                or
+                evidence.cluster_hash != cluster_record.get('cluster_hash') or
                 evidence.requested_node_count != handle.launched_nodes or
-                cloud is None or
+                not isinstance(cloud, clouds.AWS) or
                 evidence.provider_name != cloud.canonical_name()):
+            return False
+        launched_resources = handle.launched_resources
+        instance_type = launched_resources.instance_type
+        if (instance_type is None or instance_type != evidence.instance_type or
+                launched_resources.region != evidence.region or
+                launched_resources.zone != evidence.availability_zone):
+            return False
+        try:
+            _, catalog_memory_gib = cloud.get_vcpus_mem_from_instance_type(
+                instance_type)
+        except Exception:  # pylint: disable=broad-except
+            return False
+        if catalog_memory_gib != evidence.catalog_memory_gib:
             return False
         service_name = self._extra_launch_context.get(
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
@@ -3188,6 +3232,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self,
         handle: CloudVmRayResourceHandle,
         task: task_lib.Task,
+        job_id: int,
     ) -> skylet_system_oom_recovery.RecoveryLaunchPlan | None:
         """Consume the lease and make one fail-closed submission decision.
 
@@ -3195,29 +3240,92 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         allocation and this method.  Clearing the backend slot before any
         validation means every mismatch and exception consumes the decision.
         """
+        is_v3_request = (
+            serve_system_oom_recovery.has_v3_system_oom_recovery_context(
+                self._extra_launch_context))
+
+        def _log_decision(
+            decision: str,
+            reason: str,
+            evidence: backend_system_oom_recovery.FreshProvisionEvidence |
+            None = None
+        ) -> None:
+            if not is_v3_request:
+                return
+            if decision == 'ordinary':
+                event = ('evidence_lost'
+                         if reason in ('fresh_evidence_lease_absent',
+                                       'fresh_evidence_lease_consumed') else
+                         'authorization_v3_ordinary')
+                if evidence is None:
+                    try:
+                        launched_cloud = handle.launched_resources.cloud
+                        provider = ('unknown' if launched_cloud is None else
+                                    launched_cloud.canonical_name())
+                    except Exception:  # pylint: disable=broad-except
+                        provider = 'unknown'
+                    market = 'unknown'
+                else:
+                    provider = evidence.provider_name
+                    market = evidence.market_type
+                system_oom_recovery_observability.record(event,
+                                                         provider=provider,
+                                                         market=market)
+            logger.info(
+                'system_oom_recovery_backend_admission '
+                f'decision={decision} reason={reason} '
+                f'service_hash={self._extra_launch_context.get(serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)!r} '
+                f'replica_id={self._extra_launch_context.get(serve_constants.SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY)!r} '
+                f'launch_generation={self._extra_launch_context.get(serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_GENERATION_KEY)!r} '
+                f'profile_id={self._extra_launch_context.get(serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY)!r} '
+                f'job_id={job_id!r} '
+                f'provider={(None if evidence is None else evidence.provider_name)!r} '
+                f'market={(None if evidence is None else evidence.market_type)!r} '
+                f'instance_type={(None if evidence is None else evidence.instance_type)!r} '
+                f'catalog_memory_gib={(None if evidence is None else evidence.catalog_memory_gib)!r}'
+            )
+
         lease = self._fresh_provision_evidence_lease
         self._fresh_provision_evidence_lease = None
         if lease is None:
+            _log_decision('ordinary', 'fresh_evidence_lease_absent')
             return None
         evidence = lease.take()
         if evidence is None:
+            _log_decision('ordinary', 'fresh_evidence_lease_consumed')
             return None
         try:
             if (self._workload_type != 'service' or task.num_nodes != 1 or
                     task.num_nodes * handle.num_ips_per_node != 1 or
                     task.run is None or task.managed_job_dag is not None or
                     handle.launched_nodes != 1 or
-                    isinstance(handle.launched_resources.cloud,
-                               (clouds.Kubernetes, clouds.Slurm)) or
-                    not handle.provision_runtime_metadata.has_ray or
+                    not isinstance(handle.launched_resources.cloud, clouds.AWS)
+                    or not handle.provision_runtime_metadata.has_ray or
                     not handle.provision_runtime_metadata.has_job_queue or
                     not self._fresh_provision_evidence_matches_handle(
                         evidence, handle)):
+                _log_decision('ordinary', 'eligibility_or_identity_mismatch',
+                              evidence)
                 return None
             profile = serve_system_oom_recovery.match_trusted_profile(
                 task, self._extra_launch_context)
-            if profile is None:
+            if not isinstance(
+                    profile,
+                    serve_system_oom_recovery.TrustedRecoveryAuthorizationV3):
+                _log_decision('ordinary', 'authorization_mismatch', evidence)
                 return None
+            envelope = profile.resource_envelope
+            if (evidence.aws_account_id not in envelope.allowed_aws_account_ids
+                    or not envelope.allows_location(
+                        evidence.region, evidence.availability_zone) or
+                    evidence.market_type not in envelope.allowed_market_types or
+                    evidence.instance_type
+                    not in envelope.allowed_instance_types or
+                    evidence.catalog_memory_gib > envelope.max_host_memory_gib):
+                _log_decision('ordinary', 'resource_envelope_mismatch',
+                              evidence)
+                return None
+            _log_decision('capable', 'accepted', evidence)
             return profile.launch_plan()
         except Exception as error:  # pylint: disable=broad-except
             # Recovery is an optional capability.  Once the lease is consumed,
@@ -3225,6 +3333,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # it must not fail an otherwise valid service launch.
             logger.warning('Disabling system-OOM recovery for this submission: '
                            f'{common_utils.format_exception(error)}')
+            _log_decision('ordinary', 'admission_exception', evidence)
             return None
 
     def check_resources_fit_cluster(
@@ -4542,7 +4651,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             job_id, log_dir = self._add_job(handle, task_copy.name,
                                             resources_str, task.metadata_json)
             recovery_plan = self._consume_system_oom_recovery_plan_no_lock(
-                handle, task_copy)
+                handle, task_copy, job_id)
 
         num_actual_nodes = task.num_nodes * handle.num_ips_per_node
         # Case: task_lib.Task(run, num_nodes=N) or TPU VM Pods

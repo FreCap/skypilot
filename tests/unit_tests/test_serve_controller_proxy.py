@@ -177,6 +177,28 @@ def test_proxy_forwards_history_only_sync_to_distinct_controller_path(
     assert calls[0]['data'] == b'{"request_history": {}}'
 
 
+def test_proxy_forwards_system_recovery_lease_with_tight_timeout(monkeypatch):
+    owner = _owner()
+    _patch_owner_reads(monkeypatch, [owner, owner])
+    calls = []
+    upstream = _FakeControllerResponse(body=b'{"version":1,"entries":[]}')
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls, response=upstream))
+    path = ('/api/internal/serve/svc/controller/'
+            'system_recovery_route_lease')
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_system_recovery_route_lease(
+            'svc', _request(path, body=b'{}')))
+
+    assert response.status_code == 200
+    assert response.body == b'{"version":1,"entries":[]}'
+    assert calls[0]['url'] == (
+        'http://10.2.3.4:20001/controller/system_recovery_route_lease')
+    assert calls[0]['timeout'].total == (
+        constants.LB_SYSTEM_RECOVERY_LEASE_PROXY_TIMEOUT_SECONDS)
+
+
 def test_proxy_forwards_role_heartbeat_to_distinct_controller_path(monkeypatch):
     owner = _owner()
     _patch_owner_reads(monkeypatch, [owner, owner])
@@ -327,12 +349,14 @@ def test_proxy_connection_failure_is_503_without_retry(monkeypatch):
 @pytest.mark.parametrize('path,expected', [
     ('/api/internal/serve/svc/controller/load_balancer_sync', True),
     ('/api/internal/serve/svc/controller/load_balancer_role', True),
+    ('/api/internal/serve/svc/controller/system_recovery_route_lease', True),
     ('/api/internal/serve/svc/controller/'
      'load_balancer_request_history_sync', True),
     ('/api/internal/serve//controller/load_balancer_sync', False),
     ('/api/internal/serve//controller/'
      'load_balancer_request_history_sync', False),
     ('/api/internal/serve//controller/load_balancer_role', False),
+    ('/api/internal/serve//controller/system_recovery_route_lease', False),
     ('/api/internal/serve/a/b/controller/load_balancer_sync', False),
     ('/api/internal/serve/svc/controller/load_balancer_sync/more', False),
     ('/api/internal/serve/svc/controller/update_service', False),
@@ -348,6 +372,8 @@ def test_internal_route_is_hidden_from_openapi():
     )['paths']
     assert controller_proxy.CONTROLLER_ROLE_ROUTE_PATH not in app.openapi(
     )['paths']
+    assert (controller_proxy.CONTROLLER_SYSTEM_RECOVERY_LEASE_ROUTE_PATH
+            not in app.openapi()['paths'])
     assert (controller_proxy.CONTROLLER_HISTORY_SYNC_ROUTE_PATH
             not in app.openapi()['paths'])
 
@@ -449,7 +475,11 @@ def test_api_server_role_route_uses_sync_auth(monkeypatch):
     assert len(calls) == 1
 
 
-def _run_auth_middleware(monkeypatch, authorization, tokens):
+def _run_auth_middleware(monkeypatch,
+                         authorization,
+                         tokens,
+                         path=('/api/internal/serve/svc/controller/'
+                               'load_balancer_sync')):
     reads = []
 
     def get_tokens(required=False):
@@ -464,8 +494,7 @@ def _run_auth_middleware(monkeypatch, authorization, tokens):
                         raising=False)
     middleware = server.InternalServeControllerSyncAuthMiddleware(
         app=lambda scope, receive, send: None)
-    request = _request('/api/internal/serve/svc/controller/load_balancer_sync',
-                       authorization)
+    request = _request(path, authorization)
     request.state.auth_user = None
     downstream_users = []
 
@@ -497,6 +526,22 @@ def test_internal_auth_accepts_any_overlap_token(monkeypatch, token):
     assert reads == [True]
     assert len(downstream_users) == 1
     assert downstream_users[0].user_type == 'system'
+
+
+def test_system_recovery_lease_route_uses_internal_sync_auth(monkeypatch):
+    path = ('/api/internal/serve/svc/controller/'
+            'system_recovery_route_lease')
+    rejected, rejected_reads, rejected_users = _run_auth_middleware(
+        monkeypatch, 'Bearer wrong', ('sync-token',), path)
+    accepted, accepted_reads, accepted_users = _run_auth_middleware(
+        monkeypatch, 'Bearer sync-token', ('sync-token',), path)
+
+    assert rejected.status_code == 401
+    assert rejected_reads == [True]
+    assert rejected_users == []
+    assert accepted.status_code == 204
+    assert accepted_reads == [True]
+    assert accepted_users[0].user_type == 'system'
 
 
 @pytest.mark.parametrize('tokens', [(), RuntimeError('secret unavailable')])

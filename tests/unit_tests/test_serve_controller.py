@@ -18,11 +18,14 @@ from unittest import mock
 import pytest
 
 from sky.serve import autoscalers
+from sky.serve import constants
 from sky.serve import controller
 from sky.serve import drain_observability
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import system_recovery_route_lease
+from sky.serve import system_recovery_state
 from sky.utils import yaml_utils
 
 
@@ -155,6 +158,28 @@ def test_run_controller_uses_parent_owner_for_child_cutover_fence(monkeypatch):
     assert observed['fence'] == ('incarnation-a', (parent_pid, '10.0.0.1'), 7)
 
 
+def test_recovery_lease_child_dependencies_require_sync_and_owner_tokens(
+        monkeypatch):
+    monkeypatch.setattr(controller.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: ('sync-token',)
+                        if required else ())
+    sync_dependency = controller._make_auth_dependency(  # pylint: disable=protected-access
+        sync=True, required=True)
+    owner_dependency = controller._make_controller_owner_dependency(  # pylint: disable=protected-access
+        'owner-fingerprint')
+
+    with pytest.raises(controller.fastapi.HTTPException) as missing_sync:
+        asyncio.run(sync_dependency(None))
+    assert missing_sync.value.status_code == 401
+    asyncio.run(sync_dependency('Bearer sync-token'))
+
+    with pytest.raises(controller.fastapi.HTTPException) as wrong_owner:
+        asyncio.run(owner_dependency('wrong-owner'))
+    assert wrong_owner.value.status_code == 409
+    asyncio.run(owner_dependency('owner-fingerprint'))
+
+
 class _FakeHandle:
     """Stub for the resource handle returned by ReplicaInfo.handle()."""
 
@@ -176,6 +201,7 @@ class _FakeReplicaInfo:
                  accelerators: Optional[Dict[str, int]] = None,
                  handle_is_none: bool = False) -> None:
         self.replica_id = replica_id
+        self.replica_record_id = (f'00000000-0000-0000-0000-{replica_id:012d}')
         self.cluster_name = f'replica-{replica_id}'
         self.status = status
         self.version = version
@@ -187,6 +213,8 @@ class _FakeReplicaInfo:
         self.last_provider_config = None
         self.planned_capacity = 1
         self.logical_bridge_capacity_verified = False
+        self.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.ORDINARY)
 
     @property
     def url(self) -> Optional[str]:
@@ -224,7 +252,13 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
     ctrl._resource_scope = None  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
+    ctrl._lb_replica_cache_record_ids = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
+    ctrl._lb_translation_cache_record_ids = {}  # pylint: disable=protected-access
+    ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+        system_recovery_allows_routing=lambda _info: True,
+        system_recovery_route_marker=lambda _info, _url: None,
+        retire_system_recovery_route=lambda _info: None)
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
     ctrl._lb_role_lock = None  # pylint: disable=protected-access
     ctrl._lb_demand_lock = None  # pylint: disable=protected-access
@@ -1497,6 +1531,220 @@ class TestGetLbReplicaInfo:
                 'gpu_type': 'A100',
                 'gpu_count': '8'
             },
+        }
+
+    def test_capable_route_requires_and_emits_exact_marker(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080/',
+                                accelerators={'L4': 1})
+        info.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=lambda _info, url:
+            (system_recovery_route_lease.RouteMarker('1', 'a' * 32)
+             if url == 'http://1.1.1.1:8080' else None),
+            retire_system_recovery_route=lambda _info: None)
+
+        result = _sync(ctrl, [info])
+        assert result == {
+            'http://1.1.1.1:8080': {
+                'gpu_type': 'L4',
+                'gpu_count': '1',
+                constants.SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_VERSION,
+                constants.SYSTEM_RECOVERY_ROUTE_REPLICA_ID_KEY: '1',
+                constants.SYSTEM_RECOVERY_ROUTE_TOKEN_KEY: 'a' * 32,
+            }
+        }
+
+        ctrl._replica_manager.system_recovery_route_marker = (
+            lambda _info, _url: None)
+        replica_info, num_ready = _sync_full(ctrl, [info])
+        assert replica_info == {
+            'http://1.1.1.1:8080': {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+        assert num_ready == 1
+
+    @pytest.mark.parametrize('unusable_url', [None, 'not-a-route-url'])
+    def test_capable_unusable_url_retires_prior_generation(self, unusable_url):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'L4': 1})
+        info.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+        retire = mock.Mock()
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=lambda _info, _url:
+            (system_recovery_route_lease.RouteMarker('1', 'a' * 32)),
+            retire_system_recovery_route=retire)
+
+        assert list(_sync(ctrl, [info])) == ['http://1.1.1.1:8080']
+        retire.assert_not_called()
+
+        # Force endpoint re-resolution as happens after the READY cache is
+        # invalidated.  A malformed/missing replacement must stop heartbeat
+        # renewal for the retained URL A even though this heavyweight snapshot
+        # is intentionally treated as transiently empty by the LB.
+        ctrl._lb_replica_cache.clear()  # pylint: disable=protected-access
+        ctrl._lb_replica_cache_record_ids.clear()  # pylint: disable=protected-access
+        info._url = unusable_url
+        replica_info, num_ready = _sync_full(ctrl, [info])
+
+        assert replica_info == {}
+        assert num_ready == 1
+        retire.assert_called_once_with(info)
+
+    def test_invalid_ordinary_url_is_withheld(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://user:password@example.com:80',
+                                accelerators={'L4': 1})
+
+        replica_info, num_ready = _sync_full(ctrl, [info])
+
+        assert replica_info == {}
+        assert num_ready == 1
+
+    @pytest.mark.parametrize('capable_url,ordinary_url,canonical_url', [
+        ('HTTP://Example.COM:80/', 'http://example.com', 'http://example.com'),
+        ('https://Example.COM:443', 'https://example.com/',
+         'https://example.com'),
+        ('http://[2001:0db8:0:0::1]:80', 'http://[2001:db8::1]/',
+         'http://[2001:db8::1]'),
+    ])
+    def test_transport_alias_capable_ordinary_collision_is_fenced(
+            self, capable_url, ordinary_url, canonical_url):
+        ctrl = _make_controller()
+        capable = _FakeReplicaInfo(1,
+                                   serve_state.ReplicaStatus.READY,
+                                   url=capable_url,
+                                   accelerators={'L4': 1})
+        capable.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+        ordinary = _FakeReplicaInfo(2,
+                                    serve_state.ReplicaStatus.READY,
+                                    url=ordinary_url,
+                                    accelerators={'L4': 1})
+        retire = mock.Mock()
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=lambda info, _url:
+            (system_recovery_route_lease.RouteMarker(str(
+                info.replica_id), f'{info.replica_id:032x}')),
+            retire_system_recovery_route=retire)
+
+        assert _sync(ctrl, [capable, ordinary]) == {
+            canonical_url: {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+        retire.assert_called_once_with(capable)
+
+    @pytest.mark.parametrize('capable_first', [False, True])
+    def test_normalized_capable_ordinary_collision_is_fenced(
+            self, capable_first):
+        ctrl = _make_controller()
+        capable = _FakeReplicaInfo(1,
+                                   serve_state.ReplicaStatus.READY,
+                                   url='http://1.1.1.1:8080/',
+                                   accelerators={'L4': 1})
+        capable.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+        ordinary = _FakeReplicaInfo(2,
+                                    serve_state.ReplicaStatus.READY,
+                                    url='http://1.1.1.1:8080',
+                                    accelerators={'L4': 1})
+        retired = set()
+
+        def _marker(info, _url):
+            if info.replica_id in retired:
+                return None
+            return system_recovery_route_lease.RouteMarker(
+                str(info.replica_id), f'{info.replica_id:032x}')
+
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=_marker,
+            retire_system_recovery_route=(
+                lambda info: retired.add(info.replica_id)))
+        infos = ([capable, ordinary] if capable_first else [ordinary, capable])
+
+        replica_info, num_ready = _sync_full(ctrl, infos)
+        assert replica_info == {
+            'http://1.1.1.1:8080': {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+        assert num_ready == 2
+        assert retired == {1}
+
+        # Removing the duplicate cannot rehabilitate the same capable
+        # generation: collision retirement leaves an explicit fence.
+        assert _sync(ctrl, [capable]) == {
+            'http://1.1.1.1:8080': {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+
+    def test_two_capable_rows_with_distinct_tokens_are_fenced(self):
+        ctrl = _make_controller()
+        infos = []
+        retired = set()
+        for replica_id in (1, 2):
+            info = _FakeReplicaInfo(replica_id,
+                                    serve_state.ReplicaStatus.READY,
+                                    url='http://1.1.1.1:8080',
+                                    accelerators={'L4': 1})
+            info.system_recovery_disposition = (
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+            infos.append(info)
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=lambda info, _url:
+            (system_recovery_route_lease.RouteMarker(str(
+                info.replica_id), f'{info.replica_id:032x}')),
+            retire_system_recovery_route=(
+                lambda info: retired.add(info.replica_id)))
+
+        assert _sync(ctrl, infos) == {
+            'http://1.1.1.1:8080': {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+        assert retired == {1, 2}
+
+    def test_cache_rejects_recreated_same_numeric_replica_row(self):
+        ctrl = _make_controller()
+        old = _FakeReplicaInfo(1,
+                               serve_state.ReplicaStatus.READY,
+                               url='http://1.1.1.1:8080',
+                               accelerators={'L4': 1})
+        assert list(_sync(ctrl, [old])) == ['http://1.1.1.1:8080']
+
+        replacement = _FakeReplicaInfo(1,
+                                       serve_state.ReplicaStatus.READY,
+                                       url='http://2.2.2.2:8080',
+                                       accelerators={'A100': 8})
+        replacement.replica_record_id = ('00000000-0000-0000-0000-000000000099')
+        assert _sync(ctrl, [replacement]) == {
+            'http://2.2.2.2:8080': {
+                'gpu_type': 'A100',
+                'gpu_count': '8'
+            }
         }
 
     def test_async_occupancy_declaration_is_per_replica_version(self):
