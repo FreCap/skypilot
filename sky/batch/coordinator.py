@@ -1279,9 +1279,14 @@ class BatchCoordinator:
                                        workers: list[str] | None = None,
                                        strict: bool = False) -> None:
         """Clean exact old-token workers after their attempt leases expire."""
-        worker_records = managed_job_state.get_batch_worker_records(
-            self._managed_job_id)
-        self._refresh_stale_worker_tokens(worker_records)
+        stale_records_by_token: dict[str, list[dict[str, Any]]] = {}
+        for record in managed_job_state.get_batch_worker_records(
+                self._managed_job_id):
+            token = record['coordinator_token']
+            if token == self._worker_token:
+                continue
+            self._stale_worker_tokens.add(token)
+            stale_records_by_token.setdefault(token, []).append(record)
         if not self._stale_worker_tokens:
             return
         if not self._stale_attempt_leases_drained:
@@ -1290,9 +1295,9 @@ class BatchCoordinator:
         queue_jobs_by_cluster: dict[str, list[Any]] = {}
         for worker_token in sorted(self._stale_worker_tokens):
             try:
-                self._cleanup_worker_services_for_token(worker_token, workers,
-                                                        queue_jobs_by_cluster,
-                                                        worker_records)
+                self._cleanup_worker_services_for_token(
+                    worker_token, workers, queue_jobs_by_cluster,
+                    stale_records_by_token.get(worker_token, []))
             except Exception as e:  # pylint: disable=broad-except
                 if strict:
                     raise

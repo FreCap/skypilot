@@ -1859,6 +1859,49 @@ def test_stale_cleanup_reads_worker_records_once_per_pass(
     assert original_get_batch_worker_records(5) == []
 
 
+def test_stale_cleanup_scans_durable_worker_snapshot_at_most_twice(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    _create_batch_job(18, 'owner-a')
+    assert state.register_batch_worker_launch(18, 'owner-a', 'worker-a',
+                                              'batch-worker-18-owner-a')
+    assert state.register_batch_worker_launch(18, 'owner-a', 'worker-b',
+                                              'batch-worker-18-owner-a')
+    assert state.acquire_batch_coordinator(18, 'owner-b') == 'owner-a'
+    assert state.register_batch_worker_launch(18, 'owner-b', 'worker-a',
+                                              'batch-worker-18-owner-b')
+    assert state.acquire_batch_coordinator(18, 'owner-c') == 'owner-b'
+
+    batch_coordinator = _make_coordinator(job_id=18)
+    batch_coordinator._worker_token = 'owner-c'
+    batch_coordinator._stale_attempt_leases_drained = True
+
+    count = {'n': 0}
+
+    class _CountingRecords(list):
+
+        def __iter__(self):
+            for item in super().__iter__():
+                count['n'] += 1
+                yield item
+
+    original_get_batch_worker_records = state.get_batch_worker_records
+
+    def _get_batch_worker_records(job_id):
+        return _CountingRecords(original_get_batch_worker_records(job_id))
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(side_effect=_get_batch_worker_records))
+    monkeypatch.setattr(batch_coordinator,
+                        '_cancel_worker_record',
+                        lambda record, queue_jobs_by_cluster=None: None)
+
+    batch_coordinator._cleanup_stale_worker_services(strict=True)
+
+    assert count['n'] <= 6, count
+
+
 def test_get_batch_worker_records_filters_owner_token(batch_state_db):
     del batch_state_db
     _create_batch_job(16, 'owner-a')
