@@ -15700,7 +15700,7 @@ artifacts:
     domain: skylet_transport
     store: process_memory
     provider: skylet
-    operation: get_job_status_shadow_and_rollback_modes
+    operation: get_job_status_shadow_proposal_observation_and_rollback_modes
   runtime_affecting: true
   locators:
   - kind: python_enum_member
@@ -15713,6 +15713,18 @@ artifacts:
     member: SHADOW
   - kind: python_symbol
     path: sky/backends/skylet_transport.py
+    symbol: SkyletTransportRouter.propose_get_job_status_route
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletTransportRouter.observe_current_get_job_status
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletCapabilityRpcAbsentV1
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletTransportRouter._classify_get_capabilities_failure
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
     symbol: SkyletTransportRouter._emit_shadow_route_comparison
   replacement: Authoritative capability-negotiated GetJobStatus route after rollback closure
   dependencies: []
@@ -15721,7 +15733,7 @@ artifacts:
   - planned
   gates:
     source:
-    - id: zero_get_job_status_shadow_and_rollback_mode_symbols
+    - id: zero_get_job_status_shadow_proposal_observation_and_rollback_symbols
       satisfied: false
       evidence: []
     test:
@@ -15731,8 +15743,17 @@ artifacts:
     - id: shadow_event_schema_comparison_and_role_coverage_contract
       satisfied: false
       evidence: []
+    - id: decision_only_proposal_and_once_executed_inline_status_contract
+      satisfied: false
+      evidence: []
+    - id: split_api_role_never_executes_status_body_contract
+      satisfied: false
+      evidence: []
+    - id: typed_exact_capability_rpc_absence_publication_contract
+      satisfied: false
+      evidence: []
     telemetry:
-    - id: datadog_30m_all_roles_p95_500ms_and_zero_unexplained_shadow_divergence
+    - id: datadog_30m_controller_executor_p95_500ms_zero_api_execution_and_zero_unexplained_shadow_divergence
       satisfied: false
       evidence: []
     release_window:
@@ -15743,7 +15764,7 @@ artifacts:
     - id: get_job_status_shadow_modes_own_no_schema
       satisfied: true
       evidence:
-      - The temporary shadow and rollback modes own no database schema.
+      - The temporary shadow proposal, observation, and rollback modes own no database schema.
   retained_references: []
   evidence: {}
   blocker: null
