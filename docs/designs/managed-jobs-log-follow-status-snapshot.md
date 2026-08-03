@@ -21,12 +21,14 @@ is carried into the next loop iteration. Task detection and log-target
 selection must not be split across two reads because a fast subsequent task can
 otherwise replace the detected task before its logs are tailed.
 
-When a task filter is present, the follower first reads the task inventory so
-an invalid task can fail immediately without waiting for job initialization.
-The inventory also supplies the task count and avoids a separate count query.
-The active filtered path keeps the existing split reads: latest lifecycle
-status still comes from the job-level reducer, while routing must use the
-explicitly selected task rather than the latest task.
+When a task-name filter is present, the follower first reads the task inventory
+so an invalid name can fail immediately without waiting for job initialization.
+An integer task-ID filter instead reads the exact task row. A hit never
+materializes the other task rows; a miss performs one aggregate count so a
+missing job remains distinguishable from a missing task and the valid-ID hint
+stays available. The active filtered path keeps split reads: lifecycle and
+routing come from the explicitly selected task snapshot rather than the latest
+whole-job task.
 
 An initial task inventory is never authoritative after a terminal latest-task
 status is observed. The inventory read precedes the status read, so a job can
@@ -58,8 +60,10 @@ routing fields from one recovery snapshot. When the log target remains
 unavailable across a poll interval, the post-wait snapshot serves the next
 target-selection iteration, so each poll cycle performs one combined database
 read instead of two back-to-back reads. Initial status discovery, task counts,
-filtered-task reads, polling cadence, and scalar status refreshes after remote
-tail attempts are unchanged.
+polling cadence, and scalar status refreshes after remote tail attempts are
+unchanged. Integer task-ID validation changes from an O(tasks) inventory read
+to one O(1) point lookup. Only a missing task-ID adds one O(1) aggregate count;
+it does not materialize task status rows.
 
 Waiting for the next JobGroup task performs one combined database read per poll
 cycle. The successful handoff reuses that read for routing, reducing the
@@ -67,17 +71,18 @@ transition from N scalar polls plus one combined routing read to N combined
 polls. The query count therefore falls by one at every observed task handoff,
 while polling cadence and asymptotic work remain unchanged.
 
-Terminal paths perform at most one final inventory refresh. Filtered terminal
-paths still avoid the separate task-count read. Polling cadence, asymptotic
-work, remote backend calls, threads, and timers are unchanged.
+Terminal paths perform at most one final metadata refresh. A found integer
+task-ID path avoids both the inventory and count reads. Polling cadence, remote
+backend calls, threads, and timers are unchanged.
 
 ## Alternatives
 
-Reusing the initial filtered inventory for an immediately terminal status is
-unsafe because the two reads do not share a transaction or generation token.
-Reordering the status wait before task validation would make invalid filters
-wait behind job initialization. Deriving the latest job status from the task
-inventory would duplicate the state module's lifecycle reducer.
+Reusing initial filtered metadata for an immediately terminal status is unsafe
+because the reads do not share a transaction or generation token. Reordering
+the status wait before task validation would make invalid filters wait behind
+job initialization. A point lookup alone cannot distinguish a missing task
+from a missing job, so the miss-only aggregate count preserves that boundary
+without restoring the whole-task scan.
 
 ## Rollout and rollback
 
@@ -92,8 +97,11 @@ terminal transitions, terminal transitions after a `None` status, stale
 initial task inventories, filtered task validation, exact query-call counts,
 post-wait snapshot reuse for recovered targets, and remote log-call counts.
 
-`tests/unit_tests/test_sky/jobs/test_utils.py` covers the adjacent task-filter
-surface. Pull-request CI runs both under `Python Tests - Unit Tests`;
+`tests/unit_tests/test_sky/jobs/test_utils.py` covers integer and name filters,
+missing tasks, missing jobs, and exact read counts.
+`tests/unit_tests/test_sky/jobs/test_status_refresh_snapshot.py` proves task
+counting uses one aggregate query without materializing status rows.
+Pull-request CI runs all three under `Python Tests - Unit Tests`;
 `Python Tests - Jobs & API Tests` and
 `Python Tests - Limited Deps - Jobs, Serve & CLI (3.14)` cover the broader
 managed-jobs interface. Formatting, mypy, Pylint, and static-analysis workflows
@@ -103,5 +111,6 @@ cover the changed Python paths.
 
 | Changed path | Invariants | Concrete tests and commands |
 | --- | --- | --- |
-| `sky/jobs/utils.py` | The next JobGroup task and its log target come from one recovery snapshot; terminal and cancelling snapshots stop without handle lookup; same-task snapshots keep the existing polling cadence; a fast following transition cannot replace the detected task; each wait poll is one SQL-backed snapshot and the handoff adds no extra read. | `tests/unit_tests/test_sky/jobs/test_log_follow_lifecycle.py`, especially `TestWaitForNextTask` and the fast-transition regression; run the focused lifecycle file, then `pytest -n 0 --dist no tests/unit_tests/test_sky/jobs/`. |
-| `docs/designs/managed-jobs-log-follow-status-snapshot.md` | The lifecycle, failure, concurrency, and performance contracts remain synchronized with the implementation. | The lifecycle tests above plus the one-SQL snapshot assertions in `tests/unit_tests/test_sky/jobs/test_state.py`; run both files together before the component suite. |
+| `sky/jobs/log_streaming.py` | Exact integer task filters avoid whole-task scans; missing jobs and missing tasks remain distinct; terminal and cancelling snapshots stop without handle lookup; same-task snapshots keep the existing polling cadence. | `tests/unit_tests/test_sky/jobs/test_utils.py` task-filter cases and `tests/unit_tests/test_sky/jobs/test_log_follow_lifecycle.py` filtered lifecycle cases; run both focused files, then `pytest -n 0 --dist no tests/unit_tests/test_sky/jobs/`. |
+| `sky/jobs/state.py` | Task counting is one aggregate query and does not materialize status rows. | `tests/unit_tests/test_sky/jobs/test_status_refresh_snapshot.py::TestGetJobsToCheckStatusInfo::test_get_num_tasks_uses_one_count_select`. |
+| `docs/designs/managed-jobs-log-follow-status-snapshot.md` | The lifecycle, failure, concurrency, and performance contracts remain synchronized with the implementation. | The focused task-filter and lifecycle tests above plus the one-SQL count assertion. |

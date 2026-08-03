@@ -213,13 +213,23 @@ def _wait_for_initial_log_stream_snapshot(
         _sleep_log_follow_wait(1)
 
 
+def _task_filter_not_found(job_id: int, task_filter: str | int,
+                           num_tasks: int) -> tuple[str, int]:
+    if num_tasks == 0:
+        return f'Job {job_id} not found.', exceptions.JobExitCode.NOT_FOUND
+    valid_range = f'0-{num_tasks - 1}' if num_tasks > 1 else '0'
+    return (f'No task found matching {task_filter!r} in job {job_id}. '
+            f'Valid task IDs are {valid_range}.',
+            exceptions.JobExitCode.NOT_FOUND)
+
+
 def _render_stopped_snapshot_logs(
     job_id: int,
     managed_job_status: managed_job_state.ManagedJobStatus,
     *,
     task_filter: str | int | None,
     filtered_task_id: int | None,
-    num_tasks: int,
+    num_tasks: int | None,
     tail: int | None,
     tail_offset: int | None,
 ) -> tuple[str, int]:
@@ -233,10 +243,10 @@ def _render_stopped_snapshot_logs(
         terminal_task_row = managed_job_state.get_task_id_name_status_log(
             job_id, filtered_task_id)
         if terminal_task_row is None:
-            valid_range = f'0-{num_tasks - 1}' if num_tasks > 1 else '0'
-            return (f'No task found matching {task_filter!r} in job {job_id}. '
-                    f'Valid task IDs are {valid_range}.',
-                    exceptions.JobExitCode.NOT_FOUND)
+            if num_tasks is None:
+                num_tasks = managed_job_state.get_num_tasks(job_id)
+            assert task_filter is not None, filtered_task_id
+            return _task_filter_not_found(job_id, task_filter, num_tasks)
         terminal_task_info = [terminal_task_row]
     else:
         terminal_task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
@@ -413,31 +423,18 @@ def stream_logs_by_id(job_id: int,
     watchdog = threading.Thread(target=_orphan_watchdog, daemon=True)
     watchdog.start()
 
-    def matches_task_filter(task_id: int, task_name: str,
-                            task_filter: str | int | None) -> bool:
-        """Check if a task matches the task filter.
-
-        If task_filter is an int, it is matched against task_id.
-        If task_filter is a str, it is matched against task_name.
-        """
-        if task_filter is None:
-            return True
-        if isinstance(task_filter, int):
-            return task_id == task_filter
-        # task_filter is a str, match by task name
-        return task_name == task_filter
-
     msg = _JOB_WAITING_STATUS_MESSAGE.format(status_str='',
                                              provision_str='',
                                              job_id=job_id)
     status_display = rich_utils.safe_status(msg)
     task_info: list[tuple[int, str, managed_job_state.ManagedJobStatus, str,
                           float | None]] | None = None
-    if task is not None:
+    num_tasks: int | None = None
+    if isinstance(task, str):
         task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
             job_id)
         num_tasks = len(task_info)
-    else:
+    elif task is None:
         num_tasks = managed_job_state.get_num_tasks(job_id)
 
     # Check if job exists - if num_tasks is 0, the job doesn't exist
@@ -448,16 +445,22 @@ def stream_logs_by_id(job_id: int,
     # This is used for running jobs to stream logs from the correct task
     filtered_task_id: int | None = None
     if task is not None:
-        assert task_info is not None, task
-        for t_id, t_name, _, _, _ in task_info:
-            if matches_task_filter(t_id, t_name, task):
-                filtered_task_id = t_id
-                break
-        if filtered_task_id is None:
-            valid_range = f'0-{num_tasks - 1}' if num_tasks > 1 else '0'
-            return (f'No task found matching {task!r} in job {job_id}. '
-                    f'Valid task IDs are {valid_range}.',
-                    exceptions.JobExitCode.NOT_FOUND)
+        if isinstance(task, int):
+            task_row = managed_job_state.get_task_id_name_status_log(
+                job_id, task)
+            if task_row is None:
+                num_tasks = managed_job_state.get_num_tasks(job_id)
+                return _task_filter_not_found(job_id, task, num_tasks)
+            filtered_task_id = task
+        else:
+            assert task_info is not None, task
+            for t_id, t_name, _, _, _ in task_info:
+                if t_name == task:
+                    filtered_task_id = t_id
+                    break
+            if filtered_task_id is None:
+                assert num_tasks is not None, task
+                return _task_filter_not_found(job_id, task, num_tasks)
 
     def get_stream_target_snapshot() -> managed_job_state.JobLogStreamSnapshot:
         if filtered_task_id is None:
@@ -497,11 +500,14 @@ def stream_logs_by_id(job_id: int,
         task_name: str | None = None
 
         # Show hint about per-task filtering when there are multiple tasks
-        if num_tasks > 1 and task is None:
-            print(f'{colorama.Fore.CYAN}Hint: This job has {num_tasks} tasks. '
-                  f'Use \'sky jobs logs {job_id} TASK\' to view logs for a '
-                  f'specific task (TASK can be task ID or name).'
-                  f'{colorama.Style.RESET_ALL}')
+        if task is None:
+            assert num_tasks is not None, job_id
+            if num_tasks > 1:
+                print(f'{colorama.Fore.CYAN}Hint: This job has {num_tasks} '
+                      'tasks. '
+                      f'Use \'sky jobs logs {job_id} TASK\' to view logs for '
+                      'a specific task (TASK can be task ID or name).'
+                      f'{colorama.Style.RESET_ALL}')
 
         if not _should_keep_logging(managed_job_status):
             return _render_stopped_snapshot_logs(
@@ -706,12 +712,13 @@ def stream_logs_by_id(job_id: int,
                             job_id, managed_job_status)
                         continue
 
-                    if task_id == num_tasks - 1:
-                        break
-
                     # If a task filter was specified, we're done with the
                     # specific task - don't wait for other tasks.
                     if filtered_task_id is not None:
+                        break
+
+                    assert num_tasks is not None, job_id
+                    if task_id == num_tasks - 1:
                         break
 
                     # The log for the current job is finished. We need to

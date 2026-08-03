@@ -171,6 +171,35 @@ class TestGetJobsToCheckStatusInfo:
         assert info
         assert select_count == 1
 
+    def test_get_num_tasks_uses_one_count_select(self,
+                                                 _mock_managed_jobs_db_conn,
+                                                 _seed_multi_task_job,
+                                                 monkeypatch):
+        pipeline_id = _seed_multi_task_job['pipeline_job_id']
+        monkeypatch.setattr(
+            state, '_get_all_task_ids_statuses', lambda _job_id:
+            (_ for _ in ()).throw(
+                AssertionError('status rows materialized for task count')))
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            task_count = state.get_num_tasks(pipeline_id)
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert task_count == 2
+        assert select_count == 1
+
     def test_cancel_legacy_job_is_not_cancellable_through_modern_snapshot(
             self, _mock_managed_jobs_db_conn, tmp_path, monkeypatch):
         legacy_job_id = _insert_legacy_running_job(_mock_managed_jobs_db_conn)

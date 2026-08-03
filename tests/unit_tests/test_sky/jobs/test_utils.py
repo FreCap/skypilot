@@ -275,7 +275,7 @@ class TestClusterHandleNotRequired:
 
     def test_empty_fields_list(self):
         """Test with empty fields list."""
-        fields = []
+        fields: List[str] = []
         assert jobs_utils._cluster_handle_not_required(fields) is True
 
 
@@ -466,7 +466,7 @@ class TestGetManagedJobQueue:
 
         def fake_get_status_count_with_filters(**kwargs):
             # Simple implementation for testing
-            status_counts = {}
+            status_counts: Dict[str, int] = {}
             for job in jobs:
                 status_value = job['status'].value
                 status_counts[status_value] = status_counts.get(
@@ -812,7 +812,7 @@ class TestGetManagedJobQueue:
 
     def test_empty_jobs_list(self, monkeypatch):
         """Test with empty jobs list."""
-        jobs = []
+        jobs: List[Dict[str, Any]] = []
         self._patch_managed_job_state(monkeypatch, jobs)
         self._patch_global_user_state(monkeypatch)
 
@@ -1125,22 +1125,36 @@ class TestStreamLogsByIdTaskFiltering:
             task_id, managed_job_state.ManagedJobStatus.SUCCEEDED, None, None,
             None, task_name)
 
+    def _stub_stream_frontend(self, monkeypatch):
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        return status_display
+
     def test_task_filter_by_int_matches_task_id(self, monkeypatch):
         """Test that int task filter matches against task_id."""
         job_id = 1
         tasks = [(0, 'train'), (1, 'eval'), (2, 'export')]
         task_info = self._create_task_info(tasks)
+        self._stub_stream_frontend(monkeypatch)
 
-        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
-                            lambda jid: len(tasks))
         monkeypatch.setattr(
             jobs_utils.managed_job_state,
             'get_all_task_ids_names_statuses_logs',
-            lambda jid: task_info,
+            mock.Mock(side_effect=AssertionError('whole-task scan used')),
         )
+        task_row_read = mock.Mock(
+            side_effect=lambda jid, task_id: task_info[task_id])
         monkeypatch.setattr(jobs_utils.managed_job_state,
-                            'get_task_id_name_status_log',
-                            lambda jid, task_id: task_info[task_id])
+                            'get_task_id_name_status_log', task_row_read)
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_num_tasks',
+            mock.Mock(side_effect=AssertionError('count query used on found '
+                                                 'task-id filter')))
 
         # Task filter is int 1, should match task_id=1 (eval)
         # We need to verify the filter finds the right task by checking
@@ -1165,12 +1179,16 @@ class TestStreamLogsByIdTaskFiltering:
         # Should NOT return NOT_FOUND since task_id=1 exists
         assert exit_code != exceptions.JobExitCode.NOT_FOUND
         assert 'No task found matching' not in msg
+        assert task_row_read.call_args_list == [
+            mock.call(job_id, 1), mock.call(job_id, 1)
+        ]
 
     def test_task_filter_by_str_matches_task_name(self, monkeypatch):
         """Test that str task filter matches against task_name."""
         job_id = 1
         tasks = [(0, 'train'), (1, 'eval'), (2, 'export')]
         task_info = self._create_task_info(tasks)
+        self._stub_stream_frontend(monkeypatch)
 
         monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
                             lambda jid: len(tasks))
@@ -1206,15 +1224,18 @@ class TestStreamLogsByIdTaskFiltering:
         """Test that int task filter returns NOT_FOUND when task_id doesn't exist."""
         job_id = 1
         tasks = [(0, 'train'), (1, 'eval')]
-        task_info = self._create_task_info(tasks)
-
-        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
-                            lambda jid: len(tasks))
+        self._stub_stream_frontend(monkeypatch)
+        task_row_read = mock.Mock(return_value=None)
+        count_read = mock.Mock(return_value=len(tasks))
+        monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_task_id_name_status_log', task_row_read)
         monkeypatch.setattr(
             jobs_utils.managed_job_state,
             'get_all_task_ids_names_statuses_logs',
-            lambda jid: task_info,
+            mock.Mock(side_effect=AssertionError('whole-task scan used')),
         )
+        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
+                            count_read)
 
         # Task filter is int 5, which doesn't exist
         msg, exit_code = jobs_utils.stream_logs_by_id(job_id,
@@ -1224,12 +1245,40 @@ class TestStreamLogsByIdTaskFiltering:
         assert exit_code == exceptions.JobExitCode.NOT_FOUND
         assert 'No task found matching 5' in msg
         assert 'Valid task IDs are 0-1' in msg
+        task_row_read.assert_called_once_with(job_id, 5)
+        count_read.assert_called_once_with(job_id)
+
+    def test_task_filter_int_missing_job(self, monkeypatch):
+        """Test that an int task filter preserves the missing-job error."""
+        job_id = 1
+        self._stub_stream_frontend(monkeypatch)
+        task_row_read = mock.Mock(return_value=None)
+        count_read = mock.Mock(return_value=0)
+        monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_task_id_name_status_log', task_row_read)
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state,
+            'get_all_task_ids_names_statuses_logs',
+            mock.Mock(side_effect=AssertionError('whole-task scan used')),
+        )
+        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
+                            count_read)
+
+        msg, exit_code = jobs_utils.stream_logs_by_id(job_id,
+                                                      follow=False,
+                                                      task=5)
+
+        assert exit_code == exceptions.JobExitCode.NOT_FOUND
+        assert msg == f'Job {job_id} not found.'
+        task_row_read.assert_called_once_with(job_id, 5)
+        count_read.assert_called_once_with(job_id)
 
     def test_task_filter_str_not_found(self, monkeypatch):
         """Test that str task filter returns NOT_FOUND when task_name doesn't exist."""
         job_id = 1
         tasks = [(0, 'train'), (1, 'eval')]
         task_info = self._create_task_info(tasks)
+        self._stub_stream_frontend(monkeypatch)
 
         monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
                             lambda jid: len(tasks))
@@ -1252,15 +1301,18 @@ class TestStreamLogsByIdTaskFiltering:
         job_id = 1
         # Task with numeric name '99' but task_id=0
         tasks = [(0, '99')]
-        task_info = self._create_task_info(tasks)
-
-        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
-                            lambda jid: len(tasks))
+        self._stub_stream_frontend(monkeypatch)
+        task_row_read = mock.Mock(return_value=None)
+        count_read = mock.Mock(return_value=len(tasks))
+        monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_task_id_name_status_log', task_row_read)
         monkeypatch.setattr(
             jobs_utils.managed_job_state,
             'get_all_task_ids_names_statuses_logs',
-            lambda jid: task_info,
+            mock.Mock(side_effect=AssertionError('whole-task scan used')),
         )
+        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
+                            count_read)
 
         # Task filter is int 99, should NOT match task_name='99',
         # should only try to match task_id
@@ -1271,12 +1323,15 @@ class TestStreamLogsByIdTaskFiltering:
         # Should return NOT_FOUND because task_id=99 doesn't exist
         assert exit_code == exceptions.JobExitCode.NOT_FOUND
         assert 'No task found matching 99' in msg
+        task_row_read.assert_called_once_with(job_id, 99)
+        count_read.assert_called_once_with(job_id)
 
     def test_task_filter_str_does_not_match_task_id(self, monkeypatch):
         """Test that str task filter does NOT match task_id even if numeric."""
         job_id = 1
         tasks = [(0, 'train'), (1, 'eval')]
         task_info = self._create_task_info(tasks)
+        self._stub_stream_frontend(monkeypatch)
 
         monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
                             lambda jid: len(tasks))
@@ -1301,6 +1356,7 @@ class TestStreamLogsByIdTaskFiltering:
         job_id = 1
         tasks = [(0, 'train'), (1, 'eval')]
         task_info = self._create_task_info(tasks)
+        self._stub_stream_frontend(monkeypatch)
 
         monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
                             lambda jid: len(tasks))
@@ -1334,6 +1390,7 @@ class TestStreamLogsByIdTaskFiltering:
         job_id = 1
         tasks = [(0, 'train')]
         task_info = self._create_task_info(tasks)
+        self._stub_stream_frontend(monkeypatch)
 
         monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
                             lambda jid: len(tasks))
