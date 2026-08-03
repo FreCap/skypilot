@@ -6,6 +6,7 @@ in generated code and run on a replica VM.
 """
 
 import dataclasses
+import math
 import threading
 from typing import Any, NoReturn, SupportsIndex
 
@@ -37,19 +38,49 @@ class FreshProvisionEvidence:
     requested_node_count: int
     head_instance_id: str
     created_instance_ids: tuple[str, ...]
+    aws_account_id: str
+    provision_owner_identity: tuple[str, ...] = dataclasses.field(repr=False)
+    region: str
+    availability_zone: str
+    instance_type: str
+    market_type: str
+    catalog_memory_gib: float
     service_name: str
     service_hash: str
 
     def __post_init__(self) -> None:
-        for field_name in ('request_id', 'workspace', 'cluster_name',
+        for field_name in ('request_id', 'cluster_name',
                            'cluster_name_on_cloud', 'cluster_hash',
-                           'provider_name', 'head_instance_id', 'service_name',
+                           'provider_name', 'head_instance_id', 'region',
+                           'availability_zone', 'instance_type', 'service_name',
                            'service_hash'):
             _require_nonempty_string(getattr(self, field_name), field_name)
+        if not isinstance(self.workspace, str):
+            raise ValueError('workspace must be a string.')
+        if self.provider_name != 'aws':
+            raise ValueError('Fresh recovery evidence is AWS-only.')
+        if (not isinstance(self.aws_account_id, str) or
+                len(self.aws_account_id) != 12 or
+                not self.aws_account_id.isdecimal()):
+            raise ValueError('aws_account_id must contain exactly 12 digits.')
+        if (not isinstance(self.provision_owner_identity, tuple) or
+                len(self.provision_owner_identity) != 2 or
+                any(not isinstance(value, str) or not value
+                    for value in self.provision_owner_identity) or
+                self.provision_owner_identity[-1] != self.aws_account_id):
+            raise ValueError(
+                'provision_owner_identity must bind the AWS account.')
+        if self.market_type not in ('on_demand', 'spot'):
+            raise ValueError('market_type must be on_demand or spot.')
+        if (not isinstance(self.catalog_memory_gib, (int, float)) or
+                isinstance(self.catalog_memory_gib, bool) or
+                not math.isfinite(self.catalog_memory_gib) or
+                self.catalog_memory_gib <= 0):
+            raise ValueError('catalog_memory_gib must be positive and finite.')
         if (not isinstance(self.requested_node_count, int) or
                 isinstance(self.requested_node_count, bool) or
-                self.requested_node_count <= 0):
-            raise ValueError('requested_node_count must be a positive integer.')
+                self.requested_node_count != 1):
+            raise ValueError('requested_node_count must be exactly one.')
         if not isinstance(self.created_instance_ids, tuple):
             raise ValueError('created_instance_ids must be a tuple.')
         if any(not isinstance(instance_id, str) or not instance_id
@@ -80,6 +111,9 @@ class FreshProvisionEvidence:
         requested_node_count: int,
         service_name: str,
         service_hash: str,
+        cloud_user_identity: list[str] | None,
+        catalog_instance_type: str,
+        catalog_memory_gib: float,
         cluster_existed: bool,
         dryrun: bool,
         provisioning_skipped: bool,
@@ -102,6 +136,23 @@ class FreshProvisionEvidence:
             raise ValueError('Provisioned cluster identity does not match.')
         if provision_record.provider_name != provider_name:
             raise ValueError('Provisioned provider identity does not match.')
+        if provider_name != 'aws':
+            raise ValueError('Fresh recovery evidence is AWS-only.')
+        if (not isinstance(cloud_user_identity, list) or
+                len(cloud_user_identity) != 2 or
+                any(not isinstance(value, str) or not value
+                    for value in cloud_user_identity)):
+            raise ValueError('AWS provision owner identity is unavailable.')
+        provision_owner_identity = tuple(cloud_user_identity)
+        identity = provision_record.fresh_aws_instance_identity
+        if identity is None:
+            raise ValueError('Fresh AWS instance identity is unavailable.')
+        if (identity.ec2_instance_id != provision_record.head_instance_id or
+                identity.region != provision_record.region or
+                identity.availability_zone != provision_record.zone or
+                identity.instance_type != catalog_instance_type or
+                identity.aws_account_id != provision_owner_identity[-1]):
+            raise ValueError('Fresh AWS instance identity does not match.')
         created_instance_ids = tuple(
             sorted(provision_record.created_instance_ids))
         return cls(
@@ -114,6 +165,13 @@ class FreshProvisionEvidence:
             requested_node_count=requested_node_count,
             head_instance_id=provision_record.head_instance_id,
             created_instance_ids=created_instance_ids,
+            aws_account_id=identity.aws_account_id,
+            provision_owner_identity=provision_owner_identity,
+            region=identity.region,
+            availability_zone=identity.availability_zone,
+            instance_type=identity.instance_type,
+            market_type=identity.market_type,
+            catalog_memory_gib=float(catalog_memory_gib),
             service_name=service_name,
             service_hash=service_hash,
         )

@@ -307,6 +307,7 @@ class TestPaidCapacityAuthorityPG:
             success_ttl_seconds=60,
             waiter_ttl_seconds=30,
             expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        assert serve_state.add_or_update_replica('svc', 2, unclaimed)
         claimed.status_property.sky_launch_status = (
             common_utils.ProcessStatus.FAILED)
         unclaimed.status_property.sky_launch_status = (
@@ -1749,6 +1750,7 @@ class TestPaidCapacityAuthorityPG:
         infos = [(replica_id, self._info('svc', replica_id))
                  for replica_id in range(301)]
 
+        assert serve_state.add_or_update_replicas('svc', infos)
         assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
             'svc',
             'hash',
@@ -1984,13 +1986,14 @@ class TestPaidCapacityAuthorityPG:
         location, pool_a = self._paid_pool('us-east-1a', 'g6.xlarge')
         _, pool_b = self._paid_pool('us-east-1b', 'g6.2xlarge')
         frontier_key = paid_capacity.frontier_key(location)
+        info = self._info('svc', 1)
 
         def _claim(pool_key: str, now: float) -> str:
             return serve_state.try_add_replica_with_paid_capacity_claim(
                 'svc',
                 'hash',
                 1,
-                self._info('svc', 1),
+                info,
                 pool_key=pool_key,
                 priority=20,
                 base_limit=4,
@@ -2032,6 +2035,54 @@ class TestPaidCapacityAuthorityPG:
         assert pools == [pool_a]
         assert waiters == []
         assert replica_pool == pool_a
+
+    def test_paid_claim_redrive_requires_same_replica_record_identity(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        original = self._info('svc', 1)
+
+        def _claim(info: replica_managers.ReplicaInfo, priority: int,
+                   now: float) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                1,
+                info,
+                pool_key='pool',
+                priority=priority,
+                base_limit=1,
+                max_limit=4,
+                now=now,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'))
+
+        assert _claim(original, 20, 100) == 'acquired'
+        original.version = 2
+        assert _claim(original, 21, 200) == 'acquired'
+
+        replacement = self._info('svc', 1)
+        replacement.version = 99
+        assert replacement.replica_record_id != original.replica_record_id
+        assert _claim(replacement, 99, 300) == 'ownership_lost'
+
+        persisted = serve_state.get_replica_info_from_id('svc', 1)
+        assert persisted is not None
+        assert persisted.replica_record_id == original.replica_record_id
+        assert persisted.version == 2
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claim = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.pool_key,
+                    serve_state.paid_capacity_claims_table.c.priority,
+                    serve_state.paid_capacity_claims_table.c.claimed_at).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc',
+                        serve_state.paid_capacity_claims_table.c.replica_id ==
+                        1)).one()
+        assert claim == ('pool', 21, 100)
 
     def test_frontier_fill_withdraws_ineligible_priority_waiter(
             self, broker_engine, monkeypatch):
@@ -2573,14 +2624,18 @@ class TestPaidCapacityAuthorityPG:
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('low', 'hash-low', 11)
         self._add_service('high', 'hash-high', 22)
+        infos = {}
 
         def _claim(service_name: str, service_hash: str, pid: int,
                    replica_id: int, priority: int) -> str:
+            identity = (service_name, replica_id)
+            if identity not in infos:
+                infos[identity] = self._info(service_name, replica_id)
             return serve_state.try_add_replica_with_paid_capacity_claim(
                 service_name,
                 service_hash,
                 replica_id,
-                self._info(service_name, replica_id),
+                infos[identity],
                 pool_key='shared-pool',
                 priority=priority,
                 base_limit=1,

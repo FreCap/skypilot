@@ -426,6 +426,8 @@ class RayCodeGen(TaskCodeGen):
                 f'{recovery_logging_function})',
                 'task_submitters = []',
                 'attempt_contexts = []',
+                'arm_started_monotonics = []',
+                'ray_session_identities = []',
             ]
 
     def add_setup(
@@ -678,9 +680,11 @@ class RayCodeGen(TaskCodeGen):
             submission_code = textwrap.indent(
                 textwrap.dedent(f"""\
                 def {submitter_name}(attempt_number, attempt_context):
-                    future = run_bash_command_with_log_and_return_pid_with_system_oom_recovery \\
-                        .options(name=name_str, {options_str}) \\
-                        .remote(
+                    remote_task = run_bash_command_with_log_and_return_pid_with_system_oom_recovery \\
+                        .options(name=name_str, {options_str})
+                    if attempt_number == 0:
+                        arm_started_monotonics.append(time.monotonic())
+                    future = remote_task.remote(
                             script,
                             log_path,
                             env_vars=sky_env_vars_dict,
@@ -689,6 +693,9 @@ class RayCodeGen(TaskCodeGen):
                             recovery_context=attempt_context,
                             recovery_plan=system_oom_recovery_plan,
                         )
+                    if attempt_number == 0:
+                        ray_session_identities.append(
+                            system_oom_recovery.capture_ray_session_identity(ray))
                     return future
 
                 task_submitters.append({submitter_name})
@@ -760,6 +767,8 @@ class RayCodeGen(TaskCodeGen):
                     attempt_contexts[0],
                     {self.job_id!r},
                     system_oom_recovery_plan,
+                    arm_started_monotonics[0],
+                    ray_session_identities[0],
                 )"""))
         else:
             self._code.append('returncodes, _ = get_or_fail(futures, pg)')

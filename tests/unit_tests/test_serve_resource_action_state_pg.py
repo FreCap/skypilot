@@ -936,7 +936,13 @@ def test_launch_replica_admission_is_atomic_replayable_and_preserved(
                 7)).mappings().one()
     assert replayed_row['version'] == 1
     assert replayed_row['status'] == 'PENDING'
-    assert serve_state.add_or_update_replica('svc', 7, _replica(version=3))
+    updated = serve_state.get_replica_info_from_id('svc', 7)
+    assert updated is not None
+    updated.version = 3
+    assert serve_state.add_or_update_replica('svc',
+                                             7,
+                                             updated,
+                                             expected_replica_exists=True)
     with engine.connect() as connection:
         row = connection.execute(
             sqlalchemy.select(serve_state_schema.replicas_table).where(

@@ -4,6 +4,7 @@ import math
 import time
 import typing
 from typing import Any
+import uuid
 
 import colorama
 
@@ -18,6 +19,7 @@ from sky.serve import replica_tls
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
+from sky.serve import system_recovery_state
 from sky.skylet import job_lib
 from sky.utils import common_utils
 from sky.utils import env_options
@@ -28,6 +30,114 @@ logger = sky_logging.init_logger(__name__)
 # Sentinel for to_info_dict's pre-fetched cluster_record parameters. None is a
 # legitimate value meaning that the cluster row is absent.
 _NOT_PROVIDED: Any = object()
+
+# This tuple is the stable mutable recovery subdocument copied by the
+# PostgreSQL row-locked patch path. The immutable record identity is validated
+# separately and is never copied from one in-memory record to another.
+SYSTEM_RECOVERY_STORAGE_FIELDS = (
+    'system_recovery_launch_intent',
+    'system_recovery_disposition',
+    'launch_request_id',
+    'service_job_id',
+    'candidate_ready_observed_at',
+    'ordinary_release_not_before',
+    'system_recovery_revision',
+    'system_recovery',
+    'system_recovery_quarantine',
+)
+# Exact set added by v13. A row missing all ten keys is the one supported
+# rollback shape; any nonempty proper subset is quarantined.
+V13_ADDITIVE_STORAGE_FIELDS = ('replica_record_id',
+                               *SYSTEM_RECOVERY_STORAGE_FIELDS)
+
+# A fixed namespace makes the one supported v12/rollback transition identity
+# reproducible across processes and across JSON/pickle readers.  New v13 rows
+# never use this namespace: they receive an independent random UUID4.
+_REPLICA_RECORD_ID_TRANSITION_NAMESPACE = uuid.UUID(
+    '3b448973-9e2f-58aa-a640-27fb7c6a8884')
+
+
+def _canonical_replica_record_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise system_recovery_state.RecoveryStateError(
+            'replica_record_id must be a canonical UUID string.')
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError) as e:
+        raise system_recovery_state.RecoveryStateError(
+            'replica_record_id must be a canonical UUID string.') from e
+    if str(parsed) != value:
+        raise system_recovery_state.RecoveryStateError(
+            'replica_record_id must be a canonical UUID string.')
+    return value
+
+
+def _derive_transition_replica_record_id(replica: Any) -> str:
+    replica_id = getattr(replica, 'replica_id', None)
+    cluster_name = getattr(replica, 'cluster_name', None)
+    created_at = getattr(replica, 'created_at', None)
+    if (isinstance(replica_id, bool) or not isinstance(replica_id, int) or
+            replica_id < 0):
+        raise system_recovery_state.RecoveryStateError(
+            'Transition replica identity requires a nonnegative replica ID.')
+    if not isinstance(cluster_name, str) or not cluster_name:
+        raise system_recovery_state.RecoveryStateError(
+            'Transition replica identity requires a nonempty cluster name.')
+    if created_at is None:
+        created_at_token = 'none'
+    elif (isinstance(created_at, bool) or
+          not isinstance(created_at, (int, float))):
+        raise system_recovery_state.RecoveryStateError(
+            'Transition replica identity requires a finite creation timestamp.')
+    else:
+        try:
+            normalized_created_at = float(created_at)
+        except (OverflowError, TypeError, ValueError) as e:
+            raise system_recovery_state.RecoveryStateError(
+                'Transition replica identity requires a finite creation '
+                'timestamp.') from e
+        if not math.isfinite(normalized_created_at):
+            raise system_recovery_state.RecoveryStateError(
+                'Transition replica identity requires a finite creation '
+                'timestamp.')
+        created_at_token = normalized_created_at.hex()
+    identity_material = (f'{replica_id}:{len(cluster_name)}:{cluster_name}:'
+                         f'{created_at_token}')
+    return str(
+        uuid.uuid5(_REPLICA_RECORD_ID_TRANSITION_NAMESPACE, identity_material))
+
+
+def _set_transition_replica_record_id(replica: Any) -> None:
+    replica.replica_record_id = _derive_transition_replica_record_id(replica)
+
+
+def _ensure_replica_record_id(replica: Any) -> None:
+    try:
+        _canonical_replica_record_id(getattr(replica, 'replica_record_id',
+                                             None))
+    except system_recovery_state.RecoveryStateError:
+        _set_transition_replica_record_id(replica)
+
+
+def _positive_timestamp(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise system_recovery_state.RecoveryStateError(
+            f'{name} must be a positive finite timestamp.')
+    try:
+        timestamp = float(value)
+    except (OverflowError, TypeError, ValueError) as e:
+        raise system_recovery_state.RecoveryStateError(
+            f'{name} must be a positive finite timestamp.') from e
+    if not math.isfinite(timestamp) or timestamp <= 0:
+        raise system_recovery_state.RecoveryStateError(
+            f'{name} must be a positive finite timestamp.')
+    return timestamp
+
+
+def _optional_positive_timestamp(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    return _positive_timestamp(value, name)
 
 
 def _is_valid_drain_started_at(value: Any) -> bool:
@@ -274,6 +384,177 @@ def _decode_replica_resource_state(
     return decoded
 
 
+def _set_ordinary_system_recovery_defaults(replica: Any) -> None:
+    replica.system_recovery_launch_intent = None
+    replica.system_recovery_disposition = (
+        system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+    replica.launch_request_id = None
+    replica.service_job_id = None
+    replica.candidate_ready_observed_at = None
+    replica.ordinary_release_not_before = None
+    replica.system_recovery_revision = 0
+    replica.system_recovery = None
+    replica.system_recovery_quarantine = None
+
+
+def _quarantine_system_recovery(
+        replica: Any,
+        reason: system_recovery_state.RecoveryQuarantineReason) -> None:
+    """Replace an unsafe bundle with a reason-only, absorbing marker."""
+    _ensure_replica_record_id(replica)
+    _set_ordinary_system_recovery_defaults(replica)
+    replica.system_recovery_quarantine = (
+        system_recovery_state.SystemRecoveryQuarantine(reason=reason))
+
+
+def _validate_system_recovery_fields(replica: Any) -> None:
+    """Validate the complete in-memory v13 recovery subdocument."""
+    _canonical_replica_record_id(replica.replica_record_id)
+    intent = replica.system_recovery_launch_intent
+    disposition = replica.system_recovery_disposition
+    launch_request_id = replica.launch_request_id
+    service_job_id = replica.service_job_id
+    ready_at = replica.candidate_ready_observed_at
+    release_at = replica.ordinary_release_not_before
+    revision = replica.system_recovery_revision
+    recovery = replica.system_recovery
+    quarantine = replica.system_recovery_quarantine
+
+    if intent is not None:
+        if not isinstance(intent,
+                          system_recovery_state.SystemRecoveryLaunchIntent):
+            raise system_recovery_state.RecoveryStateError(
+                'system_recovery_launch_intent has an invalid type.')
+        if intent.replica_id != replica.replica_id:
+            raise system_recovery_state.RecoveryStateError(
+                'Recovery launch intent does not match replica ID.')
+    if not isinstance(disposition,
+                      system_recovery_state.SystemRecoveryDisposition):
+        raise system_recovery_state.RecoveryStateError(
+            'system_recovery_disposition has an invalid type.')
+    if (launch_request_id is not None and
+        (not isinstance(launch_request_id, str) or not launch_request_id)):
+        raise system_recovery_state.RecoveryStateError(
+            'launch_request_id must be a nonempty string.')
+    if service_job_id is not None:
+        if (isinstance(service_job_id, bool) or
+                not isinstance(service_job_id, int) or service_job_id < 1):
+            raise system_recovery_state.RecoveryStateError(
+                'service_job_id must be a positive integer.')
+        if launch_request_id is None:
+            raise system_recovery_state.RecoveryStateError(
+                'service_job_id requires launch_request_id.')
+    ready_at = _optional_positive_timestamp(ready_at,
+                                            'candidate_ready_observed_at')
+    release_at = _optional_positive_timestamp(release_at,
+                                              'ordinary_release_not_before')
+    if (ready_at is None) != (release_at is None):
+        raise system_recovery_state.RecoveryStateError(
+            'Candidate freshness anchors must be both set or both absent.')
+    if ready_at is not None:
+        assert release_at is not None
+        if not math.isclose(
+                release_at - ready_at,
+                system_recovery_state.CANDIDATE_RELEASE_GUARD_SECONDS,
+                rel_tol=0,
+                abs_tol=1e-9):
+            raise system_recovery_state.RecoveryStateError(
+                'Candidate freshness anchors disagree with the fixed guard.')
+    if (isinstance(revision, bool) or not isinstance(revision, int) or
+            revision < 0):
+        raise system_recovery_state.RecoveryStateError(
+            'system_recovery_revision must be a nonnegative integer.')
+    if recovery is not None:
+        if not isinstance(recovery,
+                          system_recovery_state.ReplicaSystemRecovery):
+            raise system_recovery_state.RecoveryStateError(
+                'system_recovery has an invalid type.')
+        if service_job_id is None or recovery.job_id != service_job_id:
+            raise system_recovery_state.RecoveryStateError(
+                'system_recovery must match the exact service job ID.')
+        if intent is None:
+            raise system_recovery_state.RecoveryStateError(
+                'system_recovery requires a launch intent.')
+        if (recovery.capability != intent.expected_runtime_capability or
+                recovery.profile_version != intent.runtime_profile_version):
+            raise system_recovery_state.RecoveryStateError(
+                'system_recovery capability does not match launch intent.')
+    if quarantine is not None and not isinstance(
+            quarantine, system_recovery_state.SystemRecoveryQuarantine):
+        raise system_recovery_state.RecoveryStateError(
+            'system_recovery_quarantine has an invalid type.')
+
+    if quarantine is not None:
+        # Only already-validated typed fields can accompany the reason-only
+        # marker. Malformed decoder input is sanitized before it reaches here.
+        # Returning now makes quarantine absorbing without requiring a
+        # disposition transition that could accidentally grant authority.
+        return
+
+    if disposition in (
+            system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+        if intent is None:
+            raise system_recovery_state.RecoveryStateError(
+                'Recovery disposition requires a launch intent.')
+    if (disposition == system_recovery_state.SystemRecoveryDisposition.CANDIDATE
+            and recovery is not None):
+        raise system_recovery_state.RecoveryStateError(
+            'CANDIDATE cannot contain capable recovery state.')
+    if (disposition == system_recovery_state.SystemRecoveryDisposition.ORDINARY
+            and recovery is not None):
+        raise system_recovery_state.RecoveryStateError(
+            'ORDINARY cannot contain capable recovery state.')
+    if disposition == system_recovery_state.SystemRecoveryDisposition.CAPABLE:
+        if (launch_request_id is None or service_job_id is None or
+                recovery is None):
+            raise system_recovery_state.RecoveryStateError(
+                'CAPABLE requires exact request, job, and recovery state.')
+    if intent is None and any(value is not None
+                              for value in (launch_request_id, service_job_id,
+                                            ready_at, release_at, recovery)):
+        raise system_recovery_state.RecoveryStateError(
+            'Recovery associations require a historical launch intent.')
+
+
+def copy_system_recovery_fields(source: Any,
+                                destination: Any,
+                                *,
+                                increment_revision: bool = False) -> None:
+    """Copy only the v13 recovery subdocument into a locked latest record.
+
+    With ``increment_revision=True``, ``source`` must have been reduced from
+    the same revision as ``destination``.  The destination is advanced exactly
+    once; a stale source is rejected instead of being replayed.
+    """
+    _validate_system_recovery_fields(source)
+    source_revision = source.system_recovery_revision
+    destination_revision = getattr(destination, 'system_recovery_revision', 0)
+    source_record_id = source.replica_record_id
+    destination_record_id = getattr(destination, 'replica_record_id', None)
+    if (isinstance(destination_revision, bool) or
+            not isinstance(destination_revision, int) or
+            destination_revision < 0):
+        raise system_recovery_state.RecoveryStateError(
+            'Locked recovery revision is invalid.')
+    if increment_revision and source_revision != destination_revision:
+        raise system_recovery_state.RecoveryStateError(
+            'Recovery subdocument revision changed.')
+    if source_record_id != destination_record_id:
+        raise system_recovery_state.RecoveryStateError(
+            'Replica record identity changed.')
+    for field in SYSTEM_RECOVERY_STORAGE_FIELDS:
+        if field == 'system_recovery_revision':
+            continue
+        setattr(destination, field, getattr(source, field))
+    destination.system_recovery_revision = (
+        system_recovery_state.next_recovery_revision(destination_revision)
+        if increment_revision else source_revision)
+    setattr(destination, '_version', max(getattr(destination, '_version', 0),
+                                         13))
+    _validate_system_recovery_fields(destination)
+
+
 class ReplicaInfo:
     """Replica info for each replica."""
 
@@ -291,8 +572,10 @@ class ReplicaInfo:
     # reserved_fill launch reason. Demand launches can also land on free
     # reserved capacity and must receive the same routing preference.
     # Version 12 stores the exact global paid-capacity pool claim associated
-    # with an unresolved fresh demand launch.
-    _VERSION = 12
+    # with an unresolved fresh demand launch. Version 13 adds the closed
+    # system-recovery launch disposition, exact associations, freshness
+    # anchors, monotonic subdocument revision, nested state, and quarantine.
+    _VERSION = 13
 
     def __init__(self,
                  replica_id: int,
@@ -317,6 +600,9 @@ class ReplicaInfo:
         # after the snapshot was taken (see
         # Autoscaler._fill_row_occupies_free_slot).
         self.created_at: float | None = time.time()
+        # This fences a physical database record, independently from the
+        # reusable numeric replica id and from resource-action identity.
+        self.replica_record_id: str = str(uuid.uuid4())
         self.first_not_ready_time: float | None = None
         # Start of the current run of consecutive failed readiness probes
         # after the replica was once READY; None while the replica is
@@ -358,6 +644,19 @@ class ReplicaInfo:
         # Exact provider capacity pool whose unresolved-launch allowance this
         # row consumes. None for zero-cost, recovery-only, and pre-v12 rows.
         self.paid_capacity_pool_key: str | None = None
+        self.system_recovery_launch_intent: (
+            system_recovery_state.SystemRecoveryLaunchIntent | None) = None
+        self.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+        self.launch_request_id: str | None = None
+        self.service_job_id: int | None = None
+        self.candidate_ready_observed_at: float | None = None
+        self.ordinary_release_not_before: float | None = None
+        self.system_recovery_revision: int = 0
+        self.system_recovery: (system_recovery_state.ReplicaSystemRecovery |
+                               None) = None
+        self.system_recovery_quarantine: (
+            system_recovery_state.SystemRecoveryQuarantine | None) = None
 
     def to_storage_dict(self) -> dict[str, Any]:
         """Serialize control-plane state into the versioned JSON contract."""
@@ -382,6 +681,31 @@ class ReplicaInfo:
                 # Placer-pinned overrides carry a Cloud instance. The recovery
                 # path accepts its registry name and reconstructs the object.
                 resources_override['cloud'] = str(cloud)
+
+        # Old pickles have no v13 attributes and are ordinary by contract.
+        # Any other partial in-memory bundle is isolated rather than silently
+        # becoming routable ordinary state.
+        present_recovery_fields = {
+            field for field in V13_ADDITIVE_STORAGE_FIELDS
+            if hasattr(self, field)
+        }
+        if getattr(self, '_version', 0) < 13:
+            _set_ordinary_system_recovery_defaults(self)
+            _set_transition_replica_record_id(self)
+            self._version = 13
+        elif (not present_recovery_fields and
+              getattr(self, '_version', 0) == 13):
+            _set_ordinary_system_recovery_defaults(self)
+            _set_transition_replica_record_id(self)
+        elif present_recovery_fields != set(V13_ADDITIVE_STORAGE_FIELDS):
+            _quarantine_system_recovery(
+                self, system_recovery_state.RecoveryQuarantineReason.
+                PARTIAL_V13_BUNDLE)
+        _validate_system_recovery_fields(self)
+        launch_intent = self.system_recovery_launch_intent
+        disposition = self.system_recovery_disposition
+        recovery = self.system_recovery
+        quarantine = self.system_recovery_quarantine
 
         def _process_status_value(
             status: common_utils.ProcessStatus | None,) -> str | None:
@@ -411,6 +735,20 @@ class ReplicaInfo:
                 self, 'cost_rebalance_for_replica_id', None),
             'paid_capacity_pool_key': getattr(self, 'paid_capacity_pool_key',
                                               None),
+            'replica_record_id': self.replica_record_id,
+            'system_recovery_launch_intent':
+                (launch_intent.to_dict() if launch_intent is not None else None
+                ),
+            'system_recovery_disposition': disposition.value,
+            'launch_request_id': self.launch_request_id,
+            'service_job_id': self.service_job_id,
+            'candidate_ready_observed_at': self.candidate_ready_observed_at,
+            'ordinary_release_not_before': self.ordinary_release_not_before,
+            'system_recovery_revision': self.system_recovery_revision,
+            'system_recovery':
+                (recovery.to_dict() if recovery is not None else None),
+            'system_recovery_quarantine':
+                (quarantine.to_dict() if quarantine is not None else None),
             'status_property': {
                 'sky_launch_status': _process_status_value(
                     status_property.sky_launch_status),
@@ -490,6 +828,66 @@ class ReplicaInfo:
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
         replica.paid_capacity_pool_key = state.get('paid_capacity_pool_key')
+        recovery_keys = set(V13_ADDITIVE_STORAGE_FIELDS)
+        present_recovery_keys = recovery_keys.intersection(state)
+        if replica._version < 13:
+            _set_ordinary_system_recovery_defaults(replica)
+            # Old writers cannot choose or preserve the v13 fence. Ignore an
+            # untrusted additive key on an old-labelled row.
+            _set_transition_replica_record_id(replica)
+        elif replica._version > 13:
+            _quarantine_system_recovery(
+                replica, system_recovery_state.RecoveryQuarantineReason.
+                INCONSISTENT_V13_BUNDLE)
+        elif not present_recovery_keys:
+            # Exact rollback compatibility: a v12 writer can retain the v13
+            # version label while erasing the *entire* additive bundle.
+            _set_ordinary_system_recovery_defaults(replica)
+            _set_transition_replica_record_id(replica)
+        elif present_recovery_keys != recovery_keys:
+            _quarantine_system_recovery(
+                replica, system_recovery_state.RecoveryQuarantineReason.
+                PARTIAL_V13_BUNDLE)
+        else:
+            _set_ordinary_system_recovery_defaults(replica)
+            try:
+                replica.replica_record_id = state['replica_record_id']
+                intent_state = state['system_recovery_launch_intent']
+                replica.system_recovery_launch_intent = (
+                    system_recovery_state.SystemRecoveryLaunchIntent.from_dict(
+                        intent_state) if intent_state is not None else None)
+                replica.system_recovery_disposition = (
+                    system_recovery_state.SystemRecoveryDisposition(
+                        state['system_recovery_disposition']))
+                replica.launch_request_id = state['launch_request_id']
+                replica.service_job_id = state['service_job_id']
+                replica.candidate_ready_observed_at = state[
+                    'candidate_ready_observed_at']
+                replica.ordinary_release_not_before = state[
+                    'ordinary_release_not_before']
+                replica.system_recovery_revision = state[
+                    'system_recovery_revision']
+                nested_state = state['system_recovery']
+                replica.system_recovery = (
+                    system_recovery_state.ReplicaSystemRecovery.from_dict(
+                        nested_state) if nested_state is not None else None)
+                quarantine_state = state['system_recovery_quarantine']
+                replica.system_recovery_quarantine = (
+                    system_recovery_state.SystemRecoveryQuarantine.from_dict(
+                        quarantine_state)
+                    if quarantine_state is not None else None)
+            except (system_recovery_state.RecoveryStateError, TypeError,
+                    ValueError):
+                _quarantine_system_recovery(
+                    replica, system_recovery_state.RecoveryQuarantineReason.
+                    MALFORMED_V13_BUNDLE)
+            else:
+                try:
+                    _validate_system_recovery_fields(replica)
+                except system_recovery_state.RecoveryStateError:
+                    _quarantine_system_recovery(
+                        replica, system_recovery_state.RecoveryQuarantineReason.
+                        INCONSISTENT_V13_BUNDLE)
         replica.status_property = ReplicaStatusProperty(
             sky_launch_status=typing.cast(
                 common_utils.ProcessStatus,
@@ -528,6 +926,20 @@ class ReplicaInfo:
                     status_state.get('logical_retirement_committed')) is bool
                 else None),
         )
+        quarantine = replica.system_recovery_quarantine
+        if quarantine is not None:
+            # Isolate only this row.  Never include its raw storage payload in
+            # the audit record or exception text.
+            replica.status_property.service_ready_now = False
+            replica.first_consecutive_failure_time = None
+            if replica.status_property.sky_down_status is None:
+                replica.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.SUCCEEDED)
+                replica.status_property.user_app_failed = True
+            logger.warning(
+                'Quarantined system recovery state for replica %s (%s); '
+                'the row remains off-route pending legacy cleanup.',
+                replica.replica_id, quarantine.reason.value)
         return replica
 
     def get_spot_location(self) -> spot_placer.Location | None:
@@ -560,7 +972,25 @@ class ReplicaInfo:
 
     @property
     def is_ready(self) -> bool:
-        return self.status == serve_state.ReplicaStatus.READY
+        return (not self._system_recovery_forces_off_route() and
+                self.status == serve_state.ReplicaStatus.READY)
+
+    def _system_recovery_forces_off_route(self) -> bool:
+        if getattr(self, 'system_recovery_quarantine', None) is not None:
+            return True
+        disposition = getattr(
+            self, 'system_recovery_disposition',
+            system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+        if disposition == system_recovery_state.SystemRecoveryDisposition.CANDIDATE:
+            return True
+        recovery = getattr(self, 'system_recovery', None)
+        return (
+            disposition
+            == system_recovery_state.SystemRecoveryDisposition.CAPABLE and
+            recovery is not None and recovery.state
+            in (system_recovery_state.ControllerRecoveryState.RECOVERING,
+                system_recovery_state.ControllerRecoveryState.RETRY_SUBMITTED,
+                system_recovery_state.ControllerRecoveryState.EXHAUSTED))
 
     def _resolve_url(
         self,
@@ -616,6 +1046,11 @@ class ReplicaInfo:
     @property
     def status(self) -> serve_state.ReplicaStatus:
         replica_status = self.status_property.to_replica_status()
+        if (self._system_recovery_forces_off_route() and
+                replica_status == serve_state.ReplicaStatus.READY):
+            if self.status_property.first_ready_time is None:
+                return serve_state.ReplicaStatus.STARTING
+            return serve_state.ReplicaStatus.NOT_READY
         if replica_status == serve_state.ReplicaStatus.UNKNOWN:
             logger.error('Detecting UNKNOWN replica status for '
                          f'replica {self.replica_id}.')
@@ -773,6 +1208,7 @@ class ReplicaInfo:
         timeout: int,
         headers: dict[str, str] | None,
         resolved_url: Any = _NOT_PROVIDED,
+        request_started_callback: typing.Callable[[float], None] | None = None,
     ) -> tuple['ReplicaInfo', bool, float]:
         """Probe the readiness of the replica.
 
@@ -803,6 +1239,13 @@ class ReplicaInfo:
             # path is unchanged; under TLS it is a session carrying the same
             # trust the proxy uses.
             client = replica_tls.probe_client()
+            # Recovery route issuance needs the exact local start of the HTTP
+            # request, not the submitting thread's queue time or wall clock.
+            # Keep the ordinary three-value return contract unchanged and
+            # expose this only through the manager-owned callback.
+            request_started_at = time.monotonic()
+            if request_started_callback is not None:
+                request_started_callback(request_started_at)
             if post_data is not None:
                 msg += 'POST'
                 response = client.post(readiness_path,
@@ -901,6 +1344,37 @@ class ReplicaInfo:
 
         self.__dict__.update(state)
         self._version = version if version >= 0 else 0
+
+        recovery_fields = set(V13_ADDITIVE_STORAGE_FIELDS)
+        present_recovery_fields = recovery_fields.intersection(state)
+        if version < 13:
+            _set_ordinary_system_recovery_defaults(self)
+            _set_transition_replica_record_id(self)
+        elif version > 13:
+            _quarantine_system_recovery(
+                self, system_recovery_state.RecoveryQuarantineReason.
+                INCONSISTENT_V13_BUNDLE)
+        elif not present_recovery_fields:
+            _set_ordinary_system_recovery_defaults(self)
+            _set_transition_replica_record_id(self)
+        elif present_recovery_fields != recovery_fields:
+            _quarantine_system_recovery(
+                self, system_recovery_state.RecoveryQuarantineReason.
+                PARTIAL_V13_BUNDLE)
+        else:
+            try:
+                _validate_system_recovery_fields(self)
+            except system_recovery_state.RecoveryStateError:
+                _quarantine_system_recovery(
+                    self, system_recovery_state.RecoveryQuarantineReason.
+                    INCONSISTENT_V13_BUNDLE)
+        if self.system_recovery_quarantine is not None:
+            self.status_property.service_ready_now = False
+            self.first_consecutive_failure_time = None
+            if self.status_property.sky_down_status is None:
+                self.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.SUCCEEDED)
+                self.status_property.user_app_failed = True
 
 
 # Keep historical import and pickle identities even when this implementation

@@ -13,6 +13,8 @@ failure-handling paths. This test pins that: while a replica's
 ``get_job_status`` is blocked, ``self.lock`` must still be acquirable. It is
 deterministic (uses Events, not sleeps).
 """
+# pylint: disable=protected-access,unnecessary-lambda,unused-argument
+# pylint: disable=use-implicit-booleaness-not-comparison
 import threading
 
 import pytest
@@ -271,9 +273,12 @@ def test_user_failure_path_skips_replica_scheduled_down(monkeypatch):
                         {1: job_lib.JobStatus.FAILED})
     monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
                         lambda svc, rid: fresh)
-    writes = []
+
+    def _unexpected_persist(*_args, **_kwargs):
+        pytest.fail('scheduled-down replica must not be persisted')
+
     monkeypatch.setattr(serve_state, 'add_or_update_replica',
-                        lambda svc, rid, info: writes.append(rid))
+                        _unexpected_persist)
 
     terminated = []
     mgr = _build_manager()
@@ -281,7 +286,6 @@ def test_user_failure_path_skips_replica_scheduled_down(monkeypatch):
     mgr._fetch_job_status()
 
     assert not fresh.status_property.user_app_failed
-    assert writes == []
     assert terminated == []
 
 
@@ -309,8 +313,15 @@ def test_command_error_on_one_replica_does_not_starve_the_rest(monkeypatch):
                         'get_job_status', _get_job_status)
     monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
                         lambda svc, rid: broken if rid == 1 else failed)
-    monkeypatch.setattr(serve_state, 'add_or_update_replica',
-                        lambda svc, rid, info: None)
+    writes = []
+
+    def _persist_existing(_service_name, replica_id, info, *,
+                          expected_replica_exists, **_fence_kwargs):
+        assert expected_replica_exists is True
+        writes.append((replica_id, info))
+        return True
+
+    monkeypatch.setattr(serve_state, 'add_or_update_replica', _persist_existing)
 
     terminated = []
     mgr = _build_manager()
@@ -323,6 +334,7 @@ def test_command_error_on_one_replica_does_not_starve_the_rest(monkeypatch):
         2
     ], ('the failed replica after the broken one must still be terminated')
     assert failed.status_property.user_app_failed
+    assert writes == [(2, failed)]
 
 
 def test_empty_job_statuses_skipped_without_aborting_walk(monkeypatch):

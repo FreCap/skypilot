@@ -38,6 +38,8 @@ from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
+from sky.serve import system_recovery_route_lease
+from sky.serve import system_recovery_state
 from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import context_utils
@@ -421,12 +423,14 @@ class SkyServeController:
         # READY; a replica that recovers with a new endpoint is thus
         # re-resolved.
         self._lb_replica_cache: dict[int, tuple[str, str, int]] = {}
+        self._lb_replica_cache_record_ids: dict[int, str] = {}
         # Superset of _lb_replica_cache for url -> replica_id translation
         # of the LB's in-flight report: keeps entries for replicas that
         # left READY but are still nonterminal, so a probe-blipped
         # replica's running job stays attributed to it (see
         # _get_lb_replica_info / _translate_in_flight).
         self._lb_translation_cache: dict[int, tuple[str, str, int]] = {}
+        self._lb_translation_cache_record_ids: dict[int, str] = {}
         # Monotonic generation for complete LB demand/capacity reports. It is
         # intentionally process-local: after restart logical scale-down stays
         # disabled until the new controller consumes a fresh report.
@@ -540,16 +544,21 @@ class SkyServeController:
                                'the load balancer routing snapshot.')
         active_versions = set(runtime_snapshot['active_versions'])
         replica_cache: dict[int, tuple[str, str, int]] = {}
+        replica_cache_record_ids: dict[int, str] = {}
         replica_info: dict[str, dict[str, str]] = {}
+        resolved_url_sources: dict[str, replica_managers.ReplicaInfo] = {}
         ready_infos = [
             info for info in replica_infos
             if (info.status == serve_state.ReplicaStatus.READY and
-                info.version in active_versions)
+                info.version in active_versions and
+                self._replica_manager.system_recovery_allows_routing(info))
         ]
         uncached_cluster_names = [
             info.cluster_name
             for info in ready_infos
-            if info.replica_id not in self._lb_replica_cache
+            if (info.replica_id not in self._lb_replica_cache or
+                getattr(self, '_lb_replica_cache_record_ids', {}).get(
+                    info.replica_id) != info.replica_record_id)
         ]
         cluster_records: dict[str, dict[str, Any] | None] = {}
         if uncached_cluster_names:
@@ -562,7 +571,9 @@ class SkyServeController:
         # query before resolving endpoints.
         uncached_handles: dict[int, Any] = {}
         for info in ready_infos:
-            if info.replica_id in self._lb_replica_cache:
+            if (info.replica_id in self._lb_replica_cache and
+                    getattr(self, '_lb_replica_cache_record_ids', {}).get(
+                        info.replica_id) == info.replica_record_id):
                 continue
             cluster_record = cluster_records.get(info.cluster_name)
             if cluster_record is None:
@@ -573,10 +584,18 @@ class SkyServeController:
             uncached_handles)
 
         for info in ready_infos:
+            is_capable = (
+                info.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE)
             cached = self._lb_replica_cache.get(info.replica_id)
+            if getattr(self, '_lb_replica_cache_record_ids',
+                       {}).get(info.replica_id) != info.replica_record_id:
+                cached = None
             if cached is None:
                 cluster_record = cluster_records.get(info.cluster_name)
                 if cluster_record is None:
+                    if is_capable:
+                        self._replica_manager.retire_system_recovery_route(info)
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its cluster record is not available yet; '
                                    'skipping for this sync.')
@@ -593,6 +612,8 @@ class SkyServeController:
                     # crashing the whole load_balancer_sync — it is simply
                     # not routable this round and will be re-resolved on
                     # the next sync.
+                    if is_capable:
+                        self._replica_manager.retire_system_recovery_route(info)
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its endpoint is not resolvable yet; '
                                    'skipping for this sync.')
@@ -612,12 +633,73 @@ class SkyServeController:
                         except (TypeError, ValueError):
                             gpu_count = 1
                 cached = (url, gpu_type, gpu_count)
-            replica_cache[info.replica_id] = cached
             url, gpu_type, gpu_count = cached
+            try:
+                normalized_url = (
+                    system_recovery_route_lease.normalize_route_url(url))
+            except system_recovery_route_lease.RouteLeaseError:
+                if is_capable:
+                    self._replica_manager.retire_system_recovery_route(info)
+                    logger.warning(
+                        'Recovery-capable replica %s has an '
+                        'invalid route URL; withholding it.', info.replica_id)
+                else:
+                    logger.warning(
+                        'Replica %s has an invalid route URL; '
+                        'withholding it.', info.replica_id)
+                continue
+            url = normalized_url
+            cached = (url, gpu_type, gpu_count)
+            route_marker = None
+            if is_capable:
+                route_marker = (
+                    self._replica_manager.system_recovery_route_marker(
+                        info, url))
+            replica_cache[info.replica_id] = cached
+            replica_cache_record_ids[info.replica_id] = info.replica_record_id
+            prior_info = resolved_url_sources.get(url)
+            if prior_info is not None:
+                for source_info in (prior_info, info):
+                    if (source_info.system_recovery_disposition ==
+                            system_recovery_state.SystemRecoveryDisposition.
+                            CAPABLE):
+                        self._replica_manager.retire_system_recovery_route(
+                            source_info)
+                # Keep the transport key present so this coherent snapshot is
+                # not mistaken for a spurious empty resolution.  New LBs parse
+                # the closed fence field and remove any retained client/lease.
+                replica_info[url] = {
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                        serve_constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+                }
+                logger.error(
+                    'Replica route collision for normalized URL %s '
+                    '(replicas %s and %s); fencing the URL.', url,
+                    prior_info.replica_id, info.replica_id)
+                continue
+            resolved_url_sources[url] = info
+            if is_capable and route_marker is None:
+                # A capable row without its exact process-local marker must
+                # never fall through as an ordinary outage-retained route.
+                replica_info[url] = {
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                        serve_constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+                }
+                continue
             replica_info[url] = {
                 'gpu_type': gpu_type,
                 'gpu_count': str(gpu_count),
             }
+            if route_marker is not None:
+                replica_info[url].update({
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_KEY:
+                        serve_constants.
+                        SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_VERSION,
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_REPLICA_ID_KEY:
+                        route_marker.replica_id,
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_TOKEN_KEY:
+                        route_marker.route_token,
+                })
             is_zero_cost = getattr(info, 'is_zero_cost', None)
             if isinstance(is_zero_cost, bool):
                 # Placement-cost provenance is independent from the launch
@@ -651,19 +733,30 @@ class SkyServeController:
         # the whole drain window. The retirement drain itself does not
         # need translation -- it matches the LB's raw url-keyed report
         # against the replica's own url (see _ReplicaDrainTracker).
-        nonterminal_ids = {
-            info.replica_id for info in replica_infos if not info.is_terminal
+        nonterminal_records = {
+            info.replica_id: info.replica_record_id
+            for info in replica_infos
+            if not info.is_terminal
         }
         translation_cache = {
             replica_id: cached
             for replica_id, cached in self._lb_translation_cache.items()
-            if replica_id in nonterminal_ids
+            if (replica_id in nonterminal_records and
+                getattr(self, '_lb_translation_cache_record_ids', {}).get(
+                    replica_id) == nonterminal_records[replica_id])
+        }
+        translation_cache_record_ids = {
+            replica_id: nonterminal_records[replica_id]
+            for replica_id in translation_cache
         }
         translation_cache.update(replica_cache)
+        translation_cache_record_ids.update(replica_cache_record_ids)
         self._lb_translation_cache = translation_cache
+        self._lb_translation_cache_record_ids = translation_cache_record_ids
         # Replacing the cache with this sync's active replicas prunes the
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
+        self._lb_replica_cache_record_ids = replica_cache_record_ids
         return replica_info, len(ready_infos)
 
     def _url_to_replica_id_map(self) -> dict[str, int]:
@@ -1310,7 +1403,7 @@ class SkyServeController:
 
             def raise_deferred_sync_cancellation() -> None:
                 if deferred_sync_cancellation is not None:
-                    raise deferred_sync_cancellation
+                    raise deferred_sync_cancellation  # pylint: disable=raising-bad-type
 
             tail_operation = loop.run_in_executor(
                 None,
@@ -1797,7 +1890,7 @@ class SkyServeController:
                 invalidate_demand_transition(transition_state)
                 cancellation = demand_transition_cancellation
                 demand_transition_cancellation = None
-                raise cancellation
+                raise cancellation  # pylint: disable=raising-bad-type
 
         lock_wait_started_at = time.monotonic()
         async with role_lock:
@@ -2511,7 +2604,7 @@ class SkyServeController:
         getter = getattr(placer, 'zero_cost_locations', None)
         if not callable(getter):
             return {}
-        locations = getter()
+        locations = getter()  # pylint: disable=not-callable
         if not isinstance(locations, list) or not locations:
             return {}
         shapes = reserved_capacity.zero_cost_pool_shapes(locations)
@@ -3860,6 +3953,17 @@ class SkyServeController:
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()
             return await self._handle_load_balancer_sync(request_data)
+
+        @self._app.post(
+            serve_constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH,
+            dependencies=[sync_auth_dependency, controller_owner_dependency])
+        async def load_balancer_system_recovery_route_lease(
+        ) -> fastapi.Response:
+            # Constant-time in-memory projection: endpoint resolution, fleet
+            # rows, cloud APIs, and application state are deliberately absent.
+            return responses.JSONResponse(content=(
+                self._replica_manager.system_recovery_route_lease_snapshot()),
+                                          status_code=200)
 
         @self._app.post(
             serve_constants.LB_CONTROLLER_ROLE_PATH,

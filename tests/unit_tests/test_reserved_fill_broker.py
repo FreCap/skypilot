@@ -1236,7 +1236,7 @@ class TestAtomicPersistFence:
         _upsert('svc-c', pool_key=pool_b)
         assert serve_state.add_replica_if_round_epoch('svc-c',
                                                       2,
-                                                      self._STUB_INFO,
+                                                      _replica(2),
                                                       pool_key=pool_b,
                                                       expected_epoch=99)
         assert self._replica_row_count() == 2
@@ -1256,22 +1256,34 @@ class TestAtomicPersistFence:
         assert stored.replica_id == 7
         assert stored.cluster_name == 'svc-7'
 
-        # A recovered controller can re-drive the same replica id. Exercise
-        # the ON CONFLICT path too: every authoritative column and the legacy
-        # rollback pickle must advance together, rather than leaving readers
-        # on the state from the first attempt.
-        info.cluster_name = 'svc-7-retry'
-        info.version = 2
-        info.created_at = 123.5
-        info.is_spot = True
-        info.planned_capacity = 4
-        info.reserved_fill = True
-        info.status_property.sky_launch_status = (
+        # A second fill admission cannot adopt or overwrite the same numeric
+        # key. Recovery instead refreshes the durable object and uses the
+        # identity-fenced expected-existing update path.
+        with pytest.raises(sqlalchemy_exc.IntegrityError):
+            serve_state.add_replica_if_round_epoch('svc-a',
+                                                   7,
+                                                   _replica(7),
+                                                   pool_key=_POOL,
+                                                   expected_epoch=alloc.epoch)
+        unchanged = serve_state.get_replica_info_from_id('svc-a', 7)
+        assert unchanged is not None
+        assert unchanged.replica_record_id == info.replica_record_id
+        assert unchanged.version == 1
+
+        unchanged.cluster_name = 'svc-7-retry'
+        unchanged.version = 2
+        unchanged.created_at = 123.5
+        unchanged.is_spot = True
+        unchanged.planned_capacity = 4
+        unchanged.reserved_fill = True
+        unchanged.status_property.sky_launch_status = (
             common_utils.ProcessStatus.RUNNING)
-        info.status_property.sky_down_status = (
+        unchanged.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
-        assert serve_state.add_replica_if_round_epoch(
-            'svc-a', 7, info, pool_key=_POOL, expected_epoch=alloc.epoch)
+        assert serve_state.add_or_update_replica('svc-a',
+                                                 7,
+                                                 unchanged,
+                                                 expected_replica_exists=True)
 
         engine = serve_state._db_manager.get_engine()
         with orm.Session(engine) as session:
@@ -1281,19 +1293,19 @@ class TestAtomicPersistFence:
                     serve_state.replicas_table.c.replica_id == 7)).one()
         raw = row._mapping  # pylint: disable=protected-access
         assert raw['replica_state_version'] == 1
-        assert raw['status'] == info.status.value
+        assert raw['status'] == unchanged.status.value
         assert (raw['sky_down_status'] ==
                 common_utils.ProcessStatus.SCHEDULED.value)
         assert raw['version'] == 2
         assert raw['cluster_name'] == 'svc-7-retry'
         assert raw['created_at'] == 123.5
         assert raw['is_spot'] is True
-        assert raw['replica_state'] == info.to_storage_dict()
-        assert (pickle.loads(
-            raw['replica_info']).to_storage_dict() == info.to_storage_dict())
+        assert raw['replica_state'] == unchanged.to_storage_dict()
+        assert (pickle.loads(raw['replica_info']).to_storage_dict() ==
+                unchanged.to_storage_dict())
         stored = serve_state.get_replica_info_from_id('svc-a', 7)
         assert stored is not None
-        assert stored.to_storage_dict() == info.to_storage_dict()
+        assert stored.to_storage_dict() == unchanged.to_storage_dict()
 
     def test_persist_requires_live_same_pool_claim(self):
         # A disabled/pruned claimant's queued fill launch must fence out
@@ -1435,11 +1447,8 @@ class TestRoundPersistExclusion:
                     rounds_table.c.pool_key == _POOL).values(epoch=alloc.epoch +
                                                              1))
             session.commit()
-        assert not broker.persist_fill_replica('svc-a',
-                                               2,
-                                               self._STUB_INFO,
-                                               pool_key=_POOL,
-                                               expected_epoch=alloc.epoch)
+        assert not broker.persist_fill_replica(
+            'svc-a', 2, _replica(2), pool_key=_POOL, expected_epoch=alloc.epoch)
         assert self._replica_row_count() == 1
 
 

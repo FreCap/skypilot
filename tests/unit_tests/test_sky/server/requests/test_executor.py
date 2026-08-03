@@ -1459,7 +1459,7 @@ async def test_request_worker_does_not_requeue_cancelled_broken_pool_request(
 @pytest.mark.asyncio
 async def test_request_worker_retry_execution_retryable_error(
         isolated_database, monkeypatch):
-    """Test that RequestWorker retries requests when ExecutionRetryableError is raised."""
+    """Typed pre-job retries ignore the unknown-stage retryable flag."""
     # Create a request in the database
     request_id = 'test-retry-request'
     request = requests_lib.Request(
@@ -1471,6 +1471,7 @@ async def test_request_worker_retry_execution_retryable_error(
         status=requests_lib.RequestStatus.RUNNING,
         created_at=time.time(),
         user_id='test-user',
+        retryable=False,
     )
     await requests_lib.create_if_not_exists_async(request)
 
@@ -1555,7 +1556,7 @@ async def test_request_worker_retry_execution_retryable_error(
     fut.set_exception(retryable_error)
 
     # Create request_element tuple
-    request_element = (request_id, False, True
+    request_element = (request_id, False, False
                       )  # (request_id, ignore_return_value, retryable)
 
     # Call handle_task_result - this should catch the exception and reschedule

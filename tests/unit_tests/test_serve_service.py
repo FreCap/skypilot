@@ -1023,8 +1023,10 @@ class TestCleanupAuditLog:
 
 def test_cleanup_bulk_removes_large_absent_replica_inventory():
     replica_infos = [
-        mock.Mock(replica_id=replica_id, cluster_name=f'svc-a-r{replica_id}')
-        for replica_id in range(2159)
+        mock.Mock(
+            replica_id=replica_id,
+            replica_record_id=(f'00000000-0000-4000-8000-{replica_id:012d}'),
+            cluster_name=f'svc-a-r{replica_id}') for replica_id in range(2159)
     ]
     lifecycle_lock = mock.Mock(epoch=31)
     expected_owner = (4242, '10.4.7.7')
@@ -1057,22 +1059,28 @@ def test_cleanup_bulk_removes_large_absent_replica_inventory():
     assert cluster_snapshot.call_args.args[0] == [
         info.cluster_name for info in replica_infos
     ]
-    remove.assert_called_once_with('svc',
-                                   [info.replica_id for info in replica_infos],
-                                   expected_service_hash='incarnation-a',
-                                   expected_lifecycle_epoch=31,
-                                   expected_controller_owner=expected_owner)
+    remove.assert_called_once_with(
+        'svc', [info.replica_id for info in replica_infos],
+        expected_service_hash='incarnation-a',
+        expected_lifecycle_epoch=31,
+        expected_controller_owner=expected_owner,
+        expected_replica_record_ids={
+            info.replica_id: info.replica_record_id for info in replica_infos
+        })
     remove_one.assert_not_called()
     terminate.assert_not_called()
 
 
 def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
     absent = mock.Mock(replica_id=1,
+                       replica_record_id='00000000-0000-4000-8000-000000000001',
                        cluster_name='svc-a-r1',
                        status_property=mock.Mock())
-    present = mock.Mock(replica_id=2,
-                        cluster_name='svc-a-r2',
-                        status_property=mock.Mock())
+    present = mock.Mock(
+        replica_id=2,
+        replica_record_id='00000000-0000-4000-8000-000000000002',
+        cluster_name='svc-a-r2',
+        status_property=mock.Mock())
     lifecycle_lock = mock.Mock(epoch=31)
     expected_owner = (4242, '10.4.7.7')
     with mock.patch.object(serve_state,
@@ -1093,7 +1101,8 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
          mock.patch.object(serve_state,
                            'remove_replicas', return_value=True) as remove, \
          mock.patch.object(serve_state,
-                           'add_or_update_replica', return_value=True), \
+                           'add_or_update_replica', return_value=True
+                          ) as persist, \
          mock.patch.object(serve_state,
                            'remove_replica', return_value=True) as remove_one, \
          mock.patch.object(service.controller_utils,
@@ -1108,16 +1117,30 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
                                   lifecycle_lock)
 
     assert not failed
-    remove.assert_called_once_with('svc', [1],
-                                   expected_service_hash='incarnation-a',
-                                   expected_lifecycle_epoch=31,
-                                   expected_controller_owner=expected_owner)
+    remove.assert_called_once_with(
+        'svc', [1],
+        expected_service_hash='incarnation-a',
+        expected_lifecycle_epoch=31,
+        expected_controller_owner=expected_owner,
+        expected_replica_record_ids={1: absent.replica_record_id})
     terminate.assert_called_once()
     assert terminate.call_args.args[0] == 'svc-a-r2'
-    remove_one.assert_called_once_with('svc',
-                                       2,
-                                       expected_service_hash='incarnation-a',
-                                       expected_lifecycle_epoch=31)
+    assert persist.call_count == 2
+    for call in persist.call_args_list:
+        assert call.args == ('svc', 2, present)
+        assert call.kwargs == {
+            'expected_service_hash': 'incarnation-a',
+            'expected_lifecycle_epoch': 31,
+            'expected_controller_owner': expected_owner,
+            'expected_replica_exists': True,
+        }
+    remove_one.assert_called_once_with(
+        'svc',
+        2,
+        expected_service_hash='incarnation-a',
+        expected_lifecycle_epoch=31,
+        expected_controller_owner=expected_owner,
+        expected_replica_record_id=(present.replica_record_id))
 
 
 def test_cleanup_skips_tail_sleep_after_final_success():
@@ -1144,9 +1167,11 @@ def test_cleanup_skips_tail_sleep_after_final_success():
             assert self.started
             events.append('join')
 
-    replica = mock.Mock(replica_id=1,
-                        cluster_name='svc-a-r1',
-                        status_property=mock.Mock())
+    replica = mock.Mock(
+        replica_id=1,
+        replica_record_id='00000000-0000-4000-8000-000000000001',
+        cluster_name='svc-a-r1',
+        status_property=mock.Mock())
     lifecycle_lock = mock.Mock(epoch=31)
     with mock.patch.object(serve_state,
                            'get_replica_infos', return_value=[replica]), \
@@ -1183,10 +1208,13 @@ def test_cleanup_skips_tail_sleep_after_final_success():
 
     assert not failed
     assert events == ['start', 'sleep', 'join', 'storage']
-    remove.assert_called_once_with('svc',
-                                   1,
-                                   expected_service_hash='incarnation-a',
-                                   expected_lifecycle_epoch=31)
+    remove.assert_called_once_with(
+        'svc',
+        1,
+        expected_service_hash='incarnation-a',
+        expected_lifecycle_epoch=31,
+        expected_controller_owner=(4242, '10.4.7.7'),
+        expected_replica_record_id=(replica.replica_record_id))
 
 
 def test_cleanup_skips_tail_sleep_after_final_start_failure():

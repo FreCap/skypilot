@@ -31,12 +31,16 @@ CONTROLLER_SYNC_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
                               constants.LB_CONTROLLER_SYNC_PATH)
 CONTROLLER_ROLE_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
                               constants.LB_CONTROLLER_ROLE_PATH)
+CONTROLLER_SYSTEM_RECOVERY_LEASE_ROUTE_PATH = (
+    _CONTROLLER_PROXY_ROUTE_PREFIX +
+    constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH)
 CONTROLLER_HISTORY_SYNC_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
                                       constants.LB_CONTROLLER_HISTORY_SYNC_PATH)
 _CONTROLLER_SYNC_ROUTE_PREFIX = '/api/internal/serve/'
 _CONTROLLER_SYNC_ROUTE_SUFFIXES = (
     constants.LB_CONTROLLER_SYNC_PATH,
     constants.LB_CONTROLLER_ROLE_PATH,
+    constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH,
     constants.LB_CONTROLLER_HISTORY_SYNC_PATH,
 )
 
@@ -134,6 +138,8 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
     phases: dict[str, float] = {}
     request_bytes: int | None = None
     is_role_request = target_path == constants.LB_CONTROLLER_ROLE_PATH
+    is_recovery_lease_request = (
+        target_path == constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH)
 
     def proxy_observability() -> dict:
         return {
@@ -199,8 +205,10 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
                     _controller_sync_url(owner_before, target_path),
                     data=body,
                     headers=forwarded_headers,
-                    timeout=aiohttp.ClientTimeout(
-                        total=constants.LB_CONTROLLER_PROXY_TIMEOUT_SECONDS),
+                    timeout=aiohttp.ClientTimeout(total=(
+                        constants.LB_SYSTEM_RECOVERY_LEASE_PROXY_TIMEOUT_SECONDS
+                        if is_recovery_lease_request else constants.
+                        LB_CONTROLLER_PROXY_TIMEOUT_SECONDS)),
                     # Following a redirect would issue another request and
                     # violate the at-most-once contract for this POST.
                     allow_redirects=False,
@@ -256,6 +264,15 @@ async def proxy_load_balancer_role(
         service_name: str, request: fastapi.Request) -> fastapi.Response:
     return await _proxy_controller_sync(service_name, request,
                                         constants.LB_CONTROLLER_ROLE_PATH)
+
+
+@router.post(CONTROLLER_SYSTEM_RECOVERY_LEASE_ROUTE_PATH,
+             include_in_schema=False)
+async def proxy_load_balancer_system_recovery_route_lease(
+        service_name: str, request: fastapi.Request) -> fastapi.Response:
+    return await _proxy_controller_sync(
+        service_name, request,
+        constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH)
 
 
 @router.post(CONTROLLER_HISTORY_SYNC_ROUTE_PATH, include_in_schema=False)

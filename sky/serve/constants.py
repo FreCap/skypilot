@@ -47,15 +47,44 @@ REPLICA_LAUNCH_FENCE_KEYS = (
 # forwarded into a user task's environment.
 SYSTEM_OOM_RECOVERY_PROFILES_ENV_VAR = (
     'SKYPILOT_INTERNAL_SERVE_SYSTEM_OOM_RECOVERY_PROFILES')
-# Recovery-capable code generation requires this exact controller-owned
-# contract tuple.  PR 1 validates it but intentionally has no producer; the
-# SkyServe adoption PR persists launch intent before emitting these values.
+# Recovery-capable code generation requires one exact controller-owned
+# contract tuple.  Contract 1 remains a deprecated transition reader until the
+# stacked cleanup PR.  New candidates use contract 2 and a closed context that
+# is atomically bound to the API server's own ordinary request ID.
 SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY = (
     'sky_serve_system_oom_recovery_controller_contract_version')
-SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION = 1
+SYSTEM_OOM_RECOVERY_LEGACY_CONTROLLER_CONTRACT_VERSION = 1
+SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION = 2
 SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY = 'sky_serve_system_oom_recovery_profile_id'
 SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY = (
     'sky_serve_system_oom_recovery_profile_version')
+SYSTEM_OOM_RECOVERY_AUTHORIZATION_VERSION_KEY = (
+    'sky_serve_system_oom_recovery_authorization_version')
+SYSTEM_OOM_RECOVERY_AUTHORIZATION_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_authorization_sha256')
+SYSTEM_OOM_RECOVERY_RUNTIME_PROFILE_VERSION_KEY = (
+    'sky_serve_system_oom_recovery_runtime_profile_version')
+SYSTEM_OOM_RECOVERY_EXPECTED_RUNTIME_CAPABILITY_KEY = (
+    'sky_serve_system_oom_recovery_expected_runtime_capability')
+SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY = (
+    'sky_serve_system_oom_recovery_replica_id')
+SYSTEM_OOM_RECOVERY_LAUNCH_GENERATION_KEY = (
+    'sky_serve_system_oom_recovery_launch_generation')
+SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY = (
+    'sky_serve_system_oom_recovery_launch_nonce')
+SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY = (
+    'sky_serve_system_oom_recovery_bound_request_id')
+SYSTEM_OOM_RECOVERY_WORKSPACE_KEY = ('sky_serve_system_oom_recovery_workspace')
+SYSTEM_OOM_RECOVERY_RESOURCE_ENVELOPE_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_resource_envelope_sha256')
+SYSTEM_OOM_RECOVERY_TASK_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_task_sha256')
+SYSTEM_OOM_RECOVERY_RUNTIME_IMAGE_DIGEST_KEY = (
+    'sky_serve_system_oom_recovery_runtime_image_digest')
+SYSTEM_OOM_RECOVERY_OWNED_CONTAINER_SPEC_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_owned_container_spec_sha256')
+SYSTEM_OOM_RECOVERY_EXECUTION_ENVELOPE_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_execution_envelope_sha256')
 
 # The consolidation mode lock ensures that if multiple API servers are running
 # at the same time (e.g. during a rolling update), recovery can only happen once
@@ -342,7 +371,37 @@ LB_CONTROLLER_SYNC_PATH = '/controller/load_balancer_sync'
 LB_CONTROLLER_ROLE_PATH = '/controller/load_balancer_role'
 LB_CONTROLLER_HISTORY_SYNC_PATH = (
     '/controller/load_balancer_request_history_sync')
+LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH = (
+    '/controller/system_recovery_route_lease')
 LB_ROLE_PROXY_OBSERVABILITY_HEADER = ('X-SkyServe-LB-Role-Proxy-Observability')
+
+# A recovery-capable backend can bind the same route after Ray has killed its
+# first process.  The heavyweight 20-second controller sync deliberately keeps
+# stale ordinary routes during controller outages, so capable routes carry an
+# independent, short-lived marker/heartbeat lease.  These values are a closed
+# correctness contract with the driver's replay-quiescence fence; do not make
+# them service-configurable.
+SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_KEY = 'system_recovery_route_lease'
+SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_VERSION = 'v1'
+SYSTEM_RECOVERY_ROUTE_REPLICA_ID_KEY = 'system_recovery_replica_id'
+SYSTEM_RECOVERY_ROUTE_TOKEN_KEY = 'system_recovery_route_token'
+# A coherent heavyweight snapshot uses this closed sentinel to revoke an
+# ambiguous transport URL (duplicate normalized rows or a capable row without
+# an exact marker).  It is a fence, never a routable marker.
+SYSTEM_RECOVERY_ROUTE_FENCE_KEY = 'system_recovery_route_fence'
+SYSTEM_RECOVERY_ROUTE_FENCE_VERSION = 'v1'
+SYSTEM_RECOVERY_ROUTE_LEASE_PROTOCOL_VERSION = 1
+SYSTEM_RECOVERY_ROUTE_PROBE_INTERVAL_SECONDS = 5
+SYSTEM_RECOVERY_ROUTE_PROBE_TIMEOUT_SECONDS = 15
+SYSTEM_RECOVERY_ROUTE_LEASE_SECONDS = 60
+SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS = 1000
+SYSTEM_RECOVERY_MAX_ELIGIBLE_PROBE_INTERVAL_SECONDS = 10
+SYSTEM_RECOVERY_MAX_ELIGIBLE_READINESS_TIMEOUT_SECONDS = 15
+LB_SYSTEM_RECOVERY_LEASE_HEARTBEAT_INTERVAL_SECONDS = 2
+LB_SYSTEM_RECOVERY_LEASE_HEARTBEAT_TIMEOUT_SECONDS = 10
+# Leave one second inside the LB's total timeout for stable-proxy owner reads
+# and response forwarding.
+LB_SYSTEM_RECOVERY_LEASE_PROXY_TIMEOUT_SECONDS = 9
 
 # [boltz fork] The timeout in seconds for the load balancer to sync with the
 # controller (raised from the previous inline 5s). A cold 215-replica routing
@@ -464,6 +523,9 @@ LB_DRAIN_CLOSE_GRACE_SECONDS = 60
 # replica must fail fast into the retry loop even when the stream
 # timeout is sized for hour-long synchronous predictions.
 LB_CONNECT_TIMEOUT_SECONDS = 10
+# Marked recovery routes have a bounded connection-pool wait as well as the
+# bounded connect above.  The driver's 83-second fence includes both budgets.
+LB_SYSTEM_RECOVERY_POOL_TIMEOUT_SECONDS = 10
 
 # Passive LB-side replica eviction, for the window where the controller is
 # paused (e.g. during a control-plane roll) and cannot update the ready set.

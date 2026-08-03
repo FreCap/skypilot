@@ -16,6 +16,7 @@ from sky.skylet import job_lib
 from sky.skylet import log_lib
 from sky.skylet import subprocess_supervisor
 from sky.skylet import system_oom_recovery
+from sky.utils.db import db_utils
 
 _IMAGE = 'repo/image@sha256:' + 'a' * 64
 
@@ -41,6 +42,19 @@ def attempt_context(tmp_path, monkeypatch, v1_plan):
                         str(tmp_path / 'recovery'))
     monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: 'boot-id')
     return system_oom_recovery.new_attempt_context(7, 0, 0, v1_plan)
+
+
+@pytest.fixture()
+def job_database(tmp_path, monkeypatch):
+    database = db_utils.SQLiteConn(str(tmp_path / 'jobs.db'),
+                                   job_lib.create_table)
+    monkeypatch.setattr(job_lib, '_DB', database)
+    monkeypatch.setattr(job_lib, '_JOB_STATUS_LOCK',
+                        str(tmp_path / 'locks' / '.job_{}.lock'))
+    monkeypatch.setattr(job_lib.constants, 'SKY_LOGS_DIRECTORY',
+                        str(tmp_path / 'logs'))
+    yield database
+    database.conn.close()
 
 
 def _docker_identity() -> system_oom_recovery.DockerIdentity:
@@ -760,6 +774,18 @@ class _FakeClock:
         self.advance(seconds)
 
 
+def _ray_with_total_memory(total_memory):
+    return SimpleNamespace(_private=SimpleNamespace(utils=SimpleNamespace(
+        get_system_memory=lambda: total_memory)))
+
+
+def _ray_with_session(session_name):
+    return SimpleNamespace(
+        is_initialized=lambda: True,
+        _private=SimpleNamespace(worker=SimpleNamespace(
+            _global_node=SimpleNamespace(session_name=session_name))))
+
+
 def _waiting_memory_session(attempt_context,
                             v1_plan,
                             submitter,
@@ -771,9 +797,14 @@ def _waiting_memory_session(attempt_context,
         'monotonic_clock': clock.monotonic_time,
         'wait': clock.sleep,
     } if clock is not None else {})
-    session = system_oom_recovery.RecoverySession(7, v1_plan, attempt_context,
-                                                  'original-ref', submitter,
-                                                  **clock_kwargs)
+    session = system_oom_recovery.RecoverySession(
+        7,
+        v1_plan,
+        attempt_context,
+        'original-ref',
+        submitter,
+        expected_ray_session_identity=('ray-session-1'),
+        **clock_kwargs)
     session.armed_info = job_lib.JobSystemRecoveryInfo(
         capability=v1_plan.capability,
         phase=job_lib.JobSystemRecoveryPhase.ARMED,
@@ -788,6 +819,12 @@ def _waiting_memory_session(attempt_context,
     session.phase = job_lib.JobSystemRecoveryPhase.WAITING_MEMORY
     session.first_event_visible_monotonic = session.monotonic_clock()
     session.event_visibility_confirmed = visibility_confirmed
+    # Existing submission tests exercise post-quiescence transition behavior.
+    # Give them an already-satisfied proof fence; dedicated timing tests below
+    # overwrite this with an exact current proof completion.
+    session.cleanup_proof_completed_monotonic = (
+        session.monotonic_clock() -
+        system_oom_recovery.SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS)
     return session
 
 
@@ -810,6 +847,111 @@ def _patch_session_submission(monkeypatch, transition_results):
     monkeypatch.setattr(job_lib, 'exhaust_job_system_recovery',
                         mock.Mock(return_value=True))
     return transitions, exhausted
+
+
+def test_ray_session_identity_is_exact_and_fail_closed():
+    assert system_oom_recovery.capture_ray_session_identity(
+        _ray_with_session('ray-session-1')) == 'ray-session-1'
+    assert system_oom_recovery.capture_ray_session_identity(
+        SimpleNamespace(is_initialized=lambda: False)) is None
+    assert system_oom_recovery.capture_ray_session_identity(
+        SimpleNamespace(is_initialized=lambda: True,
+                        _private=SimpleNamespace())) is None
+
+
+def test_missing_ray_session_disables_arm_with_bounded_log(
+        attempt_context, v1_plan, monkeypatch):
+    log = mock.Mock()
+    monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
+
+    session = system_oom_recovery.RecoverySession(7, v1_plan, attempt_context,
+                                                  'original-ref', mock.Mock())
+
+    assert session.arm_state == system_oom_recovery.RecoveryArmState.DISABLED
+    message = log.call_args.args[0]
+    assert 'decision=rejected' in message
+    assert 'reason=ray_session_unavailable' in message
+    assert 'ray_session=unavailable' in message
+
+
+def test_ray_session_change_rejects_replay_without_logging_identity(
+        attempt_context, v1_plan, monkeypatch):
+    del attempt_context
+    log = mock.Mock()
+    monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
+    placement_group_table = mock.Mock(return_value={'state': 'CREATED'})
+    ray_util = SimpleNamespace(placement_group_table=placement_group_table)
+    old_identity = 'sensitive-old-session'
+    new_identity = 'sensitive-new-session'
+
+    healthy, reason = system_oom_recovery.ray_runtime_is_healthy(
+        _ray_with_session(new_identity),
+        ray_util,
+        mock.sentinel.placement_group,
+        'boot-id',
+        old_identity,
+        profile_version=v1_plan.profile_version)
+
+    assert not healthy
+    assert reason == 'Ray session identity changed'
+    placement_group_table.assert_not_called()
+    message = log.call_args.args[0]
+    assert 'reason=ray_session_changed' in message
+    assert 'ray_session=changed' in message
+    assert old_identity not in message
+    assert new_identity not in message
+
+
+def test_unchanged_ray_session_and_placement_group_accept_replay(
+        attempt_context, v1_plan, monkeypatch):
+    del attempt_context
+    log = mock.Mock()
+    monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
+    placement_group = mock.sentinel.placement_group
+    ray_util = SimpleNamespace(placement_group_table=mock.Mock(
+        return_value={'state': 'CREATED'}))
+
+    assert system_oom_recovery.ray_runtime_is_healthy(
+        _ray_with_session('ray-session-1'),
+        ray_util,
+        placement_group,
+        'boot-id',
+        'ray-session-1',
+        profile_version=v1_plan.profile_version) == (True, '')
+    ray_util.placement_group_table.assert_called_once_with(placement_group)
+    message = log.call_args.args[0]
+    assert 'decision=accepted' in message
+    assert 'ray_session=unchanged' in message
+
+
+def test_cgroup_arm_acceptance_emits_one_bounded_log(attempt_context, v1_plan,
+                                                     monkeypatch):
+    log = mock.Mock()
+    monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
+    session = system_oom_recovery.RecoverySession(
+        7,
+        v1_plan,
+        attempt_context,
+        'original-ref',
+        mock.Mock(),
+        expected_ray_session_identity='sensitive-ray-session')
+    monkeypatch.setattr(job_lib, 'job_status_lock',
+                        lambda _job_id: contextlib.nullcontext())
+    monkeypatch.setattr(job_lib, 'arm_job_system_recovery_no_lock',
+                        mock.Mock(return_value=True))
+
+    assert session.try_arm(
+        {
+            'armed': True,
+            'written_at': attempt_context['created_at'],
+        }, _ray_with_total_memory(8 * 1024**3))
+
+    log.assert_called_once()
+    message = log.call_args.args[0]
+    assert 'decision=accepted' in message
+    assert 'cgroup=at_most_16_gib' in message
+    assert 'ray_session=captured' in message
+    assert 'sensitive-ray-session' not in message
 
 
 @pytest.mark.parametrize('wall_jump', [10000.0, -10000.0])
@@ -897,31 +1039,202 @@ def test_first_event_visibility_rechecks_cancellation_after_wait(
     submitter.assert_not_called()
 
 
+def test_replay_quiescence_immediate_memory_waits_from_cleanup_proof(
+        attempt_context, v1_plan):
+    clock = _FakeClock(attempt_context['created_at'] + 1)
+    session = _waiting_memory_session(attempt_context,
+                                      v1_plan,
+                                      mock.Mock(),
+                                      clock=clock)
+    session.cleanup_proof_completed_monotonic = None
+    session.record_cleanup_proof_completed()
+
+    assert session.wait_for_replay_quiescence() == (True, '')
+
+    assert session.cleanup_proof_completed_monotonic == 10.0
+    assert clock.monotonic == (
+        10.0 + system_oom_recovery.SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS)
+    assert clock.waits == [
+        system_oom_recovery.SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS
+    ]
+
+
+def test_replay_quiescence_overlaps_memory_and_never_submits_early(
+        attempt_context, v1_plan, monkeypatch):
+    clock = _FakeClock(attempt_context['created_at'] + 1)
+    submitted_at = []
+
+    def _submit(_attempt_number, _context):
+        submitted_at.append(clock.monotonic)
+        return 'replacement-ref'
+
+    session = _waiting_memory_session(attempt_context,
+                                      v1_plan,
+                                      _submit,
+                                      clock=clock)
+    session.cleanup_proof_completed_monotonic = None
+    session.record_cleanup_proof_completed()
+    proof_completed = session.cleanup_proof_completed_monotonic
+    # Simulate memory admission consuming part of the quiescence interval.
+    clock.advance(30)
+    _patch_session_submission(monkeypatch, [True, True])
+
+    assert session.submit_one_retry(SimpleNamespace(cancel=mock.Mock())) is True
+
+    assert proof_completed == 10.0
+    assert clock.waits == [
+        system_oom_recovery.SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS - 30
+    ]
+    assert submitted_at == [
+        proof_completed +
+        system_oom_recovery.SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS
+    ]
+
+
+def test_replay_quiescence_never_extends_recovery_deadline(
+        attempt_context, v1_plan, monkeypatch):
+    clock = _FakeClock(attempt_context['created_at'] + 1)
+    submitter = mock.Mock()
+    session = _waiting_memory_session(attempt_context,
+                                      v1_plan,
+                                      submitter,
+                                      clock=clock)
+    session.cleanup_proof_completed_monotonic = None
+    # A late positive cleanup proof leaves less than 83 seconds in the fixed
+    # 120-second recovery budget.
+    clock.advance(50)
+    session.record_cleanup_proof_completed()
+    _patch_session_submission(monkeypatch, [])
+
+    assert not session.submit_one_retry(SimpleNamespace(cancel=mock.Mock()))
+
+    assert clock.waits == [70.0]
+    assert clock.monotonic == session.deadline_monotonic
+    assert session.phase == job_lib.JobSystemRecoveryPhase.EXHAUSTED
+    submitter.assert_not_called()
+
+
 def test_try_arm_requires_exact_existing_record(attempt_context, v1_plan,
                                                 monkeypatch):
     wall_clock = mock.Mock(return_value=attempt_context['created_at'] + 1)
-    session = system_oom_recovery.RecoverySession(7,
-                                                  v1_plan,
-                                                  attempt_context,
-                                                  'original-ref',
-                                                  mock.Mock(),
-                                                  wall_clock=wall_clock)
+    session = system_oom_recovery.RecoverySession(
+        7,
+        v1_plan,
+        attempt_context,
+        'original-ref',
+        mock.Mock(),
+        expected_ray_session_identity=('ray-session-1'),
+        wall_clock=wall_clock)
     captured = {}
 
     def _arm(_job_id, info):
         captured['info'] = info
         return False
 
-    monkeypatch.setattr(job_lib, 'arm_job_system_recovery', _arm)
+    monkeypatch.setattr(job_lib, 'job_status_lock',
+                        lambda _job_id: contextlib.nullcontext())
+    monkeypatch.setattr(job_lib, 'arm_job_system_recovery_no_lock', _arm)
     monkeypatch.setattr(
         job_lib, 'get_job_system_recovery_info',
         lambda _job_id: dataclasses.replace(captured['info'], task_index=1))
 
-    assert not session.try_arm({
+    assert not session.try_arm(
+        {
+            'armed': True,
+            'written_at': attempt_context['created_at'],
+        }, _ray_with_total_memory(16 * 1024**3))
+    assert session.armed_info is None
+    assert session.arm_state == system_oom_recovery.RecoveryArmState.DISABLED
+
+
+def test_arm_gate_is_bounded_one_way_and_rejects_late_marker(
+        attempt_context, v2_plan, monkeypatch):
+    clock = _FakeClock(attempt_context['created_at'], monotonic_time=20.0)
+    arm = mock.Mock(return_value=True)
+    session = system_oom_recovery.RecoverySession(
+        7,
+        v2_plan,
+        attempt_context | {
+            'profile_version': v2_plan.profile_version,
+            'capability': v2_plan.capability,
+            'schema_version': 2,
+        },
+        'original-ref',
+        mock.Mock(),
+        arm_started_monotonic=20.0,
+        expected_ray_session_identity='ray-session-1',
+        wall_clock=clock.wall_time,
+        monotonic_clock=clock.monotonic_time)
+    monkeypatch.setattr(job_lib, 'job_status_lock',
+                        lambda _job_id: contextlib.nullcontext())
+    monkeypatch.setattr(job_lib, 'arm_job_system_recovery_no_lock', arm)
+
+    assert not session.try_arm(None, _ray_with_total_memory(8 * 1024**3))
+    assert session.arm_state == system_oom_recovery.RecoveryArmState.PENDING
+    clock.advance(system_oom_recovery.SYSTEM_RECOVERY_ARM_WINDOW_SECONDS)
+    assert not session.try_arm(
+        {
+            'armed': True,
+            'written_at': attempt_context['created_at'],
+        }, _ray_with_total_memory(8 * 1024**3))
+    assert session.arm_state == system_oom_recovery.RecoveryArmState.DISABLED
+    clock.advance(1)
+    assert not session.try_arm(
+        {
+            'armed': True,
+            'written_at': attempt_context['created_at'],
+        }, _ray_with_total_memory(8 * 1024**3))
+    arm.assert_not_called()
+
+
+def test_arm_gate_checks_cgroup_cap_and_deadline_inside_job_lock(
+        attempt_context, v1_plan, monkeypatch):
+    clock = _FakeClock(attempt_context['created_at'], monotonic_time=10.0)
+    arm = mock.Mock(return_value=True)
+    log = mock.Mock()
+    monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
+    session = system_oom_recovery.RecoverySession(
+        7,
+        v1_plan,
+        attempt_context,
+        'original-ref',
+        mock.Mock(),
+        arm_started_monotonic=10.0,
+        expected_ray_session_identity='ray-session-1',
+        wall_clock=clock.wall_time,
+        monotonic_clock=clock.monotonic_time)
+    second = system_oom_recovery.RecoverySession(
+        7,
+        v1_plan,
+        attempt_context,
+        'original-ref',
+        mock.Mock(),
+        arm_started_monotonic=10.0,
+        expected_ray_session_identity='ray-session-1',
+        wall_clock=clock.wall_time,
+        monotonic_clock=clock.monotonic_time)
+    monkeypatch.setattr(job_lib, 'arm_job_system_recovery_no_lock', arm)
+    marker = {
         'armed': True,
         'written_at': attempt_context['created_at'],
-    })
-    assert session.armed_info is None
+    }
+
+    assert not session.try_arm(marker, _ray_with_total_memory(16 * 1024**3 + 1))
+    assert session.arm_state == system_oom_recovery.RecoveryArmState.DISABLED
+    arm.assert_not_called()
+    message = log.call_args.args[0]
+    assert 'reason=cgroup_above_16_gib' in message
+    assert 'cgroup=above_16_gib' in message
+
+    @contextlib.contextmanager
+    def _late_lock(_job_id):
+        clock.advance(system_oom_recovery.SYSTEM_RECOVERY_ARM_WINDOW_SECONDS)
+        yield
+
+    monkeypatch.setattr(job_lib, 'job_status_lock', _late_lock)
+    assert not second.try_arm(marker, _ray_with_total_memory(16 * 1024**3))
+    assert second.arm_state == system_oom_recovery.RecoveryArmState.DISABLED
+    arm.assert_not_called()
 
 
 def test_recovery_session_adopts_exactly_one_replacement(
@@ -1050,7 +1363,9 @@ def test_recovery_session_post_submit_deadline_cancels_ref(
     session = _waiting_memory_session(attempt_context, v1_plan, submitter)
     _patch_session_submission(monkeypatch, [True])
     session.deadline_monotonic = 100.0
-    session.monotonic_clock = mock.Mock(side_effect=[1.0, 2.0, 101.0])
+    session.cleanup_proof_completed_monotonic = 0.0
+    session.monotonic_clock = mock.Mock(
+        side_effect=[83.0, 84.0, 85.0, 86.0, 101.0])
     cancel = mock.Mock()
 
     assert not session.submit_one_retry(SimpleNamespace(cancel=cancel))
@@ -1097,6 +1412,152 @@ def test_recovery_session_lock_entry_failure_before_ref_returns_false(
     assert not session.submit_one_retry(SimpleNamespace(cancel=mock.Mock()))
 
     submitter.assert_not_called()
+
+
+def test_v2_end_to_end_first_and_second_oom_replays_exactly_once(
+        tmp_path, monkeypatch, v2_plan, job_database):
+    del job_database
+    clock = _FakeClock(1000.0)
+    arm_started_monotonic = clock.monotonic
+    monkeypatch.setattr(
+        system_oom_recovery, 'time',
+        SimpleNamespace(time=clock.wall_time,
+                        monotonic=clock.monotonic_time,
+                        sleep=clock.sleep))
+    monkeypatch.setattr(system_oom_recovery, 'RECOVERY_ROOT',
+                        str(tmp_path / 'recovery'))
+    monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: 'boot-id')
+
+    job_id, _ = job_lib.add_job('service', 'user', 'run-ts', 'CPU:1')
+    job_lib.set_job_started(job_id)
+    initial_context = system_oom_recovery.new_attempt_context(
+        job_id, 0, 0, v2_plan)
+    _, cleanup_marker = _publish_markers(initial_context)
+    os.unlink(initial_context['cleanup_path'])
+    clock.advance(1)
+
+    class RayNodeOOM(Exception):
+        pass
+
+    original_ref = mock.sentinel.original_ref
+    replacement_ref = mock.sentinel.replacement_ref
+
+    def _get(future):
+        if future is original_ref:
+            cleanup_marker['started_at'] = clock.wall
+            cleanup_marker['completed_at'] = clock.wall
+            system_oom_recovery.atomic_write_marker(
+                initial_context['cleanup_path'], cleanup_marker)
+        elif future is not replacement_ref:
+            raise AssertionError(f'unexpected third ObjectRef: {future!r}')
+        raise RayNodeOOM()
+
+    ray_module = SimpleNamespace(
+        exceptions=SimpleNamespace(OutOfMemoryError=RayNodeOOM),
+        is_initialized=lambda: True,
+        _private=SimpleNamespace(worker=SimpleNamespace(
+            _global_node=SimpleNamespace(session_name='ray-session-1')),
+                                 utils=SimpleNamespace(
+                                     get_system_memory=lambda: 8 * 1024**3,
+                                     get_used_memory=lambda: 1024**3,
+                                 )),
+        wait=mock.Mock(side_effect=lambda refs, timeout: ([refs[0]], [])),
+        get=mock.Mock(side_effect=_get),
+        cancel=mock.Mock(),
+    )
+    placement_group = mock.sentinel.placement_group
+    ray_util_module = SimpleNamespace(
+        placement_group_table=mock.Mock(return_value={'state': 'CREATED'}),
+        remove_placement_group=mock.Mock())
+    stable_empty_docker = mock.Mock(return_value=True)
+    monkeypatch.setattr(system_oom_recovery, 'wait_for_stable_empty_docker',
+                        stable_empty_docker)
+
+    real_recovery_session = system_oom_recovery.RecoverySession
+    sessions = []
+
+    def _new_session(*args, **kwargs):
+        kwargs.update(wall_clock=clock.wall_time,
+                      monotonic_clock=clock.monotonic_time,
+                      wait=clock.sleep)
+        session = real_recovery_session(*args, **kwargs)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(system_oom_recovery, 'RecoverySession', _new_session)
+    submitted_at = []
+
+    def _submit(attempt_number, attempt_context):
+        submitted_at.append(clock.monotonic)
+        assert attempt_number == 1
+        return replacement_ref
+
+    submitter = mock.Mock(side_effect=_submit)
+
+    result = system_oom_recovery.get_or_fail_with_recovery(
+        ray_module,
+        ray_util_module,
+        original_ref,
+        placement_group,
+        submitter,
+        initial_context,
+        job_id,
+        v2_plan,
+        arm_started_monotonic=arm_started_monotonic,
+        expected_ray_session_identity='ray-session-1')
+
+    assert result == ([1], [None])
+    assert len(sessions) == 1
+    session = sessions[0]
+    submitter.assert_called_once()
+    replacement_context = submitter.call_args.args[1]
+    assert replacement_context['job_id'] == job_id
+    assert replacement_context['attempt_number'] == 1
+    assert replacement_context['profile_version'] == v2_plan.profile_version
+    assert replacement_context['capability'] == v2_plan.capability
+    assert replacement_context['node_boot_id'] == 'boot-id'
+    assert replacement_context['expected_docker_identity'] == (
+        _docker_identity().to_dict())
+    assert replacement_context['attempt_id'] != initial_context['attempt_id']
+    assert submitted_at == [
+        session.cleanup_proof_completed_monotonic +
+        system_oom_recovery.SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS
+    ]
+    assert clock.waits == [
+        system_oom_recovery.FIRST_EVENT_VISIBILITY_SECONDS,
+        system_oom_recovery.MEMORY_SAFE_SAMPLE_INTERVAL_SECONDS,
+        system_oom_recovery.MEMORY_SAFE_SAMPLE_INTERVAL_SECONDS,
+        system_oom_recovery.SYSTEM_RECOVERY_REPLAY_QUIESCENCE_SECONDS -
+        system_oom_recovery.FIRST_EVENT_VISIBILITY_SECONDS -
+        (system_oom_recovery.MEMORY_SAFE_SAMPLES - 1) *
+        system_oom_recovery.MEMORY_SAFE_SAMPLE_INTERVAL_SECONDS,
+    ]
+
+    assert ray_module.wait.call_args_list == [
+        mock.call([original_ref], timeout=1),
+        mock.call([replacement_ref], timeout=1),
+    ]
+    assert ray_module.get.call_args_list == [
+        mock.call(original_ref),
+        mock.call(replacement_ref),
+    ]
+    ray_module.cancel.assert_not_called()
+    ray_util_module.placement_group_table.assert_called_once_with(
+        placement_group)
+    ray_util_module.remove_placement_group.assert_called_once_with(
+        placement_group)
+    stable_empty_docker.assert_called_once_with(_docker_identity(), mock.ANY)
+
+    recovery_info = job_lib.get_job_system_recovery_info(job_id)
+    assert recovery_info is not None
+    assert recovery_info.phase == job_lib.JobSystemRecoveryPhase.EXHAUSTED
+    assert recovery_info.occurrence_count == 2
+    assert recovery_info.original_attempt_id == initial_context['attempt_id']
+    assert recovery_info.replacement_attempt_id == replacement_context[
+        'attempt_id']
+    assert recovery_info.reason == 'RAY_NODE_OOM'
+    assert recovery_info.summary == 'second Ray node OOM'
+    assert job_lib.get_status(job_id) == job_lib.JobStatus.FAILED
 
 
 def test_outer_finally_removes_placement_group_on_session_construction_failure(

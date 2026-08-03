@@ -136,6 +136,31 @@ class ProvisionRuntimeMetadata:
     run_started: bool = False
 
 
+@dataclasses.dataclass(frozen=True)
+class AWSInstanceIdentity:
+    """Closed AWS facts captured by the exact provisioning credential scope."""
+
+    aws_account_id: str
+    region: str
+    availability_zone: str
+    ec2_instance_id: str
+    instance_type: str
+    market_type: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.aws_account_id, str) or
+                len(self.aws_account_id) != 12 or
+                not self.aws_account_id.isdecimal()):
+            raise ValueError('aws_account_id must contain exactly 12 digits.')
+        for field_name in ('region', 'availability_zone', 'ec2_instance_id',
+                           'instance_type'):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f'{field_name} must be a nonempty string.')
+        if self.market_type not in ('on_demand', 'spot'):
+            raise ValueError('market_type must be on_demand or spot.')
+
+
 @dataclasses.dataclass
 class ProvisionRecord:
     """Record for a provisioning process."""
@@ -158,6 +183,11 @@ class ProvisionRecord:
     # Metadata about the runtime materialized by provisioning.
     runtime_metadata: ProvisionRuntimeMetadata = dataclasses.field(
         default_factory=ProvisionRuntimeMetadata)
+    # Present only when one exact fresh AWS create was re-read with the same
+    # request-scoped credential session. It is optional operational evidence,
+    # never provider lifecycle authority.
+    fresh_aws_instance_identity: AWSInstanceIdentity | None = dataclasses.field(
+        default=None, kw_only=True, repr=False)
 
     def is_instance_just_booted(self, instance_id: InstanceId) -> bool:
         """Whether or not the instance is just booted.
