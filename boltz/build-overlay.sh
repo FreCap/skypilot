@@ -140,9 +140,10 @@ fi
 
 ctx="$(mktemp -d)"; trap 'rm -rf "$ctx"' EXIT
 for f in "${files[@]}"; do mkdir -p "$ctx/$(dirname "$f")"; cp "$f" "$ctx/$f"; done
+root_module_context="$ctx/root_py_modules"
 for f in "${root_module_files[@]}"; do
-  mkdir -p "$ctx/$(dirname "$f")"
-  cp "$f" "$ctx/$f"
+  mkdir -p "$root_module_context/$(dirname "$f")"
+  cp "$f" "$root_module_context/$f"
 done
 template_files=()
 while IFS= read -r f; do [ -n "$f" ] && template_files+=("$f"); done < <(

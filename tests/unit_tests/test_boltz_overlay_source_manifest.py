@@ -32,6 +32,17 @@ def test_declared_py_module_sources_match_release_setup():
         pathlib.Path('skypilot_serve_system_oom_recovery_authorization.py'),)
 
 
+def test_overlay_dockerfile_copies_projected_root_modules():
+    build_script = (_REPO_ROOT / 'boltz' /
+                    'build-overlay.sh').read_text(encoding='utf-8')
+    dockerfile = (_REPO_ROOT / 'boltz' /
+                  'Dockerfile.overlay').read_text(encoding='utf-8')
+
+    assert 'root_module_context="$ctx/root_py_modules"' in build_script
+    assert 'cp "$f" "$root_module_context/$f"' in build_script
+    assert 'COPY root_py_modules/ ./' in dockerfile
+
+
 def test_declared_py_module_sources_support_nested_modules(tmp_path):
     setup_path = _write_setup(tmp_path, "['bootstrap', 'internal.guard']")
     (tmp_path / 'bootstrap.py').write_text('', encoding='utf-8')
