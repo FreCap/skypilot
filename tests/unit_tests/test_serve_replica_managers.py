@@ -4421,7 +4421,9 @@ class TestInfrastructureInterruptionRecovery:
         manager._spot_placer.set_preemptive.assert_called_once_with(
             spot, reason='preempted')
 
-    def test_failed_research_probe_enters_interruption_prefilter(self):
+    @pytest.mark.parametrize('changed_only', [False, True])
+    def test_failed_research_probe_enters_interruption_prefilter(
+            self, changed_only):
         research = self._location()
         manager = self._manager(research)
         info = self._info(research)
@@ -4438,6 +4440,7 @@ class TestInfrastructureInterruptionRecovery:
         manager._cloud_instance_looks_alive = mock.Mock(return_value=False)
         manager._handle_preemption = mock.Mock(return_value=True)
         manager._persist_replicas = mock.Mock()
+        manager._changed_only_readiness_persistence = changed_only
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -4452,7 +4455,10 @@ class TestInfrastructureInterruptionRecovery:
 
         manager._cloud_instance_looks_alive.assert_called_once_with(info)
         manager._handle_preemption.assert_called_once_with(info)
-        manager._persist_replicas.assert_called_once_with([])
+        if changed_only:
+            manager._persist_replicas.assert_not_called()
+        else:
+            manager._persist_replicas.assert_called_once_with([])
 
     @pytest.mark.parametrize('persisted_intent', [False, True])
     def test_recovery_redrives_reclaimed_research_replica_without_bench(

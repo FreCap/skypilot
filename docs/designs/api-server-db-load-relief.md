@@ -82,6 +82,15 @@ connection-attribution milestone is based on commit
 in `v1.1.1047` and the retired physical-capacity evidence scan was removed, on
 `origin/improvements`.
 
+The changed-only readiness milestone is based on commit
+`5b003e81e462ba70382fda5b7483c4bf0b77ad4e` on `origin/improvements`, tagged
+`v1.1.1066`. That base
+includes typed system-OOM recovery commit
+`0127dfc4ce23eb03e4da0df3be4f6ff785f09054`, tagged `v1.1.1061`, which added
+durable recovery reductions and route-suspension writes to the readiness probe
+loop. Those writes are outside the readiness fingerprint and must remain
+unconditional.
+
 The relevant behavior was compared directly with `v1.1.1015`:
 
 | Path | `v1.1.1015` and current behavior | Relevant current-only difference |
@@ -89,7 +98,7 @@ The relevant behavior was compared directly with `v1.1.1015`:
 | `RequestWorker.process_request()` and `run()` | Function ASTs are identical. An empty `queue.get()` sleeps 100 ms; a nonempty queue immediately starts the next pickup. | None. |
 | `PostgresQueueBackend.get()` | Every call opens a transaction, checks leadership when applicable, runs `_reap_expired_claims()`, then runs `_candidate()`. | Current code adds authority-worker claim predicates and rechecks those predicates when claiming. Cadence is unchanged. |
 | `PostgresQueueBackend._reap_expired_claims()` | Selects up to 100 expired claimed rows with `FOR UPDATE SKIP LOCKED`, then requeues replayable work or terminalizes ambiguous mutating work. | Current code scopes the sweep with the same authority-worker role predicates used for pickup. These predicates must be preserved. |
-| `SkyPilotReplicaManager._probe_all_replicas()` | Function ASTs are identical. Every non-preempted probe result is appended to `pending_writes`, then the whole list is batch-upserted. | None. |
+| `SkyPilotReplicaManager._probe_all_replicas()` | Every non-preempted, non-terminal probe result is appended to `pending_writes`, then the whole list is batch-upserted. | Current code also performs typed system-recovery reductions and owner-fenced route suspensions in the probe loop. Changed-only filtering must be limited to ordinary replicas and preserve those recovery writes. |
 | `controller_proxy._proxy_controller_sync()` | Function ASTs are identical. It reads owner before forwarding and after receiving the response. | None. |
 | `SkyServeController._handle_load_balancer_role()` | Function ASTs are identical. It performs an initial owner read, then an in-lock fence read and a separate cutover-state read. | None. |
 
@@ -117,6 +126,29 @@ production work:
 | `job_info` | 1.22 million rows scanned per minute from a 5,131-row table | The scheduler candidate query performs about 238 full scans per minute even with no `WAITING` jobs. |
 | `replicas` | 471 updates per minute in one sample | Stable readiness persistence is about 65 percent of observed row updates. |
 | `services` | 3,237 indexed scans per minute | Service reads remain a later consolidation candidate after the measured scan and write amplifiers. |
+
+A fresh production snapshot on 2026-08-03 confirmed which remaining milestone
+is useful before a PostgreSQL request-store cutover. The Aurora Serverless v2
+writer was at its 8-ACU ceiling, with 100 percent ACU utilization and 94.9
+percent average CPU over 20 minutes. A 141.8-second database sample measured
+about 165 new sessions and 505 commits per second. The two ready services had
+176 trackable replicas, of which 171 were already `READY`.
+
+In an aligned 51.1-second `pg_stat_user_tables` sample, `replicas` accounted for
+353 of 586 user-table updates, or 60.2 percent, and only 175 of those replica
+updates were HOT. A longer 141.8-second sample observed 875 replica updates, or
+about 370 per minute. Removing stable readiness rewrites can therefore remove
+roughly 97 percent of readiness-generated replica updates and much of the
+observed tuple, index, and WAL churn. It cannot explain or remove the measured
+session and commit rates: the readiness path batches a fleet round into about
+0.04 transactions per second. CPU improvement must be measured in the canary,
+not projected from row counts.
+
+Because production still uses the SQLite request store, the current-production
+execution order after connection attribution is Milestone 3, followed by
+Milestones 1 and 2 only as PostgreSQL request-store cutover safeguards.
+Milestone 4 remains evidence-gated because its HA fencing contract has higher
+correctness risk.
 
 The `job_info` snapshot contained 5,008 `DONE`, 114 `ALIVE_BACKOFF`, four
 `LAUNCHING`, three `INACTIVE`, two `ALIVE`, and zero `WAITING` rows. There were
@@ -591,9 +623,11 @@ case-insensitive value `true` enables it. Unset or `false` disables it; any
 other explicit value logs a warning and fails closed to disabled.
 
 In `SkyPilotReplicaManager._probe_all_replicas()`, capture a compact immutable
-readiness persistence fingerprint immediately before applying each probe result.
-Compare it with the same fingerprint after applying the result. Append the row
-to `pending_writes` only when the fingerprint changed.
+readiness persistence fingerprint immediately before reducing each probe
+result. Compare it with the same fingerprint after applying the result. A row
+may be omitted from `pending_writes` only when the feature is enabled, the row
+is changed-only eligible both before and after the reduction, and the
+fingerprint did not change.
 
 The fingerprint contains exactly:
 
@@ -614,18 +648,36 @@ mutations, and covered by transition tests for every field above. A code change
 that adds another probe-mutated persisted field must update the fingerprint and
 tests in the same change.
 
+Changed-only eligibility is deliberately narrower than "no readiness change."
+A row is eligible only when both its before and after state have
+`system_recovery_disposition == ORDINARY`, `system_recovery is None`, and no
+`system_recovery_quarantine`. Candidate, capable, quarantined, or transitioning
+recovery rows are always appended even when the four readiness fields are
+stable. This fail-closed boundary preserves the typed system-OOM recovery
+subdocument without serializing or comparing it. Historical launch intent on
+an otherwise validated ordinary row does not by itself make the row
+ineligible, because the ordinary probe path does not mutate that intent.
+
 Additional contract:
 
 - Feature disabled: append and upsert every non-preempted probe result exactly
   as today, including the existing harmless `_persist_replicas([])` call when
   every result took the separate preemption path.
-- Feature enabled: stable true-to-true and false-to-false results perform no
-  replica upsert.
+- Feature enabled: stable true-to-true and false-to-false ordinary results
+  perform no replica upsert.
+- Candidate, capable, quarantined, or recovery-transitioning rows remain
+  unconditional writes. Preserve every system-recovery reduction, revision,
+  route lease, and route-suspension outcome from the `v1.1.1061` base.
 - Persist readiness transitions and timer initialization, clearing, and
   sentinel changes before any teardown re-read.
 - Keep `_handle_preemption()` on its existing persistence path.
 - When the feature is enabled and `pending_writes` is empty, do not call
-  `_persist_replicas()`.
+  `_persist_replicas()` unless route suspensions must be committed. A nonempty
+  route-suspension batch always calls the owner-fenced persistence path even
+  if its replica-write batch is empty. The empty-batch variant must open a
+  transaction and validate a nonempty service hash plus the exact live
+  controller PID/IP owner before route holds are committed; partial, missing,
+  malformed, or stale owner identity fails closed.
 - Do not change the one full fleet read, probe concurrency, service-status
   update, returned end-of-round snapshot, owner fences, or batch-upsert format.
 - Do not add `ON CONFLICT ... WHERE` as the primary filter. Sending and locking
@@ -639,13 +691,21 @@ Transitions still write once. Database reads and HTTP probes are unchanged.
 Files:
 
 - `sky/serve/replica_managers.py`
+- `sky/serve/serve_state.py`
+- `tests/unit_tests/test_probe_round_batching.py`
 - `tests/unit_tests/test_serve_replica_managers.py`
+- `tests/unit_tests/test_serve_state.py`
 - `docs/designs/api-server-db-load-relief.md`
 
 Focused tests:
 
 - disabled mode preserves the existing full batch;
 - stable ready and stable not-ready rows are omitted in enabled mode;
+- candidate, capable, quarantined, and before/after recovery-transition rows
+  remain in the batch even with stable readiness;
+- a route-suspension-only round still calls the owner-fenced persistence path;
+- an empty route-suspension batch validates the current controller identity
+  and rejects missing or stale identity;
 - false-to-true and true-to-false transitions persist;
 - first readiness, first non-readiness, consecutive-failure start, and
   consecutive-failure recovery each persist;
@@ -659,8 +719,10 @@ Focused tests:
   `test_failed_research_probe_enters_interruption_prefilter` expectation in
   default-disabled mode and add an enabled-mode variant that performs no empty
   persistence call;
-- a test enumerates all current probe assignments and guards the fingerprint
-  contract against an undeclared persisted mutation.
+- a structural test guards the ordinary-path readiness assignments and the
+  changed-only eligibility boundary against an undeclared persisted mutation;
+- the typed system-OOM recovery probe and route-lease suites retain their
+  outcomes unchanged.
 
 ### Milestone 4: combine the in-lock HA fence and cutover state
 
@@ -900,11 +962,19 @@ Each milestone is a separate PR and deployment gate.
 ### Milestone 3
 
 1. Deploy with changed-only persistence disabled.
-2. Enable for one large, stable service controller.
-3. Compare replica upsert rows per minute, probe-round duration, readiness
-   transition latency, teardown classifications, and controller errors.
-4. Exercise ready, unready, recovery, preemption, and teardown transitions.
-5. Roll back by setting the kill switch false.
+2. Enable on the single monolithic API pod. The environment variable is
+   inherited by every service-controller child, so this canary intentionally
+   covers all currently running services rather than claiming a per-service
+   rollout that Helm cannot provide.
+3. Compare aligned five-minute `replicas.n_tup_upd` and `n_tup_hot_upd`
+   deltas, Aurora CPU, WriteIOPS, write throughput, probe-round duration,
+   readiness transition latency, teardown classifications, and controller
+   errors.
+4. Exercise ready, unready, recovery, preemption, initial-delay teardown,
+   consecutive-failure teardown, and typed system-OOM recovery transitions.
+5. Roll back by setting the kill switch false if any transition is missed,
+   teardown classification changes, the LB ready set becomes stale, or probe
+   errors increase.
 
 ### Milestone 4
 
@@ -923,7 +993,7 @@ Each milestone is a separate PR and deployment gate.
 | Attribution gate | The bounded counter's aligned aggregate explains the material share of `pg_stat_database.sessions`, every emitted label is in its allowlist, and pool behavior plus API CPU and latency are unchanged. | Listener or metric appears while disabled, unknown labels grow, metric recording warns, the aggregate materially diverges without explanation, `/tmp/metrics` grows without a safe bound, API CPU or latency materially regresses, or API/controller behavior changes. |
 | 1 | In a PostgreSQL request-backend deployment, empty-queue reads fall from about 40 to about 22 `SELECT`s/s at a 1-second interval; queue latency is unchanged. | An under-cap expiry set recovers later than interval plus normal scheduling tolerance, a capped backlog stops draining immediately, replay outcome changes, or database errors increase. |
 | 2 | Combined with 1, empty-queue reads approach 4 `SELECT`s/s at a 1-second cap. | Short-request queue-wait p99 breaches its service objective or shutdown becomes slower. |
-| 3 | Stable services approach zero replica-row updates while transition counts and outcomes match baseline. | Missed readiness transition, wrong teardown classification, stale LB ready set, or probe-round error increase. |
+| 3 | Stable ordinary replicas approach zero readiness-generated row updates while readiness and typed system-recovery transition counts and outcomes match baseline. | Missed readiness or recovery transition, wrong teardown classification, stale LB ready set, or probe-round error increase. |
 | 4 | Role heartbeat authority reads fall from 5 to 4 with identical outcomes. | Any owner mismatch, malformed-state, or cutover outcome differs. |
 
 ## Verification plan
@@ -938,9 +1008,13 @@ pytest -n 0 tests/unit_tests/test_sky/utils/test_db_utils.py
 pytest -n 0 tests/unit_tests/test_parent_death_watchdog.py
 pytest -n 0 tests/unit_tests/test_api_requests_pg.py -k 'expired or reap or queue'
 pytest -n 0 tests/unit_tests/test_sky/server/requests/test_executor.py
+pytest -n 0 tests/unit_tests/test_probe_round_batching.py
 pytest -n 0 tests/unit_tests/test_serve_replica_managers.py -k 'probe or readiness or preemption'
+pytest -n 0 tests/unit_tests/test_serve_probe_failure_window.py
+pytest -n 0 tests/unit_tests/test_serve_system_oom_recovery.py
+pytest -n 0 tests/unit_tests/test_serve_system_recovery_route_lease.py
 pytest -n 0 tests/unit_tests/test_serve_lb_ha.py
-pytest -n 0 tests/unit_tests/test_serve_state.py
+pytest -n 0 tests/unit_tests/test_serve_state.py -k 'BatchReplicaUpsert'
 pytest -n 0 tests/unit_tests/test_serve_controller_proxy.py
 pytest -n 0 tests/unit_tests/test_serve_lb_cutover_state_contract.py
 ```
@@ -966,8 +1040,10 @@ Manual verification:
    ambiguous cancelled request with `should_retry` set.
 5. Run a sustained nonempty queue and prove there is no idle sleep and no
    throughput regression.
-6. On a large stable service, record replica upsert rows for ten probe rounds,
-   enable Milestone 3, then force ready-to-unready and recovery transitions.
+6. Across all running services in the monolithic API pod, record replica update
+   and HOT-update deltas for ten probe rounds, enable Milestone 3, then force
+   ready-to-unready, recovery, preemption, teardown, and typed system-OOM
+   transitions.
 7. In HA, record one stable heartbeat, each cutover phase, a controller owner
    transfer during a heartbeat, and the exact database statement count before
    and after Milestone 4.
@@ -983,7 +1059,7 @@ Manual verification:
 | `sky/server/requests/executor.py`, `sky/jobs/controller.py`, and `sky/serve/controller.py` | exact child-process role override before database initialization | entrypoint ordering tests and existing executor/controller lifecycle suites |
 | `sky/server/requests/postgres.py` | expired-claim cadence while preserving queue fencing | PostgreSQL request tests, mixed-consumer race, statement-count observation |
 | `sky/server/requests/executor.py` | bounded idle polling and interruptible shutdown | request executor tests, deterministic backoff tests, queue-wait canary |
-| `sky/serve/replica_managers.py` | changed-only readiness bookkeeping | probe transition and preemption tests, large-fleet write-count canary |
+| `sky/serve/replica_managers.py` | changed-only ordinary readiness bookkeeping while preserving typed system-OOM recovery | probe transition, preemption, recovery, and route-suspension tests; two-service large-fleet write-count canary |
 | `sky/serve/lb_cutover_state.py` | one-query typed authority snapshot and shared validation | cutover repository contract, valid and malformed state parity, query-count test |
 | `sky/serve/serve_state.py` | historical facade for the combined reader | Serve state and direct alias tests |
 | `sky/serve/controller.py` | in-lock combined fence and staged redundant-read removal | full LB HA saga, cancellation, ownership handoff, query ordering |
