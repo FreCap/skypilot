@@ -5,6 +5,7 @@ import base64
 import os
 import time
 from unittest.mock import AsyncMock
+from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -375,6 +376,55 @@ async def test_metrics_endpoint_with_multiprocess():
             mock_registry.assert_called_once()
             mock_collector.assert_called_once_with(mock_registry_instance)
             mock_gen.assert_called_once_with(mock_registry_instance)
+
+
+@pytest.mark.parametrize('role', ['all', 'api'])
+def test_multiprocess_metrics_register_api_owned_collectors(role):
+    """Shared-state and plugin collectors remain on API-owned targets."""
+    registry = MagicMock()
+    burn_rate = MagicMock()
+    workspace_usage = MagicMock()
+    managed_jobs = MagicMock()
+    plugin = MagicMock()
+    with patch.dict(os.environ, {
+            'PROMETHEUS_MULTIPROC_DIR': '/tmp/prom',
+            'SKYPILOT_API_SERVER_ROLE': role,
+    }), patch('sky.server.metrics.prom.CollectorRegistry',
+              return_value=registry), patch(
+                  'sky.server.metrics.multiprocess.MultiProcessCollector'), \
+         patch.object(metrics, '_BURN_RATE_COLLECTOR', burn_rate), \
+         patch.object(metrics, '_WORKSPACE_USAGE_COLLECTOR', workspace_usage), \
+         patch.object(metrics, '_MANAGED_JOBS_COLLECTOR', managed_jobs), \
+         patch.object(metrics, '_plugin_collectors', [plugin]), \
+         patch('sky.server.metrics.generate_latest', return_value=b''):
+        metrics.metrics()
+
+    assert registry.register.call_args_list == [
+        call(burn_rate),
+        call(workspace_usage),
+        call(managed_jobs),
+        call(plugin),
+    ]
+
+
+@pytest.mark.parametrize('role', ['executor', 'controller'])
+def test_multiprocess_metrics_omit_api_owned_collectors_from_split_roles(role):
+    """Role targets expose only their pod-local multiprocess registry."""
+    registry = MagicMock()
+    with patch.dict(os.environ, {
+            'PROMETHEUS_MULTIPROC_DIR': '/tmp/prom',
+            'SKYPILOT_API_SERVER_ROLE': role,
+    }), patch('sky.server.metrics.prom.CollectorRegistry',
+              return_value=registry), patch(
+                  'sky.server.metrics.multiprocess.MultiProcessCollector'), \
+         patch.object(metrics, '_BURN_RATE_COLLECTOR', MagicMock()), \
+         patch.object(metrics, '_WORKSPACE_USAGE_COLLECTOR', MagicMock()), \
+         patch.object(metrics, '_MANAGED_JOBS_COLLECTOR', MagicMock()), \
+         patch.object(metrics, '_plugin_collectors', [MagicMock()]), \
+         patch('sky.server.metrics.generate_latest', return_value=b''):
+        metrics.metrics()
+
+    registry.register.assert_not_called()
 
 
 @pytest.fixture

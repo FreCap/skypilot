@@ -755,7 +755,10 @@ Default: see the yaml below.
 ``apiService.metrics.enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Enable (exposing API metrics)[Link to docs/source/reference/api-server/examples/api-server-metrics-setup.rst] from the API server. If this is enabled and the API server image does not support metrics, the deployment will fail.
+Enable metrics collection for the API server. In guarded HA mode, API,
+executor, and controller pods expose independent role-local multiprocess
+registries and scrape targets. If the API server image does not support
+metrics, the deployment will fail.
 
 Default: ``false``
 
@@ -770,7 +773,9 @@ Default: ``false``
 ``apiService.metrics.port``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The port to expose the metrics on.
+The port to expose metrics on in every API-server role pod. The bundled
+Prometheus federation jobs select the API Service's named metrics port, so this
+setting also applies to ``/gpu-metrics`` and ``/endpoints-metrics`` collection.
 
 Default: ``9090``
 

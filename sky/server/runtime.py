@@ -58,6 +58,8 @@ _ROLE_CHOICES = ('all', 'api', 'executor', 'controller', 'authority-worker')
 _SINGLETON_PREFIX = 'skypilot:api-server-runtime:v1'
 _CONTROLLER_LEADERSHIP_POLL_SECONDS = 2
 _CONTROLLER_LEADERSHIP_PROBE_SECONDS = 2
+_METRICS_STARTUP_TIMEOUT_SECONDS = 30
+_METRICS_STARTUP_POLL_SECONDS = 0.01
 _CONTROLLER_CUTOVER_QUIESCENCE_ENV_VAR = (
     'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS')
 
@@ -232,6 +234,9 @@ class _BackgroundLoop:
     def __init__(self) -> None:
         self.loop = uvloop.new_event_loop()
         self._tasks: list[asyncio.Task] = []
+        self._graceful_shutdown_hooks: list[Callable[[], Coroutine[Any, Any,
+                                                                   Any]]] = []
+        self._stopping = threading.Event()
         self._thread = threading.Thread(target=self._run,
                                         name='server-background-loop',
                                         daemon=True)
@@ -240,8 +245,19 @@ class _BackgroundLoop:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def create_task(self, coroutine: Coroutine[Any, Any, Any]) -> None:
-        self._tasks.append(self.loop.create_task(coroutine))
+    def create_task(self, coroutine: Coroutine[Any, Any,
+                                               Any]) -> asyncio.Task[Any]:
+        task = self.loop.create_task(coroutine)
+        self._tasks.append(task)
+        return task
+
+    @property
+    def is_stopping(self) -> bool:
+        return self._stopping.is_set()
+
+    def add_graceful_shutdown_hook(
+            self, hook: Callable[[], Coroutine[Any, Any, Any]]) -> None:
+        self._graceful_shutdown_hooks.append(hook)
 
     def start(self) -> None:
         self._thread.start()
@@ -254,9 +270,18 @@ class _BackgroundLoop:
         return future.result(timeout=timeout)
 
     def stop(self) -> None:
+        self._stopping.set()
         if not self._thread.is_alive():
             self.loop.close()
             return
+
+        for hook in self._graceful_shutdown_hooks:
+            future = asyncio.run_coroutine_threadsafe(hook(), self.loop)
+            try:
+                future.result(timeout=30)
+            except Exception as e:  # pylint: disable=broad-except
+                future.cancel()
+                logger.warning(f'Background shutdown hook was incomplete: {e}')
 
         async def cancel_tasks() -> None:
             for task in self._tasks:
@@ -283,16 +308,111 @@ def _singleton_task(
     return task_factory()
 
 
-def _start_background_loop(role: str, host: str,
-                           metrics_port: int) -> _BackgroundLoop:
-    background = _BackgroundLoop()
-    if role in ('all', 'api') and os.environ.get(
-            constants.ENV_VAR_SERVER_METRICS_ENABLED):
-        metrics.maybe_register_managed_jobs_collector()
-        metrics_server = metrics.build_metrics_server(host, metrics_port)
-        background.create_task(metrics_server.serve())
-        background.create_task(metrics.multiproc_reaper_daemon())
+def _metrics_enabled() -> bool:
+    return (os.environ.get(constants.ENV_VAR_SERVER_METRICS_ENABLED,
+                           'false').lower() == 'true')
 
+
+async def _serve_metrics_server(metrics_server: Any) -> None:
+    """Keep uvicorn BaseExceptions contained in the background loop task."""
+    try:
+        await metrics_server.serve()
+    except asyncio.CancelledError:
+        raise
+    except BaseException as e:
+        # uvicorn raises SystemExit when its listener cannot bind. Let the
+        # foreground startup barrier surface that as an ordinary role startup
+        # failure instead of silently terminating only the background thread.
+        raise RuntimeError('The metrics server failed.') from e
+
+
+def _metrics_task_failure(task: asyncio.Task[Any]) -> BaseException:
+    if task.cancelled():
+        return RuntimeError(
+            'The metrics server task was cancelled unexpectedly.')
+    failure = task.exception()
+    if failure is not None:
+        return failure
+    return RuntimeError('The metrics server stopped unexpectedly.')
+
+
+def _start_metrics_background_loop(role: str, host: str,
+                                   metrics_port: int) -> _BackgroundLoop | None:
+    """Serve metrics owned by one API-server role pod."""
+    if role not in ('all', 'api', 'executor', 'controller'):
+        return None
+    if not _metrics_enabled():
+        return None
+    if (role in ('executor', 'controller') and
+            not os.environ.get('PROMETHEUS_MULTIPROC_DIR')):
+        raise RuntimeError(
+            f'The {role} metrics server requires '
+            'PROMETHEUS_MULTIPROC_DIR so child-process metrics are visible.')
+
+    background = _BackgroundLoop()
+    # Initialize the optional managed-jobs shared-state collector only in its
+    # historical API/all owner. metrics.metrics() applies the same role gate
+    # to all built-in and plugin custom collectors. Process-local metrics,
+    # including controller children, still come from every role's pod-local
+    # multiprocess registry.
+    if role in ('all', 'api'):
+        metrics.maybe_register_managed_jobs_collector()
+    metrics_server = metrics.build_metrics_server(host, metrics_port)
+    serve_task = background.create_task(_serve_metrics_server(metrics_server))
+    background.create_task(metrics.multiproc_reaper_daemon())
+
+    async def stop_metrics_server() -> None:
+        metrics_server.should_exit = True
+        await asyncio.gather(serve_task, return_exceptions=True)
+
+    background.add_graceful_shutdown_hook(stop_metrics_server)
+    startup_complete = threading.Event()
+    server_failed = threading.Event()
+    failure_holder: list[BaseException] = []
+
+    def metrics_server_done(task: asyncio.Task[Any]) -> None:
+        failure = _metrics_task_failure(task)
+        failure_holder.append(failure)
+        server_failed.set()
+        if not startup_complete.is_set() or background.is_stopping:
+            return
+        logger.error(
+            'Metrics server stopped after startup; terminating the role.',
+            exc_info=(type(failure), failure, failure.__traceback__))
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except OSError:
+            logger.exception('Failed to terminate the role after metrics '
+                             'server failure.')
+
+    serve_task.add_done_callback(metrics_server_done)
+    try:
+        background.start()
+        deadline = time.monotonic() + _METRICS_STARTUP_TIMEOUT_SECONDS
+        while not metrics_server.started:
+            if server_failed.wait(_METRICS_STARTUP_POLL_SECONDS):
+                failure = failure_holder[0]
+                raise RuntimeError(
+                    f'The {role} metrics server failed to become available '
+                    f'on {host}:{metrics_port}.') from failure
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f'Timed out waiting for the {role} metrics server on '
+                    f'{host}:{metrics_port}.')
+        startup_complete.set()
+        if server_failed.is_set():
+            failure = failure_holder[0]
+            raise RuntimeError(
+                f'The {role} metrics server failed to remain available on '
+                f'{host}:{metrics_port}.') from failure
+    except Exception:
+        background.stop()
+        raise
+    return background
+
+
+def _start_background_loop(role: str) -> _BackgroundLoop:
+    background = _BackgroundLoop()
     if (role in ('all', 'api') and
             auth_tokens.is_resource_action_authority_enabled()):
         if not _uses_postgres_requests():
@@ -608,8 +728,7 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
             execution_classes=frozenset(
                 {request_registry.ExecutionClass.CONTROLLER}),
             controller_generation=generation)
-        background = _start_background_loop('controller', args.host,
-                                            args.metrics_port)
+        background = _start_background_loop('controller')
         background.run(_initialize_controller_requests())
 
         # The existing managed-jobs consolidation lock and SkyServe lifecycle
@@ -822,11 +941,14 @@ def _run_authority_preflight_role(state: RuntimeState,
 
 def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
     """Start the selected role and unwind every owned resource on exit."""
+    metrics_background: _BackgroundLoop | None = None
     background: _BackgroundLoop | None = None
     queue_server = None
     workers: list[executor.RequestWorker] = []
     health_server = None
     try:
+        metrics_background = _start_metrics_background_loop(
+            state.role, args.host, args.metrics_port)
         if state.role == 'controller':
             _run_controller_role(state, args)
             return
@@ -834,8 +956,7 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
             _run_authority_preflight_role(state, args)
             return
 
-        background = _start_background_loop(state.role, args.host,
-                                            args.metrics_port)
+        background = _start_background_loop(state.role)
         if state.role in ('all', 'executor'):
             clean_env_module.capture_clean_server_env()
             execution_classes = None
@@ -888,8 +1009,14 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
             _stop_queue_server(queue_server)
             if background is not None:
                 background.stop()
-        for plugin in plugins.get_plugins():
-            plugin.shutdown()
+        # Stop collection before plugin teardown: API-owned custom collectors
+        # must not race a plugin while its backing state is closing.
+        try:
+            if metrics_background is not None:
+                metrics_background.stop()
+        finally:
+            for plugin in plugins.get_plugins():
+                plugin.shutdown()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -927,6 +1054,9 @@ def main() -> None:
 
     if args.port == args.metrics_port and args.role in ('all', 'api'):
         raise ValueError('port and metrics-port cannot be the same')
+    if (args.role in ('executor', 'controller') and _metrics_enabled() and
+            args.role_health_port == args.metrics_port):
+        raise ValueError('role-health-port and metrics-port cannot be the same')
     if args.role != 'all' and not _uses_postgres_requests():
         raise RuntimeError(
             f'The {args.role} role requires '

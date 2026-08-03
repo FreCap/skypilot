@@ -1,8 +1,11 @@
 """Characterization tests for the ``sky api`` command group."""
 
+from unittest import mock
+
 import click
 from click import testing as click_testing
 
+from sky.client.cli import api as api_commands
 from sky.client.cli import command
 
 
@@ -50,3 +53,27 @@ def test_api_group_help_lists_commands_in_definition_order() -> None:
         'logout',
         'info',
     ]
+
+
+def test_api_start_forwards_metrics_configuration(monkeypatch) -> None:
+    start = mock.Mock()
+    server_info = mock.sentinel.server_info
+    monkeypatch.setattr(api_commands.sdk, 'api_start', start)
+    monkeypatch.setattr(api_commands.server_common, 'get_server_url',
+                        lambda host: f'http://{host}:46580')
+    monkeypatch.setattr(api_commands.server_common, 'get_api_server_status',
+                        lambda endpoint: server_info)
+    monkeypatch.setattr(api_commands.server_common,
+                        'check_and_print_upgrade_hint', mock.Mock())
+
+    result = click_testing.CliRunner().invoke(
+        command.api_start,
+        ['--deploy', '--foreground', '--metrics', '--metrics-port', '9191'])
+
+    assert result.exit_code == 0, result.output
+    start.assert_called_once_with(deploy=True,
+                                  host='127.0.0.1',
+                                  foreground=True,
+                                  metrics=True,
+                                  metrics_port=9191,
+                                  enable_basic_auth=False)

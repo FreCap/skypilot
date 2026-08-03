@@ -1,7 +1,11 @@
 # Production-Grade Multi-Replica API Server
 
 Status: M0-M4 merged in PR #1070 and live-accepted on the isolated deployment;
-production fleet rollout and M5 compatibility cleanup remain fleet-gated
+the split-role metrics-completeness correction is implemented with live scrape
+acceptance pending; production fleet rollout and M5 compatibility cleanup
+remain fleet-gated
+
+Last updated: 2026-08-03
 
 Canonical owner: this file. External plans and pull request descriptions must
 link here rather than restating a divergent contract.
@@ -432,6 +436,34 @@ Controller workers expose an internal health endpoint. Readiness reports
 healthy for a standby and reports unhealthy for a leader that loses its lock
 or cannot fence its children.
 
+When metrics are enabled, every API, executor, and controller pod starts a
+role-local metrics server for its own Prometheus multiprocess registry. The
+enablement marker is active only when
+`SKY_API_SERVER_METRICS_ENABLED=true`; unset or `false` values do not start a
+listener. The metrics server is independent of controller leadership, so
+controller standbys remain scrapeable and a newly promoted leader does not
+introduce a target gap. Role startup blocks until the metrics listener has
+successfully bound, before executor/controller readiness or controller election
+can begin.
+An unexpected listener exit after startup sends the role its normal termination
+signal, closing readiness and causing the Deployment to replace the pod rather
+than leaving a Ready target with no metrics. Executor and controller
+supervisors, request workers, and their controller subprocesses share one
+pod-local `PROMETHEUS_MULTIPROC_DIR`; the directory is created before the
+Python runtime imports metric definitions.
+After all chart hooks and credential setup, the supervisor entrypoint clears
+and recreates that directory as its final pre-exec step: the multiprocess
+reaper removes dead-process live gauges but deliberately preserves counters
+and histograms, so hook-created or stale files cannot be inherited.
+This is required for controller-emitted series such as
+`sky_serve_system_oom_recovery_events_total` to reach a scraped endpoint.
+Collectors that query shared durable state remain registered only on API
+roles, avoiding another copy on every executor and controller target. Plugin
+custom collectors keep their historical API/all ownership for the same
+reason. A plugin that needs role-local telemetry emits multiprocess-aware
+Prometheus metric types into that role's local registry instead of registering
+a custom collector on every scrape target.
+
 The handler registry routes Serve lifecycle mutations, managed-jobs operations
 that create or supervise consolidated controllers, and internal
 controller-maintenance submissions to the `controller` execution class.
@@ -492,6 +524,13 @@ The chart enforces:
   drain, and a termination grace period longer than the drain budget.
 - API Service selectors match only API pods.
 - API, executor, and controller Deployments have distinct labels and commands.
+- With `apiService.metrics.enabled=true`, all three Deployments expose the
+  configured metrics port, carry the same selected Prometheus discovery
+  annotations, and are scraped as independent pod targets. Executor and
+  controller health ports must differ from the metrics port.
+- Bundled `/gpu-metrics` and `/endpoints-metrics` federation jobs discover the
+  API Service's named `metrics` port rather than embedding `9090`, so a custom
+  `apiService.metrics.port` is one consistent chart-wide setting.
 - Pod anti-affinity or topology-spread constraints avoid placing all replicas
   on one node when the cluster has capacity.
 - PodDisruptionBudgets preserve one API, executor, and controller pod.
@@ -980,6 +1019,19 @@ targeted role-runtime tests, formatting, mypy, Pylint, dashboard checks, and a
 warning-as-error Sphinx build pass. The fast drain-marker unit test proves
 readiness fails without opening PostgreSQL.
 
+A post-acceptance telemetry review found that M2 had kept metrics-server
+startup restricted to `all` and `api` roles. The split-role chart also omitted
+metrics enablement, `PROMETHEUS_MULTIPROC_DIR`, the metrics container port, and
+scrape annotations from executor and controller pods. Controller-owned metrics
+therefore had no target, and a standby did not bind a metrics port until after
+promotion. This follow-up separates role-local metrics serving from
+leader-only background maintenance, starts it before controller election,
+and makes the chart discover every role pod. The correction changes no request
+backend, leadership, Serve recovery, or activation behavior. Production HA
+rollout requires live evidence that every Ready role pod remains scrapeable
+through a controller handoff before metrics-dependent rollout clocks may
+start.
+
 Exact-head validation after rebasing onto the current `improvements` base found
 and fixed a fresh-bootstrap regression in the shared PostgreSQL schema. The
 managed-jobs ownership columns are present in current table metadata before
@@ -1192,6 +1244,23 @@ by HA mode.
 - Executor-role tests assert no public listener starts.
 - Controller-role tests assert standby, promotion, lock-session loss, child
   fencing, and re-acquisition.
+- Metrics-role tests assert API, executor, and controller supervisors each
+  start and stop one role-local metrics server, controller metrics start before
+  leadership election, built-in shared-state and plugin custom collectors
+  remain API-only while multiprocess metrics remain role-local, and split roles
+  fail closed without a multiprocess directory, when the configured metrics
+  listener cannot bind, or with a health/metrics port collision. A metrics task
+  that dies after its startup barrier terminates the owning role, while normal
+  role shutdown asks Uvicorn to finish its lifespan, then cancels and joins the
+  remaining metrics loop without that fail-stop. Literal true/false/unset
+  marker tests prevent a present-but-false environment value from opening the
+  endpoint.
+- A production-composition metrics test starts a fresh Python subprocess with
+  a fresh multiprocess directory, increments
+  `sky_serve_system_oom_recovery_events_total` through the real SkyServe
+  observability module, starts a controller-role listener on an ephemeral
+  port, and proves an HTTP `GET /metrics` returns the labeled sample before a
+  clean Uvicorn lifespan shutdown.
 - Managed-job PostgreSQL tests prove a stale outer generation cannot claim a
   waiting job, generation advancement serializes with an in-flight claim, and
   recovery resets stale ownership before a replacement scheduler starts.
@@ -1230,6 +1299,13 @@ by HA mode.
 - Migration tests cover empty bootstrap, additive upgrade, verify-only success,
   verify-only mismatch, and two concurrent migration attempts.
 - Helm tests cover valid HA render and every invalid prerequisite.
+- Helm metrics tests prove executor and controller pods receive the fixed
+  multiprocess environment, expose the configured port, and carry standard or
+  dedicated pod-discovery annotations only when metrics are enabled. They also
+  inject stale counter and histogram files from a pre-deploy hook and prove the
+  directory reset is the final command before the Python supervisor exec.
+  Custom-port rendering proves the API runtime, role pods, API Service, and
+  bundled federation discovery all select the same non-default port.
 - Helm snapshots prove Service selectors and PDB selectors do not overlap
   roles.
 - Termination tests prove readiness fails before shutdown and the pre-stop
@@ -1287,6 +1363,15 @@ No new telemetry pipeline is introduced. Existing Datadog collection receives:
 - Migration duration and result.
 - Shared storage read/write sentinel failures.
 
+Scraping is role- and pod-scoped. API, executor, and both controller targets
+must be present independently; the API Service is not a proxy for metrics
+emitted by controller or executor children. A controller handoff may reset a
+pod-local counter but must not make the standby target unavailable. Rollout
+queries aggregate across pod targets using ordinary Prometheus counter-reset
+semantics and pair every metrics-dependent gate with gap-free target-health
+evidence. A missing target or scrape gap invalidates the sample and resets any
+continuous observation clock.
+
 Kubernetes events, pod logs, PostgreSQL rows, Helm status, and active traffic
 canaries remain separate evidence sources. A green pod rollout alone does not
 prove request continuity.
@@ -1301,6 +1386,9 @@ prove request continuity.
 - Rolling back does not delete request, queue, or controller ownership rows.
 - A failed migration hook blocks the rollout and leaves the previous
   Deployments serving.
+- Disabling `apiService.metrics.enabled` removes all role metrics ports and
+  scrape annotations together; it is an observability rollback and cannot be
+  used to claim a metrics-dependent rollout gate.
 - The isolated test release remains installed and healthy after final
   conformance. Failed revisions, one-shot canaries, stale migration Jobs, and
   abandoned test workloads are removed. Its dedicated PostgreSQL and EFS
@@ -1708,3 +1796,30 @@ Non-durable enqueue therefore retains the historical
 generation and claim-token metadata only when it dequeues a durable row. A
 focused contract test now fails if the compatibility shape changes before the
 M5 plugin and local-queue removal gate.
+
+### Review 12: split-role metrics completeness
+
+The production-readiness review challenged the assumption that the existing
+API metrics endpoint represented controller and executor work after the M2/M3
+role split. It did not. Prometheus multiprocess files are local to a pod, the
+API Service selects only API pods, and the controller did not start its
+background loop while it was a standby. Metrics emitted by controller request
+workers and child controllers therefore could not appear on the API target.
+
+Using shared storage for multiprocess files was rejected because Prometheus'
+client registry is process-host local and stale PID files from different pods
+would collide. Registering shared-state collectors on every role was also
+rejected because it would multiply identical database-derived series. The
+correct boundary is one metrics server and one clean multiprocess directory
+per role pod, with independent pod discovery. Metrics serving starts before
+controller election, while leader-only maintenance retains its existing
+post-fence lifecycle. Built-in shared-state collectors and plugin custom
+collectors retain API/all ownership; plugin role-local instruments use the
+multiprocess registry. The chart creates the directory early for hooks, then
+clears and recreates it after every arbitrary hook/setup command immediately
+before `exec`, because dead counter and histogram files are not reaped. The
+runtime fails closed when a split role lacks its multiprocess directory or the
+metrics listener cannot bind, and a post-start listener failure terminates the
+role; both runtime and Helm validation reject a role-health and metrics port
+collision. Rollout acceptance treats every role target and scrape interval as
+required evidence.

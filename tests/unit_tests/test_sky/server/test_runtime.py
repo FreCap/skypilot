@@ -1,6 +1,11 @@
 """Role-isolation tests for the API server process supervisors."""
 
 import http.client
+import os
+import pathlib
+import socket
+import subprocess
+import sys
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -12,6 +17,13 @@ from sky.jobs.server import server as jobs_server
 from sky.serve import constants as serve_constants
 from sky.server import runtime
 from sky.server.requests import registry as request_registry
+
+_SYSTEM_OOM_METRIC_CHILD_SCRIPT = """
+from sky.serve import system_oom_recovery_observability as observability
+
+observability.record(
+    'recovery_started', provider='aws', market='on_demand')
+"""
 
 
 class _BackgroundLoop:
@@ -716,6 +728,267 @@ async def test_api_role_routes_jobs_wait_to_durable_executor(monkeypatch):
     execute.assert_not_called()
 
 
+@pytest.mark.parametrize(('role', 'register_shared_collector'),
+                         [('all', True), ('api', True), ('executor', False),
+                          ('controller', False)])
+def test_every_api_server_role_exposes_local_multiprocess_metrics(
+        monkeypatch, role, register_shared_collector):
+    background = mock.Mock()
+    metrics_server = mock.Mock()
+    serve = mock.sentinel.serve
+    reaper = mock.sentinel.reaper
+    metrics_server.started = True
+    serve_task = mock.Mock()
+    background.create_task.side_effect = [serve_task, mock.sentinel.reaper_task]
+    register = mock.Mock()
+    build = mock.Mock(return_value=metrics_server)
+    build_serve = mock.Mock(return_value=serve)
+    build_reaper = mock.Mock(return_value=reaper)
+    monkeypatch.setenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED, 'true')
+    monkeypatch.setenv('PROMETHEUS_MULTIPROC_DIR', '/tmp/metrics')
+    monkeypatch.setattr(runtime, '_BackgroundLoop', lambda: background)
+    monkeypatch.setattr(runtime.metrics,
+                        'maybe_register_managed_jobs_collector', register)
+    monkeypatch.setattr(runtime.metrics, 'build_metrics_server', build)
+    monkeypatch.setattr(runtime, '_serve_metrics_server', build_serve)
+    monkeypatch.setattr(runtime.metrics, 'multiproc_reaper_daemon',
+                        build_reaper)
+
+    result = runtime._start_metrics_background_loop(  # pylint: disable=protected-access
+        role, '127.0.0.1', 9090)
+
+    assert result is background
+    if register_shared_collector:
+        register.assert_called_once_with()
+    else:
+        register.assert_not_called()
+    build.assert_called_once_with('127.0.0.1', 9090)
+    build_serve.assert_called_once_with(metrics_server)
+    assert background.create_task.call_args_list == [
+        mock.call(serve), mock.call(reaper)
+    ]
+    background.add_graceful_shutdown_hook.assert_called_once_with(mock.ANY)
+    serve_task.add_done_callback.assert_called_once_with(mock.ANY)
+    background.start.assert_called_once_with()
+
+
+@pytest.mark.parametrize(('value', 'expected'),
+                         [('true', True), ('false', False), (None, False)])
+def test_metrics_enabled_requires_literal_true(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED,
+                           raising=False)
+    else:
+        monkeypatch.setenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED,
+                           value)
+
+    assert runtime._metrics_enabled() is expected  # pylint: disable=protected-access
+
+
+def test_controller_role_metrics_expose_child_system_oom_counter(
+        monkeypatch, tmp_path):
+    """Exercise child emission through the real role-local HTTP endpoint."""
+    repository_root = pathlib.Path(runtime.__file__).resolve().parents[2]
+    child_env = os.environ.copy()
+    child_env['PROMETHEUS_MULTIPROC_DIR'] = str(tmp_path)
+    child_env[runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED] = 'true'
+    child_env['SKYPILOT_API_SERVER_ROLE'] = 'controller'
+    existing_pythonpath = child_env.get('PYTHONPATH')
+    child_env['PYTHONPATH'] = (
+        str(repository_root) if not existing_pythonpath else
+        f'{repository_root}{os.pathsep}{existing_pythonpath}')
+    subprocess.run([sys.executable, '-c', _SYSTEM_OOM_METRIC_CHILD_SCRIPT],
+                   cwd=repository_root,
+                   env=child_env,
+                   capture_output=True,
+                   text=True,
+                   check=True,
+                   timeout=60)
+
+    monkeypatch.setenv('PROMETHEUS_MULTIPROC_DIR', str(tmp_path))
+    monkeypatch.setenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED, 'true')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'controller')
+    built_servers = []
+    build_server = runtime.metrics.build_metrics_server
+
+    def capture_server(host, port):
+        server = build_server(host, port)
+        built_servers.append(server)
+        return server
+
+    monkeypatch.setattr(runtime.metrics, 'build_metrics_server', capture_server)
+    background = runtime._start_metrics_background_loop(  # pylint: disable=protected-access
+        'controller', '127.0.0.1', 0)
+    assert background is not None
+    try:
+        assert len(built_servers) == 1
+        sockets = built_servers[0].servers[0].sockets
+        assert sockets is not None
+        metrics_port = sockets[0].getsockname()[1]
+        connection = http.client.HTTPConnection('127.0.0.1', metrics_port, 10)
+        try:
+            connection.request('GET', '/metrics')
+            response = connection.getresponse()
+            payload = response.read().decode('utf-8')
+        finally:
+            connection.close()
+        assert response.status == 200
+        samples = [
+            line for line in payload.splitlines()
+            if line.startswith('sky_serve_system_oom_recovery_events_total{')
+        ]
+        assert len(samples) == 1, payload
+        assert 'event="recovery_started"' in samples[0]
+        assert 'provider="aws"' in samples[0]
+        assert 'market="on_demand"' in samples[0]
+        assert samples[0].endswith(' 1.0')
+    finally:
+        background.stop()
+    assert background.is_stopping
+    assert not background._thread.is_alive()  # pylint: disable=protected-access
+
+
+def test_metrics_server_death_after_start_terminates_role(monkeypatch):
+    background = mock.Mock()
+    background.is_stopping = False
+    metrics_server = mock.Mock(started=True)
+    serve_task = mock.Mock()
+    background.create_task.side_effect = [serve_task, mock.Mock()]
+    terminate = mock.Mock()
+    pid = runtime.os.getpid()
+    monkeypatch.setenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED, 'true')
+    monkeypatch.setenv('PROMETHEUS_MULTIPROC_DIR', '/tmp/metrics')
+    monkeypatch.setattr(runtime, '_BackgroundLoop', lambda: background)
+    monkeypatch.setattr(runtime.metrics, 'build_metrics_server',
+                        lambda *args: metrics_server)
+    monkeypatch.setattr(runtime, '_serve_metrics_server',
+                        lambda *args: mock.sentinel.serve)
+    monkeypatch.setattr(runtime.metrics, 'multiproc_reaper_daemon',
+                        lambda: mock.sentinel.reaper)
+    monkeypatch.setattr(runtime.os, 'kill', terminate)
+
+    runtime._start_metrics_background_loop(  # pylint: disable=protected-access
+        'executor', '127.0.0.1', 9090)
+    done_callback = serve_task.add_done_callback.call_args.args[0]
+    failed_task = mock.Mock()
+    failed_task.cancelled.return_value = False
+    failed_task.exception.return_value = RuntimeError('listener failed')
+    done_callback(failed_task)
+
+    terminate.assert_called_once_with(pid, runtime.signal.SIGTERM)
+    background.is_stopping = True
+    done_callback(failed_task)
+    terminate.assert_called_once_with(pid, runtime.signal.SIGTERM)
+
+
+def test_cancelled_metrics_server_task_is_an_unexpected_failure():
+    cancelled_task = mock.Mock()
+    cancelled_task.cancelled.return_value = True
+
+    failure = runtime._metrics_task_failure(  # pylint: disable=protected-access
+        cancelled_task)
+
+    assert isinstance(failure, RuntimeError)
+    assert str(failure) == 'The metrics server task was cancelled unexpectedly.'
+    cancelled_task.exception.assert_not_called()
+
+
+def test_metrics_startup_fails_closed_when_port_is_occupied(
+        monkeypatch, tmp_path):
+    loops = []
+    loop_type = runtime._BackgroundLoop  # pylint: disable=protected-access
+
+    def build_loop():
+        loop = loop_type()
+        loops.append(loop)
+        return loop
+
+    monkeypatch.setenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED, 'true')
+    monkeypatch.setenv('PROMETHEUS_MULTIPROC_DIR', str(tmp_path))
+    monkeypatch.setattr(runtime, '_BackgroundLoop', build_loop)
+    with socket.socket() as occupied:
+        occupied.bind(('127.0.0.1', 0))
+        occupied.listen()
+        port = occupied.getsockname()[1]
+
+        with pytest.raises(RuntimeError, match='failed to become available'):
+            runtime._start_metrics_background_loop(  # pylint: disable=protected-access
+                'executor', '127.0.0.1', port)
+
+    assert len(loops) == 1
+    assert loops[0].is_stopping
+    assert not loops[0]._thread.is_alive()  # pylint: disable=protected-access
+
+
+def test_metrics_background_is_disabled_without_deployment_marker(monkeypatch):
+    start = mock.Mock(side_effect=AssertionError('metrics loop started'))
+    monkeypatch.delenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED,
+                       raising=False)
+    monkeypatch.setattr(runtime, '_BackgroundLoop', start)
+
+    result = runtime._start_metrics_background_loop(  # pylint: disable=protected-access
+        'controller', '127.0.0.1', 9090)
+
+    assert result is None
+    start.assert_not_called()
+
+
+@pytest.mark.parametrize('role', ['executor', 'controller'])
+def test_split_role_metrics_require_multiprocess_directory(monkeypatch, role):
+    monkeypatch.setenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED, 'true')
+    monkeypatch.delenv('PROMETHEUS_MULTIPROC_DIR', raising=False)
+
+    with pytest.raises(RuntimeError, match='requires PROMETHEUS_MULTIPROC_DIR'):
+        runtime._start_metrics_background_loop(  # pylint: disable=protected-access
+            role, '127.0.0.1', 9090)
+
+
+def test_controller_metrics_start_before_leadership_and_stop_after_role(
+        monkeypatch):
+    events = []
+    metrics_background = mock.Mock()
+    metrics_background.stop.side_effect = lambda: events.append('metrics-stop')
+    plugin = mock.Mock()
+    plugin.shutdown.side_effect = lambda: events.append('plugin-stop')
+    state = runtime.RuntimeState('controller', mock.Mock(), mock.Mock(), False)
+    monkeypatch.setattr(
+        runtime, '_start_metrics_background_loop', lambda *args:
+        (events.append('metrics-start') or metrics_background))
+    monkeypatch.setattr(runtime, '_run_controller_role',
+                        lambda *args: events.append('controller-role'))
+    monkeypatch.setattr(runtime.plugins, 'get_plugins', lambda: [plugin])
+
+    runtime.run_role(state, _args())
+
+    assert events == [
+        'metrics-start', 'controller-role', 'metrics-stop', 'plugin-stop'
+    ]
+
+
+@pytest.mark.parametrize('role', ['executor', 'controller'])
+def test_role_health_and_metrics_ports_must_differ(monkeypatch, role):
+    args = SimpleNamespace(host='127.0.0.1',
+                           port=46580,
+                           deploy=True,
+                           metrics_port=9090,
+                           role=role,
+                           role_health_port=9090,
+                           authority_preflight_port=46583)
+    parser = mock.Mock()
+    parser.parse_args.return_value = args
+    monkeypatch.setenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED, 'true')
+    # main() intentionally publishes the selected role process-wide. Register
+    # the variables with monkeypatch first so this validation-only invocation
+    # cannot leak a split role into later tests on the same xdist worker.
+    monkeypatch.setenv(runtime.request_postgres.SERVER_ROLE_ENV_VAR, 'all')
+    monkeypatch.setenv(runtime.constants.ENV_VAR_IS_SKYPILOT_SERVER, 'true')
+    monkeypatch.setattr(runtime, '_build_parser', lambda: parser)
+
+    with pytest.raises(ValueError,
+                       match='role-health-port and metrics-port cannot be'):
+        runtime.main()
+
+
 def test_api_background_uses_release_scoped_retirement_singleton(monkeypatch):
     background = mock.Mock()
     singleton_coroutine = mock.sentinel.singleton_coroutine
@@ -736,7 +1009,7 @@ def test_api_background_uses_release_scoped_retirement_singleton(monkeypatch):
                         run_singleton)
 
     result = runtime._start_background_loop(  # pylint: disable=protected-access
-        'api', '127.0.0.1', 9090)
+        'api')
 
     assert result is background
     from_environment.assert_called_once_with()
@@ -771,7 +1044,7 @@ def test_api_background_ignores_legacy_authority_envs_while_disabled(
         'from_environment', from_environment)
 
     result = runtime._start_background_loop(  # pylint: disable=protected-access
-        'api', '127.0.0.1', 9090)
+        'api')
 
     assert result is background
     from_environment.assert_not_called()
@@ -795,6 +1068,6 @@ def test_api_background_enabled_authority_requires_complete_scope(monkeypatch):
 
     with pytest.raises(ValueError, match='environment is incomplete'):
         runtime._start_background_loop(  # pylint: disable=protected-access
-            'api', '127.0.0.1', 9090)
+            'api')
 
     background.start.assert_not_called()

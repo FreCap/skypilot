@@ -93,6 +93,79 @@ tests:
             name: state-volume
             mountPath: /root/.sky
             subPath: .sky
+      - notExists:
+          path: spec.template.metadata.annotations["skypilot.co/scrape"]
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKY_API_SERVER_METRICS_ENABLED
+      - notContains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9090
+
+  - it: should expose controller multiprocess metrics from leaders and standbys
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      apiService.metrics.enabled: true
+      prometheus.useDedicatedScrapeConfig: true
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["skypilot.co/scrape"]
+          value: "true"
+      - equal:
+          path: spec.template.metadata.annotations["skypilot.co/path"]
+          value: /metrics
+      - equal:
+          path: spec.template.metadata.annotations["skypilot.co/port"]
+          value: "9090"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKY_API_SERVER_METRICS_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PROMETHEUS_MULTIPROC_DIR
+            value: /tmp/metrics
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9090
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "export PROMETHEUS_MULTIPROC_DIR=/tmp/metrics\\s+rm -rf /tmp/metrics\\s+mkdir -p /tmp/metrics\\s+exec python[\\s\\S]+--metrics-port 9090"
+
+  - it: should discard stale controller metric files after hooks before exec
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.metrics.enabled: true
+      apiService.preDeployHook: |
+        touch /tmp/metrics/counter_123.db
+        touch /tmp/metrics/histogram_123.db
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "mkdir -p /tmp/metrics[\\s\\S]+touch /tmp/metrics/counter_123.db[\\s\\S]+touch /tmp/metrics/histogram_123.db[\\s\\S]+export PROMETHEUS_MULTIPROC_DIR=/tmp/metrics\\s+rm -rf /tmp/metrics\\s+mkdir -p /tmp/metrics\\s+exec python"
+
+  - it: should reject a controller health and metrics port collision
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9090
+      controllerService.healthPort: 9090
+    asserts:
+      - failedTemplate:
+          errorMessage: controllerService.healthPort must differ from apiService.metrics.port when metrics are enabled
 
   - it: should allow an explicit controller topology-spread opt-out
     set:
