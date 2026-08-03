@@ -78,8 +78,9 @@ migration. No milestone changes a public API or requires an API version bump.
 The initial scheduler-index implementation was based on commit
 `34ac0be6c3d7ca1bdaaf7ec8459a590a07a4df7f`, tagged `v1.1.1043`. The
 connection-attribution milestone is based on commit
-`fbf0c1bef3a3a11e20c54d3074e954b3b7bd8c9f`, after the scheduler index shipped
-in `v1.1.1047`, on `origin/improvements`.
+`3e06b0e88587479dfc58496f2cf9e71d4a8e73b2`, after the scheduler index shipped
+in `v1.1.1047` and the retired physical-capacity evidence scan was removed, on
+`origin/improvements`.
 
 The relevant behavior was compared directly with `v1.1.1015`:
 
@@ -250,9 +251,9 @@ collapsed into `executor`. An unexpected role maps to `unknown` instead of
 becoming a label.
 
 Engine namespaces are normalized to `shared`, `api-requests-control`,
-`advisory-lock`, `physical-capacity-evidence`, or `other`. Sync and async are
-the only mode values. The complete Cartesian bound is therefore 8 process
-roles times 5 namespaces times 2 modes, or at most 80 labeled combinations.
+`advisory-lock`, or `other`. Sync and async are the only mode values. The
+complete Cartesian bound is therefore 8 process roles times 4 namespaces times
+2 modes, or at most 64 labeled combinations.
 The production multiprocess collector exports one `_total` series for each
 combination. A non-multiprocess local registry may also expose Prometheus
 client's `_created` companion series. Database URLs, users, process IDs, job
@@ -350,17 +351,16 @@ code-only rollout behaviorally inert and avoids adding Prometheus allocation
 work to controller processes that do not publish metrics.
 
 Attach exactly one listener immediately after each new PostgreSQL engine is
-created in these cache-miss branches:
+created in both cache-miss branches:
 
 - the default sync or async engine in `get_engine()`;
-- the dedicated advisory-lock engine in `get_postgres_lock_engine()`; and
-- the isolated physical-capacity engine in `get_isolated_postgres_engine()`.
+- the dedicated advisory-lock engine in `get_postgres_lock_engine()`.
 
 Do not attach on cache hits or SQLite engines. Normalize a missing default
 namespace to `shared`, preserve `api-requests-control`, assign
-`advisory-lock` to the lock engine, preserve `physical-capacity-evidence`, and
-map every other namespace to `other`. Attach async events to
-`AsyncEngine.sync_engine` and label them `async`; all other paths are `sync`.
+`advisory-lock` to the lock engine, and map every other namespace to `other`.
+Attach async events to `AsyncEngine.sync_engine` and label them `async`; all
+other paths are `sync`.
 
 Resolve the process role inside the event callback. Add a validated
 process-local setter in `db_utils` and call it before plugin or database

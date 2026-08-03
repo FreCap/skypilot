@@ -120,7 +120,6 @@ class TestGetEngine:
         # Clear the module-level caches
         db_utils._postgres_engine_cache.clear()
         db_utils._postgres_lock_engine_cache.clear()
-        db_utils._postgres_isolated_engine_cache.clear()
         db_utils._sqlite_engine_cache.clear()
         monkeypatch.setattr(
             db_utils, '_postgres_connection_metrics_process_role_override',
@@ -517,13 +516,12 @@ class TestGetEngine:
             expected_dir = runtime_dir / '.sky'
             assert expected_dir.exists()
 
-    @pytest.mark.parametrize(
-        ('namespace', 'expected'),
-        [(None, 'shared'), ('', 'shared'),
-         ('api-requests-control', 'api-requests-control'),
-         ('advisory-lock', 'advisory-lock'),
-         ('physical-capacity-evidence', 'physical-capacity-evidence'),
-         ('caller-controlled-value', 'other')])
+    @pytest.mark.parametrize(('namespace', 'expected'),
+                             [(None, 'shared'), ('', 'shared'),
+                              ('api-requests-control', 'api-requests-control'),
+                              ('advisory-lock', 'advisory-lock'),
+                              ('physical-capacity-evidence', 'other'),
+                              ('caller-controlled-value', 'other')])
     def test_postgres_connection_metric_namespace_is_bounded(
             self, namespace, expected):
         assert (db_utils._postgres_connection_metrics_engine_namespace(
@@ -553,14 +551,13 @@ class TestGetEngine:
                 'shared',
                 'api-requests-control',
                 'advisory-lock',
-                'physical-capacity-evidence',
                 'other',
             }))
         assert db_utils._POSTGRES_CONNECTION_METRIC_MODES == frozenset(
             {'sync', 'async'})
         assert (len(db_utils._POSTGRES_CONNECTION_METRIC_PROCESS_ROLES) *
                 len(db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES) *
-                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 80)
+                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 64)
 
     def test_postgres_connection_metric_process_role_is_write_once(
             self, monkeypatch):
@@ -698,7 +695,7 @@ metrics_utils.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL.labels(
             'mode': 'async',
         }
 
-    def test_special_postgres_engines_attach_once_with_bounded_namespaces(
+    def test_postgres_lock_engine_attaches_once_with_bounded_namespace(
             self, monkeypatch):
         monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
         base_engine = mock.MagicMock()
@@ -706,35 +703,17 @@ metrics_utils.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL.labels(
         base_engine.url = sqlalchemy.engine.make_url(
             'postgresql://user:pass@localhost/db')
         lock_engine = mock.MagicMock()
-        isolated_engine = mock.MagicMock()
 
-        with mock.patch('sqlalchemy.create_engine',
-                        side_effect=[lock_engine, isolated_engine]), \
+        with mock.patch('sqlalchemy.create_engine', return_value=lock_engine), \
              mock.patch('sqlalchemy.event.listen') as listen:
             first_lock = db_utils.get_postgres_lock_engine(base_engine)
             second_lock = db_utils.get_postgres_lock_engine(base_engine)
-            first_isolated = db_utils.get_isolated_postgres_engine(
-                base_engine,
-                namespace='physical-capacity-evidence',
-                pool_size=1,
-                application_name='skypilot-physical-capacity-evidence')
-            second_isolated = db_utils.get_isolated_postgres_engine(
-                base_engine,
-                namespace='physical-capacity-evidence',
-                pool_size=1,
-                application_name='skypilot-physical-capacity-evidence')
 
         assert first_lock is second_lock is lock_engine
-        assert first_isolated is second_isolated is isolated_engine
-        assert listen.call_count == 2
-        assert listen.call_args_list[0].args[:2] == (lock_engine, 'connect')
-        assert listen.call_args_list[0].args[2].keywords == {
+        listen.assert_called_once()
+        assert listen.call_args.args[:2] == (lock_engine, 'connect')
+        assert listen.call_args.args[2].keywords == {
             'engine_namespace': 'advisory-lock',
-            'mode': 'sync',
-        }
-        assert listen.call_args_list[1].args[:2] == (isolated_engine, 'connect')
-        assert listen.call_args_list[1].args[2].keywords == {
-            'engine_namespace': 'physical-capacity-evidence',
             'mode': 'sync',
         }
 

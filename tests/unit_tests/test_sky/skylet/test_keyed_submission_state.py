@@ -139,7 +139,7 @@ def _initialize(db_path) -> sqlite3.Connection:
 def test_fresh_database_has_exact_passive_schema(tmp_path):
     conn = _initialize(tmp_path / 'jobs.db')
     try:
-        assert constants.SKYLET_VERSION == '42'
+        assert constants.SKYLET_VERSION == '43'
         assert keyed_submission_state.KEYED_SUBMISSION_SCHEMA_VERSION == 1
         assert keyed_submission_state.schema_is_available(conn.cursor())
         assert tuple(row[1] for row in _legacy_shape(conn, 'jobs')) == (

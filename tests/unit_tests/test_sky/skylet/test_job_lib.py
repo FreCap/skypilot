@@ -57,7 +57,7 @@ def _waiting_cleanup_info() -> job_lib.JobSystemRecoveryInfo:
 
 
 def test_skylet_lib_version_includes_system_recovery_api():
-    assert job_lib.constants.SKYLET_VERSION == '42'
+    assert job_lib.constants.SKYLET_VERSION == '43'
     assert job_lib.constants.SKYLET_LIB_VERSION == 9
     assert job_lib.JOB_SYSTEM_RECOVERY_API_VERSION == 1
 

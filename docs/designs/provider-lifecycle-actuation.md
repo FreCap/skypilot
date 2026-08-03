@@ -21,10 +21,15 @@ trigger, then terminated cleanly. That is historical v40 qualification for the
 already deployed M5-S0a slice. PR 1181 subsequently advanced the inherited
 ordinary-worker baseline on this integration branch to `SKYLET_VERSION = 42`
 and `SKYLET_LIB_VERSION = 9`; PR 1194 synchronized the passive-schema invariant
-test with that baseline. M5-S0b1a0 inherits those versions and does not change
-either constant, activate coordinated mode, or restart an ordinary worker. The
-next gate is the reviewed S0b design correction below; no
-coordinated-worker capability or runtime is active.
+test with that baseline. The additive Skylet capability-routing C1 candidate
+advances the current ordinary-worker contract to Skylet v43 while retaining
+library version 9. Its v40 and v42 replacement matrix, running-v42 restart, and
+ordinary v43 behavior must qualify before C1 merges. M5-S0b1a0 itself landed
+against v42/9 and changed neither constant, coordinated mode, nor an ordinary
+worker. Future M5-S0b gates inherit v43/9 after C1. C1 qualification is the
+active ordinary-worker gate. M5-S0b1a1 remains the next M5 gate and is still
+subject to its separate public-package authority; no coordinated-worker
+capability or runtime is active.
 
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
@@ -289,6 +294,47 @@ happen. They enter readback or quarantine according to typed evidence.
 This kernel reuses mechanics without defining a universal resource status enum
 or a universal reducer. Volumes, clusters, Serve, pools, managed jobs, and
 managed images retain their legal domain transitions and generation fences.
+
+### PostgreSQL session advisory-lock lifecycle kernel
+
+The controller currently has two independent owners of PostgreSQL
+session-advisory-lock mechanics. `PostgresLock` owns the synchronous path,
+while `run_distributed_singleton()` independently owns an async connection,
+acquisition transaction, standby retry, liveness transaction, task
+cancellation, unlock, and close. The async implementation omits transaction
+closure and has produced process-lifetime `idle in transaction` snapshots that
+block concurrent migration DDL.
+
+M3-PG0 first fixes the active defect without changing abstraction boundaries:
+it commits immediately after every acquisition probe, health probe, and
+successful unlock, and closes a nonwinning connection before retry sleep. It
+preserves the existing server-side `hashtextextended(name, 0)` key, exact lock
+and retry ordering, and mixed-version behavior.
+
+M3-PG1 then introduces one provider- and domain-neutral PostgreSQL session-lock
+contract. A versioned identity retains the current key strategy rather than
+normalizing it: async controller singleton names remain
+`PG_HASHTEXTEXTENDED_SEED0_V1`, while existing `PostgresLock` callers remain
+`SHA256_POSITIVE_INT63_V1`. The shared owner controls dedicated connection
+acquisition, try-lock and unlock statement plans, transaction closure after
+every statement, close-before-retry, same-session health, loss cleanup, and
+bounded redacted identity. Thin sync and async transports own only their I/O
+syntax. A shared pure lifecycle reducer owns the legal session-state ordering,
+while the sync facade retains blocking and timeout scheduling and the async
+coordinator retains task and timer scheduling. One generated event-trace corpus
+prevents either transport or coordinator from acquiring independent SQL,
+transaction, or session-close policy.
+
+The synchronous `PostgresLock` API remains a compatibility facade, including
+shared mode, blocking and timeout behavior, force-unlock administration, and
+same-session fenced callbacks. The async API retains owned-coroutine
+start/cancel/retry semantics. Neither facade directly owns a raw connection or
+transaction after migration.
+
+This session-lock kernel is not the durable lifecycle action lease. A session
+lock can elect a process singleton, but it cannot prove that a provider effect
+ran once, fence a process after external I/O, or replace an action claim,
+generation, intent, readback, or quarantine record.
 
 ### Provider registration projection, descriptor, and generated conformance
 
@@ -943,10 +989,12 @@ caches a legacy choice. Capability advertisement, not a scattered semantic
 version comparison or a caught transport exception, becomes the positive
 selection signal.
 
-The first slice is read-only: add backward-compatible `GetCapabilities`, then
-route only `GetJobStatus` through the central selector. Old Skylets return
-`UNIMPLEMENTED` and use the existing transport. No launch, cancellation,
-teardown, or job-state behavior changes in that slice.
+The C1 slice is read-only and adds backward-compatible `GetCapabilities`
+without changing any route. C2 adds channel binding and the cache, C3 observes
+shadow decisions without changing the existing transport, and C4 routes only
+`GetJobStatus` through the central selector. Old Skylets return `UNIMPLEMENTED`
+and use the existing transport until the enforced support policy below closes.
+No launch, cancellation, teardown, or job-state behavior changes in C1.
 
 `SkyletCapabilitiesV1` remains scoped to that legacy and read-only compatibility
 router. Coordinated workers expose a distinct
@@ -956,10 +1004,15 @@ SSH, or legacy transport fallback. Neither capability type can be substituted
 for the other.
 
 The removal gate requires single-flight handshakes with the bounded refresh
-contract above, mixed old and new Skylet qualification, zero unexplained
-fallback for one compatibility release, and repository proof that migrated
-methods have no fallback catch or direct SSH transport outside the router.
-Old-node fallback remains until that gate closes.
+contract above, mixed old and new Skylet qualification, and an enforced support
+policy that upgrades every reachable ordinary Skylet to v43 or newer before
+use, or rejects it with an explicit upgrade-required error. Offline and
+long-lived clusters remain reachable until that policy rejects them. Datadog and structured-log proof
+of zero unexplained fallback for the compatibility interval is supporting
+evidence, not the deletion authority. Repository proof must also show that
+migrated methods have no fallback catch or direct SSH transport outside the
+router. Fallback for v40 and v42 workers remains until that enforced policy
+closes.
 
 #### Shared raw-offer normalization, filtering, and explicit cache policy
 
@@ -4523,8 +4576,16 @@ Lease issue, renewal, expiry, and due-time comparisons use a fresh
 transaction-start time, application wall clocks, and a timestamp read before a
 lock wait are forbidden for lease safety.
 
-No database transaction or connection is held across provider or nested API
-I/O. The `IN_FLIGHT` intent transaction commits before bytes may be sent.
+No ordinary pooled database connection and no database transaction is held
+across provider or nested API I/O. The `IN_FLIGHT` intent transaction commits
+before bytes may be sent. A separately budgeted, direct PostgreSQL session may
+span only process-singleton or election ownership through the shared
+session-advisory-lock kernel. That session must be transaction-idle before and
+after owned work, must not come from an action worker's ordinary pool, and is
+not an action lease or provider-effect fence. Existing legacy lifecycle callers
+that hold such a session across provider work remain explicitly legacy until
+their removal rows close; new action-runtime code may not introduce this shape.
+
 Heartbeats and synchronous fences use a reserved connection budget or
 dedicated bounded pool that worker concurrency cannot consume. If that reserve
 cannot obtain a connection before the lease safety margin, the worker stops
@@ -5900,6 +5961,23 @@ rollback, and cleanup on the exact image digest.
 
 ### M3: Durable action runtime and volume pilot
 
+- land M3-PG0 first as an independently deployable async singleton
+  transaction-hygiene hotfix with no schema, key, retry, ownership, or daemon
+  change; prove all eight controller singleton owners are transaction-idle and
+  concurrent-index canary DDL completes without restarting a controller;
+- in M3-PG1 add the inert shared session-lock identity, statement-plan,
+  lifecycle-reducer, sync/async transport contracts, and generated trace
+  conformance with no caller routed to them;
+- in M3-PG2 route the eight async controller singletons through the shared
+  kernel while preserving `PG_HASHTEXTEXTENDED_SEED0_V1`, then remove
+  `run_distributed_singleton()` only after old/new mutual exclusion, standby
+  promotion, cancellation, and rollback-image qualification pass;
+- in M3-PG3 retain the `PostgresLock` public facade but move its direct
+  connection, acquisition, health, unlock, force-unlock, and same-session
+  callback mechanics into the shared kernel under
+  `SHA256_POSITIVE_INT63_V1`; remove its private connection fields and helper
+  bodies only after the complete synchronous corpus and all existing Jobs,
+  Serve, daemon, and controller-leader consumers pass;
 - land M3-S0 first: the domain-local pure volume refresh projection and
   shadow-only wiring, with the current reducer and writer still authoritative;
 - deploy M3-S0 without a schema migration, prove mismatch, projector,
@@ -5936,6 +6014,11 @@ legacy until its separate deprecation gate.
 
 Deployment exercises create, refresh, delete, lost worker, stale lease,
 ambiguous provider response, readback, and cleanup.
+
+M3-PG0 is a prerequisite for later M3 database migrations, but it grants no
+action-writer or provider-effect authority. M3-PG1 through M3-PG3 require a
+dedicated adversarial review of the exact shared interface before
+implementation.
 
 ### M4: Cluster provisioning and teardown
 
@@ -8063,13 +8146,16 @@ not a mode of legacy Skylet. The top-level package
 observational; freeze and removal are signed mutations. Legacy
 `sky.skylet.skylet`, `attempt_skylet.py`, its TCP listener, imported `EVENTS`,
 handlers, watchdog, and PID files remain on the inherited ordinary-worker path.
-The exact baseline for M5-S0b1a0 is `SKYLET_VERSION = 42` and
-`SKYLET_LIB_VERSION = 9`, inherited from PR 1181. The coordinated gates do not
-themselves change those constants. M5-S0b1a0 changes generic package delivery
-but not the ordinary Skylet entrypoint, scheduler, handler, watchdog, or
-lifecycle semantics. Skylet v40 remains the characterized compatibility and
-rollback floor from the deployed M5-S0a slice; this does not assert that v40 and
-v42 are mutually byte-identical. Any
+The exact baseline when M5-S0b1a0 landed was `SKYLET_VERSION = 42` and
+`SKYLET_LIB_VERSION = 9`, inherited from PR 1181. Capability-routing C1
+advances the ordinary contract to Skylet v43, retains library version 9, and
+adds only an observational capability service before any transport route
+changes. The coordinated gates do not themselves change those constants.
+M5-S0b1a0 changed generic package delivery but not the ordinary Skylet
+entrypoint, scheduler, handler, watchdog, or lifecycle semantics. Skylet v40
+remains the characterized compatibility and rollback floor from the deployed
+M5-S0a slice, and v42 is the characterized intermediate upgrade baseline; this
+does not assert that v40, v42, and v43 are mutually byte-identical. Any
 later integration-base Skylet or library version change reopens this contract
 and its v40-through-current qualification before the stack advances. No mixed
 handler registry or legacy-worker restart is part of coordinated activation.
@@ -8158,10 +8244,10 @@ extras, so it performs no index lookup for the standalone distribution. It
 repeats the exact installed-file and import-root probe and writes
 `current_sky_wheel_hash` only after it passes; mismatch leaves the prior marker
 unchanged and fails the install. The
-ordinary target therefore receives the current v42 main distribution and the
+ordinary target therefore receives the current v43 main distribution and the
 standalone distribution without enabling coordinated mode. A pre-existing v40
-worker follows the characterized ordinary updater and becomes v42; it does not
-remain a v40 process after installing the current bundle. The dedicated
+or v42 worker follows the characterized ordinary updater and becomes v43; it
+does not remain an older process after installing the current bundle. The dedicated
 coordinated venv installs only the same verified standalone wheel and its hash-
 locked dependencies, never the main wheel. Thus no environment has two
 distributions claiming the same import path.
@@ -8317,10 +8403,10 @@ refreshes status must use the reducer or reject the coordinated row.
 
 ###### Immutable coordinated activation and central-only lifecycle ownership
 
-Ordinary workers continue to run the inherited Skylet v42 path; deployed or
-rolled-back v40 workers remain supported by the explicit compatibility floor.
-Neither version inserts a row into either S0b singleton, and the coordinated
-gates preserve each version's existing `StopEvent`, `SetAutostop`, hook,
+Ordinary workers continue to run the inherited Skylet v43 path; deployed or
+rolled-back v40 and v42 workers remain supported by the explicit compatibility
+matrix. None of those versions inserts a row into either S0b singleton, and the
+coordinated gates preserve each version's existing `StopEvent`, `SetAutostop`, hook,
 indicator, exception, listener, and provider-retry behavior. M5-S0a shipped
 only the three keyed side tables and five indexes. Neither S0b singleton exists
 before S0b1c, and neither new singleton schema has a legacy token or nullable
@@ -8381,7 +8467,7 @@ through the peer-authenticated manager socket; it does not follow the marker
 path itself. Missing, late, replaced, or changed identity is a permanent
 activation failure for that physical worker.
 
-Ordinary Skylet v40 through v42 never reads or writes these coordinated
+Ordinary Skylet v40, v42, and v43 never reads or writes these coordinated
 singletons. A later marker cannot promote a worker on which the private birth
 transaction allowed an ordinary Skylet to start. For a fresh coordinated
 marker, startup first installs and validates the `jobs.db` mode guard and
@@ -8414,8 +8500,8 @@ fenced worker is destroyed rather than downgraded.
 
 ###### Coordinated startup barrier and exactly-one control listener
 
-Ordinary Skylet v42, and the v40 compatibility floor, follow their respective
-existing startup paths and do not execute this barrier. The fresh private birth
+Ordinary Skylet v43, and the v40 and v42 compatibility baselines, follow their
+respective existing startup paths and do not execute this barrier. The fresh private birth
 path proves before boot that no legacy Skylet unit, watchdog, cron entry, reboot
 rearm, or ordinary-user SSH
 authorization is enabled for the image. The long-lived root manager is the activation owner. It acquires
@@ -8456,7 +8542,7 @@ READY the server accepts only the standard health method and returns
 from the coordinated systemd service plus the manager's lifetime lock, not the
 historical PID file, TCP port, or opportunistic dynamic port. The legacy
 `attempt_skylet.py` path is never installed or invoked on a coordinated worker.
-A copied ordinary v40 or v42 executable cannot acquire the control identity,
+A copied ordinary v40, v42, or v43 executable cannot acquire the control identity,
 open either database or protected socket, receive authoritative traffic, use a
 live provisioning session, elevate privileges, or obtain provider lifecycle
 credentials.
@@ -8552,8 +8638,9 @@ v40-compatible persistence pre-slice before any coordinated process was
 advertised. M5-S0a created no keyed row, registered no RPC, changed no
 scheduler or status path, and kept the then-current `SKYLET_VERSION = 40`.
 PR 1181 later advanced the inherited ordinary baseline to v42 for an unrelated
-typed system-OOM runtime; that parent change is not part of M5-S0a or
-coordinated activation. This distinction is required because a Skylet version
+typed system-OOM runtime. Capability-routing C1 later advances the ordinary
+baseline to v43 for an additive observational RPC. Neither version change is
+part of M5-S0a or coordinated activation. This distinction is required because a Skylet version
 bump force-kills and restarts the existing daemon: allocating a new legacy
 Skylet version for schema-only code would cause an unnecessary restart and
 couple unrelated legacy and coordinated protocols. The complete coordinated implementation must
@@ -8736,7 +8823,8 @@ CREATE TABLE keyed_submission_seals (
 
 S0b adds the following dormant `jobs.db` singleton. Its installer creates the
 table and triggers but no row while the running process remains on the ordinary
-path, currently v42 and compatible back through v40. The first coordinated
+path, currently v43 and compatible through the v42 intermediate baseline back
+to v40. The first coordinated
 process may insert exactly one all-non-null `COORDINATED_V1` row;
 no M5 code updates or deletes it. S0a did not ship this table, so there is no
 compatibility reason to encode a `LEGACY` row. The coordinated row is committed
@@ -9162,8 +9250,9 @@ END;
 
 The reducer separately enforces the exact closed state-transition graph and
 the correspondence between each transient state and the one legacy mutation
-it admits. The SQL above is persistent negative authority against stale v40 or
-v42 ordinary writers, generic writers, direct code-generation, and partially
+it admits. The SQL above is persistent negative authority against stale v40,
+v42, and v43 ordinary writers, generic writers, direct code-generation, and
+partially
 upgraded writers. It is not a second scheduler.
 
 Three code-owned catalog manifests use the same byte framing, with objects
@@ -9256,7 +9345,7 @@ All identifier, digest, token, and canonical-byte fields are additionally
 validated by the coordinated reducer before insertion. SQLite owns only the closed
 state, nullability, numeric, primary-key, and uniqueness invariants above; it
 does not guess future digest or UUID versions. Foreign keys are deliberately
-absent because qualified ordinary v40 and v42 connections do not enable SQLite
+absent because qualified ordinary v40, v42, and v43 connections do not enable SQLite
 foreign-key enforcement. The reducer must validate the parent submission in its same
 `BEGIN IMMEDIATE` transaction. The partial unique local-owner index enforces at
 most one `LOCAL_CGROUP_V2_DIRECT_V1` row per submission; the coordinated reducer and
@@ -9270,15 +9359,15 @@ SQLite omits from `sqlite_master.sql` and then applies exactly
 `SQLITE_MASTER_SQL_V1` above. Repeated and concurrent installation is
 create-or-validate.
 A reserved-name or owned-object shape mismatch rolls back every object created
-by that attempt, reports keyed schema unavailable, and leaves ordinary v40 and
-v42 job initialization available; an I/O error, corrupt database, or failure
+by that attempt, reports keyed schema unavailable, and leaves ordinary v40,
+v42, and v43 job initialization available; an I/O error, corrupt database, or failure
 involving either legacy table still propagates. The later coordinated capability revalidates this
 exact object set and advertises no keyed profile when it is unavailable.
 
 M5-S0a deliberately installs no trigger and no mapped-row producer. The exact
 persistent negative-authority catalog above lands dormant in an S0b ordinary-
-worker slice, qualified against the current v42 baseline and the v40
-compatibility floor, together with no mode row and no producer. It becomes active only when the
+worker slice, qualified against the current v43 baseline plus the v40 and v42
+compatibility baselines, together with no mode row and no producer. It becomes active only when the
 complete coordinated startup barrier commits `COORDINATED_V1`. Its `RAISE(ROLLBACK,
 ...)` guards reject unkeyed legacy inserts and every unauthorized update or
 delete, reject pending inserts after either applicable seal, preserve immutable
@@ -9287,11 +9376,11 @@ to the exact stored provisional process, reject replace or rekey, and prevent
 rewriting of side-table identities and stored receipts. The reducer owns the
 closed state graph; the triggers are durable negative authority.
 
-A v40 or v42 binary can still add and queue ordinary jobs after the dormant
+A v40, v42, or v43 binary can still add and queue ordinary jobs after the dormant
 schema and triggers appear while the coordinated row is absent. Once the
 coordinated guard commits, no ordinary job or pending-row write remains legal,
 whether or not a keyed mapping already exists. A stale ordinary scheduler from
-either qualified version fails before its first database mutation; process
+any qualified version fails before its first database mutation; process
 spawn is independently blocked because the
 control UID has no legacy command path and the payload UID cannot open the
 database. A stale `CancelJobs` request cannot reach an authoritative mutation
@@ -10370,7 +10459,7 @@ birth. There is no in-place executable swap and no ledger-schema downgrade.
 
 Rollback is therefore explicit:
 
-- dormant artifacts and empty additive tables on an ordinary v40 or v42 worker
+- dormant artifacts and empty additive tables on an ordinary v40, v42, or v43 worker
   can be removed or ignored without restarting or changing ordinary Skylet; and
 - any coordinated marker, `COORDINATED_V1` row, fence, manager ledger entry,
   cgroup owner, receipt, or tombstone makes in-place downgrade illegal. A
@@ -11102,8 +11191,9 @@ or external effect until the provider-actuation dependency below is qualified.
 Each group is itself split into the bounded merge, deploy, and monitoring gates
 listed below. Together they apply coordinated-worker protocol `1`, API-requests
 `005`, API version `69`, Serve `033`, and spot-jobs `027`; the coordinated work
-does not bump the inherited ordinary Skylet v42 or library version 9, and v40
-remains the compatibility floor. PostgreSQL version-0 paths preserve their
+does not bump the inherited ordinary Skylet v43 or library version 9, and v40
+remains the compatibility floor with v42 retained as an intermediate baseline.
+PostgreSQL version-0 paths preserve their
 existing decisions, writes, and locking exactly, and SQLite retains its
 existing filesystem-lock path. M5 does not attempt an in-place cutover of
 either topology.
@@ -11672,15 +11762,25 @@ legacy behavior; it did not force-restart the existing worker fleet and cannot
 count as coordinated-runtime qualification.
 
 PR 1181 subsequently advanced the integration baseline to ordinary Skylet v42
-and library version 9. M5-S0b is split into eleven additional ordered gates.
-None independently consumes a new ordinary Skylet or library version: each
-gate inherits v42/9, and any later base-version movement requires this design
-and the compatibility matrices to be requalified before merge. Ordinary v42
-workers remain on their existing path, v40 remains the tested upgrade and
-rollback floor, and fresh coordinated workers use the independently versioned
-runtime protocol. In the gates below, "does not bump" means the gate changes
-neither ordinary Skylet version constant nor ordinary Skylet executable; it
-does not claim that v40 and v42 have identical bytes.
+and library version 9, and M5-S0b1a0 landed against that exact baseline.
+Capability-routing C1 advances the current ordinary baseline to Skylet v43,
+retains library version 9, and adds one observational method-advertisement RPC
+without activating coordinated mode or changing lifecycle authority. Before
+C1 merges, the offline same-version wheel matrix must replace both v40 and v42
+with v43, a running v42 daemon must restart as v43, the ordinary v43 Skylet
+corpus must preserve its inherited autostop, hook, indicator, exception,
+listener, scheduler, status, and provider-retry behavior, and a disposable live
+v42 worker must upgrade through an ordinary control-plane operation and then
+serve the exact additive capability contract. M5-S0b is split into eleven
+additional ordered gates. Gates after C1 inherit v43/9, and any later
+base-version movement requires this design and the v40-through-current
+compatibility matrices to be requalified before merge. Ordinary v43 workers
+remain on their existing path, v40 remains the tested upgrade and rollback
+floor, v42 remains an explicit intermediate upgrade baseline, and fresh
+coordinated workers use the independently versioned runtime protocol. In the
+gates below, "does not bump" means the gate changes neither ordinary Skylet
+version constant nor ordinary Skylet executable; it does not claim that v40,
+v42, and v43 have identical bytes.
 
 M5-S0b0 is this design-only correction. It commits the exact responsibility,
 authorization, global guard, startup, lifecycle-quiescence, packaging, DDL,
@@ -11688,8 +11788,8 @@ trigger, rollback, and subgate contracts. It changes no runtime and requires no
 deployment. An adversarial review of this exact committed design must return
 `PURSUE` before implementation.
 
-M5-S0b1a0 does not bump the inherited ordinary Skylet v42 or library version 9
-and lands only the index-independent packaging foundation. It creates the separate
+M5-S0b1a0 did not bump its then-inherited ordinary Skylet v42 or library version 9
+and landed only the index-independent packaging foundation. It created the separate
 `addons/submission-containment/python-runtime/` build root and standalone
 distribution, restricts main-wheel package discovery, embeds and verifies the
 opaque standalone wheel in release artifacts, and makes the internal worker
@@ -11722,7 +11822,7 @@ later touches a v40 worker, the inherited PR 1181 version change performs its
 ordinary v40-to-v42 restart; that parent behavior is qualified separately and
 is not coordinated activation.
 
-M5-S0b1a1 does not bump the inherited ordinary Skylet v42 or library version 9
+M5-S0b1a1 does not bump the inherited ordinary Skylet v43 or library version 9
 and activates only distribution dependency and publication. Before its
 dependency commit or release-workflow activation
 reaches an integration branch, an explicitly authorized bootstrap operator
@@ -11742,7 +11842,7 @@ source, editable, wheel, sdist, Docker, worker-floor, and backward-compatibility
 install matrices must pass with the exact dependency before merge. This gate
 adds no runtime entrypoint, process, listener, capability, or provider effect.
 
-M5-S0b1b does not bump the inherited ordinary Skylet v42 or library version 9
+M5-S0b1b does not bump the inherited ordinary Skylet v43 or library version 9
 and relocates only the already-shipped pure keyed schema primitives into the
 now-qualified standalone dependency root.
 `sky.skylet.keyed_submission_state` becomes the compatibility facade only
@@ -11752,7 +11852,7 @@ the release, internal, and source environments. No persistence schema or
 runtime behavior changes, and the standalone dependency still exposes no
 entrypoint or handler.
 
-M5-S0b1c does not bump the inherited ordinary Skylet v42 or library version 9
+M5-S0b1c does not bump the inherited ordinary Skylet v43 or library version 9
 and adds only dormant persistence installers for `keyed_submission_runtime`,
 the exact negative-authority trigger catalog, the
 two config-database tables and immutable triggers, the exact
@@ -11767,10 +11867,10 @@ concurrent, wrong-shape, corrupt, and rollback databases plus exact
 design-to-catalog bytes, numeric-token boundaries, fresh-empty protected and
 upgraded legacy config paths, exact config table and autoindex shapes,
 command-size limits, quota-receipt guards, and frozen
-terminal-inventory guards are tested before deployment to one disposable v42
-worker and against the v40 compatibility database fixtures.
+terminal-inventory guards are tested before deployment to one disposable v43
+worker and against the v40 and v42 compatibility database fixtures.
 
-M5-S0b2 does not bump the inherited ordinary Skylet v42 or library version 9
+M5-S0b2 does not bump the inherited ordinary Skylet v43 or library version 9
 and adds only additive coordinated protocol messages, canonical identity and
 Ed25519 authorization types, method and payload digests,
 artifact plan, prepare, launch, log-cursor, finalization, retention, and
@@ -11779,7 +11879,7 @@ capability/readback results, and coordinated client/router
 methods. It does not register a handler or caller. A legacy endpoint is a hard
 incompatibility and never permission to generate SSH code.
 
-M5-S0b3a does not bump the inherited ordinary Skylet v42 or library version 9
+M5-S0b3a does not bump the inherited ordinary Skylet v43 or library version 9
 and adds the independently testable dormant `SubmissionArtifactOwnerV1`
 library, exact artifact ledger owner, intent-first
 staging and atomic publication, sealed-FD open, protected log write and offset
@@ -11789,7 +11889,7 @@ no worker RPC. Fault injection covers every `PREPARING` row/filesystem pairing,
 cursor recovery, retained read/tail, freeze membership, and removal response
 loss before this gate merges.
 
-M5-S0b3b does not bump the inherited ordinary Skylet v42 or library version 9
+M5-S0b3b does not bump the inherited ordinary Skylet v43 or library version 9
 and adds only the independently buildable native containment manager, launcher,
 and outcome shim plus their durable ledger and
 bounded event/log-channel protocol. Hermetic Linux integration tests exercise
@@ -11799,7 +11899,7 @@ reaping, retirement, restart reconciliation, UID and socket isolation, and the
 escape probe. It installs or activates no principal, bridge, SSH policy, unit,
 or marker.
 
-M5-S0b3c does not bump the inherited ordinary Skylet v42 or library version 9
+M5-S0b3c does not bump the inherited ordinary Skylet v43 or library version 9
 and adds the fixed standalone venv, signed build manifest, forced-command
 bridge, restricted login executable, exact principal
 and SSH-policy definitions, and unit-file bytes. Its normal installer only
@@ -11808,7 +11908,7 @@ or enable units, change `sshd`, start a service, publish a marker, or advertise
 capability. Package, `python -I` import-isolation, forced-command, effective
 `sshd -T`, credential, and unit-coupling tests pass against the exact digests.
 
-M5-S0b4 does not bump the inherited ordinary Skylet v42 or library version 9
+M5-S0b4 does not bump the inherited ordinary Skylet v43 or library version 9
 and adds the separately packaged dormant `skypilot_worker_runtime` entrypoint
 in its dedicated venv, single-writer reducer, coordinated-
 only scheduler, exact trigger validation, manager and artifact clients, closed
@@ -11816,8 +11916,8 @@ RPC registry including authenticated artifact inventory, offset readback,
 freeze, and removal, and bidirectional reconciler. It is installed but unreachable:
 no ordinary path creates a marker, enables its units, inserts a mode row, or
 creates a fence. It does not import legacy events or generic mutation services
-and changes no ordinary v42 or compatibility-v40 executable, handler, event
-construction, watchdog, listener, or caller. Reducer tests use fake
+and changes no executable, handler, event construction, watchdog, listener,
+or caller on the ordinary v43 or v40 and v42 compatibility paths. Reducer tests use fake
 containment and artifact owners plus the
 exact SQL catalog. A complete `sys.modules` and static import-graph assertion
 proves no `sky` module is loaded by the exact installed worker command.
@@ -11828,11 +11928,11 @@ lock, systemd failure coupling, forced SSH-to-UDS bridge, exact SSH policy,
 signed authorization interceptor, closed keyed RPC registration, artifact and
 containment recovery, credential and privilege probes, and READY publication.
 No bootstrap marker producer is reachable from an ordinary pool path, so the
-ordinary fleet remains on its inherited v42 path, v40 workers are not
+ordinary fleet remains on its inherited v43 path, v40 and v42 workers are not
 force-restarted, and no ordinary canary is force-restarted. The disposable
 worker proves the coordinated-only Unix listener, absence of every legacy
 process and restart path, removal of provisioning access, hook-free identity,
-negative worker lifecycle credentials, and uploaded v40 and v42 Skylets'
+negative worker lifecycle credentials, and uploaded v40, v42, and v43 Skylets'
 inability to access protected state or perform lifecycle actuation. A
 partial capability, listener, manager lock, artifact owner, guard, catalog,
 fence, SSH policy, or reconciliation failure publishes no READY state and has
@@ -12026,19 +12126,21 @@ The design is not promotable without all of the following:
   one byte-identical opaque wheel resource. Source and installed-API internal
   builders produce the same manifest-hashed bundle, invalidate on either wheel
   input, transfer both, reject bundle and installed-file tampering, and install
-  by explicit local paths. The same-package-version stale-v40-main/current-
-  runtime/current-marker case cannot skip the v42 replacement. Release,
-  internal, source, ordinary v42, and characterized v40-to-v42 update
+  by explicit local paths. The same-package-version stale-v40-main and
+  stale-v42-main cases with the current runtime and marker cannot skip the v43
+  replacement. Release,
+  internal, source, ordinary v43, and characterized v40-to-v43 and v42-to-v43
+  update
   environments preserve the facade, while the standalone dedicated venv
   imports no `sky` module;
 - the coordinated migration preserves the legacy `jobs` and `pending_jobs` schemas,
-  duplicate legacy pending rows, and ordinary v40-through-v42 writes while the
+  duplicate legacy pending rows, and ordinary v40, v42, and v43 writes while the
   mode row is absent. Both new singleton DDLs accept only `COORDINATED_V1`; any other token
   is a wrong-shape catalog and quarantine, not a compatibility state.
   Exact design-to-catalog comparison passes. After the
   `COORDINATED_V1` sentinel commits, persistent triggers reject every unkeyed
   job or pending insert, update, and delete, a same-transaction second keyed
-  pending insert, orphan future-job pending row, stale ordinary v40 or v42
+  pending insert, orphan future-job pending row, stale ordinary v40, v42, or v43
   pending update before spawn, status or PID update, and pending delete. The side-row-first
   `AddJobKeyed` order is atomic under crash, response loss, and concurrent
   retry; the reversed legacy-row-first order is rejected by the trigger.
@@ -12119,7 +12221,7 @@ The design is not promotable without all of the following:
 - generic `CancelJobs`, cancel-all, wrong-runtime, wrong-digest,
   wrong-containment, delayed retired-owner, and PID-reuse cases perform no
   process, cgroup, supervisor, or database mutation for a keyed row;
-  a v40 or v42 listener, or an independently launched ordinary service process,
+  a v40, v42, or v43 listener, or an independently launched ordinary service process,
   prevents manager READY until predecessor eviction completes, and a simultaneous or
   later restart attempt cannot obtain the manager lock, protected state,
   authoritative traffic, elevation, provisioning credential, or provider
@@ -12139,17 +12241,17 @@ The design is not promotable without all of the following:
   startup, restart, SIGTERM, idle timeout, malformed marker, preexisting
   autostop config, indicator, hook claim, and stored hook tests all produce zero
   local lifecycle effect and no READY state in coordinated mode. A separate
-  compatibility corpus proves ordinary v42 workers retain their exact inherited
+  compatibility corpus proves ordinary v43 workers retain their exact inherited
   autostop, hook, indicator, exception, listener, and provider-retry path and
-  separately proves the same no-regression boundary for v40 fixtures.
+  separately proves the same no-regression boundary for v40 and v42 fixtures.
   Every legacy and current launch, resource, autostop, down, and preemption hook
   input is rejected during coordinated planning before row birth, marker
   creation, or provider effect, and the down path never reaches a hook CAS or
   hook codegen;
 - an ordinary worker receives no coordinated marker, singleton, enabled unit,
   listener, principal activation, or process change and continues to run its
-  exact ordinary entrypoint, currently v42 with v40 retained as the compatibility
-  floor. A fresh coordinated worker has the signed marker,
+  exact ordinary entrypoint, currently v43 with v40 retained as the compatibility
+  floor and v42 as an intermediate baseline. A fresh coordinated worker has the signed marker,
   one-way singleton, manager and artifact ledgers, coordinated Unix listener,
   and no legacy Skylet process, watchdog, TCP listener, or generic mutation
   service;
@@ -12182,7 +12284,7 @@ The design is not promotable without all of the following:
   and destruction of every older trusting worker are tested as distinct cases;
 - after READY the payload has no sudo, polkit, setuid/file-capability, trusted-
   group, privileged-socket, systemd, or ordinary-login path; the one-time
-  provisioning principal has no key or live session. An uploaded v40 or v42
+  provisioning principal has no key or live session. An uploaded v40, v42, or v43
   Skylet cannot open protected databases or sockets, receive authoritative traffic,
   obtain platform lifecycle credentials, or call provider stop/down. The pilot
   worker role's denied lifecycle actions and the central executor's sole
@@ -12494,7 +12596,7 @@ still incomplete until the code is deleted and the row reaches `removed`.
 | import-time or hand-maintained provider-wide capability matrices for migrated facets | the immutable provider descriptor generates positive capability views and resource-dependent predicates | every declared capability has executable conformance and repository search finds no migrated parallel list |
 | generic retry, cache update, and failure classification in `RetryingVmProvisioner` | typed attempts and domain retry policy are authoritative | old and new failover traces agree on the characterization corpus |
 | generic feasibility and ordering bodies in `DigitalOcean._get_feasible_launchable_resources()`, `DigitalOcean.regions_with_offering()`, and `DigitalOcean.zones_provision_loop()` | the DigitalOcean `RawOfferSnapshotV1` source plus shared pure offer policy is authoritative | the frozen and bounded live DigitalOcean corpus preserves or explicitly improves candidates, price, region order, fuzzy matching, and the characterized absence of rejection hints; semantic search finds no second DigitalOcean generic filter or ordering owner |
-| gRPC exception fallback and direct SSH status transport in `CloudVmRayBackend.get_job_status()` | `SkyletCapabilitiesV1` and the bounded, incarnation-and-channel-keyed `GetJobStatus` router are authoritative | mixed old and new Skylet tests pass, handshakes are single-flight and boundedly refreshed, qualified deployments record zero unexplained fallback for one compatibility release, and this method contains no fallback catch or direct SSH transport outside the router |
+| gRPC exception fallback and direct SSH status transport in `CloudVmRayBackend.get_job_status()` | `SkyletCapabilitiesV1` and the bounded, incarnation-and-channel-keyed `GetJobStatus` router are authoritative | mixed old and new Skylet tests pass, handshakes are single-flight and boundedly refreshed, an enforced support policy upgrades every reachable ordinary Skylet to v43 or newer before use or rejects it with an explicit upgrade-required error, offline and long-lived clusters remain reachable until that policy rejects them, Datadog and structured logs support that policy with zero unexplained fallback for the compatibility interval, and this method contains no fallback catch or direct SSH transport outside the router |
 | central-PostgreSQL `FileLock` and synchronous provider-call ownership in `sky.volumes.server.core.volume_apply()` and `volume_delete()` | M3 action worker owns central volume create and delete | HA stale-worker, readback, UID replacement, and cleanup tests pass, the server gate is promoted, and both exact functions have no central-PostgreSQL provider-call branch |
 | `sky.server.daemons.refresh_volume_status_event`, its daemon registration, and its direct call into `sky.volumes.server.core.volume_refresh()` | the action reconciler and domain reducer own central-PostgreSQL volume observation | refresh parity and missed-wakeup recovery pass, no central-PostgreSQL daemon registration or direct call remains, and the separately supported SQLite refresh path retains an exact ledger row |
 | local or controller SQLite volume mutation path and `FileLock` | the product separately deprecates that officially supported path | deprecation window and local compatibility inventory are complete |
@@ -12515,6 +12617,8 @@ still incomplete until the code is deleted and the row reaches `removed`.
 | direct child status transport in `SkyPilotReplicaManager._fetch_job_status()` | `ChildWorkloadObservationV1` owns the read-only child-status call while Serve retains replica health and rollout policy | the exact replica status, preemption, pool, timeout, and lock-free polling corpus passes, and the method contains no direct `backend.get_job_status` call outside the adapter |
 | duplicate managed-image worker lease, heartbeat, retry, and provider-call mechanics | the shared kernel executes already-admitted image actions while image domain admission retains shard fairness and reservations | shard `max_in_flight`, two-level due rotation, fresh-versus-recovery accounting, publication reservations, `COPY`/`VERIFY`/`EVICT`/`READBACK` crash recovery, fencing, quarantine, exact absence, and canary qualification pass with zero dual due or lease owner |
 | `api_controller_action_reservations` and `_reserve_controller_action()` / `_mark_controller_action_state()` | generalized action ledger preserves controller-generation fencing and active reservations are backfilled | compatibility reconciler observes zero unmigrated active reservations and rollback qualification passes |
+| `run_distributed_singleton()` and `_singleton_task()` direct request-PostgreSQL call | shared async session-lock kernel is authoritative for all eight controller maintenance daemons | exact legacy key contention works in both mixed-version ownership orders, transaction-idle and standby-promotion tests pass, one compatibility window records zero legacy route, and rollback-image qualification passes |
+| direct PostgreSQL session fields, SQL, transaction closure, health, unlock, close, force-unlock, and callback ownership inside `PostgresLock` | the compatibility facade delegates to the shared sync session-lock kernel | existing shared/exclusive, blocking, timeout, cancellation, connection-loss, controller-generation, Jobs, Serve, and daemon corpora pass; one compatibility window records zero direct legacy owner; repository search and manifest locators prove the old bodies absent |
 
 The fleet-gated M5 compatibility paths in
 `docs/designs/multi-replica-api-server.md` are outside this migration's deletion
@@ -12629,6 +12733,36 @@ owned by the named test rather than left implicit:
     classifiers cover the supported 3.10 through 3.14 range.
 14. `test_placement_types_are_not_publicly_reexported`.
 15. `test_cloud_offer_source_default_is_none_and_side_effect_free`.
+
+### PostgreSQL session advisory locks
+
+- a real-PostgreSQL async singleton test maps the exact
+  `hashtextextended(lock_name, 0)` advisory key through `pg_locks` to its owner
+  and proves `state = 'idle'`, `xact_start IS NULL`, and
+  `backend_xmin IS NULL` after acquisition and after at least one `SELECT 1`
+  health probe;
+- the same test cancels the owner, proves exactly one standby promotion, proves
+  the old backend and granted lock disappear, and repeats the transaction-idle
+  assertions for the successor;
+- mock event-order tests prove acquire commit precedes task creation,
+  nonwinner close precedes retry sleep, health commit follows every successful
+  probe, owned task cancellation precedes unlock and connection close, unlock
+  commit occurs when possible, and query or commit failure cannot start work;
+- a shared sync/async trace corpus covers acquire false/true, shared and
+  exclusive mode, timeout, nonblocking failure, task success and failure,
+  cancellation, connection loss, failed commit, failed unlock, and close or
+  invalidation;
+- key goldens preserve `SHA256_POSITIVE_INT63_V1`, statement-shape tests
+  preserve `PG_HASHTEXTEXTENDED_SEED0_V1`, and old/new implementations contend
+  for one real lock in both ownership orders;
+- same-session callback tests prove success leaves no transaction open and any
+  exception rolls back before propagation or session invalidation;
+- repository checks prove the shared leaf imports no server, Jobs, Serve,
+  provider, or action-domain module and prove migrated facades contain no
+  direct connection checkout, SQL advisory-lock statement, commit, rollback,
+  or close lifecycle;
+- a bounded `CREATE INDEX CONCURRENTLY` canary runs while all eight controller
+  singleton locks are held and cleans up its exact table and index afterward.
 
 ### Action runtime
 
@@ -12849,6 +12983,17 @@ identity evidence.
 
 ## Rollback
 
+- M3-PG0 is schema-free and can roll back by image, but the prior image
+  reintroduces process-lifetime singleton transactions. Before any migration
+  DDL after such a rollback, preflight must prove no SkyPilot advisory-lock
+  session is idle in transaction. Restarting a controller is incident
+  remediation, not qualification or a permanent workaround.
+- M3-PG2 and M3-PG3 preserve each caller's exact old lock-key strategy, so old
+  and new images remain mutually exclusive. Rollback is allowed only while the
+  shared implementation has introduced no new key strategy or externally
+  persisted contract. Any future key migration needs a separately reviewed
+  dual-acquire or durable-generation protocol and cannot infer safety from a
+  quiet telemetry window.
 - M1 is code-only additive and rolls back by image. M2 adds no database schema,
   but image rollback is permitted only after the current-image preflight proves
   every `placement_attempt_fence` is null.

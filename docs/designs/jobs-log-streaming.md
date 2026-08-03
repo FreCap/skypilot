@@ -96,6 +96,14 @@ The following contracts must remain unchanged:
    codes.
 7. Import order and import time. No new eager heavy dependency is allowed.
 
+One targeted follow-up is intentional after the extraction: when
+`sky jobs logs --no-follow` sees a latest-task snapshot that is still
+`RUNNING` but no longer has a stream target, it may perform one additional
+local snapshot read before returning. That recheck is limited to the stale
+RUNNING-without-stream-target case so a just-finished task can still surface
+its cached logs; the common PENDING, STARTING, RECOVERING, and controller-tail
+paths keep their previous operation counts.
+
 ## Alternatives considered
 
 Leaving the module unchanged avoids a structural diff, but retains a fast-changing
@@ -129,7 +137,9 @@ request.
 Benchmark alternating base and head imports. For representative characterized
 stream paths, compare operation counters rather than wall-clock timing because
 network and polling latency are mocked; the required result is no additional
-query, sleep, filesystem, thread, select, runtime, or backend-tail operation.
+query, sleep, filesystem, thread, select, runtime, or backend-tail operation
+except for the intentional one-time local snapshot refresh in the stale
+RUNNING-without-stream-target `--no-follow` path.
 
 ## Rollout and rollback
 

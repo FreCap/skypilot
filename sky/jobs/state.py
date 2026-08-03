@@ -745,7 +745,13 @@ def get_task_id_name_status_log(
 
 
 def get_num_tasks(job_id: int) -> int:
-    return len(_get_all_task_ids_statuses(job_id))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        task_count = session.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count(),  # pylint: disable=not-callable
+            ).where(spot_table.c.spot_job_id == job_id)).scalar_one()
+        return int(task_count)
 
 
 def get_latest_task_id_from_statuses(

@@ -79,7 +79,7 @@ def test_gateway_implementation_fingerprints():
     ) == '0471f7f7f6e26ce328d8fc2806c2c0aea3189d1c7dc932479724025954463f25'
     assert _runtime_source_hash(
         cloud_vm_ray_backend.SkyletClient
-    ) == 'f4688ab7a4f5c1b9791905d32872b78b0d91659fe2621874db4d55ad3e6bde6f'
+    ) == 'bf8a14c657fab601eec8e8d9488b0746ca87b2151637be033f602829da692a81'
 
 
 def test_cancel_aware_stub_resolves_unary_transport_through_facade():

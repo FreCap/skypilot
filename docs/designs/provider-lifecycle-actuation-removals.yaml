@@ -10431,6 +10431,131 @@ artifacts:
   retained_references: []
   evidence: {}
   blocker: null
+- id: PLA-M3-111
+  milestone: M3
+  introduced_by: f0d881cb2ec7b088d698e2179fa2c623fa1a40dd
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: server_maintenance
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: async_session_singleton_lifecycle_v1
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/server/requests/postgres.py
+    symbol: run_distributed_singleton
+  - kind: python_call_within
+    path: sky/server/runtime.py
+    symbol: _singleton_task
+    call: request_postgres.run_distributed_singleton
+  replacement: Shared PostgreSQL session advisory-lock kernel and async singleton coordinator
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: legacy_async_singleton_symbol_and_call_absent
+      satisfied: false
+      evidence: []
+    test:
+    - id: shared_async_lock_key_transaction_idle_cancellation_promotion_and_mixed_version_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_legacy_async_singleton_route_one_compatibility_window
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: shared_async_singleton_rollback_image_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: async_singleton_lifecycle_owns_no_schema
+      satisfied: true
+      evidence:
+      - The async singleton lifecycle owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M3-112
+  milestone: M3
+  introduced_by: 1b636c36a2c668973391e61b6beb99d25e9a8410
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: distributed_lock
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: synchronous_direct_session_lifecycle_v1
+  runtime_affecting: true
+  locators:
+  - kind: python_attribute
+    path: sky/utils/locks.py
+    symbol: PostgresLock
+    attribute: _connection
+  - kind: python_attribute
+    path: sky/utils/locks.py
+    symbol: PostgresLock
+    attribute: _acquired
+  - kind: python_call_within
+    path: sky/utils/locks.py
+    symbol: PostgresLock.acquire
+    call: self._get_connection
+  - kind: python_call_within
+    path: sky/utils/locks.py
+    symbol: PostgresLock.acquire
+    call: self._connection.commit
+  - kind: python_call_within
+    path: sky/utils/locks.py
+    symbol: PostgresLock.release
+    call: self._connection.cursor
+  - kind: python_call_within
+    path: sky/utils/locks.py
+    symbol: PostgresLock.force_unlock
+    call: self._get_connection
+  - kind: python_call_within
+    path: sky/utils/locks.py
+    symbol: PostgresLock.is_session_alive
+    call: self._connection.cursor
+  - kind: python_ast_pattern
+    path: sky/utils/locks.py
+    symbol: PostgresLock.run_in_lock_session
+    pattern: return operation(self._connection)
+  replacement: PostgresLock compatibility facade over the shared PostgreSQL session advisory-lock kernel
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_postgres_lock_direct_session_state_or_lifecycle_calls
+      satisfied: false
+      evidence: []
+    test:
+    - id: shared_sync_lock_key_mode_timeout_cancellation_loss_force_unlock_and_callback_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_direct_sync_session_lifecycle_owner_one_compatibility_window
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: shared_sync_lock_facade_rollback_image_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: synchronous_session_lock_lifecycle_owns_no_schema
+      satisfied: true
+      evidence:
+      - The synchronous session-lock lifecycle owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
 - id: PLA-M4-001
   milestone: M4
   introduced_by: f90ccc1757680ccbff2fb8d86fc6dfd4242bd182
@@ -13386,6 +13511,9 @@ artifacts:
     - id: mixed_skylet_get_job_status_transport_conformance
       satisfied: false
       evidence: []
+    - id: enforced_v43_or_upgrade_required_policy_for_all_reachable_skylets_including_offline_and_long_lived
+      satisfied: false
+      evidence: []
     telemetry:
     - id: zero_direct_ssh_status_transport_one_release
       satisfied: false
@@ -13431,6 +13559,9 @@ artifacts:
       evidence: []
     test:
     - id: skylet_single_flight_handshake_and_max_60s_refresh_conformance
+      satisfied: false
+      evidence: []
+    - id: enforced_v43_or_upgrade_required_policy_for_all_reachable_skylets_including_offline_and_long_lived
       satisfied: false
       evidence: []
     telemetry:

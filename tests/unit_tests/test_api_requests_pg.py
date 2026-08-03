@@ -1249,6 +1249,160 @@ def test_request_control_pool_survives_saturated_ordinary_pool(
             engine.dispose()
 
 
+def test_distributed_singleton_lock_session_stays_outside_transaction(
+        request_database):
+    engine, _ = request_database
+    lock_name = f'test-singleton-transaction-{uuid.uuid4()}'
+    holder_statement = sqlalchemy.text("""
+        SELECT activity.pid,
+               activity.state,
+               activity.xact_start,
+               activity.backend_xmin,
+               activity.state_change
+        FROM pg_stat_activity AS activity
+        JOIN pg_locks AS held_lock ON held_lock.pid = activity.pid
+        WHERE activity.datname = current_database()
+          AND held_lock.locktype = 'advisory'
+          AND held_lock.objsubid = 1
+          AND held_lock.mode = 'ExclusiveLock'
+          AND held_lock.granted
+          AND ((held_lock.classid::bigint << 32) |
+               held_lock.objid::bigint) =
+              hashtextextended(CAST(:lock_name AS text), 0)
+        ORDER BY activity.pid
+        """)
+
+    def read_holders() -> list[dict[str, object]]:
+        with engine.connect() as connection:
+            return [
+                dict(row) for row in connection.execute(holder_statement, {
+                    'lock_name': lock_name
+                }).mappings().all()
+            ]
+
+    def backend_exists(pid: int) -> bool:
+        with engine.connect() as connection:
+            return bool(
+                connection.execute(
+                    sqlalchemy.text(
+                        'SELECT EXISTS('
+                        'SELECT 1 FROM pg_stat_activity WHERE pid = :pid)'), {
+                            'pid': pid
+                        }).scalar_one())
+
+    async def exercise() -> None:
+        started: asyncio.Queue[str] = asyncio.Queue()
+        release = {
+            'first': asyncio.Event(),
+            'second': asyncio.Event(),
+        }
+
+        def factory(name: str):
+
+            async def owned() -> None:
+                await started.put(name)
+                await release[name].wait()
+
+            return owned
+
+        async def wait_for_holder(
+            *,
+            expected_pid: int | None = None,
+            after_state_change: datetime.datetime | None = None,
+        ) -> dict[str, object]:
+            deadline = time.monotonic() + 5
+            last_rows: list[dict[str, object]] = []
+            while time.monotonic() < deadline:
+                last_rows = await asyncio.to_thread(read_holders)
+                if len(last_rows) == 1:
+                    row = last_rows[0]
+                    pid_matches = (expected_pid is None or
+                                   row['pid'] == expected_pid)
+                    probe_matches = (after_state_change is None and
+                                     row['state'] == 'idle')
+                    if after_state_change is not None:
+                        state_change = row['state_change']
+                        assert isinstance(state_change, datetime.datetime)
+                        probe_matches = (row['state'] == 'idle' and
+                                         state_change > after_state_change)
+                    if pid_matches and probe_matches:
+                        return row
+                await asyncio.sleep(0.01)
+            raise AssertionError(
+                f'Expected one matching singleton holder, got {last_rows!r}')
+
+        def assert_transaction_idle(row: dict[str, object]) -> None:
+            assert row['state'] == 'idle'
+            assert row['xact_start'] is None
+            assert row['backend_xmin'] is None
+
+        first = asyncio.create_task(
+            request_postgres.run_distributed_singleton(
+                lock_name,
+                factory('first'),
+                retry_interval_seconds=0.05,
+                connection_check_interval_seconds=0.05))
+        second = asyncio.create_task(
+            request_postgres.run_distributed_singleton(
+                lock_name,
+                factory('second'),
+                retry_interval_seconds=0.05,
+                connection_check_interval_seconds=0.05))
+        tasks = {'first': first, 'second': second}
+        try:
+            winner = await asyncio.wait_for(started.get(), timeout=5)
+            initial = await wait_for_holder()
+            assert_transaction_idle(initial)
+            winner_pid = int(initial['pid'])
+            initial_state_change = initial['state_change']
+            assert isinstance(initial_state_change, datetime.datetime)
+
+            after_probe = await wait_for_holder(
+                expected_pid=winner_pid,
+                after_state_change=initial_state_change)
+            assert_transaction_idle(after_probe)
+            assert started.empty()
+
+            winner_task = tasks[winner]
+            standby_name = 'second' if winner == 'first' else 'first'
+            standby_task = tasks[standby_name]
+            winner_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await winner_task
+
+            assert await asyncio.wait_for(started.get(),
+                                          timeout=5) == (standby_name)
+            successor = await wait_for_holder()
+            assert_transaction_idle(successor)
+            successor_pid = int(successor['pid'])
+            assert successor_pid != winner_pid
+
+            deadline = time.monotonic() + 5
+            while (await asyncio.to_thread(backend_exists, winner_pid) and
+                   time.monotonic() < deadline):
+                await asyncio.sleep(0.01)
+            assert not await asyncio.to_thread(backend_exists, winner_pid)
+
+            successor_state_change = successor['state_change']
+            assert isinstance(successor_state_change, datetime.datetime)
+            successor_after_probe = await wait_for_holder(
+                expected_pid=successor_pid,
+                after_state_change=successor_state_change)
+            assert_transaction_idle(successor_after_probe)
+            assert started.empty()
+
+            standby_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await standby_task
+        finally:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
 def test_distributed_singleton_promotes_one_standby(request_database):
     del request_database
 

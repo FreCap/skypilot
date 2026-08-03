@@ -1,8 +1,7 @@
 """Closed row enums for the revision-001 physical-capacity foundation.
 
-This module intentionally contains no persistence models.  C2's ephemeral
-payload DTOs live in ``contracts``; only closed values shared with scan
-persistence live here.
+This module intentionally contains no persistence models or production
+projection payloads.  Those contracts require a separate C2 design review.
 """
 
 import enum
@@ -18,30 +17,6 @@ class ProjectionScanState(str, enum.Enum):
     RUNNING = 'running'
     COMPLETED = 'completed'
     FAILED = 'failed'
-
-
-class ProjectionScanPhase(str, enum.Enum):
-    """Closed C2 scan cursor phase."""
-
-    FULL_SNAPSHOT = 'full_snapshot'
-
-
-class ProjectionScanErrorCode(str, enum.Enum):
-    """Closed, identifier-free C2 scan failure codes."""
-
-    ROW_LIMIT_EXCEEDED = 'row_limit_exceeded'
-    BYTE_LIMIT_EXCEEDED = 'byte_limit_exceeded'
-    SCAN_TIMEOUT = 'scan_timeout'
-    SOURCE_DECODE_FAILED = 'source_decode_failed'
-    SOURCE_CONFLICT = 'source_conflict'
-    SELECTOR_MISMATCH = 'selector_mismatch'
-    SOURCE_INDEX_MISSING = 'source_index_missing'
-    NON_COLOCATED_SOURCE_STORE = 'non_colocated_source_store'
-    CONTROLLER_FENCED = 'controller_fenced'
-    SERIALIZATION_EXHAUSTED = 'serialization_exhausted'
-    DATABASE_UNAVAILABLE = 'database_unavailable'
-    DATABASE_STATEMENT_FAILED = 'database_statement_failed'
-    STALE_SCAN = 'stale_scan'
 
 
 class OwnerKind(str, enum.Enum):

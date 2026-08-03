@@ -1,5 +1,4 @@
-"""Read-only PostgreSQL physical-capacity evidence projection.
+"""PostgreSQL physical-capacity projection foundation.
 
-Revision 001 persists only bounded scan summaries.  It exposes no capacity
-inventory reader, workload mutation path, or provider observation loop.
+Revision 001 intentionally exposes no production projector or mutation path.
 """

@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package skylet.v1;
+
+// Advertises exact worker-side method contracts implemented by this Skylet
+// process. Diagnostic build fields never participate in route selection.
+service CapabilitiesService {
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (SkyletCapabilitiesV1);
+}
+
+message GetCapabilitiesRequest {}
+
+message SkyletMethodCapabilityV1 {
+  string service = 1;
+  string method = 2;
+  repeated uint32 contract_versions = 3;
+}
+
+message SkyletCapabilitiesV1 {
+  uint32 schema_version = 1;
+  string skylet_boot_id = 2;
+  string skylet_version = 3;
+  string skypilot_version = 4;
+  string skypilot_commit = 5;
+  repeated SkyletMethodCapabilityV1 methods = 6;
+}
