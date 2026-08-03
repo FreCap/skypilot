@@ -244,6 +244,28 @@ readers consume indices 0 and 1. New code remains able to read a valid bounded
 pair written after rollback. The pickle column is unchanged, so this needs
 neither a handle-version bump nor a database migration.
 
+The persisted PID is a locator, not process-ownership proof. The process that
+opens a new tunnel registers its canonical generation in a process-local
+ownership table together with the exact `psutil.Process` object constructed
+while that child is known to be alive. The table is tagged with the owning
+Python PID and is discarded whenever `os.getpid()` changes, so a fork cannot
+inherit signal authority. A signal path must take an entry by exact generation
+and exact PID from that table and use the stored `psutil.Process` identity for
+descendant enumeration and termination. It must never reconstruct signal
+authority from the persisted PID. `psutil.Process` binds PID and process create
+time and rechecks reuse before signalling, so a dead tunnel whose PID has been
+reassigned cannot authorize a signal to the replacement process.
+
+Legacy pairs, persisted triples opened by another process, and registrations
+lost on process restart remain readable transport metadata but confer no
+signal authority. After an `UPDATED` publish or clear, missing ownership proof
+leaves the prior process untouched for its owning process or container teardown
+to reap. This bounded leak is safer than guessing. The newly opened process is
+registered before readiness and database publication, so publication conflict,
+readiness failure, and every later exception can terminate that exact owned
+process without a PID-only fallback. Taking an ownership entry is destructive:
+one generation can authorize at most one termination attempt.
+
 Global state adds one read that returns `cluster_hash` and tunnel metadata from
 the same cluster-table row. A non-null `cluster_hash` is the only cluster-row
 incarnation fence. For such a row, every tunnel publish and clear uses one
@@ -260,9 +282,11 @@ below; more than one row is an invariant failure. On publish, the caller first
 requires a non-null snapshot, then opens the process, then compares and sets.
 `CONFLICT` terminates only that newly opened unpublished process and retries
 from a new same-row snapshot. On clear, compare-and-set to null occurs before
-any signal. Only `UPDATED` permits signalling the exact observed process;
-`CONFLICT` leaves replacement metadata and its process untouched. Neither
-predicate may be weakened to preserve availability.
+any signal. Only `UPDATED` plus exact local generation ownership permits
+signalling the exact observed process; `UPDATED` without that proof clears the
+metadata but sends no signal. `CONFLICT` leaves replacement metadata and its
+process untouched. Neither predicate nor process-ownership proof may be
+weakened to preserve availability.
 
 An observed null `cluster_hash` is not a fence. SQL `IS NULL` cannot distinguish
 delete and reinsert when both incarnations have null hashes, even if the tunnel
@@ -885,6 +909,9 @@ its item boundary and receives no transport-policy responsibility.
   compare-and-set publication and clearing for non-null hashes. Fail closed
   before SQL, process open, or process signal for null hashes; permit only an
   explicitly uncached, read-only handshake through an already healthy tunnel.
+- Bind process signalling to an exact process-local generation registration
+  backed by the `psutil.Process` identity captured at open time. Discard the
+  table after fork and never reconstruct authority from a persisted PID.
 - Return the exact `UPDATED`, `CONFLICT`, or
   `UNFENCED_CLUSTER_INCARNATION` mutation result. Enforce numeric tuple bounds
   and quarantine malformed metadata until exact-hash, exact-bytes repair.
@@ -982,6 +1009,14 @@ its item boundary and receives no transport-policy responsibility.
   open, replacement, normal-clear, and process-signal calls. Only the explicit
   repair path with exact non-null hash and exact raw-byte predicates may clear
   it; either mismatch changes zero rows.
+- Generation-bound process ownership tests register one live process, replace
+  its PID with a different process after the original exits, and prove that an
+  `UPDATED` clear or publish never signals the replacement. Persisted metadata
+  without a matching local generation registration sends no signal. A matching
+  registration terminates through the stored identity exactly once, and a
+  simulated fork clears inherited registrations before lookup. Publication
+  conflict, readiness timeout, and an injected post-open exception each reap
+  only the newly registered process.
 - Every non-null fast, exclusive-lock, shared-lock, and new-tunnel snapshot
   return proves channel endpoint and key came from the same tunnel object and
   same-row cluster hash. Null compatibility returns prove channel-only output
