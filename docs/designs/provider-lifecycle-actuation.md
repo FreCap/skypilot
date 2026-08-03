@@ -183,9 +183,20 @@ signatures:
 discover(scope, expected_incarnation) -> NodeInventoryV1
 prepare(exact_action, inventory) -> ProviderEffectPlanV1
 submit_effect(exact_effect, persisted_locator) -> EffectEvidenceV1
-observe_effect(effect_handle, persisted_locator) -> EffectObservationV1
+observe_effect(effect_handle_ref, persisted_locator) -> EffectObservationV1
 prove_absent(persisted_locator) -> AbsenceEvidenceV1
 ```
+
+`effect_handle_ref` is the closed tagged union `EffectHandleRefV1`, never a
+nullable handle. `PROVIDER_HANDLE` carries one bounded serialized provider
+request or operation identity. `LOCATOR_ONLY` carries exactly one reason from
+`PROVIDER_HAS_NO_HANDLE`, `RESPONSE_LOST`, or `CRASH_RECOVERY` and no fabricated
+provider identity. A successor that finds durable `IN_FLIGHT` intent without
+persisted response evidence calls `observe_effect()` with
+`LOCATOR_ONLY(CRASH_RECOVERY)` and the original locator. A transport failure
+after bytes may have been sent uses `LOCATOR_ONLY(RESPONSE_LOST)`. Thus readback
+is callable in precisely the cases where no provider handle can exist; `None`,
+an empty string, and skipping observation are invalid.
 
 `ClusterEffectReconcilerV1` is the sole cluster-domain adapter admitted to the
 durable action runtime for this facet. For one already-admitted
@@ -204,8 +215,11 @@ provider client, or second effect store.
 `discover()` performs one bounded provider-native traversal and preserves
 canonical provider IDs, duplicate and completeness evidence, provider scope,
 native state, role evidence, and incarnation match, missing, or mismatch. It
-never collapses resources by display name. `prepare()` is pure and cannot read
-credentials, configuration, clocks, randomness, the database, or the provider.
+never collapses resources by display name. Provider-private connection payloads
+are normalized inside this boundary into `NodeConnectionObservationV1`; no raw
+network map or provider SDK object may enter `NodeInventoryV1` or a shared
+projector. `prepare()` is pure and cannot read credentials, configuration,
+clocks, randomness, the database, or the provider.
 `submit_effect()` performs at most one underlying provider mutation attempt.
 Any provider SDK retry must be disabled or surfaced as typed attempt evidence;
 one live fence can never conceal several submissions. `observe_effect()` and
@@ -214,15 +228,18 @@ attempt from a later same-name resource.
 
 `persisted_locator` is committed before provider I/O. It includes the logical
 effect ID, provider-native idempotency token when supported, deterministic
-resource identity or unforgeable attempt marker, provider account and region
-scope, expected incarnation, expected resource kinds, and bounded cardinality.
+resource identity and provider-visible attempt marker, provider account and
+region scope, expected incarnation, expected resource kinds, and bounded
+cardinality.
 It is not constructed or changed inside `submit_effect()`. The returned handle
 may add provider request or operation identity, but the runtime persists that
 evidence without replacing the base locator.
 
 A mutation method returns without polling for terminal readiness and yields
 bounded typed evidence with a serializable provider operation handle when one
-exists. Observation is a separate method. A logical cluster action may require
+exists. The runtime stores `EffectHandleRefV1`; it creates the tagged
+locator-only variant when submission does not return evidence. Observation is
+a separate method. A logical cluster action may require
 several provider effects, such as an Azure NIC followed by a VM, a Kubernetes
 PVC followed by a Deployment, or an AWS instance batch followed by role tags.
 The runtime, not an in-memory provider call, journals progress between those
@@ -916,6 +933,9 @@ from class inheritance or method presence. V1 has these closed facet kinds:
   value;
 - `NODE_ACTUATION`, whose implementation satisfies the exact
   `NodeActuationFacetV1` contract above;
+- `NODE_ACCESS_BINDING`, whose read-only `NodeAccessBindingFacetV1` resolves a
+  requested public-key digest to a preexisting provider key binding without
+  creating, importing, or deleting a key;
 - `VOLUME_ACTUATION`, whose implementation satisfies the separately reviewed
   `VolumeActuationV1` contract;
 - `DEPLOY_SNAPSHOT`, whose implementation produces the exact provider deploy
@@ -944,7 +964,8 @@ resolved entry. Replacement publishes a new whole snapshot and invalidates the
 old generation; no in-place map or facet mutation is supported.
 
 `ProviderOperationSubsetV1` is closed in V1 to `OFFER_READ`,
-`NODE_DISCOVERY`, `NODE_START_STOP`, `NODE_TERMINATE_OWNED`,
+`NODE_DISCOVERY`, `NODE_ACCESS_BINDING_READ`, `NODE_START_STOP`,
+`NODE_TERMINATE_OWNED`,
 `NODE_CREATE_OWNED_LIFECYCLE`, `VOLUME_OWNED_LIFECYCLE`, and
 `DEPLOY_SNAPSHOT_READ`. Each descriptor carries a sorted
 `ProviderOperationContractV1` tuple. One operation contract contains:
@@ -971,10 +992,12 @@ The V1 dependency rules include these minimum edges:
 
 - `OFFER_READ` requires `OFFER_SOURCE`;
 - `NODE_DISCOVERY` requires `NODE_ACTUATION`;
+- `NODE_ACCESS_BINDING_READ` requires `NODE_ACCESS_BINDING`;
 - `NODE_START_STOP` requires `NODE_ACTUATION` and `NODE_DISCOVERY`;
 - `NODE_TERMINATE_OWNED` requires `NODE_ACTUATION` and `NODE_DISCOVERY`;
 - `NODE_CREATE_OWNED_LIFECYCLE` requires `NODE_ACTUATION`,
-  `NODE_DISCOVERY`, `NODE_START_STOP`, and `NODE_TERMINATE_OWNED`;
+  `NODE_DISCOVERY`, `NODE_ACCESS_BINDING_READ`, `NODE_START_STOP`, and
+  `NODE_TERMINATE_OWNED`;
 - `VOLUME_OWNED_LIFECYCLE` requires `VOLUME_ACTUATION`; and
 - `DEPLOY_SNAPSHOT_READ` requires `DEPLOY_SNAPSHOT`.
 
@@ -982,6 +1005,19 @@ Any operation contract whose support rule is not `ALWAYS` must also include
 `RESOURCE_SUPPORT_PREDICATE` in its required facet tuple. The registrar rejects
 a predicate contract without that binding and rejects a predicate binding that
 is not referenced by any operation contract.
+
+`NodeAccessBindingFacetV1` has one exact read-only method:
+
+```text
+observe_existing(scope, public_key_sha256) -> NodeAccessBindingObservationV1
+```
+
+The result is tagged `EXACT_ONE`, `MISSING`, `AMBIGUOUS`, `INCOMPLETE`, or
+`UNAUTHORIZED`. Only `EXACT_ONE` carries a bounded provider key ID,
+fingerprint, account-scope digest, public-key SHA-256, observation time, and
+freshness deadline. It never carries private key material or creates, imports,
+updates, or deletes a provider key. Admission may durably pin only `EXACT_ONE`;
+every other result makes create ineligible.
 
 The create subset deliberately includes resume and stop, deterministic role
 assignment including any head-role rename, termination, cleanup readback, and
@@ -7054,13 +7090,14 @@ route or data-plane operation was exercised.
 
 This foundation adds no temporary compatibility machinery and closes no
 removal row. `PLA-M4-102`, `PLA-M4-103`, and `PLA-M4-107` through
-`PLA-M4-115` track the exact legacy DigitalOcean planner, discovery, bulk run,
-wait, stop, terminate, compound create, projection, query, and mixed
-submit-observe owners. The separately stacked Skylet rows `PLA-M4-104` through
-`PLA-M4-106` retain their IDs and ownership. This foundation slice neither
-introduces nor removes those owners. The next slice may add a provider-local
-diagnostic facet only after its exact one-traversal contract and failure
-containment are accepted.
+`PLA-M4-119` track the exact legacy DigitalOcean planner, discovery, bulk run,
+wait, stop, terminate, compound create, projection, query, mixed
+submit-observe, marker projection and propagation, SSH-key creation, and
+built-in compatibility owners. The separately stacked Skylet rows
+`PLA-M4-104` through `PLA-M4-106` retain their IDs and ownership. This
+foundation slice neither introduces nor removes those owners. The next slice
+may add a provider-local diagnostic facet only after its exact one-traversal
+contract and failure containment are accepted.
 
 #### M4 DigitalOcean authoritative query projection extraction
 
@@ -7298,6 +7335,19 @@ for mutation. Legacy query projection and the pure planner may shadow from the
 same captured rows, but only the legacy query returns to callers. No mutation
 method or operation contract is published in this slice.
 
+Each DigitalOcean node row contains a tagged
+`NodeConnectionObservationV1`. The provider adapter alone traverses the raw
+`networks.v4` array in provider order. `READY_PUBLIC_IPV4` carries canonical
+numeric droplet ID, legacy node name, the first provider-ordered public IPv4
+normalized to canonical text, that same value as the current internal and
+external address projection, SSH port 22, source ordinal, and complete=true.
+`MISSING_PUBLIC_IPV4`, `MALFORMED_PUBLIC_IPV4`, and `INCOMPLETE_NETWORKS` carry
+bounded typed evidence and no address. The shared `ClusterInfo` projector
+consumes only this tagged value and never imports DigitalOcean, indexes
+`networks`, or sees a raw network dictionary. Compatibility preserves the
+first-public selection and missing-public error; malformed provider data fails
+closed before projection and must be reviewed as an explicit safer difference.
+
 Before the mutation closure can be eligible, the same bounded discovery owns
 an associated-resource preview for every exact candidate droplet and a complete
 region-scoped traversal of marker-owned volumes. The frozen inventory records
@@ -7312,12 +7362,30 @@ used to infer mutation support from an incomplete associated inventory.
 
 The first mutation-capable descriptor is not create-only. It must publish the
 complete `NODE_CREATE_OWNED_LIFECYCLE` dependency closure, including discovery,
-resume and stop, deterministic role assignment, readback, cleanup termination,
-and exact absence proof. It reuses the generic durable action runtime as the
-only claim, lease, heartbeat, due-time, retry, and transaction owner. The
+preexisting access-key binding, resume and stop, deterministic role assignment,
+readback, cleanup termination, and exact absence proof. It reuses the generic
+durable action runtime as the only claim, lease, heartbeat, due-time, retry,
+and transaction owner. The
 `ClusterEffectReconcilerV1` adapter supplies desired roles, count, resume
 policy, selected placement, compensation policy, and terminal projection. No
 DigitalOcean-specific worker, queue, lease, or retry loop is added.
+
+DigitalOcean create also requires one durable preexisting
+`DigitalOceanSshKeyBindingV1`. Its access-binding facet performs a complete
+bounded account-scoped SSH-key traversal, hashes each returned public key with
+SHA-256, and returns `EXACT_ONE` only for one key whose digest matches the
+request. Admission persists the numeric key ID, provider fingerprint, requested
+public-key digest, account-scope digest, observation time, freshness deadline,
+and descriptor implementation digest in `ActuationBindingV1` before the node
+action is runnable. Immediately before `CREATE_DROPLET`, a read-only exact-ID
+lookup must reproduce the ID, fingerprint, public-key digest, and account scope.
+The droplet request uses only that pinned fingerprint. V1 never calls
+`ssh_keys.create`; `MISSING`, duplicate matches, incomplete pagination,
+authorization failure, stale evidence, or changed binding makes create
+ineligible. A later key-creation feature requires its own separately journaled,
+replay-safe provider effect and cleanup policy.
+`PLA-M4-118` tracks the current process cache, list-and-create helper, create
+callsite, and raw `ssh_keys.create` effect until that binding is authoritative.
 
 For one new node, the descriptor-bound facet's `prepare()` emits this exact
 deterministic effect DAG, and `ClusterEffectReconcilerV1` persists it through
@@ -7330,12 +7398,39 @@ CREATE_DROPLET -> CREATE_VOLUME -> ATTACH_VOLUME
 The whole DAG, every logical effect ID, and every base readback locator commit
 before `CREATE_DROPLET` can issue provider I/O. The deterministic droplet and
 volume names derive from cluster incarnation plus stable planner slot and role,
-not UUID or provider page order. Each locator binds the descriptor
-implementation digest, account scope, region, cluster incarnation, logical
-effect ID, one reserved attempt marker, resource kind, deterministic name, and
-maximum cardinality one. The attachment locator is incomplete and
-non-runnable until the exact returned droplet and volume IDs have both been
-persisted; it then binds those two IDs and expected attachment relation.
+not UUID or provider page order. Admission assigns one random UUIDv4
+`provider_create_attempt_id` per planned node create and persists it in the
+action and all three base locators before `prepare()` output can commit. It is
+not the worker attempt number. It is never regenerated after claim loss,
+timeout, response loss, or readback, and a later create receives a new value
+only after the prior action's cleanup proof closes.
+
+DigitalOcean exposes that identity through exactly one managed tag on both the
+droplet-create and volume-create requests. If `LP(x)` is the ASCII decimal
+UTF-8 byte length of `x`, a colon, then the exact UTF-8 bytes of `x`, the digest
+bytes are:
+
+```text
+SHA256(
+  b"skypilot-do-create-attempt-v1\0" +
+  LP(lowercase control-plane store UUID) +
+  LP(lowercase action UUID) +
+  LP(lowercase provider_create_attempt_id UUID)
+)
+```
+
+The provider-visible tag is exactly
+`skypilot-create-attempt:v1-<64 lowercase hexadecimal characters>`. The raw
+UUIDs never leave the control plane. The descriptor-owned tag projector
+removes case-folded user occupants of both the existing
+`skypilot-cluster-incarnation:` namespace and this attempt namespace, then
+appends exactly one incarnation tag and this same attempt tag to both requests.
+Every locator binds the descriptor implementation digest, account scope,
+region, cluster incarnation, logical effect ID, the persisted raw attempt UUID,
+the exact provider-visible digest, resource kind, deterministic name, and
+maximum cardinality one. The attachment locator is incomplete and non-runnable
+until the exact returned droplet and volume IDs have both been persisted; it
+then binds those two IDs and expected attachment relation.
 
 `CREATE_DROPLET` performs only the droplet-create request. Its response ID is
 persisted before any follow-up GET. `CREATE_VOLUME` performs only the
@@ -7343,11 +7438,15 @@ volume-create request after the droplet effect is durably observed or adopted.
 `ATTACH_VOLUME` performs only the exact-ID attachment request after both create
 effects are durably observed or adopted. Provider GETs, list-by-marker
 reconciliation, and attachment inspection run only through
-`observe_effect()`. A provider-supported idempotency token is stored in the
-base locator and reused for the same logical effect. When DigitalOcean has no
-such token, a lost response enters `READBACK`; a successor performs complete
-bounded lookup by account, region, deterministic name, reserved attempt
-marker, resource kind, and incarnation. Exactly one matching object may be
+`observe_effect()`. A successful response with an action ID uses
+`PROVIDER_HANDLE`; a response with no action ID uses
+`LOCATOR_ONLY(PROVIDER_HAS_NO_HANDLE)`. A lost response and a reclaimed
+`IN_FLIGHT` effect use `LOCATOR_ONLY(RESPONSE_LOST)` and
+`LOCATOR_ONLY(CRASH_RECOVERY)`, respectively. A provider-supported idempotency
+token is stored in the base locator and reused for the same logical effect.
+When DigitalOcean has no such token, locator-only readback performs complete
+bounded lookup by account, region, deterministic name, exact create-attempt
+tag, resource kind, and incarnation. Exactly one matching object may be
 adopted. Multiple matches, incomplete traversal, mismatched immutable fields,
 or an unresolved zero result before the provider-specific ambiguity horizon
 quarantines the effect. Lease expiry never licenses a new random create.
@@ -7393,15 +7492,18 @@ never at bulk `run_instances()` replay. Compensation is a new planned DAG over
 the recorded IDs and cannot erase the original evidence.
 
 Promotion requires crash injection before and after every provider request and
-evidence commit; lost-response, duplicate-name, partial-pagination,
-same-name-recreation, stale-lease, descriptor-replacement, `worker_only`,
-no-resume, stop, terminate, foreign-associated-resource preservation, and
-compound-absence conformance; a credentialed DigitalOcean create, resume,
-stop, down, and orphan-free canary; one measured compatibility release with
-zero unexplained legacy route; and a closed rollback window with no
-nonterminal, quarantined, or cleanup-bearing effect that the rollback image
-cannot reconcile. Until all gates pass, the descriptor and effect plans may be
-exercised only in read-only or disabled mode.
+evidence commit; all three locator-only readback reasons; exact shared attempt
+tag bytes on droplet and volume; missing, duplicate, changed, and stale SSH-key
+binding without any V1 key creation; normalized connection success and typed
+failure; duplicate-name, partial-pagination, same-name-recreation, stale-lease,
+descriptor-replacement, `worker_only`, no-resume, stop, terminate,
+foreign-associated-resource preservation, and compound-absence conformance; a
+credentialed DigitalOcean create, resume, stop, down, and orphan-free canary;
+one measured compatibility release with zero unexplained legacy route; and a
+closed rollback window with no nonterminal, quarantined, or cleanup-bearing
+effect that the rollback image cannot reconcile. Until all gates pass, the
+descriptor and effect plans may be exercised only in read-only or disabled
+mode.
 
 The focused compatibility suite must prove:
 
@@ -7446,9 +7548,17 @@ is explicit: already marked resources retain their tag, the old image ignores
 it, and the old image may create unmarked siblings. A later upgrade must treat
 that mixed generation as ineligible for typed mutation until legacy resources
 are gone or a separately reviewed migration proves ownership and completeness.
-The tag is not removed during rollback. The slice adds no database schema,
-feature flag, metric, event, persisted report, dual execution path, or
-temporary removal-ledger owner.
+The tag is not removed during rollback. The slice added no database schema,
+feature flag, metric, event, persisted report, or dual execution path. This
+amendment corrects its original missing deletion inventory: `PLA-M4-116`
+tracks the legacy DigitalOcean incarnation-tag constants, projector, and sole
+writer call, while `PLA-M4-117` tracks the generic field, redaction, keyword
+propagation that feeds that writer. `PLA-M4-119` separately tracks the physical
+built-in-call compatibility alias. The current tree has no incarnation-marker
+reader. Any reader added before the descriptor replacement must add its exact
+runtime locator to `PLA-M4-116` in the same follow-up commit. None of these rows
+may close until descriptor-owned incarnation plus attempt tags are
+authoritative and repository search finds no legacy writer or reader.
 
 #### M4 DigitalOcean dual-family inventory traversal, deferred
 

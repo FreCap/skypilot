@@ -16159,6 +16159,7 @@ artifacts:
   - PLA-M4-103
   - PLA-M4-111
   - PLA-M4-115
+  - PLA-M4-118
   status: present
   status_history:
   - planned
@@ -16225,7 +16226,7 @@ artifacts:
     path: sky/provision/do/instance.py
     symbol: get_cluster_info
     call: common.ClusterInfo
-  replacement: Shared cluster-domain ProvisionRecord and ClusterInfo projectors over immutable node observations
+  replacement: Shared cluster-domain ProvisionRecord and ClusterInfo projectors over provider-normalized immutable NodeConnectionObservationV1 values
   dependencies: []
   status: present
   status_history:
@@ -16237,7 +16238,7 @@ artifacts:
       satisfied: false
       evidence: []
     test:
-    - id: digitalocean_provision_record_cluster_info_exact_identity_network_and_order_projection_conformance
+    - id: digitalocean_provision_record_cluster_info_typed_connection_identity_network_and_order_projection_conformance
       satisfied: false
       evidence: []
     telemetry:
@@ -16321,7 +16322,7 @@ artifacts:
     path: sky/provision/do/utils.py
     symbol: _create_droplet
     pattern: client().droplets.get(droplet_id)
-  replacement: CREATE_DROPLET submit_effect response evidence followed by separate observe_effect readback
+  replacement: CREATE_DROPLET submit evidence followed by EffectHandleRefV1 provider-handle or locator-only observe_effect readback
   dependencies: []
   status: present
   status_history:
@@ -16333,7 +16334,7 @@ artifacts:
       satisfied: false
       evidence: []
     test:
-    - id: digitalocean_create_response_id_persistence_and_separate_readback_conformance
+    - id: digitalocean_create_response_id_and_all_locator_only_readback_reason_conformance
       satisfied: false
       evidence: []
     telemetry:
@@ -16349,6 +16350,254 @@ artifacts:
       satisfied: true
       evidence:
       - The process-local DigitalOcean create submission helper owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-116
+  milestone: M4
+  introduced_by: 44add3fa3c0bc346ed957c666e7ceb1c034ab021
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_incarnation_marker_namespace_projection_and_writer
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/incarnation_tags.py
+    symbol: TAG_SKYPILOT_CLUSTER_INCARNATION
+  - kind: python_symbol
+    path: sky/provision/do/incarnation_tags.py
+    symbol: _INCARNATION_DOMAIN_SEPARATOR
+  - kind: python_symbol
+    path: sky/provision/do/incarnation_tags.py
+    symbol: _INCARNATION_TAG_PREFIX
+  - kind: python_symbol
+    path: sky/provision/do/incarnation_tags.py
+    symbol: project_instance_tags
+  - kind: python_call_within
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+    call: incarnation_tags.project_instance_tags
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+    pattern: "instance_request = {'name': instance_name, 'region': region, 'size': config.node_config['InstanceType'], 'image': image_id, 'ssh_keys': [ssh_key_id(config.authentication_config['ssh_public_key'])['fingerprint']], 'tags': tags}"
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+    pattern: "volume_request = {'size_gigabytes': config.node_config['DiskSize'], 'name': instance_name, 'region': region, 'filesystem_type': 'ext4', 'tags': tags}"
+  replacement: Descriptor-owned dual incarnation and provider-create-attempt tag projection inserted identically into exact droplet and volume requests
+  dependencies:
+  - PLA-M4-112
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_legacy_digitalocean_incarnation_marker_writer_or_reader
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_exact_incarnation_and_attempt_tag_bytes_dual_request_and_reserved_namespace_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_legacy_digitalocean_marker_projection_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_descriptor_owned_dual_tag_projection_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_legacy_incarnation_marker_writer_owns_no_schema
+      satisfied: true
+      evidence:
+      - The legacy marker projector and writer own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  - tests/unit_tests/test_sky/provision/test_do_incarnation_tags.py
+  evidence: {}
+  blocker: null
+- id: PLA-M4-117
+  milestone: M4
+  introduced_by: 44add3fa3c0bc346ed957c666e7ceb1c034ab021
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_incarnation_marker_generic_propagation_bridge
+  runtime_affecting: true
+  locators:
+  - kind: python_ast_pattern
+    path: sky/provision/common.py
+    symbol: ProvisionConfig
+    pattern: 'cluster_incarnation: str | None = dataclasses.field(default=None, kw_only=True, repr=False)'
+  - kind: python_ast_pattern
+    path: sky/provision/common.py
+    symbol: ProvisionConfig.get_redacted_config
+    pattern: config.pop('cluster_incarnation', None)
+  - kind: python_ast_pattern
+    path: sky/provision/provisioner.py
+    symbol: bulk_provision
+    pattern: "bootstrap_config = provision_common.ProvisionConfig(provider_config=original_config['provider'], authentication_config=original_config['auth'], docker_config=original_config.get('docker', {}), node_config=original_config['available_node_types'][head_node_type]['node_config'], count=num_nodes, tags={}, resume_stopped_nodes=True, ports_to_open_on_launch=ports_to_open_on_launch, cluster_incarnation=cluster_incarnation)"
+  - kind: python_ast_pattern
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: RetryingVmProvisioner._retry_zones
+    pattern: "getattr(provisioner, '_BUILTIN_BULK_PROVISION', None)"
+  - kind: python_ast_pattern
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: RetryingVmProvisioner._retry_zones
+    pattern: bulk_provision_kwargs['cluster_incarnation'] = self._active_cluster_hash
+  replacement: Descriptor-bound ActuationBindingV1 carries durable cluster incarnation and create-attempt identity without a compatibility-only ProvisionConfig field or builtin-call seam
+  dependencies:
+  - PLA-M4-112
+  - PLA-M4-116
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_legacy_incarnation_keyword_field_redaction_and_builtin_dispatch_bridge
+      satisfied: false
+      evidence: []
+    test:
+    - id: descriptor_binding_incarnation_attempt_identity_and_old_new_client_compatibility_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_legacy_incarnation_propagation_bridge_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: descriptor_binding_identity_propagation_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: legacy_incarnation_propagation_bridge_owns_no_schema
+      satisfied: true
+      evidence:
+      - The compatibility-only field and call seam own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  - tests/unit_tests/test_sky/provision/test_provision_cluster_incarnation.py
+  - tests/unit_tests/test_sky/test_failover_classification.py
+  evidence: {}
+  blocker: null
+- id: PLA-M4-118
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_process_cached_ssh_key_lookup_and_creation_effect
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
+    symbol: _ssh_key_id
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
+    symbol: ssh_key_id
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: ssh_key_id
+    pattern: client().ssh_keys.list(per_page=50, page=page)
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: ssh_key_id
+    pattern: client().ssh_keys.create(body=request)
+  - kind: python_call_within
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+    call: ssh_key_id
+  replacement: Descriptor-bound NodeAccessBindingFacetV1 and durable preexisting DigitalOceanSshKeyBindingV1 with no V1 key creation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_process_cached_ssh_key_lookup_or_create_effect
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_preexisting_ssh_key_unique_binding_revalidation_missing_duplicate_stale_and_no_create_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_ssh_key_create_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_preexisting_ssh_key_binding_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_legacy_ssh_key_helper_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local SSH key cache and helper own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-119
+  milestone: M4
+  introduced_by: 44add3fa3c0bc346ed957c666e7ceb1c034ab021
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_builtin_bulk_provision_incarnation_compatibility_alias
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/provisioner.py
+    symbol: _BUILTIN_BULK_PROVISION
+  replacement: Descriptor dispatch carries the pinned actuation binding without callable-identity-gated keyword injection
+  dependencies:
+  - PLA-M4-117
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_builtin_bulk_provision_incarnation_compatibility_alias
+      satisfied: false
+      evidence: []
+    test:
+    - id: descriptor_dispatch_old_new_provisioner_signature_compatibility_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_incarnation_compatibility_alias_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: descriptor_dispatch_binding_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: builtin_bulk_provision_compatibility_alias_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local compatibility alias owns no database schema.
   retained_references:
   - docs/designs/provider-lifecycle-actuation.md
   evidence: {}
