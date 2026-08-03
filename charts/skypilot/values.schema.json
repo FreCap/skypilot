@@ -1345,7 +1345,8 @@
                     "type": "object",
                     "properties": {
                         "activeCohort": {
-                            "type": "string"
+                            "type": "string",
+                            "maxLength": 42
                         },
                         "auth": {
                             "type": "object",
@@ -1356,26 +1357,155 @@
                                 "key": {
                                     "type": "string"
                                 }
-                            }
+                            },
+                            "additionalProperties": false
                         },
                         "cohorts": {
-                            "type": "array",
+                            "allOf": [
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "required": [
+                                            "id",
+                                            "replicas",
+                                            "image",
+                                            "imagePullPolicy",
+                                            "ociConfigDigest",
+                                            "qualificationArtifact",
+                                            "podTemplateContract",
+                                            "artifactInventory",
+                                            "callableInventory"
+                                        ],
+                                        "properties": {
+                                            "artifactInventory": {},
+                                            "callableInventory": {},
+                                            "id": {},
+                                            "image": {},
+                                            "imagePullPolicy": {},
+                                            "ociConfigDigest": {},
+                                            "podTemplateContract": {},
+                                            "qualificationArtifact": {},
+                                            "replicas": {}
+                                        },
+                                        "additionalProperties": false
+                                    }
+                                }
+                            ],
                             "items": {
+                                "type": "object",
                                 "properties": {
+                                    "artifactInventory": {
+                                        "type": "object",
+                                        "required": [
+                                            "repoPath",
+                                            "byteSize",
+                                            "sha256"
+                                        ],
+                                        "properties": {
+                                            "byteSize": {
+                                                "type": "integer",
+                                                "minimum": 1
+                                            },
+                                            "repoPath": {
+                                                "const": "sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"
+                                            },
+                                            "sha256": {
+                                                "type": "string",
+                                                "pattern": "^[0-9a-f]{64}$"
+                                            }
+                                        },
+                                        "additionalProperties": false
+                                    },
+                                    "callableInventory": {
+                                        "type": "object",
+                                        "required": [
+                                            "repoPath",
+                                            "byteSize",
+                                            "sha256"
+                                        ],
+                                        "properties": {
+                                            "byteSize": {
+                                                "type": "integer",
+                                                "minimum": 1
+                                            },
+                                            "repoPath": {
+                                                "const": "sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"
+                                            },
+                                            "sha256": {
+                                                "type": "string",
+                                                "pattern": "^[0-9a-f]{64}$"
+                                            }
+                                        },
+                                        "additionalProperties": false
+                                    },
                                     "id": {
                                         "type": "string",
-                                        "maxLength": 63,
+                                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$",
+                                        "maxLength": 42,
                                         "minLength": 1
                                     },
                                     "image": {
                                         "type": "string",
+                                        "pattern": "^.+@sha256:[0-9a-f]{64}$",
                                         "minLength": 1
                                     },
                                     "imagePullPolicy": {
-                                        "type": "string"
+                                        "const": "Always"
+                                    },
+                                    "ociConfigDigest": {
+                                        "type": "string",
+                                        "pattern": "^sha256:[0-9a-f]{64}$"
+                                    },
+                                    "podTemplateContract": {
+                                        "type": "object",
+                                        "required": [
+                                            "repoPath",
+                                            "byteSize",
+                                            "sha256"
+                                        ],
+                                        "properties": {
+                                            "byteSize": {
+                                                "type": "integer",
+                                                "minimum": 1
+                                            },
+                                            "repoPath": {
+                                                "const": "sky/serve/resource_action_provider_preflight.py"
+                                            },
+                                            "sha256": {
+                                                "type": "string",
+                                                "pattern": "^[0-9a-f]{64}$"
+                                            }
+                                        },
+                                        "additionalProperties": false
+                                    },
+                                    "qualificationArtifact": {
+                                        "type": "object",
+                                        "required": [
+                                            "repoPath",
+                                            "byteSize",
+                                            "sha256"
+                                        ],
+                                        "properties": {
+                                            "byteSize": {
+                                                "type": "integer",
+                                                "maximum": 65536,
+                                                "minimum": 1
+                                            },
+                                            "repoPath": {
+                                                "type": "string",
+                                                "pattern": "^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$",
+                                                "maxLength": 253,
+                                                "minLength": 1
+                                            },
+                                            "sha256": {
+                                                "type": "string",
+                                                "pattern": "^[0-9a-f]{64}$"
+                                            }
+                                        },
+                                        "additionalProperties": false
                                     },
                                     "replicas": {
-                                        "type": "integer"
+                                        "const": 2
                                     }
                                 }
                             }
@@ -1388,13 +1518,27 @@
                             "maximum": 65535,
                             "minimum": 1
                         },
+                        "installationId": {
+                            "type": "string",
+                            "pattern": "^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                        },
                         "preflightPort": {
-                            "type": "integer",
+                            "const": 46583,
                             "maximum": 65535,
                             "minimum": 1
                         },
                         "retirementTombstones": {
-                            "type": "array",
+                            "allOf": [
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$",
+                                        "maxLength": 42,
+                                        "minLength": 1
+                                    }
+                                }
+                            ],
+                            "uniqueItems": true,
                             "items": {
                                 "type": "string"
                             }
@@ -1414,9 +1558,11 @@
                                 "privateKeyKey": {
                                     "type": "string"
                                 }
-                            }
+                            },
+                            "additionalProperties": false
                         }
-                    }
+                    },
+                    "additionalProperties": false
                 }
             }
         },

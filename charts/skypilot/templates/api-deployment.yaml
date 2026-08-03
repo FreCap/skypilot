@@ -10,6 +10,33 @@
 {{- $executorReplicas := dig "replicas" 2 $executorService -}}
 {{- $controllerService := .Values.controllerService | default (dict) -}}
 {{- $controllerReplicas := dig "replicas" 2 $controllerService -}}
+{{- $resourceActions := .Values.resourceActions | default (dict) -}}
+{{- $authorityWorker := get $resourceActions "authorityWorker" | default (dict) -}}
+{{- $authorityWorkerEnabled := get $authorityWorker "enabled" | default false -}}
+{{- $authorityInstallationId := get $authorityWorker "installationId" | default "" -}}
+{{- $authorityCohortSuffixes := list -}}
+{{- $authorityRetirementTombstones := list -}}
+{{- if $authorityWorkerEnabled -}}
+{{- $authoritySuffixSet := dict -}}
+{{- range $cohort := get $authorityWorker "cohorts" | default (list) -}}
+{{- $suffix := get $cohort "id" | default "" -}}
+{{- if hasKey $authoritySuffixSet $suffix -}}
+{{- fail (printf "resourceActions.authorityWorker cohort id %q is duplicated" $suffix) -}}
+{{- end -}}
+{{- $_ := set $authoritySuffixSet $suffix true -}}
+{{- $authorityCohortSuffixes = append $authorityCohortSuffixes $suffix -}}
+{{- end -}}
+{{- $authorityCohortSuffixes = sortAlpha $authorityCohortSuffixes -}}
+{{- $authorityTombstoneSet := dict -}}
+{{- range $suffix := get $authorityWorker "retirementTombstones" | default (list) -}}
+{{- if or (hasKey $authoritySuffixSet $suffix) (hasKey $authorityTombstoneSet $suffix) -}}
+{{- fail (printf "resourceActions.authorityWorker retirement tombstone %q is duplicated or still active" $suffix) -}}
+{{- end -}}
+{{- $_ := set $authorityTombstoneSet $suffix true -}}
+{{- $authorityRetirementTombstones = append $authorityRetirementTombstones $suffix -}}
+{{- end -}}
+{{- $authorityRetirementTombstones = sortAlpha $authorityRetirementTombstones -}}
+{{- end -}}
 {{- $externalLB := .Values.serve.externalLoadBalancer | default (dict) -}}
 {{- $externalLBEnabled := get $externalLB "enabled" | default false -}}
 {{- $externalLBResources := get $externalLB "resources" | default (dict) -}}
@@ -30,13 +57,24 @@
 {{- fail "serve.externalLoadBalancer.auth.lbDataPlane.existingSecret and serve.externalLoadBalancer.auth.lbDataPlane.key must either both be set or both be empty when serve.externalLoadBalancer.enabled=true" -}}
 {{- end -}}
 {{- $lbDataPlaneAuthEnabled := and $externalLBEnabled (not (empty $lbDataPlaneSecret)) (not (empty $lbDataPlaneKey)) -}}
+{{- if and $externalLBEnabled $lbDataPlaneAuthEnabled (eq $lbSyncSecret $lbDataPlaneSecret) (eq $lbSyncKey $lbDataPlaneKey) -}}
+{{- fail "serve.externalLoadBalancer.auth.lbSync and serve.externalLoadBalancer.auth.lbDataPlane must reference different Secret keys" -}}
+{{- end -}}
+{{- if and $externalLBEnabled $lbDataPlaneAuthEnabled (eq $controllerAdminSecret $lbDataPlaneSecret) (eq $controllerAdminKey $lbDataPlaneKey) -}}
+{{- fail "serve.externalLoadBalancer.auth.controllerAdmin and serve.externalLoadBalancer.auth.lbDataPlane must reference different Secret keys" -}}
+{{- end -}}
 {{- if and $externalLBEnabled (not (empty $lbSyncSecret)) (not (empty $lbSyncKey)) (not (empty $controllerAdminSecret)) (not (empty $controllerAdminKey)) (not $lbDataPlaneAuthEnabled) -}}
 {{- fail "serve.externalLoadBalancer.auth.lbDataPlane is required when serve.externalLoadBalancer.enabled=true" -}}
 {{- end -}}
 {{- /* Custom credential wiring is the compatibility path when a native chart
-      credential block is disabled. Reserve provider-owned fields only when the
-      chart will actually emit them. */ -}}
-{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
+      credential block is disabled. Reserve provider-owned credential fields
+      only when the chart will actually emit them. The authority activation
+      marker has no compatibility meaning and remains chart-owned in every
+      mode. */ -}}
+{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
+{{- if $authorityWorkerEnabled -}}
+{{- $apiReservedEnvNames = concat $apiReservedEnvNames (list "SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON") -}}
+{{- end -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedEnvNames = concat $apiReservedEnvNames (list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY") -}}
 {{- end -}}
@@ -251,11 +289,9 @@ spec:
         # This label indicates that the API server is ready to serve requests.
         skypilot.co/ready: "true"
     spec:
-      # External-LB mode also needs the SA token: the consolidated controller
-      # uses in-cluster config (is_incluster_config_available() checks for the
-      # projected token) to create/reconcile each service's LB Deployment+Service.
-      # Without it create_lb_deployment_and_service() silently no-ops.
-      automountServiceAccountToken: {{ or .Values.kubernetesCredentials.useApiServerCluster $externalLBEnabled }}
+      # External-LB and resource-action authority modes also need the SA token:
+      # their API-role reconcilers use in-cluster config for exact scoped reads.
+      automountServiceAccountToken: {{ or .Values.kubernetesCredentials.useApiServerCluster $externalLBEnabled $authorityWorkerEnabled }}
       serviceAccountName: {{ include "skypilot.serviceAccountName" . }}
       {{- with .Values.podSecurityContext }}
       securityContext:
@@ -322,6 +358,16 @@ spec:
           value: {{ .Values.apiService.skypilotDev | quote }}
         - name: SKYPILOT_RELEASE_NAME
           value: {{ $fullName | quote }}
+        {{- if $authorityWorkerEnabled }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+          value: "true"
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
+          value: {{ $authorityInstallationId | quote }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+          value: {{ toRawJson $authorityCohortSuffixes | quote }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
+          value: {{ toRawJson $authorityRetirementTombstones | quote }}
+        {{- end }}
         - name: SKYPILOT_API_REQUEST_BACKEND
           value: {{ .Values.requestStore.backend | quote }}
         - name: SKYPILOT_API_SERVER_ROLE

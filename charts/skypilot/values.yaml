@@ -354,34 +354,51 @@ controllerService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: kubernetes.io/hostname
 
-# Dedicated normal-executor cohorts for private Serve resource actions.  This
-# surface is dark by default; enabling it requires registered Serve033 cohort
-# identities that exactly match the immutable routing inputs rendered here.
+# Dedicated preflight-only authority cohorts for private Serve resource
+# actions. This surface stays dark until an immutable image has been built and
+# its separately reviewed OCI qualification artifact is packaged by the chart.
 resourceActions:
+  # @schema additionalProperties: false
   authorityWorker:
     # @schema type: [boolean]
     enabled: false
+    # Immutable installation UUID used to derive database-wide cohort IDs.
+    # Never reuse or change this value while cohort or tombstone rows exist.
+    # @schema type: string; pattern: ^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+    installationId: ""
     # Cohort selected for new preparation references.  Existing DRAINING
     # cohorts remain listed until all of their frozen work is released.
-    # @schema type: string
+    # @schema type: string; maxLength: 42
     activeCohort: ""
-    # @schema type: array; itemProperties: {"id": {"type": "string", "minLength": 1, "maxLength": 63}, "replicas": {"type": "integer"}, "image": {"type": "string", "minLength": 1}, "imagePullPolicy": {"type": "string"}}
+    # Each cohort requires a <=42-character DNS-label suffix, exactly two
+    # replicas, a manifest-digest-pinned image and distinct OCI config digest,
+    # one chart-packaged qualification ref, and three installed-package refs.
+    # @schema type: array; item: object
+    # @schema itemProperties: {"id":{"type":"string","minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"},"replicas":{"type":"integer","const":2},"image":{"type":"string","minLength":1,"pattern":"^.+@sha256:[0-9a-f]{64}$"},"imagePullPolicy":{"type":"string","const":"Always"},"ociConfigDigest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"qualificationArtifact":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","minLength":1,"maxLength":253,"pattern":"^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"},"byteSize":{"type":"integer","minimum":1,"maximum":65536},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"podTemplateContract":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_provider_preflight.py"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"artifactInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"callableInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
+    # @schema allOf: [{"type":"array","items":{"properties":{"id":{},"replicas":{},"image":{},"imagePullPolicy":{},"ociConfigDigest":{},"qualificationArtifact":{},"podTemplateContract":{},"artifactInventory":{},"callableInventory":{}},"additionalProperties":false,"required":["id","replicas","image","imagePullPolicy","ociConfigDigest","qualificationArtifact","podTemplateContract","artifactInventory","callableInventory"]}}]
     cohorts: []
     # Cohort IDs whose removed Deployment/ServiceAccount names remain visible
-    # to the surviving retirement verifier.
-    # @schema type: array; item: string
+    # to the surviving API retirement verifier.  After the last cohort is
+    # removed, keep enabled=true, activeCohort="", cohorts=[], and at least one
+    # tombstone until every matching central row is RETIRED.
+    # @schema type: array; item: string; uniqueItems: true
+    # @schema allOf: [{"type":"array","items":{"minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"}}]
     retirementTombstones: []
     # @schema type: [integer]; minimum: 1; maximum: 65535
     healthPort: 46581
     # The future authenticated preflight endpoint.  The routing slice exposes
     # no mutation service and does not treat this Service as activation proof.
-    # @schema type: [integer]; minimum: 1; maximum: 65535
+    # @schema type: [integer]; minimum: 1; maximum: 65535; const: 46583
     preflightPort: 46583
+    # @schema additionalProperties: false
     auth:
+      # This purpose-only Secret/key must differ from every external-LB auth
+      # Secret/key. The controller also rejects equal mounted token bytes.
       # @schema type: string
       existingSecret: ""
       # @schema type: string
       key: tokens
+    # @schema additionalProperties: false
     tls:
       # @schema type: string
       existingSecret: ""
@@ -416,10 +433,12 @@ requestStore:
 
 # Run central PostgreSQL schema upgrades in a revision-scoped Kubernetes Job.
 # API replicas verify the resulting revision and never execute deployment DDL.
-# Guarded HA runs the Job as a blocking pre-install and pre-upgrade hook and
-# therefore requires a pre-existing apiService.dbConnectionSecretName.
-# Compatibility mode keeps a regular Job so a chart-managed dbConnectionString
-# Secret can be created first.
+# A PostgreSQL request store backed by a pre-existing
+# apiService.dbConnectionSecretName runs the Job as a blocking pre-install and
+# pre-upgrade hook, including after HA and authority-worker values are cleared.
+# That hook validates the proposed authority release inventory before Helm
+# mutates workloads. Compatibility mode keeps a regular Job so a chart-managed
+# dbConnectionString Secret can be created first.
 databaseMigration:
   # @schema type: [boolean]
   enabled: true
@@ -625,7 +644,7 @@ serve:
     # Each Secret value is a newline-delimited token ring. Keep the current and
     # previous token during rotation within ONE ring; projected Secret volumes
     # update in place. The lbSync and controllerAdmin rings must remain
-    # disjoint in content, and cannot reference the same Secret key.
+    # pairwise disjoint in content, and cannot reference the same Secret key.
     # @schema type: [object, null]
     auth:
       # Tokens presented by an external LB when syncing replica/load state.

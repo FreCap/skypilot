@@ -1,0 +1,4 @@
+global:
+  extraEnvs:
+    - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
+      value: crossed

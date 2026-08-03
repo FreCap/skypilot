@@ -286,166 +286,166 @@ _PARTIAL_DOWN_CASES = (
 _PARTIAL_DOWN_SPEC_GOLDEN_MANIFEST_V1 = {
     'realistic': {
         'create_intent_0_not_found':
-            (40902,
-             'c3ca60be204c5cdaae0858615ce0651c30ce36725305b4a3f725d991a738e1ac'
+            (44733,
+             '8c5f499843c3a07695f69201f8c3f2e425e5c2ea3d2e43fe6d8dfce0009d8c74'
             ),
         'objects_partial_1_not_found':
-            (41245,
-             '90770c254f142f1c0fcd1ad1ca4e9c3b03a7eed682400d109ede0545c7b8a7d9'
+            (45076,
+             '7d45821508385bc555bf3d6afc13822129743ef6c1f75e99e651e7e70dbe8e39'
             ),
         'create_intent_1_not_found':
-            (41245,
-             '4f0843ce69d8b58c33dd72a11e20e8ba04c960ef5839fd8263d6e914c4658d3a'
+            (45076,
+             'c3f5c0a187d18ae478c0f3eaad45c6b458dc826426aa1948cf0dce54862579d4'
             ),
         'objects_partial_2_not_found':
-            (41576,
-             'f65522552fcc3d9f75e068c727cfa842e6547c798f26cd7a5b17d5bd457ec4b2'
+            (45407,
+             '3002be9c4ed62600ab67b85bbc3dc19efbd921e721d1af412359944509f22231'
             ),
         'create_intent_2_not_found':
-            (41576,
-             '6ef439f6129f354e11c49040931650a451b879d917dbfd37eff519fb38efe28e'
+            (45407,
+             'ccb18419f3bbba72dd9363a2159a7298766c9213875d03466d5234311c2ffa0d'
             ),
         'objects_partial_3_unscheduled_not_found':
-            (41586,
-             '451c21ae311a277b175f6c83642483f287c602ced07a3a534e00c754087717d6'
+            (45417,
+             'a8bc177ffd49054fb13d48aa5c004e45d9789b943f4f7eb1d701136cc0734861'
             ),
         'objects_exact_not_found':
-            (41667,
-             '974d64610580aef4fdfcc51d2f6ab23f9e181409009dd2808d78325d73997d15'
+            (45498,
+             '360a42181903b66588c01216b6c2b9edd0a7bd2c18f8f199e375b5fd747703c9'
             ),
         'handle_intent_not_found':
-            (41667,
-             '091a086a0c4bb40f646fbea98088c5321cac26b98bf0ea730af7f9278dc640c3'
+            (45498,
+             'a81c4b0cc88de5102728766fe3612a23cf0ef66d06949e46b3295f79b4abc6a6'
             ),
         'handle_committed_not_found':
-            (41667,
-             '3899af5c151589a461fa079947b86982874785d1ef4ebc8aa0fea04b19ae8a77'
+            (45498,
+             'd7804d51a3def6d762a70636884a64793fc35f105447b18304fce56f3a86905a'
             ),
         'handle_committed_exact_handle':
-            (42528,
-             'e5101e78369455c8c88919674561cbbe229c84cb10f53d40bb78aec47db1fd1c'
+            (46359,
+             '118e2ad21ea5c0bb1b3301fcd80a87ac57ec5654fe1d5c9cf8973740f31e773e'
             ),
         'runtime_ready_not_found':
-            (41667,
-             '3979e4cd73fd7ae758986bba041d0bfebd8bf3945c76100bd57e56afeb746186'
+            (45498,
+             'b8b9faa188ce3f45f090d270744be159a025bb3c9e6558522142ee90539cc753'
             ),
         'runtime_ready_exact_handle':
-            (42528,
-             '83636bcbd2c51669a5f9dc2c899f5ee3e88c7c6bb8d472aae85e56790b98fb3e'
+            (46359,
+             'dfc01ec9bc1240820b0ea7bbf15ff8e40d009419b8a4d25d0992af8646082552'
             ),
         'job_intent_not_found':
-            (41667,
-             '65e6520fcef3b71cb8128ad9b1ab1c76caddffb55b38abd21efc2d7dd3f9327b'
+            (45498,
+             '021704f1f232b4e9e27e24cf524a8e22217dd4f09a1e7f705c2b7c560e69f242'
             ),
         'job_intent_exact_handle':
-            (42528,
-             '157829fe6fcb74e66504df3ffc1cf64ac3dc3f9aa7589de26f57db014fab589a'
+            (46359,
+             '717de202eca2d78f6a213179c32810b2b64f9fa3d9e7d6920408f02f661831c3'
             ),
         'job_committed_not_found':
-            (41667,
-             'a49450742e8ad05a130ccf8dbba7f1ed9850b4495ae6cf103127d6d89da12be8'
+            (45498,
+             'f34a851f6b05de6b12030f611ca774bd39839e35206ab7ab6db0cec3dac90f14'
             ),
         'job_committed_exact_handle':
-            (42528,
-             'cf1450c232d09ac7f954ae3832f05293ae7d9bd0811e148b82ff0aa87197a727'
+            (46359,
+             '5c60bfed33d1415c20bdffd33f8c2b13f25fd476fcee8df2bb4615916e3a983e'
             ),
         'job_running_not_found':
-            (41667,
-             '4346bba59c134692a0826d3e9978478dacdf996bc79bd35ecf74e6ff23d3aa24'
+            (45498,
+             '07424fadc3c10b748714f38f6e6ae26562c007c4aa34c5aaceeb3ae44ead92a0'
             ),
         'job_running_exact_handle':
-            (42528,
-             '74ba0982994e3f5961c5b31d82193d276d67299d459eb9bc50d74ba26bb325d2'
+            (46359,
+             'f0cc7f54f00b851af00b643bb9c8eb3487a8fda40e84299de72238c058bab8ff'
             ),
         'endpoint_resolved_not_found':
-            (41667,
-             '1223070789777fbc695a87732e7dc02afd7a025dc7950bd68f2b2eabf73320c4'
+            (45498,
+             '6bba103f5283c33cc5347207205a1eb20576af175238a04e697d537dfe833d7d'
             ),
         'endpoint_resolved_exact_handle':
-            (42528,
-             '9a4c2a674a4ad0758ad30f7b0013af59f7c8868ccd5a2ed11dace135b15d2115'
+            (46359,
+             '083812b30aa6351522d3f17407eab50a5a4caf9c6bc34b62bf0e6bfae72ead6e'
             ),
     },
     'candidate_maximal': {
         'create_intent_0_not_found':
-            (40929,
-             '943fdb0767d09b148c5686bae959c1975b26c11edb528108f17d1266bdba6c67'
+            (44760,
+             '77bd3563530d2b1a3c0fc67cab98001e6ff407d0a5037e58123c946a91cae97a'
             ),
         'objects_partial_1_not_found':
-            (42276,
-             'a6804d63efcd8e95ba9c673077fdb29a087d61c432dd120a32316534d5d16f52'
+            (46107,
+             '6572cfbc5ea6e6977c2b615098e12a4f1c4b86b5fe5b15e0f7c9f0d77f6b1701'
             ),
         'create_intent_1_not_found':
-            (42276,
-             '6bbbd6058d241fb6e757f0da35492147d1a3ecea018ff83941b3e3bdabebebb1'
+            (46107,
+             '97541d7bbe670a71a6e5c2bd3964be21934c6e46b2cee6db9d8d28fa51dd145c'
             ),
         'objects_partial_2_not_found':
-            (43615,
-             'c171ed9be5b68a7112df0c064c136527229dfa98fb2ab883c2f8bc3ed50b167a'
+            (47446,
+             'cd8b5ee788cf51785c377d5042aab2f176ae4bbccb607b0f1dfef930beff8449'
             ),
         'create_intent_2_not_found':
-            (43615,
-             'a17449a9fede611f5a50b8940f4a72b68e7960b0b07d12cb89e8ec4a454eadbb'
+            (47446,
+             '5d79caa3e83bb8923dd521cfbf221bb70753c0f4876bd8691d10718dbb29a527'
             ),
         'objects_partial_3_unscheduled_not_found':
-            (44637,
-             'ed97ac6a68f6bc39470806aa51d5b5b89a22a2e3875e6257e8d6477189a27484'
+            (48468,
+             'e7ee42f17e5137c1d6b78f93693ae65c4ee510e4677b4f56bb46b1c2bc845920'
             ),
         'objects_exact_not_found':
-            (44718,
-             'abda7acfa130801ff6c2218edaa561570cdaee9163836a5dd3cf6f06ad0ff02f'
+            (48549,
+             '4f652bcb0a6f8a2269036f28d9445690fc133e4786bee0fbddbea4e37800e6c4'
             ),
         'handle_intent_not_found':
-            (44718,
-             '09ffb85c73b79282c56d96a3226fd09f2c5dc35b2fa3683b49ead0f4dbaf867b'
+            (48549,
+             '85c0260b525985529f45ff3dc6aefa841d51c92ee5b7f0d034b1a91fd8798bbb'
             ),
         'handle_committed_not_found':
-            (44718,
-             '6b5342f2954c59b688a9176d873ece8b778b765c92153a4994e01bb02b301a8d'
+            (48549,
+             '28af3e470b9c4dd36463b8b7b393487ce44e56fc822dc25af2cb21680c6f7b17'
             ),
         'handle_committed_exact_handle':
-            (48603,
-             '03b507aede0721a5189687a2315de1e08f97549000aac47df36bdb65578ba2cc'
+            (52434,
+             '920f60a7c0a0c3b8cd5a9202be43a8ea73c18cc460de00fc8359192d6d64bfc1'
             ),
         'runtime_ready_not_found':
-            (44718,
-             '5951215d10dcfe7ab9fb9513f99f786d9ec80c95730b2963aef442587da3c16c'
+            (48549,
+             'c5ea17afabb3a5befd425d7bf5fc4bf135baa3da5bd1eb4c704affcf71dbfde4'
             ),
         'runtime_ready_exact_handle':
-            (48603,
-             '5acd2c4edfa4efc109bea49ff91fc3709ecbd46f7d769cfb9306fd1c02051b1c'
+            (52434,
+             'ddad030f61f06f9c6558c8c3ee77457dbc2d582fd8b6d07a024227ff276b8ef7'
             ),
         'job_intent_not_found':
-            (44718,
-             '9a9636903a9653dd06ab4e2c59971edf520a4e8abd2060e109fe62935a17b250'
+            (48549,
+             'e60fe4bf259aeb00773a290b3f1bf23dcd9830350e67765430613cf632b55ee1'
             ),
         'job_intent_exact_handle':
-            (48603,
-             '73193bb83ddf96ed096e76789196ad1def97c8f18652ec57fef804498f4db98b'
+            (52434,
+             'ee6ca242e42ac71908405fb3d3ae68610e8b3c5000486a3ce4b67e4bf20c795e'
             ),
         'job_committed_not_found':
-            (44718,
-             '7126ac1d0bfec4bbac7f1f70564484a4ff324f57efff409d458bfbe645eeb993'
+            (48549,
+             '82e663f9951aa49c384082edae69b3031f1829016776a7859dc64800de35dba2'
             ),
         'job_committed_exact_handle':
-            (48603,
-             '4036710b64d408b349edf5c00d06abb7852a9d87c36a153a5b7c0a35aaaecad5'
+            (52434,
+             '437002f3f48a8d70f61e6ff461410fdf89a2f8c02bf6d5b2af20de6dd07db6ad'
             ),
         'job_running_not_found':
-            (44718,
-             'b1264bae9df8c2829bf81a218a08166087893fcfe075bc3f58491ed4f53aa49a'
+            (48549,
+             '11343849111c0162ba9296df10e28b0ce98621e90bb26ab096cf3b550a750b73'
             ),
         'job_running_exact_handle':
-            (48603,
-             '8905715e2acf2722e94e8f4bc95aa8c8fc7435541e59ebc8b5f8e8a61dd9f7cd'
+            (52434,
+             '5553d080ef26d25b77173de1c88db4f5abee00acc8892c3401b0dd181ef33319'
             ),
         'endpoint_resolved_not_found':
-            (44718,
-             '7c578cf5cfb7a9d8bbc3829a8125be8ee500eb2edde0ab736d49d03b97093b45'
+            (48549,
+             'f32fb2d8e1efad09c2d63873473a48184631a3937c6eed095322a2dbbcad1e4d'
             ),
         'endpoint_resolved_exact_handle':
-            (48603,
-             '198a9edd1a8f7cdde06668257ef9968248ee8861d17b6f7c900a69332e68a7d0'
+            (52434,
+             '32375a2a73ed0b7fddc7ee1c7cedfa55a45962357f78252391fec23cd6ce7b4a'
             ),
     },
 }
@@ -1038,27 +1038,27 @@ def test_completed_down_spec_literal_size_and_hash_goldens() -> None:
     config = spec.invocation.require_down().execution_config
 
     assert (len(basis.canonical_bytes), basis.sha256) == (
-        7_705,
-        'b2c1a2521aed918a3a226072bad4b6b1a598b8dd8e9da906087e20f36be45838')
+        7_727,
+        'fd7c9d45f9cd1145d32a11ad74b7570d71d4fe687376c398f9ff13a6980e2322')
     assert (len(cleanup.canonical_bytes), cleanup.sha256) == (
         11_190,
-        '62f5070ee0db6df4742bfeb2e8fcc4c52ea0b98f803aed6cd1f5c2c405aa74d8')
+        '185b254247d8149b3b042cfa7d8d20a3e18b182039198779a57aaa26e502f33e')
     assert (len(config.capsule.canonical_bytes), config.capsule.sha256) == (
-        25_067,
-        '598eac1ff12dc289389bcb5707a23e0107668570ffa6df57dbae8b0894a66c1e')
+        28_843,
+        'a3c87b4ea539ace88eca79c896658900169695ef71201be64a18b44f6ebccc08')
     assert (len(config.canonical_bytes), config.sha256) == (
-        29_913,
-        'fab84be9a0d31b8cc94220a8ffe531e134766eb7f15bd9d6d174bdd6d4b27dbb')
+        33_700,
+        '511718d8f4402f7803752361c93881312f6d19eb5b11ab338b75df1702785243')
     assert (len(spec.invocation.canonical_bytes), spec.invocation.sha256) == (
-        41_166,
-        '9c1977d999d30373862677056855355e905a0c9fa61eee308e60d8bd6dbcf980')
+        44_986,
+        'ec71a0291f865694addeb307ec0e1184d3864b895c0a59af9bd5bb389ee5a2d8')
     assert (len(
         spec.provider_plan.canonical_bytes), spec.provider_plan.sha256) == (
-            3_878,
-            'b15b8be415ddac7b730f6844d534ffce3b990c66c77d23fff18cf6acd3e69c5a')
+            3_889,
+            'e8e78370fea6c50c030e3e693430aafc59548197ab812eeb36557f4ac157f9f9')
     assert (len(spec.canonical_bytes), spec.sha256) == (
-        45_088,
-        'a04de4329e36779997b4c99845f7eac68424b5d19c8792120717f73ec90d2dd7')
+        48_919,
+        'e51205dd1e6d7d44e2c92eb148290bc183deef25cadd97bc39c1d3716c7a5a68')
     assert len(spec.canonical_bytes) <= 60_000
 
 
@@ -1117,33 +1117,33 @@ def test_realistic_handle_committed_partial_down_component_goldens() -> None:
     config = spec.invocation.require_down().execution_config
 
     assert (len(cursor.canonical_bytes), cursor.sha256) == (
-        28_716,
-        '3ecec5f09161a670cf079d69b698ec697f096e746d62d306404c4f4414e5d1d2')
+        30_556,
+        '1443e523fc63de312f8a9ca4257fad77320f9fc15e93bcab59aa707a07c815c8')
     assert (len(quiescence.canonical_bytes), quiescence.sha256) == (
-        27_607,
-        '9ace94abed0fd8031f67781c1b0f048363039a90a5b83624ae7fc83d88dd2567')
+        29_447,
+        '176dd70df90fcdc895228aa69d9c3de0dd619507c49f4c440b8c1f57ce14d020')
     assert (len(basis.canonical_bytes), basis.sha256) == (
-        5_139,
-        '8e84f10e712170f4b6807f14d2d973d35b2948edcccbd77b0636290bd218f2f9')
+        5_161,
+        'c676ca770ccecdb2474d5fb83369614a655f47f48279c33a3771b2dba39b266f')
     assert (len(cleanup.canonical_bytes), cleanup.sha256) == (
         11_196,
-        'c5db037b65c5373b5927d90454743bf1ca10513653b4b9cc19f8fb3d89309e38')
+        '5d2b2d3957668e19eba7c3e431933e17b5e12f724b81a5e0f23fca23c2ba67ac')
     assert (len(config.capsule.canonical_bytes), config.capsule.sha256) == (
-        25_073,
-        '99900a7e0cb9fd5cc8055d81427ae0b93912b1c904ba97b10aba540d63c5daf2')
+        28_849,
+        'f0344b70e49a0a65116fc4abce530ff1e6d9cb20dcdf279f3d7802c473423c8d')
     assert (len(config.canonical_bytes), config.sha256) == (
-        29_919,
-        '672274d16176bd3c01f73f2fae3efd809f03215cec8fc16899713052c0a74e90')
+        33_706,
+        '12ca91c6a9973b4f1e6cee8e5c6b453ae70e38721589422ddcc91743173da9fd')
     assert (len(spec.invocation.canonical_bytes), spec.invocation.sha256) == (
-        38_606,
-        '1e322001b96a17156dfe69b2f3538473dfb4dee8142e52d20a42d0cd7801d71e')
+        42_426,
+        '0c32225c32b83695dd986702482d06c1d03476899639620fc9a0658aabcaccc7')
     assert (len(
         spec.provider_plan.canonical_bytes), spec.provider_plan.sha256) == (
-            3_878,
-            '476edbe55250fa5445969f089e07471424256b124de4267fe5d194bafe646390')
+            3_889,
+            '748e62ed00389d4cb4ec600da0e13041d12bb8bbf5f53828c65f07ea5884dcaf')
     assert (len(spec.canonical_bytes), spec.sha256) == (
-        42_528,
-        'e5101e78369455c8c88919674561cbbe229c84cb10f53d40bb78aec47db1fd1c')
+        46_359,
+        '118e2ad21ea5c0bb1b3301fcd80a87ac57ec5654fe1d5c9cf8973740f31e773e')
 
 
 def test_candidate_maximal_partial_down_component_goldens() -> None:
@@ -1166,14 +1166,14 @@ def test_candidate_maximal_partial_down_component_goldens() -> None:
     assert cursor.endpoint is not None
     assert len(cursor.endpoint.pod_uid.encode('utf-8')) == 1_024
     assert (len(cursor.canonical_bytes), cursor.sha256) == (
-        56_319,
-        'e5a8458b8a4781b2f4c833b2dc499407883399c6195c3d0edf18087ba230f1af')
+        58_771,
+        'ee25e6e3e7f24940a3805cd5642f50f05532e0c29a7279babba47339c7448631')
     assert (len(quiescence.canonical_bytes), quiescence.sha256) == (
-        41_704,
-        '94babbb7a9f587e5b4fa22329a0405fdeadc1c8d1dc407819f5711d3445bde8c')
+        44_004,
+        '26ba93fab9e90144fddec87df65e31473d48fbce1bde6475b0fae8d7ec913589')
     assert (len(spec.canonical_bytes), spec.sha256) == (
-        48_603,
-        '198a9edd1a8f7cdde06668257ef9968248ee8861d17b6f7c900a69332e68a7d0')
+        52_434,
+        '32375a2a73ed0b7fddc7ee1c7cedfa55a45962357f78252391fec23cd6ce7b4a')
 
 
 def test_serve_spec_parser_keeps_absolute_65536_byte_bound() -> None:

@@ -170,6 +170,21 @@ Compute full release name with optional fullnameOverride.
 {{- end -}}
 
 {{/*
+Stable, release-scoped name for a proposed authority cohort's pre-apply
+manifest.  Do not use skypilot.fullname here: fullnameOverride is mutable,
+while namespace + Helm release name is the durable release anchor.
+*/}}
+{{- define "skypilot.resourceActionAuthorityPreflightManifestName" -}}
+{{- $identity := printf "%s\n%s\n%s" .namespace .helmReleaseName .cohortSuffix -}}
+{{- printf "skypilot-ra-preflight-%s" (sha256sum $identity | trunc 40) -}}
+{{- end -}}
+
+{{/* Exact read-only path consumed by the migration preflight parser. */}}
+{{- define "skypilot.resourceActionAuthorityPreflightManifestPath" -}}
+{{- printf "/etc/skypilot/resource-action-authority/release-preflight/%s/manifest.json" .cohortSuffix -}}
+{{- end -}}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "skypilot.serviceAccountName" -}}

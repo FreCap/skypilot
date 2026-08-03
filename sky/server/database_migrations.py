@@ -44,6 +44,18 @@ def initialize_central_databases() -> None:
         # pylint: disable=import-outside-toplevel
         from sky.physical_capacity import state as capacity_state
         capacity_state.initialize_and_get_db()
+        release_preflight = os.environ.get(
+            'SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON')
+        if release_preflight is not None:
+            # This process is Helm's blocking pre-install/pre-upgrade hook.
+            # Validate the proposed cohort/tombstone inventory only after the
+            # Serve034 and its release ledger are at head, but before Helm
+            # mutates any workload.
+            # pylint: disable=import-outside-toplevel
+            from sky.server.requests import authority_worker_retirement
+            authority_worker_retirement.validate_release_preflight(
+                authority_worker_retirement.AuthorityWorkerReleasePreflight.
+                from_json(release_preflight))
     elif capacity_configuration.mode != capacity_config.CapacityMode.DISABLED:
         raise RuntimeError('Physical capacity requires the central PostgreSQL '
                            'database; SQLite supports only disabled mode.')

@@ -46,6 +46,7 @@ _MAX_ACTIVATION_EVIDENCE_AGE = datetime.timedelta(minutes=5)
 _MAX_WORKER_REGISTRATION_AGE = datetime.timedelta(minutes=5)
 _MAX_PROMOTION_INVENTORY_DECISIONS = 10_000
 _MAX_PROMOTION_INVENTORY_ATTEMPTS_AND_LINKS = 100_000
+_MAX_AUTHORITY_RELEASE_COHORTS = 256
 
 
 def _profile_is_authoritative(
@@ -221,6 +222,22 @@ class WorkerCohortRecord:
 class WorkerCohortTransition:
     record: WorkerCohortRecord
     adopted: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class AuthorityReleaseRecord:
+    """Validated current fence for one immutable Helm release identity."""
+
+    namespace: str
+    helm_release_name: str
+    installation_id: str
+    helm_full_name: str
+    enabled: bool
+    live_manifests: tuple[actions.ProviderAuthorityWorkerCohortManifestV1, ...]
+    tombstone_suffixes: tuple[str, ...]
+    revision: int
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
 
 
 @dataclasses.dataclass(frozen=True)
@@ -422,8 +439,8 @@ class ActivationGateEvidenceV1:
         if self.api_schema_revision not in ('005', '007'):
             raise ValueError('activation requires API schema revision 005 or '
                              '007.')
-        if self.serve_schema_revision != '033':
-            raise ValueError('activation requires Serve schema revision 033.')
+        if self.serve_schema_revision != '034':
+            raise ValueError('activation requires Serve schema revision 034.')
         if self.global_user_state_schema_revision != '028':
             raise ValueError('activation requires global-user-state schema '
                              'revision 028.')
@@ -592,6 +609,190 @@ def _validate_current_worker_registrations(
                     f'Worker {name} is older than five minutes.')
 
 
+def _registration_timestamp(value: str, *, name: str) -> datetime.datetime:
+    return _canonical_timestamp_datetime(value, name=name)
+
+
+def _registration_set(
+    cohort: actions.WorkerCohortIdentityV1,
+    registrations: tuple[actions.ProviderAuthorityWorkerRegistrationV1, ...],
+) -> actions.WorkerCohortRegistrationSetV1:
+    """Build one canonical sorted registration set owned by the store."""
+    return actions.WorkerCohortRegistrationSetV1(
+        version=1,
+        cohort_identity_sha256=cohort.sha256,
+        workers=tuple(sorted(registrations, key=lambda item: item.pod_uid)))
+
+
+def _registration_by_pod_uid(
+    registrations: actions.WorkerCohortRegistrationSetV1,
+) -> dict[str, actions.ProviderAuthorityWorkerRegistrationV1]:
+    return {item.pod_uid: item for item in registrations.registrations}
+
+
+def _renewal_immutable_value(
+    registration: actions.ProviderAuthorityWorkerRegistrationV1,
+) -> dict[str, Any]:
+    """Return every registration field which a same-Pod renewal freezes."""
+    value = registration.canonical_value()
+    value.pop('registered_at')
+    worker = value['worker']
+    assert isinstance(worker, dict)
+    worker.pop('observed_at')
+    worker.pop('pod_resource_version')
+    worker.pop('replica_set_resource_version')
+    return value
+
+
+def _validate_own_registration_renewal(
+    previous: actions.ProviderAuthorityWorkerRegistrationV1,
+    replacement: actions.ProviderAuthorityWorkerRegistrationV1,
+) -> None:
+    if replacement.pod_uid != previous.pod_uid:
+        raise kernel_actions.ActionConflict(
+            'Worker registration renewal changed the Pod UID.')
+    if (_renewal_immutable_value(previous)
+            != _renewal_immutable_value(replacement)):
+        raise kernel_actions.ActionConflict(
+            'Worker registration renewal changed frozen evidence.')
+    previous_registered = _registration_timestamp(previous.registered_at,
+                                                  name='previous.registered_at')
+    replacement_registered = _registration_timestamp(
+        replacement.registered_at, name='replacement.registered_at')
+    previous_observed = _registration_timestamp(
+        previous.worker.observed_at, name='previous.worker.observed_at')
+    replacement_observed = _registration_timestamp(
+        replacement.worker.observed_at, name='replacement.worker.observed_at')
+    if (replacement_registered <= previous_registered or
+            replacement_observed <= previous_observed):
+        raise kernel_actions.ActionConflict(
+            'Worker registration renewal timestamps must advance.')
+
+
+def _validate_stale_worker_registrations(
+    registrations: actions.WorkerCohortRegistrationSetV1,
+    database_now: datetime.datetime,
+) -> None:
+    """Require every registered/observed timestamp to be strictly expired."""
+    now = _timestamp(database_now,
+                     name='database_now').astimezone(datetime.timezone.utc)
+    for index, registration in enumerate(registrations.registrations):
+        timestamps = (
+            ('registered_at',
+             _registration_timestamp(
+                 registration.registered_at,
+                 name=f'registration[{index}].registered_at')),
+            ('observed_at',
+             _registration_timestamp(
+                 registration.worker.observed_at,
+                 name=f'registration[{index}].worker.observed_at')),
+        )
+        for name, timestamp in timestamps:
+            if timestamp > now:
+                raise kernel_actions.ActionConflict(
+                    f'Worker {name} is in the database future.')
+            if now - timestamp <= _MAX_WORKER_REGISTRATION_AGE:
+                raise kernel_actions.ActionConflict(
+                    'A registering worker cohort is not yet stale.')
+
+
+def _authority_release_label(value: Any,
+                             *,
+                             name: str,
+                             maximum_bytes: int = 63) -> str:
+    """Validate one canonical lowercase DNS label used by the ledger."""
+    normalized = _bounded_text(value, name=name, maximum_bytes=maximum_bytes)
+    if (not normalized.isascii() or normalized != normalized.lower() or
+            normalized[0] == '-' or normalized[-1] == '-' or
+            any(not (character.islower() or character.isdecimal() or
+                     character == '-') for character in normalized)):
+        raise ValueError(f'{name} must be one lowercase DNS label.')
+    return normalized
+
+
+def _authority_cohort_manifest_suffix(
+    manifest: actions.ProviderAuthorityWorkerCohortManifestV1,) -> str:
+    return manifest.pod_template_binding.release_inputs.cohort_suffix
+
+
+def _authority_cohort_manifest_installation_id(
+    manifest: actions.ProviderAuthorityWorkerCohortManifestV1,) -> str:
+    # ProviderAuthorityWorkerCohortManifestV1 has already validated the closed
+    # ra:<installation>:<release digest>:<suffix> grammar.
+    return manifest.cohort_id.split(':', 3)[1]
+
+
+def _authority_release_record(row: Mapping[str, Any]) -> AuthorityReleaseRecord:
+    """Decode and hash-check one durable release inventory row."""
+    try:
+        namespace = _authority_release_label(row['namespace'],
+                                             name='release.namespace')
+        release_name = _authority_release_label(
+            row['helm_release_name'], name='release.helm_release_name')
+        installation_id = str(
+            _canonical_uuid(row['installation_id'],
+                            name='release.installation_id'))
+        full_name = _authority_release_label(row['helm_full_name'],
+                                             name='release.helm_full_name')
+        enabled = row['enabled']
+        if type(enabled) is not bool:
+            raise TypeError('release.enabled must be Boolean.')
+        live_values = row['live_manifests']
+        if type(live_values) is not list:
+            raise TypeError('release.live_manifests must be a JSON array.')
+        if actions.canonical_sha256(
+                live_values) != row['live_inventory_sha256']:
+            raise ValueError('release live inventory hash does not match.')
+        live_manifests = tuple(
+            actions.ProviderAuthorityWorkerCohortManifestV1.from_value(value)
+            for value in live_values)
+        live_suffixes = tuple(
+            _authority_cohort_manifest_suffix(manifest)
+            for manifest in live_manifests)
+        if live_suffixes != tuple(sorted(set(live_suffixes))):
+            raise ValueError('release live inventory is not sorted and unique.')
+        tombstone_values = row['tombstone_suffixes']
+        if type(tombstone_values) is not list or any(
+                type(value) is not str for value in tombstone_values):
+            raise TypeError('release tombstone inventory must be a text array.')
+        if actions.canonical_sha256(
+                tombstone_values) != row['tombstone_inventory_sha256']:
+            raise ValueError('release tombstone inventory hash does not match.')
+        tombstones = tuple(
+            _authority_release_label(
+                value, name='release.tombstone_suffix', maximum_bytes=42)
+            for value in tombstone_values)
+        if tombstones != tuple(sorted(set(tombstones))):
+            raise ValueError('release tombstones are not sorted and unique.')
+        if (not set(live_suffixes).isdisjoint(tombstones) or
+                len(live_suffixes) + len(tombstones)
+                > _MAX_AUTHORITY_RELEASE_COHORTS):
+            raise ValueError('release inventories overlap or exceed bounds.')
+        if enabled and not live_manifests and not tombstones:
+            raise ValueError('enabled release row has an empty inventory.')
+        if not enabled and (live_manifests or tombstones):
+            raise ValueError('disabled release row has a nonempty inventory.')
+        for manifest in live_manifests:
+            release_inputs = manifest.pod_template_binding.release_inputs
+            if (manifest.namespace != namespace or
+                    release_inputs.helm_full_name != full_name or
+                    _authority_cohort_manifest_installation_id(manifest)
+                    != installation_id):
+                raise ValueError('release live manifest has another identity.')
+        revision = _positive_integer(row['revision'], name='release.revision')
+        created_at = _timestamp(row['created_at'], name='release.created_at')
+        updated_at = _timestamp(row['updated_at'], name='release.updated_at')
+        if updated_at < created_at:
+            raise ValueError('release update timestamp precedes creation.')
+        return AuthorityReleaseRecord(namespace, release_name, installation_id,
+                                      full_name, enabled, live_manifests,
+                                      tombstones, revision, created_at,
+                                      updated_at)
+    except (KeyError, TypeError, ValueError) as e:
+        raise kernel_actions.InvariantViolation(
+            'Authority release row failed closed validation.') from e
+
+
 def _worker_cohort_record(row: Mapping[str, Any]) -> WorkerCohortRecord:
     try:
         identity = _required_typed_pair(
@@ -629,9 +830,11 @@ def _worker_cohort_record(row: Mapping[str, Any]) -> WorkerCohortRecord:
                 != (retired_at is not None)):
             raise ValueError('cohort retirement timestamp has an invalid '
                              'lifecycle shape.')
-        if (state is actions.WorkerCohortLifecycleState.ACCEPTING and
+        if (state in (actions.WorkerCohortLifecycleState.ACCEPTING,
+                      actions.WorkerCohortLifecycleState.DRAINING) and
                 registrations.count != 2):
-            raise ValueError('an accepting cohort requires two workers.')
+            raise ValueError('an accepting or draining cohort requires two '
+                             'workers.')
         return WorkerCohortRecord(identity, registrations, state, revision,
                                   created_at, changed_at, retired_at)
     except (KeyError, TypeError, ValueError) as e:
@@ -1317,6 +1520,410 @@ class PostgresServeResourceActionStateStore:
     def _require_session(self, session: orm.Session) -> None:
         self._require_postgres(session.get_bind())
 
+    def read_database_clock(self) -> datetime.datetime:
+        """Read the PostgreSQL wall clock used by worker evidence gates."""
+        with self._database().connect() as connection:
+            value = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+        return _timestamp(value, name='database_now')
+
+    @staticmethod
+    def _locked_authority_release(
+        session: orm.Session,
+        namespace: str,
+        helm_release_name: str,
+    ) -> Mapping[str, Any] | None:
+        table = state_schema.AUTHORITY_RELEASES
+        return session.execute(
+            sqlalchemy.select(table).where(
+                table.c.namespace == namespace, table.c.helm_release_name ==
+                helm_release_name).with_for_update()).mappings().first()
+
+    @staticmethod
+    def _locked_authority_release_by_installation(
+        session: orm.Session,
+        installation_id: str,
+    ) -> Mapping[str, Any] | None:
+        table = state_schema.AUTHORITY_RELEASES
+        return session.execute(
+            sqlalchemy.select(table).where(table.c.installation_id == uuid.UUID(
+                installation_id)).with_for_update()).mappings().first()
+
+    @staticmethod
+    def _locked_release_worker_rows(
+        session: orm.Session,
+        *,
+        namespace: str,
+        helm_full_name: str,
+        installation_id: str | None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Lock one bounded union of release- and installation-scoped rows."""
+        table = state_schema.WORKER_COHORTS
+        identity = table.c.cohort_identity
+        release_predicate = sqlalchemy.and_(
+            identity['manifest']['namespace'].astext == namespace,
+            identity['manifest']['pod_template_binding']['release_inputs']
+            ['helm_full_name'].astext == helm_full_name)
+        predicate = release_predicate
+        if installation_id is not None:
+            predicate = sqlalchemy.or_(
+                table.c.cohort_id.like(f'ra:{installation_id}:%'),
+                release_predicate)
+        statement = (sqlalchemy.select(table).where(predicate).order_by(
+            table.c.cohort_id).limit(_MAX_AUTHORITY_RELEASE_COHORTS +
+                                     1).with_for_update())
+        return tuple(session.execute(statement).mappings().all())
+
+    @staticmethod
+    def _bind_authority_release_cohort(
+        session: orm.Session,
+        release: AuthorityReleaseRecord,
+        manifest: actions.ProviderAuthorityWorkerCohortManifestV1,
+    ) -> None:
+        """Insert or exactly reuse one never-deleted suffix/manifest binding."""
+        release_inputs = manifest.pod_template_binding.release_inputs
+        suffix = release_inputs.cohort_suffix
+        if (manifest.namespace != release.namespace or
+                release_inputs.helm_full_name != release.helm_full_name or
+                _authority_cohort_manifest_installation_id(manifest)
+                != release.installation_id):
+            raise kernel_actions.ActionConflict(
+                'Authority cohort manifest differs from its release identity.')
+        table = state_schema.AUTHORITY_RELEASE_COHORTS
+        session.execute(
+            postgresql.insert(table).values(
+                namespace=release.namespace,
+                helm_release_name=release.helm_release_name,
+                cohort_suffix=suffix,
+                cohort_id=manifest.cohort_id,
+                manifest=manifest.canonical_value(),
+                manifest_sha256=manifest.sha256,
+                bound_at=sqlalchemy.func.clock_timestamp()).
+            on_conflict_do_nothing())
+        row = session.execute(
+            sqlalchemy.select(table).where(
+                table.c.namespace == release.namespace,
+                table.c.helm_release_name == release.helm_release_name,
+                table.c.cohort_suffix ==
+                suffix).with_for_update()).mappings().first()
+        if row is None:
+            raise kernel_actions.ActionConflict(
+                'Authority cohort ID is already bound outside this release.')
+        try:
+            bound_manifest = (
+                actions.ProviderAuthorityWorkerCohortManifestV1.from_value(
+                    row['manifest']))
+            if (row['cohort_id'] != manifest.cohort_id or
+                    row['manifest_sha256'] != manifest.sha256 or
+                    bound_manifest.canonical_bytes != manifest.canonical_bytes):
+                raise ValueError('immutable cohort binding differs')
+        except (KeyError, TypeError, ValueError) as e:
+            raise kernel_actions.ActionConflict(
+                'Authority cohort suffix already has different immutable '
+                'manifest bytes.') from e
+
+    @staticmethod
+    def _locked_authority_cohort_binding(
+        session: orm.Session,
+        release: AuthorityReleaseRecord,
+        cohort_suffix: str,
+    ) -> Mapping[str, Any] | None:
+        table = state_schema.AUTHORITY_RELEASE_COHORTS
+        return session.execute(
+            sqlalchemy.select(table).where(
+                table.c.namespace == release.namespace,
+                table.c.helm_release_name == release.helm_release_name,
+                table.c.cohort_suffix ==
+                cohort_suffix).with_for_update()).mappings().first()
+
+    @staticmethod
+    def _normalized_authority_release_input(
+        namespace: str,
+        helm_release_name: str,
+        helm_full_name: str,
+        installation_id: str,
+        enabled: bool,
+        live_manifests: tuple[actions.ProviderAuthorityWorkerCohortManifestV1,
+                              ...],
+        tombstone_suffixes: tuple[str, ...],
+    ) -> tuple[str, str, str, str | None, tuple[
+            actions.ProviderAuthorityWorkerCohortManifestV1, ...], tuple[str,
+                                                                         ...]]:
+        namespace = _authority_release_label(namespace, name='namespace')
+        helm_release_name = _authority_release_label(helm_release_name,
+                                                     name='helm_release_name')
+        helm_full_name = _authority_release_label(helm_full_name,
+                                                  name='helm_full_name')
+        if type(enabled) is not bool:
+            raise TypeError('enabled must be Boolean.')
+        if type(installation_id) is not str:
+            raise TypeError('installation_id must be text.')
+        parsed_installation_id: str | None
+        if installation_id == '':
+            if enabled:
+                raise ValueError(
+                    'Enabled authority release requires an installation ID.')
+            parsed_installation_id = None
+        else:
+            parsed_installation_id = str(
+                _canonical_uuid(installation_id, name='installation_id'))
+            if parsed_installation_id != installation_id:
+                raise ValueError('installation_id must be canonical UUID text.')
+        if (type(live_manifests) is not tuple or any(
+                type(manifest)
+                is not actions.ProviderAuthorityWorkerCohortManifestV1
+                for manifest in live_manifests)):
+            raise TypeError(
+                'live_manifests must be a tuple of typed manifests.')
+        if type(tombstone_suffixes) is not tuple:
+            raise TypeError('tombstone_suffixes must be a tuple.')
+        tombstones = tuple(
+            _authority_release_label(
+                value, name='tombstone_suffix', maximum_bytes=42)
+            for value in tombstone_suffixes)
+        suffixes = tuple(
+            _authority_cohort_manifest_suffix(manifest)
+            for manifest in live_manifests)
+        if suffixes != tuple(sorted(set(suffixes))):
+            raise ValueError(
+                'live_manifests must be sorted by unique cohort suffix.')
+        if tombstones != tuple(sorted(set(tombstones))):
+            raise ValueError('tombstone_suffixes must be sorted and unique.')
+        if not set(suffixes).isdisjoint(tombstones):
+            raise ValueError('Live and tombstone inventories overlap.')
+        if (len(suffixes) + len(tombstones) > _MAX_AUTHORITY_RELEASE_COHORTS):
+            raise ValueError('Authority release inventory exceeds 256 cohorts.')
+        if enabled and not suffixes and not tombstones:
+            raise ValueError(
+                'Enabled authority release must contain at least one live or '
+                'tombstone cohort.')
+        if not enabled and (live_manifests or tombstones):
+            raise ValueError(
+                'Disabled authority release must have no inventory.')
+        for manifest in live_manifests:
+            release_inputs = manifest.pod_template_binding.release_inputs
+            if (manifest.namespace != namespace or
+                    release_inputs.helm_full_name != helm_full_name or
+                    _authority_cohort_manifest_installation_id(manifest)
+                    != parsed_installation_id):
+                raise ValueError(
+                    'Live manifest differs from proposed release identity.')
+        return (namespace, helm_release_name, helm_full_name,
+                parsed_installation_id, live_manifests, tombstones)
+
+    def preflight_authority_release(
+        self,
+        namespace: str,
+        helm_release_name: str,
+        helm_full_name: str,
+        installation_id: str,
+        enabled: bool,
+        live_manifests: tuple[actions.ProviderAuthorityWorkerCohortManifestV1,
+                              ...],
+        tombstone_suffixes: tuple[str, ...],
+    ) -> AuthorityReleaseRecord | None:
+        """Atomically bind and fence one proposed Helm authority inventory.
+
+        The release row is the lock-order root for both this transition and
+        first worker registration.  Thus a registering Pod either commits
+        before this method validates the complete cohort inventory, or waits
+        and observes the newly committed live-manifest fence.
+        """
+        (namespace, helm_release_name, helm_full_name, proposed_installation_id,
+         live_manifests, tombstones) = self._normalized_authority_release_input(
+             namespace, helm_release_name, helm_full_name, installation_id,
+             enabled, live_manifests, tombstone_suffixes)
+        live_values = [
+            manifest.canonical_value() for manifest in live_manifests
+        ]
+        tombstone_values = list(tombstones)
+        release_table = state_schema.AUTHORITY_RELEASES
+        with orm.Session(self._database()) as session, session.begin():
+            row = self._locked_authority_release(session, namespace,
+                                                 helm_release_name)
+            if row is None and proposed_installation_id is None:
+                scoped_rows = self._locked_release_worker_rows(
+                    session,
+                    namespace=namespace,
+                    helm_full_name=helm_full_name,
+                    installation_id=None)
+                if len(scoped_rows) > _MAX_AUTHORITY_RELEASE_COHORTS:
+                    raise kernel_actions.ActionConflict(
+                        'Authority release worker inventory exceeds 256 rows.')
+                if scoped_rows:
+                    raise kernel_actions.ActionConflict(
+                        'Authority release has cohort history but no durable '
+                        'installation binding; supply its exact installation '
+                        'ID for one-time adoption.')
+                return None
+            if row is None:
+                assert proposed_installation_id is not None
+                session.execute(
+                    postgresql.insert(release_table).values(
+                        namespace=namespace,
+                        helm_release_name=helm_release_name,
+                        installation_id=uuid.UUID(proposed_installation_id),
+                        helm_full_name=helm_full_name,
+                        enabled=enabled,
+                        live_manifests=live_values,
+                        live_inventory_sha256=actions.canonical_sha256(
+                            live_values),
+                        tombstone_suffixes=tombstone_values,
+                        tombstone_inventory_sha256=actions.canonical_sha256(
+                            tombstone_values),
+                        revision=1,
+                        created_at=sqlalchemy.func.clock_timestamp(),
+                        updated_at=sqlalchemy.func.clock_timestamp()).
+                    on_conflict_do_nothing())
+                row = self._locked_authority_release(session, namespace,
+                                                     helm_release_name)
+                if row is None:
+                    collision = self._locked_authority_release_by_installation(
+                        session, proposed_installation_id)
+                    if collision is not None:
+                        raise kernel_actions.ActionConflict(
+                            'Authority installation ID is already bound to '
+                            'another Helm release.')
+                    raise kernel_actions.ActionConflict(
+                        'Authority release identity could not be bound.')
+            current = _authority_release_record(row)
+            if current.helm_full_name != helm_full_name:
+                raise kernel_actions.ActionConflict(
+                    'Authority Helm full name is immutable for this release.')
+            if (proposed_installation_id is not None and
+                    current.installation_id != proposed_installation_id):
+                raise kernel_actions.ActionConflict(
+                    'Authority installation ID is immutable for this release.')
+
+            worker_rows = self._locked_release_worker_rows(
+                session,
+                namespace=namespace,
+                helm_full_name=helm_full_name,
+                installation_id=current.installation_id)
+            if len(worker_rows) > _MAX_AUTHORITY_RELEASE_COHORTS:
+                raise kernel_actions.ActionConflict(
+                    'Authority release worker inventory exceeds 256 rows.')
+            workers_by_suffix: dict[str, WorkerCohortRecord] = {}
+            for worker_row in worker_rows:
+                worker = _worker_cohort_record(worker_row)
+                manifest = worker.cohort_identity.manifest
+                release_inputs = manifest.pod_template_binding.release_inputs
+                suffix = release_inputs.cohort_suffix
+                if (manifest.namespace != namespace or
+                        release_inputs.helm_full_name != helm_full_name or
+                        _authority_cohort_manifest_installation_id(manifest)
+                        != current.installation_id or
+                        suffix in workers_by_suffix):
+                    raise kernel_actions.ActionConflict(
+                        'Authority worker history conflicts with the immutable '
+                        'release identity.')
+                workers_by_suffix[suffix] = worker
+                self._bind_authority_release_cohort(session, current, manifest)
+
+            for manifest in live_manifests:
+                self._bind_authority_release_cohort(session, current, manifest)
+
+            live_suffixes = {
+                _authority_cohort_manifest_suffix(manifest)
+                for manifest in live_manifests
+            }
+            tombstone_set = set(tombstones)
+            for suffix, worker in workers_by_suffix.items():
+                state = worker.lifecycle_state
+                if not enabled and state is not (
+                        actions.WorkerCohortLifecycleState.RETIRED):
+                    raise kernel_actions.ActionConflict(
+                        'Authority cannot be disabled while a cohort is '
+                        'nonretired.')
+                if state in (actions.WorkerCohortLifecycleState.REGISTERING,
+                             actions.WorkerCohortLifecycleState.ACCEPTING,
+                             actions.WorkerCohortLifecycleState.DRAINING):
+                    if suffix not in live_suffixes:
+                        raise kernel_actions.ActionConflict(
+                            'A live authority cohort is absent from the '
+                            'proposed live inventory.')
+                elif state is actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED:
+                    # The first retirement upgrade may leave the object live;
+                    # the second replaces it by a tombstone.  Absence from both
+                    # inventories is the unsafe state.
+                    if (suffix not in live_suffixes and
+                            suffix not in tombstone_set):
+                        raise kernel_actions.ActionConflict(
+                            'A removal-authorized authority cohort is absent '
+                            'from both proposed inventories.')
+                elif (state is actions.WorkerCohortLifecycleState.RETIRED and
+                      suffix in live_suffixes):
+                    raise kernel_actions.ActionConflict(
+                        'A retired authority cohort cannot become live again.')
+
+            for suffix in tombstones:
+                binding = self._locked_authority_cohort_binding(
+                    session, current, suffix)
+                tombstone_worker = workers_by_suffix.get(suffix)
+                if (binding is None or tombstone_worker is None or
+                        tombstone_worker.lifecycle_state not in
+                    (actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED,
+                     actions.WorkerCohortLifecycleState.RETIRED)):
+                    raise kernel_actions.ActionConflict(
+                        'Authority tombstone lacks an exact removal-authorized '
+                        'or retired cohort binding.')
+                try:
+                    bound_manifest = (
+                        actions.ProviderAuthorityWorkerCohortManifestV1.
+                        from_value(binding['manifest']))
+                except (KeyError, TypeError, ValueError) as e:
+                    raise kernel_actions.InvariantViolation(
+                        'Authority tombstone manifest binding is corrupt.'
+                    ) from e
+                if (binding['manifest_sha256'] != bound_manifest.sha256 or
+                        bound_manifest.canonical_bytes != tombstone_worker.
+                        cohort_identity.manifest.canonical_bytes):
+                    raise kernel_actions.ActionConflict(
+                        'Authority tombstone differs from its permanent '
+                        'manifest binding.')
+
+            desired_live_hash = actions.canonical_sha256(live_values)
+            desired_tombstone_hash = actions.canonical_sha256(tombstone_values)
+            expected_revision = current.revision
+            if (current.enabled != enabled or [
+                    manifest.canonical_value()
+                    for manifest in current.live_manifests
+            ] != live_values or
+                    list(current.tombstone_suffixes) != tombstone_values):
+                expected_revision += 1
+                updated_revision = session.execute(
+                    sqlalchemy.update(release_table).where(
+                        release_table.c.namespace == namespace,
+                        release_table.c.helm_release_name == helm_release_name,
+                        release_table.c.revision == current.revision).values(
+                            enabled=enabled,
+                            live_manifests=live_values,
+                            live_inventory_sha256=desired_live_hash,
+                            tombstone_suffixes=tombstone_values,
+                            tombstone_inventory_sha256=desired_tombstone_hash,
+                            revision=expected_revision,
+                            updated_at=sqlalchemy.func.clock_timestamp()).
+                    returning(release_table.c.revision)).scalar_one_or_none()
+                if updated_revision != expected_revision:
+                    raise kernel_actions.InvariantViolation(
+                        'Authority release update did not commit the exact '
+                        'proposed fence.')
+                row = self._locked_authority_release(session, namespace,
+                                                     helm_release_name)
+                assert row is not None
+                current = _authority_release_record(row)
+            if (current.enabled != enabled or
+                    current.revision != expected_revision or [
+                        manifest.canonical_value()
+                        for manifest in current.live_manifests
+                    ] != live_values or
+                    list(current.tombstone_suffixes) != tombstone_values):
+                raise kernel_actions.InvariantViolation(
+                    'Authority release readback differs from the exact '
+                    'proposed fence.')
+            return current
+
     @staticmethod
     def _locked_worker_cohort(session: orm.Session,
                               cohort_id: str) -> Mapping[str, Any] | None:
@@ -1324,6 +1931,105 @@ class PostgresServeResourceActionStateStore:
             sqlalchemy.select(state_schema.WORKER_COHORTS).where(
                 state_schema.WORKER_COHORTS.c.cohort_id ==
                 cohort_id).with_for_update()).mappings().first()
+
+    def _require_authority_registration_fence(
+        self,
+        session: orm.Session,
+        manifest: actions.ProviderAuthorityWorkerCohortManifestV1,
+    ) -> None:
+        """Lock and require the current release's exact live-manifest fence."""
+        installation_id = _authority_cohort_manifest_installation_id(manifest)
+        row = self._locked_authority_release_by_installation(
+            session, installation_id)
+        if row is None:
+            raise kernel_actions.ActionConflict(
+                'Authority cohort has no durable Helm release binding.')
+        release = _authority_release_record(row)
+        release_inputs = manifest.pod_template_binding.release_inputs
+        if (not release.enabled or manifest.namespace != release.namespace or
+                release_inputs.helm_full_name != release.helm_full_name):
+            raise kernel_actions.ActionConflict(
+                'Authority release no longer permits cohort registration.')
+        suffix = release_inputs.cohort_suffix
+        live_by_suffix = {
+            _authority_cohort_manifest_suffix(item): item
+            for item in release.live_manifests
+        }
+        proposed = live_by_suffix.get(suffix)
+        if (proposed is None or
+                proposed.canonical_bytes != manifest.canonical_bytes):
+            raise kernel_actions.ActionConflict(
+                'Authority cohort is absent from the current exact live '
+                'inventory.')
+        binding = self._locked_authority_cohort_binding(session, release,
+                                                        suffix)
+        if binding is None:
+            raise kernel_actions.InvariantViolation(
+                'Authority live inventory lacks its permanent cohort binding.')
+        try:
+            bound = actions.ProviderAuthorityWorkerCohortManifestV1.from_value(
+                binding['manifest'])
+            if (binding['cohort_id'] != manifest.cohort_id or
+                    binding['manifest_sha256'] != manifest.sha256 or
+                    bound.canonical_bytes != manifest.canonical_bytes):
+                raise ValueError('manifest binding differs')
+        except (KeyError, TypeError, ValueError) as e:
+            raise kernel_actions.InvariantViolation(
+                'Authority live cohort binding failed closed validation.'
+            ) from e
+
+    def _locked_authority_release_for_manifest(
+        self,
+        session: orm.Session,
+        manifest: actions.ProviderAuthorityWorkerCohortManifestV1,
+    ) -> AuthorityReleaseRecord:
+        """Lock and resolve the stable release that owns one cohort manifest."""
+        installation_id = _authority_cohort_manifest_installation_id(manifest)
+        row = self._locked_authority_release_by_installation(
+            session, installation_id)
+        if row is None:
+            raise kernel_actions.ActionConflict(
+                'Authority cohort has no durable Helm release binding.')
+        release = _authority_release_record(row)
+        release_inputs = manifest.pod_template_binding.release_inputs
+        if (manifest.namespace != release.namespace or
+                release_inputs.helm_full_name != release.helm_full_name):
+            raise kernel_actions.ActionConflict(
+                'Authority cohort differs from its durable release identity.')
+        return release
+
+    def _require_authority_retirement_fence(
+        self,
+        session: orm.Session,
+        release: AuthorityReleaseRecord,
+        manifest: actions.ProviderAuthorityWorkerCohortManifestV1,
+    ) -> None:
+        """Require the currently locked release to still tombstone a cohort."""
+        suffix = _authority_cohort_manifest_suffix(manifest)
+        live_suffixes = {
+            _authority_cohort_manifest_suffix(item)
+            for item in release.live_manifests
+        }
+        if (not release.enabled or suffix in live_suffixes or
+                suffix not in release.tombstone_suffixes):
+            raise kernel_actions.ActionConflict(
+                'Authority cohort is no longer in the current exact '
+                'tombstone inventory.')
+        binding = self._locked_authority_cohort_binding(session, release,
+                                                        suffix)
+        if binding is None:
+            raise kernel_actions.InvariantViolation(
+                'Authority tombstone lacks its permanent cohort binding.')
+        try:
+            bound = actions.ProviderAuthorityWorkerCohortManifestV1.from_value(
+                binding['manifest'])
+            if (binding['cohort_id'] != manifest.cohort_id or
+                    binding['manifest_sha256'] != manifest.sha256 or
+                    bound.canonical_bytes != manifest.canonical_bytes):
+                raise ValueError('manifest binding differs')
+        except (KeyError, TypeError, ValueError) as e:
+            raise kernel_actions.InvariantViolation(
+                'Authority tombstone binding failed closed validation.') from e
 
     def register_worker_cohort_in_session(
         self,
@@ -1333,16 +2039,16 @@ class PostgresServeResourceActionStateStore:
     ) -> WorkerCohortTransition:
         """Insert or exactly adopt one immutable REGISTERING cohort."""
         self._require_session(session)
-        if not isinstance(cohort_identity, actions.WorkerCohortIdentityV1):
+        if type(cohort_identity) is not actions.WorkerCohortIdentityV1:
             raise TypeError('cohort_identity has an invalid type.')
-        if not isinstance(registration_attestations,
-                          actions.WorkerCohortRegistrationSetV1):
+        if (type(registration_attestations)
+                is not actions.WorkerCohortRegistrationSetV1):
             raise TypeError('registration_attestations has an invalid type.')
         registration_attestations.validate_for_cohort(cohort_identity,
                                                       require_two=False)
-        if registration_attestations.count not in (1, 2):
-            raise ValueError('A registering cohort requires one or two '
-                             'worker attestations.')
+        if registration_attestations.count != 1:
+            raise ValueError('Initial cohort registration requires exactly one '
+                             'worker attestation.')
         database_now = session.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
         _validate_current_worker_registrations(cohort_identity,
@@ -1355,6 +2061,11 @@ class PostgresServeResourceActionStateStore:
         deployment_uid = _bounded_text(cohort_identity.deployment_uid,
                                        name='deployment_uid',
                                        maximum_bytes=1024)
+        # This is the shared lock-order root with Helm release preflight.  Do
+        # not move it after the worker row lock/insert: that would reopen the
+        # exact upgrade-vs-first-registration race the durable ledger closes.
+        self._require_authority_registration_fence(session,
+                                                   cohort_identity.manifest)
         table = state_schema.WORKER_COHORTS
         inserted = session.execute(
             postgresql.insert(table).values(
@@ -1410,6 +2121,568 @@ class PostgresServeResourceActionStateStore:
                     parsed_id)).mappings().first()
         return None if row is None else _worker_cohort_record(row)
 
+    def list_worker_cohorts_for_installation(
+        self,
+        installation_id: str,
+        lifecycle_states: tuple[actions.WorkerCohortLifecycleState, ...],
+        *,
+        limit: int = 128,
+    ) -> tuple[WorkerCohortRecord, ...]:
+        """Return one bounded, installation-scoped maintenance batch."""
+        if type(installation_id) is not str:
+            raise TypeError('installation_id must be text.')
+        try:
+            parsed_installation_id = uuid.UUID(installation_id)
+        except ValueError as e:
+            raise ValueError('installation_id must be a canonical UUID.') from e
+        if str(parsed_installation_id) != installation_id:
+            raise ValueError('installation_id must be a canonical UUID.')
+        if (type(lifecycle_states) is not tuple or not lifecycle_states or any(
+                type(state) is not actions.WorkerCohortLifecycleState
+                for state in lifecycle_states) or
+                len(set(lifecycle_states)) != len(lifecycle_states)):
+            raise ValueError('lifecycle_states must be distinct typed states.')
+        if (type(limit) is not int or isinstance(limit, bool) or limit < 1 or
+                limit > 256):
+            raise ValueError('limit must be an integer from 1 through 256.')
+        table = state_schema.WORKER_COHORTS
+        prefix = f'ra:{installation_id}:'
+        statement = sqlalchemy.select(table).where(
+            table.c.cohort_id.like(prefix + '%'),
+            table.c.lifecycle_state.in_(
+                tuple(state.value for state in lifecycle_states))).order_by(
+                    table.c.state_changed_at, table.c.cohort_id).limit(limit)
+        with orm.Session(self._database()) as session:
+            rows = session.execute(statement).mappings().all()
+        return tuple(_worker_cohort_record(row) for row in rows)
+
+    @staticmethod
+    def _write_worker_cohort_registration_state(
+        session: orm.Session,
+        current: WorkerCohortRecord,
+        replacement: actions.WorkerCohortRegistrationSetV1,
+        target_state: actions.WorkerCohortLifecycleState,
+        *,
+        change_lifecycle_timestamp: bool,
+        retire: bool = False,
+    ) -> WorkerCohortRecord:
+        values: dict[str, Any] = {
+            'registration_attestations': replacement.canonical_value(),
+            'registration_attestations_sha256': replacement.sha256,
+            'lifecycle_state': target_state.value,
+            'revision': current.revision + 1,
+        }
+        if change_lifecycle_timestamp:
+            values['state_changed_at'] = sqlalchemy.func.clock_timestamp()
+        if retire:
+            values['retired_at'] = sqlalchemy.func.clock_timestamp()
+        table = state_schema.WORKER_COHORTS
+        updated = session.execute(
+            sqlalchemy.update(table).where(
+                table.c.cohort_id == current.cohort_id,
+                table.c.lifecycle_state == current.lifecycle_state.value,
+                table.c.revision == current.revision,
+                table.c.registration_attestations_sha256 ==
+                current.registration_attestations.sha256).values(**values))
+        if updated.rowcount != 1:
+            raise kernel_actions.StaleRevision(
+                'Worker cohort changed during lifecycle transition.')
+        updated_row = PostgresServeResourceActionStateStore._locked_worker_cohort(
+            session, current.cohort_id)
+        assert updated_row is not None
+        return _worker_cohort_record(updated_row)
+
+    def append_worker_cohort_registration_in_session(
+        self,
+        session: orm.Session,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+        own_registration: actions.ProviderAuthorityWorkerRegistrationV1,
+    ) -> WorkerCohortTransition:
+        """Append exactly the caller's second worker registration."""
+        self._require_session(session)
+        if not isinstance(cohort_identity, actions.WorkerCohortIdentityV1):
+            raise TypeError('cohort_identity has an invalid type.')
+        expected_revision = _positive_integer(expected_revision,
+                                              name='expected_revision')
+        if not isinstance(expected_registration_attestations,
+                          actions.WorkerCohortRegistrationSetV1):
+            raise TypeError('expected registrations have an invalid type.')
+        if not isinstance(own_registration,
+                          actions.ProviderAuthorityWorkerRegistrationV1):
+            raise TypeError('own registration has an invalid type.')
+        expected_registration_attestations.validate_for_cohort(cohort_identity)
+        if expected_registration_attestations.count != 1:
+            raise ValueError('Worker registration append requires one exact '
+                             'stored predecessor.')
+        expected_workers = _registration_by_pod_uid(
+            expected_registration_attestations)
+        if own_registration.pod_uid in expected_workers:
+            raise kernel_actions.ActionConflict(
+                'Worker registration append cannot replace an existing Pod.')
+        replacement = _registration_set(
+            cohort_identity, expected_registration_attestations.registrations +
+            (own_registration,))
+        replacement.validate_for_cohort(cohort_identity, require_two=True)
+
+        row = self._locked_worker_cohort(session, cohort_identity.cohort_id)
+        if row is None:
+            raise kernel_actions.InvariantViolation(
+                f'Unknown worker cohort {cohort_identity.cohort_id!r}.')
+        current = _worker_cohort_record(row)
+        if current.cohort_identity.canonical_bytes != cohort_identity.canonical_bytes:
+            raise kernel_actions.ActionConflict(
+                'Worker cohort immutable identity differs during append.')
+        if (current.lifecycle_state
+                is actions.WorkerCohortLifecycleState.REGISTERING and
+                current.revision == expected_revision + 1 and
+                current.registration_attestations.canonical_bytes
+                == replacement.canonical_bytes):
+            return WorkerCohortTransition(current, adopted=True)
+        if (current.lifecycle_state
+                is not actions.WorkerCohortLifecycleState.REGISTERING or
+                current.revision != expected_revision or
+                current.registration_attestations.canonical_bytes
+                != expected_registration_attestations.canonical_bytes):
+            raise kernel_actions.StaleRevision(
+                'Worker cohort append predecessor changed.')
+        database_now = session.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        _validate_current_worker_registrations(cohort_identity,
+                                               replacement,
+                                               database_now,
+                                               require_two=True)
+        record = self._write_worker_cohort_registration_state(
+            session,
+            current,
+            replacement,
+            actions.WorkerCohortLifecycleState.REGISTERING,
+            change_lifecycle_timestamp=False)
+        return WorkerCohortTransition(record)
+
+    def append_worker_cohort_registration(
+        self,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+        own_registration: actions.ProviderAuthorityWorkerRegistrationV1,
+    ) -> WorkerCohortTransition:
+        with orm.Session(self._database()) as session, session.begin():
+            return self.append_worker_cohort_registration_in_session(
+                session, cohort_identity, expected_revision,
+                expected_registration_attestations, own_registration)
+
+    def promote_worker_cohort_in_session(
+        self,
+        session: orm.Session,
+        cohort_id: str,
+        expected_revision: int,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+    ) -> WorkerCohortTransition:
+        """Promote one exact, current two-worker REGISTERING snapshot."""
+        self._require_session(session)
+        parsed_id = _bounded_text(cohort_id,
+                                  name='cohort_id',
+                                  maximum_bytes=1024)
+        expected_revision = _positive_integer(expected_revision,
+                                              name='expected_revision')
+        if not isinstance(expected_registration_attestations,
+                          actions.WorkerCohortRegistrationSetV1):
+            raise TypeError('expected registrations have an invalid type.')
+        row = self._locked_worker_cohort(session, parsed_id)
+        if row is None:
+            raise kernel_actions.InvariantViolation(
+                f'Unknown worker cohort {parsed_id!r}.')
+        current = _worker_cohort_record(row)
+        expected_registration_attestations.validate_for_cohort(
+            current.cohort_identity, require_two=True)
+        exact_registration = (
+            current.registration_attestations.canonical_bytes ==
+            expected_registration_attestations.canonical_bytes)
+        if (current.lifecycle_state
+                is actions.WorkerCohortLifecycleState.ACCEPTING and
+                current.revision == expected_revision + 1 and
+                exact_registration):
+            return WorkerCohortTransition(current, adopted=True)
+        if (current.lifecycle_state
+                is not actions.WorkerCohortLifecycleState.REGISTERING or
+                current.revision != expected_revision or
+                not exact_registration):
+            raise kernel_actions.StaleRevision(
+                'Worker cohort promotion predecessor changed.')
+        database_now = session.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        _validate_current_worker_registrations(
+            current.cohort_identity,
+            expected_registration_attestations,
+            database_now,
+            require_two=True)
+        record = self._write_worker_cohort_registration_state(
+            session,
+            current,
+            expected_registration_attestations,
+            actions.WorkerCohortLifecycleState.ACCEPTING,
+            change_lifecycle_timestamp=True)
+        return WorkerCohortTransition(record)
+
+    def promote_worker_cohort(
+        self,
+        cohort_id: str,
+        expected_revision: int,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+    ) -> WorkerCohortTransition:
+        with orm.Session(self._database()) as session, session.begin():
+            return self.promote_worker_cohort_in_session(
+                session, cohort_id, expected_revision,
+                expected_registration_attestations)
+
+    def renew_worker_cohort_registration_in_session(
+        self,
+        session: orm.Session,
+        cohort_id: str,
+        expected_revision: int,
+        expected_state: actions.WorkerCohortLifecycleState,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+        own_registration: actions.ProviderAuthorityWorkerRegistrationV1,
+    ) -> WorkerCohortTransition:
+        """Renew only the caller's accepted Pod entry, preserving its peer."""
+        self._require_session(session)
+        parsed_id = _bounded_text(cohort_id,
+                                  name='cohort_id',
+                                  maximum_bytes=1024)
+        expected_revision = _positive_integer(expected_revision,
+                                              name='expected_revision')
+        state = (expected_state if isinstance(
+            expected_state, actions.WorkerCohortLifecycleState) else
+                 actions.WorkerCohortLifecycleState(expected_state))
+        if state not in (actions.WorkerCohortLifecycleState.ACCEPTING,
+                         actions.WorkerCohortLifecycleState.DRAINING):
+            raise ValueError('Worker renewal requires ACCEPTING or DRAINING.')
+        if not isinstance(expected_registration_attestations,
+                          actions.WorkerCohortRegistrationSetV1):
+            raise TypeError('expected registrations have an invalid type.')
+        if not isinstance(own_registration,
+                          actions.ProviderAuthorityWorkerRegistrationV1):
+            raise TypeError('own registration has an invalid type.')
+
+        row = self._locked_worker_cohort(session, parsed_id)
+        if row is None:
+            raise kernel_actions.InvariantViolation(
+                f'Unknown worker cohort {parsed_id!r}.')
+        current = _worker_cohort_record(row)
+        expected_registration_attestations.validate_for_cohort(
+            current.cohort_identity, require_two=True)
+        expected_workers = _registration_by_pod_uid(
+            expected_registration_attestations)
+        previous_own = expected_workers.get(own_registration.pod_uid)
+        if previous_own is None:
+            raise kernel_actions.ActionConflict(
+                'Worker renewal Pod UID is outside the accepted pair.')
+        _validate_own_registration_renewal(previous_own, own_registration)
+        replacement = _registration_set(
+            current.cohort_identity,
+            tuple(own_registration if item.pod_uid ==
+                  own_registration.pod_uid else item
+                  for item in expected_registration_attestations.registrations))
+        if replacement.canonical_bytes == expected_registration_attestations.canonical_bytes:
+            raise ValueError('Worker registration renewal made no change.')
+
+        if (current.lifecycle_state is state and
+                current.revision == expected_revision + 1 and
+                current.registration_attestations.canonical_bytes
+                == replacement.canonical_bytes):
+            return WorkerCohortTransition(current, adopted=True)
+        if (current.lifecycle_state is not state or
+                current.revision != expected_revision or
+                current.registration_attestations.canonical_bytes
+                != expected_registration_attestations.canonical_bytes):
+            raise kernel_actions.StaleRevision(
+                'Worker cohort renewal predecessor changed.')
+        database_now = session.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        _validate_current_worker_registrations(current.cohort_identity,
+                                               replacement,
+                                               database_now,
+                                               require_two=True)
+        record = self._write_worker_cohort_registration_state(
+            session,
+            current,
+            replacement,
+            state,
+            change_lifecycle_timestamp=False)
+        return WorkerCohortTransition(record)
+
+    def renew_worker_cohort_registration(
+        self,
+        cohort_id: str,
+        expected_revision: int,
+        expected_state: actions.WorkerCohortLifecycleState,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+        own_registration: actions.ProviderAuthorityWorkerRegistrationV1,
+    ) -> WorkerCohortTransition:
+        with orm.Session(self._database()) as session, session.begin():
+            return self.renew_worker_cohort_registration_in_session(
+                session, cohort_id, expected_revision, expected_state,
+                expected_registration_attestations, own_registration)
+
+    @staticmethod
+    def _cohort_id_json_match(column: Any, cohort_id: str) -> Any:
+        """Match any current carrier location declaring this full key.
+
+        Recursive JSONPath is intentional for the stale P2a existence audit:
+        private routing and primary shadow-child invocations carry the same
+        key at different closed locations.  A same-key/cross-identity or
+        split-parent/child carrier is corruption, not evidence that the cohort
+        is unused, and therefore retains a stale registration.
+        """
+        path = sqlalchemy.literal('$.**.cohort_id ? (@ == $target)',
+                                  type_=postgresql.JSONPATH)
+        variables = sqlalchemy.func.jsonb_build_object('target', cohort_id)
+        return sqlalchemy.func.jsonb_path_exists(column, path, variables)
+
+    @staticmethod
+    def _scan_has_row(session: orm.Session, statement: Any) -> bool:
+        return session.execute(statement.limit(1)).first() is not None
+
+    def _worker_cohort_dependency_names_in_session(
+        self,
+        session: orm.Session,
+        cohort: WorkerCohortRecord,
+    ) -> tuple[str, ...]:
+        """Read every possible carrier before aborting REGISTERING.
+
+        A never-accepted cohort cannot legitimately have even terminal or
+        released dependents.  This strict scan therefore treats every carrier
+        declaring the full cohort key as a dependency.  The later normal
+        DRAINING authorization path will own its distinct typed/nonlocking
+        terminality audit; RETIRED trusts the already-committed
+        REMOVAL_AUTHORIZED fence and exact Kubernetes absence evidence.
+        """
+        cohort_id = cohort.cohort_id
+        refs = state_schema.WORKER_COHORT_REFS
+        coverage = state_schema.SHADOW_COVERAGE
+        coverage_attempts = state_schema.SHADOW_COVERAGE_ATTEMPTS
+        samples = state_schema.STAGED_SHADOW_SAMPLES
+        sample_attempts = state_schema.STAGED_SHADOW_ATTEMPTS
+        requests = request_postgres.REQUESTS
+        queue = request_postgres.QUEUE
+        action_table = request_postgres.RESOURCE_ACTIONS
+        action_attempts = request_postgres.RESOURCE_ACTION_ATTEMPTS
+        scans = (
+            ('cohort references', sqlalchemy.select(
+                refs.c.decision_id).where(refs.c.cohort_id == cohort_id)),
+            ('shadow coverage',
+             sqlalchemy.select(coverage.c.decision_id).select_from(
+                 coverage.join(
+                     refs, coverage.c.worker_cohort_ref_id ==
+                     refs.c.decision_id)).where(refs.c.cohort_id == cohort_id)),
+            ('shadow coverage attempts',
+             sqlalchemy.select(coverage_attempts.c.decision_id).select_from(
+                 coverage_attempts.join(
+                     coverage, coverage_attempts.c.decision_id ==
+                     coverage.c.decision_id).join(
+                         refs, coverage.c.worker_cohort_ref_id == refs.c.
+                         decision_id)).where(refs.c.cohort_id == cohort_id)),
+            ('resource actions',
+             sqlalchemy.select(action_table.c.action_id).where(
+                 self._cohort_id_json_match(action_table.c.immutable_spec,
+                                            cohort_id))),
+            ('resource action attempts',
+             sqlalchemy.select(action_attempts.c.action_id).select_from(
+                 action_attempts.join(
+                     action_table, action_attempts.c.action_id ==
+                     action_table.c.action_id)).where(
+                         self._cohort_id_json_match(
+                             action_table.c.immutable_spec, cohort_id))),
+            ('private requests', sqlalchemy.select(requests.c.request_id).where(
+                self._cohort_id_json_match(requests.c.payload_json,
+                                           cohort_id))),
+            ('private queue rows',
+             sqlalchemy.select(queue.c.request_id).select_from(
+                 queue.join(requests,
+                            queue.c.request_id == requests.c.request_id)).where(
+                                self._cohort_id_json_match(
+                                    requests.c.payload_json, cohort_id))),
+            ('shadow samples',
+             sqlalchemy.select(samples.c.would_be_action_id).where(
+                 self._cohort_id_json_match(samples.c.immutable_spec,
+                                            cohort_id))),
+            ('shadow attempts',
+             sqlalchemy.select(
+                 sample_attempts.c.would_be_action_id).select_from(
+                     sample_attempts.join(
+                         samples, sample_attempts.c.would_be_action_id ==
+                         samples.c.would_be_action_id)).where(
+                             sqlalchemy.or_(
+                                 self._cohort_id_json_match(
+                                     samples.c.immutable_spec, cohort_id),
+                                 self._cohort_id_json_match(
+                                     sample_attempts.c.invocation,
+                                     cohort_id)))),
+        )
+        return tuple(name for name, statement in scans
+                     if self._scan_has_row(session, statement))
+
+    def authorize_stale_worker_cohort_removal_in_session(
+        self,
+        session: orm.Session,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+    ) -> WorkerCohortTransition:
+        """Fence a stale never-accepted cohort after exhaustive zero scans."""
+        self._require_session(session)
+        if not isinstance(cohort_identity, actions.WorkerCohortIdentityV1):
+            raise TypeError('cohort_identity has an invalid type.')
+        expected_revision = _positive_integer(expected_revision,
+                                              name='expected_revision')
+        if not isinstance(expected_registration_attestations,
+                          actions.WorkerCohortRegistrationSetV1):
+            raise TypeError('expected registrations have an invalid type.')
+        expected_registration_attestations.validate_for_cohort(cohort_identity)
+        row = self._locked_worker_cohort(session, cohort_identity.cohort_id)
+        if row is None:
+            raise kernel_actions.InvariantViolation(
+                f'Unknown worker cohort {cohort_identity.cohort_id!r}.')
+        current = _worker_cohort_record(row)
+        exact_identity = (current.cohort_identity.canonical_bytes ==
+                          cohort_identity.canonical_bytes)
+        exact_registration = (
+            current.registration_attestations.canonical_bytes ==
+            expected_registration_attestations.canonical_bytes)
+        if (current.lifecycle_state
+                is actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED and
+                current.revision == expected_revision + 1 and exact_identity and
+                exact_registration):
+            return WorkerCohortTransition(current, adopted=True)
+        if (current.lifecycle_state
+                is not actions.WorkerCohortLifecycleState.REGISTERING or
+                current.revision != expected_revision or not exact_identity or
+                not exact_registration):
+            raise kernel_actions.StaleRevision(
+                'Stale worker-cohort abort predecessor changed.')
+        database_now = session.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        _validate_stale_worker_registrations(current.registration_attestations,
+                                             database_now)
+        dependencies = self._worker_cohort_dependency_names_in_session(
+            session, current)
+        if dependencies:
+            raise kernel_actions.ActionConflict(
+                'Worker cohort removal is retained by: ' +
+                ', '.join(dependencies) + '.')
+        record = self._write_worker_cohort_registration_state(
+            session,
+            current,
+            current.registration_attestations,
+            actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED,
+            change_lifecycle_timestamp=True)
+        return WorkerCohortTransition(record)
+
+    def authorize_stale_worker_cohort_removal(
+        self,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+    ) -> WorkerCohortTransition:
+        with orm.Session(self._database()) as session, session.begin():
+            return self.authorize_stale_worker_cohort_removal_in_session(
+                session, cohort_identity, expected_revision,
+                expected_registration_attestations)
+
+    def retire_worker_cohort_in_session(
+        self,
+        session: orm.Session,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+        *,
+        deployment_not_found: bool,
+        service_account_not_found: bool,
+    ) -> WorkerCohortTransition:
+        """Retire one tombstone only after both exact objects are absent."""
+        self._require_session(session)
+        if type(deployment_not_found) is not bool or type(
+                service_account_not_found) is not bool:
+            raise TypeError('NotFound evidence flags must be booleans.')
+        if not deployment_not_found or not service_account_not_found:
+            raise kernel_actions.ActionConflict(
+                'Worker cohort retirement requires exact Deployment and '
+                'ServiceAccount NotFound evidence.')
+        if not isinstance(cohort_identity, actions.WorkerCohortIdentityV1):
+            raise TypeError('cohort_identity has an invalid type.')
+        expected_revision = _positive_integer(expected_revision,
+                                              name='expected_revision')
+        if not isinstance(expected_registration_attestations,
+                          actions.WorkerCohortRegistrationSetV1):
+            raise TypeError('expected registrations have an invalid type.')
+        expected_registration_attestations.validate_for_cohort(cohort_identity)
+        # Release is the shared lock-order root with Helm preflight.  A stale
+        # API process must not retire a suffix after a rollback has made that
+        # suffix live again.
+        release = self._locked_authority_release_for_manifest(
+            session, cohort_identity.manifest)
+        row = self._locked_worker_cohort(session, cohort_identity.cohort_id)
+        if row is None:
+            raise kernel_actions.InvariantViolation(
+                f'Unknown worker cohort {cohort_identity.cohort_id!r}.')
+        current = _worker_cohort_record(row)
+        exact_identity = (current.cohort_identity.canonical_bytes ==
+                          cohort_identity.canonical_bytes)
+        exact_registration = (
+            current.registration_attestations.canonical_bytes ==
+            expected_registration_attestations.canonical_bytes)
+        if (current.lifecycle_state
+                is actions.WorkerCohortLifecycleState.RETIRED and
+                current.revision == expected_revision + 1 and exact_identity and
+                exact_registration):
+            return WorkerCohortTransition(current, adopted=True)
+        if (current.lifecycle_state
+                is not actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED or
+                current.revision != expected_revision or not exact_identity or
+                not exact_registration):
+            raise kernel_actions.StaleRevision(
+                'Worker cohort retirement predecessor changed.')
+        self._require_authority_retirement_fence(session, release,
+                                                 cohort_identity.manifest)
+        record = self._write_worker_cohort_registration_state(
+            session,
+            current,
+            current.registration_attestations,
+            actions.WorkerCohortLifecycleState.RETIRED,
+            change_lifecycle_timestamp=True,
+            retire=True)
+        return WorkerCohortTransition(record)
+
+    def retire_worker_cohort(
+        self,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+        *,
+        deployment_not_found: bool,
+        service_account_not_found: bool,
+    ) -> WorkerCohortTransition:
+        with orm.Session(self._database()) as session, session.begin():
+            return self.retire_worker_cohort_in_session(
+                session,
+                cohort_identity,
+                expected_revision,
+                expected_registration_attestations,
+                deployment_not_found=deployment_not_found,
+                service_account_not_found=service_account_not_found)
+
     def transition_worker_cohort_in_session(
         self,
         session: orm.Session,
@@ -1452,10 +2725,6 @@ class PostgresServeResourceActionStateStore:
                              current.registration_attestations.canonical_bytes)
         transition = (old_state, target_state)
         allowed = {
-            (actions.WorkerCohortLifecycleState.REGISTERING,
-             actions.WorkerCohortLifecycleState.REGISTERING),
-            (actions.WorkerCohortLifecycleState.REGISTERING,
-             actions.WorkerCohortLifecycleState.ACCEPTING),
             (actions.WorkerCohortLifecycleState.ACCEPTING,
              actions.WorkerCohortLifecycleState.DRAINING),
             (actions.WorkerCohortLifecycleState.DRAINING,
@@ -1473,33 +2742,8 @@ class PostgresServeResourceActionStateStore:
                 'Worker cohort lifecycle revision/state changed.')
         database_now = session.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        if transition == (actions.WorkerCohortLifecycleState.REGISTERING,
-                          actions.WorkerCohortLifecycleState.REGISTERING):
-            if registration_attestations is None or same_registration:
-                raise ValueError('REGISTERING evidence update must append a '
-                                 'new worker attestation.')
-            old_workers = {
-                item['worker']['pod_uid']: actions.canonical_json_bytes(item)
-                for item in current.registration_attestations.canonical_value()
-                ['workers']
-            }
-            new_workers = {
-                item['worker']['pod_uid']: actions.canonical_json_bytes(item)
-                for item in replacement.canonical_value()['workers']
-            }
-            if (len(new_workers) <= len(old_workers) or any(
-                    new_workers.get(key) != value
-                    for key, value in old_workers.items())):
-                raise kernel_actions.ActionConflict(
-                    'REGISTERING attestations must append without replacing '
-                    'existing worker evidence.')
-            _validate_current_worker_registrations(current.cohort_identity,
-                                                   replacement,
-                                                   database_now,
-                                                   require_two=False)
-        elif target_state is actions.WorkerCohortLifecycleState.ACCEPTING:
-            if (old_state is actions.WorkerCohortLifecycleState.DRAINING and
-                    registration_attestations is None):
+        if target_state is actions.WorkerCohortLifecycleState.ACCEPTING:
+            if registration_attestations is None:
                 raise ValueError('DRAINING rollback requires replacement '
                                  'two-worker evidence.')
             _validate_current_worker_registrations(current.cohort_identity,

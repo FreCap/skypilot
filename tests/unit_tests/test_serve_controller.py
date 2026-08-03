@@ -45,6 +45,50 @@ def _restore_consolidation_override():
         original_metrics_role)
 
 
+def test_lifespan_validates_resource_action_auth_isolation(monkeypatch):
+    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
+    monkeypatch.setenv(
+        controller.serve_constants.
+        RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR, '/purpose/tokens')
+    monkeypatch.setenv(
+        controller.serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
+        'true')
+    validate = mock.Mock()
+    monkeypatch.setattr(
+        controller.auth_tokens,
+        'validate_resource_action_preflight_auth_token_isolation', validate)
+
+    async def _run_lifespan():
+        async with ctrl.lifespan(None):
+            pass
+
+    asyncio.run(_run_lifespan())
+    validate.assert_called_once_with(required=True)
+
+
+def test_lifespan_ignores_custom_preflight_env_while_authority_disabled(
+        monkeypatch):
+    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
+    monkeypatch.delenv(
+        controller.serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
+        raising=False)
+    monkeypatch.setenv(
+        controller.serve_constants.
+        RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR,
+        '/compatibility/tokens')
+    validate = mock.Mock()
+    monkeypatch.setattr(
+        controller.auth_tokens,
+        'validate_resource_action_preflight_auth_token_isolation', validate)
+
+    async def _run_lifespan():
+        async with ctrl.lifespan(None):
+            pass
+
+    asyncio.run(_run_lifespan())
+    validate.assert_not_called()
+
+
 def test_update_ignores_stale_submitted_yaml_without_request_declaration():
     with mock.patch('builtins.open') as open_file:
         submitted = controller._read_declared_submitted_yaml(  # pylint: disable=protected-access

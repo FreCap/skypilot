@@ -11,6 +11,7 @@ import time
 import uuid
 
 import pytest
+import serve_resource_action_test_fixtures as authority_fixtures
 import sqlalchemy
 import test_serve_resource_action_down_execution_config
 import test_serve_resource_action_launch_execution_config
@@ -104,10 +105,17 @@ def shadow_database(postgres_engine):
     serve_state_schema.Base.metadata.create_all(postgres_engine)
     resource_action_state_schema.RESOURCE_ACTION_STATE_METADATA.create_all(
         postgres_engine)
+    resource_action_state_schema.RESOURCE_ACTION_AUTHORITY_RELEASE_METADATA.create_all(
+        postgres_engine)
     request_postgres.REQUESTS.create(postgres_engine, checkfirst=True)
-    return postgres_engine, (
-        resource_action_state.PostgresServeResourceActionStateStore(
-            postgres_engine))
+    store = resource_action_state.PostgresServeResourceActionStateStore(
+        postgres_engine)
+    store.preflight_authority_release(
+        authority_fixtures.NAMESPACE, authority_fixtures.HELM_FULL_NAME,
+        authority_fixtures.HELM_FULL_NAME, authority_fixtures.INSTALLATION_ID,
+        True, (actions.ProviderAuthorityWorkerCohortManifestV1.from_value(
+            authority_fixtures.authority_manifest_value()),), ())
+    return postgres_engine, store
 
 
 @pytest.fixture
@@ -390,83 +398,38 @@ def _accept_worker_cohort(engine, store) -> None:
     evidence_time = database_now - datetime.timedelta(seconds=1)
     timestamp = evidence_time.astimezone(_UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
-    cohort_value = copy.deepcopy(launch_config_fixtures._canonical_cohort())
-    manifest = cohort_value['manifest']
-    qualification = manifest['image']
-    pod_template_contract = manifest['pod_template_contract']
-    artifact_inventory = manifest['artifact_inventory']
-    callable_inventory = manifest['callable_inventory']
+    cohort_value = authority_fixtures.authority_cohort_value()
     cohort = actions.WorkerCohortIdentityV1.from_value(cohort_value)
 
-    def worker(pod_uid: str) -> dict[str, object]:
-        qualification_artifact = qualification['qualification_artifact']
-        assert isinstance(qualification_artifact, dict)
-        runtime = {
-            'raw_image_id': 'containerd://sha256:' + '2' * 64,
-            'runtime_image_id_scheme': 'containerd',
-            'runtime_image_id_digest': 'sha256:' + '2' * 64,
-            'qualified_oci_manifest_digest': 'sha256:' + '1' * 64,
-            'qualified_oci_config_digest': 'sha256:' + '2' * 64,
-            'qualification_artifact_sha256': qualification_artifact['sha256'],
-            'runtime_id_contract': 'qualified_oci_config_digest_v1',
-        }
-        return {
-            'namespace': manifest['namespace'],
-            'pod_name': f'worker-{pod_uid}',
-            'pod_uid': pod_uid,
-            'pod_resource_version': '101',
-            'pod_service_account_name': manifest['service_account_name'],
-            'pod_controller_owner': {
-                'api_version': 'apps/v1',
-                'kind': 'ReplicaSet',
-                'name': 'skypilot-authority-v1-abc',
-                'uid': 'replicaset-uid-v1',
-            },
-            'replica_set_name': 'skypilot-authority-v1-abc',
-            'replica_set_uid': 'replicaset-uid-v1',
-            'replica_set_resource_version': '102',
-            'replica_set_controller_owner': {
-                'api_version': 'apps/v1',
-                'kind': 'Deployment',
-                'name': manifest['deployment_name'],
-                'uid': cohort_value['deployment_uid'],
-            },
-            'deployment_name': manifest['deployment_name'],
-            'deployment_uid': cohort_value['deployment_uid'],
-            'deployment_resource_version': '103',
-            'deployment_generation': 5,
-            'deployment_observed_generation': 5,
-            'pod_template_contract_sha256': pod_template_contract['sha256'],
-            'image': {
-                'qualification': qualification,
-                'runtime': runtime,
-            },
-            'service_account_uid': cohort_value['service_account_uid'],
-            'artifact_inventory_sha256': artifact_inventory['sha256'],
-            'callable_inventory_sha256': callable_inventory['sha256'],
-            'handler_allowlist_sha256': actions.canonical_sha256(
-                manifest['handler_allowlist']),
-            'observed_at': timestamp,
-        }
-
-    registrations = actions.WorkerCohortRegistrationSetV1.from_value({
-        'version': 1,
-        'cohort_identity_sha256': cohort.sha256,
-        'workers': [{
-            'worker': worker(pod_uid),
+    def registration(
+            pod_uid: str) -> actions.ProviderAuthorityWorkerRegistrationV1:
+        worker = authority_fixtures.authority_worker_value(pod_uid)
+        worker['observed_at'] = timestamp
+        return actions.ProviderAuthorityWorkerRegistrationV1.from_value({
+            'worker': worker,
             'pod_ready': True,
             'deployment_spec_replicas': 2,
             'deployment_status_observed_generation': 5,
+            'deployment_status_replicas': 2,
+            'deployment_updated_replicas': 2,
             'deployment_ready_replicas': 2,
             'deployment_available_replicas': 2,
+            'deployment_unavailable_replicas': 0,
             'registered_at': timestamp,
-        } for pod_uid in ('pod-a', 'pod-b')],
+        })
+
+    first = actions.WorkerCohortRegistrationSetV1.from_value({
+        'version': 1,
+        'cohort_identity_sha256': cohort.sha256,
+        'workers': [registration('pod-a').canonical_value()],
     })
-    registered = store.register_worker_cohort(cohort, registrations)
-    accepted = store.transition_worker_cohort(
-        cohort.manifest.cohort_id, registered.record.revision,
-        actions.WorkerCohortLifecycleState.REGISTERING,
-        actions.WorkerCohortLifecycleState.ACCEPTING)
+    registered = store.register_worker_cohort(cohort, first)
+    appended = store.append_worker_cohort_registration(
+        cohort, registered.record.revision,
+        registered.record.registration_attestations, registration('pod-b'))
+    accepted = store.promote_worker_cohort(
+        cohort.cohort_id, appended.record.revision,
+        appended.record.registration_attestations)
     assert accepted.record.lifecycle_state is actions.WorkerCohortLifecycleState.ACCEPTING
 
 
@@ -656,7 +619,7 @@ def _gate_evidence(
         approved_image_digest='sha256:' + '1' * 64,
         api_schema_revision=(('007' if authority_ready else '005')
                              if api_revision is None else api_revision),
-        serve_schema_revision='033',
+        serve_schema_revision='034',
         global_user_state_schema_revision=global_revision,
         handler_registered_everywhere=True,
         image_inventory_sha256='2' * 64,
@@ -799,7 +762,10 @@ def test_linked_down_cohort_id_mismatch_rejects_before_any_mutation(
     _accept_worker_cohort(engine, store)
     sample, _ = _sample('down', 2)
     reference = _prepare_worker_cohort_reference(store, sample)
-    crossed = dataclasses.replace(reference, cohort_id='crossed-cohort')
+    crossed = dataclasses.replace(
+        reference,
+        cohort_id=('ra:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb:' + 'b' * 64 +
+                   ':p2a-v1'))
 
     with pytest.raises(kernel_actions.ActionConflict,
                        match='cohort ID differs'):

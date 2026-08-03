@@ -8,174 +8,160 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: should render one exact immutable authority cohort and closed routing
-    release:
-      name: test-release
-      namespace: skypilot-system
+  - it: should reject a dotted rendered Helm full name
+    values:
+      - fixtures/resource-action-authority-values.yaml
     set:
-      apiService.highAvailability.enabled: true
-      apiService.dbConnectionSecretName: external-db
-      requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
-      resourceActions.authorityWorker.enabled: true
-      resourceActions.authorityWorker.activeCohort: authority-v1
-      resourceActions.authorityWorker.auth.existingSecret: authority-auth
-      resourceActions.authorityWorker.tls.existingSecret: authority-tls
-      resourceActions.authorityWorker.cohorts:
-        - id: authority-v1
-          replicas: 2
-          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
-          imagePullPolicy: Always
-    asserts:
-      - hasDocuments:
-          count: 9
-      - isKind:
-          of: ConfigMap
-        documentIndex: 0
-      - equal:
-          path: immutable
-          value: true
-        documentIndex: 0
-      - matchRegex:
-          path: data["routing.json"]
-          pattern: '"handler_allowlist":\["serve_shadow_candidate_launch","serve_shadow_candidate_down","serve_resource_action_launch","serve_resource_action_down"\]'
-        documentIndex: 0
-      - isKind:
-          of: ServiceAccount
-        documentIndex: 1
-      - equal:
-          path: automountServiceAccountToken
-          value: true
-        documentIndex: 1
-      - isKind:
-          of: Deployment
-        documentIndex: 2
-      - equal:
-          path: spec.replicas
-          value: 2
-        documentIndex: 2
-      - equal:
-          path: spec.template.spec.serviceAccountName
-          value: test-release-authority-authority-v1
-        documentIndex: 2
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_API_SERVER_ROLE
-            value: authority-worker
-        documentIndex: 2
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACTIVE_COHORT
-            value: authority-v1
-        documentIndex: 2
-      - equal:
-          path: spec.template.spec.containers[0].imagePullPolicy
-          value: Always
-        documentIndex: 2
-      - isKind:
-          of: Service
-        documentIndex: 3
-      - equal:
-          path: spec.type
-          value: ClusterIP
-        documentIndex: 3
-      - equal:
-          path: spec.selector["skypilot.co/authority-cohort"]
-          value: authority-v1
-        documentIndex: 3
-      - isKind:
-          of: NetworkPolicy
-        documentIndex: 4
-      - equal:
-          path: spec.ingress[0].from[0].podSelector.matchLabels["skypilot.co/role"]
-          value: controller
-        documentIndex: 4
-      - equal:
-          path: rules[0].verbs
-          value: ["get"]
-        documentIndex: 5
-      - equal:
-          path: rules[1].verbs
-          value: ["get"]
-        documentIndex: 5
-
-  - it: should reject a mutable image
-    set:
-      apiService.highAvailability.enabled: true
-      apiService.dbConnectionSecretName: external-db
-      requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
-      resourceActions.authorityWorker.enabled: true
-      resourceActions.authorityWorker.activeCohort: authority-v1
-      resourceActions.authorityWorker.auth.existingSecret: authority-auth
-      resourceActions.authorityWorker.tls.existingSecret: authority-tls
-      resourceActions.authorityWorker.cohorts:
-        - id: authority-v1
-          replicas: 2
-          image: registry.example/authority:latest
-          imagePullPolicy: Always
+      fullnameOverride: bad.name
     asserts:
       - failedTemplate:
-          errorMessage: 'resourceActions.authorityWorker cohort "authority-v1" image must be digest-pinned'
+          errorMessage: resourceActions.authorityWorker requires the rendered Helm full name to be one lowercase DNS label
 
-  - it: should reject a non-HA cohort
+  - it: should reject an uppercase rendered Helm full name
+    values:
+      - fixtures/resource-action-authority-values.yaml
     set:
-      apiService.highAvailability.enabled: true
-      apiService.dbConnectionSecretName: external-db
-      requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
-      resourceActions.authorityWorker.enabled: true
-      resourceActions.authorityWorker.activeCohort: authority-v1
-      resourceActions.authorityWorker.auth.existingSecret: authority-auth
-      resourceActions.authorityWorker.tls.existingSecret: authority-tls
-      resourceActions.authorityWorker.cohorts:
-        - id: authority-v1
-          replicas: 1
-          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
-          imagePullPolicy: Always
+      fullnameOverride: Bad
     asserts:
       - failedTemplate:
-          errorMessage: 'resourceActions.authorityWorker cohort "authority-v1" must have replicas: 2'
+          errorMessage: resourceActions.authorityWorker requires the rendered Helm full name to be one lowercase DNS label
 
-  - it: should reject an active cohort outside the immutable cohort set
+  - it: should reject a leading-hyphen rendered Helm full name
+    values:
+      - fixtures/resource-action-authority-values.yaml
     set:
-      apiService.highAvailability.enabled: true
-      apiService.dbConnectionSecretName: external-db
-      requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
-      resourceActions.authorityWorker.enabled: true
-      resourceActions.authorityWorker.activeCohort: authority-v2
-      resourceActions.authorityWorker.auth.existingSecret: authority-auth
-      resourceActions.authorityWorker.tls.existingSecret: authority-tls
-      resourceActions.authorityWorker.cohorts:
-        - id: authority-v1
-          replicas: 2
-          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
-          imagePullPolicy: Always
+      fullnameOverride: -bad
     asserts:
       - failedTemplate:
-          errorMessage: resourceActions.authorityWorker.activeCohort must name exactly one cohort
+          errorMessage: resourceActions.authorityWorker requires the rendered Helm full name to be one lowercase DNS label
 
-  - it: should require purpose auth and TLS secrets
+  - it: should reject a dotted full name in tombstone-only mode
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-tombstone-values.yaml
     set:
-      apiService.highAvailability.enabled: true
-      apiService.dbConnectionSecretName: external-db
-      requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
-      resourceActions.authorityWorker.enabled: true
-      resourceActions.authorityWorker.activeCohort: authority-v1
-      resourceActions.authorityWorker.cohorts:
-        - id: authority-v1
-          replicas: 2
-          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
-          imagePullPolicy: Always
+      fullnameOverride: bad.name
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker requires the rendered Helm full name to be one lowercase DNS label
+
+  - it: should require an immutable installation UUID before enablement
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.installationId: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.installationId must be a canonical lowercase UUID
+
+  - it: should reject identical health and preflight ports
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.healthPort: 46583
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker healthPort and preflightPort must differ
+
+  - it: should require the PostgreSQL HA topology
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      apiService.highAvailability.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.enabled=true requires apiService.highAvailability.enabled=true
+
+  - it: should require the purpose authentication Secret
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.auth.existingSecret: ""
     asserts:
       - failedTemplate:
           errorMessage: resourceActions.authorityWorker.auth existingSecret and key are required
+
+  - it: should reject the LB-sync Secret key as the purpose credential
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: authority-auth
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.auth and serve.externalLoadBalancer.auth.lbSync must reference different Secret keys
+
+  - it: should reject the controller-admin Secret key as the purpose credential
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: authority-auth
+      serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.auth and serve.externalLoadBalancer.auth.controllerAdmin must reference different Secret keys
+
+  - it: should reject the data-plane Secret key as the purpose credential
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      serve.externalLoadBalancer.auth.lbDataPlane.existingSecret: authority-auth
+      serve.externalLoadBalancer.auth.lbDataPlane.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.auth and serve.externalLoadBalancer.auth.lbDataPlane must reference different Secret keys
+
+  - it: should require the exact qualification bytes to be chart-packaged
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: 'resourceActions.authorityWorker cohort "p2a-v1" qualification artifact is not packaged by this chart'
+
+  - it: should reject configured tolerations that overlap a fixed admission default
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-colliding-toleration-values.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker executorService.tolerations[0] collides with a fixed authority-worker NoExecute toleration
+
+  - it: should retain only exact API verifier RBAC after the last cohort is removed
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-tombstone-values.yaml
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: kind
+          value: Role
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: release-name-authority-retirement-verifier
+        documentIndex: 0
+      - equal:
+          path: rules[0].resourceNames
+          value:
+            - release-name-authority-p2a-v1
+        documentIndex: 0
+      - equal:
+          path: kind
+          value: RoleBinding
+        documentIndex: 1
+      - equal:
+          path: subjects
+          value:
+            - kind: ServiceAccount
+              name: release-name-api-sa
+              namespace: NAMESPACE
+        documentIndex: 1
+
+  - it: should reject enabled state with neither a live cohort nor a tombstone
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-empty-values.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.enabled=true requires at least one live cohort or retirement tombstone

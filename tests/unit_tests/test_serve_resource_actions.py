@@ -226,14 +226,14 @@ def test_launch_invocation_literal_golden_bytes_hash_and_action_id() -> None:
         _launch_invocation())
     assert invocation.canonical_bytes == actions.canonical_json_bytes(
         invocation.canonical_value())
-    assert len(invocation.canonical_bytes) == 52_889
+    assert len(invocation.canonical_bytes) == 57_040
     assert invocation.sha256 == (
-        '3f907c130c9685df8edf5f91006f59684a86a40562e4ccdfbbb76f9062d30c61')
+        'ce8c9b9c2195bc49cc5b8f6122c154b3cadde1b095d2a3a4af19c551879440ef')
     assert invocation.action_id == uuid.UUID(
         'a1fa64dd-eea2-59db-b7b6-733d8001a086')
     assert invocation.launch is not None
     assert invocation.launch.resources.sha256 == (
-        'ddfb2d078e7d76a8e6b20ad0951aedb3219b76b09399dfab1b960d6af5492d62')
+        'c4f2e770236bb1fc6d903d93676bfc65a0d137d093643d278920fc9ee30e90a1')
 
 
 def test_down_invocation_literal_golden_bytes_hash_and_action_id() -> None:
@@ -241,9 +241,9 @@ def test_down_invocation_literal_golden_bytes_hash_and_action_id() -> None:
         _down_invocation())
     assert invocation.canonical_bytes == actions.canonical_json_bytes(
         invocation.canonical_value())
-    assert len(invocation.canonical_bytes) == 41_166
+    assert len(invocation.canonical_bytes) == 44_986
     assert invocation.sha256 == (
-        '51a3546648a400772c8743a96c3bded08385c4da6e74b97b5eec06917d190b9e')
+        'c2c8348e397772df91c8347accac0199bb05edefb42da5b400bf9b9444e90b2f')
     assert invocation.action_id == uuid.UUID(
         '324a4cdd-4640-57ae-aea8-b3f65851f735')
 
@@ -331,16 +331,16 @@ def test_locator_and_plan_literal_golden_bytes_and_hashes() -> None:
     locator = actions.ProviderLocatorV1.from_value(_target())
     assert locator.canonical_bytes == actions.canonical_json_bytes(
         locator.canonical_value())
-    assert len(locator.canonical_bytes) == 2_938
+    assert len(locator.canonical_bytes) == 2_949
     assert locator.sha256 == (
-        '21a7dab73f56fef56fae733682a1275c307c3d7e9fb507fb1d3af6afd603a607')
+        'deff1707400aeb62ae3b693108c46501054331dab69faa5a5498278263986bf6')
 
     plan = actions.ProviderLifecyclePlanV1.from_value(_launch_plan())
     assert plan.canonical_bytes == actions.canonical_json_bytes(
         plan.canonical_value())
-    assert len(plan.canonical_bytes) == 3_756
+    assert len(plan.canonical_bytes) == 3_767
     assert plan.sha256 == (
-        '47563a773ef3cafaa7ba5e2524db71f98caf8074626eeaf09b6e3d4e9690c1fa')
+        '10a96fce5a883932cfd10ec8419d8d3026f51b8053e6b73758ba585e034fdc57')
 
 
 def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
@@ -349,16 +349,21 @@ def test_action_spec_literal_golden_bytes_hashes_and_action_ids() -> None:
                        b',"provider_plan":' +
                        launch.provider_plan.canonical_bytes + b',"version":1}')
     assert launch.canonical_bytes == expected_launch
-    assert len(launch.canonical_bytes) == 56_689
+    assert len(launch.canonical_bytes) == 60_851
     assert launch.sha256 == (
-        '51868b94c4d1edb1805da8dc71b397c8462fb9f59ccf9192c61296a40604d4de')
+        '81a770595947e61f0c2095a84ab746e72aed08b554f5acf5e458debd3264b0a7')
     assert launch.action_id == uuid.UUID('a1fa64dd-eea2-59db-b7b6-733d8001a086')
-    assert len(launch.canonical_bytes) <= 60_000
+    # The complete P2a release manifest is intentionally retained in the
+    # frozen capsule for this dark tranche. It still fits the absolute parser
+    # contract, but fails the stricter activation qualification budget. P2b
+    # must replace it with a hash-checked durable cohort reference before any
+    # represented admission is enabled.
+    assert 60_000 < len(launch.canonical_bytes) <= 65_536
 
     down = actions.ServeReplicaActionSpecV1.from_value(_down_spec())
     assert (len(down.canonical_bytes), down.sha256) == (
-        45_088,
-        '5be7dc540da44ce9fe9a9c3a392c16efd5cf1752f381bae7c66db14ac2aacd4f')
+        48_919,
+        '5c6d4203ab01bf6dd548f3603ffb02446fcfa13504bd149f9409bfb6ff432bb0')
     assert len(down.canonical_bytes) <= 60_000
 
 
@@ -550,7 +555,7 @@ def test_action_spec_cleanup_down_is_the_only_child_invocation_exception(
     assert cleanup.requested_target == spec.invocation.requested_target
     assert cleanup.legacy_down_request.workspace == 'boltz-test'
     assert cleanup.sha256 == (
-        '4711563acb5a99d29457d2b90f22ff52afe34440777c675d8fe2e7f277956d04')
+        'c917c535a983057ea14dcc8cb4926782b18e124313d4ffb996ae11d43c57961e')
     spec.validate_shadow_child_invocation(
         actions.ShadowRequestRole.LAUNCH_CLEANUP_DOWN, cleanup)
 
@@ -582,7 +587,7 @@ def test_action_spec_completed_down_stays_below_rollout_and_parser_bounds(
     spec = actions.ServeReplicaActionSpecV1.from_value(value)
 
     assert spec.canonical_bytes == actions.canonical_json_bytes(value)
-    assert len(spec.canonical_bytes) == 45_088
+    assert len(spec.canonical_bytes) == 48_919
     assert len(spec.canonical_bytes) <= 60_000
     assert len(spec.canonical_bytes) <= 65_536
 

@@ -120,6 +120,24 @@ CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR = (
 LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR = (
     'SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED')
 
+# Chart-owned marker for role-local authority behavior. Absence is the only
+# disabled representation; charts never emit a false value.
+RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR = (
+    'SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED')
+# Dedicated controller-to-authority-worker preflight trust domain.  This ring
+# has no legacy environment fallback and must never share a token with any
+# public API, LB sync, controller administration, or inference credential.
+RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR = (
+    'SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE')
+RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_PATH = (
+    '/etc/skypilot/resource-action-authority/auth/tokens')
+RESOURCE_ACTION_PREFLIGHT_TLS_DIRECTORY = (
+    '/etc/skypilot/resource-action-authority/tls')
+RESOURCE_ACTION_PREFLIGHT_PATH = (
+    '/internal/resource-actions/v1/kubernetes/preflight')
+RESOURCE_ACTION_PREFLIGHT_PORT = 46583
+RESOURCE_ACTION_PREFLIGHT_SERVICE_SUFFIX = 'authority-preflight'
+
 # A load balancer stamps the durable service incarnation it was created for.
 # The stable API-server proxy rejects stale same-name LBs before forwarding.
 SERVICE_HASH_HEADER = 'X-SkyPilot-Serve-Service-Hash'

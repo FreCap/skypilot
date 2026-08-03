@@ -6,6 +6,7 @@ from unittest import mock
 
 import pytest
 import requests
+import serve_resource_action_test_fixtures as authority_fixtures
 import urllib3.util
 
 from sky.serve import resource_action_client
@@ -37,7 +38,7 @@ def _request() -> actions.ProviderLaunchIdentityCanonicalizationRequestV1:
         version=1,
         decision_id=identity.action_identity(
             kernel_actions.ActionKind.LAUNCH).action_id,
-        cohort_id='authority-v1',
+        cohort_id=authority_fixtures.COHORT_ID,
         action_type=kernel_actions.ActionKind.LAUNCH,
         controller_owner_fence='123:10.0.0.1',
         lifecycle_epoch=4,

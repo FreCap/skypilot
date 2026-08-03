@@ -86,8 +86,15 @@ class _CanonicalJsonValueSubclass(actions.CanonicalJsonValue):
         raise AssertionError('wrapper subclass must be rejected before use')
 
 
-def _artifact(path: str = 'images/runtime.json') -> dict:
-    return {'repo_path': path, 'byte_size': 17, 'sha256': 'a' * 64}
+def _artifact() -> dict:
+    return {
+        'source': 'helm_chart_configmap_v1',
+        'repo_path': ('charts/skypilot/files/'
+                      'resource-action-qualifications/runtime.json'),
+        'mount_path': '/etc/skypilot/resource-action-authority/qualification.json',
+        'byte_size': 17,
+        'sha256': 'a' * 64,
+    }
 
 
 def _image() -> dict:

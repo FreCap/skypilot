@@ -6,22 +6,43 @@ contract foundations are implemented. As of 2026-08-02, the exact three-object
 `ResolvedProviderTargetV1` is the first deployable v1 resolved-target wire; the
 unreleased flattened v1 scaffold is rejected. Immutable launch and down
 invocations/execution configurations, completed and partial down bases, the
-closed API006 progress/lineage/reduction contract, and strict private-handler
-return codecs are implemented and locally verified. The five pinned renderer
-artifacts, closed renderer input/seed, exact three-object body and atomic
+closed API006 progress/lineage/reduction contract, and strict authoritative-
+handler return codecs are implemented and locally verified. The shadow-handler
+strict codecs required before P3 dispatch are not implemented. The five pinned
+renderer artifacts, closed renderer input/seed, exact three-object body and atomic
 capsule-validator cutover, effect-free staged renderer, and pure request and
 admitted-object normalizers are also implemented and locally verified. Live
-transport normalization, preflight, manager/runtime admission and session,
-request-handler dispatch, provider observation/effect capture, canary cohort
-qualification, and live provider authority are not implemented. Authority
-remains disabled. Activation evidence rejects API006 as an authority head:
+target observation, manager/runtime admission and session, request-handler
+dispatch, provider observation/effect capture, and live provider authority are
+not implemented. The P2a preflight-only transport, exact release/static
+manifest contracts, two-Pod self-attestation/bootstrap, fail-closed stale-row
+retirement, API tombstone verifier, and disabled-by-default Helm topology are
+implemented and locally unit/PostgreSQL/Helm verified. The merged-image dark
+rollout and cohort qualification are still pending. The exact representative
+launch spec is 60,851 bytes, above the separate 60,000-byte activation budget
+but below the 65,536-byte parser ceiling, so authority remains disabled.
+Activation evidence rejects API006 as an authority head:
 API005 is limited to legacy-controller shadow, while API007 gates
 private-handler dispatch readiness and `shadow -> authoritative`. This does
-not claim M4 or provider-authoritative rollout. The candidate v1 artifacts are
+not yet implement any of the parent design's three server-owned API007 proof
+builders or their transition/dispatch writes and does not claim M4 or
+provider-authoritative rollout. The candidate v1 artifacts are
 packaged and present in a dark ordinary-role deployment, but have not been
 accepted into or exercised by an executor cohort; the eventual
 canary-namespace, persisted 201/409, scheduler, and runtime gates remain
 incomplete.
+
+The current bounded implementation tranche is P2a, a preflight-only cohort
+bootstrap. Its closed wire envelopes, private HTTPS transport, two-Pod
+self-attestation, complete static-manifest projection, and retirement fences
+deliberately start no request executor, claim no queue row, accept no manager
+admission, construct no workload/action-provider client, and perform no
+Kubernetes mutation or provider effect. Its dedicated observer only GETs its
+own Pod, owner ReplicaSet, exact Deployment, and ServiceAccount. Its initial
+evaluator may return only the typed
+`not_representable: preflight_unavailable_or_invalid` result after the cohort
+is accepted. Complete live target observation and private dispatch remain P2b
+and P3 work.
 
 Source commit `a836825ef9c219563bb2abc740707c825c26edc5` and immutable
 image digest
@@ -33,7 +54,8 @@ Authority-worker resources remained disabled and absent; no provider session,
 private-handler dispatch, shadow sample, action row, provider I/O, or M4
 authority was exercised.
 
-The later API007 activation correction and frozen renderer-contract merge
+The later API006-rejection/API007-readiness correction and frozen
+renderer-contract merge
 commit `4f024b60f2fc71852fa8fb9747390f4d3917b03f` was deployed dark as immutable
 digest
 `sha256:06c9e71c5744ea970c41402fb9c4934e6722a7b53271f6715231b4b275525d25`.
@@ -57,7 +79,7 @@ zero, and the four schema heads were unchanged. This proves dark packaging and
 ordinary-role deployability only; no renderer entrypoint, executor cohort,
 provider I/O, shadow comparison, or authority path was exercised.
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 Canonical owner: this file governs only the provider-mutation and observation
 seam for `docs/designs/durable-serve-replica-actions.md`. It does not supersede
@@ -3376,10 +3398,12 @@ uncorrelated tap, extra provider call, body/path/query mismatch, bootstrap/
 divergent. The post-policy hook remains useful policy evidence but cannot by
 itself establish provider-byte parity.
 
-Before the candidate window starts, the narrow legacy-owned path is routed
-through the same pure object renderer and prebooted-runtime/Skylet seam while
-the existing SafeThread and one real PR #1070 request remain the only mutation
-owner. It uses a private `serve_shadow_candidate_launch/down` handler that only
+Before the candidate window starts, the narrow represented path is routed
+through the same pure object renderer and prebooted-runtime/Skylet seam. The
+existing SafeThread remains the sole decision/admission/request owner and waits
+for one real PR #1070 request; its claimed private
+`serve_shadow_candidate_launch/down` handler is the sole provider-effect owner.
+No SDK or parallel mutation path runs. Only
 the attested authority-worker cohort may claim; public clients cannot select
 that handler, and general normal executors explicitly exclude it. If the
 current generic launch still emits bootstrap, sync, setup, or a non-idempotent
@@ -3470,7 +3494,7 @@ optional-execution-config form.
 
 The one-time first-deployment gate keeps every API, worker, and controller on
 the proven baseline image while the additive migrations reach API007,
-Serve033, and global-user-state 028. In one consistent read-only PostgreSQL
+Serve034, and global-user-state 028. In one consistent read-only PostgreSQL
 snapshot it then requires zero Serve replica rows in `api_resource_actions`,
 their attempts and correlated `api_requests`; zero rows in all six Serve033
 sample, represented-attempt, coverage, coverage-attempt, worker-cohort, and
@@ -3848,17 +3872,38 @@ ProviderOCIImageQualificationV1 = {
   requested_reference: DigestPinnedOCIReference,
   oci_manifest_digest: "sha256:" + 64LowerHex,
   oci_config_digest: "sha256:" + 64LowerHex,
-  qualification_artifact: ProviderRepoArtifactRefV1
+  qualification_artifact: ProviderProjectedQualificationArtifactRefV1
+}
+
+ProviderProjectedQualificationArtifactRefV1 = {
+  source: "helm_chart_configmap_v1",
+  repo_path: "charts/skypilot/files/resource-action-qualifications/" + Text,
+  mount_path:
+    "/etc/skypilot/resource-action-authority/qualification.json",
+  byte_size: PositiveInteger,
+  sha256: Sha256
+}
+
+ProviderOCIImageQualificationArtifactV1 = {
+  version: 1,
+  requested_reference: DigestPinnedOCIReference,
+  oci_manifest_digest: "sha256:" + 64LowerHex,
+  oci_config_digest: "sha256:" + 64LowerHex,
+  source_commit: 40LowerHex,
+  platform: "linux/amd64"
 }
 
 ProviderRuntimeImageIdentityV1 = {
   raw_image_id: Text,
-  runtime_image_id_scheme: "containerd" | "cri-o" | "docker-pullable",
+  runtime_image_id_scheme:
+    "containerd" | "cri-o" | "docker-pullable" | "oci-reference",
   runtime_image_id_digest: "sha256:" + 64LowerHex,
   qualified_oci_manifest_digest: "sha256:" + 64LowerHex,
   qualified_oci_config_digest: "sha256:" + 64LowerHex,
   qualification_artifact_sha256: Sha256,
-  runtime_id_contract: "qualified_oci_config_digest_v1"
+  runtime_id_contract:
+    "qualified_oci_config_digest_v1" |
+    "qualified_oci_manifest_digest_v1"
 }
 
 ProviderPodImageV1 = {
@@ -3875,6 +3920,44 @@ including parsed requested-reference digest equality with
 `oci_manifest_digest`; merely passing the generic OCI parser is insufficient.
 Every resource-contract, object-body, runtime, and artifact-binding copy of the
 workload image must agree under the enclosing capsule checks.
+
+Runtime-image observation is a closed discriminated union, not an assumption
+that manifest and config digests are interchangeable. `containerd://sha256:...`
+and `cri-o://sha256:...` use
+`qualified_oci_config_digest_v1` and must equal the qualification's OCI config
+digest. `docker-pullable://<canonical-reference>@sha256:...` and the bare
+canonical digest-pinned reference reported by current EKS use
+`qualified_oci_manifest_digest_v1` (the latter has scheme `oci-reference`) and
+must equal the qualification's OCI manifest digest. The checked-in
+qualification artifact binds that manifest digest to the distinct config
+digest. No parser may relabel a manifest digest as a config digest.
+
+The qualification artifact is intentionally not an image-local repository
+artifact. It is canonical JSON checked into the follow-up chart, packaged by
+Helm, rendered byte-for-byte into an immutable cohort ConfigMap, and mounted at
+the one fixed path above. The manifest and qualification keys are each mounted
+as an individual read-only `subPath` file from immutable ConfigMaps; they
+therefore appear as regular bind-mounted files rather than kubelet atomic-writer
+symlink chains, and immutability means update propagation is neither expected
+nor relied upon. The already-built candidate contains the verifier,
+not its own future evidence. At startup the verifier opens the projected file
+without following a caller-selected path, requires its exact size/hash and
+canonical bytes plus exactly one final LF, parses exactly
+`ProviderOCIImageQualificationArtifactV1`, and requires the document's requested reference, manifest
+digest, config digest, source commit, and `linux/amd64` platform to equal the
+manifest and running image qualification. `source_commit` must equal the
+40-lowercase-hex release-build `sky.__commit__`; a template, unknown, `-dirty`,
+short, uppercase, or otherwise nonrelease value fails bootstrap. The other three cohort references
+remain installed-package `ProviderRepoArtifactRefV1` values and are resolved
+descriptor-safely beneath the fixed package root. A manifest cannot substitute
+one source kind for the other.
+
+Live evidence on 2026-08-02 confirms why both variants are required. Revision
+76 Pods reported raw `imageID`
+`361913687221.dkr.ecr.us-east-1.amazonaws.com/skypilot-ha@sha256:b21f0e7cc39f62a21bc5887406f941d0b298d8fc277f0b5abb8b1f170c88b198`,
+while registry inspection reported the distinct OCI config digest
+`sha256:e1ea2aa540a0247c855de513a84a56d73eae9f40afaaad69ffcc52757e8061b6`.
+That is an `oci-reference`/manifest observation, not config-digest evidence.
 
 ProviderKubernetesConfigProjectionV1 = {
   version: 1,
@@ -4252,6 +4335,83 @@ ProviderAuthorityWorkerImageV1 = {
   runtime: ProviderRuntimeImageIdentityV1
 }
 
+ProviderAuthorityWorkerPodTemplateReleaseInputsV1 = {
+  version: 1,
+  namespace: Text,
+  helm_full_name: Text,
+  cohort_suffix: DnsLabelMax42,
+  cohort_id: Text,
+  deployment_name: Text,
+  service_account_name: Text,
+  container_name: "skypilot-authority-worker",
+  image: DigestPinnedOCIReference,
+  image_pull_policy: "Always",
+  command: [Text],
+  args: [Text],
+  health_port: DecimalPortText,
+  preflight_port: DecimalPortText,
+  manifest_config_map: {name: Text, key: "manifest.json",
+                        mount_path:
+                          "/etc/skypilot/resource-action-authority/manifest.json"},
+  qualification_config_map: {name: Text, key: "qualification.json",
+                             mount_path:
+                               "/etc/skypilot/resource-action-authority/qualification.json"},
+  auth_secret: {name: Text, key: Text,
+                mount_path:
+                  "/etc/skypilot/resource-action-authority/auth/tokens"},
+  tls_secret: {name: Text, cert_key: Text, private_key_key: Text,
+               ca_key: Text,
+               cert_path:
+                 "/etc/skypilot/resource-action-authority/tls/tls.crt",
+               private_key_path:
+                 "/etc/skypilot/resource-action-authority/tls/tls.key",
+               ca_path:
+                 "/etc/skypilot/resource-action-authority/tls/ca.crt"},
+  database_secret: {name: Text, key: Text},
+  downward_api_fields: [  # exact order
+    {env: "SKYPILOT_POD_NAME", field_path: "metadata.name"},
+    {env: "SKYPILOT_POD_NAMESPACE", field_path: "metadata.namespace"},
+    {env: "SKYPILOT_POD_UID", field_path: "metadata.uid"}
+  ],
+  literal_env: [                                  # exact ascending closed set
+    {name: "SKYPILOT_API_REQUEST_BACKEND", value: "postgres"},
+    {name: "SKYPILOT_API_SERVER_ROLE", value: "authority-worker"},
+    {name: "SKYPILOT_RELEASE_NAME", value: Text},
+    {name: "SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE",
+     value: "/etc/skypilot/resource-action-authority/auth/tokens"},
+    {name: "SKYPILOT_STATE_DB_MIGRATION_MODE", value: "verify"}
+  ],
+  secret_env: [                                   # exact closed set
+    {name: "SKYPILOT_DB_CONNECTION_URI", secret_name: Text, key: Text}
+  ],
+  resources: CanonicalKubernetesResourceRequirementsV1,
+  image_pull_secrets: [Text],
+  pod_labels: [{key: Text, value: Text}],
+  pod_annotations_without_manifest_hash: [{key: Text, value: Text}],
+  pod_security_context: CanonicalKubernetesPodSecurityContextV1,
+  container_security_context: CanonicalKubernetesContainerSecurityContextV1,
+  node_selector: [{key: Text, value: Text}],
+  affinity: CanonicalKubernetesAffinityV1 | null,
+  tolerations: [CanonicalKubernetesTolerationV1],
+  topology_spread_constraints:
+      [CanonicalKubernetesTopologySpreadConstraintV1],
+  priority_class_name: Text | null,
+  runtime_class_name: Text | null,
+  scheduler_name: Text | null,
+  termination_grace_period_seconds: PositiveInteger
+}
+
+ProviderAuthorityWorkerPodTemplateBindingV1 = {
+  version: 1,
+  contract: "authority_worker_pod_template_v1",
+  projector_artifact_sha256: Sha256,
+  release_inputs: ProviderAuthorityWorkerPodTemplateReleaseInputsV1,
+  expected_template_sha256: Sha256,
+  manifest_hash_annotation_json_pointer:
+      "/metadata/annotations/skypilot.co~1resource-action-manifest-sha256",
+  manifest_hash_placeholder: "$MANIFEST_SHA256"
+}
+
 ProviderAuthorityWorkerCohortManifestV1 = {
   version: 1,
   cohort_id: Text,
@@ -4261,6 +4421,7 @@ ProviderAuthorityWorkerCohortManifestV1 = {
   container_name: "skypilot-authority-worker",
   image: ProviderOCIImageQualificationV1,
   pod_template_contract: ProviderRepoArtifactRefV1,
+  pod_template_binding: ProviderAuthorityWorkerPodTemplateBindingV1,
   artifact_inventory: ProviderRepoArtifactRefV1,
   callable_inventory: ProviderRepoArtifactRefV1,
   claim_contract: "frozen_action_cohort_join_v1",
@@ -4315,8 +4476,11 @@ ProviderAuthorityWorkerRegistrationV1 = {
   pod_ready: true,
   deployment_spec_replicas: 2,
   deployment_status_observed_generation: PositiveInteger,
+  deployment_status_replicas: 2,
+  deployment_updated_replicas: 2,
   deployment_ready_replicas: 2,
   deployment_available_replicas: 2,
+  deployment_unavailable_replicas: 0,
   registered_at: UtcTimestamp
 }
 
@@ -4991,7 +5155,19 @@ attestation, bind it to the carried cursor, and reconcile that cursor, but it
 cannot repeat a committed effect. An unattested worker rejects; a replacement
 Pod in the same frozen cohort may recover.
 
-`manifest.cohort_id` names an immutable versioned Deployment, not a mutable
+The values-level cohort `id` is only a version suffix `S`: a lowercase
+DNS-label of at most 42 characters. Each authority installation has one
+immutable operator-provisioned UUID `I`, unique among clusters/releases sharing
+the central database. For release namespace `N` and rendered Helm full name
+`F`, `manifest.cohort_id` is the database key
+`"ra:" + I + ":" + sha256(N + "\\n" + F + "\\n" + S).hexdigest() + ":" + S`;
+the fields are exact UTF-8 and each displayed `"\\n"` is byte `0x0A`.
+Every database row and wire proof carries that full key, while rendered
+resource names derive from `F` and `S`. The chart rejects a missing, changed,
+or noncanonical installation UUID and any derived-key/name overflow. The
+database primary key plus exact identity comparison makes duplicate-ID/hash
+collision fail closed. Cross-release, cross-namespace, cross-installation, and
+forced-collision tests cover this boundary. The full key names an immutable versioned Deployment, not a mutable
 release-wide slot. Multiple cohort Deployments may run concurrently. The
 action's frozen resolved cohort alone may claim it; a newer active cohort cannot
 claim or reinterpret an older action. An old cohort remains deployed while any
@@ -5019,10 +5195,18 @@ locks that cohort and inserts or exactly adopts the decision's nonexecuting
 `PREPARING` retention reference, then releases every lock before the network
 preflight. The authority-worker cohort created its registry identity during
 rollout by self-attesting the same projected static manifest plus its live
-Deployment and ServiceAccount UIDs. The first worker inserts `REGISTERING`; each
-distinct ready Pod exactly adopts the immutable identity and appends its closed
-registration evidence. Only the typed two-worker gate changes it to
-`ACCEPTING`. The action-specific preflight response's `resolved_cohort` must be
+Deployment and ServiceAccount UIDs. Both Pods first become
+`/bootstrapz`-Ready. The first process that then observes the exact Deployment
+with spec/status-total/updated/ready/available replicas all two, unavailable
+zero, and one generation /
+resourceVersion inserts one registration for its own Pod/owner chain. The peer
+reads that row after insert conflict, observes the same Deployment snapshot,
+and compare-and-swap appends its own distinct registration; neither GETs the
+peer Pod. The resulting pair is sorted by Pod UID. Only the typed two-worker
+gate, including a final same-snapshot Deployment read, changes it to
+`ACCEPTING`. Lost insert/append/promotion acknowledgements exact-read and adopt
+the committed row/revision. The
+action-specific preflight response's `resolved_cohort` must be
 byte-equal to that registry identity. The reference authorizes no claim or I/O;
 it only prevents retirement while prepared work is unadmitted.
 
@@ -5177,14 +5361,58 @@ The expected cohort manifest contains only values knowable from the rendered
 release: names, qualified image identity, inventories, template contract,
 claim contract, and handler allowlist. Generated Deployment and ServiceAccount
 UIDs are deliberately absent. Helm renders the canonical manifest into an
-immutable, read-only projected file mounted by controllers and the matching
-worker cohort; neither side performs a runtime ConfigMap GET. A complete
+immutable ConfigMap key mounted by individual read-only `subPath` at exactly
+`/etc/skypilot/resource-action-authority/manifest.json` in controllers and the
+matching worker cohort. It must be a nonsymlink regular bind-mounted file with
+exact canonical bytes/size/hash; neither side performs a runtime ConfigMap GET.
+A complete
 response's `resolved_cohort.manifest` must be byte-equal to the request's
 manifest, and its `manifest_sha256` must recompute from those bytes. The
 authenticated worker identity must prove that the serving Pod is owned by the
 returned Deployment UID and runs under the returned ServiceAccount UID. The
 execution capsule's `executor_cohort` must equal the returned resolved cohort.
 Any mismatch is not representable and is never normalized away.
+
+The installed `pod_template_contract` is the qualified pure builder/projector
+implementation and closed schema; it is not treated as a generic expected
+release template. V1 accepts exactly the installed source artifact
+`sky/serve/resource_action_provider_preflight.py`: its descriptor-read source
+bytes bind `projector_artifact_sha256`, while the closed release-input DTOs in
+`sky/serve/resource_actions.py` bind the projector's schema. The runtime calls
+that module's named pure projector only after the source reference resolves
+byte-for-byte; an arbitrary same-shaped module or data file cannot select a
+callable. The manifest's `pod_template_binding.release_inputs` is the trusted
+complete release-specific preimage. It includes every Helm-varying Pod-template
+byte: image/command/args/ports/resources, every literal/downward/Secret-backed
+env entry, every release-specific Secret/ConfigMap name/key/path and
+volume/mount, database credential reference, ServiceAccount name/pull-secret
+settings, labels/annotations, security contexts, and all variable
+scheduling/termination values. The v1 builder supplies the remaining closed
+non-variable bytes: Pod token automount is exactly false; both Pod
+`serviceAccount` fields equal the cohort ServiceAccount; one explicitly named
+`kube-api-access` projected volume is mounted read-only at
+`/var/run/secrets/kubernetes.io/serviceaccount`; and its sources are exactly a
+3,607-second ServiceAccount token at `token`, `kube-root-ca.crt` key `ca.crt`
+at `ca.crt`, and downward `metadata.namespace` at `namespace`. The cohort
+ServiceAccount object itself retains explicit token automount true. This
+suppresses the admission plugin's dynamically suffixed token volume without
+removing the bootstrap observer's in-cluster credential. Unknown inputs,
+environment names, volumes, mounts, containers, or template fields reject. The
+builder artifact hash must equal
+`projector_artifact_sha256`; it deterministically constructs the expected
+PodTemplateSpec and recomputes `expected_template_sha256`.
+
+The manifest hash has no recursive preimage. The builder places the literal
+`$MANIFEST_SHA256` only at the one annotation JSON pointer and hashes that
+placeholder template into `expected_template_sha256`. The static manifest
+contains that binding but no computed manifest hash, so its canonical SHA-256
+is then well-defined. Helm substitutes that final manifest SHA only into the
+live Deployment annotation. Bootstrap requires the live annotation equal the
+computed static-file hash, replaces exactly that value with the placeholder,
+and then compares the rebuilt expected template to Deployment, ReplicaSet, and
+Pod projections. The immutable manifest ConfigMap name is cohort-versioned but
+not content-hash-derived. No other field may contain the placeholder or final
+manifest hash.
 
 The controller may use generated UIDs as preparation/execution evidence only
 from this authenticated live response. The registry copy is a retention and
@@ -5195,7 +5423,9 @@ record. The response is bound to its nonce, request hash, action kind, and
 expected manifest and cannot be replayed for another preparation.
 
 The exact endpoint is
-`POST https://<release>-resource-action-authority.<release-namespace>.svc:46583/internal/resource-actions/v1/kubernetes/preflight`.
+`POST https://<full-name>-authority-preflight.<release-namespace>.svc:46583/internal/resource-actions/v1/kubernetes/preflight`,
+where `<full-name>` is the Helm chart's rendered full name (for the current
+test release, `skypilot-ha-authority-preflight.skypilot-ha.svc`).
 It is served by a read-only extension of the authority executor's role-health
 supervisor, not public FastAPI and not a request handler. The endpoint imports
 only preflight construction and no action submit/session mutation callable.
@@ -5206,18 +5436,107 @@ connection reset, timeout, or 502/503/504. It never retries a 2xx/4xx response.
 Exhaustion, malformed bytes, nonce/hash mismatch, mixed cohort identity, or an
 unequal capsule is not representable and never enqueues fallback work.
 
-Transport authentication uses the existing file-backed token-ring parser and
-constant-time comparison with a distinct
-`SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE`; API-user, LB-sync,
-controller-admin, and data-plane tokens are forbidden. A purpose-specific TLS
+Transport authentication extends the existing token-ring module with the
+purpose-specific strict parser below and constant-time comparison with a distinct
+`SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE`. The purpose grammar
+rejects the reserved `sky_` prefix used by every SkyPilot service-account API
+token; LB-sync, controller-admin, and data-plane token bytes are compared from
+their mounted rings and must be disjoint. A purpose-specific TLS
 Secret supplies `tls.crt`, `tls.key`, and `ca.crt`, with a SAN for the exact
-Service DNS. Authority workers mount cert/key/CA and controllers mount only CA;
-both reread token files for rotation. Helm refuses authority enablement without
+Service DNS. Authority workers mount cert/key/CA, controllers mount only CA
+from that TLS Secret, and both separately mount/reread the purpose token ring.
+Helm refuses authority enablement without
 the two named existing Secrets. A ClusterIP Service selects only ready
 authority-worker Pods, has no Ingress/LoadBalancer, and exposes only 46583. A
 NetworkPolicy admits that port only from controller-role Pods in the release
-namespace; an existing controller egress policy receives the reciprocal rule
-without replacing its other egress.
+namespace. P2a renders no controller egress policy: introducing the first
+egress policy for that selector would silently isolate every other controller
+destination. If a deployment already isolates controller egress, the cohort
+stays disabled until its complete existing egress policy is explicitly
+extended with the Service path and regression-tested.
+
+The v1 HTTP/TLS edge is closed:
+
+- P2a speaks HTTP/1.1 over TLS only. The server requires TLS 1.2 or newer and
+  ALPN `http/1.1`. The leaf/key must match; the chain must terminate in the
+  mounted purpose CA; and the currently valid leaf has `CA=false`,
+  `serverAuth` EKU, and exactly one SAN: the full Service `dNSName`. CN
+  fallback, wildcard/IP/URI/extra DNS SAN, plaintext, client-certificate mode,
+  system CA, proxy, and hostname-disable paths reject. The client sends and
+  verifies exact SNI/hostname equality. Of the TLS triple, controllers mount
+  only `ca.crt`; they separately mount the purpose token ring. Workers mount
+  `tls.crt`, `tls.key`, `ca.crt`, and the same purpose ring.
+- The request is exactly `POST`, the literal path with no query/fragment,
+  HTTP/1.1, and one each of `Host: <service-dns>:46583`,
+  `Authorization: Bearer <ASCII-token>`,
+  `Content-Type: application/json`, `Accept: application/json`,
+  `Accept-Encoding: identity`, canonical decimal `Content-Length`, and
+  `Connection: close`. `Content-Encoding`, `Transfer-Encoding`, `Expect`,
+  `Proxy-Authorization`, `Cookie`, credentials outside Authorization,
+  absolute-form targets, and duplicate headers reject. The request line is at
+  most 2,048 bytes; at most 32 headers are allowed, each at most 8,192 bytes and
+  32,768 bytes aggregate. Content length is 1..65,536; short or trailing body
+  bytes reject. UTF-8 input must byte-equal canonical reserialization.
+- The purpose ring file is at most 514 bytes and contains exactly one or two
+  unique LF-delimited ASCII tokens, each 32..256 characters matching
+  `[A-Za-z0-9._~+/=-]+` but not beginning `sky_`, with one final LF and no
+  blank/CR/duplicate line. SkyPilot API service-account tokens always use that
+  excluded prefix and only their hashes are retained centrally, so no chart
+  Secret reference or reversible raw API-token inventory exists to compare.
+  The server rereads it for every request and compares the candidate against all
+  ring members without an early-exit timing branch. After bounded framing-header
+  validation, ring validity and bearer comparison occur before reading any body
+  byte; 401/503 closes without draining an unauthenticated body. Helm
+  requires a Secret/key distinct from each configured LB-sync,
+  controller-admin, and data-plane ring. Controller startup compares every
+  mounted ring and rejects equal token bytes across trust domains; each client
+  call rereads and repeats that comparison so a projected Secret rotation also
+  fails closed.
+- Status/body bytes are closed: 200 carries only the validated canonical typed
+  response; every error is exactly
+  `{"code":"<code>","version":1}`, where the sole mapping is 400
+  `bad_request`, 401 `unauthorized`, 404 `not_found`, 405
+  `method_not_allowed`, 408 `timeout`, 411 `length_required`, 413
+  `body_too_large`, 415 `unsupported_media_type`, 431
+  `headers_too_large`, and 503 `cohort_unavailable`. Unexpected exceptions
+  become the fixed 503, never traceback. No branch echoes request bytes, token,
+  filesystem, certificate, exception, or cohort detail.
+- Every response is canonical JSON no larger than 65,536 bytes and has exactly
+  one `Content-Type: application/json`, `Content-Length`,
+  `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, and
+  `Connection: close`. Only 401 adds `WWW-Authenticate: Bearer`; only 405
+  adds `Allow: POST`. There is no `Server`, `Date`, compression, chunking,
+  redirect, or free-form header. The client rejects duplicate/missing response
+  headers, any content/transfer encoding, wrong/excess length, noncanonical
+  body bytes, nonce/hash/cohort mismatch, or an invalid typed union.
+- The listener uses a fixed eight-request worker pool and backlog 16, never an
+  unbounded thread/process per connection and never more than one request per
+  connection. Socket/header/body/evaluator/encode work has a five-second
+  deadline. An admitted request without a worker/evaluator slot receives fixed
+  503; a socket rejected before parsing is reset and falls under the client's
+  one reset retry. Shutdown stops admission, clears `/bootstrapz`, drains only
+  bounded in-flight work, and closes TLS.
+- The client creates a fresh trust-isolated session for each attempt with
+  `trust_env=false`, no proxy/netrc/cookie/system-CA state, the closed headers,
+  exact DNS verification, no redirect, connect timeout at most one second, and
+  wall-clock total at most five seconds. It retries once after 100 ms with
+  byte-identical body/nonce only on reset, timeout, or 502/503/504; it never
+  retries TLS/auth, any other 2xx/4xx/500, or a secondary token after 401.
+- TLS files are opened descriptor-relatively from one Kubernetes projected
+  Secret `..data` generation. A watcher fully validates leaf/key/CA, then
+  atomically swaps the SSL context for new connections. Invalid/mixed rotation
+  clears bootstrap and the local accepted snapshot and yields failed TLS/fixed
+  503 rather than stale service. CA rotation is ordered: add old+new CA roots,
+  swap the leaf/key, obtain two fresh worker registrations, then remove the old
+  root. `Connection: close` bounds old-context lifetime. Token rotation uses
+  the analogous two-member overlap then removal. Tests cover every intermediate
+  generation, partial/invalid files, SAN drift, and recovery.
+
+Before P2a deployment is called verified, a controller Pod using the mounted
+CA/token must make the exact live call and receive the typed initial
+`not_representable: preflight_unavailable_or_invalid`; unauthenticated,
+wrong-purpose-token, wrong-CA, wrong-SAN, redirect, oversized, duplicate-header,
+and concurrency-saturation canaries must receive only the closed failures.
 
 The preflight endpoint itself creates no API request, queue row, lease, or
 durable state; the caller's already-committed `PREPARING` retention reference is
@@ -5424,6 +5743,62 @@ ServeReplicaActionSpecV1 = {
 }
 ```
 
+Every installed-package artifact path is normalized relative to the fixed
+package root, contains no empty, dot, parent, absolute, or platform-separator
+segment, and is opened descriptor-relative with no symlink traversal. Every
+inventory entry must be a unique regular file with exact byte size and SHA-256;
+missing, duplicate, extra, symlink, directory, device, path escape, or changed
+bytes fail bootstrap. The separately projected qualification file uses its one
+fixed mount path and the same nonsymlink/regular-file/size/hash checks, but is
+not falsely included in the image-installed inventory.
+
+`pod_template_contract` supplies the qualified pure builder/projector and
+closed schema; `pod_template_binding.release_inputs` supplies every
+release-specific value. Together they canonically construct/project every Pod-template-affecting
+field: Deployment selector and template labels/annotations; every container's
+name, digest image, pull policy, command, args, env name and literal/valueFrom
+source, port, resource request/limit, security context, and volumeMount; all
+init/ephemeral containers; volumes and projected item modes; ServiceAccount /
+token automount/imagePullSecrets; startup/readiness/liveness probes; restart /
+termination settings; Pod security context; DNS/host/network settings; node /
+affinity/toleration/topology/scheduler/runtimeClass/priority fields. The live
+Deployment projection, release-input hash, expected-template hash, and canonical
+static manifest must all recompute exactly. An omitted field is represented by
+the contract's explicit null/empty/default token, never ignored ambiently.
+
+Bootstrap normalizes the live Deployment template through that exact projector,
+requires the owning ReplicaSet template byte-equal after exactly one permitted
+controller transform—adding one computed `pod-template-hash` label with the
+same value to its selector and template—and requires no other RS drift. The
+API-stored Deployment and ReplicaSet templates must each carry exactly null
+`metadata.creationTimestamp`; the closed `api_default_values` rule verifies
+and removes that field before comparison because the Pod projection below has
+no ObjectMeta lifecycle field. The
+observer first exact-validates Pod `apiVersion/kind/metadata.namespace`, its
+identity, and the separately closed ReplicaSet ownerReference. It then
+constructs exactly `{metadata:{labels,annotations}, spec}` rather than
+comparing full-object TypeMeta/identity fields to a PodTemplateSpec, and removes
+only scheduler-assigned `spec.nodeName`. Every other API/admission default is
+made deterministic in the expected template: `serviceAccount`,
+`schedulerName`, container termination-message fields, and probe
+`successThreshold`/`timeoutSeconds` are explicit; Pod priority is zero,
+preemption policy is `PreemptLowerPriority`, and the two unique final
+`NoExecute` tolerations are, in order, `node.kubernetes.io/not-ready` and
+`node.kubernetes.io/unreachable` with 300-second bounds. Release-input
+tolerations using either reserved key with effect absent/null/empty (the
+Kubernetes all-effects form) or `NoExecute` reject, so each fixed suffix entry
+is unique. Every API-defaulted
+spec/container field instead must equal the explicit default map in the
+artifact. The artifact's canonical
+`deployment_to_replicaset_rules`, `replicaset_to_pod_runtime_paths`, and
+`api_default_values` are exhaustive closed maps; unknown ignored paths reject.
+It separately recomputes the running
+four-handler registry—names, entrypoint module/qualname, execution class,
+replay/cancellation policy, aliases, and strict result codec—and requires it
+byte/hash-equal to the callable/handler inventories in the manifest. A merely
+matching Pod annotation or manifest hash cannot substitute for any of these
+three live comparisons.
+
 Unknown keys and floats are rejected, and the canonical object is bounded to
 65,536 UTF-8 bytes. `provider_plan.validate_invocation(invocation)` must pass;
 the plan and invocation derive the enclosing action ID, and
@@ -5547,6 +5922,20 @@ down, and realistic/candidate-maximal full-spec goldens prove the revised shape
 is at most 60,000 bytes and capped preflight request/response goldens satisfy
 their independent 65,536-byte transport limits.
 
+The P2a Helm-derived complete static cohort makes the current representative
+launch spec exactly 60,851 bytes. That remains parseable but deliberately fails
+this activation gate; P2a may deploy only dark and must not raise the
+60,000-byte budget. Before P2b linked represented admission, replace the
+capsule's 5,241-byte complete cohort with a closed compact durable reference
+containing only `version`, `cohort_id`, and `cohort_identity_sha256`. The
+complete cohort is already permanently retained in
+`serve_resource_action_worker_cohorts`. Admission must lock that row, recompute
+the canonical identity hash, and require exact equality before it materializes
+or dispatches a request. The measured 231-byte reference projects the
+representative fixture to approximately 55,841 bytes, but checked-in exact
+realistic and candidate-maximal goldens must prove the unchanged 60,000-byte
+gate; the estimate is not qualification.
+
 The `source` object contains a `content` reference to an immutable retained
 `version_specs` row plus the closed server-effective identity proof;
 the builder verifies the row's exact UTF-8 YAML bytes against
@@ -5601,18 +5990,32 @@ logical-state lock and use a separate bounded pool from provider submission.
 When an existing provider slot is available, the manager performs the parent
 design's short service -> replica -> capacity -> cohort -> reference ->
 coverage -> optional-parent transaction. Before signaling it requires the
-same-ID `PREPARING` reference and atomically changes it to `SHADOW_ACTIVE` while
-writing `worker_cohort_ref_id=decision_id`; mismatch or rollback leaves no
-approval. It signals only after commit or exact lost-commit readback. A
-representable approval carries the same-ID coverage/parent, stored spec and
-invocation hashes, and an unguessable process-local preparation nonce; a
-not-representable approval carries coverage and that nonce but grants no
-cross-process replay authority. The same-cell worker recomputes the projection,
-rechecks owner/cancel/scope fences, and commits either the represented child or
-coverage-only attempt `PRE_SUBMIT` before entering SDK request creation.
+same-ID `PREPARING` reference and writes
+`worker_cohort_ref_id=decision_id`; mismatch or rollback leaves no approval.
+For a legacy-SDK represented or not-representable branch, that same transaction
+changes the reference to `SHADOW_ACTIVE`, and it signals only after commit or
+exact lost-commit readback. A not-representable approval carries coverage and
+an unguessable process-local nonce but grants no cross-process replay authority.
+The same-cell worker rechecks owner/cancel/scope fences and commits its
+represented child or coverage-only attempt `PRE_SUBMIT` before SDK request
+creation.
+
+For the private represented branch, the capacity transaction deliberately
+leaves the reference `PREPARING` and signals nothing. The narrow follow-up
+materializer locks the complete graph and atomically creates/exact-adopts the
+represented child, deterministic request, queue delivery, private correlation,
+binds the child to that ID and `REQUEST_BOUND`, and commits the
+`SHADOW_ACTIVE` transition. Only its commit or exact lost-ack adoption
+lets the SafeThread enter its wait state. A crash in between leaves no claimable
+request and recovery can exact-adopt or safely retain `PREPARING`.
 Construction/start of a PREPARING worker is
 not mutation enqueue; release of this gate is the enforceable provider
 boundary.
+
+Only the represented branch may instead atomically materialize the deterministic
+private request and represented child, then wait for its single claimed handler.
+The coverage-only branch always takes the same-cell legacy SDK path above; it
+has no private request or cross-process executable input.
 
 The live worker uses the same in-memory request object and retained identity
 proof until SDK request admission, but object identity is not a distributed
@@ -5836,7 +6239,107 @@ and rollback. This proves that the unshipped feature-only Serve032 shape was
 absent and that the guarded Serve033 migration handled the upstream catalog;
 it does not prove this provider facet.
 
-### P2: live shadow observation
+### P2a: preflight-only cohort bootstrap
+
+- Add exactly six closed canonical envelopes: launch and down preflight seeds,
+  the discriminated authority request, launch and down responses, and their
+  discriminated response union. The request binds its action kind, fresh nonce,
+  self-hash, expected manifest, and complete seed. A complete response must
+  carry the kind-matched capsule and proof and exact returned
+  cohort/manifest/worker identity; a not-representable response must carry
+  only its closed reason. Every forbidden branch field is null, every hash is
+  recomputed, and each canonical request/response is at most 65,536 bytes.
+- Add the purpose-token-authenticated private HTTPS server and strict client at
+  the exact Service DNS. The client trusts only the mounted purpose CA, follows
+  no redirect, uses one-second connect/five-second total timeouts, and makes at
+  most one byte-identical retry after 100 ms for reset, timeout, 502, 503, or
+  504. It uses a fresh session with `trust_env=false`. The endpoint imports no
+  submit, provider-mutation, execution-session, or request-store callable and
+  uses the exact method/header/status/body/concurrency/rotation contract below.
+- Split Kubernetes bootstrap readiness from queue-claim readiness. The role
+  binds health and preflight listeners first; `/bootstrapz` becomes ready once
+  the static manifest, TLS/token files, and local server are valid, and is the
+  P2a Pod startup and readiness probe. `/readyz` remains false because P2a
+  never starts a request executor. `/bootstrapz` also fails while the role drain
+  marker exists. The preflight route returns 503 until this Pod has adopted an
+  `ACCEPTING` cohort.
+- The API-request `ServerInstanceLease` is deliberately not queue-ready in
+  P2a. It remains `ready=false` with closed
+  `health_detail={"phase":"preflight-only"}` after bootstrap and cohort
+  acceptance; this runtime path has no call to `set_ready(true)`. Kubernetes
+  readiness therefore comes only from `/bootstrapz` and cannot accidentally
+  advertise a claim-capable authority executor.
+- In a bootstrap coordinator separate from the endpoint, load and byte-verify
+  the complete projected manifest and its installed-package artifact refs;
+  byte-verify the separately projected post-build qualification artifact; read
+  the live Pod -> ReplicaSet -> Deployment owner chain and ServiceAccount; take
+  the registration timestamp from a public read-only PostgreSQL-clock seam
+  before those reads; and use the existing Serve033 register / compare-and-swap
+  lifecycle primitives. Both Pods first become `/bootstrapz`-Ready, so the
+  Deployment can report spec/status-total/updated/ready/available replicas all
+  exactly two and unavailable replicas zero
+  before either typed registration is constructible. The first process that
+  observes exact Deployment `2/2` creates `REGISTERING` with its own
+  registration; the peer reads that row and appends its own registration only
+  after observing the same generation/resourceVersion. The set is then sorted,
+  either process rereads that same Deployment snapshot and promotes, and the
+  peer polls and adopts that same
+  `ACCEPTING` identity. Stale-version
+  retries discard the observation, take a new database timestamp, and repeat
+  the exact live proof. Competing one-entry insert conflict is expected: the
+  loser exact-reads the winner, verifies the immutable identity/Deployment
+  snapshot, merges only its own entry, and compare-and-swaps. A lost
+  insert/append/promotion acknowledgement first adopts exact stored bytes and
+  revision; it does not reobserve and demand timestamp equality. They never
+  merge unequal identities. If the append-only
+  registration cannot finish inside the five-minute freshness bound, the
+  API-role abort path may fence a never-accepted row only after proving zero
+  references/evidence/actions/proofs, authorize removal, verify exact NotFound,
+  and retire it; operators then use a new immutable cohort ID.
+- Do not call `executor.start()`, construct an authority claim config, or claim
+  any PR #1070 queue row in P2a. The four private handlers remain fail closed;
+  no manager calls the endpoint; no `PREPARING`, `SHADOW_ACTIVE`, action,
+  request, or queue row is created; no workload/action-provider client,
+  Kubernetes mutation, or provider effect is reachable. Only the dedicated
+  bootstrap observer may GET its own Pod, owning ReplicaSet, exact Deployment,
+  and ServiceAccount. After acceptance, the initial evaluator returns only typed
+  `not_representable: preflight_unavailable_or_invalid`. Complete live target
+  observation is P2b.
+- Expand the Helm cohort value into a complete static-manifest input: immutable
+  image reference and registry manifest digest, OCI config digest, qualification
+  artifact reference, Pod-template contract reference, artifact-inventory
+  reference, callable-inventory reference, exact deployment/service-account /
+  container names, claim contract, and four-handler allowlist. Project the
+  canonical manifest read-only and bind its hash into the Pod template.
+- Qualify an image without circular evidence: first merge/build the dark P2a
+  runtime and inspect its immutable registry manifest and OCI config; then land
+  a follow-up checked-in, chart-packaged qualification artifact and values
+  selecting that exact prior image. The current chart projects the immutable
+  artifact bytes beside `manifest.json`, allowing the prior image to verify
+  their size/hash without pretending the file was installed in that image.
+  Never derive the OCI config digest from a manifest digest or a live CRI
+  `imageID`. `authorityWorker.enabled` remains false until that follow-up
+  evidence is reviewed.
+- P2a does not claim rolling replacement recovery. If the accepted two-Pod set
+  changes or any manifest/live identity drifts, the continuing coordinator
+  clears its process-local accepted snapshot, the endpoint returns 503, and
+  queue readiness remains false. Each accepted process has a five-minute local
+  lease from the oldest attested database timestamp. Before expiry, a watchdog
+  may compare-and-swap `ACCEPTING -> ACCEPTING` only by replacing its own
+  Pod-UID registration and preserving the peer entry byte-for-byte. The sorted
+  UID set, Deployment UID/generation, ServiceAccount UID, immutable identity,
+  and non-temporal proof fields cannot change; only that caller's timestamps /
+  Pod/ReplicaSet resourceVersions may advance; Deployment resourceVersion is
+  frozen across the pair. A CAS loser rereads and reapplies only its own
+  entry; a replacement UID rejects immediately and a survivor clears acceptance
+  no later than peer freshness expiry. Database-clock failure, future/stale
+  time, Pod replacement, Deployment resourceVersion change, owner /
+  generation drift, projected-byte drift, or failed renewal clears the lease
+  and returns 503. Immutable conflicts terminate the process; transient
+  observation failure stays unavailable. P3 still requires a separately
+  reviewed rolling-replacement protocol before claims.
+
+### P2b: live shadow observation
 
 - Capture the actual serialized CoreV1 and Skylet effect trace through its
   closed create/delete/typed-submit union, not merely the high-level legacy
@@ -5857,7 +6360,27 @@ it does not prove this provider facet.
 
 ### P3: request-handler integration
 
-- Add journal-before-I/O mutation boundary to action-correlated requests.
+- Add a narrow represented-only PostgreSQL admission primitive that locks
+  service -> replica -> cohort -> reference -> coverage -> parent -> represented
+  attempt and atomically materializes and binds the sole private PR #1070
+  request/queue row before changing
+  `PREPARING -> SHADOW_ACTIVE`. It validates the exact service owner/epoch,
+  active accepted cohort, immutable request body, deterministic request ID,
+  and write-once compatibility association before queue visibility.
+  `NOT_REPRESENTABLE` coverage remains same-cell legacy SDK work and cannot
+  create a private request. Do not broaden the legacy SDK request binder.
+  Within that transaction the represented child advances from `PRE_SUBMIT` to
+  committed `REQUEST_BOUND` with the deterministic request ID and bind
+  timestamp. Claim SQL joins the exact parent/child, route sequence, request-ID
+  equality, private correlation, and active reference; an unbound child is
+  never claimable.
+- Give the private payload a legal public Pydantic field with serialization
+  alias `_skypilot_resource_action_authority_v1`, forbid extras, and serialize
+  durable request JSON with aliases while handler kwargs use the public field
+  name. The PostgreSQL claim predicate must observe exactly the underscore
+  alias.
+- Add the journal-before-I/O mutation boundary to that action-correlated
+  request.
 - Add API006 monotonic provider progress and persist partial object UIDs/specs,
   exact handle, runtime, job intent/ID, endpoint, operation IDs, and typed
   outcomes under existing request claim fences.
@@ -5865,7 +6388,9 @@ it does not prove this provider facet.
   only the attempt-scoped attestation envelope, and reject any crossed-boundary
   gap or regression.
 - Invoke the in-server execution/core seam directly; the handler must not call
-  `sdk.launch()` or `sdk.down()` and create a nested API request.
+  `sdk.launch()` or `sdk.down()` and create a nested API request. It consumes
+  the active execution claim's request ID and generation as the only request
+  identity; SDK entrypoints are hard-failed in integration tests.
 - Drive exact CoreV1 operations through one `KubernetesResourceActionSession`;
   bypass policy reapplication, generic bootstrap/config discovery, cached
   clients, and mutation helpers that rewrite bytes.
@@ -5890,6 +6415,50 @@ it does not prove this provider facet.
   Serve path after soak.
 
 ## Tests
+
+P2a cannot be marked complete until one focused unit/PostgreSQL/Helm/live suite
+proves all of the following together:
+
+- liveness uses only `/livez`; both startup and readiness use
+  `/bootstrapz`; `/readyz` stays false; the PostgreSQL server-instance row
+  stays `ready=false`/phase `preflight-only`; monkeypatched
+  `executor.start()`, claim-config construction, queue-claim SQL, request-store
+  writes, provider client construction, and Kubernetes mutation hard-fail;
+- two simultaneous one-entry inserts linearize as insert/conflict/exact-read /
+  own-entry merge/CAS, one exact Deployment snapshot reaches `ACCEPTING`, and
+  lost insert, append, promotion, and renewal acknowledgements adopt only exact
+  stored bytes. Crash before/after each boundary, freshness expiry, abort /
+  append/promotion/reference races, exact tombstone removal, and >1 watchdog
+  interval cover own-entry-only renewal, peer-byte preservation, CAS loss,
+  frozen Deployment resourceVersion, stale peer, replacement UID, clock
+  failure, and local lease clearing. A >5-minute DRAINING fixture proves
+  same-Pod `DRAINING -> DRAINING` renewal keeps frozen work dispatch-eligible
+  without permitting a new reference;
+- exact probes and the entire HTTP/TLS/auth/status/header/concurrency/rotation
+  matrix above pass. A real controller Pod makes the typed initial
+  not-representable call using its mounted purpose CA/ring, while wrong ring /
+  CA/SAN/SNI, duplicate/framing/header/body/canonical errors, slow body,
+  saturation, partial Secret generations, and old/new overlap take only their
+  closed branches;
+- PostgreSQL asserts zero request, queue, action, attempt, reference, coverage,
+  and private-evidence rows; Kubernetes audit asserts only own-Pod, owner-RS,
+  exact Deployment, and ServiceAccount GETs, with zero list/watch or mutation.
+  RBAC authorization tests deny every other verb/resource and separately cover
+  the exact conditional API tombstone GET grant;
+- qualification uses the real registry manifest/config digests and both
+  containerd/cri-o config-ID plus live EKS bare OCI-reference/manifest-ID
+  branches. Missing/tampered/substituted/extra/symlink/path-escape artifacts,
+  wrong `subPath` bytes, Pod/RS/Deployment projector drift, unexpected
+  API-default/runtime fields, missing/extra release-specific Secret/ConfigMap /
+  env/volume/scheduling input, manifest-placeholder misuse or self-hash
+  mismatch, handler-registry drift, and every hash/size/canonical mismatch
+  block bootstrap; and
+- Helm schema/render/install/upgrade tests cover immutable installation ID,
+  cross-release/namespace/installation/full-key collision handling, every
+  required value/resource/name, worker/tombstone least privilege, and an
+  active-selection-only render diff that changes only selector/manager
+  resources while every cohort Deployment, ServiceAccount, ConfigMap,
+  RoleBinding subject, and Pod template remains byte-identical.
 
 Contract tests must cover:
 
@@ -6175,9 +6744,12 @@ paths, and no false teardown completion.
 
 Provider changes ship dark, then shadow, then per-service authoritative. The
 blocking migration job must converge all three independent additive
-heads—global-user-state 028, Serve033, and API005 for legacy-only shadow; API007
+heads—global-user-state 028, Serve034, and API005 for legacy-only shadow; API007
 (including the API006 progress substrate) is the required API head before any
-private-handler shadow, provider dispatch, or authority. There is
+private-handler shadow, provider dispatch, or authority. API007 activation
+uses the parent design's distinct server-owned proof, exact-reads the three
+actual Alembic heads and accepted cohort under the transition transaction, and
+never trusts caller-supplied revision strings alone. There is
 no cross-lineage Alembic dependency. No provider profile is enabled globally by
 schema migration. Application rollback retains all three heads and
 uses only a compatible image that preserves nonnull cluster-record UUIDs as
@@ -6210,6 +6782,17 @@ sequence. Their future deployment is separately gated by renderer/runtime/
 preflight and cohort-attestation evidence. The first additive migration stage
 omits `--atomic`; repair or rollback uses the current chart and compatible
 prior digests against retained additive heads, never native `helm rollback`.
+
+The first P2a image is necessarily built and deployed with the authority role
+disabled. Registry inspection of that immutable image supplies its distinct
+OCI manifest and config digests; a follow-up reviewed change checks in the
+qualification artifact and complete cohort values for that already-built
+image. That follow-up chart packages and projects the exact qualification bytes
+as a distinct immutable file; the prior runtime verifies the projected bytes
+against `qualificationArtifact` instead of trying to open a repository file
+that its image cannot contain. Only then may the preflight-only cohort be
+rendered. Even then it starts no queue executor and cannot produce complete
+preflight evidence or provider I/O.
 
 ### `boltz-test` dark rollout evidence (2026-08-02)
 
@@ -6315,9 +6898,20 @@ The dark-by-default Helm contract is:
 resourceActions:
   authorityWorker:
     enabled: false
+    installationId: ""       # immutable UUID, required before enablement
     activeCohort: ""
-    cohorts: []                 # [{id, replicas, image, imagePullPolicy}]
-    retirementTombstones: []    # [cohort-id]; exact names derive from the ID
+    cohorts: []
+    # Each entry is:
+    # - id: p2a-v1              # version suffix, not the database cohort key
+    #   replicas: 2
+    #   image: registry.example/repo@sha256:<OCI-manifest-digest>
+    #   imagePullPolicy: Always
+    #   ociConfigDigest: sha256:<OCI-config-digest>
+    #   qualificationArtifact: {repoPath: ..., byteSize: ..., sha256: ...}
+    #   podTemplateContract: {repoPath: ..., byteSize: ..., sha256: ...}
+    #   artifactInventory: {repoPath: ..., byteSize: ..., sha256: ...}
+    #   callableInventory: {repoPath: ..., byteSize: ..., sha256: ...}
+    retirementTombstones: []    # [cohort suffix]; exact names derive from it
     healthPort: 46581
     preflightPort: 46583
     auth:
@@ -6330,35 +6924,218 @@ resourceActions:
       caKey: ca.crt
 ```
 
-Every v1 cohort entry requires a DNS-label `id`, `replicas: 2`, a digest-pinned
-`image`, and `imagePullPolicy: Always`. When enabled, `activeCohort` names
-exactly one entry. Helm renders one immutable, version-named normal-executor
+Every v1 cohort entry requires a lowercase DNS-label `id` suffix of at most 42
+characters, `replicas: 2`, a digest-pinned
+`image`, `imagePullPolicy: Always`, the distinct qualified OCI config digest,
+one chart-packaged projected qualification reference, and the three exact
+installed-package references shown above. The manifest
+digest parsed from `image` and the supplied config digest are not
+interchangeable. Helm derives the database key as
+`"ra:" + installationId + ":" + sha256(namespace + "\\n" + fullName +
+"\\n" + id).hexdigest() + ":" + id`, requires the immutable installation
+UUID when enabled, requires `fullName` itself to be one lowercase DNS label,
+and rejects name/key overflow. Serve034 persists a release ledger keyed by the
+stable `(namespace, .Release.Name)` pair with a database-wide unique
+installation UUID, immutable rendered full name, exact desired live-manifest
+array/hash, tombstone array/hash, and revision. Its companion binding table has
+primary key `(namespace, .Release.Name, cohort suffix)`, a unique full cohort
+ID, and the complete immutable canonical manifest/hash. Changing either
+identity, reusing a suffix with different bytes, or reusing the installation
+UUID in another release fails closed even after all chart authority values are
+cleared.
+When enabled, `activeCohort` names exactly one suffix entry. Helm
+renders one immutable, version-named authority-worker
 Deployment and one immutable version-named ServiceAccount per entry, one
 ClusterIP preflight Service selecting only the active cohort, purpose-token/TLS
 projections, the canonical static cohort manifest as an immutable read-only
-projected file, and NetworkPolicy. It renders no additional queue, Ingress, LoadBalancer, or
+projected file, and authority-ingress NetworkPolicy. The manifest hash is a Pod
+template annotation so an immutable cohort ID cannot silently retain Pods from
+another manifest. The Deployment strategy is exact `Recreate` with no
+rolling-update parameters. Every initial/final/watchdog Deployment observation
+rejects any other strategy before registration or lease adoption, preserving
+the two-Pod no-overlap invariant without adding a mutable strategy field to the
+cohort manifest. It renders no additional queue, Ingress, LoadBalancer, or
 mutation service, and the runtime needs no ConfigMap GET permission.
+
+For PostgreSQL with the required pre-existing database Secret, the migration
+Job is always a blocking pre-install/pre-upgrade hook even when proposed HA and
+authority are disabled. It receives a closed canonical release proposal keyed
+by namespace plus `.Release.Name`. Each live entry names only its suffix and a
+fixed path beneath
+`/etc/skypilot/resource-action-authority/release-preflight/`. A weight `-20`
+immutable hook ConfigMap reuses the exact canonical `$manifestJson` bytes later
+placed in the worker ConfigMap; the weight `-10` migration Job mounts each file
+read-only, descriptor-reads and canonical-validates it, then atomically updates
+the ledger before Helm may mutate workload objects. A fully cleared disabled
+proposal uses empty installation/live/tombstone values but resolves an existing
+ledger through the stable release key. It cannot hide a live cohort. Authority
+remains unsupported with the chart-managed database-secret path; credential
+topology changes occur only as a separate post-retirement operation.
+
+The runtime does not infer activation from those compatibility environment
+names. The chart always reserves its exclusive
+`SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED` marker, and only exact text `true`
+activates an authority path. It is emitted to API for every enabled inventory
+(including tombstone-only retirement) and to controller only when a live
+cohort's preflight credentials and manifest are mounted. An absent marker is
+authoritative disabled even if an operator-defined legacy installation or
+token-file environment value is present.
+
+The current hook predicate still depends on the proposed PostgreSQL backend and
+pre-existing Secret values. Consequently no cohort may be enabled until a
+follow-up persists a stable retained release/database anchor before the ledger
+commit, with no first-enable crash gap, and makes every later ordinary upgrade
+resolve that anchor and run preflight using the pinned Secret even after values
+are cleared or credential topology is changed. Missing/tampered anchors or
+Secrets must stop the release before object deletion. `--no-hooks`, raw object
+deletion, and uninstall are explicit administrator bypasses requiring a
+separate break-glass/finalizer protocol. This is an enablement blocker, not a
+dark-deployment blocker for a release that has never enabled authority.
+
+First worker registration resolves the installation UUID from its full cohort
+ID and locks the release row before the cohort row. It requires the release to
+remain enabled and the complete manifest bytes to match both the current live
+inventory and permanent suffix binding. A race therefore either registers
+under the locked predecessor inventory before preflight audits every cohort
+row, or waits and observes the new inventory; it cannot register in the gap
+between preflight and Helm apply. `REMOVAL_AUTHORIZED` may remain live for the
+first removal upgrade or appear as a tombstone for the deletion upgrade, but
+absence from both inventories rejects.
+
+The release-input schema above is also the complete environment contract: five
+literal entries, one database-Secret entry, and the three ordered downward-API
+entries, with no additional resource-field or ambient environment injection.
+The runtime derives `SKYPILOT_API_SERVER_INSTANCE_ID` internally from the
+validated `SKYPILOT_POD_UID` before acquiring its lease; it is not a fourth
+downward-API entry. Manifest, qualification, and TLS paths are fixed code
+constants rather than extra environment variables.
 Each retirement tombstone is a previously rendered cohort ID; the chart derives
 its two fixed names and rejects arbitrary name overrides. Operational removal
 requires the registry row to be `REMOVAL_AUTHORIZED` with those exact names and
 UIDs before the tombstone-bearing upgrade.
 
-A cohort ID permanently binds its static manifest plus Deployment and
+Whenever authority-worker support is enabled, including a tombstone-only
+release with no live cohort, the API Pod receives the immutable installation
+UUID plus canonical compact JSON arrays of the sorted unique live suffixes and
+sorted unique tombstone suffixes in exactly
+`SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID`,
+`SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON`, and
+`SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON`. These names
+are reserved from operator extra environments. The surviving API role runs one
+PostgreSQL advisory-lock singleton scoped by installation UUID, namespace, and
+rendered Helm full name. It validates every central row back to that exact
+release digest and inventory. A live `REGISTERING` row may take only the stale
+zero-carrier authorization path and performs no Kubernetes read; a live
+`REMOVAL_AUTHORIZED` row waits for an operator tombstone. Only an inventoried
+tombstone may issue exact-name GETs for its bound Deployment and
+ServiceAccount. Only HTTP 404 is absence; 403, transport failure, or a returned
+object with different apiVersion/kind/namespace/name/UID leaves the row
+unchanged and does not prevent later records in the bounded pass from being
+checked. Two exact 404 results permit the fenced `RETIRED` transition. There is
+no list, watch, delete, ambient kubeconfig, or cross-release fallback.
+
+The API Pod's ServiceAccount token automount is enabled while this verifier is
+configured, and a tombstone-scoped Role grants that existing API
+ServiceAccount `get` on only the derived Deployment and ServiceAccount names.
+With tombstones but no live cohort, Helm renders only the API verifier
+environment/RBAC portion of this feature: no authority Deployment,
+ServiceAccount, manifest/qualification ConfigMap, preflight Service,
+NetworkPolicy, purpose-token Secret mount, or TLS Secret mount is synthesized.
+After every matching central row is `RETIRED`, a later current-chart upgrade
+may remove the tombstone suffix and therefore the corresponding GET grant.
+
+Every authority object and Pod uses
+`skypilot.co/authority-release-scope=trunc63(sha256(<namespace> + "\n" +
+<rendered-full-name>))`. The Deployment, selector Service, topology-spread
+constraint, and NetworkPolicy target combine that label with the authority role
+and, where applicable, cohort suffix. NetworkPolicy ingress additionally
+requires both `skypilot.co/role=controller` and the immutable
+`app=<rendered-full-name>-controller` source label. Thus two Helm releases in
+one namespace may reuse a cohort suffix without either Service selecting the
+other's Pods or either NetworkPolicy admitting the other's controllers. A
+two-release render guard requires target scope sets and source selectors to be
+exact and disjoint.
+
+`activeCohort` is consumed only by the selector Service and manager/controller
+selection projection. It is not rendered into any cohort Deployment Pod
+template, environment variable, annotation, volume, projected manifest, or
+hash. An active-only values change therefore changes selection resources but
+leaves every old and new cohort Deployment byte-identical; a Helm render-diff
+golden enforces byte identity for every cohort Deployment, ServiceAccount,
+per-cohort manifest/qualification ConfigMap, RoleBinding subject, and Pod
+template across the switch. A frozen worker learns only its own full cohort ID
+from its immutable manifest, never the current active suffix.
+
+A full derived cohort ID permanently binds its static manifest plus Deployment and
 ServiceAccount UIDs. An upgrade never changes those fields in place: it adds a
-new cohort. The first worker self-attests its projected manifest/live owner
-chain and inserts a `REGISTERING` Serve033 identity; each of the two distinct
-ready Pods exactly adopts that identity and appends its bounded registration.
-Only the typed two-worker/Deployment-readiness transaction changes it to
-`ACCEPTING`, after which the cohort may be selected. New launch/down
+new cohort. Both Pods first become `/bootstrapz`-Ready. The first process that
+then observes one exact Deployment generation/resourceVersion at
+spec/status-total/updated/ready/available replicas all two and unavailable zero
+inserts its own registration in a
+`REGISTERING` Serve033 identity. The peer exact-reads that row and appends its
+own registration only after observing the same Deployment snapshot; the pair
+is sorted by Pod UID and no peer-Pod GET is needed. Only the typed two-worker /
+same-Deployment-snapshot transaction changes it to `ACCEPTING`, after which the
+cohort may be selected. New launch/down
 preparations first create a `PREPARING` reference under that `ACCEPTING`
 identity and then freeze the same resolved cohort returned by preflight.
-Kubernetes readiness during `REGISTERING` proves only the self-attestation/
-health contract. `ACCEPTING` plus active selection gates creation of new
-`PREPARING` references, not claims. The existing queue claim predicate binds
-each worker's own immutable cohort and an existing `SHADOW_ACTIVE` or
-`ACTION_ACTIVE` reference; it remains enabled for that cohort in either
-`ACCEPTING` or `DRAINING`, independent of later active selection, so activation
-has no readiness cycle and frozen old work remains recoverable.
+In P2a, Kubernetes startup and readiness probes call `/bootstrapz` and prove
+only local manifest/transport health; `/readyz` stays false, preflight stays
+503 until `ACCEPTING`, and the role starts no executor. Both Pods therefore
+become Kubernetes Ready before the typed registration path requires the
+Deployment's two ready/available replicas. P3 changes `/readyz` to claim
+readiness only after the accepted identity is resolved. `ACCEPTING` plus active
+selection gates creation of new `PREPARING` references, not claims. Once P3 is
+implemented, the existing queue claim predicate binds each worker's own
+immutable cohort and an existing `SHADOW_ACTIVE` or `ACTION_ACTIVE` reference;
+it remains enabled for that cohort in either `ACCEPTING` or `DRAINING`,
+independent of later active selection, so activation has no readiness cycle and
+frozen old work remains recoverable.
+
+A crash cannot wedge a never-accepted row forever. After all stored
+registration/observation timestamps are more than five minutes behind a fresh
+PostgreSQL clock read, the API-role abort transaction may lock and change
+`REGISTERING -> REMOVAL_AUTHORIZED` only if the row has no acceptance history
+and exhaustive scans find zero cohort references, private requests/evidence,
+action specs/attempts, or activation/promotion proofs. It locks the cohort row;
+because every append, promotion, and reference admission locks that earlier
+class first, all later-class carrier scans are deliberately nonlocking and do
+not violate the global lock order. A carrier declaring the same full cohort key
+blocks even when its remaining identity differs. The P2a stale-registration
+audit uses a recursive JSONB cohort-ID locator over every current action,
+request, shadow-parent, and shadow-child carrier, so a top-level/embedded or
+parent/child disagreement cannot hide the target key. It is an existence audit:
+target-located terminal, released, unknown-handler, malformed, and
+hash-inconsistent rows all retain the cohort. State with no recognizable target
+locator does not globally retain every unrelated P2a cohort; normalized
+locators and complete typed/hash/terminal-graph validation are a P3 normal
+`DRAINING` retirement gate. P2a persists no separate cohort-bearing
+activation/promotion-proof row, so there is no additional carrier table to
+scan. A concurrent append, promotion, or reference wins and makes abort reject.
+The current chart
+then removes only the exact bound Deployment/ServiceAccount; the API verifier
+commits `RETIRED` after exact NotFound. Operators create a new suffix/full ID;
+the aborted ID is never retried. Tests cover crash before insert, after insert,
+after the second append, after promotion commit but before acknowledgement, and
+abort racing each append/promotion/reference boundary.
+
+Every locally adopted `ACCEPTING` or `DRAINING` identity expires after five
+minutes unless a watchdog renews it. A same-cohort, same-state
+`ACCEPTING -> ACCEPTING` or `DRAINING -> DRAINING` compare-and-swap may
+replace only the caller's own Pod-UID registration while preserving the peer
+entry byte-for-byte. The sorted UID set, Deployment UID/generation,
+Deployment resourceVersion, ServiceAccount UID, manifest/image/artifact /
+template/handler/claim identities, and all other non-temporal fields remain
+identical; only that caller's observation/registration timestamps and
+Pod/ReplicaSet resourceVersions may advance. CAS loss rereads and reapplies only the caller's
+entry; a new UID rejects and a stale peer clears acceptance at peer expiry. The
+watchdog uses PostgreSQL time, rejects future timestamps and
+clock failure, rereads all projected bytes and the live owner chain, and clears
+its local accepted snapshot before expiry on any drift or failed renewal.
+Preflight then returns 503. DRAINING renewal cannot create new references; once
+P3 exists it only keeps frozen old requests eligible for per-dispatch proof.
+P2a treats Pod/Deployment replacement as a new cohort; claim readiness remains
+false until P3's rolling protocol is implemented.
 
 Moving active selection away does not remove the old cohort. The typed
 retirement helper first locks it and commits `DRAINING`, which rejects new
@@ -6370,11 +7147,16 @@ Serve parent/child evidence, and private shadow requests/coverage attempts, and
 commits `REMOVAL_AUTHORIZED`. Unknown, malformed, inaccessible, cross-identity,
 or ambiguously decoded state counts as a reference. Only then may the current
 chart remove the Deployment and ServiceAccount; exact NotFound commits
-`RETIRED`. Removal moves their exact names into
+`RETIRED` without rescanning terminal historical carriers because the durable
+`REMOVAL_AUTHORIZED` state is the authorization fence. Removal moves their exact names into
 `authorityWorker.retirementTombstones`; the surviving API-role retirement
 verifier keeps tombstone-scoped release-namespace GET permission, performs the
-NotFound checks, and commits `RETIRED` before a later chart upgrade prunes that
-permission. The removed worker/ServiceAccount is never the verifier. A
+NotFound checks, then locks the stable release row before the cohort and
+requires the exact suffix to remain tombstoned and absent from live inventory
+before committing `RETIRED`. A concurrent rollback either makes the suffix
+live first and rejects the stale NotFound result, or sees `RETIRED` and rejects
+recreation. A later chart upgrade prunes the permission. The removed
+worker/ServiceAccount is never the verifier. A
 prepared-but-unadmitted decision therefore pins its old cohort, as do private
 shadow requests and nonterminal actions. Rollback may change
 `DRAINING -> ACCEPTING` only in the transaction that replaces registration
@@ -6394,6 +7176,13 @@ missing/mixed allowlist, unknown cohort, mutable cohort manifest, or handler
 inventory blocks shadow-window collection and authority. This adds no request
 class, queue row type, claim token, heartbeat, or lease.
 
+Before either branch, the SQL predicate requires the exact registered private
+payload type `sky.server.requests.payloads:ResourceActionPrivateRequestBodyV1`,
+format `pydantic-json`, version 1, an object-valued `payload_json` with
+object length exactly one, and the sole underscore alias object. Wrong
+type/format/version, nonobject JSON, public-name encoding, or an extra sibling
+key rejects. Mutation tests cover each independently.
+
 Action claims additionally require the same decision's `ACTION_ACTIVE`
 reference; private shadow claims require its `SHADOW_ACTIVE` reference. A
 `DRAINING` cohort does not invalidate either. A released, missing,
@@ -6404,9 +7193,26 @@ API-request revision 007 only admits `authority-worker` as a durable
 ordinary API006 rows. General-role query construction excludes the four private
 names without a Serve import or Serve033 relation, while authority startup
 requires the exact registered handler inventory and resolves its immutable
-cohort identity against Serve033 before starting workers. The role therefore
+cohort identity against Serve033 before P3 may call `executor.start()` or start
+queue workers. P2a's health/preflight listeners and bootstrap coordinator start
+before registration and never start that executor. The role therefore
 fails closed on an API007/Serve032 mixed deployment, and ordinary API007
 executors remain operational during the staged Serve033 rollout.
+
+P2a renders only the release-namespace self-attestation Role/Binding needed to
+GET Pods and ReplicaSets for the worker's owner chain plus the exact versioned
+Deployment and ServiceAccount by `resourceNames`. Runtime code further requires
+the Pod name/namespace/UID from downward-API identity, follows only its
+controller owner references, and rejects any object outside that chain. P2a
+renders no ClusterRole/Binding, canary-namespace Role, access-review create,
+Namespace/version/admission/LB/workload GET, or workload mutation permission.
+Those broader resources below belong to P2b/P3 and remain absent while the
+initial evaluator can return only not-representable. The sole conditional
+exception is a tombstone-bearing removal upgrade: it adds a distinct Role /
+Binding for the surviving API ServiceAccount, limited to GET the exact
+tombstoned Deployment and ServiceAccount names so it can commit NotFound /
+`RETIRED`; the next upgrade prunes that binding. It grants no Pod/ReplicaSet
+or wildcard read.
 
 Deployment precreates and freezes the namespace, a no-permission workload
 ServiceAccount with token automount disabled and no image pull secrets, the
@@ -6476,9 +7282,28 @@ absence result through a public API.
 - M4/provider authority is not reached. Keep the authority worker and every
   provider-authoritative route disabled until the remaining gates below are
   implemented and verified; immutable specs, progress, and codecs alone do not
-  authorize provider I/O. Private-handler shadow and the live dispatcher must
-  consume the API007-only activation fence immediately before provider
-  dispatch; the pure readiness predicate does not itself enable a route.
+  authorize provider I/O. Private shadow transition requires
+  `PrivateShadowActivationProofV1`; every live dispatch must atomically consume
+  `PrivateDispatchReadinessProofV1`; authority promotion separately requires
+  `AuthoritativePromotionProofV1`. The pure readiness predicate does not
+  itself enable a route.
+- Merge, build, and dark-verify the implemented P2a slice before enabling a
+  cohort: the six closed wire envelopes, strict TLS/purpose-token transport,
+  `/bootstrapz` versus `/readyz` split, complete projected manifest,
+  Pod/ReplicaSet/Deployment/ServiceAccount observer, PostgreSQL-clock two-Pod
+  registration, and post-build OCI qualification. The role starts no queue
+  executor and its only accepted response remains typed not-representable. P2a
+  includes same-Pod lease renewal; Pod-replacement/rolling registration remains
+  a P3 gate.
+- Before the first enabled P2a cohort, implement and live-verify the retained
+  release/database anchor above across first-enable crashes, empty values,
+  backend/Secret changes, missing Secret, rollback, and ordinary uninstall.
+  Keep `resourceActions.authorityWorker.enabled=false` until that gate passes.
+- Before P2b linked represented admission, replace each capsule's full cohort
+  with the locked permanent-row compact reference above and restore every
+  realistic/candidate-maximal full action spec to at most 60,000 bytes. The
+  current exact 60,851-byte launch fixture is an activation blocker; do not
+  increase either the qualification budget or parser ceiling.
 - Exact inventory of existing providers that can propagate a stable
   cluster-record UUID/incarnation before launch; multi-node/compound launch is
   ineligible until all effects have one exact observable target contract.
@@ -6507,7 +7332,7 @@ absence result through a public API.
   decomposition and rejection rules, including host, default-port, path, IPv6,
   IDNA, and percent-encoding handling. The pure transport DTO intentionally
   does not invent those source-normalization rules.
-- Implement the live preflight endpoint/client and same-client runtime
+- After P2a, implement the complete live preflight evaluator and same-client runtime
   admission/session, including current-scope drift checks, artifact loading,
   principal/authorization proofs, and the exact request-handler dispatcher.
   The dispatcher must checkpoint the implemented API006 progress contract and

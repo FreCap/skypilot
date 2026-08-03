@@ -275,20 +275,30 @@ def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
                 "TIMESTAMPTZ '2026-08-01 00:00:00+00', false, "
                 "TIMESTAMPTZ '2026-08-01 00:01:00+00')"))
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
-                                         migration_utils.SERVE_VERSION)
+                                         '033')
     _assert_upstream_request_classification_catalog(engine)
     _assert_classification_rows_retained(engine)
-    # Simulate lost acknowledgements for both additive revisions: retain all
-    # DDL/data, move only Alembic's marker back, and prove 032/033 converge.
+    # Simulate a lost revision-033 acknowledgement before revision 034 could
+    # have run: retain its DDL/data, move only Alembic's marker back, and prove
+    # 032/033 convergence without making the historical migration aware of a
+    # future table inventory.
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
     alembic_command.stamp(config, '031')
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
-                                         migration_utils.SERVE_VERSION)
+                                         '033')
     assert migration_utils.get_current_alembic_revision(
         engine, migration_utils.SERVE_DB_NAME) == '033'
     _assert_upstream_request_classification_catalog(engine)
     _assert_classification_rows_retained(engine)
+
+    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
+                                         migration_utils.SERVE_VERSION)
+    alembic_command.stamp(config, '033')
+    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
+                                         migration_utils.SERVE_VERSION)
+    assert migration_utils.get_current_alembic_revision(
+        engine, migration_utils.SERVE_DB_NAME) == '034'
 
     inspector = sqlalchemy.inspect(engine)
     assert {
@@ -441,7 +451,7 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
     with pytest.raises(RuntimeError, match='additive and cannot be downgraded'):
         alembic_command.downgrade(config, '031')
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '033'
+        engine, migration_utils.SERVE_DB_NAME) == '034'
 
 
 def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
@@ -477,7 +487,7 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
                            match='additive and cannot be downgraded'):
             alembic_command.downgrade(config, '031')
         assert migration_utils.get_current_alembic_revision(
-            engine, migration_utils.SERVE_DB_NAME) == '033'
+            engine, migration_utils.SERVE_DB_NAME) == '034'
     finally:
         engine.dispose()
 

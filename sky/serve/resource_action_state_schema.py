@@ -776,6 +776,115 @@ SHADOW_COVERAGE = shadow_coverage_table
 SHADOW_COVERAGE_ATTEMPTS = shadow_coverage_attempts_table
 RESOURCE_ACTION_STATE_METADATA = head_metadata
 
+# Revision 034 owns the stable Helm-release ledger separately from the
+# revision-033 evidence graph.  Keeping a distinct metadata object is
+# important: revision 033 must remain capable of installing exactly its own
+# historical catalog when Alembic walks through it on the way to head.
+authority_release_metadata = sqlalchemy.MetaData()
+
+authority_release_bindings_table = sqlalchemy.Table(
+    'serve_resource_action_authority_releases',
+    authority_release_metadata,
+    sqlalchemy.Column('namespace', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('helm_release_name', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('installation_id',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('helm_full_name', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('enabled', sqlalchemy.Boolean, nullable=False),
+    sqlalchemy.Column('live_manifests',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+    sqlalchemy.Column('live_inventory_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('tombstone_suffixes',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+    sqlalchemy.Column('tombstone_inventory_sha256',
+                      sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.Column('revision',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='1'),
+    sqlalchemy.Column('created_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.Column('updated_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.PrimaryKeyConstraint('namespace',
+                                    'helm_release_name',
+                                    name='pk_serve_ra_authority_releases'),
+    sqlalchemy.UniqueConstraint(
+        'installation_id', name='uq_serve_ra_authority_releases_installation'),
+    sqlalchemy.CheckConstraint(
+        'octet_length(namespace) BETWEEN 1 AND 63 AND '
+        'octet_length(helm_release_name) BETWEEN 1 AND 63 AND '
+        'octet_length(helm_full_name) BETWEEN 1 AND 63',
+        name='ck_serve_ra_authority_releases_text_bounds'),
+    sqlalchemy.CheckConstraint(
+        "jsonb_typeof(live_manifests) = 'array' AND "
+        f"live_inventory_sha256 ~ '{_SHA256_PATTERN}' AND "
+        "jsonb_typeof(tombstone_suffixes) = 'array' AND "
+        f"tombstone_inventory_sha256 ~ '{_SHA256_PATTERN}' AND "
+        '(jsonb_array_length(live_manifests) + '
+        'jsonb_array_length(tombstone_suffixes)) <= 256 AND '
+        '((enabled AND (jsonb_array_length(live_manifests) + '
+        'jsonb_array_length(tombstone_suffixes)) > 0) OR '
+        '(NOT enabled AND jsonb_array_length(live_manifests) = 0 AND '
+        'jsonb_array_length(tombstone_suffixes) = 0))',
+        name='ck_serve_ra_authority_releases_inventories'),
+    sqlalchemy.CheckConstraint('revision > 0 AND updated_at >= created_at',
+                               name='ck_serve_ra_authority_releases_revision'),
+)
+
+authority_release_cohorts_table = sqlalchemy.Table(
+    'serve_resource_action_authority_release_cohorts',
+    authority_release_metadata,
+    sqlalchemy.Column('namespace', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('helm_release_name', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('cohort_suffix', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('cohort_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('manifest',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+    sqlalchemy.Column('manifest_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('bound_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.PrimaryKeyConstraint(
+        'namespace',
+        'helm_release_name',
+        'cohort_suffix',
+        name='pk_serve_ra_authority_release_cohorts'),
+    sqlalchemy.UniqueConstraint(
+        'cohort_id', name='uq_serve_ra_authority_release_cohorts_id'),
+    sqlalchemy.ForeignKeyConstraint(
+        ['namespace', 'helm_release_name'], [
+            'serve_resource_action_authority_releases.namespace',
+            'serve_resource_action_authority_releases.helm_release_name'
+        ],
+        ondelete='RESTRICT',
+        name='fk_serve_ra_authority_release_cohorts_release'),
+    sqlalchemy.CheckConstraint(
+        'octet_length(namespace) BETWEEN 1 AND 63 AND '
+        'octet_length(helm_release_name) BETWEEN 1 AND 63 AND '
+        'octet_length(cohort_suffix) BETWEEN 1 AND 42 AND '
+        'octet_length(cohort_id) BETWEEN 1 AND 1024',
+        name='ck_serve_ra_authority_release_cohorts_text_bounds'),
+    sqlalchemy.CheckConstraint(
+        f'{_json_object_shape("manifest")} AND '
+        f"manifest_sha256 ~ '{_SHA256_PATTERN}'",
+        name='ck_serve_ra_authority_release_cohorts_manifest'),
+)
+
+AUTHORITY_RELEASES = authority_release_bindings_table
+AUTHORITY_RELEASE_COHORTS = authority_release_cohorts_table
+RESOURCE_ACTION_AUTHORITY_RELEASE_METADATA = authority_release_metadata
+
 
 def service_columns() -> tuple[sqlalchemy.Column, ...]:
     """Return fresh revision-033 columns for the existing services table."""
