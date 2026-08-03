@@ -8,6 +8,7 @@ from typing import Any
 
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
+from sky.backends import skylet_transport
 from sky.serve import constants as serve_constants
 from sky.skylet import constants
 from sky.utils import env_options
@@ -25,6 +26,7 @@ if typing.TYPE_CHECKING:
     from sky.schemas.generated import managed_jobsv1_pb2_grpc
     from sky.schemas.generated import servev1_pb2
     from sky.schemas.generated import servev1_pb2_grpc
+    from sky.schemas.generated import skyletv1_pb2
 else:
     # Keep runtime annotation resolution compatible with the historical
     # cloud_vm_ray_backend implementation while preserving lazy imports.
@@ -52,6 +54,12 @@ else:
         'sky.schemas.generated.managed_jobsv1_pb2')
     managed_jobsv1_pb2_grpc = adaptors_common.LazyImport(
         'sky.schemas.generated.managed_jobsv1_pb2_grpc')
+    skyletv1_pb2 = adaptors_common.LazyImport(
+        'sky.schemas.generated.skyletv1_pb2')
+
+
+def _identity_bytes(payload: bytes) -> bytes:
+    return payload
 
 
 class _CancelAwareStub:
@@ -89,6 +97,12 @@ class SkyletClient:
     """The client to interact with a remote cluster through Skylet."""
 
     def __init__(self, channel: 'grpc.Channel'):
+        self._get_capabilities_rpc = channel.unary_unary(
+            '/skylet.v1.CapabilitiesService/GetCapabilities',
+            request_serializer=(
+                skyletv1_pb2.GetCapabilitiesRequest.SerializeToString),
+            response_deserializer=_identity_bytes,
+            _registered_method=True)
         self._autostop_stub = _CancelAwareStub(
             autostopv1_pb2_grpc.AutostopServiceStub(channel))
         self._jobs_stub = _CancelAwareStub(
@@ -100,6 +114,17 @@ class SkyletClient:
             managed_jobsv1_pb2_grpc.ManagedJobsServiceStub(channel))
         self._health_stub = _CancelAwareStub(
             healthv1_pb2_grpc.HealthServiceStub(channel))
+
+    def get_capabilities(
+        self,
+        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
+    ) -> skylet_transport.SkyletCapabilitiesV1:
+        """Return the strictly parsed method contracts for this Skylet boot."""
+        payload = backend_utils.invoke_grpc_unary(
+            self._get_capabilities_rpc,
+            skyletv1_pb2.GetCapabilitiesRequest(),
+            timeout=timeout)
+        return skylet_transport.parse_skylet_capabilities_v1(payload)
 
     def set_autostop(
         self,

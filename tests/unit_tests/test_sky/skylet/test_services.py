@@ -289,6 +289,37 @@ class TestGetJobStatus(unittest.TestCase):
                          jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED)
         context.abort.assert_not_called()
 
+    @mock.patch('sky.skylet.services.job_lib.get_job_system_recovery_details',
+                return_value=({}, {
+                    999: job_lib.JobSystemRecoveryDetailStatus.ABSENT
+                }))
+    @mock.patch('sky.skylet.services.job_lib.get_statuses',
+                return_value={999: None})
+    def test_contract_v1_represents_unknown_requested_id(
+            self, get_statuses, get_recovery_infos):
+        response = self.service.GetJobStatus(
+            jobsv1_pb2.GetJobStatusRequest(job_ids=[999]), mock.Mock())
+
+        self.assertEqual(dict(response.job_statuses),
+                         {999: jobsv1_pb2.JOB_STATUS_UNSPECIFIED})
+        get_statuses.assert_called_once_with([999])
+        get_recovery_infos.assert_called_once_with([999])
+
+    @mock.patch('sky.skylet.services.job_lib.get_job_system_recovery_details',
+                return_value=({}, {}))
+    @mock.patch('sky.skylet.services.job_lib.get_statuses', return_value={})
+    @mock.patch('sky.skylet.services.job_lib.get_latest_job_id',
+                return_value=None)
+    def test_contract_v1_empty_request_without_jobs_returns_empty_wire_map(
+            self, get_latest_job_id, get_statuses, get_recovery_infos):
+        response = self.service.GetJobStatus(jobsv1_pb2.GetJobStatusRequest(),
+                                             mock.Mock())
+
+        self.assertEqual(dict(response.job_statuses), {})
+        get_latest_job_id.assert_called_once_with()
+        get_statuses.assert_called_once_with([])
+        get_recovery_infos.assert_called_once_with([])
+
     def test_proto_fields_are_wire_additive(self):
         descriptor = jobsv1_pb2.GetJobStatusResponse.DESCRIPTOR
         self.assertEqual(descriptor.fields_by_name['job_statuses'].number, 1)

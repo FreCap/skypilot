@@ -13386,6 +13386,9 @@ artifacts:
     - id: mixed_skylet_get_job_status_transport_conformance
       satisfied: false
       evidence: []
+    - id: enforced_v43_or_upgrade_required_policy_for_all_reachable_skylets_including_offline_and_long_lived
+      satisfied: false
+      evidence: []
     telemetry:
     - id: zero_direct_ssh_status_transport_one_release
       satisfied: false
@@ -13431,6 +13434,9 @@ artifacts:
       evidence: []
     test:
     - id: skylet_single_flight_handshake_and_max_60s_refresh_conformance
+      satisfied: false
+      evidence: []
+    - id: enforced_v43_or_upgrade_required_policy_for_all_reachable_skylets_including_offline_and_long_lived
       satisfied: false
       evidence: []
     telemetry:

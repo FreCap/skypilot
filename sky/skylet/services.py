@@ -3,9 +3,11 @@
 import json
 import os
 import subprocess
+import uuid
 
 import grpc
 
+import sky
 from sky import exceptions
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
@@ -20,6 +22,8 @@ from sky.schemas.generated import managed_jobsv1_pb2
 from sky.schemas.generated import managed_jobsv1_pb2_grpc
 from sky.schemas.generated import servev1_pb2
 from sky.schemas.generated import servev1_pb2_grpc
+from sky.schemas.generated import skyletv1_pb2
+from sky.schemas.generated import skyletv1_pb2_grpc
 from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -34,6 +38,43 @@ logger = sky_logging.init_logger(__name__)
 # In the worst case, flush the log buffer every 50ms,
 # to ensure responsiveness.
 DEFAULT_LOG_CHUNK_FLUSH_INTERVAL = 0.05
+
+
+class CapabilitiesServiceImpl(skyletv1_pb2_grpc.CapabilitiesServiceServicer):
+    """Immutable advertisement of worker-wire contracts for one Skylet."""
+
+    def __init__(self, skylet_boot_id: str):
+        parsed_boot_id = uuid.UUID(skylet_boot_id)
+        if str(parsed_boot_id) != skylet_boot_id:
+            raise ValueError(
+                f'Noncanonical Skylet boot ID: {skylet_boot_id!r}.')
+
+        jobs_service = jobsv1_pb2.DESCRIPTOR.services_by_name['JobsService']
+        get_job_status = jobs_service.methods_by_name['GetJobStatus']
+        methods = [
+            skyletv1_pb2.SkyletMethodCapabilityV1(
+                service=jobs_service.full_name,
+                method=get_job_status.name,
+                contract_versions=(1,),
+            )
+        ]
+        methods.sort(key=lambda method: (method.service, method.method))
+        response = skyletv1_pb2.SkyletCapabilitiesV1(
+            schema_version=1,
+            skylet_boot_id=skylet_boot_id,
+            skylet_version=constants.SKYLET_VERSION,
+            skypilot_version=sky.__version__,
+            skypilot_commit=sky.__commit__,
+            methods=methods)
+        self._serialized_response = response.SerializeToString(
+            deterministic=True)
+
+    def GetCapabilities(
+            self, request: skyletv1_pb2.GetCapabilitiesRequest,
+            context: grpc.ServicerContext) -> skyletv1_pb2.SkyletCapabilitiesV1:
+        del request, context
+        return skyletv1_pb2.SkyletCapabilitiesV1.FromString(
+            self._serialized_response)
 
 
 class AutostopServiceImpl(autostopv1_pb2_grpc.AutostopServiceServicer):

@@ -50,17 +50,20 @@ def _isolated_bundle_cache(tmp_path, monkeypatch):
     return cache, transfer
 
 
-def _build_prior_v40_wheel(output_dir: Path) -> Path:
-    """Builds a same-package-version v40 distribution for replacement."""
+def _build_prior_skylet_wheel(output_dir: Path, skylet_version: str,
+                              skylet_lib_version: int) -> Path:
+    """Builds a same-package-version prior Skylet for replacement."""
     output_dir.mkdir()
     wheel_path = output_dir / 'skypilot-1.1.0-py3-none-any.whl'
     dist_info = 'skypilot-1.1.0.dist-info'
+    sentinel_module = f'v{skylet_version}_only'
     files = {
         'sky/__init__.py': "__version__ = '1.1.0'\n",
         'sky/skylet/__init__.py': '',
         'sky/skylet/constants.py':
-            ("SKYLET_VERSION = '40'\nSKYLET_LIB_VERSION = 7\n"),
-        'sky/v40_only.py': 'PRIOR_VERSION_SENTINEL = True\n',
+            (f"SKYLET_VERSION = '{skylet_version}'\n"
+             f'SKYLET_LIB_VERSION = {skylet_lib_version}\n'),
+        f'sky/{sentinel_module}.py': 'PRIOR_VERSION_SENTINEL = True\n',
         f'{dist_info}/METADATA':
             ('Metadata-Version: 2.1\nName: skypilot\nVersion: 1.1.0\n'),
         f'{dist_info}/WHEEL': ('Wheel-Version: 1.0\nGenerator: SkyPilot test\n'
@@ -432,13 +435,16 @@ print('BUNDLE_RESULT=' + json.dumps({{
     assert result['manifest'].encode() == source_manifest
 
 
-def test_two_local_wheels_replace_v40_offline_on_v42_baseline(
-        _isolated_bundle_cache, tmp_path):
+@pytest.mark.parametrize(('prior_version', 'prior_lib_version'), [('40', 7),
+                                                                  ('42', 9)])
+def test_two_local_wheels_replace_v40_or_v42_offline_on_v43_baseline(
+        _isolated_bundle_cache, tmp_path, prior_version, prior_lib_version):
     bundle, digest = wheel_utils.build_sky_wheel()
     manifest, _ = worker_runtime_packaging.verify_internal_bundle(
         bundle, expected_digest=digest)
     installed = tmp_path / 'installed'
-    prior_wheel = _build_prior_v40_wheel(tmp_path / 'prior-wheel')
+    prior_wheel = _build_prior_skylet_wheel(tmp_path / 'prior-wheel',
+                                            prior_version, prior_lib_version)
     completed = subprocess.run([
         sys.executable, '-m', 'pip', 'install', '--no-index', '--no-deps',
         '--target',
@@ -450,11 +456,13 @@ def test_two_local_wheels_replace_v40_offline_on_v42_baseline(
                                text=True,
                                check=False)
     assert completed.returncode == 0, completed.stderr
-    prior_probe = (f'import sys; sys.path.insert(0, {str(installed)!r});'
-                   'from sky.skylet import constants; import sky.v40_only;'
-                   "assert constants.SKYLET_VERSION == '40';"
-                   'assert constants.SKYLET_LIB_VERSION == 7;'
-                   'assert sky.v40_only.PRIOR_VERSION_SENTINEL is True')
+    prior_probe = (
+        f'import sys; sys.path.insert(0, {str(installed)!r});'
+        'import importlib; from sky.skylet import constants;'
+        f"prior = importlib.import_module('sky.v{prior_version}_only');"
+        f"assert constants.SKYLET_VERSION == '{prior_version}';"
+        f'assert constants.SKYLET_LIB_VERSION == {prior_lib_version};'
+        'assert prior.PRIOR_VERSION_SENTINEL is True')
     completed = subprocess.run([sys.executable, '-I', '-c', prior_probe],
                                capture_output=True,
                                text=True,
@@ -479,10 +487,11 @@ def test_two_local_wheels_replace_v40_offline_on_v42_baseline(
     assert completed.returncode == 0, completed.stderr
     baseline_probe = (
         'from sky.skylet import constants;'
-        "assert constants.SKYLET_VERSION == '42';"
+        "assert constants.SKYLET_VERSION == '43';"
         'assert constants.SKYLET_LIB_VERSION == 9;'
         'import importlib.util;'
-        "assert importlib.util.find_spec('sky.v40_only') is None;")
+        f"assert importlib.util.find_spec('sky.v{prior_version}_only') is None;"
+    )
     completed = _run_installed_distribution_probe(installed, main_wheel,
                                                   runtime_wheel)
     assert completed.returncode == 0, completed.stderr
