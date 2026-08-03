@@ -1,6 +1,7 @@
 """Kubeconfig and context helpers for Kubernetes provisioning."""
 
 from collections.abc import Callable
+import hashlib
 import os
 import subprocess
 from typing import Any
@@ -177,3 +178,89 @@ def get_kubeconfig_paths() -> list[str]:
         os.path.expanduser(path)
         for path in paths.split(kubernetes.ENV_KUBECONFIG_PATH_SEPARATOR)
     ]
+
+
+def format_kubeconfig_exec_auth(config: Any,
+                                output_path: str,
+                                inject_wrapper: bool = True,
+                                *,
+                                safe_dump_fn: Callable[..., None]) -> bool:
+    """Rewrite exec authentication commands for the SkyPilot runtime."""
+    updated = False
+    for user in config.get('users', []):
+        exec_info = user.get('user', {}).get('exec', {})
+        current_command = exec_info.get('command', '')
+
+        if current_command:
+            # Strip the path and keep only the executable name.
+            executable = os.path.basename(current_command)
+            if executable == kubernetes_constants.SKY_K8S_EXEC_AUTH_WRAPPER:
+                # Avoid recursively wrapping a previously rewritten command.
+                continue
+
+            if inject_wrapper:
+                exec_info[
+                    'command'] = kubernetes_constants.SKY_K8S_EXEC_AUTH_WRAPPER
+                if exec_info.get('args') is None:
+                    exec_info['args'] = []
+                exec_info['args'].insert(0, executable)
+                updated = True
+            elif executable != current_command:
+                exec_info['command'] = executable
+                updated = True
+
+            # Nebius profiles are local-machine specific.  Use the profile
+            # provisioned in the SkyPilot runtime instead.
+            if executable == 'nebius':
+                args = exec_info.get('args', [])
+                if args and '--profile' in args:
+                    try:
+                        profile_index = args.index('--profile')
+                        if profile_index + 1 < len(args):
+                            old_profile = args[profile_index + 1]
+                            if old_profile != 'sky':
+                                args[profile_index + 1] = 'sky'
+                                updated = True
+                    except ValueError:
+                        pass
+
+    os.makedirs(os.path.dirname(os.path.expanduser(output_path)), exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as file:
+        safe_dump_fn(config, file)
+
+    return updated
+
+
+def format_kubeconfig_exec_auth_with_cache(
+    kubeconfig_path: str,
+    *,
+    safe_load_fn: Callable[..., Any],
+    dump_fn: Callable[..., str],
+    format_kubeconfig_exec_auth_fn: Callable[..., bool],
+    warning_fn: Callable[[str], None],
+    format_exception_fn: Callable[..., str],
+) -> str:
+    """Rewrite a kubeconfig into the content-addressed credential cache."""
+    with open(kubeconfig_path, encoding='utf-8') as file:
+        config = safe_load_fn(file)
+    normalized = dump_fn(config, sort_keys=True)
+    hashed = hashlib.sha1(normalized.encode('utf-8'),
+                          usedforsecurity=False).hexdigest()
+    path = os.path.expanduser(
+        f'{kubernetes_constants.SKY_K8S_EXEC_AUTH_KUBECONFIG_CACHE}/{hashed}.yaml'
+    )
+
+    if os.path.isfile(path):
+        return path
+
+    try:
+        format_kubeconfig_exec_auth_fn(config, path)
+        return path
+    except Exception as e:  # pylint: disable=broad-except
+        # The user may not be using Kubernetes or SSH node pools, so keep the
+        # historical best-effort fallback to the original kubeconfig.
+        warning_fn(f'Failed to format kubeconfig at {kubeconfig_path}. '
+                   'Please check if the kubeconfig is valid. This may cause '
+                   'problems when Kubernetes infra is used. '
+                   f'Reason: {format_exception_fn(e)}')
+        return kubeconfig_path

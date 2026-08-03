@@ -4934,48 +4934,12 @@ def format_kubeconfig_exec_auth(config: Any,
         inject_wrapper (bool): Whether to inject the wrapper script
     Returns: whether config was updated, for logging purposes
     """
-    updated = False
-    for user in config.get('users', []):
-        exec_info = user.get('user', {}).get('exec', {})
-        current_command = exec_info.get('command', '')
-
-        if current_command:
-            # Strip the path and keep only the executable name
-            executable = os.path.basename(current_command)
-            if executable == kubernetes_constants.SKY_K8S_EXEC_AUTH_WRAPPER:
-                # we don't want this happening recursively.
-                continue
-
-            if inject_wrapper:
-                exec_info[
-                    'command'] = kubernetes_constants.SKY_K8S_EXEC_AUTH_WRAPPER
-                if exec_info.get('args') is None:
-                    exec_info['args'] = []
-                exec_info['args'].insert(0, executable)
-                updated = True
-            elif executable != current_command:
-                exec_info['command'] = executable
-                updated = True
-
-            # Handle Nebius kubeconfigs: change --profile to 'sky'
-            if executable == 'nebius':
-                args = exec_info.get('args', [])
-                if args and '--profile' in args:
-                    try:
-                        profile_index = args.index('--profile')
-                        if profile_index + 1 < len(args):
-                            old_profile = args[profile_index + 1]
-                            if old_profile != 'sky':
-                                args[profile_index + 1] = 'sky'
-                                updated = True
-                    except ValueError:
-                        pass
-
-    os.makedirs(os.path.dirname(os.path.expanduser(output_path)), exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as file:
-        yaml.safe_dump(config, file)
-
-    return updated
+    return context_utils.format_kubeconfig_exec_auth(
+        config,
+        output_path,
+        inject_wrapper,
+        safe_dump_fn=yaml.safe_dump,
+    )
 
 
 def format_kubeconfig_exec_auth_with_cache(kubeconfig_path: str) -> str:
@@ -4989,32 +4953,14 @@ def format_kubeconfig_exec_auth_with_cache(kubeconfig_path: str) -> str:
         kubeconfig_path (str): kubeconfig path
     Returns: updated kubeconfig path
     """
-    # TODO(kyuds): GC cache files
-    with open(kubeconfig_path, encoding='utf-8') as file:
-        config = yaml_utils.safe_load(file)
-    normalized = yaml.dump(config, sort_keys=True)
-    hashed = hashlib.sha1(normalized.encode('utf-8'),
-                          usedforsecurity=False).hexdigest()
-    path = os.path.expanduser(
-        f'{kubernetes_constants.SKY_K8S_EXEC_AUTH_KUBECONFIG_CACHE}/{hashed}.yaml'
+    return context_utils.format_kubeconfig_exec_auth_with_cache(
+        kubeconfig_path,
+        safe_load_fn=yaml_utils.safe_load,
+        dump_fn=yaml.dump,
+        format_kubeconfig_exec_auth_fn=format_kubeconfig_exec_auth,
+        warning_fn=logger.warning,
+        format_exception_fn=common_utils.format_exception,
     )
-
-    # If we have already converted the same kubeconfig before, just return.
-    if os.path.isfile(path):
-        return path
-
-    try:
-        format_kubeconfig_exec_auth(config, path)
-        return path
-    except Exception as e:  # pylint: disable=broad-except
-        # There may be problems with kubeconfig, but the user is not actually
-        # using Kubernetes (or SSH Node Pools)
-        logger.warning(
-            f'Failed to format kubeconfig at {kubeconfig_path}. '
-            'Please check if the kubeconfig is valid. This may cause '
-            'problems when Kubernetes infra is used. '
-            f'Reason: {common_utils.format_exception(e)}')
-        return kubeconfig_path
 
 
 def delete_k8s_resource_with_retry(delete_func: Callable, resource_type: str,
