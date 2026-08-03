@@ -1,6 +1,7 @@
 """Capability contracts for centralized Skylet transport routing."""
 
 import dataclasses
+import enum
 import re
 import typing
 import uuid
@@ -28,6 +29,52 @@ _METHOD_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,127}')
 
 class SkyletCapabilitiesParseError(ValueError):
     """The Skylet capability advertisement violates its wire contract."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SkyletChannelKeyV1:
+    """Identity of one cluster incarnation and persisted Skylet tunnel."""
+
+    cluster_hash: str | None
+    endpoint: str
+    tunnel_generation: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SkyletChannelSnapshotV1:
+    """A generic channel bound to one fenced tunnel observation."""
+
+    channel: typing.Any
+    key: SkyletChannelKeyV1
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SkyletCapabilityChannelSnapshotV1:
+    """A channel that may be used only for capability negotiation."""
+
+    channel: typing.Any
+    key: SkyletChannelKeyV1
+
+    @property
+    def publishable(self) -> bool:
+        """Whether this snapshot has a cluster-incarnation fence."""
+        return self.key.cluster_hash is not None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SkyletLogicalKeyV1:
+    """A channel identity extended with one observed Skylet boot."""
+
+    channel_key: SkyletChannelKeyV1
+    skylet_boot_id: uuid.UUID
+
+
+class TunnelMutationResult(enum.Enum):
+    """Closed outcomes for incarnation-fenced tunnel metadata writes."""
+
+    UPDATED = 'updated'
+    CONFLICT = 'conflict'
+    UNFENCED_CLUSTER_INCARNATION = 'unfenced_cluster_incarnation'
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

@@ -18,12 +18,57 @@ from sky import global_user_state
 from sky import resources
 from sky import task
 from sky.backends import cloud_vm_ray_backend
+from sky.backends import skylet_transport
 from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
 from sky.backends.cloud_vm_ray_backend import GangSchedulingStatus
 from sky.backends.cloud_vm_ray_backend import RetryingVmProvisioner
 from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
 from sky.schemas.generated import jobsv1_pb2
 from sky.utils import status_lib
+
+
+@pytest.mark.parametrize('metadata, expected', [
+    ((1, 1), SSHTunnelInfo(port=1, pid=1, generation='legacy:1:1')),
+    ((65535, 2**31 - 1),
+     SSHTunnelInfo(
+         port=65535, pid=2**31 - 1, generation=f'legacy:{2**31 - 1}:65535')),
+    ((12345, 23456, '00000000-0000-0000-0000-000000000001'),
+     SSHTunnelInfo(port=12345,
+                   pid=23456,
+                   generation='00000000-0000-0000-0000-000000000001')),
+])
+def test_decode_skylet_ssh_tunnel_metadata_compatibility(metadata, expected):
+    decoded = cloud_vm_ray_backend._decode_skylet_ssh_tunnel_metadata(  # pylint: disable=protected-access
+        metadata)
+    assert decoded == expected
+    assert metadata[0] == decoded.port
+    assert metadata[1] == decoded.pid
+
+
+@pytest.mark.parametrize('metadata', [
+    None,
+    [],
+    (),
+    (1,),
+    (1, 2, 3, 4),
+    (True, 2),
+    (1, False),
+    (0, 1),
+    (65536, 1),
+    (1, 0),
+    (1, 2**31),
+    ('1', 2),
+    (1, '2'),
+    (1, 2, 3),
+    (1, 2, 'legacy:2:1'),
+    (1, 2, 'not-a-uuid'),
+    (1, 2, '00000000-0000-0000-0000-00000000000A'),
+    (1, 2, '{00000000-0000-0000-0000-000000000001}'),
+])
+def test_decode_skylet_ssh_tunnel_metadata_rejects_malformed(metadata):
+    with pytest.raises(ValueError):
+        cloud_vm_ray_backend._decode_skylet_ssh_tunnel_metadata(  # pylint: disable=protected-access
+            metadata)
 
 
 class TestCloudVmRayResourceHandleCardinality:
@@ -653,6 +698,28 @@ class TestCloudVmRayBackendGetGrpcChannel:
     INITIAL_TUNNEL_PID = 12345
     PROCESS_JOIN_TIMEOUT_SECONDS = 30
 
+    @pytest.fixture(autouse=True)
+    def _reset_tunnel_process_ownership(self):
+        cloud_vm_ray_backend._reset_skylet_tunnel_process_ownership_after_fork(  # pylint: disable=protected-access
+        )
+        yield
+        cloud_vm_ray_backend._reset_skylet_tunnel_process_ownership_after_fork(  # pylint: disable=protected-access
+        )
+
+    @staticmethod
+    def _tunnel_state(tunnel, *, cluster_hash='cluster-hash'):
+        metadata = None
+        if tunnel is not None:
+            metadata = (tunnel.port, tunnel.pid, tunnel.generation)
+        return cloud_vm_ray_backend._SkyletTunnelStateV1(  # pylint: disable=protected-access
+            observed=global_user_state.ClusterSkyletSSHTunnelSnapshotV1(
+                cluster_hash=cluster_hash,
+                metadata=metadata,
+                serialized_metadata=None,
+            ),
+            tunnel=tunnel,
+        )
+
     class _FakeClock:
         """Minimal monotonic clock for deterministic deadline tests."""
 
@@ -673,7 +740,7 @@ class TestCloudVmRayBackendGetGrpcChannel:
         """Simulate a process calling get_grpc_channel.
 
         This test mocks:
-        - _get_skylet_ssh_tunnel: To avoid making an actual DB query
+        - _get_skylet_ssh_tunnel_state: To avoid making an actual DB query
         - _open_and_update_skylet_tunnel: To avoid actually opening an SSH tunnel
         - grpc.insecure_channel: To just return the address instead of a Channel object
         - socket.socket.connect: To avoid actually connecting to the tunnel
@@ -688,11 +755,16 @@ class TestCloudVmRayBackendGetGrpcChannel:
             def mock_get_tunnel_side_effect():
                 # Return None if the tunnel is not created yet.
                 if tunnel_port.value == -1 or tunnel_pid.value == -1:
-                    return None
-                return SSHTunnelInfo(port=tunnel_port.value,
-                                     pid=tunnel_pid.value)
+                    return self._tunnel_state(None)
+                tunnel = SSHTunnelInfo(
+                    port=tunnel_port.value,
+                    pid=tunnel_pid.value,
+                    generation=str(uuid.UUID(int=tunnel_port.value)),
+                )
+                return self._tunnel_state(tunnel)
 
-            def mock_open_tunnel():
+            def mock_open_tunnel(tunnel_state):
+                del tunnel_state
                 # Simulate time taken to create tunnel.
                 time.sleep(2)
                 with tunnel_creation_count.get_lock():
@@ -702,10 +774,13 @@ class TestCloudVmRayBackendGetGrpcChannel:
                     # First creation -> 10000/12345; second -> 10001/12346; and so on.
                     tunnel_port.value = self.INITIAL_TUNNEL_PORT + (created - 1)
                     tunnel_pid.value = self.INITIAL_TUNNEL_PID + (created - 1)
-                    return SSHTunnelInfo(port=tunnel_port.value,
-                                         pid=tunnel_pid.value)
+                    return SSHTunnelInfo(
+                        port=tunnel_port.value,
+                        pid=tunnel_pid.value,
+                        generation=str(uuid.UUID(int=tunnel_port.value)),
+                    )
 
-            with patch.object(handle, '_get_skylet_ssh_tunnel', side_effect=mock_get_tunnel_side_effect), \
+            with patch.object(handle, '_get_skylet_ssh_tunnel_state', side_effect=mock_get_tunnel_side_effect), \
                 patch.object(handle, '_open_and_update_skylet_tunnel', side_effect=mock_open_tunnel), \
                 patch('grpc.insecure_channel', side_effect=lambda addr, options: addr), \
                 patch('socket.socket') as mock_socket:
@@ -727,6 +802,599 @@ class TestCloudVmRayBackendGetGrpcChannel:
         if port == self.INITIAL_TUNNEL_PORT:
             raise socket.error("Connection error")
         return None
+
+    def test_channel_snapshot_binds_fast_path_identity(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                               pid=self.INITIAL_TUNNEL_PID,
+                               generation=str(uuid.UUID(int=11)))
+        tunnel_state = self._tunnel_state(tunnel, cluster_hash='hash-fast')
+
+        with patch.object(
+                handle, '_get_skylet_ssh_tunnel_state',
+                return_value=tunnel_state) as get_state, patch.object(
+                    cloud_vm_ray_backend,
+                    '_is_tunnel_healthy',
+                    return_value=True), patch(
+                        'grpc.insecure_channel',
+                        side_effect=lambda endpoint, options: endpoint):
+            snapshot = handle.get_grpc_channel_with_snapshot()
+
+        assert snapshot.channel == f'localhost:{self.INITIAL_TUNNEL_PORT}'
+        assert snapshot.key == skylet_transport.SkyletChannelKeyV1(
+            cluster_hash='hash-fast',
+            endpoint=f'localhost:{self.INITIAL_TUNNEL_PORT}',
+            tunnel_generation=tunnel.generation,
+        )
+        get_state.assert_called_once_with()
+
+    def test_channel_snapshot_binds_newly_published_identity(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        empty_state = self._tunnel_state(None, cluster_hash='hash-new')
+        new_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT + 1,
+                                   pid=self.INITIAL_TUNNEL_PID + 1,
+                                   generation=str(uuid.UUID(int=17)))
+
+        class _AcquiredLock:
+
+            def acquire(self, blocking):
+                assert not blocking
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                del exc_type, exc_value, traceback
+
+        with patch.object(
+                handle,
+                '_get_skylet_ssh_tunnel_state',
+                side_effect=[empty_state, empty_state]), patch.object(
+                    handle,
+                    '_open_and_update_skylet_tunnel',
+                    return_value=new_tunnel) as open_tunnel, patch.object(
+                        cloud_vm_ray_backend.locks,
+                        'get_lock',
+                        return_value=_AcquiredLock()), patch(
+                            'grpc.insecure_channel',
+                            side_effect=lambda endpoint, options: endpoint):
+            snapshot = handle.get_grpc_channel_with_snapshot()
+
+        assert snapshot.channel == f'localhost:{new_tunnel.port}'
+        assert snapshot.key == skylet_transport.SkyletChannelKeyV1(
+            cluster_hash='hash-new',
+            endpoint=f'localhost:{new_tunnel.port}',
+            tunnel_generation=new_tunnel.generation,
+        )
+        open_tunnel.assert_called_once_with(empty_state)
+
+    def test_channel_snapshot_binds_shared_wakeup_identity(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        empty_state = self._tunnel_state(None, cluster_hash='hash-shared')
+        fresh_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT + 2,
+                                     pid=self.INITIAL_TUNNEL_PID + 2,
+                                     generation=str(uuid.UUID(int=18)))
+        fresh_state = self._tunnel_state(fresh_tunnel,
+                                         cluster_hash='hash-shared')
+
+        class _ContendedLock:
+
+            def acquire(self, blocking):
+                assert not blocking
+                raise cloud_vm_ray_backend.locks.LockTimeout
+
+        class _SharedLock:
+
+            def acquire(self, blocking):
+                assert blocking
+
+            def release(self):
+                pass
+
+        def get_lock(lock_id, timeout, *, shared_lock=False):
+            del lock_id, timeout
+            return _SharedLock() if shared_lock else _ContendedLock()
+
+        with patch.object(
+                handle,
+                '_get_skylet_ssh_tunnel_state',
+                side_effect=[empty_state, fresh_state]), patch.object(
+                    cloud_vm_ray_backend,
+                    '_is_tunnel_healthy',
+                    return_value=True), patch.object(
+                        cloud_vm_ray_backend.locks,
+                        'get_lock',
+                        side_effect=get_lock), patch.object(
+                            cloud_vm_ray_backend.random,
+                            'uniform',
+                            return_value=0.0), patch(
+                                'grpc.insecure_channel',
+                                side_effect=lambda endpoint, options: endpoint):
+            snapshot = handle.get_grpc_channel_with_snapshot()
+
+        assert snapshot.channel == f'localhost:{fresh_tunnel.port}'
+        assert snapshot.key == skylet_transport.SkyletChannelKeyV1(
+            cluster_hash='hash-shared',
+            endpoint=f'localhost:{fresh_tunnel.port}',
+            tunnel_generation=fresh_tunnel.generation,
+        )
+
+    def test_null_hash_channel_is_capability_read_only(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                               pid=self.INITIAL_TUNNEL_PID,
+                               generation=str(uuid.UUID(int=12)))
+        tunnel_state = self._tunnel_state(tunnel, cluster_hash=None)
+
+        with patch.object(
+                handle, '_get_skylet_ssh_tunnel_state',
+                return_value=tunnel_state), patch.object(
+                    cloud_vm_ray_backend,
+                    '_is_tunnel_healthy',
+                    return_value=True), patch(
+                        'grpc.insecure_channel',
+                        side_effect=lambda endpoint, options: endpoint):
+            capability_snapshot = (
+                handle.get_capability_channel_with_snapshot())
+            channel = handle.get_grpc_channel()
+            with pytest.raises(exceptions.SkyletUnavailableError,
+                               match='no fenced healthy'):
+                handle.get_grpc_channel_with_snapshot()
+
+        assert capability_snapshot.channel == channel
+        assert capability_snapshot.key.cluster_hash is None
+        assert not capability_snapshot.publishable
+
+    @pytest.mark.parametrize('tunnel, healthy', [
+        (None, False),
+        (SSHTunnelInfo(
+            port=10000,
+            pid=12345,
+            generation='00000000-0000-0000-0000-00000000000d'), False),
+    ])
+    def test_null_hash_missing_or_unhealthy_never_recovers(
+            self, tunnel, healthy):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel_state = self._tunnel_state(tunnel, cluster_hash=None)
+
+        with patch.object(
+                handle,
+                '_get_skylet_ssh_tunnel_state',
+                return_value=tunnel_state), patch.object(
+                    cloud_vm_ray_backend,
+                    '_is_tunnel_healthy',
+                    return_value=healthy), patch.object(
+                        cloud_vm_ray_backend.locks,
+                        'get_lock') as get_lock, patch.object(
+                            handle,
+                            '_open_and_update_skylet_tunnel') as open_tunnel, \
+                patch.object(global_user_state,
+                             'compare_and_set_cluster_skylet_ssh_tunnel_metadata') as cas, \
+                patch.object(handle,
+                             '_terminate_ssh_tunnel_process') as terminate:
+            with pytest.raises(exceptions.SkyletUnavailableError,
+                               match='recovery is disabled'):
+                handle.get_grpc_channel()
+
+        get_lock.assert_not_called()
+        open_tunnel.assert_not_called()
+        cas.assert_not_called()
+        terminate.assert_not_called()
+
+    def test_missing_cluster_row_never_enters_tunnel_recovery(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        with patch.object(
+                global_user_state,
+                'get_cluster_skylet_ssh_tunnel_snapshot',
+                return_value=None), patch.object(
+                    cloud_vm_ray_backend.locks,
+                    'get_lock') as get_lock, patch.object(
+                        handle,
+                        '_open_and_update_skylet_tunnel') as open_tunnel:
+            with pytest.raises(exceptions.SkyletUnavailableError,
+                               match='Cluster row'):
+                handle.get_grpc_channel()
+
+        get_lock.assert_not_called()
+        open_tunnel.assert_not_called()
+
+    def test_malformed_tunnel_metadata_is_quarantined(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        observed = global_user_state.ClusterSkyletSSHTunnelSnapshotV1(
+            cluster_hash='hash-malformed',
+            metadata=(10000,),
+            serialized_metadata=b'raw-malformed',
+        )
+        with patch.object(
+                global_user_state,
+                'get_cluster_skylet_ssh_tunnel_snapshot',
+                return_value=observed), patch.object(
+                    cloud_vm_ray_backend.locks,
+                    'get_lock') as get_lock, patch.object(
+                        handle,
+                        '_open_and_update_skylet_tunnel') as open_tunnel, \
+                patch.object(handle,
+                             '_terminate_ssh_tunnel_process') as terminate:
+            with pytest.raises(exceptions.SkyletUnavailableError,
+                               match='malformed'):
+                handle.get_grpc_channel()
+            with pytest.raises(exceptions.SkyletUnavailableError,
+                               match='malformed'):
+                handle.close_skylet_ssh_tunnel()
+
+        get_lock.assert_not_called()
+        open_tunnel.assert_not_called()
+        terminate.assert_not_called()
+
+    def test_unfenced_tunnel_mutations_have_no_side_effects(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                               pid=self.INITIAL_TUNNEL_PID,
+                               generation=str(uuid.UUID(int=14)))
+        tunnel_state = self._tunnel_state(tunnel, cluster_hash=None)
+
+        with patch.object(handle, 'get_command_runners') as runners, \
+                patch.object(cloud_vm_ray_backend.backend_utils,
+                             'open_ssh_tunnel') as open_tunnel, \
+                patch.object(global_user_state,
+                             'compare_and_set_cluster_skylet_ssh_tunnel_metadata') as cas, \
+                patch.object(handle,
+                             '_terminate_ssh_tunnel_process') as terminate:
+            publish = handle._open_and_update_skylet_tunnel(  # pylint: disable=protected-access
+                tunnel_state)
+            with patch.object(handle,
+                              '_get_skylet_ssh_tunnel_state',
+                              return_value=tunnel_state):
+                clear = handle.close_skylet_ssh_tunnel()
+
+        assert publish is (
+            skylet_transport.TunnelMutationResult.UNFENCED_CLUSTER_INCARNATION)
+        assert clear is (
+            skylet_transport.TunnelMutationResult.UNFENCED_CLUSTER_INCARNATION)
+        runners.assert_not_called()
+        open_tunnel.assert_not_called()
+        cas.assert_not_called()
+        terminate.assert_not_called()
+
+    def test_matching_tunnel_process_ownership_is_consumed_once(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                               pid=self.INITIAL_TUNNEL_PID,
+                               generation=str(uuid.UUID(int=21)))
+        process = MagicMock(pid=tunnel.pid)
+        process.is_running.return_value = True
+        process.status.return_value = 'running'
+        descendant = MagicMock(pid=tunnel.pid + 1)
+        process.children.return_value = [descendant]
+
+        with patch.object(
+                cloud_vm_ray_backend.psutil, 'Process',
+                return_value=process) as process_constructor, patch.object(
+                    cloud_vm_ray_backend.subprocess_utils,
+                    'kill_process_with_grace_period') as kill_process:
+            cloud_vm_ray_backend._register_skylet_tunnel_process(  # pylint: disable=protected-access
+                tunnel.generation, tunnel.pid)
+            handle._terminate_ssh_tunnel_process(tunnel)  # pylint: disable=protected-access
+            handle._terminate_ssh_tunnel_process(tunnel)  # pylint: disable=protected-access
+
+        process_constructor.assert_called_once_with(tunnel.pid)
+        process.children.assert_called_once_with(recursive=True)
+        assert kill_process.call_args_list == [call(process), call(descendant)]
+
+    @pytest.mark.parametrize('metadata', [
+        (INITIAL_TUNNEL_PORT, INITIAL_TUNNEL_PID),
+        (INITIAL_TUNNEL_PORT, INITIAL_TUNNEL_PID,
+         '00000000-0000-0000-0000-000000000016'),
+    ])
+    def test_unowned_tunnel_metadata_never_signals(self, metadata):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel = cloud_vm_ray_backend._decode_skylet_ssh_tunnel_metadata(  # pylint: disable=protected-access
+            metadata)
+
+        with patch.object(cloud_vm_ray_backend.psutil,
+                          'Process') as process_constructor, patch.object(
+                              cloud_vm_ray_backend.subprocess_utils,
+                              'kill_process_with_grace_period') as kill_process:
+            handle._terminate_ssh_tunnel_process(tunnel)  # pylint: disable=protected-access
+
+        process_constructor.assert_not_called()
+        kill_process.assert_not_called()
+
+    def test_publish_same_pid_uses_exact_generation_identity(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        old_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                                   pid=self.INITIAL_TUNNEL_PID,
+                                   generation=str(uuid.UUID(int=23)))
+        tunnel_state = self._tunnel_state(old_tunnel,
+                                          cluster_hash='hash-pid-reuse')
+        original_process = MagicMock(pid=old_tunnel.pid)
+        # psutil.Process.is_running() compares its cached create time, so False
+        # represents the numeric PID now identifying a different process.
+        original_process.is_running.return_value = False
+        replacement_process = MagicMock(pid=old_tunnel.pid)
+        replacement_process.is_running.return_value = True
+        replacement_process.status.return_value = 'running'
+        replacement_process.children.return_value = []
+
+        class _ReadyFuture:
+
+            def result(self, *, timeout):
+                assert timeout == cloud_vm_ray_backend.constants.SKYLET_GRPC_TIMEOUT_SECONDS
+
+        with patch.object(handle,
+                          'get_command_runners',
+                          return_value=[object()]), patch.object(
+                              cloud_vm_ray_backend.backend_utils,
+                              'open_ssh_tunnel',
+                              return_value=MagicMock(pid=old_tunnel.pid)), \
+                patch.object(cloud_vm_ray_backend.psutil,
+                             'Process',
+                             side_effect=[original_process,
+                                          replacement_process]) as process_constructor, \
+                patch('grpc.insecure_channel',
+                      return_value=object()), patch(
+                          'grpc.channel_ready_future',
+                          return_value=_ReadyFuture()), patch.object(
+                              global_user_state,
+                              'compare_and_set_cluster_skylet_ssh_tunnel_metadata',
+                              return_value=skylet_transport.TunnelMutationResult.UPDATED), \
+                patch.object(cloud_vm_ray_backend.subprocess_utils,
+                             'kill_process_with_grace_period') as kill_process:
+            cloud_vm_ray_backend._register_skylet_tunnel_process(  # pylint: disable=protected-access
+                old_tunnel.generation, old_tunnel.pid)
+            replacement_tunnel = handle._open_and_update_skylet_tunnel(  # pylint: disable=protected-access
+                tunnel_state)
+            assert isinstance(replacement_tunnel, SSHTunnelInfo)
+            assert replacement_tunnel.pid == old_tunnel.pid
+            assert replacement_tunnel.generation != old_tunnel.generation
+            handle._terminate_ssh_tunnel_process(  # pylint: disable=protected-access
+                replacement_tunnel)
+
+        assert process_constructor.call_args_list == [
+            call(old_tunnel.pid),
+            call(old_tunnel.pid),
+        ]
+        original_process.children.assert_not_called()
+        kill_process.assert_called_once_with(replacement_process)
+
+    def test_process_ownership_is_cleared_after_pid_change(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        inherited_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                                         pid=self.INITIAL_TUNNEL_PID,
+                                         generation=str(uuid.UUID(int=24)))
+        child_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT + 1,
+                                     pid=self.INITIAL_TUNNEL_PID + 1,
+                                     generation=str(uuid.UUID(int=25)))
+        inherited_process = MagicMock(pid=inherited_tunnel.pid)
+        child_process = MagicMock(pid=child_tunnel.pid)
+        child_process.is_running.return_value = True
+        child_process.status.return_value = 'running'
+        child_process.children.return_value = []
+        original_pid = cloud_vm_ray_backend.os.getpid()
+
+        with patch.object(
+                cloud_vm_ray_backend.psutil,
+                'Process',
+                side_effect=[inherited_process,
+                             child_process]) as process_constructor, \
+                patch.object(cloud_vm_ray_backend.subprocess_utils,
+                             'kill_process_with_grace_period') as kill_process:
+            cloud_vm_ray_backend._register_skylet_tunnel_process(  # pylint: disable=protected-access
+                inherited_tunnel.generation, inherited_tunnel.pid)
+            with patch.object(cloud_vm_ray_backend.os,
+                              'getpid',
+                              return_value=original_pid + 1):
+                handle._terminate_ssh_tunnel_process(  # pylint: disable=protected-access
+                    inherited_tunnel)
+                cloud_vm_ray_backend._register_skylet_tunnel_process(  # pylint: disable=protected-access
+                    child_tunnel.generation, child_tunnel.pid)
+                handle._terminate_ssh_tunnel_process(  # pylint: disable=protected-access
+                    child_tunnel)
+
+        assert process_constructor.call_args_list == [
+            call(inherited_tunnel.pid),
+            call(child_tunnel.pid),
+        ]
+        kill_process.assert_called_once_with(child_process)
+
+    @pytest.mark.parametrize('failure', ['conflict', 'readiness'])
+    def test_new_process_cleanup_uses_registered_identity(self, failure):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel_state = self._tunnel_state(None, cluster_hash='hash-cleanup')
+        new_pid = self.INITIAL_TUNNEL_PID + 1
+        process = MagicMock(pid=new_pid)
+        process.is_running.return_value = True
+        process.status.return_value = 'running'
+        descendant = MagicMock(pid=new_pid + 1)
+        process.children.return_value = [descendant]
+
+        class _ReadyFuture:
+
+            def result(self, *, timeout):
+                assert timeout == cloud_vm_ray_backend.constants.SKYLET_GRPC_TIMEOUT_SECONDS
+                if failure == 'readiness':
+                    raise cloud_vm_ray_backend.grpc.FutureTimeoutError()
+
+        with patch.object(handle,
+                          'get_command_runners',
+                          return_value=[object()]), patch.object(
+                              cloud_vm_ray_backend.random,
+                              'randint',
+                              return_value=self.INITIAL_TUNNEL_PORT + 2), \
+                patch.object(cloud_vm_ray_backend.backend_utils,
+                             'open_ssh_tunnel',
+                             return_value=MagicMock(pid=new_pid)), patch.object(
+                                 cloud_vm_ray_backend.psutil,
+                                 'Process',
+                                 return_value=process) as process_constructor, \
+                patch('grpc.insecure_channel',
+                      return_value=object()), patch(
+                          'grpc.channel_ready_future',
+                          return_value=_ReadyFuture()), patch.object(
+                              global_user_state,
+                              'compare_and_set_cluster_skylet_ssh_tunnel_metadata',
+                              return_value=skylet_transport.TunnelMutationResult.CONFLICT) as cas, \
+                patch.object(cloud_vm_ray_backend.subprocess_utils,
+                             'kill_process_with_grace_period') as kill_process:
+            if failure == 'readiness':
+                with pytest.raises(
+                        cloud_vm_ray_backend.grpc.FutureTimeoutError):
+                    handle._open_and_update_skylet_tunnel(  # pylint: disable=protected-access
+                        tunnel_state)
+                cas.assert_not_called()
+            else:
+                result = handle._open_and_update_skylet_tunnel(  # pylint: disable=protected-access
+                    tunnel_state)
+                assert result is skylet_transport.TunnelMutationResult.CONFLICT
+                cas.assert_called_once()
+
+        process_constructor.assert_called_once_with(new_pid)
+        process.children.assert_called_once_with(recursive=True)
+        assert kill_process.call_args_list == [call(process), call(descendant)]
+
+    def test_registration_failure_cleans_up_exact_opened_process(self):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel_state = self._tunnel_state(None, cluster_hash='hash-register')
+        opened_process = MagicMock(pid=self.INITIAL_TUNNEL_PID + 1)
+        registration_error = RuntimeError('injected registration failure')
+
+        with patch.object(handle,
+                          'get_command_runners',
+                          return_value=[object()]), patch.object(
+                              cloud_vm_ray_backend.backend_utils,
+                              'open_ssh_tunnel',
+                              return_value=opened_process), patch.object(
+                                  cloud_vm_ray_backend,
+                                  '_register_skylet_tunnel_process',
+                                  side_effect=registration_error), patch.object(
+                                      cloud_vm_ray_backend.subprocess_utils,
+                                      'kill_process_with_grace_period') as kill_process, \
+                patch.object(global_user_state,
+                             'compare_and_set_cluster_skylet_ssh_tunnel_metadata') as cas:
+            with pytest.raises(RuntimeError,
+                               match='injected registration failure'):
+                handle._open_and_update_skylet_tunnel(  # pylint: disable=protected-access
+                    tunnel_state)
+
+        kill_process.assert_called_once_with(opened_process)
+        cas.assert_not_called()
+
+    @pytest.mark.parametrize('outcome, expected_events', [
+        (skylet_transport.TunnelMutationResult.UPDATED,
+         ['open', 'register', 'ready', 'cas', 'kill-old']),
+        (skylet_transport.TunnelMutationResult.CONFLICT,
+         ['open', 'register', 'ready', 'cas', 'kill-new']),
+    ])
+    def test_nonnull_tunnel_publish_cas_owns_process_order(
+            self, outcome, expected_events):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        old_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                                   pid=self.INITIAL_TUNNEL_PID,
+                                   generation=str(uuid.UUID(int=15)))
+        tunnel_state = self._tunnel_state(old_tunnel,
+                                          cluster_hash='hash-publish')
+        new_pid = self.INITIAL_TUNNEL_PID + 1
+        events = []
+
+        class _ReadyFuture:
+
+            def result(self, *, timeout):
+                assert timeout == cloud_vm_ray_backend.constants.SKYLET_GRPC_TIMEOUT_SECONDS
+                events.append('ready')
+
+        def open_tunnel(runner, ports):
+            del runner
+            assert ports == (self.INITIAL_TUNNEL_PORT + 2,
+                             cloud_vm_ray_backend.constants.SKYLET_GRPC_PORT)
+            events.append('open')
+            return MagicMock(pid=new_pid)
+
+        def cas(cluster_name, *, observed, replacement):
+            assert cluster_name == 'test-cluster'
+            assert observed is tunnel_state.observed
+            assert replacement[:2] == (self.INITIAL_TUNNEL_PORT + 2, new_pid)
+            assert str(uuid.UUID(replacement[2])) == replacement[2]
+            events.append('cas')
+            return outcome
+
+        def register(generation, pid):
+            assert str(uuid.UUID(generation)) == generation
+            assert pid == new_pid
+            events.append('register')
+
+        def terminate(tunnel):
+            events.append('kill-old' if tunnel is old_tunnel else 'kill-new')
+
+        with patch.object(handle,
+                          'get_command_runners',
+                          return_value=[object()]), patch.object(
+                              cloud_vm_ray_backend.random,
+                              'randint',
+                              return_value=self.INITIAL_TUNNEL_PORT + 2), \
+                patch.object(cloud_vm_ray_backend.backend_utils,
+                             'open_ssh_tunnel',
+                             side_effect=open_tunnel), patch.object(
+                                 cloud_vm_ray_backend,
+                                 '_register_skylet_tunnel_process',
+                                 side_effect=register), patch(
+                                 'grpc.insecure_channel',
+                                 return_value=object()), patch(
+                                     'grpc.channel_ready_future',
+                                     return_value=_ReadyFuture()), patch.object(
+                                         global_user_state,
+                                         'compare_and_set_cluster_skylet_ssh_tunnel_metadata',
+                                         side_effect=cas), patch.object(
+                                             handle,
+                                             '_terminate_ssh_tunnel_process',
+                                             side_effect=terminate):
+            result = handle._open_and_update_skylet_tunnel(  # pylint: disable=protected-access
+                tunnel_state)
+
+        assert events == expected_events
+        if outcome is skylet_transport.TunnelMutationResult.UPDATED:
+            assert isinstance(result, SSHTunnelInfo)
+            assert result.pid == new_pid
+        else:
+            assert result is outcome
+
+    @pytest.mark.parametrize('outcome, expected_events', [
+        (skylet_transport.TunnelMutationResult.UPDATED, ['cas', 'kill']),
+        (skylet_transport.TunnelMutationResult.CONFLICT, ['cas']),
+    ])
+    def test_nonnull_tunnel_close_cas_owns_process_order(
+            self, outcome, expected_events):
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                               pid=self.INITIAL_TUNNEL_PID,
+                               generation=str(uuid.UUID(int=16)))
+        tunnel_state = self._tunnel_state(tunnel, cluster_hash='hash-close')
+        events = []
+
+        def cas(cluster_name, *, observed, replacement):
+            assert cluster_name == 'test-cluster'
+            assert observed is tunnel_state.observed
+            assert replacement is None
+            events.append('cas')
+            return outcome
+
+        def terminate(observed_tunnel):
+            assert observed_tunnel is tunnel
+            events.append('kill')
+
+        with patch.object(
+                handle, '_get_skylet_ssh_tunnel_state',
+                return_value=tunnel_state), patch.object(
+                    global_user_state,
+                    'compare_and_set_cluster_skylet_ssh_tunnel_metadata',
+                    side_effect=cas), patch.object(
+                        handle,
+                        '_terminate_ssh_tunnel_process',
+                        side_effect=terminate):
+            result = handle.close_skylet_ssh_tunnel()
+
+        assert result is outcome
+        assert events == expected_events
 
     def test_get_grpc_channel_deadline_preserves_retry_budget(self):
         """Each retry derives its timeout from one immutable deadline."""
@@ -753,25 +1421,27 @@ class TestCloudVmRayBackendGetGrpcChannel:
             lock_timeouts.append(timeout)
             return _AcquiredLock()
 
-        def open_tunnel():
+        def open_tunnel(tunnel_state):
+            del tunnel_state
             nonlocal open_attempts
             open_attempts += 1
             clock.now += 1.0
             raise RuntimeError('tunnel startup failed')
 
-        with patch.object(handle, '_get_skylet_ssh_tunnel',
-                          return_value=None), patch.object(
-                              handle,
-                              '_open_and_update_skylet_tunnel',
-                              side_effect=open_tunnel), patch.object(
-                                  cloud_vm_ray_backend.backend_utils,
-                                  'CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS',
-                                  3.0), patch.object(
-                                      cloud_vm_ray_backend, 'time',
-                                      clock), patch.object(
-                                          cloud_vm_ray_backend.locks,
-                                          'get_lock',
-                                          side_effect=get_lock):
+        with patch.object(
+                handle,
+                '_get_skylet_ssh_tunnel_state',
+                return_value=self._tunnel_state(None)), patch.object(
+                    handle,
+                    '_open_and_update_skylet_tunnel',
+                    side_effect=open_tunnel), patch.object(
+                        cloud_vm_ray_backend.backend_utils,
+                        'CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS',
+                        3.0), patch.object(cloud_vm_ray_backend, 'time',
+                                           clock), patch.object(
+                                               cloud_vm_ray_backend.locks,
+                                               'get_lock',
+                                               side_effect=get_lock):
             with pytest.raises(RuntimeError,
                                match='Timeout waiting for gRPC channel'):
                 handle.get_grpc_channel()
@@ -807,8 +1477,9 @@ class TestCloudVmRayBackendGetGrpcChannel:
             return _SharedLock() if shared_lock else _ContendedLock()
 
         with patch.object(
-                handle, '_get_skylet_ssh_tunnel',
-                return_value=None), patch.object(
+                handle,
+                '_get_skylet_ssh_tunnel_state',
+                return_value=self._tunnel_state(None)), patch.object(
                     cloud_vm_ray_backend.backend_utils,
                     'CLUSTER_TUNNEL_LOCK_TIMEOUT_SECONDS', 1.0), patch.object(
                         cloud_vm_ray_backend, 'time',
@@ -829,9 +1500,11 @@ class TestCloudVmRayBackendGetGrpcChannel:
         """A late lock winner reuses a tunnel refreshed by another process."""
         handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
         stale_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
-                                     pid=self.INITIAL_TUNNEL_PID)
+                                     pid=self.INITIAL_TUNNEL_PID,
+                                     generation=str(uuid.UUID(int=1)))
         fresh_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT + 1,
-                                     pid=self.INITIAL_TUNNEL_PID + 1)
+                                     pid=self.INITIAL_TUNNEL_PID + 1,
+                                     generation=str(uuid.UUID(int=2)))
 
         class _AcquiredLock:
 
@@ -848,8 +1521,11 @@ class TestCloudVmRayBackendGetGrpcChannel:
         open_tunnel = MagicMock()
         with patch.object(
                 handle,
-                '_get_skylet_ssh_tunnel',
-                side_effect=[stale_tunnel, fresh_tunnel]), patch.object(
+                '_get_skylet_ssh_tunnel_state',
+                side_effect=[
+                    self._tunnel_state(stale_tunnel),
+                    self._tunnel_state(fresh_tunnel),
+                ]), patch.object(
                     handle, '_open_and_update_skylet_tunnel',
                     open_tunnel), patch.object(
                         cloud_vm_ray_backend,
@@ -860,9 +1536,14 @@ class TestCloudVmRayBackendGetGrpcChannel:
                             return_value=_AcquiredLock()), patch(
                                 'grpc.insecure_channel',
                                 side_effect=lambda addr, options: addr):
-            channel = handle.get_grpc_channel()
+            snapshot = handle.get_grpc_channel_with_snapshot()
 
-        assert channel == f'localhost:{self.INITIAL_TUNNEL_PORT + 1}'
+        assert snapshot.channel == f'localhost:{self.INITIAL_TUNNEL_PORT + 1}'
+        assert snapshot.key == skylet_transport.SkyletChannelKeyV1(
+            cluster_hash='cluster-hash',
+            endpoint=f'localhost:{self.INITIAL_TUNNEL_PORT + 1}',
+            tunnel_generation=fresh_tunnel.generation,
+        )
         assert is_healthy.call_args_list == [
             call(stale_tunnel),
             call(fresh_tunnel),
