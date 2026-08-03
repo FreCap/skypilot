@@ -23,9 +23,13 @@ each existing owner when the document becomes visible again.
   surface through its existing refresh owner.
 - A periodic tick immediately after a visibility refresh is suppressed. Later
   periodic ticks resume at the existing interval.
-- In-flight automatic refreshes remain coalesced. Manual supersession,
-  stale-response fencing, dynamic batch intervals, and cache invalidation
-  behavior remain unchanged.
+- In-flight automatic refreshes remain coalesced. A visibility refresh
+  supersedes only an older automatic owner and reuses an in-flight manual or
+  interactive owner.
+- Filter, pagination, sort, manual, and post-controller-restart reads supersede
+  any older snapshot. An older request may finish, but cannot publish state or
+  clear the newer request owner.
+- Dynamic batch intervals and cache invalidation behavior remain unchanged.
 - Disabling or unmounting a surface removes both its timer and visibility
   listener, so later events perform zero work.
 
@@ -36,6 +40,13 @@ interval and `visibilitychange` listener, reads the current callback through a
 ref so callback updates do not recreate the timer, and forwards the trigger
 source to the existing refresh owner. The service list now reuses the same
 lifecycle instead of duplicating it.
+
+The managed-jobs table classifies the one active request as automatic,
+visibility, interactive, or manual. Periodic ticks reuse any active owner.
+Visibility restoration reuses manual and interactive work, but replaces a
+pre-hide automatic owner. Interactive callers supersede by default so deferred
+page-reset options and the controller-restart path cannot accidentally reuse a
+request made for older UI state. A single request sequence fences publication.
 
 The helper records a visibility-triggered refresh timestamp. If the existing
 periodic timer fires within the same interval window, it skips that one tick to
@@ -62,14 +73,16 @@ returns to inspect it.
 | `sky/dashboard/src/hooks/useVisibleRefreshInterval.js` | A backward wall-clock correction after visibility restore suppresses only the adjacent tick, and later polling resumes                                       | `sky/dashboard/src/components/jobs.test.jsx`; same command                                                                  |
 | `sky/dashboard/src/components/jobs.jsx`                | Hidden job ticks do no work; visibility restore refreshes once through the existing automatic owner                                                          | `sky/dashboard/src/components/jobs.test.jsx`; same command                                                                  |
 | `sky/dashboard/src/components/jobs.jsx`                | Initial/manual ownership, stale pool and job response fencing, dynamic batch intervals, cache reuse, and automatic refresh serialization remain intact       | Existing lifecycle cases in `sky/dashboard/src/components/jobs.test.jsx`; same command                                      |
+| `sky/dashboard/src/components/jobs.jsx`                | A page-reset fetch supersedes an older request and publishes page 1; the older completion cannot overwrite it                                               | `sky/dashboard/src/components/jobs.test.jsx`; same command                                                                  |
 
 ## Performance Evidence
 
 The focused tests assert exact pool and job read counts. Hidden intervals remain
 at zero reads. Each visible transition adds at most one refresh per surface,
 and the adjacent-timer test proves that the visibility refresh does not add a
-second periodic read. The steady visible path keeps the existing interval and
-request complexity, adding only one constant-time visibility read per tick.
+second periodic read. The page-reset boundary performs exactly one necessary
+replacement read. The steady visible path keeps the existing interval and
+request complexity, adding only constant-time owner checks per trigger.
 
 ## Rollout and Verification
 
