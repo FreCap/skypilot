@@ -39,6 +39,7 @@ from sky.server.requests import cutover as request_cutover
 from sky.server.requests import payloads
 from sky.server.requests import registry as request_registry
 from sky.server.requests import request_names
+from sky.server.requests import request_wire
 from sky.server.requests import storage as request_storage
 from sky.server.requests.serializers import decoders
 from sky.server.requests.serializers import encoders
@@ -222,12 +223,14 @@ def _status_value_for_client(status_value: str) -> str:
     and crash on an unknown value, so downgrade it to the closest status they
     understand on the wire.
     """
-    remote_api_version = versions.get_remote_api_version()
-    if (status_value == RequestStatus.WAITING.value and
-            remote_api_version is not None and remote_api_version
-            < server_constants.MIN_WAITING_STATUS_API_VERSION):
-        return RequestStatus.RUNNING.value
-    return status_value
+    return request_wire.status_value_for_client(
+        status_value,
+        waiting_status_value=RequestStatus.WAITING.value,
+        running_status_value=RequestStatus.RUNNING.value,
+        get_remote_api_version=versions.get_remote_api_version,
+        min_waiting_status_api_version=(
+            server_constants.MIN_WAITING_STATUS_API_VERSION),
+    )
 
 
 def _build_error_dict(error: BaseException) -> dict[str, Any]:
@@ -568,45 +571,15 @@ class Request:
 
     def encode(self) -> payloads.RequestPayload:
         """Serialize the SkyPilot API request."""
-        assert isinstance(self.request_body,
-                          payloads.RequestBody), (self.name, self.request_body)
-        # Pydantic validates normal request construction, but this final fence
-        # also covers internally constructed or restored bodies before their
-        # task text can enter the durable request row.
-        payloads.validate_task_request_body_for_persistence(self.request_body)
-        try:
-            # Use version-aware serializer to handle backward compatibility
-            # for old clients that don't recognize new fields.
-            serializer = return_value_serializers.get_serializer(self.name)
-            return payloads.RequestPayload(
-                request_id=self.request_id,
-                name=self.name,
-                entrypoint=encoders.pickle_and_encode(self.entrypoint),
-                request_body=encoders.pickle_and_encode(self.request_body),
-                status=_status_value_for_client(self.status.value),
-                return_value=serializer(self.return_value),
-                error=orjson.dumps(self.error).decode('utf-8'),
-                pid=self.pid,
-                created_at=self.created_at,
-                schedule_type=self.schedule_type.value,
-                user_id=self.user_id,
-                cluster_name=self.cluster_name,
-                status_msg=self.status_msg,
-                should_retry=self.should_retry,
-                finished_at=self.finished_at,
-                file_mounts_blob_id=self.file_mounts_blob_id,
-            )
-        except (TypeError, ValueError) as e:
-            # The error is unexpected, so we don't suppress the stack trace.
-            logger.error(
-                f'Error encoding: {e}\n'
-                f'  {self.request_id}\n'
-                f'  {self.name}\n'
-                f'  {self.request_body}\n'
-                f'  {self.return_value}\n'
-                f'  {self.created_at}\n',
-                exc_info=e)
-            raise
+        return request_wire.encode_request(
+            self,
+            validate_request_body=(
+                payloads.validate_task_request_body_for_persistence),
+            get_serializer=return_value_serializers.get_serializer,
+            pickle_and_encode=encoders.pickle_and_encode,
+            project_status=_status_value_for_client,
+            logger=logger,
+        )
 
     @staticmethod
     def _decode_entrypoint(encoded_entrypoint: str) -> Callable:
@@ -620,48 +593,25 @@ class Request:
         /``ImportError``. Since the value is never called on the client, fall
         back to a placeholder instead of failing the whole request.
         """
-        try:
-            return decoders.decode_and_unpickle(encoded_entrypoint)
-        except (AttributeError, ImportError) as e:
-            logger.debug(
-                'Could not resolve the request entrypoint while decoding '
-                f'(likely a client/server version skew): {e}. The entrypoint '
-                'is not used on the client, so falling back to a placeholder.')
-            return _unresolved_entrypoint
+        return request_wire.decode_entrypoint(
+            encoded_entrypoint,
+            decode_and_unpickle=decoders.decode_and_unpickle,
+            unresolved_entrypoint=_unresolved_entrypoint,
+            logger=logger,
+        )
 
     @classmethod
     def decode(cls, payload: payloads.RequestPayload) -> 'Request':
         """Deserialize the SkyPilot API request."""
-        try:
-            return cls(
-                request_id=payload.request_id,
-                name=payload.name,
-                entrypoint=cls._decode_entrypoint(payload.entrypoint),
-                request_body=decoders.decode_and_unpickle(payload.request_body),
-                status=RequestStatus(payload.status),
-                return_value=orjson.loads(payload.return_value),
-                error=orjson.loads(payload.error),
-                pid=payload.pid,
-                created_at=payload.created_at,
-                schedule_type=ScheduleType(payload.schedule_type),
-                user_id=payload.user_id,
-                cluster_name=payload.cluster_name,
-                status_msg=payload.status_msg,
-                should_retry=payload.should_retry,
-                finished_at=payload.finished_at,
-                file_mounts_blob_id=payload.file_mounts_blob_id,
-            )
-        except (TypeError, ValueError) as e:
-            logger.error(
-                f'Error decoding: {e}\n'
-                f'  {payload.request_id}\n'
-                f'  {payload.name}\n'
-                f'  {payload.entrypoint}\n'
-                f'  {payload.request_body}\n'
-                f'  {payload.created_at}\n',
-                exc_info=e)
-            # The error is unexpected, so we don't suppress the stack trace.
-            raise
+        return request_wire.decode_request(
+            payload,
+            request_factory=cls,
+            entrypoint_decoder=cls._decode_entrypoint,
+            decode_and_unpickle=decoders.decode_and_unpickle,
+            status_cls=RequestStatus,
+            schedule_type_cls=ScheduleType,
+            logger=logger,
+        )
 
 
 def get_new_request_id() -> str:
@@ -683,39 +633,11 @@ def encode_requests(requests: list[Request]) -> list[payloads.RequestPayload]:
         sent to the client side, especially for the request table could include
         all the requests.
         """
-    encoded_requests = []
-    all_users = global_user_state.get_all_users()
-    all_users_map = {user.id: user.name for user in all_users}
-    for request in requests:
-        if request.request_body is not None:
-            assert isinstance(request.request_body,
-                              payloads.RequestBody), (request.name,
-                                                      request.request_body)
-        user_name = all_users_map.get(request.user_id)
-        payload = payloads.RequestPayload(
-            request_id=request.request_id,
-            name=request.name,
-            entrypoint=request.entrypoint.__name__
-            if request.entrypoint is not None else '',
-            request_body=request.request_body.model_dump_json()
-            if request.request_body is not None else
-            orjson.dumps(None).decode('utf-8'),
-            status=_status_value_for_client(request.status.value),
-            return_value=orjson.dumps(None).decode('utf-8'),
-            error=orjson.dumps(None).decode('utf-8'),
-            pid=None,
-            created_at=request.created_at,
-            schedule_type=request.schedule_type.value,
-            user_id=request.user_id,
-            user_name=user_name,
-            cluster_name=request.cluster_name,
-            status_msg=request.status_msg,
-            should_retry=request.should_retry,
-            finished_at=request.finished_at,
-            file_mounts_blob_id=request.file_mounts_blob_id,
-        )
-        encoded_requests.append(payload)
-    return encoded_requests
+    return request_wire.encode_requests(
+        requests,
+        get_all_users=global_user_state.get_all_users,
+        project_status=_status_value_for_client,
+    )
 
 
 def _update_request_row_fields(
