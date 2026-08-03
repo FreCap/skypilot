@@ -844,10 +844,30 @@ spec:
         # Warn if logrotate is missing in the image and keep the sidecar running
         args:
         - |
+          # Track foreground work through wait so the shell can handle signals
+          # immediately instead of deferring them until a long sleep exits.
+          child_pid=""
+          shutdown() {
+            trap - TERM INT
+            if [ -n "${child_pid}" ]; then
+              kill "${child_pid}" 2>/dev/null || true
+            fi
+            exit 0
+          }
+          run_interruptibly() {
+            "$@" &
+            child_pid=$!
+            wait "${child_pid}"
+            child_status=$?
+            child_pid=""
+            return "${child_status}"
+          }
+          trap shutdown TERM INT
+
           if ! command -v logrotate >/dev/null 2>&1; then
             echo "warning: logrotate not found; skipping log retention" >&2
             while true; do
-              sleep 3600
+              run_interruptibly sleep 3600
             done
           fi
           set -x
@@ -869,8 +889,8 @@ spec:
           }
           EOF
           while true; do
-            logrotate -s /var/lib/logrotate/status /etc/logrotate.conf
-            sleep 60;
+            run_interruptibly logrotate -s /var/lib/logrotate/status /etc/logrotate.conf
+            run_interruptibly sleep 60
           done
         volumeMounts:
         {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}

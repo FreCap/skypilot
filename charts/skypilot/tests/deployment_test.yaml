@@ -1403,6 +1403,33 @@ tests:
           path: spec.template.spec.containers[1].args[0]
           pattern: '/root/\.sky/serve/\*/replica'
 
+  - it: should stop the logrotate sidecar child promptly on TERM or INT
+    set:
+      apiService.serveServerLog: true
+      apiService.logs.retention.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'shutdown\(\) \{[\s\S]*trap - TERM INT[\s\S]*kill "\$\{child_pid\}"[\s\S]*exit 0[\s\S]*\}'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'run_interruptibly\(\) \{[\s\S]*"\$@" &[\s\S]*child_pid=\$![\s\S]*wait "\$\{child_pid\}"[\s\S]*\}'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'trap shutdown TERM INT'
+
+  - it: should make both logrotate sidecar loops interruptible
+    set:
+      apiService.serveServerLog: true
+      apiService.logs.retention.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'if ! command -v logrotate[\s\S]*run_interruptibly sleep 3600[\s\S]*fi'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'EOF\s+while true; do\s+run_interruptibly logrotate -s /var/lib/logrotate/status /etc/logrotate\.conf\s+run_interruptibly sleep 60\s+done'
+
   - it: should not include logrotate sidecar when serveServerLog is false
     set:
       apiService.serveServerLog: false
