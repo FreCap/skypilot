@@ -504,8 +504,10 @@ class BatchCoordinator:
             return True, worker_job_id
 
         within_deadline, succeeded, records = await _run_call(
-            'worker record read', managed_job_state.get_batch_worker_records,
-            self._managed_job_id)
+            'worker record read',
+            managed_job_state.get_batch_worker_records,
+            self._managed_job_id,
+            owner_token=self._worker_token)
         if not within_deadline:
             return
         if succeeded:
@@ -1264,7 +1266,7 @@ class BatchCoordinator:
         worker_filter = set(workers) if workers is not None else None
         if records is None:
             records = managed_job_state.get_batch_worker_records(
-                self._managed_job_id)
+                self._managed_job_id, owner_token=worker_token)
         for record in records:
             if record['coordinator_token'] != worker_token:
                 continue
