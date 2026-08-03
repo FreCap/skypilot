@@ -858,8 +858,10 @@ async def run_distributed_singleton(
     unlock_statement = sqlalchemy.text(
         'SELECT pg_advisory_unlock('
         'hashtextextended(CAST(:lock_name AS text), 0))')
+    liveness_statement = sqlalchemy.text('SELECT 1')
     while True:
         owned_task: asyncio.Task | None = None
+        acquired = False
         try:
             engine = await _get_async_engine()
             async with engine.connect() as connection:
@@ -867,29 +869,36 @@ async def run_distributed_singleton(
                     (await
                      connection.execute(lock_statement,
                                         {'lock_name': lock_name})).scalar_one())
-                if not acquired:
-                    await asyncio.sleep(retry_interval_seconds)
-                    continue
-                logger.info(f'Acquired distributed singleton {lock_name}.')
-                owned_task = asyncio.create_task(task_factory())
-                try:
-                    while not owned_task.done():
-                        done, _ = await asyncio.wait(
-                            {owned_task},
-                            timeout=connection_check_interval_seconds)
-                        if done:
-                            await owned_task
-                            return
-                        await connection.execute(sqlalchemy.text('SELECT 1'))
-                finally:
-                    if owned_task is not None and not owned_task.done():
-                        owned_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await owned_task
-                    with contextlib.suppress(Exception):
-                        await connection.execute(unlock_statement,
-                                                 {'lock_name': lock_name})
-                    logger.info(f'Released distributed singleton {lock_name}.')
+                # The lock is session-scoped and survives commit. End the
+                # implicit SELECT transaction before starting owned work or
+                # closing a losing connection for its retry sleep.
+                await connection.commit()
+                if acquired:
+                    logger.info(f'Acquired distributed singleton {lock_name}.')
+                    owned_task = asyncio.create_task(task_factory())
+                    try:
+                        while not owned_task.done():
+                            done, _ = await asyncio.wait(
+                                {owned_task},
+                                timeout=connection_check_interval_seconds)
+                            if done:
+                                await owned_task
+                                return
+                            await connection.execute(liveness_statement)
+                            await connection.commit()
+                    finally:
+                        if owned_task is not None and not owned_task.done():
+                            owned_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await owned_task
+                        with contextlib.suppress(Exception):
+                            await connection.execute(unlock_statement,
+                                                     {'lock_name': lock_name})
+                            await connection.commit()
+                        logger.info(
+                            f'Released distributed singleton {lock_name}.')
+            if not acquired:
+                await asyncio.sleep(retry_interval_seconds)
         except asyncio.CancelledError:
             if owned_task is not None and not owned_task.done():
                 owned_task.cancel()
