@@ -209,7 +209,10 @@ class SkyletChannelSnapshotV1:
 class SkyletCapabilityChannelSnapshotV1:
     channel: typing.Any
     key: SkyletChannelKeyV1
-    publishable: bool
+
+    @property
+    def publishable(self) -> bool:
+        return self.key.cluster_hash is not None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -279,10 +282,12 @@ contract before any mutation or process operation:
    every pre-C4 Skylet RPC. Missing, malformed, or unhealthy metadata returns
    typed tunnel unavailability before opening a process.
 4. Only `get_capability_channel_with_snapshot()` may expose the null-hash key.
-   It returns `SkyletCapabilityChannelSnapshotV1(publishable=False)` over that
-   same healthy persisted tunnel. The C3 decision-only proposal is its sole
-   caller and invokes only `GetCapabilities`; cache publication rejects this
-   snapshot. Generic method-routing code does not accept this snapshot type.
+   It returns a `SkyletCapabilityChannelSnapshotV1` whose derived `publishable`
+   property is false over that same healthy persisted tunnel. The property is
+   not a constructor argument and cannot disagree with `key.cluster_hash`. The
+   C3 decision-only proposal is its sole caller and invokes only
+   `GetCapabilities`; cache publication rejects this snapshot. Generic
+   method-routing code does not accept this snapshot type.
 5. In C4 authoritative mode, a null-hash same-row observation selects the
    explicitly temporary legacy adapter with reason
    `unfenced_cluster_incarnation`. It never invokes advertised `GetJobStatus`
@@ -305,8 +310,9 @@ The handle must not read cluster hash after constructing the channel. This
 generic snapshot API never returns a null-hash key. The existing
 `get_grpc_channel()` remains a channel-only compatibility facade and, for a
 null row, may take only the healthy persisted-tunnel path. The capability-only
-snapshot API may take that same path with `publishable=False`. Neither null path
-enters exclusive open, publish, replacement, or clear code.
+snapshot API may take that same path with its derived `publishable` property
+false. Neither null path enters exclusive open, publish, replacement, or clear
+code.
 
 The provisional cache key is `SkyletChannelKeyV1`. A successful advertisement
 is stored with the full `SkyletLogicalKeyV1`. The cache contains capability
@@ -317,16 +323,21 @@ hash permits only the read-only C3 negotiation above and forbids publication,
 tunnel recovery, and authoritative method invocation; C4 uses the temporary
 legacy route instead.
 
-The negative evidence type is exactly `SkyletCapabilityRpcAbsentV1`, not a
-boolean or generic failure sentinel. The C3 classifier
-`_classify_get_capabilities_failure()` is its sole factory. It returns this
-value only when the RPC path is exactly
+The negative evidence type is the module-private
+`_SkyletCapabilityRpcAbsentV1`, not a boolean or caller-supplied failure
+sentinel. The module creates exactly one identity-bearing instance,
+`_SKYLET_CAPABILITY_RPC_ABSENT_V1`. A private capability load-and-publication
+operation owns the exact `GetCapabilities` RPC catch, classification, and cache
+write as one operation. It does not accept negative evidence as an argument.
+Its `_classify_get_capabilities_failure()` helper returns the private singleton
+only when the RPC path is exactly
 `skylet.v1.CapabilitiesService/GetCapabilities` and gRPC status is exactly
-`UNIMPLEMENTED`; every other status raises its typed result. Cache publication
-accepts the typed value only with a matching
-`SkyletCapabilityChannelSnapshotV1(publishable=True)` and non-null channel key.
-An `UNIMPLEMENTED` from `JobsService/GetJobStatus`, an `UNKNOWN`, a fabricated
-value, or any null-hash capability snapshot cannot publish absence.
+`UNIMPLEMENTED`; every other status raises its typed result. The private
+publication branch requires identity with that singleton, the same derived
+publishable snapshot used by the RPC, and a non-null channel key. A second
+instance of the private class is fabricated evidence and is rejected. An
+`UNIMPLEMENTED` from `JobsService/GetJobStatus`, an `UNKNOWN`, or any null-hash
+capability snapshot cannot publish absence.
 
 The cache lives only in `sky/backends/skylet_transport.py` and obeys all of the
 following rules:
@@ -336,9 +347,9 @@ following rules:
   closed 45 through 60 second interval;
 - at most one network-bearing capability flight, ordinary or forced, exists per
   provisional key, and no network I/O occurs while the mutex is held;
-- the exact C3-classified capability-RPC `UNIMPLEMENTED` may publish
-  `SkyletCapabilityRpcAbsentV1` under the provisional key because no boot ID is
-  available;
+- the exact C3-classified capability-RPC `UNIMPLEMENTED` may publish the private
+  `_SKYLET_CAPABILITY_RPC_ABSENT_V1` singleton under the provisional key because
+  no boot ID is available;
 - a valid advertisement, including method omission, publishes the complete
   advertisement under its logical key;
 - transient, authentication, internal, malformed, and request-cancellation
@@ -392,9 +403,11 @@ class SkyletRoute(enum.Enum):
     GRPC = 'grpc'
     LEGACY = 'legacy'
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class SkyletCapabilityRpcAbsentV1:
-    channel_key: SkyletChannelKeyV1
+class _SkyletCapabilityRpcAbsentV1:
+    __slots__ = ()
+
+
+_SKYLET_CAPABILITY_RPC_ABSENT_V1 = _SkyletCapabilityRpcAbsentV1()
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class SkyletRouteDecisionV1:
@@ -426,8 +439,8 @@ class SkyletTransportRouter:
 `propose_get_job_status_route()` is decision-only. It evaluates local policy,
 obtains at most one `SkyletCapabilityChannelSnapshotV1` through
 `get_capability_channel_with_snapshot()`, negotiates capabilities, and returns
-one bounded proposal. It is the only API allowed to consume a
-`publishable=False` null-hash snapshot. It never accepts `job_ids`,
+one bounded proposal. It is the only API allowed to consume a null-hash
+snapshot whose derived `publishable` property is false. It never accepts `job_ids`,
 `stream_logs`, a command runner, or a status callback, and it never invokes
 either `GetJobStatus` implementation.
 Expected negotiation failures, request cancellation during the proposal, and
@@ -435,7 +448,11 @@ unexpected ordinary exceptions become a `route=None` proposal with the exact
 closed reason, so none can replace the current status result. Process-fatal
 `KeyboardInterrupt` and `SystemExit` are not swallowed.
 `observe_current_get_job_status()` likewise converts any ordinary setup failure
-to the no-op observer before the current body starts.
+to the no-op observer before the current body starts. For the two closed enum
+constants, `mark_actual_route()` is a total, non-throwing assignment: it invokes
+no logger, clock, emitter, callback, or user code and contains any ordinary
+internal failure before returning. A marker failure therefore cannot replace a
+status return or exception.
 
 C3 contains observation around the current inline
 `CloudVmRayBackend.get_job_status()` body. In `off`, it constructs only a no-op
@@ -608,7 +625,7 @@ The Platform SkyPilot on-call is the promotion owner. Before the measurement
 window, the exact rendered test-cluster manifests must prove separate `api`,
 `controller`, and `executor` Deployments with matching
 `SKYPILOT_API_SERVER_ROLE` values. A direct role test must prove
-`sky.server.requests.executor._request_execution_enabled()` is false in an
+`sky.server.requests.executor.api_process_execution_enabled()` is false in an
 explicit API process, that no request worker starts there, and that the same
 ordinary requests are claimed only by executor or controller workers. This is
 the evidence for excluding API from required event coverage; synthetic
@@ -658,19 +675,25 @@ database, custom Datadog client, or Prometheus metric.
 
 ## Authoritative attempt and retry contract
 
-C4 makes the router the sole retry owner for ordinary `GetJobStatus` in every
-mode. The authoritative path must not call
-`backend_utils.invoke_skylet_with_retries()`: that helper owns a nested retry
+C4 makes the router the sole retry owner only in
+`authoritative_get_job_status` mode. That authoritative branch must not call
+`backend_utils.invoke_skylet_with_retries()`: the helper owns a nested retry
 loop and classifies both `UNKNOWN` and `UNIMPLEMENTED` as method absence. Other
 Skylet methods continue using it unchanged. During the rollback window, `off`
-and `shadow` preserve the characterized selector and fallback in
-`SkyletTransportRouter._get_job_status_compatibility`.
+and `shadow` call
+`SkyletTransportRouter._get_job_status_compatibility()` exactly once per
+top-level status call, without an outer router attempt loop. That compatibility
+operation preserves the characterized selector, fallback, and existing
+`invoke_skylet_with_retries()` behavior until C5. Its helper-owned attempts are
+temporary compatibility behavior and are not counted as authoritative router
+attempts.
 
-One top-level ordinary-status call has one loop of at most five route attempts,
-one `common_utils.Backoff(initial_backoff=0.5)`, and at most four
-`context_utils.sleep_with_cancellation()` calls. The budget includes capability
-handshakes and method calls together. No cache loader, compatibility helper, or
-method helper may start a nested attempt loop, and there is no terminal sleep.
+One top-level authoritative ordinary-status call has one loop of at most five
+route attempts, one `common_utils.Backoff(initial_backoff=0.5)`, and at most
+four `context_utils.sleep_with_cancellation()` calls. The budget includes
+capability handshakes and method calls together. In the authoritative branch,
+no cache loader, compatibility helper, or method helper may start a nested
+attempt loop, and there is no terminal sleep.
 
 Each route attempt takes these steps in order:
 
@@ -883,8 +906,9 @@ its item boundary and receives no transport-policy responsibility.
   mark the exact current gRPC and SSH branches, and execute status exactly once
   with identical return and exception behavior. Do not introduce the C4a
   adapter or a status callback in C3.
-- Add `SkyletCapabilityRpcAbsentV1` and its sole exact-`GetCapabilities`
-  `UNIMPLEMENTED` factory; reject every other negative-publication source.
+- Add the private `_SkyletCapabilityRpcAbsentV1` singleton and one combined
+  exact-`GetCapabilities` catch, classification, and publication operation;
+  reject every other negative-publication source and every second instance.
 - Compare proposed route with actual existing selection in structured logs and
   the exact unsampled Datadog event. Block C4a until the owned 30-minute
   controller/executor coverage, split-API nonexecution, p95 latency, and
@@ -900,9 +924,11 @@ its item boundary and receives no transport-policy responsibility.
   the public C3 proposal and backend observer integration, and move the
   characterized off/shadow compatibility branch plus observation into the
   router.
-- Use one five-attempt router loop with a new atomic snapshot per attempt,
-  exact-key invalidation and renegotiation, no nested retry helper, and one
-  bounded post-advertisement forced refresh.
+- In `authoritative_get_job_status` only, use one five-attempt router loop with
+  a new atomic snapshot per attempt, exact-key invalidation and renegotiation,
+  no nested retry helper, and one bounded post-advertisement forced refresh.
+  Off and shadow invoke the characterized compatibility operation once with its
+  existing helper and no outer router loop.
 - Canonicalize gRPC and SSH output, including no-job latest.
 - Make only typed unavailability transient in Managed Jobs, and contain it per
   future in Serve without inferring preemption.
@@ -1001,12 +1027,14 @@ its item boundary and receives no transport-policy responsibility.
   separate test records the intentional bound that healthy boot-A
   evidence remains usable until expiry without a refresh-triggering signal.
 - Positive advertisement, typed exact capability-service absence, and
-  boot-bound omission are the only cacheable evidence classes. Factory tests
-  prove only exact `CapabilitiesService/GetCapabilities` `UNIMPLEMENTED`
-  constructs `SkyletCapabilityRpcAbsentV1`; wrong RPC path, method-level
-  `UNIMPLEMENTED`, `UNKNOWN`, fabricated sentinel, and `publishable=False`
-  snapshots cannot publish. Existing C1 parser, client, Python 3.10
-  import-floor, and tunnel multiprocess tests remain green.
+  boot-bound omission are the only cacheable evidence classes. Tests prove the
+  private load-and-publication operation accepts no negative-evidence argument,
+  only exact `CapabilitiesService/GetCapabilities` `UNIMPLEMENTED` yields the
+  identity-checked `_SKYLET_CAPABILITY_RPC_ABSENT_V1`, and a separately
+  constructed `_SkyletCapabilityRpcAbsentV1` is rejected. Wrong RPC path,
+  method-level `UNIMPLEMENTED`, `UNKNOWN`, and a snapshot whose derived
+  `publishable` property is false cannot publish. Existing C1 parser, client,
+  Python 3.10 import-floor, and tunnel multiprocess tests remain green.
 
 ### C3 shadow tests
 
@@ -1016,10 +1044,10 @@ its item boundary and receives no transport-policy responsibility.
   decision-only API accepts no job IDs, stream flag, runner, or status callback
   and never invokes the proposed method.
 - Every supported, absent, unfenced-null-row, unavailable, cancelled,
-  malformed, unexpected-proposal, observer-setup-failure, and logging-failure
-  shadow case runs the current inline path exactly once with the same object
-  identity or exact exception identity. A recording observer proves gRPC
-  success marks `grpc`,
+  malformed, unexpected-proposal, observer-setup-failure, marker-failure, and
+  logging-failure shadow case runs the current inline path exactly once with the
+  same object identity or exact exception identity. A recording observer proves
+  gRPC success marks `grpc`,
   broad-fallback then SSH marks final `legacy`, uncaught gRPC error remains
   `grpc`, direct SSH remains `legacy`, and one event is attempted only from
   `__exit__`. Event failure never changes the body result.
@@ -1030,9 +1058,10 @@ its item boundary and receives no transport-policy responsibility.
 - Comparison records final gRPC success or SSH fallback. Exact capability-RPC
   absence plus actual gRPC success is the only expected mismatch; all other
   successful unequal routes are unexplained.
-- Split-role tests prove the rendered role environment, API
-  `_request_execution_enabled()` false result, absence of API request workers,
-  and executor/controller-only claims. The read-only Datadog fixture then uses
+- Split-role tests prove the rendered role environment,
+  `api_process_execution_enabled()` returns false for API, no API request worker
+  starts, and only executor/controller workers claim requests. The read-only
+  Datadog fixture then uses
   real queued executor bodies and controller polling plus 20 distinct tunnel
   generations to generate at least 100 unsampled events and 20 misses for each
   required role. The recorded 30-minute query proves zero API execution events,
@@ -1061,6 +1090,10 @@ order, and owns no route, cache, retry, or protobuf canonicalization branch.
 
 ### C4 retry, response, consumer, and ledger tests
 
+- Off and shadow each call `_get_job_status_compatibility()` exactly once and
+  start no outer router attempt loop. Characterization tests retain the existing
+  `invoke_skylet_with_retries()` attempt, fallback, return, and exception
+  behavior in those two modes. The authoritative mode never calls that helper.
 - Retryable `UNAVAILABLE` succeeds on route attempts 2 and 5 and fails typed on
   attempt 5. The exhausted case obtains five snapshots and performs exactly
   four cancellation-aware sleeps.
@@ -1232,7 +1265,10 @@ introduces runtime symbols, add planned `PLA-M4-104` with null provenance for
 `SkyletRoutingMode.OFF`, `SkyletRoutingMode.SHADOW`,
 `SkyletTransportRouter.propose_get_job_status_route`,
 `SkyletTransportRouter.observe_current_get_job_status`,
-`SkyletCapabilityRpcAbsentV1`,
+`GetJobStatusShadowObservation`, the two calls to the public router methods from
+`CloudVmRayBackend.get_job_status`,
+`_SkyletCapabilityRpcAbsentV1`,
+`_SKYLET_CAPABILITY_RPC_ABSENT_V1`,
 `SkyletTransportRouter._classify_get_capabilities_failure`, and the shadow
 comparator/emitter.
 After the runtime commit exists, a follow-up manifest commit records its exact
@@ -1246,10 +1282,11 @@ proof of zero API request-body execution events, per-required-role p95 at most
 500 milliseconds, and zero unexplained divergence before shadow code can later
 be removed.
 
-In the C4b runtime commit, delete the two C3-only public symbols and the backend
-observer call sites, then replace only their row-104 locators with the private
-router locations below. Keep row 104's provenance, status, history, gates,
-evidence, and blocker unchanged:
+In the C4b runtime commit, delete the two C3-only public router symbols, the
+public observation class, and both backend router call sites. Remove their five
+row-104 locators and replace them with the private router locations below. Keep
+row 104's other locators, provenance, status, history, gates, evidence, and
+blocker unchanged:
 
 ```yaml
 - kind: python_symbol
@@ -1258,11 +1295,14 @@ evidence, and blocker unchanged:
 - kind: python_symbol
   path: sky/backends/skylet_transport.py
   symbol: SkyletTransportRouter._observe_get_job_status
+- kind: python_symbol
+  path: sky/backends/skylet_transport.py
+  symbol: _GetJobStatusShadowObservation
 ```
 
 The `OFF`, `SHADOW`, typed absence, classifier, and emitter locators remain. No
-C4b commit may leave a C3 public-symbol locator unresolved, and moving
-observation into the router does not satisfy a removal gate.
+C4b commit may leave a C3 public-symbol or backend-call locator unresolved, and
+moving observation into the router does not satisfy a removal gate.
 
 Before C4a introduces the adapter, add planned `PLA-M4-105` with null
 provenance for `sky.backends.skylet_legacy.get_job_status_via_ssh`. Activate it
@@ -1313,8 +1353,8 @@ After the enforced ordinary-status support gate closes, delete:
 
 - the temporary legacy SSH adapter;
 - the temporary shadow comparator and mode branch;
-- `SkyletCapabilityRpcAbsentV1` and its exact-RPC classifier when the
-  missing-capability route closes;
+- `_SkyletCapabilityRpcAbsentV1`, its singleton, and its exact-RPC classifier
+  when the missing-capability route closes;
 - temporary mixed-version shadow tests, while retaining a frozen permanent
   compatibility corpus;
 - `JobLibCodeGen.get_job_status`;

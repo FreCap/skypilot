@@ -15719,7 +15719,21 @@ artifacts:
     symbol: SkyletTransportRouter.observe_current_get_job_status
   - kind: python_symbol
     path: sky/backends/skylet_transport.py
-    symbol: SkyletCapabilityRpcAbsentV1
+    symbol: GetJobStatusShadowObservation
+  - kind: python_call_within
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: CloudVmRayBackend.get_job_status
+    call: propose_get_job_status_route
+  - kind: python_call_within
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: CloudVmRayBackend.get_job_status
+    call: observe_current_get_job_status
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: _SkyletCapabilityRpcAbsentV1
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: _SKYLET_CAPABILITY_RPC_ABSENT_V1
   - kind: python_symbol
     path: sky/backends/skylet_transport.py
     symbol: SkyletTransportRouter._classify_get_capabilities_failure
