@@ -29,6 +29,8 @@ logger = sky_logging.init_logger(__name__)
 
 _BURN_RATE_UPDATE_INTERVAL_SECONDS = 30
 _COST_TIME_HORIZON_SECONDS = 3600
+_SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
+_API_OWNED_METRICS_ROLES = frozenset({'all', 'api'})
 
 # Idempotency guard for register_multiproc_cleanup_atexit.
 _multiproc_cleanup_registered = False
@@ -242,7 +244,14 @@ _plugin_collectors: list = []
 
 
 def register_plugin_collector(collector):
-    """Register a custom Prometheus collector from a plugin."""
+    """Register an API-owned custom Prometheus collector from a plugin.
+
+    Custom collectors predate split roles and were historically exported by
+    the API server.  They remain API/all-owned instead of being repeated on
+    every role target.  Plugins that emit process-local executor/controller
+    metrics should use prometheus_client's multiprocess-aware metric types;
+    those are collected from the role's pod-local multiprocess registry.
+    """
     _plugin_collectors.append(collector)
     try:
         prom.REGISTRY.register(collector)
@@ -615,6 +624,22 @@ def maybe_register_managed_jobs_collector():
 metrics_app = fastapi.FastAPI()
 
 
+def _register_api_owned_collectors(registry: prom.CollectorRegistry) -> None:
+    """Add shared-state and plugin collectors to API/all registries only."""
+    role = os.environ.get(_SERVER_ROLE_ENV_VAR, 'all')
+    if role not in _API_OWNED_METRICS_ROLES:
+        return
+    registry.register(_BURN_RATE_COLLECTOR)
+    registry.register(_WORKSPACE_USAGE_COLLECTOR)
+    if _MANAGED_JOBS_COLLECTOR is not None:
+        registry.register(_MANAGED_JOBS_COLLECTOR)
+    for collector in _plugin_collectors:
+        try:
+            registry.register(collector)
+        except ValueError:
+            pass
+
+
 # Serve /metrics in dedicated thread to avoid blocking the event loop
 # of metrics server.
 @metrics_app.get('/metrics')
@@ -624,15 +649,7 @@ def metrics() -> fastapi.Response:
         # In multiprocess mode, we need to collect metrics from all processes.
         registry = prom.CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
-        registry.register(_BURN_RATE_COLLECTOR)
-        registry.register(_WORKSPACE_USAGE_COLLECTOR)
-        if _MANAGED_JOBS_COLLECTOR is not None:
-            registry.register(_MANAGED_JOBS_COLLECTOR)
-        for c in _plugin_collectors:
-            try:
-                registry.register(c)
-            except ValueError:
-                pass
+        _register_api_owned_collectors(registry)
         data = generate_latest(registry)
     else:
         data = generate_latest()

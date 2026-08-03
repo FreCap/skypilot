@@ -266,7 +266,7 @@ false
 
 {{/* API server start arguments */}}
 {{- define "skypilot.apiArgs" -}}
---deploy{{ if include "skypilot.enableBasicAuthInAPIServer" . | trim | eq "true" }} --enable-basic-auth{{ end }}
+--deploy{{ if .Values.apiService.metrics.enabled }} --metrics --metrics-port {{ .Values.apiService.metrics.port }}{{ end }}{{ if include "skypilot.enableBasicAuthInAPIServer" . | trim | eq "true" }} --enable-basic-auth{{ end }}
 {{- end -}}
 
 {{- define "skypilot.oauth2ProxyURL" -}}

@@ -184,12 +184,14 @@ apiService:
   # Optional secret that contains SSH keys for the API server to use, all the entries in the secret will be mounted to ~/.ssh/ directory in the API server.
   # @schema type: [string, null]
   sshKeySecret: null
-  # Metrics configuration for the API server.
+  # Metrics configuration for API-server roles. In guarded HA mode the API,
+  # executor, and controller pods each expose their own process-local
+  # multiprocess registry on this port and are discovered independently.
   # Refer to https://docs.skypilot.co/en/latest/reference/api-server/examples/api-server-metrics-setup.html for more details.
   metrics:
     # Whether to enable metrics collection, default to false. If this is enabled and the API server image does not support metrics, the deployment will fail.
     enabled: false
-    # The port to expose the metrics on, default to 9090.
+    # The port to expose metrics on in every API-server role pod, default to 9090.
     port: 9090
     # NOTE: model-serving (/endpoints-metrics) federation + dashboards are
     # gated separately by prometheus.scrapeEndpointMetrics.
@@ -1131,11 +1133,21 @@ prometheus:
     retentionSize: "43GB"
   # Configure additional scrape configs using extraScrapeConfigs
   extraScrapeConfigs: |
-    # Static scrape target for SkyPilot API server GPU metrics
+    # Discover the API Service's named metrics port so custom
+    # apiService.metrics.port values remain consistent.
     - job_name: 'skypilot-api-server-gpu-metrics'
-      static_configs:
-        # Use the API service created by this Helm chart
-        - targets: ['{{ include "skypilot.fullname" . }}-api-service.{{ .Release.Namespace }}.svc.cluster.local:9090']
+      kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - '{{ .Release.Namespace }}'
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_service_name]
+          action: keep
+          regex: '{{ include "skypilot.fullname" . }}-api-service'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: metrics
       metrics_path: '/gpu-metrics'
       scrape_interval: 60s
       scrape_timeout: 45s
@@ -1147,7 +1159,7 @@ prometheus:
         target_label: node
         replacement: $1
     {{- if .Values.scrapeEndpointMetrics }}
-    # Static scrape target for SkyPilot API server endpoint serving
+    # Service-discovered target for SkyPilot API server endpoint serving
     # metrics. The /endpoints-metrics endpoint federates the serving
     # engines' native series (vllm:* today) from every remote Kubernetes
     # context the API server can see, with a cluster=<context> label
@@ -1155,8 +1167,18 @@ prometheus:
     # filter by cluster.
     - job_name: 'skypilot-api-server-endpoints-metrics'
       honor_labels: true
-      static_configs:
-        - targets: ['{{ include "skypilot.fullname" . }}-api-service.{{ .Release.Namespace }}.svc.cluster.local:9090']
+      kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - '{{ .Release.Namespace }}'
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_service_name]
+          action: keep
+          regex: '{{ include "skypilot.fullname" . }}-api-service'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: metrics
       metrics_path: '/endpoints-metrics'
       scrape_interval: 60s
       scrape_timeout: 45s

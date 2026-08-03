@@ -3,10 +3,12 @@ suite: prometheus_extra_scrape_configs_test
 templates:
   - charts/prometheus/templates/cm.yaml
 tests:
-  - it: should render extraScrapeConfigs with resolved service target
+  - it: should discover federation through the named metrics service port
     set:
       prometheus.enabled: true
       prometheus.useDedicatedScrapeConfig: true
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9191
     asserts:
       - hasDocuments:
           count: 1
@@ -14,7 +16,16 @@ tests:
           of: ConfigMap
       - matchRegex:
           path: data["prometheus.yml"]
-          pattern: "RELEASE-NAME-api-service\\.NAMESPACE\\.svc\\.cluster\\.local:9090"
+          pattern: "job_name: 'skypilot-api-server-gpu-metrics'[\\s\\S]+role: service"
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "regex: 'RELEASE-NAME-api-service'"
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "source_labels: \\[__meta_kubernetes_service_port_name\\][\\s\\S]+regex: metrics"
+      - notMatchRegex:
+          path: data["prometheus.yml"]
+          pattern: "api-service.*:9090"
 
   - it: should render extraScrapeConfigs using fullnameOverride for service name
     set:
@@ -27,7 +38,7 @@ tests:
           count: 1
       - matchRegex:
           path: data["prometheus.yml"]
-          pattern: "custom-name-api-service\\.NAMESPACE\\.svc\\.cluster\\.local:9090"
+          pattern: "regex: 'custom-name-api-service'"
 
   - it: should NOT render the endpoints-metrics scrape job by default
     set:
@@ -48,6 +59,28 @@ tests:
       - matchRegex:
           path: data["prometheus.yml"]
           pattern: "/endpoints-metrics"
+      - matchRegex:
+          path: data["prometheus.yml"]
+          pattern: "job_name: 'skypilot-api-server-endpoints-metrics'[\\s\\S]+role: service[\\s\\S]+__meta_kubernetes_service_port_name"
+
+---
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: api_service_metrics_port_test
+templates:
+  - templates/api-service.yaml
+tests:
+  - it: should expose the configured port selected by federation discovery
+    set:
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9191
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            port: 9191
+            name: metrics
+            targetPort: 9191
+            protocol: TCP
 
 ---
 # yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json

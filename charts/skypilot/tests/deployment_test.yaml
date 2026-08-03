@@ -1308,6 +1308,15 @@ tests:
           content:
             name: slurm-config
 
+  - it: should pass the configured metrics port to the API runtime
+    set:
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9191
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "sky api start --deploy --metrics --metrics-port 9191 --foreground"
+
   # Test cases for apiService.serveServerLog configuration
   - it: should tee server logs to file by default
     asserts:
