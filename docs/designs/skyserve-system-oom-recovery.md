@@ -1,17 +1,17 @@
 # SkyServe System OOM Recovery
 
 _Status: rewritten #1182 implementation and canonical design are complete;
-repository-wide unit integration corrections have passed local non-PostgreSQL
-verification and exact paid-capacity retry review, with required real-
-PostgreSQL CI pending; the corrected route-lease/runtime design passed exact
-adversarial re-review; the stacked draft #1183 steady-state removal is authored
-and remains blocked on all seven removal gates; production activation is
-blocked_
+repository-wide required CI, including the real-PostgreSQL suites and exact
+paid-capacity retry, passed at the exact corrected implementation tips; the
+implementation remains unchanged on the latest baseline; the corrected route-
+lease/runtime design passed exact adversarial re-review; the stacked draft
+#1183 steady-state removal is authored and remains blocked on all seven removal
+gates; production activation is blocked_
 
 _Last updated: 2026-08-03_
 
 _Design baseline: `origin/improvements` at
-`02cc7ceb722b8ef15a0766b6bdf83416ad0603bd`_
+`3e06b0e88587479dfc58496f2cf9e71d4a8e73b2`_
 
 ## Context and decision
 
@@ -1717,15 +1717,29 @@ authority.
   3.14. All 1,582 tests in the 29 non-PostgreSQL modules pass. The four real-
   PostgreSQL modules collect 200 tests, including the exact paid-claim replay
   identity regression, but cannot execute because this host has a Docker CLI
-  without a Docker socket; they remain a required CI/merge gate rather than
-  inferred evidence.
+  without a Docker socket. They were therefore treated as required CI evidence
+  rather than inferred locally; the mandatory lane below executed them without
+  skips.
 - Repository-wide CI on the preceding tip exposed 36 integration failures in
   legacy mocks/fixtures and the exact paid-claim retry. All 167 affected non-PG
   tests now pass together. The mocks assert the update-only existence fence,
   ordinary fixtures carry explicit recovery state and canonical record IDs,
   fresh-launch tests exercise the insert-only worker seam, and exact-claim
-  re-delivery uses identity-fenced UPDATE semantics. The corrected full unit
-  lane and real-PostgreSQL result are pending the republished stack.
+  re-delivery uses identity-fenced UPDATE semantics. At exact corrected feature
+  implementation SHA `2968f044877e196ed9871e4573828962c08f6cde`, all 30
+  reported #1182 checks passed. Its mandatory
+  [Unit Tests job](https://github.com/boltz-bio/skypilot/actions/runs/30776425080/job/91572674383)
+  installed `testcontainers==4.14.2`, set both required-PostgreSQL flags,
+  started two `postgres:16` containers, and finished with 13,936 passed, one
+  xfailed, 71 passed subtests, and no skips. This closes the corrected
+  full-unit and real-PostgreSQL implementation gate.
+- At exact corrected cleanup implementation SHA
+  `66ab79dd448543ffe19e5b29478035e2940e7f58`, all 30 reported #1183 checks
+  also passed. Its mandatory
+  [Unit Tests job](https://github.com/boltz-bio/skypilot/actions/runs/30776430908/job/91572690546)
+  used the same required-PostgreSQL setup and finished with 13,939 passed, one
+  xfailed, 71 passed subtests, and no skips. This verifies the authored
+  steady state but does not satisfy any production rollout or removal gate.
 - Focused architecture, route-lease, route-registry, controller, proxy,
   load-balancer, manager-transaction, backend, driver, AWS-admission, and
   authorization tests pass. They include the composite-worker ordering races,
@@ -1746,10 +1760,9 @@ authority.
   confirms the production recovery surface contains no port 4517, SQS,
   EventBridge, Temporal, or application completion-marker authority.
 - No production deployment, authorization activation, real AWS OOM injection,
-  or provider-termination race has been performed. The real PostgreSQL suite,
-  both 16-GB cloud smoke sequences, deployment inventory, rollback exercise,
-  and seven continuous UTC days of compatibility telemetry remain blocking
-  evidence below.
+  or provider-termination race has been performed. Both 16-GB cloud smoke
+  sequences, deployment inventory, rollback exercise, and seven continuous UTC
+  days of compatibility telemetry remain blocking evidence below.
 
 ## PR 3 removal gates
 
