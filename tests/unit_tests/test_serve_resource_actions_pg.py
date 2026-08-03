@@ -482,7 +482,7 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
         engine.dispose()
 
 
-def test_pg_generic_replica_upserts_preserve_action_owned_columns(
+def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
         empty_postgres, monkeypatch):
     engine = empty_postgres
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
@@ -529,22 +529,32 @@ def test_pg_generic_replica_upserts_preserve_action_owned_columns(
                     replica_id).values(**action_values))
             session.commit()
 
-    assert serve_state.add_or_update_replica('svc', 1, _replica(1, version=2))
-    assert serve_state.add_or_update_replicas('svc',
-                                              [(2, _replica(2, version=2))])
-    assert serve_state.try_add_replica_with_paid_capacity_claim(
-        'svc',
-        service_hash,
-        3,
-        _replica(3, version=2),
-        pool_key='test-paid-pool',
-        priority=1,
-        base_limit=1,
-        max_limit=2,
-        now=100.0,
-        success_ttl_seconds=60.0,
-        waiter_ttl_seconds=60.0,
-        expected_controller_owner=None) == 'acquired'
+    first = serve_state.get_replica_info_from_id('svc', 1)
+    second = serve_state.get_replica_info_from_id('svc', 2)
+    assert first is not None and second is not None
+    first.version = 2
+    second.version = 2
+    assert serve_state.add_or_update_replica('svc',
+                                             1,
+                                             first,
+                                             expected_replica_exists=True)
+    assert serve_state.add_or_update_replicas('svc', [(2, second)],
+                                              expected_replica_exists=True)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            service_hash,
+            3,
+            _replica(3, version=2),
+            pool_key='test-paid-pool',
+            priority=1,
+            base_limit=1,
+            max_limit=2,
+            now=100.0,
+            success_ttl_seconds=60.0,
+            waiter_ttl_seconds=60.0,
+            expected_controller_owner=None)
 
     with orm.Session(engine) as session:
         session.execute(serve_state.reserved_fill_claims_table.insert().values(
@@ -556,11 +566,12 @@ def test_pg_generic_replica_upserts_preserve_action_owned_columns(
             holdings_fill=1,
             heartbeat_ts=100.0))
         session.commit()
-    assert serve_state.add_replica_if_round_epoch('svc',
-                                                  4,
-                                                  _replica(4, version=2),
-                                                  pool_key='test-fill-pool',
-                                                  expected_epoch=1)
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        serve_state.add_replica_if_round_epoch('svc',
+                                               4,
+                                               _replica(4, version=2),
+                                               pool_key='test-fill-pool',
+                                               expected_epoch=1)
 
     with orm.Session(engine) as session:
         rows = session.execute(
@@ -568,6 +579,15 @@ def test_pg_generic_replica_upserts_preserve_action_owned_columns(
                 serve_state.replicas_table.c.service_name ==
                 'svc')).mappings().all()
     actual_by_replica = {row['replica_id']: row for row in rows}
+    assert {
+        replica_id: row['version']
+        for replica_id, row in actual_by_replica.items()
+    } == {
+        1: 2,
+        2: 2,
+        3: 1,
+        4: 1,
+    }
     for replica_id, expected in expected_by_replica.items():
         assert {
             name: actual_by_replica[replica_id][name]

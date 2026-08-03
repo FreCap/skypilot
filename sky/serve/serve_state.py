@@ -3318,9 +3318,21 @@ def try_add_replica_with_paid_capacity_claim(
                                          updated_at=now))
 
         replica_info.paid_capacity_pool_key = pool_key
-        replica_insert = _upsert_insert_func(engine)(replicas_table).values(
-            **_replica_row_values(service_name, replica_id, replica_info))
-        session.execute(replica_insert)
+        if is_existing_claim:
+            # Re-delivery of an exact durable claim updates the same replica
+            # record.  The immutable record identity fence prevents a stale
+            # manager incarnation from adopting that claim.
+            if not _upsert_replica_rows_in_session(
+                    session,
+                    engine,
+                    service_name, [(replica_id, replica_info)],
+                    expected_replica_exists=True):
+                session.rollback()
+                return 'ownership_lost'
+        else:
+            replica_insert = _upsert_insert_func(engine)(replicas_table).values(
+                **_replica_row_values(service_name, replica_id, replica_info))
+            session.execute(replica_insert)
         claim_insert = _upsert_insert_func(engine)(
             paid_capacity_claims_table).values(service_name=service_name,
                                                service_hash=service_hash,

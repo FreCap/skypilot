@@ -1,14 +1,17 @@
 # SkyServe System OOM Recovery
 
 _Status: rewritten #1182 implementation and canonical design are complete;
-the corrected route-lease/runtime design passed exact adversarial re-review;
-the stacked draft #1183 steady-state removal is authored and remains blocked
-on all seven removal gates; production activation is blocked_
+repository-wide unit integration corrections have passed local non-PostgreSQL
+verification and exact paid-capacity retry review, with required real-
+PostgreSQL CI pending; the corrected route-lease/runtime design passed exact
+adversarial re-review; the stacked draft #1183 steady-state removal is authored
+and remains blocked on all seven removal gates; production activation is
+blocked_
 
-_Last updated: 2026-08-02_
+_Last updated: 2026-08-03_
 
 _Design baseline: `origin/improvements` at
-`2a1ce0cd0ba2ab514cd727b7ea3ae2079e3571cd`_
+`02cc7ceb722b8ef15a0766b6bdf83416ad0603bd`_
 
 ## Context and decision
 
@@ -464,9 +467,10 @@ the writer carries that expected row identity. The transaction aborts the whole
 batch if any locked row is absent or has a different identity. A v12/rollback-
 shaped row deterministically derives its transition identity from its immutable
 replica ID, cluster name, and creation timestamp, and the first v13 rewrite
-persists it; a newly created row always receives a new random identity. Only the
-explicit initial-create and reserved-capacity claim/fill paths may insert, and
-those are insert-only rather than conflict-upserts. Consequently a stale
+persists it; a newly created row always receives a new random identity. Only
+the explicit initial-create, new paid-capacity claim, and reserved-capacity
+fill paths may insert, and those are insert-only rather than conflict-upserts.
+Consequently a stale
 callback or manager snapshot serialized after terminal row deletion cannot
 recreate the replica or overwrite a later same-ID row, even while the service
 owner incarnation is still valid. Replica-lifecycle single and batch deletes
@@ -479,6 +483,14 @@ refreshes and re-reduces instead of retrying individual statements. This
 protocol prevents database/manager lock inversion, lost request/job/reducer
 updates, post-delete resurrection, and stale same-key aliasing; the identity
 lives in versioned JSON/pickle and adds no table column or migration.
+
+An exact durable paid-capacity claim re-delivery is bookkeeping rather than a
+new admission. It may update the existing replica only after the immutable
+`replica_record_id` matches; that update preserves the stored recovery bundle
+and the claim's original `claimed_at`. A missing or replaced row rolls back
+every pool/claim mutation in the transaction and reports ownership loss. A live
+row without a valid claim remains on the insert-only admission path and
+conflicts instead of being adopted.
 
 The Ray job can already be live when job-ID persistence fails. That cannot
 retroactively disarm its bounded driver. The driver may complete one replay,
@@ -1185,6 +1197,9 @@ claim, request, provider journal, or absence inference.
   teardown deletes its row, no stale manager snapshot or callback can insert it
   again or match a later row that reuses the numeric ID; immutable record
   identity must also match.
+- Exact paid-capacity claim replay requires that same immutable record identity,
+  preserves the original claim-selection timestamp and recovery-owned fields,
+  and rolls back rather than adopting a live row with a missing or stale claim.
 - Authorization v3 maps explicitly to runtime profile/capability v2. No reducer
   compares those different version domains for equality.
 - `JobSystemRecoveryInfo` API v1 and supervisor marker/capability v2 remain
@@ -1565,8 +1580,10 @@ action evidence, because this feature creates none.
   prove write-first then delete leaves no row. Delete, recreate the same numeric
   replica ID with a new record identity, then prove every stale old-identity
   writer and replica-lifecycle deleter aborts without touching the new JSON or
-  pickle. Insert-only fresh/reserved writers fail rather than overwrite a
-  conflict. A stale ready/capable or
+  pickle. Exact paid-capacity claim replay preserves `claimed_at` only for the
+  same record identity; a new identity returns ownership loss without changing
+  the row, priority, or claim. Insert-only fresh/reserved writers fail rather
+  than overwrite a conflict. A stale ready/capable or
   request/job patch cannot land after terminal teardown, exhaustion,
   quarantine, or demotion. A revision conflict must refresh and rerun the pure
   reducer; terminal states remain absorbing. Exactly one existing cleanup
@@ -1694,12 +1711,21 @@ both PRs. Exact per-replica associations remain in current `ReplicaInfo`;
 bounded structured logs supply diagnostic correlation but are not lifecycle
 authority.
 
-### Local verification evidence (2026-08-02)
+### Local verification evidence (2026-08-03)
 
-- The complete 24-module changed-test sweep passes under Python 3.14. Nine
-  PostgreSQL persistence cases are collected but skipped because this host has
-  no Docker daemon; they remain a required CI/merge gate rather than inferred
-  evidence.
+- The expanded 33-module changed-test sweep collects 1,782 tests under Python
+  3.14. All 1,582 tests in the 29 non-PostgreSQL modules pass. The four real-
+  PostgreSQL modules collect 200 tests, including the exact paid-claim replay
+  identity regression, but cannot execute because this host has a Docker CLI
+  without a Docker socket; they remain a required CI/merge gate rather than
+  inferred evidence.
+- Repository-wide CI on the preceding tip exposed 36 integration failures in
+  legacy mocks/fixtures and the exact paid-claim retry. All 167 affected non-PG
+  tests now pass together. The mocks assert the update-only existence fence,
+  ordinary fixtures carry explicit recovery state and canonical record IDs,
+  fresh-launch tests exercise the insert-only worker seam, and exact-claim
+  re-delivery uses identity-fenced UPDATE semantics. The corrected full unit
+  lane and real-PostgreSQL result are pending the republished stack.
 - Focused architecture, route-lease, route-registry, controller, proxy,
   load-balancer, manager-transaction, backend, driver, AWS-admission, and
   authorization tests pass. They include the composite-worker ordering races,

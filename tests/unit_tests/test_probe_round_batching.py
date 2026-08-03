@@ -13,6 +13,7 @@ from unittest import mock
 
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import system_recovery_state
 
 
 def _replica_info(replica_id, probe_result):
@@ -26,6 +27,13 @@ def _replica_info(replica_id, probe_result):
     info.status_property.first_ready_time = 1.0
     info.first_consecutive_failure_time = None
     info.first_not_ready_time = None
+    # This fixture models an ordinary replica.  Recovery fields must be
+    # explicit: an implicit child Mock for quarantine is deliberately treated
+    # as fail-closed production state and schedules legacy teardown.
+    info.system_recovery_quarantine = None
+    info.system_recovery_disposition = (
+        system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+    info.system_recovery = None
     info.probe = mock.Mock(return_value=(info, probe_result, 2.0))
     info.probe_pool = mock.Mock(return_value=(info, probe_result, 2.0))
     return info
@@ -69,8 +77,14 @@ class TestProbeRoundBatching(unittest.TestCase):
              mock.patch.object(serve_state, 'set_service_uptime'):
             manager._probe_all_replicas()
 
-        info.probe.assert_called_once_with('/', None, 15, None,
-                                           'http://10.0.0.1:8080')
+        info.probe.assert_called_once_with('/',
+                                           None,
+                                           15,
+                                           None,
+                                           'http://10.0.0.1:8080',
+                                           request_started_callback=mock.ANY)
+        self.assertTrue(
+            callable(info.probe.call_args.kwargs['request_started_callback']))
 
     def test_probe_url_resolution_batches_cluster_state(self):
         manager = self._make_manager()
@@ -171,13 +185,18 @@ class TestProbeRoundBatching(unittest.TestCase):
         # failure threshold (0s) -> teardown this round.
         infos = [_replica_info(1, True), _replica_info(2, False)]
         calls = []
+
+        def _persist_batch(*_args, **_kwargs):
+            calls.append('batch')
+            return True
+
         with mock.patch.object(serve_state, 'get_replica_infos',
                                return_value=infos), \
              mock.patch.object(serve_state, 'get_specs',
                                return_value={1: mock.Mock()}), \
              mock.patch.object(
-                serve_state, 'add_or_update_replicas',
-                side_effect=lambda *a: calls.append('batch')) as mock_batch, \
+                 serve_state, 'add_or_update_replicas',
+                side_effect=_persist_batch) as mock_batch, \
              mock.patch.object(
                 serve_state, 'add_or_update_replica',
                 side_effect=AssertionError(
@@ -190,6 +209,8 @@ class TestProbeRoundBatching(unittest.TestCase):
             manager._probe_all_replicas()
 
         self.assertEqual(mock_batch.call_count, 1)
+        self.assertEqual(mock_batch.call_args.kwargs,
+                         {'expected_replica_exists': True})
         written = mock_batch.call_args.args[1]
         self.assertEqual(sorted(rid for rid, _ in written), [1, 2])
         self.assertEqual(calls, ['batch', 'teardown'])

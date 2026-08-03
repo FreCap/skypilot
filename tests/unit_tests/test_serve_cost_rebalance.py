@@ -15,6 +15,7 @@ from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import service_spec
 from sky.serve import spot_placer
+from sky.serve import system_recovery_state
 from sky.utils import common_utils
 
 
@@ -645,7 +646,7 @@ class TestPinnedReplacementLaunch:
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
         manager._replica_to_launch_cancelled = {}
-        manager._persist_replica = mock.Mock()
+        manager._persist_new_replica = mock.Mock()
         override = cheap.to_dict()
         override[constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY] = 7
 
@@ -656,14 +657,76 @@ class TestPinnedReplacementLaunch:
              mock.patch.object(replica_managers.spot_placer.Location,
                                'from_resources_override',
                                return_value=cheap), \
-             mock.patch.object(replica_managers.thread_utils, 'SafeThread'):
+             mock.patch.object(
+                 replica_managers,
+                 '_ReplicaLaunchThread') as launch_thread_cls:
             assert manager._launch_replica(8, override)
 
-        info = manager._persist_replica.call_args.args[1]
+        manager._persist_new_replica.assert_called_once_with(8, mock.ANY)
+        info = manager._persist_new_replica.call_args.args[1]
         assert info.cost_rebalance_for_replica_id == 7
         assert constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY not in info.resources_override
         assert info.resources_override['region'] == 'research'
         assert info.is_spot is False
+
+        launch_thread_cls.assert_called_once()
+        construction = launch_thread_cls.call_args
+        assert construction.args == ()
+        assert set(construction.kwargs) == {
+            'target',
+            'replica_id',
+            'completion_queue',
+            'completion_event',
+            'args',
+            'kwargs',
+        }
+        runtime = manager._legacy_mutation_runtime_state()
+        assert construction.kwargs['target'] is replica_managers.launch_cluster
+        assert construction.kwargs['replica_id'] == 8
+        assert (construction.kwargs['completion_queue']
+                is runtime.launch_completion_queue)
+        assert (construction.kwargs['completion_event']
+                is runtime.launch_completion_event)
+        assert construction.kwargs['args'] == (
+            8,
+            manager.yaml_content,
+            info.cluster_name,
+            mock.ANY,
+            runtime.replica_to_request_id,
+            runtime.replica_to_launch_cancelled,
+            info.resources_override,
+            False,
+        )
+        launch_kwargs = construction.kwargs['kwargs']
+        assert set(launch_kwargs) == {
+            'availability_max_retry',
+            'exact_resources_override',
+            'pre_launch_guard',
+            'cloud_launch_guard',
+            'continue_guard',
+            'launch_fence',
+            'service_spec',
+            'service_name',
+            'workspace',
+        }
+        assert launch_kwargs['availability_max_retry'] == 1
+        assert launch_kwargs['exact_resources_override'] is True
+        pre_launch_guard = launch_kwargs['pre_launch_guard']
+        assert pre_launch_guard.__self__ is manager
+        assert (pre_launch_guard.__func__
+                is type(manager)._service_is_launch_authorized)
+        assert launch_kwargs['cloud_launch_guard'] is None
+        continue_guard = launch_kwargs['continue_guard']
+        assert continue_guard.__self__ is manager
+        assert (continue_guard.__func__
+                is type(manager)._launch_owner_watchdog_allows_continue)
+        assert launch_kwargs['launch_fence'] is None
+        assert launch_kwargs['service_spec'] is None
+        assert launch_kwargs['service_name'] == 'svc'
+        assert isinstance(launch_kwargs['workspace'], str)
+        launch_thread = launch_thread_cls.return_value
+        assert manager._launch_thread_pool[8] is launch_thread
+        launch_thread.start.assert_not_called()
 
     def test_paid_replacement_acquires_exact_pool_claim(self):
         paid = make_location('paid',
@@ -830,6 +893,12 @@ def _pending_row(replica_id, replacement_for):
         status_property=status_property,
         resources_override={'region': 'research'},
         reserved_fill=False,
+        replica_record_id=(f'00000000-0000-4000-8000-{replica_id:012d}'),
+        system_recovery_quarantine=None,
+        system_recovery_disposition=(
+            system_recovery_state.SystemRecoveryDisposition.ORDINARY),
+        candidate_ready_observed_at=None,
+        system_recovery=None,
     )
     if replacement_for is not _ABSENT:
         row.cost_rebalance_for_replica_id = replacement_for
@@ -946,7 +1015,13 @@ class TestWaitForIdleRecovery:
             url='http://replica',
             is_spot=False,
             status=serve_state.ReplicaStatus.SHUTTING_DOWN,
-            status_property=status_property)
+            status_property=status_property,
+            replica_record_id='00000000-0000-4000-8000-000000000001',
+            system_recovery_quarantine=None,
+            system_recovery_disposition=(
+                system_recovery_state.SystemRecoveryDisposition.ORDINARY),
+            candidate_ready_observed_at=None,
+            system_recovery=None)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',

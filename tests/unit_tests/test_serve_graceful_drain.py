@@ -691,6 +691,14 @@ class TestRecoveryRedrive:
         location = mock.sentinel.location
         info.get_spot_location.return_value = location
         writes = []
+
+        def _record_recovered_preemption(_service_name, _replica_id, _info, *,
+                                         expected_replica_exists,
+                                         **_fence_kwargs):
+            assert expected_replica_exists is True
+            writes.append(sp.preempted)
+            return True
+
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]), \
@@ -700,7 +708,7 @@ class TestRecoveryRedrive:
              mock.patch.object(
                  replica_managers.serve_state,
                  'add_or_update_replica',
-                 side_effect=lambda *args: writes.append(sp.preempted)):
+                 side_effect=_record_recovered_preemption):
             rm._recover_replica_operations()
 
         assert writes == [True]
@@ -808,6 +816,7 @@ class TestTerminateReplicaDrainAssembly:
             rm._replica_to_request_id = {7: 'req-7'}
         info = mock.Mock()
         info.cluster_name = 'svc-7-abc'
+        info.replica_record_id = '00000000-0000-4000-8000-000000000007'
         info.status_property = replica_managers.ReplicaStatusProperty()
         info.status_property.drain_started_at = started_at
         if url_error is not None:
@@ -825,11 +834,14 @@ class TestTerminateReplicaDrainAssembly:
 
         writes = []
 
-        def _snapshot_write(_service_name, _replica_id, written_info):
+        def _snapshot_write(_service_name, _replica_id, written_info, *,
+                            expected_replica_exists, **_fence_kwargs):
+            assert expected_replica_exists is True
             writes.append((written_info.status_property.sky_launch_status,
                            written_info.status_property.sky_down_status,
                            written_info.status_property.drain_cap_seconds,
                            written_info.status_property.drain_started_at))
+            return True
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
