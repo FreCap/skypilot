@@ -1,5 +1,7 @@
 """Incarnation-fenced Skylet tunnel metadata state tests."""
+# pylint: disable=protected-access
 
+import inspect
 import pickle
 from unittest import mock
 import uuid
@@ -16,6 +18,38 @@ from sky.utils.db import db_utils
 class _Handle:
     launched_resources = None
     stable_internal_external_ips = [('1.2.3.4', '5.6.7.8')]
+
+
+def test_tunnel_facade_public_and_pickle_contract(monkeypatch):
+    snapshot_type = global_user_state.ClusterSkyletSSHTunnelSnapshotV1
+    assert snapshot_type.__module__ == 'sky.global_user_state'
+    snapshot = snapshot_type(
+        cluster_hash='cluster-hash',
+        metadata=(12345, 23456),
+        serialized_metadata=pickle.dumps((12345, 23456)),
+    )
+    restored = pickle.loads(pickle.dumps(snapshot))
+    assert type(restored) is snapshot_type
+    assert restored == snapshot
+
+    assert list(
+        inspect.signature(
+            global_user_state.get_cluster_skylet_ssh_tunnel_snapshot).parameters
+    ) == ['cluster_name']
+    cas_signature = inspect.signature(
+        global_user_state.compare_and_set_cluster_skylet_ssh_tunnel_metadata)
+    assert list(cas_signature.parameters) == [
+        'cluster_name', 'observed', 'replacement'
+    ]
+    assert cas_signature.return_annotation == (
+        'skylet_transport.TunnelMutationResult')
+
+    marker = object()
+    monkeypatch.setattr(global_user_state,
+                        'get_cluster_skylet_ssh_tunnel_snapshot',
+                        lambda _: snapshot_type('cluster-hash', marker, b'x'))
+    assert global_user_state.get_cluster_skylet_ssh_tunnel_metadata(
+        'cluster') is marker
 
 
 def _fresh_db(tmp_path, monkeypatch):

@@ -32,6 +32,7 @@ from sky import global_user_state_cluster_yaml
 from sky import global_user_state_notifications
 from sky import global_user_state_schema
 from sky import global_user_state_service_account_tokens
+from sky import global_user_state_skylet_tunnels
 from sky import global_user_state_storage
 from sky import global_user_state_system_config
 from sky import global_user_state_users
@@ -382,19 +383,10 @@ class ClusterRecordRemovalOutcome(enum.Enum):
     ALREADY_ABSENT = 'already_absent'
 
 
-SkyletSSHTunnelMetadata = tuple[int, int] | tuple[int, int, str]
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class ClusterSkyletSSHTunnelSnapshotV1:
-    """One same-row cluster incarnation and exact tunnel metadata read."""
-
-    cluster_hash: str | None
-    metadata: object | None
-    serialized_metadata: bytes | None
-
-
-_MALFORMED_SKYLET_SSH_TUNNEL_METADATA = object()
+SkyletSSHTunnelMetadata = (
+    global_user_state_skylet_tunnels.SkyletSSHTunnelMetadata)
+ClusterSkyletSSHTunnelSnapshotV1 = (
+    global_user_state_skylet_tunnels.ClusterSkyletSSHTunnelSnapshotV1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1941,34 +1933,9 @@ def set_cluster_storage_mounts_metadata(
 @metrics_lib.time_me
 def get_cluster_skylet_ssh_tunnel_snapshot(
         cluster_name: str) -> ClusterSkyletSSHTunnelSnapshotV1 | None:
-    """Returns the cluster hash and exact tunnel blob from one row read."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(
-            cluster_table.c.cluster_hash,
-            cluster_table.c.skylet_ssh_tunnel_metadata).filter_by(
-                name=cluster_name).first()
-    if row is None:
-        return None
-    serialized_metadata = row.skylet_ssh_tunnel_metadata
-    if serialized_metadata is not None:
-        serialized_metadata = bytes(serialized_metadata)
-        try:
-            metadata = pickle.loads(serialized_metadata)
-        except Exception:  # pylint: disable=broad-except
-            # Keep the exact bytes available for an explicitly fenced repair,
-            # but never let automatic tunnel recovery reinterpret corruption
-            # as missing metadata.
-            metadata = _MALFORMED_SKYLET_SSH_TUNNEL_METADATA
-        if metadata is None:
-            metadata = _MALFORMED_SKYLET_SSH_TUNNEL_METADATA
-    else:
-        metadata = None
-    return ClusterSkyletSSHTunnelSnapshotV1(
-        cluster_hash=row.cluster_hash,
-        metadata=metadata,
-        serialized_metadata=serialized_metadata,
-    )
+    return (
+        global_user_state_skylet_tunnels.get_cluster_skylet_ssh_tunnel_snapshot(
+            _db_manager.get_engine, orm.Session, cluster_table, cluster_name))
 
 
 @metrics_lib.time_me
@@ -1987,37 +1954,15 @@ def compare_and_set_cluster_skylet_ssh_tunnel_metadata(
     observed: ClusterSkyletSSHTunnelSnapshotV1,
     replacement: SkyletSSHTunnelMetadata | None,
 ) -> 'skylet_transport.TunnelMutationResult':
-    """Fenced compare-and-set for one exact tunnel metadata observation."""
-    if not isinstance(observed, ClusterSkyletSSHTunnelSnapshotV1):
-        raise TypeError('observed must be a tunnel metadata snapshot.')
-
-    if observed.cluster_hash is None:
-        return skylet_transport.TunnelMutationResult.UNFENCED_CLUSTER_INCARNATION
-
-    # A null-to-null row recreation has no incarnation fence and has already
-    # returned above, before obtaining an engine or SQL session.
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        predicate = (cluster_table.c.skylet_ssh_tunnel_metadata.is_(None)
-                     if observed.serialized_metadata is None else
-                     cluster_table.c.skylet_ssh_tunnel_metadata
-                     == observed.serialized_metadata)
-        replacement_blob = (pickle.dumps(replacement)
-                            if replacement is not None else None)
-        result = session.execute(
-            sqlalchemy.update(cluster_table).where(
-                cluster_table.c.name == cluster_name,
-                cluster_table.c.cluster_hash == observed.cluster_hash,
-                predicate,
-            ).values(skylet_ssh_tunnel_metadata=replacement_blob))
-        session.commit()
-    count = result.rowcount
-    if count == 1:
-        return skylet_transport.TunnelMutationResult.UPDATED
-    if count == 0:
-        return skylet_transport.TunnelMutationResult.CONFLICT
-    raise RuntimeError('Tunnel metadata compare-and-set affected an invalid '
-                       f'number of rows: {count}.')
+    return (global_user_state_skylet_tunnels.
+            compare_and_set_cluster_skylet_ssh_tunnel_metadata(
+                _db_manager.get_engine,
+                orm.Session,
+                cluster_table,
+                cluster_name,
+                observed=observed,
+                replacement=replacement,
+            ))
 
 
 @metrics_lib.time_me
