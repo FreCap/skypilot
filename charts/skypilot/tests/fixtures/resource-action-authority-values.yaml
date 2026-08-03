@@ -1,0 +1,52 @@
+fullnameOverride: release-name
+apiService:
+  replicas: 2
+  upgradeStrategy: RollingUpdate
+  highAvailability:
+    enabled: true
+  dbConnectionSecretName: external-db
+requestStore:
+  backend: postgres
+kubernetesCredentials:
+  useApiServerCluster: false
+serve:
+  externalLoadBalancer:
+    enabled: false
+storage:
+  enabled: true
+  accessMode: ReadWriteMany
+resourceActions:
+  authorityWorker:
+    enabled: true
+    installationId: 01234567-89ab-cdef-0123-456789abcdef
+    activeCohort: p2a-v1
+    auth:
+      existingSecret: authority-auth
+      key: tokens
+    tls:
+      existingSecret: authority-tls
+      certKey: tls.crt
+      privateKeyKey: tls.key
+      caKey: ca.crt
+    cohorts:
+    - id: p2a-v1
+      replicas: 2
+      image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
+      imagePullPolicy: Always
+      ociConfigDigest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+      qualificationArtifact:
+        repoPath: charts/skypilot/files/resource-action-qualifications/not-packaged.json
+        byteSize: 1
+        sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      podTemplateContract:
+        repoPath: sky/serve/resource_action_provider_preflight.py
+        byteSize: 1
+        sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      artifactInventory:
+        repoPath: sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json
+        byteSize: 1
+        sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+      callableInventory:
+        repoPath: sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json
+        byteSize: 1
+        sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd

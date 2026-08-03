@@ -24,6 +24,7 @@ def _clear_token_file_envs(monkeypatch):
                        raising=False)
     monkeypatch.delenv(constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR,
                        raising=False)
+    monkeypatch.delenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR, raising=False)
 
 
 def _run(dep, authorization):
@@ -129,6 +130,24 @@ def test_cross_domain_token_overlap_fails_both_routes_closed(
         with pytest.raises(fastapi.HTTPException) as excinfo:
             _run(dep, 'Bearer shared-old')
         assert excinfo.value.status_code == 503
+
+
+@pytest.mark.parametrize('other_domain', ['sync', 'admin'])
+def test_data_plane_overlap_with_control_ring_fails_closed(
+        monkeypatch, tmp_path, other_domain):
+    data_ring = tmp_path / 'data.tokens'
+    data_ring.write_text('data-new\nshared-old\n', encoding='utf-8')
+    other_ring = tmp_path / f'{other_domain}.tokens'
+    other_ring.write_text(f'{other_domain}-new\nshared-old\n', encoding='utf-8')
+    monkeypatch.setenv(constants.LB_AUTH_TOKENS_FILE_ENV_VAR, str(data_ring))
+    other_env = (constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR
+                 if other_domain == 'sync' else
+                 constants.CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR)
+    monkeypatch.setenv(other_env, str(other_ring))
+
+    with pytest.raises(serve_utils.AuthTokenConfigurationError,
+                       match='pairwise disjoint'):
+        serve_utils.get_lb_auth_tokens(required=True)
 
 
 def test_unsafe_live_rotation_fails_closed_until_rings_are_disjoint(

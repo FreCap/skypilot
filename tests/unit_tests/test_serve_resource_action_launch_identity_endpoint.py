@@ -7,6 +7,7 @@ from unittest import mock
 import fastapi
 from fastapi import testclient
 import pytest
+import serve_resource_action_test_fixtures as authority_fixtures
 import sqlalchemy
 
 from sky import models
@@ -43,7 +44,7 @@ def _typed_request(
         version=1,
         decision_id=identity.action_identity(
             kernel_actions.ActionKind.LAUNCH).action_id,
-        cohort_id='authority-v1',
+        cohort_id=authority_fixtures.COHORT_ID,
         action_type=kernel_actions.ActionKind.LAUNCH,
         controller_owner_fence='123:10.0.0.1',
         lifecycle_epoch=4,

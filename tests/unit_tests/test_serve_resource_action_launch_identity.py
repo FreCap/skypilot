@@ -5,6 +5,7 @@ import hashlib
 import uuid
 
 import pytest
+import serve_resource_action_test_fixtures as authority_fixtures
 
 from sky.serve import resource_actions as actions
 from sky.server.requests import resource_actions as kernel_actions
@@ -52,7 +53,7 @@ def _context() -> dict[str, object]:
     return {
         'version': 1,
         'decision_id': str(decision_id),
-        'cohort_id': 'authority-v1',
+        'cohort_id': authority_fixtures.COHORT_ID,
         'action_type': 'launch',
         'controller_owner_fence': '123:10.0.0.1',
         'lifecycle_epoch': 4,
@@ -120,14 +121,14 @@ def test_launch_identity_contracts_round_trip_exactly(contract_type,
 @pytest.mark.parametrize('contract_type,value,byte_size,sha256', [
     (actions.ProviderLaunchIdentityCanonicalizationInputV1, _input, 408,
      'd25567c62210d31dc19f99ba67926d5472ff39a5dba85c0a51682b666908f8f3'),
-    (actions.ProviderLaunchIdentityCanonicalizationContextV1, _context, 839,
-     '46b13cd4902dbc1ab12eef9ef45c24c8dc513670d5e49ace87b1283735716e3f'),
-    (actions.ProviderLaunchIdentityCanonicalizationRequestV1, _request, 1039,
-     '563b9a130250aed948a95b0b1a7216d4c2f07c9359bde703954e48eecd1205ab'),
-    (actions.ProviderLaunchIdentityCanonicalizationProofV1, _proof, 1076,
-     'e830ebd6dca18f36d65192e6b8e664ce3a7fc13b0595fdeb679ad8713b057009'),
-    (actions.ProviderLaunchIdentityCanonicalizationResponseV1, _response, 1317,
-     '25ce46946386796cc6ce8a03cc59ed3633b051e40d6cff6b527bf13d3d99481b'),
+    (actions.ProviderLaunchIdentityCanonicalizationContextV1, _context, 938,
+     '46737a3ae039bfdb069d06d6d76ae0f17576382ec1e8c699ecc032061c0b8a34'),
+    (actions.ProviderLaunchIdentityCanonicalizationRequestV1, _request, 1138,
+     'd13c4e8d88cd4c32187d6859f267c5321ddf6f68bb1cfdad2ee7ef75259b5ecd'),
+    (actions.ProviderLaunchIdentityCanonicalizationProofV1, _proof, 1175,
+     '212c1a55e590d9e7887a76206dbf1b32511eabb63be421372af9fec350c49b28'),
+    (actions.ProviderLaunchIdentityCanonicalizationResponseV1, _response, 1416,
+     '0edd61893f40e526c7a73fd0328e29018cb20838dc79051c77b5520d77ecc73c'),
 ])
 def test_launch_identity_contracts_have_fixed_canonical_fixtures(
         contract_type, value, byte_size: int, sha256: str) -> None:

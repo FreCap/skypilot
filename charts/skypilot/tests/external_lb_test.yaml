@@ -75,6 +75,32 @@ tests:
       - failedTemplate:
           errorMessage: "serve.externalLoadBalancer.auth.lbSync and serve.externalLoadBalancer.auth.controllerAdmin must reference different Secret keys"
 
+  - it: should reject the same Secret key for LB sync and data plane
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: admin-auth
+      serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
+      serve.externalLoadBalancer.auth.lbDataPlane.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.lbDataPlane.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.lbSync and serve.externalLoadBalancer.auth.lbDataPlane must reference different Secret keys"
+
+  - it: should reject the same Secret key for controller admin and data plane
+    set:
+      serve.externalLoadBalancer.enabled: true
+      serve.externalLoadBalancer.auth.lbSync.existingSecret: sync-auth
+      serve.externalLoadBalancer.auth.lbSync.key: tokens
+      serve.externalLoadBalancer.auth.controllerAdmin.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.controllerAdmin.key: tokens
+      serve.externalLoadBalancer.auth.lbDataPlane.existingSecret: shared-auth
+      serve.externalLoadBalancer.auth.lbDataPlane.key: tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: "serve.externalLoadBalancer.auth.controllerAdmin and serve.externalLoadBalancer.auth.lbDataPlane must reference different Secret keys"
+
   - it: should allow different keys in one Secret for runtime content checks
     set:
       serve.externalLoadBalancer.enabled: true

@@ -9,8 +9,10 @@ import shutil
 import uuid
 
 import pytest
+import serve_resource_action_test_fixtures as authority_fixtures
 import sqlalchemy
 from sqlalchemy import orm
+import test_serve_resource_action_state_pg as shadow_state_fixtures
 
 from sky.serve import resource_action_state
 from sky.serve import resource_action_state_schema
@@ -93,16 +95,35 @@ def serve033_store(postgres_engine):
     serve_state_schema.Base.metadata.create_all(postgres_engine)
     resource_action_state_schema.RESOURCE_ACTION_STATE_METADATA.create_all(
         postgres_engine)
-    request_postgres.REQUESTS.create(postgres_engine, checkfirst=True)
-    return (postgres_engine,
-            resource_action_state.PostgresServeResourceActionStateStore(
-                postgres_engine))
+    resource_action_state_schema.RESOURCE_ACTION_AUTHORITY_RELEASE_METADATA.create_all(
+        postgres_engine)
+    request_postgres._METADATA.create_all(  # pylint: disable=protected-access
+        postgres_engine)
+    store = resource_action_state.PostgresServeResourceActionStateStore(
+        postgres_engine)
+    store.preflight_authority_release(
+        authority_fixtures.NAMESPACE, authority_fixtures.HELM_FULL_NAME,
+        authority_fixtures.HELM_FULL_NAME, authority_fixtures.INSTALLATION_ID,
+        True, (actions.ProviderAuthorityWorkerCohortManifestV1.from_value(
+            authority_fixtures.authority_manifest_value()),), ())
+    return postgres_engine, store
 
 
 def _database_now(engine: sqlalchemy.engine.Engine) -> datetime.datetime:
     with engine.connect() as connection:
         return connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+
+
+def _preflight_cohort_tombstone(
+    store: resource_action_state.PostgresServeResourceActionStateStore,
+) -> resource_action_state.AuthorityReleaseRecord:
+    record = store.preflight_authority_release(
+        authority_fixtures.NAMESPACE, authority_fixtures.HELM_FULL_NAME,
+        authority_fixtures.HELM_FULL_NAME, authority_fixtures.INSTALLATION_ID,
+        True, (), (authority_fixtures.COHORT_SUFFIX,))
+    assert record is not None
+    return record
 
 
 def _add_shadow_service(
@@ -136,104 +157,16 @@ def _timestamp(value: datetime.datetime) -> str:
     return value.astimezone(_UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
 
-def _artifact(path: str, digest_character: str) -> dict[str, object]:
-    return {
-        'repo_path': path,
-        'byte_size': 17,
-        'sha256': digest_character * 64,
-    }
-
-
-def _qualification() -> dict[str, object]:
-    return {
-        'requested_reference':
-            ('registry.example/authority@sha256:' + '1' * 64),
-        'oci_manifest_digest': 'sha256:' + '1' * 64,
-        'oci_config_digest': 'sha256:' + '2' * 64,
-        'qualification_artifact': _artifact('images/authority.json', '3'),
-    }
-
-
 def _cohort_value() -> dict[str, object]:
-    manifest = {
-        'version': 1,
-        'cohort_id': 'authority-v1',
-        'namespace': 'skypilot-system',
-        'deployment_name': 'skypilot-authority-v1',
-        'service_account_name': 'skypilot-authority-v1',
-        'container_name': 'skypilot-authority-worker',
-        'image': _qualification(),
-        'pod_template_contract': _artifact('charts/worker.yaml', '4'),
-        'artifact_inventory': _artifact('inventories/artifacts.json', '5'),
-        'callable_inventory': _artifact('inventories/callables.json', '6'),
-        'claim_contract': 'frozen_action_cohort_join_v1',
-        'handler_allowlist': list(
-            actions.PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1),
-    }
-    return {
-        'version': 1,
-        'manifest': manifest,
-        'manifest_sha256': actions.canonical_sha256(manifest),
-        'deployment_uid': 'deployment-uid-v1',
-        'service_account_uid': 'service-account-uid-v1',
-    }
+    return authority_fixtures.authority_cohort_value()
 
 
 def _worker_value(cohort: dict[str, object], pod_uid: str,
                   observed_at: str) -> dict[str, object]:
-    manifest = cohort['manifest']
-    assert isinstance(manifest, dict)
-    qualification = _qualification()
-    qualification_artifact = qualification['qualification_artifact']
-    assert isinstance(qualification_artifact, dict)
-    runtime = {
-        'raw_image_id': 'containerd://sha256:' + '2' * 64,
-        'runtime_image_id_scheme': 'containerd',
-        'runtime_image_id_digest': 'sha256:' + '2' * 64,
-        'qualified_oci_manifest_digest': 'sha256:' + '1' * 64,
-        'qualified_oci_config_digest': 'sha256:' + '2' * 64,
-        'qualification_artifact_sha256': qualification_artifact['sha256'],
-        'runtime_id_contract': 'qualified_oci_config_digest_v1',
-    }
-    return {
-        'namespace': manifest['namespace'],
-        'pod_name': f'worker-{pod_uid}',
-        'pod_uid': pod_uid,
-        'pod_resource_version': '101',
-        'pod_service_account_name': manifest['service_account_name'],
-        'pod_controller_owner': {
-            'api_version': 'apps/v1',
-            'kind': 'ReplicaSet',
-            'name': 'skypilot-authority-v1-abc',
-            'uid': 'replicaset-uid-v1',
-        },
-        'replica_set_name': 'skypilot-authority-v1-abc',
-        'replica_set_uid': 'replicaset-uid-v1',
-        'replica_set_resource_version': '102',
-        'replica_set_controller_owner': {
-            'api_version': 'apps/v1',
-            'kind': 'Deployment',
-            'name': manifest['deployment_name'],
-            'uid': cohort['deployment_uid'],
-        },
-        'deployment_name': manifest['deployment_name'],
-        'deployment_uid': cohort['deployment_uid'],
-        'deployment_resource_version': '103',
-        'deployment_generation': 5,
-        'deployment_observed_generation': 5,
-        'pod_template_contract_sha256': manifest['pod_template_contract']
-                                        ['sha256'],
-        'image': {
-            'qualification': qualification,
-            'runtime': runtime,
-        },
-        'service_account_uid': cohort['service_account_uid'],
-        'artifact_inventory_sha256': manifest['artifact_inventory']['sha256'],
-        'callable_inventory_sha256': manifest['callable_inventory']['sha256'],
-        'handler_allowlist_sha256': actions.canonical_sha256(
-            manifest['handler_allowlist']),
-        'observed_at': observed_at,
-    }
+    assert cohort == authority_fixtures.authority_cohort_value()
+    worker = authority_fixtures.authority_worker_value(pod_uid)
+    worker['observed_at'] = observed_at
+    return worker
 
 
 def _registration_set(
@@ -249,8 +182,11 @@ def _registration_set(
             'pod_ready': True,
             'deployment_spec_replicas': 2,
             'deployment_status_observed_generation': 5,
+            'deployment_status_replicas': 2,
+            'deployment_updated_replicas': 2,
             'deployment_ready_replicas': 2,
             'deployment_available_replicas': 2,
+            'deployment_unavailable_replicas': 0,
             'registered_at': timestamp,
         })
     return actions.WorkerCohortRegistrationSetV1.from_value({
@@ -319,7 +255,7 @@ def _reference(
     return actions.WorkerCohortReferenceInputV1(
         version=1,
         decision_id=identity.decision_id,
-        cohort_id='authority-v1',
+        cohort_id=authority_fixtures.COHORT_ID,
         service_hash=identity.service_hash,
         replica_incarnation=identity.replica_incarnation,
         desired_generation=identity.desired_generation,
@@ -357,7 +293,7 @@ def _launch_identity_request(
     context = actions.ProviderLaunchIdentityCanonicalizationContextV1(
         version=1,
         decision_id=identity.decision_id,
-        cohort_id='authority-v1',
+        cohort_id=authority_fixtures.COHORT_ID,
         action_type=kernel_actions.ActionKind.LAUNCH,
         controller_owner_fence=owner_fence,
         lifecycle_epoch=lifecycle_epoch,
@@ -382,18 +318,22 @@ def _insert_request(
     finished_at: datetime.datetime | None = None,
     resource_action_id: uuid.UUID | None = None,
     resource_action_attempt: int | None = None,
+    handler_name: str = 'test-handler',
+    payload_json: dict[str, object] | None = None,
 ) -> None:
+    if payload_json is None:
+        payload_json = {}
     now = _database_now(engine)
     with engine.begin() as connection:
         connection.execute(request_postgres.REQUESTS.insert().values(
             request_id=request_id,
             name=name,
-            handler_name='test-handler',
+            handler_name=handler_name,
             payload_type='test-payload',
             payload_format='json',
             payload_version=1,
             producer_version='test',
-            payload_json={},
+            payload_json=payload_json,
             execution_class='short',
             status=status,
             created_at=now,
@@ -407,6 +347,68 @@ def _insert_request(
             resource_action_id=resource_action_id,
             resource_action_attempt=resource_action_attempt,
             updated_at=now))
+
+
+def _insert_resource_action_cohort_carrier(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    deployment_uid: str = 'cross-identity-deployment',
+) -> uuid.UUID:
+    """Insert a terminal same-key carrier without using Serve admission."""
+    cohort_value = authority_fixtures.authority_cohort_value()
+    cohort_value['deployment_uid'] = deployment_uid
+    immutable_spec = {
+        'invocation': {
+            'launch': {
+                'execution_config': {
+                    'capsule': {
+                        'executor_cohort': cohort_value,
+                    },
+                },
+            },
+        },
+    }
+    action_id = uuid.uuid4()
+    now = _database_now(engine)
+    with engine.begin() as connection:
+        connection.execute(request_postgres.RESOURCE_ACTIONS.insert().values(
+            action_id=action_id,
+            domain='serve',
+            resource_type='replica',
+            resource_identity='test-resource-identity',
+            desired_generation=1,
+            action_type='launch',
+            immutable_spec=immutable_spec,
+            immutable_spec_sha256=kernel_actions.canonical_sha256(
+                immutable_spec),
+            kernel_state=kernel_actions.KernelState.TERMINAL.value,
+            current_attempt=1,
+            terminal_disposition='test-terminal',
+            revision=1,
+            created_at=now,
+            updated_at=now,
+            terminal_at=now))
+    return action_id
+
+
+def _replace_cohort_id_locations(value: object, *, target: str,
+                                 replacement: str) -> object:
+    """Replace every exact cohort-ID leaf in one JSON-compatible value."""
+    if isinstance(value, dict):
+        return {
+            key: (replacement if key == 'cohort_id' and child == target else
+                  _replace_cohort_id_locations(
+                      child, target=target, replacement=replacement)
+                 ) for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _replace_cohort_id_locations(child,
+                                         target=target,
+                                         replacement=replacement)
+            for child in value
+        ]
+    return value
 
 
 def _insert_attempt_after_test_fences(
@@ -425,12 +427,15 @@ def _insert_attempt_after_test_fences(
 
 
 def _accept_cohort(engine, store):
-    cohort, registrations = _cohort_and_registrations(engine, 'pod-a', 'pod-b')
-    registered = store.register_worker_cohort(cohort, registrations)
-    accepted = store.transition_worker_cohort(
-        cohort.cohort_id, registered.record.revision,
-        actions.WorkerCohortLifecycleState.REGISTERING,
-        actions.WorkerCohortLifecycleState.ACCEPTING)
+    cohort, first = _cohort_and_registrations(engine, 'pod-a')
+    _, peer = _cohort_and_registrations(engine, 'pod-b')
+    registered = store.register_worker_cohort(cohort, first)
+    appended = store.append_worker_cohort_registration(
+        cohort, registered.record.revision,
+        registered.record.registration_attestations, peer.registrations[0])
+    accepted = store.promote_worker_cohort(
+        cohort.cohort_id, appended.record.revision,
+        appended.record.registration_attestations)
     return cohort, accepted
 
 
@@ -439,7 +444,7 @@ def _admit_linked_unsupported(
     store: resource_action_state.PostgresServeResourceActionStateStore,
     identity: actions.CoverageDecisionIdentityV1,
 ) -> None:
-    if store.get_worker_cohort('authority-v1') is None:
+    if store.get_worker_cohort(authority_fixtures.COHORT_ID) is None:
         _accept_cohort(engine, store)
     reference = _reference(identity, owner_fence='123:10.0.0.1')
     store.prepare_worker_cohort_reference(reference)
@@ -518,22 +523,22 @@ def test_store_and_activation_contract_fail_closed_on_old_dialects() -> None:
             sqlalchemy.create_engine('sqlite://'))
 
     legacy_shadow = _activation_evidence(api_revision='005',
-                                         serve_revision='033')
+                                         serve_revision='034')
     assert legacy_shadow.shadow_ready
     assert not legacy_shadow.private_handler_dispatch_ready
     private_dispatch = _activation_evidence(api_revision='007',
-                                            serve_revision='033',
+                                            serve_revision='034',
                                             authority_ready=True)
     assert private_dispatch.private_handler_dispatch_ready
     assert private_dispatch.authority_ready
-    with pytest.raises(ValueError, match='Serve schema revision 033'):
-        _activation_evidence(api_revision='007', serve_revision='032')
+    with pytest.raises(ValueError, match='Serve schema revision 034'):
+        _activation_evidence(api_revision='007', serve_revision='033')
 
 
 def test_api006_cannot_authorize_m4() -> None:
     with pytest.raises(ValueError, match='API schema revision 005 or 007'):
         _activation_evidence(api_revision='006',
-                             serve_revision='033',
+                             serve_revision='034',
                              authority_ready=True)
 
 
@@ -549,35 +554,48 @@ def test_worker_cohort_exact_adoption_freshness_and_legal_lifecycle(
                                         'pod-b',
                                         evidence_time=evidence_now)
 
+    class CohortSubclass(actions.WorkerCohortIdentityV1):
+        pass
+
+    class RegistrationSetSubclass(actions.WorkerCohortRegistrationSetV1):
+        pass
+
+    cohort_subclass = CohortSubclass(
+        **{
+            field.name: getattr(cohort, field.name)
+            for field in dataclasses.fields(cohort)
+        })
+    registrations_subclass = RegistrationSetSubclass(
+        **{
+            field.name: getattr(first, field.name)
+            for field in dataclasses.fields(first)
+        })
+    with pytest.raises(TypeError, match='cohort_identity'):
+        store.register_worker_cohort(cohort_subclass, first)
+    with pytest.raises(TypeError, match='registration_attestations'):
+        store.register_worker_cohort(cohort, registrations_subclass)
+
     registered = store.register_worker_cohort(cohort, first)
     assert not registered.adopted
     assert store.register_worker_cohort(cohort, first).adopted
-    with pytest.raises(ValueError, match='must append'):
+    with pytest.raises(ValueError, match='exactly one'):
+        store.register_worker_cohort(cohort, both)
+    with pytest.raises(ValueError, match='reviewed evidence path'):
         store.transition_worker_cohort(
             cohort.cohort_id, 1, actions.WorkerCohortLifecycleState.REGISTERING,
             actions.WorkerCohortLifecycleState.REGISTERING)
 
-    appended = store.transition_worker_cohort(
-        cohort.cohort_id,
-        1,
-        actions.WorkerCohortLifecycleState.REGISTERING,
-        actions.WorkerCohortLifecycleState.REGISTERING,
-        registration_attestations=both)
+    appended = store.append_worker_cohort_registration(cohort, 1, first,
+                                                       both.registrations[1])
     assert appended.record.revision == 2
-    assert store.transition_worker_cohort(
-        cohort.cohort_id,
-        1,
-        actions.WorkerCohortLifecycleState.REGISTERING,
-        actions.WorkerCohortLifecycleState.REGISTERING,
-        registration_attestations=both).adopted
+    assert appended.record.registration_attestations.canonical_bytes == (
+        both.canonical_bytes)
+    assert store.append_worker_cohort_registration(
+        cohort, 1, first, both.registrations[1]).adopted
 
-    accepted = store.transition_worker_cohort(
-        cohort.cohort_id, 2, actions.WorkerCohortLifecycleState.REGISTERING,
-        actions.WorkerCohortLifecycleState.ACCEPTING)
+    accepted = store.promote_worker_cohort(cohort.cohort_id, 2, both)
     assert accepted.record.revision == 3
-    assert store.transition_worker_cohort(
-        cohort.cohort_id, 2, actions.WorkerCohortLifecycleState.REGISTERING,
-        actions.WorkerCohortLifecycleState.ACCEPTING).adopted
+    assert store.promote_worker_cohort(cohort.cohort_id, 2, both).adopted
     with pytest.raises(ValueError, match='reviewed evidence path'):
         store.transition_worker_cohort(
             cohort.cohort_id, 2,
@@ -632,6 +650,338 @@ def test_worker_cohort_exact_adoption_freshness_and_legal_lifecycle(
     with pytest.raises(kernel_actions.InvariantViolation,
                        match='Invalid Serve worker cohort row'):
         store.get_worker_cohort(cohort.cohort_id)
+
+
+def _renewed_registration(
+    registration: actions.ProviderAuthorityWorkerRegistrationV1,
+    evidence_time: datetime.datetime,
+    *,
+    pod_resource_version: str,
+    replica_set_resource_version: str,
+) -> actions.ProviderAuthorityWorkerRegistrationV1:
+    timestamp = _timestamp(evidence_time)
+    worker = dataclasses.replace(
+        registration.worker,
+        pod_resource_version=pod_resource_version,
+        replica_set_resource_version=replica_set_resource_version,
+        observed_at=timestamp)
+    return dataclasses.replace(registration,
+                               worker=worker,
+                               registered_at=timestamp)
+
+
+def test_worker_cohort_renewal_changes_only_own_entry_and_adopts_exactly(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    cohort, accepted = _accept_cohort(engine, store)
+    predecessor = accepted.record.registration_attestations
+    peer_before = predecessor.registrations[1].canonical_bytes
+    own = _renewed_registration(predecessor.registrations[0],
+                                _database_now(engine),
+                                pod_resource_version='201',
+                                replica_set_resource_version='202')
+
+    renewed = store.renew_worker_cohort_registration(
+        cohort.cohort_id, accepted.record.revision,
+        actions.WorkerCohortLifecycleState.ACCEPTING, predecessor, own)
+    assert renewed.record.revision == accepted.record.revision + 1
+    assert renewed.record.registration_attestations.registrations[
+        1].canonical_bytes == peer_before
+    assert store.renew_worker_cohort_registration(
+        cohort.cohort_id, accepted.record.revision,
+        actions.WorkerCohortLifecycleState.ACCEPTING, predecessor, own).adopted
+
+    frozen_drift = dataclasses.replace(
+        renewed.record.registration_attestations.registrations[0].worker,
+        deployment_resource_version='changed')
+    invalid = dataclasses.replace(
+        renewed.record.registration_attestations.registrations[0],
+        worker=frozen_drift,
+        registered_at=_timestamp(_database_now(engine)))
+    with pytest.raises(kernel_actions.ActionConflict, match='frozen evidence'):
+        store.renew_worker_cohort_registration(
+            cohort.cohort_id, renewed.record.revision,
+            actions.WorkerCohortLifecycleState.ACCEPTING,
+            renewed.record.registration_attestations, invalid)
+
+    draining = store.transition_worker_cohort(
+        cohort.cohort_id, renewed.record.revision,
+        actions.WorkerCohortLifecycleState.ACCEPTING,
+        actions.WorkerCohortLifecycleState.DRAINING)
+    draining_predecessor = draining.record.registration_attestations
+    own_b = _renewed_registration(draining_predecessor.registrations[1],
+                                  _database_now(engine),
+                                  pod_resource_version='301',
+                                  replica_set_resource_version='302')
+    draining_renewed = store.renew_worker_cohort_registration(
+        cohort.cohort_id, draining.record.revision,
+        actions.WorkerCohortLifecycleState.DRAINING, draining_predecessor,
+        own_b)
+    assert draining_renewed.record.lifecycle_state is (
+        actions.WorkerCohortLifecycleState.DRAINING)
+    assert draining_renewed.record.registration_attestations.registrations[
+        0].canonical_bytes == draining_predecessor.registrations[
+            0].canonical_bytes
+
+    _, outsider = _cohort_and_registrations(engine, 'pod-c')
+    with pytest.raises(kernel_actions.ActionConflict,
+                       match='outside the accepted pair'):
+        store.renew_worker_cohort_registration(
+            cohort.cohort_id, draining_renewed.record.revision,
+            actions.WorkerCohortLifecycleState.DRAINING,
+            draining_renewed.record.registration_attestations,
+            outsider.registrations[0])
+
+
+def _force_worker_cohort_registrations(
+    engine: sqlalchemy.engine.Engine,
+    cohort: actions.WorkerCohortIdentityV1,
+    registrations: actions.WorkerCohortRegistrationSetV1,
+) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                resource_action_state_schema.WORKER_COHORTS).where(
+                    resource_action_state_schema.WORKER_COHORTS.c.cohort_id ==
+                    cohort.cohort_id).values(
+                        registration_attestations=(
+                            registrations.canonical_value()),
+                        registration_attestations_sha256=registrations.sha256))
+
+
+def test_stale_registering_abort_and_exact_not_found_retirement(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    cohort, fresh = _cohort_and_registrations(engine, 'pod-a')
+    inserted = store.register_worker_cohort(cohort, fresh)
+    _, stale = _cohort_and_registrations(engine,
+                                         'pod-a',
+                                         evidence_time=_database_now(engine) -
+                                         datetime.timedelta(minutes=6))
+    _force_worker_cohort_registrations(engine, cohort, stale)
+
+    authorized = store.authorize_stale_worker_cohort_removal(
+        cohort, inserted.record.revision, stale)
+    assert authorized.record.lifecycle_state is (
+        actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED)
+    assert store.authorize_stale_worker_cohort_removal(cohort,
+                                                       inserted.record.revision,
+                                                       stale).adopted
+    _preflight_cohort_tombstone(store)
+    with pytest.raises(kernel_actions.ActionConflict, match='NotFound'):
+        store.retire_worker_cohort(cohort,
+                                   authorized.record.revision,
+                                   stale,
+                                   deployment_not_found=True,
+                                   service_account_not_found=False)
+    retired = store.retire_worker_cohort(cohort,
+                                         authorized.record.revision,
+                                         stale,
+                                         deployment_not_found=True,
+                                         service_account_not_found=True)
+    assert retired.record.lifecycle_state is (
+        actions.WorkerCohortLifecycleState.RETIRED)
+    assert retired.record.retired_at is not None
+    assert store.retire_worker_cohort(cohort,
+                                      authorized.record.revision,
+                                      stale,
+                                      deployment_not_found=True,
+                                      service_account_not_found=True).adopted
+
+
+def test_stale_registering_abort_is_blocked_by_any_cohort_reference(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    cohort, fresh = _cohort_and_registrations(engine, 'pod-a')
+    inserted = store.register_worker_cohort(cohort, fresh)
+    _, stale = _cohort_and_registrations(engine,
+                                         'pod-a',
+                                         evidence_time=_database_now(engine) -
+                                         datetime.timedelta(minutes=6))
+    _force_worker_cohort_registrations(engine, cohort, stale)
+    now = _database_now(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                resource_action_state_schema.WORKER_COHORT_REFS).values(
+                    decision_id=uuid.uuid4(),
+                    cohort_id=cohort.cohort_id,
+                    service_hash=str(_SERVICE_UUID),
+                    replica_incarnation=_REPLICA_UUID,
+                    desired_generation=1,
+                    action_type='launch',
+                    controller_owner_fence='owner',
+                    lifecycle_epoch=1,
+                    preparation_capability_sha256='a' * 64,
+                    reference_state='RELEASED',
+                    revision=3,
+                    created_at=now,
+                    bound_at=now,
+                    released_at=now))
+    with pytest.raises(kernel_actions.ActionConflict,
+                       match='cohort references'):
+        store.authorize_stale_worker_cohort_removal(cohort,
+                                                    inserted.record.revision,
+                                                    stale)
+
+
+def test_stale_abort_blocks_cross_identity_and_unknown_handler_carriers(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    cohort, fresh = _cohort_and_registrations(engine, 'pod-a')
+    inserted = store.register_worker_cohort(cohort, fresh)
+    _, stale = _cohort_and_registrations(engine,
+                                         'pod-a',
+                                         evidence_time=_database_now(engine) -
+                                         datetime.timedelta(minutes=6))
+    _force_worker_cohort_registrations(engine, cohort, stale)
+
+    action_id = _insert_resource_action_cohort_carrier(engine)
+    with pytest.raises(kernel_actions.ActionConflict, match='resource actions'):
+        store.authorize_stale_worker_cohort_removal(cohort,
+                                                    inserted.record.revision,
+                                                    stale)
+    with engine.begin() as connection:
+        connection.execute(request_postgres.RESOURCE_ACTIONS.delete().where(
+            request_postgres.RESOURCE_ACTIONS.c.action_id == action_id))
+
+    _insert_request(engine,
+                    'unknown-authority-carrier',
+                    name='unknown-authority-carrier',
+                    status='SUCCEEDED',
+                    finished_at=_database_now(engine),
+                    handler_name='unknown-private-handler',
+                    payload_json={
+                        '_skypilot_resource_action_authority_v1': {
+                            'cohort_id': cohort.cohort_id,
+                        },
+                    })
+    with pytest.raises(kernel_actions.ActionConflict, match='private requests'):
+        store.authorize_stale_worker_cohort_removal(cohort,
+                                                    inserted.record.revision,
+                                                    stale)
+
+    with engine.begin() as connection:
+        connection.execute(request_postgres.REQUESTS.delete().where(
+            request_postgres.REQUESTS.c.request_id ==
+            'unknown-authority-carrier'))
+    other_cohort_id = cohort.cohort_id.replace(
+        authority_fixtures.INSTALLATION_ID,
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+    _insert_request(engine,
+                    'split-authority-carrier',
+                    name='unknown-authority-carrier',
+                    status='SUCCEEDED',
+                    finished_at=_database_now(engine),
+                    handler_name='unknown-private-handler',
+                    payload_json={
+                        '_skypilot_resource_action_authority_v1': {
+                            'cohort_id': other_cohort_id,
+                            'executor_cohort': {
+                                'manifest': {
+                                    'cohort_id': cohort.cohort_id,
+                                },
+                            },
+                        },
+                    })
+    with pytest.raises(kernel_actions.ActionConflict, match='private requests'):
+        store.authorize_stale_worker_cohort_removal(cohort,
+                                                    inserted.record.revision,
+                                                    stale)
+
+
+def test_stale_abort_blocks_shadow_child_parent_identity_disagreement(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    cohort, fresh = _cohort_and_registrations(engine, 'pod-a')
+    inserted = store.register_worker_cohort(cohort, fresh)
+    _, stale = _cohort_and_registrations(engine,
+                                         'pod-a',
+                                         evidence_time=_database_now(engine) -
+                                         datetime.timedelta(minutes=6))
+    _force_worker_cohort_registrations(engine, cohort, stale)
+    _add_shadow_service(engine)
+
+    sample, invocation = shadow_state_fixtures._sample()  # pylint: disable=protected-access
+    admitted = store.admit(sample, (123, '10.0.0.1'), 4)
+    store.prepare_attempt(sample.action_id, admitted.revision, 1, 1,
+                          actions.ShadowRequestRole.PRIMARY_LAUNCH,
+                          actions.PlannedExecutionKind.API_REQUEST, invocation)
+    other_cohort_id = cohort.cohort_id.replace(
+        authority_fixtures.INSTALLATION_ID,
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
+    crossed_parent = _replace_cohort_id_locations(
+        sample.immutable_spec.canonical_value(),
+        target=cohort.cohort_id,
+        replacement=other_cohort_id)
+    assert isinstance(crossed_parent, dict)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                resource_action_state_schema.STAGED_SHADOW_SAMPLES).where(
+                    resource_action_state_schema.STAGED_SHADOW_SAMPLES.c.
+                    would_be_action_id == sample.action_id).values(
+                        immutable_spec=crossed_parent,
+                        immutable_spec_sha256=kernel_actions.canonical_sha256(
+                            crossed_parent)))
+
+    with pytest.raises(kernel_actions.ActionConflict, match='shadow attempts'):
+        store.authorize_stale_worker_cohort_removal(cohort,
+                                                    inserted.record.revision,
+                                                    stale)
+
+
+def test_retirement_trusts_authorized_fence_not_terminal_history(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    cohort, fresh = _cohort_and_registrations(engine, 'pod-a')
+    inserted = store.register_worker_cohort(cohort, fresh)
+    _, stale = _cohort_and_registrations(engine,
+                                         'pod-a',
+                                         evidence_time=_database_now(engine) -
+                                         datetime.timedelta(minutes=6))
+    _force_worker_cohort_registrations(engine, cohort, stale)
+    authorized = store.authorize_stale_worker_cohort_removal(
+        cohort, inserted.record.revision, stale)
+
+    _insert_resource_action_cohort_carrier(engine)
+    _preflight_cohort_tombstone(store)
+    retired = store.retire_worker_cohort(cohort,
+                                         authorized.record.revision,
+                                         stale,
+                                         deployment_not_found=True,
+                                         service_account_not_found=True)
+    assert retired.record.lifecycle_state is (
+        actions.WorkerCohortLifecycleState.RETIRED)
+
+
+def test_worker_cohort_installation_listing_is_bounded_and_typed(
+        serve033_store) -> None:
+    engine, store = serve033_store
+    cohort, registrations = _cohort_and_registrations(engine, 'pod-a')
+    store.register_worker_cohort(cohort, registrations)
+
+    records = store.list_worker_cohorts_for_installation(
+        authority_fixtures.INSTALLATION_ID,
+        (actions.WorkerCohortLifecycleState.REGISTERING,))
+    assert tuple(record.cohort_id for record in records) == (cohort.cohort_id,)
+    assert store.list_worker_cohorts_for_installation(
+        authority_fixtures.INSTALLATION_ID,
+        (actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED,)) == ()
+    with pytest.raises(ValueError, match='canonical UUID'):
+        store.list_worker_cohorts_for_installation(
+            authority_fixtures.INSTALLATION_ID.upper(),
+            (actions.WorkerCohortLifecycleState.REGISTERING,))
+    with pytest.raises(ValueError, match='distinct typed states'):
+        store.list_worker_cohorts_for_installation(
+            authority_fixtures.INSTALLATION_ID,
+            (actions.WorkerCohortLifecycleState.REGISTERING,
+             actions.WorkerCohortLifecycleState.REGISTERING))
+    with pytest.raises(ValueError, match='1 through 256'):
+        store.list_worker_cohorts_for_installation(
+            authority_fixtures.INSTALLATION_ID,
+            (actions.WorkerCohortLifecycleState.REGISTERING,),
+            limit=0)
 
 
 def test_reference_coverage_and_terminal_release_are_owner_fenced(
@@ -1269,7 +1619,7 @@ def test_authority_transition_requires_locked_inventory_hash_equality(
                                       actions.ResourceActionMode.AUTHORITATIVE,
                                       gate_evidence=_activation_evidence(
                                           api_revision='007',
-                                          serve_revision='033',
+                                          serve_revision='034',
                                           authority_ready=True,
                                           candidate_since=candidate_since,
                                           coverage_inventory_sha256='b' * 64),
@@ -1282,7 +1632,7 @@ def test_authority_transition_requires_locked_inventory_hash_equality(
         actions.ResourceActionMode.AUTHORITATIVE,
         gate_evidence=_activation_evidence(
             api_revision='007',
-            serve_revision='033',
+            serve_revision='034',
             authority_ready=True,
             candidate_since=candidate_since,
             coverage_inventory_sha256=locked_hash),

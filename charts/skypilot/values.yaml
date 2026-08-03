@@ -354,21 +354,30 @@ controllerService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: kubernetes.io/hostname
 
-# Dedicated normal-executor cohorts for private Serve resource actions.  This
-# surface is dark by default; enabling it requires registered Serve033 cohort
-# identities that exactly match the immutable routing inputs rendered here.
+# Dedicated preflight-only authority cohorts for private Serve resource
+# actions. This surface stays dark until an immutable image has been built and
+# its separately reviewed OCI qualification artifact is packaged by the chart.
 resourceActions:
   authorityWorker:
     # @schema type: [boolean]
     enabled: false
+    # Immutable installation UUID used to derive database-wide cohort IDs.
+    # Never reuse or change this value while cohort or tombstone rows exist.
+    # @schema type: string
+    installationId: ""
     # Cohort selected for new preparation references.  Existing DRAINING
     # cohorts remain listed until all of their frozen work is released.
     # @schema type: string
     activeCohort: ""
-    # @schema type: array; itemProperties: {"id": {"type": "string", "minLength": 1, "maxLength": 63}, "replicas": {"type": "integer"}, "image": {"type": "string", "minLength": 1}, "imagePullPolicy": {"type": "string"}}
+    # Each cohort requires a <=42-character DNS-label suffix, exactly two
+    # replicas, a manifest-digest-pinned image and distinct OCI config digest,
+    # one chart-packaged qualification ref, and three installed-package refs.
+    # @schema type: array; item: object
     cohorts: []
     # Cohort IDs whose removed Deployment/ServiceAccount names remain visible
-    # to the surviving retirement verifier.
+    # to the surviving API retirement verifier.  After the last cohort is
+    # removed, keep enabled=true, activeCohort="", cohorts=[], and at least one
+    # tombstone until every matching central row is RETIRED.
     # @schema type: array; item: string
     retirementTombstones: []
     # @schema type: [integer]; minimum: 1; maximum: 65535
@@ -378,6 +387,8 @@ resourceActions:
     # @schema type: [integer]; minimum: 1; maximum: 65535
     preflightPort: 46583
     auth:
+      # This purpose-only Secret/key must differ from every external-LB auth
+      # Secret/key. The controller also rejects equal mounted token bytes.
       # @schema type: string
       existingSecret: ""
       # @schema type: string
@@ -416,10 +427,12 @@ requestStore:
 
 # Run central PostgreSQL schema upgrades in a revision-scoped Kubernetes Job.
 # API replicas verify the resulting revision and never execute deployment DDL.
-# Guarded HA runs the Job as a blocking pre-install and pre-upgrade hook and
-# therefore requires a pre-existing apiService.dbConnectionSecretName.
-# Compatibility mode keeps a regular Job so a chart-managed dbConnectionString
-# Secret can be created first.
+# A PostgreSQL request store backed by a pre-existing
+# apiService.dbConnectionSecretName runs the Job as a blocking pre-install and
+# pre-upgrade hook, including after HA and authority-worker values are cleared.
+# That hook validates the proposed authority release inventory before Helm
+# mutates workloads. Compatibility mode keeps a regular Job so a chart-managed
+# dbConnectionString Secret can be created first.
 databaseMigration:
   # @schema type: [boolean]
   enabled: true
@@ -625,7 +638,7 @@ serve:
     # Each Secret value is a newline-delimited token ring. Keep the current and
     # previous token during rotation within ONE ring; projected Secret volumes
     # update in place. The lbSync and controllerAdmin rings must remain
-    # disjoint in content, and cannot reference the same Secret key.
+    # pairwise disjoint in content, and cannot reference the same Secret key.
     # @schema type: [object, null]
     auth:
       # Tokens presented by an external LB when syncing replica/load state.

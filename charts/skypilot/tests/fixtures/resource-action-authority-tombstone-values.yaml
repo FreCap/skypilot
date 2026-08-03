@@ -1,0 +1,6 @@
+resourceActions:
+  authorityWorker:
+    activeCohort: ""
+    cohorts: []
+    retirementTombstones:
+      - p2a-v1

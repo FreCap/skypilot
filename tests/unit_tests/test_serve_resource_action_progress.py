@@ -8,6 +8,7 @@ import datetime
 import uuid
 
 import pytest
+import serve_resource_action_test_fixtures as authority_fixtures
 import test_serve_resource_action_down_execution_config
 import test_serve_resource_action_execution_foundation
 import test_serve_resource_action_skylet_policy
@@ -28,98 +29,18 @@ _STATE_STORE_UUID = '44444444-4444-4444-8444-444444444444'
 _TIME = '2026-08-01T01:02:03.000004Z'
 
 
-def _artifact(path: str, marker: str) -> dict:
-    return {
-        'repo_path': path,
-        'byte_size': 17,
-        'sha256': marker * 64,
-    }
-
-
 def _qualification() -> dict:
-    return {
-        'requested_reference':
-            ('registry.example/authority@sha256:' + '1' * 64),
-        'oci_manifest_digest': 'sha256:' + '1' * 64,
-        'oci_config_digest': 'sha256:' + '2' * 64,
-        'qualification_artifact': _artifact('images/authority.json', '3'),
-    }
+    return copy.deepcopy(authority_fixtures.authority_manifest_value()['image'])
 
 
 def _cohort() -> dict:
-    manifest = {
-        'version': 1,
-        'cohort_id': 'authority-v1',
-        'namespace': 'skypilot-system',
-        'deployment_name': 'authority-v1',
-        'service_account_name': 'authority-v1',
-        'container_name': 'skypilot-authority-worker',
-        'image': _qualification(),
-        'pod_template_contract': _artifact('charts/worker.yaml', '4'),
-        'artifact_inventory': _artifact('inventories/artifacts.json', '5'),
-        'callable_inventory': _artifact('inventories/callables.json', '6'),
-        'claim_contract': 'frozen_action_cohort_join_v1',
-        'handler_allowlist': list(
-            values.PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1),
-    }
-    return {
-        'version': 1,
-        'manifest': manifest,
-        'manifest_sha256': values.canonical_sha256(manifest),
-        'deployment_uid': 'deployment-uid-v1',
-        'service_account_uid': 'service-account-uid-v1',
-    }
+    return authority_fixtures.authority_cohort_value()
 
 
 def _worker(pod_uid: str = 'worker-pod-uid', observed_at: str = _TIME) -> dict:
-    qualification = _qualification()
-    return {
-        'namespace': 'skypilot-system',
-        'pod_name': 'worker-0',
-        'pod_uid': pod_uid,
-        'pod_resource_version': '101',
-        'pod_service_account_name': 'authority-v1',
-        'pod_controller_owner': {
-            'api_version': 'apps/v1',
-            'kind': 'ReplicaSet',
-            'name': 'authority-v1-abc',
-            'uid': 'replicaset-uid-v1',
-        },
-        'replica_set_name': 'authority-v1-abc',
-        'replica_set_uid': 'replicaset-uid-v1',
-        'replica_set_resource_version': '102',
-        'replica_set_controller_owner': {
-            'api_version': 'apps/v1',
-            'kind': 'Deployment',
-            'name': 'authority-v1',
-            'uid': 'deployment-uid-v1',
-        },
-        'deployment_name': 'authority-v1',
-        'deployment_uid': 'deployment-uid-v1',
-        'deployment_resource_version': '103',
-        'deployment_generation': 5,
-        'deployment_observed_generation': 5,
-        'pod_template_contract_sha256': '4' * 64,
-        'image': {
-            'qualification': qualification,
-            'runtime': {
-                'raw_image_id': 'containerd://sha256:' + '2' * 64,
-                'runtime_image_id_scheme': 'containerd',
-                'runtime_image_id_digest': 'sha256:' + '2' * 64,
-                'qualified_oci_manifest_digest': 'sha256:' + '1' * 64,
-                'qualified_oci_config_digest': 'sha256:' + '2' * 64,
-                'qualification_artifact_sha256':
-                    qualification['qualification_artifact']['sha256'],
-                'runtime_id_contract': 'qualified_oci_config_digest_v1',
-            },
-        },
-        'service_account_uid': 'service-account-uid-v1',
-        'artifact_inventory_sha256': '5' * 64,
-        'callable_inventory_sha256': '6' * 64,
-        'handler_allowlist_sha256': values.canonical_sha256(
-            _cohort()['manifest']['handler_allowlist']),
-        'observed_at': observed_at,
-    }
+    worker = authority_fixtures.authority_worker_value(pod_uid)
+    worker['observed_at'] = observed_at
+    return worker
 
 
 def _attestation(
@@ -2415,7 +2336,7 @@ def test_persisted_timestamp_boundaries_reject_subclasses(monkeypatch) -> None:
             type(self).method_called = True
             raise AssertionError('subclass method must not be called')
 
-        def astimezone(self, tz=None):
+        def astimezone(self, _tz=None):
             type(self).method_called = True
             raise AssertionError('subclass method must not be called')
 
@@ -3558,10 +3479,10 @@ def test_request_terminal_fallback_p0_o_s_x_and_goldens(monkeypatch) -> None:
              '107745520de2f879c863ec8f545815b4f1a5036e323922ad96db851d60170c6d'
             ),
         'O': (957,
-              '6bb45637d871e085952bad8130d7f35333e6d7876259743b55da34c172e69187'
+              'ac291b238a10d4ffea290e4d2bbeb0705721437d30fe53ffa29382689058f5a9'
              ),
         'S': (5687,
-              'd4117c231a5eb1cce99c3a839da6e05fadcbf9a1c862ae91e9d29f21ac2d0382'
+              'aa4980f99714fac0c5503ac964196d9370b3bc6634108dd59218ce2eeec7bde0'
              ),
         'X': (941,
               '8e13d9e0fc07b33ff17a3e91babf5b74dd0a83eb0b269c0152002ee7fbcac49d'

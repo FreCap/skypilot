@@ -1,0 +1,161 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: resource_action_authority_api_env_test
+templates:
+  - templates/api-deployment.yaml
+tests:
+  - it: should omit the verifier installation identity while authority is dark
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
+
+  - it: should leave all authority verifier env names available while disabled
+    set:
+      resourceActions.authorityWorker.enabled: false
+      apiService.extraEnvs:
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
+          value: compatibility-installation
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+          value: '[]'
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
+          value: '[]'
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
+            value: compatibility-installation
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+            value: '[]'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
+            value: '[]'
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+
+  - it: should project sorted live and tombstone scope arrays into the enabled API role
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-sorted-tombstones-values.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+            value: '[]'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
+            value: '["retired-a","retired-z"]'
+
+  - it: should project the immutable installation identity into only the enabled API role
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-tombstone-values.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
+            value: 01234567-89ab-cdef-0123-456789abcdef
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+            value: '[]'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
+            value: '["p2a-v1"]'
+
+  - it: should reject a suffix crossed between the live and retirement scopes
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-disjoint-values.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker retirement tombstone "p2a-v1" is duplicated or still active
+
+  - it: should reserve the verifier installation identity from user extras
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-tombstone-values.yaml
+      - fixtures/resource-action-authority-api-env-collision-values.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID" is duplicated or reserved by the chart
+
+  - it: should reserve the chart-owned activation marker
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      apiService.extraEnvs:
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+          value: "true"
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" is duplicated or reserved by the chart
+
+  - it: should not allow compatibility extras to spoof the activation marker
+    set:
+      resourceActions.authorityWorker.enabled: false
+      apiService.extraEnvs:
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+          value: "true"
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" is duplicated or reserved by the chart
+
+  - it: should reserve the live-suffix scope from user extras
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-cohort-env-collision-values.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON" is duplicated or reserved by the chart
+
+  - it: should reserve the retirement-suffix scope from user extras
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-tombstone-env-collision-values.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON" is duplicated or reserved by the chart

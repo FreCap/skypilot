@@ -14,13 +14,24 @@ def _artifact(path: str = 'contracts/config-access.json') -> dict:
     return {'repo_path': path, 'byte_size': 17, 'sha256': 'a' * 64}
 
 
+def _qualification_artifact() -> dict:
+    return {
+        'source': 'helm_chart_configmap_v1',
+        'repo_path': ('charts/skypilot/files/'
+                      'resource-action-qualifications/runtime.json'),
+        'mount_path': '/etc/skypilot/resource-action-authority/qualification.json',
+        'byte_size': 17,
+        'sha256': 'a' * 64,
+    }
+
+
 def _qualification() -> dict:
     return {
         'requested_reference': 'registry.example/runtime:approved@sha256:' +
                                '1' * 64,
         'oci_manifest_digest': 'sha256:' + '1' * 64,
         'oci_config_digest': 'sha256:' + '2' * 64,
-        'qualification_artifact': _artifact('images/runtime.json'),
+        'qualification_artifact': _qualification_artifact(),
     }
 
 

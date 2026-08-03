@@ -1343,12 +1343,15 @@
             "properties": {
                 "authorityWorker": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "activeCohort": {
-                            "type": "string"
+                            "type": "string",
+                            "maxLength": 42
                         },
                         "auth": {
                             "type": "object",
+                            "additionalProperties": false,
                             "properties": {
                                 "existingSecret": {
                                     "type": "string"
@@ -1361,21 +1364,137 @@
                         "cohorts": {
                             "type": "array",
                             "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                    "id",
+                                    "replicas",
+                                    "image",
+                                    "imagePullPolicy",
+                                    "ociConfigDigest",
+                                    "qualificationArtifact",
+                                    "podTemplateContract",
+                                    "artifactInventory",
+                                    "callableInventory"
+                                ],
                                 "properties": {
+                                    "artifactInventory": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "repoPath",
+                                            "byteSize",
+                                            "sha256"
+                                        ],
+                                        "properties": {
+                                            "byteSize": {
+                                                "type": "integer",
+                                                "minimum": 1
+                                            },
+                                            "repoPath": {
+                                                "type": "string",
+                                                "const": "sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"
+                                            },
+                                            "sha256": {
+                                                "type": "string",
+                                                "pattern": "^[0-9a-f]{64}$"
+                                            }
+                                        }
+                                    },
+                                    "callableInventory": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "repoPath",
+                                            "byteSize",
+                                            "sha256"
+                                        ],
+                                        "properties": {
+                                            "byteSize": {
+                                                "type": "integer",
+                                                "minimum": 1
+                                            },
+                                            "repoPath": {
+                                                "type": "string",
+                                                "const": "sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"
+                                            },
+                                            "sha256": {
+                                                "type": "string",
+                                                "pattern": "^[0-9a-f]{64}$"
+                                            }
+                                        }
+                                    },
                                     "id": {
                                         "type": "string",
-                                        "maxLength": 63,
-                                        "minLength": 1
+                                        "minLength": 1,
+                                        "maxLength": 42,
+                                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"
                                     },
                                     "image": {
                                         "type": "string",
-                                        "minLength": 1
+                                        "minLength": 1,
+                                        "pattern": "^.+@sha256:[0-9a-f]{64}$"
                                     },
                                     "imagePullPolicy": {
-                                        "type": "string"
+                                        "type": "string",
+                                        "const": "Always"
+                                    },
+                                    "ociConfigDigest": {
+                                        "type": "string",
+                                        "pattern": "^sha256:[0-9a-f]{64}$"
+                                    },
+                                    "podTemplateContract": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "repoPath",
+                                            "byteSize",
+                                            "sha256"
+                                        ],
+                                        "properties": {
+                                            "byteSize": {
+                                                "type": "integer",
+                                                "minimum": 1
+                                            },
+                                            "repoPath": {
+                                                "type": "string",
+                                                "const": "sky/serve/resource_action_provider_preflight.py"
+                                            },
+                                            "sha256": {
+                                                "type": "string",
+                                                "pattern": "^[0-9a-f]{64}$"
+                                            }
+                                        }
+                                    },
+                                    "qualificationArtifact": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "repoPath",
+                                            "byteSize",
+                                            "sha256"
+                                        ],
+                                        "properties": {
+                                            "byteSize": {
+                                                "type": "integer",
+                                                "minimum": 1,
+                                                "maximum": 65536
+                                            },
+                                            "repoPath": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 253,
+                                                "pattern": "^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"
+                                            },
+                                            "sha256": {
+                                                "type": "string",
+                                                "pattern": "^[0-9a-f]{64}$"
+                                            }
+                                        }
                                     },
                                     "replicas": {
-                                        "type": "integer"
+                                        "type": "integer",
+                                        "const": 2
                                     }
                                 }
                             }
@@ -1388,19 +1507,29 @@
                             "maximum": 65535,
                             "minimum": 1
                         },
+                        "installationId": {
+                            "type": "string",
+                            "pattern": "^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                        },
                         "preflightPort": {
                             "type": "integer",
+                            "const": 46583,
                             "maximum": 65535,
                             "minimum": 1
                         },
                         "retirementTombstones": {
                             "type": "array",
+                            "uniqueItems": true,
                             "items": {
-                                "type": "string"
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 42,
+                                "pattern": "^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"
                             }
                         },
                         "tls": {
                             "type": "object",
+                            "additionalProperties": false,
                             "properties": {
                                 "caKey": {
                                     "type": "string"

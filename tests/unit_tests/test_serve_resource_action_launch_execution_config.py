@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 
 import pytest
+import serve_resource_action_test_fixtures as authority_fixtures
 import test_serve_resource_action_capsule_leaves as leaves
 import test_serve_resource_action_execution_foundation
 import test_serve_resource_action_kubernetes_scope
@@ -152,42 +153,16 @@ def _canonical_prerequisites(principals: dict, cohort: dict) -> list[dict]:
 
 
 def _canonical_cohort() -> dict:
+    return authority_fixtures.authority_cohort_value()
 
-    def artifact(path: str, digest_character: str) -> dict:
-        return {
-            'repo_path': path,
-            'byte_size': 17,
-            'sha256': digest_character * 64,
-        }
 
-    manifest = {
-        'version': 1,
-        'cohort_id': 'authority-v1',
-        'namespace': 'skypilot-system',
-        'deployment_name': 'skypilot-authority-v1',
-        'service_account_name': 'authority-worker',
-        'container_name': 'skypilot-authority-worker',
-        'image': {
-            'requested_reference':
-                ('registry.example/authority@sha256:' + '1' * 64),
-            'oci_manifest_digest': 'sha256:' + '1' * 64,
-            'oci_config_digest': 'sha256:' + '2' * 64,
-            'qualification_artifact': artifact('images/authority.json', '3'),
-        },
-        'pod_template_contract': artifact('charts/worker.yaml', '4'),
-        'artifact_inventory': artifact('inventories/artifacts.json', '5'),
-        'callable_inventory': artifact('inventories/callables.json', '6'),
-        'claim_contract': 'frozen_action_cohort_join_v1',
-        'handler_allowlist': list(
-            actions.PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1),
-    }
-    return {
-        'version': 1,
-        'manifest': manifest,
-        'manifest_sha256': actions.canonical_sha256(manifest),
-        'deployment_uid': 'deployment-uid-v1',
-        'service_account_uid': 'uid-authority-worker',
-    }
+def _authority_scope() -> dict:
+    scope = scope_fixtures._scope()
+    cohort = _canonical_cohort()
+    scope['caller_service_account_name'] = (
+        cohort['manifest']['service_account_name'])
+    scope['caller_service_account_uid'] = cohort['service_account_uid']
+    return scope
 
 
 def _canonical_object_plan(role: str, topology_item: dict,
@@ -261,6 +236,13 @@ def _capsule_raw(*, workspace: str = 'workspace-a') -> dict:
             renderer['admitted_object_normalization'])
     cohort = _canonical_cohort()
     principals = foundation._principals()
+    principals['caller']['name'] = cohort['manifest']['service_account_name']
+    principals['caller']['uid'] = cohort['service_account_uid']
+    principals['caller_authorization']['identity']['username'] = (
+        'system:serviceaccount:' + cohort['manifest']['namespace'] + ':' +
+        cohort['manifest']['service_account_name'])
+    principals['caller_authorization']['identity']['uid'] = (
+        cohort['service_account_uid'])
     prerequisites = _canonical_prerequisites(principals, cohort)
     endpoint = runtime_fixtures._endpoint()
     by_role = {item['role']: item for item in prerequisites}
@@ -286,13 +268,14 @@ def _capsule_raw(*, workspace: str = 'workspace-a') -> dict:
     for artifact in post_provision['runtime_artifacts']:
         artifact['workload_image_digest'] = resources['image']['qualification'][
             'oci_manifest_digest']
+    scope = _authority_scope()
     return {
         'version': 1,
         'implementation_contract': 'kubernetes_serve_prebooted_runtime_v1',
         'executor_cohort': cohort,
         'config_projection': config_projection,
         'config_projection_sha256': actions.canonical_sha256(config_projection),
-        'scope': scope_fixtures._scope(),
+        'scope': scope,
         'principals': principals,
         'prerequisites': prerequisites,
         'request_identity': request_identity,
@@ -319,7 +302,7 @@ def _capsule(
 
 
 def _target() -> dict:
-    scope = scope_fixtures._scope()
+    scope = _authority_scope()
     scope_sha256 = actions.ProviderKubernetesScopeV1.from_value(scope).sha256
     return {
         'version': 1,
@@ -346,7 +329,7 @@ def _target() -> dict:
 
 def _resource_snapshot() -> dict:
     scope_sha256 = actions.ProviderKubernetesScopeV1.from_value(
-        scope_fixtures._scope()).sha256
+        _authority_scope()).sha256
     return {
         'version': 1,
         'cloud': 'kubernetes',
@@ -516,9 +499,9 @@ def test_launch_source_wrapper_is_exact_and_content_only_leaves_stay_closed(
     assert source.identity_canonicalization_sha256 == (
         source.identity_canonicalization.sha256)
     assert hashlib.sha256(source.canonical_bytes).hexdigest() == source.sha256
-    assert len(source.canonical_bytes) == 1467
+    assert len(source.canonical_bytes) == 1566
     assert source.sha256 == (
-        'e72f1acdc989235f357ea1f4b76fa2aa5c39e64683e49338d80241e0f8f96845')
+        'dc221480bd3c0aa3b622b3651c8c32dc85fe14c80cddc22149415335dd3bd845')
     assert set(raw) == {
         'content', 'identity_canonicalization',
         'identity_canonicalization_sha256'
@@ -548,12 +531,12 @@ def test_launch_capsule_and_execution_config_have_fixed_canonical_bytes(
         capsule.canonical_value()) == capsule
     assert actions.ProviderKubernetesExecutionConfigV1.from_value(
         config.canonical_value()) == config
-    assert len(capsule.canonical_bytes) == 37430
+    assert len(capsule.canonical_bytes) == 41361
     assert capsule.sha256 == (
-        'e5728dbba47b2812acb32d4eaffeeaa617822df9d769b66fcddf2674d6ff5d97')
-    assert len(config.canonical_bytes) == 45732
+        '93abbe7c2309eccb9a202d00882be30b086e5a3e198d38f8e35dcdf9f89a4825')
+    assert len(config.canonical_bytes) == 49773
     assert config.sha256 == (
-        'e787007ef20518414b8f9f544281752b1a382c867eeb17169278ed348954546b')
+        '970cb55a2302dc36ad944adf6479d49717d02b8f83dafbcb0f6211b769971427')
 
 
 @pytest.mark.parametrize('mutation,match', [
@@ -628,8 +611,10 @@ def test_launch_policy_projector_owns_variable_preimage_bindings() -> None:
             crossed_source, subject.requested_target, subject.resources,
             capsule.topology, 7, True, capsule)
 
+    crossed_cohort_id = authority_fixtures.COHORT_ID.replace(
+        ':p2a-v1', ':p2a-v2')
     context = dataclasses.replace(source.identity_canonicalization.context,
-                                  cohort_id='crossed-cohort')
+                                  cohort_id=crossed_cohort_id)
     proof = dataclasses.replace(source.identity_canonicalization,
                                 context=context,
                                 context_sha256=context.sha256)

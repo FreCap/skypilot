@@ -6,6 +6,7 @@ import datetime
 import uuid
 
 import pytest
+import serve_resource_action_test_fixtures as authority_fixtures
 import test_serve_resource_action_down_execution_config
 import test_serve_resource_action_launch_execution_config
 
@@ -70,38 +71,11 @@ def _artifact(path: str, digest_character: str) -> dict:
 
 
 def _qualification() -> dict:
-    return {
-        'requested_reference':
-            ('registry.example/authority@sha256:' + '1' * 64),
-        'oci_manifest_digest': 'sha256:' + '1' * 64,
-        'oci_config_digest': 'sha256:' + '2' * 64,
-        'qualification_artifact': _artifact('images/authority.json', '3'),
-    }
+    return authority_fixtures.authority_manifest_value()['image']
 
 
 def _cohort() -> dict:
-    manifest = {
-        'version': 1,
-        'cohort_id': 'authority-v1',
-        'namespace': 'skypilot-system',
-        'deployment_name': 'skypilot-authority-v1',
-        'service_account_name': 'skypilot-authority-v1',
-        'container_name': 'skypilot-authority-worker',
-        'image': _qualification(),
-        'pod_template_contract': _artifact('charts/worker.yaml', '4'),
-        'artifact_inventory': _artifact('inventories/artifacts.json', '5'),
-        'callable_inventory': _artifact('inventories/callables.json', '6'),
-        'claim_contract': 'frozen_action_cohort_join_v1',
-        'handler_allowlist': list(
-            actions.PROVIDER_AUTHORITY_WORKER_HANDLER_ALLOWLIST_V1),
-    }
-    return {
-        'version': 1,
-        'manifest': manifest,
-        'manifest_sha256': actions.canonical_sha256(manifest),
-        'deployment_uid': 'deployment-uid-v1',
-        'service_account_uid': 'service-account-uid-v1',
-    }
+    return authority_fixtures.authority_cohort_value()
 
 
 def _worker(pod_uid: str) -> dict:
@@ -165,8 +139,11 @@ def _registration(pod_uid: str) -> dict:
         'pod_ready': True,
         'deployment_spec_replicas': 2,
         'deployment_status_observed_generation': 5,
+        'deployment_status_replicas': 2,
+        'deployment_updated_replicas': 2,
         'deployment_ready_replicas': 2,
         'deployment_available_replicas': 2,
+        'deployment_unavailable_replicas': 0,
         'registered_at': _REGISTERED_TIME,
     }
 
@@ -185,7 +162,7 @@ def _reference() -> dict:
     return {
         'version': 1,
         'decision_id': coverage['decision_id'],
-        'cohort_id': 'authority-v1',
+        'cohort_id': authority_fixtures.COHORT_ID,
         'service_hash': _SERVICE_UUID,
         'replica_incarnation': _REPLICA_UUID,
         'desired_generation': 3,
@@ -359,7 +336,7 @@ def test_runtime_image_binds_raw_id_scheme_and_digest(raw_image_id: str,
 
 def test_runtime_image_scheme_union_is_closed() -> None:
     assert actions.ProviderRuntimeImageIdentityV1._SCHEMES == frozenset(
-        {'containerd', 'cri-o', 'docker-pullable'})
+        {'containerd', 'cri-o', 'docker-pullable', 'oci-reference'})
     runtime = _worker('pod-uid')['image']['runtime']
     runtime['raw_image_id'] = 'docker://sha256:' + '2' * 64
     runtime['runtime_image_id_scheme'] = 'docker'
@@ -367,13 +344,54 @@ def test_runtime_image_scheme_union_is_closed() -> None:
         actions.ProviderRuntimeImageIdentityV1.from_value(runtime)
 
 
-def test_docker_pullable_runtime_image_parses_terminal_digest() -> None:
+@pytest.mark.parametrize(('scheme', 'raw_image_id'), [
+    ('docker-pullable',
+     'docker-pullable://registry.example/authority@sha256:' + '1' * 64),
+    ('oci-reference', 'registry.example/authority@sha256:' + '1' * 64),
+])
+def test_manifest_runtime_image_schemes_bind_manifest_digest(
+        scheme: str, raw_image_id: str) -> None:
     runtime = _worker('pod-uid')['image']['runtime']
-    runtime['raw_image_id'] = ('docker-pullable://registry.example/authority@'
-                               'sha256:' + '2' * 64)
-    runtime['runtime_image_id_scheme'] = 'docker-pullable'
-    assert actions.ProviderRuntimeImageIdentityV1.from_value(
-        runtime).runtime_image_id_digest == 'sha256:' + '2' * 64
+    runtime.update({
+        'raw_image_id': raw_image_id,
+        'runtime_image_id_scheme': scheme,
+        'runtime_image_id_digest': 'sha256:' + '1' * 64,
+        'runtime_id_contract': 'qualified_oci_manifest_digest_v1',
+    })
+    parsed = actions.ProviderRuntimeImageIdentityV1.from_value(runtime)
+    assert parsed.runtime_image_id_digest == 'sha256:' + '1' * 64
+
+
+@pytest.mark.parametrize(('scheme', 'raw_image_id'), [
+    ('docker-pullable',
+     'docker-pullable://registry.example/authority@sha256:' + '2' * 64),
+    ('oci-reference', 'registry.example/authority@sha256:' + '2' * 64),
+])
+def test_manifest_runtime_image_schemes_reject_config_digest(
+        scheme: str, raw_image_id: str) -> None:
+    runtime = _worker('pod-uid')['image']['runtime']
+    runtime.update({
+        'raw_image_id': raw_image_id,
+        'runtime_image_id_scheme': scheme,
+        'runtime_id_contract': 'qualified_oci_manifest_digest_v1',
+    })
+    with pytest.raises(ValueError, match='qualified OCI manifest digest'):
+        actions.ProviderRuntimeImageIdentityV1.from_value(runtime)
+
+
+@pytest.mark.parametrize('scheme', ['docker-pullable', 'oci-reference'])
+def test_manifest_runtime_image_schemes_reject_config_contract(
+        scheme: str) -> None:
+    runtime = _worker('pod-uid')['image']['runtime']
+    prefix = ('docker-pullable://' if scheme == 'docker-pullable' else '')
+    runtime.update({
+        'raw_image_id': prefix + 'registry.example/authority@sha256:' +
+                        '1' * 64,
+        'runtime_image_id_scheme': scheme,
+        'runtime_image_id_digest': 'sha256:' + '1' * 64,
+    })
+    with pytest.raises(ValueError, match='manifest-ID contract'):
+        actions.ProviderRuntimeImageIdentityV1.from_value(runtime)
 
 
 @pytest.mark.parametrize('requested_reference', [
@@ -389,14 +407,15 @@ def test_qualified_image_rejects_noncanonical_oci_reference(
         actions.ProviderOCIImageQualificationV1.from_value(qualification)
 
 
-@pytest.mark.parametrize(
-    'cohort_id',
-    ['not/a-dns-label', 'A_UPPER', 'a' * 64, '-leading', 'trailing-'])
-def test_cohort_manifest_requires_dns_label_id(cohort_id: str) -> None:
+@pytest.mark.parametrize('cohort_id', [
+    'not/a-dns-label', 'A_UPPER', 'a' * 64, '-leading', 'trailing-',
+    ('ra:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:' + '0' * 64 + ':A_UPPER')
+])
+def test_cohort_manifest_requires_full_scoped_id(cohort_id: str) -> None:
     cohort = _cohort()
     cohort['manifest']['cohort_id'] = cohort_id
     cohort['manifest_sha256'] = actions.canonical_sha256(cohort['manifest'])
-    with pytest.raises(ValueError, match='DNS label'):
+    with pytest.raises(ValueError, match='ra:<UUID>'):
         actions.ProviderAuthorityWorkerCohortV1.from_value(cohort)
 
 
@@ -505,7 +524,7 @@ def test_coverage_enforces_outcome_pair_and_kind_refined_reason() -> None:
 
 def test_cohort_identity_is_closed_bounded_and_hash_linked() -> None:
     cohort = actions.WorkerCohortIdentityV1.from_value(_cohort())
-    assert cohort.cohort_id == 'authority-v1'
+    assert cohort.cohort_id == authority_fixtures.COHORT_ID
     assert cohort.deployment_uid == 'deployment-uid-v1'
     assert actions.WorkerCohortIdentityV1.from_value(
         cohort.canonical_value()).canonical_bytes == cohort.canonical_bytes
@@ -516,7 +535,7 @@ def test_cohort_identity_is_closed_bounded_and_hash_linked() -> None:
         (lambda value: value.update({'manifest_sha256': '0' * 64}),
          'manifest hash'),
         (lambda value: value['manifest'].update({'cohort_id': 'c' * 254}),
-         'DNS label'),
+         'ra:<UUID>'),
         (lambda value: value['manifest']['image'].update(
             {'oci_manifest_digest': 'SHA256:' + '1' * 64}), 'sha256:<64'),
         (lambda value: value['manifest'].update(
@@ -625,6 +644,23 @@ def test_registration_set_relation_sorting_readiness_hash_and_freshness(
         registrations.validate_freshness(datetime.datetime(2026, 8, 1, 1, 5))
 
 
+@pytest.mark.parametrize('field,value,match', [
+    ('deployment_status_replicas', 1, 'must equal 2'),
+    ('deployment_updated_replicas', 1, 'must equal 2'),
+    ('deployment_unavailable_replicas', 1, 'must equal 0'),
+])
+def test_registration_binds_every_deployment_replica_counter(
+        field: str, value: int, match: str) -> None:
+    registration = _registration('pod-a')
+    registration[field] = value
+    with pytest.raises(ValueError, match=match):
+        actions.ProviderAuthorityWorkerRegistrationV1.from_value(registration)
+    missing = _registration('pod-a')
+    missing.pop(field)
+    with pytest.raises(ValueError, match='unknown or missing'):
+        actions.ProviderAuthorityWorkerRegistrationV1.from_value(missing)
+
+
 @pytest.mark.parametrize('mutate,match', [
     (lambda value: value.update({'extra': None}), 'unknown or missing'),
     (lambda value: value.pop('cohort_id'), 'unknown or missing'),
@@ -687,10 +723,10 @@ def test_cohort_reference_rejects_postgres_bigint_overflow(field: str) -> None:
 @pytest.mark.parametrize(
     'cohort_id',
     ['not/a-dns-label', 'A_UPPER', 'a' * 64, '-leading', 'trailing-'])
-def test_cohort_reference_requires_dns_label_id(cohort_id: str) -> None:
+def test_cohort_reference_requires_full_scoped_id(cohort_id: str) -> None:
     reference = _reference()
     reference['cohort_id'] = cohort_id
-    with pytest.raises(ValueError, match='DNS label'):
+    with pytest.raises(ValueError, match='ra:<UUID>'):
         actions.WorkerCohortReferenceInputV1.from_value(reference)
 
 

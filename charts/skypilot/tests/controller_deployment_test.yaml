@@ -102,6 +102,122 @@ tests:
       - notExists:
           path: spec.template.spec.topologySpreadConstraints
 
+  - it: should leave authority purpose names available while disabled
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.enabled: false
+      controllerService.extraEnvs:
+        - name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
+          value: /compat/tokens
+      controllerService.extraVolumes:
+        - name: skypilot-resource-action-authority-auth
+          emptyDir: {}
+        - name: skypilot-resource-action-authority-ca
+          emptyDir: {}
+        - name: skypilot-resource-action-authority-manifest
+          emptyDir: {}
+      controllerService.extraVolumeMounts:
+        - name: skypilot-resource-action-authority-auth
+          mountPath: /etc/skypilot/resource-action-authority/auth
+        - name: skypilot-resource-action-authority-ca
+          mountPath: /etc/skypilot/resource-action-authority/tls
+        - name: skypilot-resource-action-authority-manifest
+          mountPath: /etc/skypilot/resource-action-authority/manifest.json
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
+            value: /compat/tokens
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-resource-action-authority-manifest
+            emptyDir: {}
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-resource-action-authority-manifest
+            mountPath: /etc/skypilot/resource-action-authority/manifest.json
+
+  - it: should emit the activation marker with live preflight wiring
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
+            value: /etc/skypilot/resource-action-authority/auth/tokens
+
+  - it: should omit controller activation for a tombstone-only release
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-tombstone-values.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
+
+  - it: should reserve the authority purpose env while enabled
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      controllerService.extraEnvs:
+        - name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
+          value: /compat/tokens
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE" is duplicated or reserved by the chart
+
+  - it: should reserve the chart-owned activation marker
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      controllerService.extraEnvs:
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+          value: "true"
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" is duplicated or reserved by the chart
+
+  - it: should reserve authority purpose volume names while enabled
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      controllerService.extraVolumes:
+        - name: skypilot-resource-action-authority-manifest
+          emptyDir: {}
+    asserts:
+      - failedTemplate:
+          errorMessage: volume name "skypilot-resource-action-authority-manifest" is duplicated or reserved by the chart
+
+  - it: should reserve authority purpose mount paths while enabled
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      controllerService.extraVolumeMounts:
+        - name: compatibility-manifest
+          mountPath: /etc/skypilot/resource-action-authority/manifest.json
+    asserts:
+      - failedTemplate:
+          errorMessage: volume mount path "/etc/skypilot/resource-action-authority/manifest.json" is duplicated or reserved by the chart
+
   - it: should reject a custom controller API endpoint
     set:
       apiService.highAvailability.enabled: true

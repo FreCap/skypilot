@@ -14,8 +14,10 @@ from collections.abc import Mapping
 import dataclasses
 import datetime
 import enum
+import hashlib
 import ipaddress
 import json
+import posixpath
 import re
 import types
 from typing import Any, ClassVar, TypeVar
@@ -37,6 +39,10 @@ _MAX_LIST_ITEMS = 256
 _SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 _SHA256_DIGEST_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
 _DNS_LABEL_RE = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+_AUTHORITY_COHORT_ID_RE = re.compile(
+    r'^ra:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-'
+    r'[0-9a-f]{12}):([0-9a-f]{64}):'
+    r'([a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?)$')
 _MAX_POSTGRES_BIGINT = 2**63 - 1
 _MAX_POSTGRES_INTEGER = 2**31 - 1
 _UTC_TIMESTAMP_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:'
@@ -526,6 +532,29 @@ def _dns_label(value: Any, *, name: str) -> str:
     if _DNS_LABEL_RE.fullmatch(normalized) is None:
         raise ValueError(f'{name} must be a DNS label.')
     return normalized
+
+
+def _authority_cohort_id(value: Any, *, name: str) -> str:
+    """Validate one installation/release-scoped immutable cohort key."""
+
+    normalized = _text(value, name=name, maximum_bytes=_MAX_TEXT_BYTES)
+    match = _AUTHORITY_COHORT_ID_RE.fullmatch(normalized)
+    if match is None:
+        raise ValueError(
+            f'{name} must be ra:<UUID>:<64 lowercase hex>:<DNS label max42>.')
+    installation_id, release_digest, cohort_suffix = match.groups()
+    _uuid(installation_id, name=f'{name}.installation_id')
+    _sha256(release_digest, name=f'{name}.release_digest')
+    if len(cohort_suffix) > 42:
+        raise ValueError(f'{name} cohort suffix must be at most 42 characters.')
+    _dns_label(cohort_suffix, name=f'{name}.cohort_suffix')
+    return normalized
+
+
+def _authority_cohort_id_parts(value: str) -> tuple[uuid.UUID, str, str]:
+    normalized = _authority_cohort_id(value, name='authority cohort ID')
+    _, installation_id, release_digest, cohort_suffix = normalized.split(':')
+    return uuid.UUID(installation_id), release_digest, cohort_suffix
 
 
 def _dns_subdomain(value: Any, *, name: str) -> str:
@@ -1235,8 +1264,15 @@ class ProviderRepoArtifactRefV1:
             raise TypeError('artifact.byte_size must be an integer.')
         if type(self.sha256) is not str:
             raise TypeError('artifact.sha256 must be text.')
-        object.__setattr__(self, 'repo_path',
-                           _text(self.repo_path, name='artifact.repo_path'))
+        repo_path = _text(self.repo_path, name='artifact.repo_path')
+        if (not repo_path.isascii() or repo_path.startswith('/') or
+                repo_path.endswith('/') or '\\' in repo_path or
+                posixpath.normpath(repo_path) != repo_path or
+                any(component in ('', '.', '..')
+                    for component in repo_path.split('/'))):
+            raise ValueError('artifact.repo_path must be a normalized relative '
+                             'POSIX path.')
+        object.__setattr__(self, 'repo_path', repo_path)
         object.__setattr__(
             self, 'byte_size',
             _positive_integer(self.byte_size, name='artifact.byte_size'))
@@ -1263,13 +1299,77 @@ class ProviderRepoArtifactRefV1:
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderProjectedQualificationArtifactRefV1:
+    """Chart-packaged post-build qualification evidence reference."""
+
+    source: str
+    repo_path: str
+    mount_path: str
+    byte_size: int
+    sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'source', 'repo_path', 'mount_path', 'byte_size', 'sha256'})
+    _REPO_PREFIX: ClassVar[
+        str] = 'charts/skypilot/files/resource-action-qualifications/'
+    _MOUNT_PATH: ClassVar[
+        str] = '/etc/skypilot/resource-action-authority/qualification.json'
+
+    def __post_init__(self) -> None:
+        if self.source != 'helm_chart_configmap_v1':
+            raise ValueError('qualification artifact source is unsupported.')
+        repo_path = _text(self.repo_path,
+                          name='qualification_artifact.repo_path')
+        if (not repo_path.isascii() or
+                not repo_path.startswith(self._REPO_PREFIX) or
+                repo_path == self._REPO_PREFIX or repo_path.endswith('/') or
+                '\\' in repo_path or
+                posixpath.normpath(repo_path) != repo_path or
+                any(component in ('', '.', '..')
+                    for component in repo_path.split('/'))):
+            raise ValueError('qualification artifact repository path is '
+                             'unsupported.')
+        object.__setattr__(self, 'repo_path', repo_path)
+        if self.mount_path != self._MOUNT_PATH:
+            raise ValueError('qualification artifact mount path is '
+                             'unsupported.')
+        object.__setattr__(
+            self, 'byte_size',
+            _positive_integer(self.byte_size,
+                              name='qualification_artifact.byte_size'))
+        object.__setattr__(
+            self, 'sha256',
+            _sha256(self.sha256, name='qualification_artifact.sha256'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> ProviderProjectedQualificationArtifactRefV1:
+        raw = _closed_object(value,
+                             name='projected qualification artifact reference',
+                             keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        encoded = canonical_json_bytes(self.canonical_value())
+        if len(encoded) > _MAX_OBJECT_BYTES:
+            raise ValueError('Projected qualification artifact reference '
+                             'exceeds 65536 bytes.')
+        return encoded
+
+
+@dataclasses.dataclass(frozen=True)
 class ProviderOCIImageQualificationV1(_CanonicalContract):
     """Digest-qualified immutable OCI image identity."""
 
     requested_reference: str
     oci_manifest_digest: str
     oci_config_digest: str
-    qualification_artifact: ProviderRepoArtifactRefV1
+    qualification_artifact: ProviderProjectedQualificationArtifactRefV1
 
     _KEYS: ClassVar[frozenset[str]] = frozenset({
         'requested_reference', 'oci_manifest_digest', 'oci_config_digest',
@@ -1298,7 +1398,8 @@ class ProviderOCIImageQualificationV1(_CanonicalContract):
         if requested_manifest_digest != self.oci_manifest_digest:
             raise ValueError('image requested reference digest must equal the '
                              'qualified OCI manifest digest.')
-        if type(self.qualification_artifact) is not ProviderRepoArtifactRefV1:
+        if type(self.qualification_artifact
+               ) is not ProviderProjectedQualificationArtifactRefV1:
             raise TypeError('image qualification artifact has an invalid type.')
         _ = self.canonical_bytes
 
@@ -1310,8 +1411,9 @@ class ProviderOCIImageQualificationV1(_CanonicalContract):
         return cls(requested_reference=raw['requested_reference'],
                    oci_manifest_digest=raw['oci_manifest_digest'],
                    oci_config_digest=raw['oci_config_digest'],
-                   qualification_artifact=ProviderRepoArtifactRefV1.from_value(
-                       raw['qualification_artifact']))
+                   qualification_artifact=(
+                       ProviderProjectedQualificationArtifactRefV1.from_value(
+                           raw['qualification_artifact'])))
 
     def canonical_value(self) -> JsonObject:
         return {
@@ -1341,7 +1443,7 @@ class ProviderRuntimeImageIdentityV1(_CanonicalContract):
         'qualification_artifact_sha256', 'runtime_id_contract'
     })
     _SCHEMES: ClassVar[frozenset[str]] = frozenset(
-        {'containerd', 'cri-o', 'docker-pullable'})
+        {'containerd', 'cri-o', 'docker-pullable', 'oci-reference'})
 
     def __post_init__(self) -> None:
         raw_image_id = _text(self.raw_image_id,
@@ -1359,11 +1461,14 @@ class ProviderRuntimeImageIdentityV1(_CanonicalContract):
                 self, field,
                 _sha256_digest(getattr(self, field),
                                name=f'runtime_image.{field}'))
-        prefix = f'{scheme}://'
-        if not raw_image_id.startswith(prefix):
-            raise ValueError('raw runtime image ID does not match its declared '
-                             'scheme.')
-        raw_body = raw_image_id[len(prefix):]
+        if scheme == 'oci-reference':
+            raw_body = raw_image_id
+        else:
+            prefix = f'{scheme}://'
+            if not raw_image_id.startswith(prefix):
+                raise ValueError(
+                    'raw runtime image ID does not match its declared scheme.')
+            raw_body = raw_image_id[len(prefix):]
         raw_digest: str | None
         if scheme in ('containerd', 'cri-o'):
             raw_digest = raw_body
@@ -1390,9 +1495,20 @@ class ProviderRuntimeImageIdentityV1(_CanonicalContract):
             self, 'qualification_artifact_sha256',
             _sha256(self.qualification_artifact_sha256,
                     name='runtime_image.qualification_artifact_sha256'))
-        if self.runtime_id_contract != 'qualified_oci_config_digest_v1':
-            raise ValueError('runtime image ID contract is unsupported.')
-        if self.runtime_image_id_digest != self.qualified_oci_config_digest:
+        if scheme in ('containerd', 'cri-o'):
+            if self.runtime_id_contract != 'qualified_oci_config_digest_v1':
+                raise ValueError('runtime image config-ID contract is '
+                                 'unsupported.')
+            expected_digest = self.qualified_oci_config_digest
+        else:
+            if self.runtime_id_contract != 'qualified_oci_manifest_digest_v1':
+                raise ValueError('runtime image manifest-ID contract is '
+                                 'unsupported.')
+            expected_digest = self.qualified_oci_manifest_digest
+        if self.runtime_image_id_digest != expected_digest:
+            if scheme in ('docker-pullable', 'oci-reference'):
+                raise ValueError('runtime image ID must equal the qualified '
+                                 'OCI manifest digest.')
             raise ValueError('runtime image ID must equal the qualified OCI '
                              'config digest.')
 
@@ -1446,6 +1562,693 @@ class ProviderAuthorityWorkerImageV1(_CanonicalContract):
         }
 
 
+class CanonicalKubernetesResourceRequirementsV1(CanonicalJsonObject):
+    """Canonical Kubernetes container resource requirements."""
+
+
+class CanonicalKubernetesPodSecurityContextV1(CanonicalJsonObject):
+    """Canonical Kubernetes Pod security context."""
+
+
+class CanonicalKubernetesContainerSecurityContextV1(CanonicalJsonObject):
+    """Canonical Kubernetes container security context."""
+
+
+class CanonicalKubernetesAffinityV1(CanonicalJsonObject):
+    """Canonical Kubernetes affinity object."""
+
+
+class CanonicalKubernetesTolerationV1(CanonicalJsonObject):
+    """Canonical Kubernetes toleration object."""
+
+
+class CanonicalKubernetesTopologySpreadConstraintV1(CanonicalJsonObject):
+    """Canonical Kubernetes topology-spread constraint."""
+
+
+def _environment_name(value: Any, *, name: str) -> str:
+    parsed = _text(value, name=name, maximum_bytes=_MAX_SHORT_TEXT_BYTES)
+    if (not parsed.isascii() or
+            re.fullmatch(r'[A-Z_][A-Z0-9_]*', parsed) is None):
+        raise ValueError(f'{name} must be a canonical environment name.')
+    return parsed
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerConfigMapFileV1(_CanonicalContract):
+    """One immutable ConfigMap key mounted as an individual file."""
+
+    name: str
+    key: str
+    mount_path: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'name', 'key', 'mount_path'})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'name',
+                           _dns_subdomain(self.name, name='config_map.name'))
+        object.__setattr__(self, 'key', _text(self.key, name='config_map.key'))
+        object.__setattr__(self, 'mount_path',
+                           _text(self.mount_path, name='config_map.mount_path'))
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerConfigMapFileV1:
+        return cls(**_closed_object(
+            value, name='authority ConfigMap file', keys=cls._KEYS))
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerAuthSecretV1(_CanonicalContract):
+    """Purpose bearer-token Secret projection."""
+
+    name: str
+    key: str
+    mount_path: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'name', 'key', 'mount_path'})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'name',
+                           _dns_subdomain(self.name, name='auth_secret.name'))
+        object.__setattr__(self, 'key', _text(self.key, name='auth_secret.key'))
+        if self.mount_path != (
+                '/etc/skypilot/resource-action-authority/auth/tokens'):
+            raise ValueError('authority auth Secret mount path is unsupported.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerAuthSecretV1:
+        return cls(**_closed_object(
+            value, name='authority auth Secret', keys=cls._KEYS))
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerTLSSecretV1(_CanonicalContract):
+    """Purpose TLS Secret projection for one authority cohort."""
+
+    name: str
+    cert_key: str
+    private_key_key: str
+    ca_key: str
+    cert_path: str
+    private_key_path: str
+    ca_path: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'name', 'cert_key', 'private_key_key', 'ca_key', 'cert_path',
+        'private_key_path', 'ca_path'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'name',
+                           _dns_subdomain(self.name, name='tls_secret.name'))
+        for field in ('cert_key', 'private_key_key', 'ca_key'):
+            object.__setattr__(
+                self, field,
+                _text(getattr(self, field), name=f'tls_secret.{field}'))
+        expected = {
+            'cert_path': '/etc/skypilot/resource-action-authority/tls/tls.crt',
+            'private_key_path': '/etc/skypilot/resource-action-authority/tls/tls.key',
+            'ca_path': '/etc/skypilot/resource-action-authority/tls/ca.crt',
+        }
+        if any(
+                getattr(self, field) != value
+                for field, value in expected.items()):
+            raise ValueError('authority TLS Secret paths are unsupported.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerTLSSecretV1:
+        return cls(**_closed_object(
+            value, name='authority TLS Secret', keys=cls._KEYS))
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerDatabaseSecretV1(_CanonicalContract):
+    """PostgreSQL connection Secret key used by the frozen Pod template."""
+
+    name: str
+    key: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'name', 'key'})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'name', _dns_subdomain(self.name,
+                                         name='database_secret.name'))
+        object.__setattr__(self, 'key',
+                           _text(self.key, name='database_secret.key'))
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerDatabaseSecretV1:
+        return cls(**_closed_object(
+            value, name='authority database Secret', keys=cls._KEYS))
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerDownwardAPIFieldV1(_CanonicalContract):
+    """One exact downward-API environment binding."""
+
+    env: str
+    field_path: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'env', 'field_path'})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'env',
+                           _environment_name(self.env, name='downward.env'))
+        object.__setattr__(self, 'field_path',
+                           _text(self.field_path, name='downward.field_path'))
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> ProviderAuthorityWorkerDownwardAPIFieldV1:
+        return cls(**_closed_object(
+            value, name='authority downward API field', keys=cls._KEYS))
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerLiteralEnvV1(_CanonicalContract):
+    """One literal environment value in the frozen Pod template."""
+
+    name: str
+    value: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'name', 'value'})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'name', _environment_name(self.name, name='literal_env.name'))
+        object.__setattr__(self, 'value',
+                           _text(self.value, name='literal_env.value'))
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerLiteralEnvV1:
+        return cls(**_closed_object(
+            value, name='authority literal environment', keys=cls._KEYS))
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerSecretEnvV1(_CanonicalContract):
+    """One Secret-key environment value in the frozen Pod template."""
+
+    name: str
+    secret_name: str
+    key: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({'name', 'secret_name', 'key'})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'name',
+                           _environment_name(self.name, name='secret_env.name'))
+        object.__setattr__(
+            self, 'secret_name',
+            _dns_subdomain(self.secret_name, name='secret_env.secret_name'))
+        object.__setattr__(self, 'key', _text(self.key, name='secret_env.key'))
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerSecretEnvV1:
+        return cls(**_closed_object(
+            value, name='authority Secret environment', keys=cls._KEYS))
+
+    def canonical_value(self) -> JsonObject:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerPodTemplateReleaseInputsV1(_CanonicalContract):
+    """Complete Helm-varying preimage for one authority Pod template."""
+
+    version: int
+    namespace: str
+    helm_full_name: str
+    cohort_suffix: str
+    cohort_id: str
+    deployment_name: str
+    service_account_name: str
+    container_name: str
+    image: str
+    image_pull_policy: str
+    command: tuple[str, ...]
+    args: tuple[str, ...]
+    health_port: str
+    preflight_port: str
+    manifest_config_map: ProviderAuthorityWorkerConfigMapFileV1
+    qualification_config_map: ProviderAuthorityWorkerConfigMapFileV1
+    auth_secret: ProviderAuthorityWorkerAuthSecretV1
+    tls_secret: ProviderAuthorityWorkerTLSSecretV1
+    database_secret: ProviderAuthorityWorkerDatabaseSecretV1
+    downward_api_fields: tuple[ProviderAuthorityWorkerDownwardAPIFieldV1, ...]
+    literal_env: tuple[ProviderAuthorityWorkerLiteralEnvV1, ...]
+    secret_env: tuple[ProviderAuthorityWorkerSecretEnvV1, ...]
+    resources: CanonicalKubernetesResourceRequirementsV1
+    image_pull_secrets: tuple[str, ...]
+    pod_labels: tuple[ProviderLabelV1, ...]
+    pod_annotations_without_manifest_hash: tuple[ProviderAnnotationV1, ...]
+    pod_security_context: CanonicalKubernetesPodSecurityContextV1
+    container_security_context: CanonicalKubernetesContainerSecurityContextV1
+    node_selector: tuple[ProviderLabelV1, ...]
+    affinity: CanonicalKubernetesAffinityV1 | None
+    tolerations: tuple[CanonicalKubernetesTolerationV1, ...]
+    topology_spread_constraints: tuple[
+        CanonicalKubernetesTopologySpreadConstraintV1, ...]
+    priority_class_name: str | None
+    runtime_class_name: str | None
+    scheduler_name: str | None
+    termination_grace_period_seconds: int
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'namespace', 'helm_full_name', 'cohort_suffix', 'cohort_id',
+        'deployment_name', 'service_account_name', 'container_name', 'image',
+        'image_pull_policy', 'command', 'args', 'health_port', 'preflight_port',
+        'manifest_config_map', 'qualification_config_map', 'auth_secret',
+        'tls_secret', 'database_secret', 'downward_api_fields', 'literal_env',
+        'secret_env', 'resources', 'image_pull_secrets', 'pod_labels',
+        'pod_annotations_without_manifest_hash', 'pod_security_context',
+        'container_security_context', 'node_selector', 'affinity',
+        'tolerations', 'topology_spread_constraints', 'priority_class_name',
+        'runtime_class_name', 'scheduler_name',
+        'termination_grace_period_seconds'
+    })
+    _DOWNWARD_FIELDS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ('SKYPILOT_POD_NAME', 'metadata.name'),
+        ('SKYPILOT_POD_NAMESPACE', 'metadata.namespace'),
+        ('SKYPILOT_POD_UID', 'metadata.uid'),
+    )
+    _AUTH_TOKENS_PATH: ClassVar[
+        str] = '/etc/skypilot/resource-action-authority/auth/tokens'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='Pod template release-input version')
+        namespace = _dns_subdomain(self.namespace,
+                                   name='release_inputs.namespace')
+        full_name = _dns_label(self.helm_full_name,
+                               name='release_inputs.helm_full_name')
+        suffix = _dns_label(self.cohort_suffix,
+                            name='release_inputs.cohort_suffix')
+        if len(suffix) > 42:
+            raise ValueError('release_inputs.cohort_suffix exceeds 42 bytes.')
+        cohort_id = _authority_cohort_id(self.cohort_id,
+                                         name='release_inputs.cohort_id')
+        _, release_digest, cohort_id_suffix = _authority_cohort_id_parts(
+            cohort_id)
+        expected_digest = hashlib.sha256(
+            f'{namespace}\n{full_name}\n{suffix}'.encode('utf-8')).hexdigest()
+        if release_digest != expected_digest or cohort_id_suffix != suffix:
+            raise ValueError('release-input cohort ID does not bind its '
+                             'namespace/full name/suffix.')
+        object.__setattr__(self, 'namespace', namespace)
+        object.__setattr__(self, 'helm_full_name', full_name)
+        object.__setattr__(self, 'cohort_suffix', suffix)
+        object.__setattr__(self, 'cohort_id', cohort_id)
+        expected_name = f'{full_name}-authority-{suffix}'
+        for field in ('deployment_name', 'service_account_name'):
+            parsed = _dns_label(getattr(self, field),
+                                name=f'release_inputs.{field}')
+            if parsed != expected_name:
+                raise ValueError(f'release_inputs.{field} is not derived from '
+                                 'the Helm full name and cohort suffix.')
+            object.__setattr__(self, field, parsed)
+        if self.container_name != 'skypilot-authority-worker':
+            raise ValueError('authority container name is unsupported.')
+        image = _text(self.image, name='release_inputs.image')
+        try:
+            canonical_image = container_image_models.validate_oci_reference(
+                image, 'release_inputs.image')
+            _, digest = container_image_models.split_digest(canonical_image)
+        except (TypeError, ValueError) as e:
+            raise ValueError('release-input image is not a canonical OCI '
+                             'reference.') from e
+        if canonical_image != image or digest is None:
+            raise ValueError('release-input image must be digest-pinned.')
+        object.__setattr__(self, 'image', image)
+        if self.image_pull_policy != 'Always':
+            raise ValueError('authority image pull policy must be Always.')
+        for field in ('command', 'args'):
+            values = getattr(self, field)
+            if (type(values) is not tuple or not values or
+                    len(values) > _MAX_LIST_ITEMS):
+                raise ValueError(f'release_inputs.{field} must be a nonempty '
+                                 'bounded tuple.')
+            object.__setattr__(
+                self, field,
+                tuple(
+                    _text(value, name=f'release_inputs.{field}')
+                    for value in values))
+        health = _decimal_port_text(self.health_port,
+                                    name='release_inputs.health_port')
+        preflight = _decimal_port_text(self.preflight_port,
+                                       name='release_inputs.preflight_port')
+        if health == preflight:
+            raise ValueError(
+                'authority health and preflight ports must differ.')
+        object.__setattr__(self, 'health_port', health)
+        object.__setattr__(self, 'preflight_port', preflight)
+        expected_types = (
+            ('manifest_config_map', ProviderAuthorityWorkerConfigMapFileV1),
+            ('qualification_config_map',
+             ProviderAuthorityWorkerConfigMapFileV1),
+            ('auth_secret', ProviderAuthorityWorkerAuthSecretV1),
+            ('tls_secret', ProviderAuthorityWorkerTLSSecretV1),
+            ('database_secret', ProviderAuthorityWorkerDatabaseSecretV1),
+            ('resources', CanonicalKubernetesResourceRequirementsV1),
+            ('pod_security_context', CanonicalKubernetesPodSecurityContextV1),
+            ('container_security_context',
+             CanonicalKubernetesContainerSecurityContextV1),
+        )
+        for field, expected_type in expected_types:
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'release_inputs.{field} has an invalid type.')
+        if (self.manifest_config_map.key != 'manifest.json' or
+                self.manifest_config_map.mount_path
+                != '/etc/skypilot/resource-action-authority/manifest.json'):
+            raise ValueError('manifest ConfigMap projection is unsupported.')
+        if (self.qualification_config_map.key != 'qualification.json' or
+                self.qualification_config_map.mount_path !=
+                '/etc/skypilot/resource-action-authority/qualification.json'):
+            raise ValueError('qualification ConfigMap projection is '
+                             'unsupported.')
+        downward = tuple(
+            (item.env, item.field_path) for item in self.downward_api_fields)
+        if (type(self.downward_api_fields) is not tuple or any(
+                type(item) is not ProviderAuthorityWorkerDownwardAPIFieldV1
+                for item in self.downward_api_fields) or
+                downward != self._DOWNWARD_FIELDS):
+            raise ValueError('authority downward API fields are not the exact '
+                             'ordered v1 inventory.')
+        for field, expected_type in (
+            ('literal_env', ProviderAuthorityWorkerLiteralEnvV1),
+            ('secret_env', ProviderAuthorityWorkerSecretEnvV1),
+        ):
+            values = getattr(self, field)
+            if (type(values) is not tuple or len(values) > _MAX_LIST_ITEMS or
+                    any(type(item) is not expected_type for item in values)):
+                raise ValueError(f'release_inputs.{field} has invalid entries.')
+            names = tuple(item.name for item in values)
+            if names != tuple(sorted(set(names))):
+                raise ValueError(f'release_inputs.{field} must be sorted by '
+                                 'unique name.')
+        expected_literal_env = (
+            ('SKYPILOT_API_REQUEST_BACKEND', 'postgres'),
+            ('SKYPILOT_API_SERVER_ROLE', 'authority-worker'),
+            ('SKYPILOT_RELEASE_NAME', full_name),
+            ('SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE',
+             self._AUTH_TOKENS_PATH),
+            ('SKYPILOT_STATE_DB_MIGRATION_MODE', 'verify'),
+        )
+        if tuple((item.name, item.value)
+                 for item in self.literal_env) != expected_literal_env:
+            raise ValueError('authority literal environment is not the exact '
+                             'ordered v1 inventory.')
+        if (len(self.secret_env) != 1 or
+                self.secret_env[0].name != 'SKYPILOT_DB_CONNECTION_URI' or
+                self.secret_env[0].secret_name != self.database_secret.name or
+                self.secret_env[0].key != self.database_secret.key):
+            raise ValueError('database Secret environment does not match its '
+                             'exact declared v1 inventory.')
+        if (type(self.image_pull_secrets) is not tuple or
+                len(self.image_pull_secrets) > _MAX_LIST_ITEMS):
+            raise ValueError('image_pull_secrets must be a bounded tuple.')
+        parsed_pull_secrets = tuple(
+            _dns_subdomain(value, name='release_inputs.image_pull_secret')
+            for value in self.image_pull_secrets)
+        if len(set(parsed_pull_secrets)) != len(parsed_pull_secrets):
+            raise ValueError('image_pull_secrets must be unique.')
+        object.__setattr__(self, 'image_pull_secrets', parsed_pull_secrets)
+        for field, expected_type in (
+            ('pod_labels', ProviderLabelV1),
+            ('pod_annotations_without_manifest_hash', ProviderAnnotationV1),
+            ('node_selector', ProviderLabelV1),
+        ):
+            values = getattr(self, field)
+            if (type(values) is not tuple or len(values) > _MAX_LIST_ITEMS or
+                    any(type(item) is not expected_type for item in values)):
+                raise ValueError(f'release_inputs.{field} has invalid entries.')
+            keys = tuple(item.key for item in values)
+            if keys != tuple(sorted(set(keys))):
+                raise ValueError(f'release_inputs.{field} must be sorted by '
+                                 'unique key.')
+        if any(item.key == 'skypilot.co/resource-action-manifest-sha256'
+               for item in self.pod_annotations_without_manifest_hash):
+            raise ValueError('manifest hash annotation must be excluded from '
+                             'release inputs.')
+        if self.affinity is not None and type(
+                self.affinity) is not CanonicalKubernetesAffinityV1:
+            raise TypeError('release_inputs.affinity has an invalid type.')
+        for field, expected_type in (
+            ('tolerations', CanonicalKubernetesTolerationV1),
+            ('topology_spread_constraints',
+             CanonicalKubernetesTopologySpreadConstraintV1),
+        ):
+            values = getattr(self, field)
+            if (type(values) is not tuple or len(values) > _MAX_LIST_ITEMS or
+                    any(type(item) is not expected_type for item in values)):
+                raise ValueError(f'release_inputs.{field} has invalid entries.')
+        fixed_toleration_keys = frozenset({
+            'node.kubernetes.io/not-ready',
+            'node.kubernetes.io/unreachable',
+        })
+        for toleration in self.tolerations:
+            value = toleration.canonical_value()
+            if (value.get('key') in fixed_toleration_keys and
+                    value.get('effect') in (None, '', 'NoExecute')):
+                raise ValueError(
+                    'release_inputs.tolerations collides with a fixed '
+                    'authority admission-default toleration.')
+        for field in ('priority_class_name', 'runtime_class_name',
+                      'scheduler_name'):
+            object.__setattr__(
+                self, field,
+                _optional_text(getattr(self, field),
+                               name=f'release_inputs.{field}'))
+        object.__setattr__(
+            self, 'termination_grace_period_seconds',
+            _positive_integer(
+                self.termination_grace_period_seconds,
+                name='release_inputs.termination_grace_period_seconds'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(
+            cls,
+            value: Any) -> ProviderAuthorityWorkerPodTemplateReleaseInputsV1:
+        raw = _closed_object(value,
+                             name='authority Pod-template release inputs',
+                             keys=cls._KEYS)
+
+        def _tuple(field: str, reader: Any) -> tuple[Any, ...]:
+            items = raw[field]
+            if type(items) is not list:
+                raise TypeError(f'release_inputs.{field} must be a list.')
+            return tuple(reader(item) for item in items)
+
+        affinity = raw['affinity']
+        return cls(
+            version=raw['version'],
+            namespace=raw['namespace'],
+            helm_full_name=raw['helm_full_name'],
+            cohort_suffix=raw['cohort_suffix'],
+            cohort_id=raw['cohort_id'],
+            deployment_name=raw['deployment_name'],
+            service_account_name=raw['service_account_name'],
+            container_name=raw['container_name'],
+            image=raw['image'],
+            image_pull_policy=raw['image_pull_policy'],
+            command=_tuple('command', lambda item: item),
+            args=_tuple('args', lambda item: item),
+            health_port=raw['health_port'],
+            preflight_port=raw['preflight_port'],
+            manifest_config_map=ProviderAuthorityWorkerConfigMapFileV1.
+            from_value(raw['manifest_config_map']),
+            qualification_config_map=(
+                ProviderAuthorityWorkerConfigMapFileV1.from_value(
+                    raw['qualification_config_map'])),
+            auth_secret=ProviderAuthorityWorkerAuthSecretV1.from_value(
+                raw['auth_secret']),
+            tls_secret=ProviderAuthorityWorkerTLSSecretV1.from_value(
+                raw['tls_secret']),
+            database_secret=ProviderAuthorityWorkerDatabaseSecretV1.from_value(
+                raw['database_secret']),
+            downward_api_fields=_tuple(
+                'downward_api_fields',
+                ProviderAuthorityWorkerDownwardAPIFieldV1.from_value),
+            literal_env=_tuple('literal_env',
+                               ProviderAuthorityWorkerLiteralEnvV1.from_value),
+            secret_env=_tuple('secret_env',
+                              ProviderAuthorityWorkerSecretEnvV1.from_value),
+            resources=CanonicalKubernetesResourceRequirementsV1(
+                raw['resources']),
+            image_pull_secrets=_tuple('image_pull_secrets', lambda item: item),
+            pod_labels=_tuple('pod_labels', ProviderLabelV1.from_value),
+            pod_annotations_without_manifest_hash=_tuple(
+                'pod_annotations_without_manifest_hash',
+                ProviderAnnotationV1.from_value),
+            pod_security_context=(CanonicalKubernetesPodSecurityContextV1(
+                raw['pod_security_context'])),
+            container_security_context=(
+                CanonicalKubernetesContainerSecurityContextV1(
+                    raw['container_security_context'])),
+            node_selector=_tuple('node_selector', ProviderLabelV1.from_value),
+            affinity=(None if affinity is None else
+                      CanonicalKubernetesAffinityV1(affinity)),
+            tolerations=_tuple('tolerations',
+                               CanonicalKubernetesTolerationV1.from_value),
+            topology_spread_constraints=_tuple(
+                'topology_spread_constraints',
+                CanonicalKubernetesTopologySpreadConstraintV1.from_value),
+            priority_class_name=raw['priority_class_name'],
+            runtime_class_name=raw['runtime_class_name'],
+            scheduler_name=raw['scheduler_name'],
+            termination_grace_period_seconds=raw[
+                'termination_grace_period_seconds'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'namespace': self.namespace,
+            'helm_full_name': self.helm_full_name,
+            'cohort_suffix': self.cohort_suffix,
+            'cohort_id': self.cohort_id,
+            'deployment_name': self.deployment_name,
+            'service_account_name': self.service_account_name,
+            'container_name': 'skypilot-authority-worker',
+            'image': self.image,
+            'image_pull_policy': 'Always',
+            'command': list(self.command),
+            'args': list(self.args),
+            'health_port': self.health_port,
+            'preflight_port': self.preflight_port,
+            'manifest_config_map': self.manifest_config_map.canonical_value(),
+            'qualification_config_map':
+                self.qualification_config_map.canonical_value(),
+            'auth_secret': self.auth_secret.canonical_value(),
+            'tls_secret': self.tls_secret.canonical_value(),
+            'database_secret': self.database_secret.canonical_value(),
+            'downward_api_fields': [
+                item.canonical_value() for item in self.downward_api_fields
+            ],
+            'literal_env': [
+                item.canonical_value() for item in self.literal_env
+            ],
+            'secret_env': [item.canonical_value() for item in self.secret_env],
+            'resources': self.resources.canonical_value(),
+            'image_pull_secrets': list(self.image_pull_secrets),
+            'pod_labels': [item.canonical_value() for item in self.pod_labels],
+            'pod_annotations_without_manifest_hash': [
+                item.canonical_value()
+                for item in self.pod_annotations_without_manifest_hash
+            ],
+            'pod_security_context': self.pod_security_context.canonical_value(),
+            'container_security_context':
+                self.container_security_context.canonical_value(),
+            'node_selector': [
+                item.canonical_value() for item in self.node_selector
+            ],
+            'affinity': (None if self.affinity is None else
+                         self.affinity.canonical_value()),
+            'tolerations': [
+                item.canonical_value() for item in self.tolerations
+            ],
+            'topology_spread_constraints': [
+                item.canonical_value()
+                for item in self.topology_spread_constraints
+            ],
+            'priority_class_name': self.priority_class_name,
+            'runtime_class_name': self.runtime_class_name,
+            'scheduler_name': self.scheduler_name,
+            'termination_grace_period_seconds':
+                self.termination_grace_period_seconds,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerPodTemplateBindingV1(_CanonicalContract):
+    """Hash binding from release inputs to the exact PodTemplateSpec."""
+
+    version: int
+    contract: str
+    projector_artifact_sha256: str
+    release_inputs: ProviderAuthorityWorkerPodTemplateReleaseInputsV1
+    expected_template_sha256: str
+    manifest_hash_annotation_json_pointer: str
+    manifest_hash_placeholder: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'contract', 'projector_artifact_sha256', 'release_inputs',
+        'expected_template_sha256', 'manifest_hash_annotation_json_pointer',
+        'manifest_hash_placeholder'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='Pod-template binding version')
+        if self.contract != 'authority_worker_pod_template_v1':
+            raise ValueError('Pod-template binding contract is unsupported.')
+        object.__setattr__(
+            self, 'projector_artifact_sha256',
+            _sha256(self.projector_artifact_sha256,
+                    name='pod_template_binding.projector_artifact_sha256'))
+        if type(self.release_inputs
+               ) is not ProviderAuthorityWorkerPodTemplateReleaseInputsV1:
+            raise TypeError('Pod-template release inputs have an invalid type.')
+        object.__setattr__(
+            self, 'expected_template_sha256',
+            _sha256(self.expected_template_sha256,
+                    name='pod_template_binding.expected_template_sha256'))
+        if self.manifest_hash_annotation_json_pointer != (
+                '/metadata/annotations/'
+                'skypilot.co~1resource-action-manifest-sha256'):
+            raise ValueError('manifest hash annotation pointer is unsupported.')
+        if self.manifest_hash_placeholder != '$MANIFEST_SHA256':
+            raise ValueError('manifest hash placeholder is unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> ProviderAuthorityWorkerPodTemplateBindingV1:
+        raw = _closed_object(value,
+                             name='authority Pod-template binding',
+                             keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            contract=raw['contract'],
+            projector_artifact_sha256=raw['projector_artifact_sha256'],
+            release_inputs=(
+                ProviderAuthorityWorkerPodTemplateReleaseInputsV1.from_value(
+                    raw['release_inputs'])),
+            expected_template_sha256=raw['expected_template_sha256'],
+            manifest_hash_annotation_json_pointer=raw[
+                'manifest_hash_annotation_json_pointer'],
+            manifest_hash_placeholder=raw['manifest_hash_placeholder'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'contract': 'authority_worker_pod_template_v1',
+            'projector_artifact_sha256': self.projector_artifact_sha256,
+            'release_inputs': self.release_inputs.canonical_value(),
+            'expected_template_sha256': self.expected_template_sha256,
+            'manifest_hash_annotation_json_pointer':
+                self.manifest_hash_annotation_json_pointer,
+            'manifest_hash_placeholder': '$MANIFEST_SHA256',
+        }
+
+
 @dataclasses.dataclass(frozen=True)
 class ProviderAuthorityWorkerCohortManifestV1(_CanonicalContract):
     """Static release-rendered identity for an authority-worker cohort."""
@@ -1458,6 +2261,7 @@ class ProviderAuthorityWorkerCohortManifestV1(_CanonicalContract):
     container_name: str
     image: ProviderOCIImageQualificationV1
     pod_template_contract: ProviderRepoArtifactRefV1
+    pod_template_binding: ProviderAuthorityWorkerPodTemplateBindingV1
     artifact_inventory: ProviderRepoArtifactRefV1
     callable_inventory: ProviderRepoArtifactRefV1
     claim_contract: str
@@ -1466,13 +2270,14 @@ class ProviderAuthorityWorkerCohortManifestV1(_CanonicalContract):
     _KEYS: ClassVar[frozenset[str]] = frozenset({
         'version', 'cohort_id', 'namespace', 'deployment_name',
         'service_account_name', 'container_name', 'image',
-        'pod_template_contract', 'artifact_inventory', 'callable_inventory',
-        'claim_contract', 'handler_allowlist'
+        'pod_template_contract', 'pod_template_binding', 'artifact_inventory',
+        'callable_inventory', 'claim_contract', 'handler_allowlist'
     })
 
     def __post_init__(self) -> None:
         _version_one(self.version, name='cohort manifest version')
-        cohort_id = _dns_label(self.cohort_id, name='cohort_manifest.cohort_id')
+        cohort_id = _authority_cohort_id(self.cohort_id,
+                                         name='cohort_manifest.cohort_id')
         object.__setattr__(self, 'cohort_id', cohort_id)
         for field in ('namespace', 'deployment_name', 'service_account_name'):
             object.__setattr__(
@@ -1488,6 +2293,23 @@ class ProviderAuthorityWorkerCohortManifestV1(_CanonicalContract):
                       'callable_inventory'):
             if type(getattr(self, field)) is not ProviderRepoArtifactRefV1:
                 raise TypeError(f'cohort manifest {field} has an invalid type.')
+        if type(self.pod_template_binding
+               ) is not ProviderAuthorityWorkerPodTemplateBindingV1:
+            raise TypeError('cohort manifest Pod-template binding has an '
+                            'invalid type.')
+        release_inputs = self.pod_template_binding.release_inputs
+        if (release_inputs.cohort_id != cohort_id or
+                release_inputs.namespace != self.namespace or
+                release_inputs.deployment_name != self.deployment_name or
+                release_inputs.service_account_name != self.service_account_name
+                or release_inputs.container_name != self.container_name or
+                release_inputs.image != self.image.requested_reference):
+            raise ValueError('cohort manifest and Pod-template release inputs '
+                             'are not byte-bound.')
+        if (self.pod_template_binding.projector_artifact_sha256
+                != self.pod_template_contract.sha256):
+            raise ValueError('Pod-template binding does not name the manifest '
+                             'projector artifact.')
         if self.claim_contract != 'frozen_action_cohort_join_v1':
             raise ValueError('cohort manifest claim contract is unsupported.')
         if type(self.handler_allowlist) is not tuple:
@@ -1517,6 +2339,9 @@ class ProviderAuthorityWorkerCohortManifestV1(_CanonicalContract):
                        raw['image']),
                    pod_template_contract=ProviderRepoArtifactRefV1.from_value(
                        raw['pod_template_contract']),
+                   pod_template_binding=(
+                       ProviderAuthorityWorkerPodTemplateBindingV1.from_value(
+                           raw['pod_template_binding'])),
                    artifact_inventory=ProviderRepoArtifactRefV1.from_value(
                        raw['artifact_inventory']),
                    callable_inventory=ProviderRepoArtifactRefV1.from_value(
@@ -1535,6 +2360,7 @@ class ProviderAuthorityWorkerCohortManifestV1(_CanonicalContract):
             'image': self.image.canonical_value(),
             'pod_template_contract':
                 self.pod_template_contract.canonical_value(),
+            'pod_template_binding': self.pod_template_binding.canonical_value(),
             'artifact_inventory': self.artifact_inventory.canonical_value(),
             'callable_inventory': self.callable_inventory.canonical_value(),
             'claim_contract': 'frozen_action_cohort_join_v1',
@@ -1812,14 +2638,19 @@ class ProviderAuthorityWorkerRegistrationV1(_CanonicalContract):
     pod_ready: bool
     deployment_spec_replicas: int
     deployment_status_observed_generation: int
+    deployment_status_replicas: int
+    deployment_updated_replicas: int
     deployment_ready_replicas: int
     deployment_available_replicas: int
+    deployment_unavailable_replicas: int
     registered_at: str
 
     _KEYS: ClassVar[frozenset[str]] = frozenset({
         'worker', 'pod_ready', 'deployment_spec_replicas',
-        'deployment_status_observed_generation', 'deployment_ready_replicas',
-        'deployment_available_replicas', 'registered_at'
+        'deployment_status_observed_generation', 'deployment_status_replicas',
+        'deployment_updated_replicas', 'deployment_ready_replicas',
+        'deployment_available_replicas', 'deployment_unavailable_replicas',
+        'registered_at'
     })
 
     def __post_init__(self) -> None:
@@ -1828,11 +2659,18 @@ class ProviderAuthorityWorkerRegistrationV1(_CanonicalContract):
         _boolean(self.pod_ready, name='registration.pod_ready')
         if not self.pod_ready:
             raise ValueError('worker registration requires a ready Pod.')
-        for field in ('deployment_spec_replicas', 'deployment_ready_replicas',
+        for field in ('deployment_spec_replicas', 'deployment_status_replicas',
+                      'deployment_updated_replicas',
+                      'deployment_ready_replicas',
                       'deployment_available_replicas'):
             if _positive_integer(getattr(self, field),
                                  name=f'registration.{field}') != 2:
                 raise ValueError(f'registration.{field} must equal 2.')
+        if _nonnegative_integer(
+                self.deployment_unavailable_replicas,
+                name='registration.deployment_unavailable_replicas') != 0:
+            raise ValueError(
+                'registration.deployment_unavailable_replicas must equal 0.')
         observed = _positive_integer(
             self.deployment_status_observed_generation,
             name='registration.deployment_status_observed_generation')
@@ -1858,8 +2696,12 @@ class ProviderAuthorityWorkerRegistrationV1(_CanonicalContract):
             deployment_spec_replicas=raw['deployment_spec_replicas'],
             deployment_status_observed_generation=raw[
                 'deployment_status_observed_generation'],
+            deployment_status_replicas=raw['deployment_status_replicas'],
+            deployment_updated_replicas=raw['deployment_updated_replicas'],
             deployment_ready_replicas=raw['deployment_ready_replicas'],
             deployment_available_replicas=raw['deployment_available_replicas'],
+            deployment_unavailable_replicas=raw[
+                'deployment_unavailable_replicas'],
             registered_at=raw['registered_at'])
 
     def canonical_value(self) -> JsonObject:
@@ -1869,8 +2711,11 @@ class ProviderAuthorityWorkerRegistrationV1(_CanonicalContract):
             'deployment_spec_replicas': 2,
             'deployment_status_observed_generation':
                 self.deployment_status_observed_generation,
+            'deployment_status_replicas': 2,
+            'deployment_updated_replicas': 2,
             'deployment_ready_replicas': 2,
             'deployment_available_replicas': 2,
+            'deployment_unavailable_replicas': 0,
             'registered_at': self.registered_at,
         }
 
@@ -2324,7 +3169,8 @@ class WorkerCohortReferenceInputV1(_CanonicalContract):
             _uuid(self.decision_id, name='cohort_reference.decision_id'))
         object.__setattr__(
             self, 'cohort_id',
-            _dns_label(self.cohort_id, name='cohort_reference.cohort_id'))
+            _authority_cohort_id(self.cohort_id,
+                                 name='cohort_reference.cohort_id'))
         service_hash = _schema_uuid(self.service_hash,
                                     name='cohort_reference.service_hash')
         object.__setattr__(self, 'service_hash', str(service_hash))
@@ -2492,7 +3338,7 @@ class ProviderLaunchIdentityCanonicalizationContextV1(_CanonicalContract):
         object.__setattr__(self, 'decision_id', decision_id)
         object.__setattr__(
             self, 'cohort_id',
-            _dns_label(
+            _authority_cohort_id(
                 self.cohort_id,
                 name='launch identity canonicalization context cohort_id'))
         action_type = _action_kind(
@@ -12521,6 +13367,829 @@ class ProviderLifecyclePlanV1(_CanonicalContract):
                     basis.launch_workspace_identity.sha256):
                 raise ValueError('down plan workspace hash does not match its '
                                  'prior launch workspace identity.')
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchPreflightSeedV1(_CanonicalContract):
+    """Closed controller-owned launch preimage sent to an authority worker."""
+
+    version: int
+    resource_identity: ProviderResourceIdentityV1
+    workspace: str
+    source: ProviderLaunchSourceV1
+    requested_target: ProviderLocatorV1
+    requested_cloud: str
+    context_mode: str
+    target_namespace: str
+    resources: ProviderPodResourceSnapshotV1
+    topology: ProviderPodTopologyV1
+    replica_id: int
+    retry_until_up: bool
+    request_identity: ProviderKubernetesRequestIdentityV1
+    config_projection: ProviderKubernetesConfigProjectionV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'resource_identity', 'workspace', 'source',
+        'requested_target', 'requested_cloud', 'context_mode',
+        'target_namespace', 'resources', 'topology', 'replica_id',
+        'retry_until_up', 'request_identity', 'config_projection'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='launch preflight seed version')
+        for field, expected_type in (
+            ('resource_identity', ProviderResourceIdentityV1),
+            ('source', ProviderLaunchSourceV1),
+            ('requested_target', ProviderLocatorV1),
+            ('resources', ProviderPodResourceSnapshotV1),
+            ('topology', ProviderPodTopologyV1),
+            ('request_identity', ProviderKubernetesRequestIdentityV1),
+            ('config_projection', ProviderKubernetesConfigProjectionV1),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'launch preflight seed {field} has an invalid '
+                                'type.')
+        workspace = _text(self.workspace,
+                          name='launch_preflight_seed.workspace')
+        namespace = _text(self.target_namespace,
+                          name='launch_preflight_seed.target_namespace',
+                          maximum_bytes=_MAX_SHORT_TEXT_BYTES)
+        object.__setattr__(self, 'workspace', workspace)
+        object.__setattr__(self, 'target_namespace', namespace)
+        if self.requested_cloud != 'kubernetes':
+            raise ValueError('launch preflight requested cloud must be '
+                             'kubernetes.')
+        if self.context_mode != 'in_cluster':
+            raise ValueError('launch preflight context mode must be '
+                             'in_cluster.')
+        replica_id = _nonnegative_integer(
+            self.replica_id, name='launch_preflight_seed.replica_id')
+        object.__setattr__(self, 'replica_id', replica_id)
+        _boolean(self.retry_until_up,
+                 name='launch_preflight_seed.retry_until_up')
+        if not self.requested_target.is_authoritative_pod_locator:
+            raise ValueError('launch preflight requires an authoritative '
+                             'Kubernetes Pod target.')
+        kubernetes = self.requested_target.kubernetes
+        assert kubernetes is not None
+        proof = self.source.identity_canonicalization
+        proof_resource_identity = proof.context.input.resource_identity
+        if (proof_resource_identity.canonical_bytes
+                != self.resource_identity.canonical_bytes):
+            raise ValueError('launch preflight resource identity does not '
+                             'match its retained source proof.')
+        projected_request_identity = (
+            project_provider_kubernetes_request_identity_v1(
+                proof.effective_original_user, kubernetes.name_basis))
+        if (self.source.content.workspace != workspace or
+                self.source.content.service_incarnation
+                != self.resource_identity.service_incarnation or
+                proof.effective_user_hash
+                != kubernetes.name_basis.frozen_user_hash or
+                projected_request_identity.canonical_bytes
+                != self.request_identity.canonical_bytes):
+            raise ValueError('launch preflight source, workspace, or request '
+                             'identity projection does not match.')
+        if (replica_id != self.resource_identity.replica_id or
+                kubernetes.replica_incarnation_label != str(
+                    self.resource_identity.replica_incarnation)):
+            raise ValueError('launch preflight replica identity does not '
+                             'match its requested target.')
+        if (namespace != kubernetes.namespace or
+                namespace != self.resources.namespace or
+                namespace != self.config_projection.target_namespace or
+                self.resources.cluster_fingerprint_sha256
+                != kubernetes.cluster_fingerprint_sha256 or
+                self.topology.canonical_bytes
+                != kubernetes.topology.canonical_bytes or
+                self.resources.ports != self.topology.resources_ports):
+            raise ValueError('launch preflight target, resources, topology, '
+                             'and namespace do not match.')
+        if (self.config_projection.workspace != workspace or
+                self.config_projection.context_mode != self.context_mode):
+            raise ValueError('launch preflight configuration projection does '
+                             'not match its outer workspace or context.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderLaunchPreflightSeedV1:
+        raw = _closed_object(value,
+                             name='launch preflight seed',
+                             keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            resource_identity=ProviderResourceIdentityV1.from_value(
+                raw['resource_identity']),
+            workspace=raw['workspace'],
+            source=ProviderLaunchSourceV1.from_value(raw['source']),
+            requested_target=ProviderLocatorV1.from_value(
+                raw['requested_target']),
+            requested_cloud=raw['requested_cloud'],
+            context_mode=raw['context_mode'],
+            target_namespace=raw['target_namespace'],
+            resources=ProviderPodResourceSnapshotV1.from_value(
+                raw['resources']),
+            topology=ProviderPodTopologyV1.from_value(raw['topology']),
+            replica_id=raw['replica_id'],
+            retry_until_up=raw['retry_until_up'],
+            request_identity=ProviderKubernetesRequestIdentityV1.from_value(
+                raw['request_identity']),
+            config_projection=ProviderKubernetesConfigProjectionV1.from_value(
+                raw['config_projection']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'resource_identity': self.resource_identity.canonical_value(),
+            'workspace': self.workspace,
+            'source': self.source.canonical_value(),
+            'requested_target': self.requested_target.canonical_value(),
+            'requested_cloud': 'kubernetes',
+            'context_mode': 'in_cluster',
+            'target_namespace': self.target_namespace,
+            'resources': self.resources.canonical_value(),
+            'topology': self.topology.canonical_value(),
+            'replica_id': self.replica_id,
+            'retry_until_up': self.retry_until_up,
+            'request_identity': self.request_identity.canonical_value(),
+            'config_projection': self.config_projection.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderDownPreflightSeedV1(_CanonicalContract):
+    """Closed controller-owned down preimage sent to an authority worker."""
+
+    version: int
+    resource_identity: ProviderResourceIdentityV1
+    workspace: str
+    requested_target: ProviderLocatorV1
+    prior_launch_basis: PriorLaunchBasisV1
+    prior_launch_basis_sha256: str
+    cleanup_target: ProviderKubernetesCleanupTargetV1
+    cleanup_target_sha256: str
+    context_mode: str
+    config_projection: ProviderKubernetesConfigProjectionV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'resource_identity', 'workspace', 'requested_target',
+        'prior_launch_basis', 'prior_launch_basis_sha256', 'cleanup_target',
+        'cleanup_target_sha256', 'context_mode', 'config_projection'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='down preflight seed version')
+        for field, expected_types in (
+            ('resource_identity', (ProviderResourceIdentityV1,)),
+            ('requested_target', (ProviderLocatorV1,)),
+            ('prior_launch_basis', (CompletedLaunchBasisV1,
+                                    PartialLaunchCleanupBasisV1)),
+            ('cleanup_target', (ProviderKubernetesCleanupTargetV1,)),
+            ('config_projection', (ProviderKubernetesConfigProjectionV1,)),
+        ):
+            if type(getattr(self, field)) not in expected_types:
+                raise TypeError(f'down preflight seed {field} has an invalid '
+                                'type.')
+        workspace = _text(self.workspace, name='down_preflight_seed.workspace')
+        object.__setattr__(self, 'workspace', workspace)
+        if self.context_mode != 'in_cluster':
+            raise ValueError('down preflight context mode must be in_cluster.')
+        basis_hash = _sha256(
+            self.prior_launch_basis_sha256,
+            name='down_preflight_seed.prior_launch_basis_sha256')
+        cleanup_hash = _sha256(self.cleanup_target_sha256,
+                               name='down_preflight_seed.cleanup_target_sha256')
+        object.__setattr__(self, 'prior_launch_basis_sha256', basis_hash)
+        object.__setattr__(self, 'cleanup_target_sha256', cleanup_hash)
+        if basis_hash != self.prior_launch_basis.sha256:
+            raise ValueError('down preflight prior-launch basis hash does not '
+                             'match its complete preimage.')
+        if cleanup_hash != self.cleanup_target.sha256:
+            raise ValueError('down preflight cleanup-target hash does not '
+                             'match its complete preimage.')
+        _validate_prior_launch_cleanup_target_binding_v1(
+            self.prior_launch_basis, self.cleanup_target)
+        if not self.requested_target.is_authoritative_pod_locator:
+            raise ValueError('down preflight requires an authoritative '
+                             'Kubernetes Pod target.')
+        if self.requested_target.canonical_bytes != (
+                self.prior_launch_basis.launch_requested_target.canonical_bytes
+        ):
+            raise ValueError('down preflight requested target is not '
+                             'byte-equal to its prior launch basis.')
+        prior_identity = self.prior_launch_basis.launch_resource_identity
+        stable_fields = ('service_hash', 'service_incarnation', 'replica_id',
+                         'replica_incarnation')
+        if any(
+                getattr(self.resource_identity, field) != getattr(
+                    prior_identity, field) for field in stable_fields):
+            raise ValueError('down preflight resource identity does not match '
+                             'its prior launch identity.')
+        if self.resource_identity.desired_generation != (
+                prior_identity.desired_generation + 1):
+            raise ValueError('down preflight generation must immediately '
+                             'follow its prior launch generation.')
+        kubernetes = self.requested_target.kubernetes
+        assert kubernetes is not None
+        if (workspace
+                != self.prior_launch_basis.launch_workspace_identity.workspace
+                or self.config_projection.workspace != workspace or
+                self.config_projection.context_mode != self.context_mode or
+                self.config_projection.target_namespace
+                != kubernetes.namespace):
+            raise ValueError('down preflight workspace, target, and '
+                             'configuration projection do not match.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderDownPreflightSeedV1:
+        raw = _closed_object(value, name='down preflight seed', keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            resource_identity=ProviderResourceIdentityV1.from_value(
+                raw['resource_identity']),
+            workspace=raw['workspace'],
+            requested_target=ProviderLocatorV1.from_value(
+                raw['requested_target']),
+            prior_launch_basis=prior_launch_basis_from_value_v1(
+                raw['prior_launch_basis']),
+            prior_launch_basis_sha256=raw['prior_launch_basis_sha256'],
+            cleanup_target=ProviderKubernetesCleanupTargetV1.from_value(
+                raw['cleanup_target']),
+            cleanup_target_sha256=raw['cleanup_target_sha256'],
+            context_mode=raw['context_mode'],
+            config_projection=ProviderKubernetesConfigProjectionV1.from_value(
+                raw['config_projection']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'resource_identity': self.resource_identity.canonical_value(),
+            'workspace': self.workspace,
+            'requested_target': self.requested_target.canonical_value(),
+            'prior_launch_basis': self.prior_launch_basis.canonical_value(),
+            'prior_launch_basis_sha256': self.prior_launch_basis_sha256,
+            'cleanup_target': self.cleanup_target.canonical_value(),
+            'cleanup_target_sha256': self.cleanup_target_sha256,
+            'context_mode': 'in_cluster',
+            'config_projection': self.config_projection.canonical_value(),
+        }
+
+
+ProviderLifecyclePreflightSeedV1 = (ProviderLaunchPreflightSeedV1 |
+                                    ProviderDownPreflightSeedV1)
+
+_PROVIDER_AUTHORITY_PREFLIGHT_CONTRACT_V1 = ('provider_kubernetes_preflight_v1')
+_PROVIDER_AUTHORITY_PREFLIGHT_RESPONSE_KEYS_V1 = frozenset({
+    'version', 'contract', 'action_kind', 'nonce', 'request_sha256',
+    'disposition', 'reason', 'resolved_cohort', 'execution_capsule',
+    'executor_policy_proof', 'worker_identity'
+})
+
+
+def provider_lifecycle_preflight_seed_from_value_v1(
+    value: Any,
+    action_kind: kernel_actions.ActionKind | str,
+) -> ProviderLifecyclePreflightSeedV1:
+    """Decode the exact preflight seed selected by the outer action kind."""
+
+    kind = _action_kind(action_kind, name='preflight action_kind')
+    if kind is kernel_actions.ActionKind.LAUNCH:
+        return ProviderLaunchPreflightSeedV1.from_value(value)
+    return ProviderDownPreflightSeedV1.from_value(value)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAuthorityPreflightRequestV1(_CanonicalContract):
+    """Nonce-bound, content-addressed private authority request."""
+
+    version: int
+    contract: str
+    action_kind: kernel_actions.ActionKind
+    nonce: uuid.UUID
+    seed: ProviderLifecyclePreflightSeedV1
+    expected_cohort_manifest: ProviderAuthorityWorkerCohortManifestV1
+    request_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'contract', 'action_kind', 'nonce', 'seed',
+        'expected_cohort_manifest', 'request_sha256'
+    })
+    _CONTRACT: ClassVar[str] = _PROVIDER_AUTHORITY_PREFLIGHT_CONTRACT_V1
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='authority preflight request version')
+        if self.contract != self._CONTRACT:
+            raise ValueError('authority preflight request contract is '
+                             'unsupported.')
+        kind = _action_kind(self.action_kind,
+                            name='authority preflight request action_kind')
+        object.__setattr__(self, 'action_kind', kind)
+        object.__setattr__(
+            self, 'nonce',
+            _uuid(self.nonce, name='authority preflight request nonce'))
+        expected_seed_type = (ProviderLaunchPreflightSeedV1
+                              if kind is kernel_actions.ActionKind.LAUNCH else
+                              ProviderDownPreflightSeedV1)
+        if type(self.seed) is not expected_seed_type:
+            raise TypeError('authority preflight request seed has the wrong '
+                            'action-kind type.')
+        if type(self.expected_cohort_manifest
+               ) is not ProviderAuthorityWorkerCohortManifestV1:
+            raise TypeError('authority preflight expected cohort manifest has '
+                            'an invalid type.')
+        if kind is kernel_actions.ActionKind.LAUNCH:
+            assert type(self.seed) is ProviderLaunchPreflightSeedV1
+            if (self.seed.source.identity_canonicalization.context.cohort_id
+                    != self.expected_cohort_manifest.cohort_id):
+                raise ValueError(
+                    'launch preflight source proof does not name the expected '
+                    'authority cohort.')
+        request_hash = _sha256(
+            self.request_sha256,
+            name='authority preflight request request_sha256')
+        object.__setattr__(self, 'request_sha256', request_hash)
+        if request_hash != canonical_sha256(self.preimage_value()):
+            raise ValueError('authority preflight request hash does not match '
+                             'its complete preimage.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        action_kind: kernel_actions.ActionKind | str,
+        nonce: uuid.UUID | str,
+        seed: ProviderLifecyclePreflightSeedV1,
+        expected_cohort_manifest: ProviderAuthorityWorkerCohortManifestV1,
+    ) -> ProviderAuthorityPreflightRequestV1:
+        """Construct a request and its nonrecursive hash commitment."""
+
+        kind = _action_kind(action_kind,
+                            name='authority preflight request action_kind')
+        parsed_nonce = _uuid(nonce, name='authority preflight request nonce')
+        preimage: JsonObject = {
+            'version': 1,
+            'contract': cls._CONTRACT,
+            'action_kind': kind.value,
+            'nonce': str(parsed_nonce),
+            'seed': seed.canonical_value(),
+            'expected_cohort_manifest':
+                expected_cohort_manifest.canonical_value(),
+        }
+        return cls(version=1,
+                   contract=cls._CONTRACT,
+                   action_kind=kind,
+                   nonce=parsed_nonce,
+                   seed=seed,
+                   expected_cohort_manifest=expected_cohort_manifest,
+                   request_sha256=canonical_sha256(preimage))
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderAuthorityPreflightRequestV1:
+        raw = _closed_action_kind_object(
+            value,
+            name='authority preflight request',
+            keys=cls._KEYS,
+            action_kind_name='authority preflight request.action_kind')
+        kind = _action_kind(raw['action_kind'],
+                            name='authority preflight request.action_kind')
+        return cls(version=raw['version'],
+                   contract=raw['contract'],
+                   action_kind=kind,
+                   nonce=_uuid(raw['nonce'],
+                               name='authority preflight request.nonce'),
+                   seed=provider_lifecycle_preflight_seed_from_value_v1(
+                       raw['seed'], kind),
+                   expected_cohort_manifest=(
+                       ProviderAuthorityWorkerCohortManifestV1.from_value(
+                           raw['expected_cohort_manifest'])),
+                   request_sha256=raw['request_sha256'])
+
+    def preimage_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'contract': self._CONTRACT,
+            'action_kind': self.action_kind.value,
+            'nonce': str(self.nonce),
+            'seed': self.seed.canonical_value(),
+            'expected_cohort_manifest':
+                self.expected_cohort_manifest.canonical_value(),
+        }
+
+    def canonical_value(self) -> JsonObject:
+        value = self.preimage_value()
+        value['request_sha256'] = self.request_sha256
+        return value
+
+
+class ProviderAuthorityPreflightDispositionV1(str, enum.Enum):
+    """Closed private preflight disposition."""
+
+    COMPLETE = 'complete'
+    NOT_REPRESENTABLE = 'not_representable'
+
+
+def _validate_authority_preflight_response_v1(
+    *,
+    expected_action_kind: kernel_actions.ActionKind,
+    action_kind: kernel_actions.ActionKind | str,
+    disposition: ProviderAuthorityPreflightDispositionV1 | str,
+    reason: ProviderLaunchNotRepresentableReasonV1 |
+    ProviderDownNotRepresentableReasonV1 | None,
+    resolved_cohort: ProviderAuthorityWorkerCohortV1 | None,
+    execution_capsule: ProviderKubernetesExecutionCapsuleV1 |
+    ProviderKubernetesDownExecutionCapsuleV1 | None,
+    executor_policy_proof: ProviderPolicyBoundaryProofV1 | None,
+    worker_identity: ProviderAuthorityWorkerIdentityV1 | None,
+) -> ProviderAuthorityPreflightDispositionV1:
+    kind = _action_kind(action_kind,
+                        name='authority preflight response action_kind')
+    if kind is not expected_action_kind:
+        raise ValueError('authority preflight response action kind is wrong.')
+    parsed_disposition = _enum_value(
+        ProviderAuthorityPreflightDispositionV1,
+        disposition,
+        name='authority preflight response disposition')
+    reason_type = (ProviderLaunchNotRepresentableReasonV1
+                   if kind is kernel_actions.ActionKind.LAUNCH else
+                   ProviderDownNotRepresentableReasonV1)
+    capsule_type = (ProviderKubernetesExecutionCapsuleV1
+                    if kind is kernel_actions.ActionKind.LAUNCH else
+                    ProviderKubernetesDownExecutionCapsuleV1)
+    evidence = (resolved_cohort, execution_capsule, executor_policy_proof,
+                worker_identity)
+    if parsed_disposition is ProviderAuthorityPreflightDispositionV1.COMPLETE:
+        if reason is not None:
+            raise ValueError('complete preflight response reason must be null.')
+        expected_types = (ProviderAuthorityWorkerCohortV1, capsule_type,
+                          ProviderPolicyBoundaryProofV1,
+                          ProviderAuthorityWorkerIdentityV1)
+        if any(
+                type(item) is not expected_type
+                for item, expected_type in zip(evidence, expected_types)):
+            raise TypeError('complete preflight response requires all four '
+                            'kind-matched evidence values.')
+        assert resolved_cohort is not None
+        assert execution_capsule is not None
+        assert executor_policy_proof is not None
+        assert worker_identity is not None
+        if execution_capsule.executor_cohort.canonical_bytes != (
+                resolved_cohort.canonical_bytes):
+            raise ValueError('preflight capsule executor cohort does not match '
+                             'the resolved cohort.')
+        worker_identity.validate_for_cohort(resolved_cohort)
+        if worker_identity.deployment_observed_generation != (
+                worker_identity.deployment_generation):
+            raise ValueError('preflight worker Deployment observation is '
+                             'stale.')
+        if executor_policy_proof.boundary != 'api_executor_pre_io':
+            raise ValueError('preflight policy proof has the wrong boundary.')
+        if executor_policy_proof.config_projection_sha256 != (
+                execution_capsule.config_projection_sha256):
+            raise ValueError('preflight proof does not bind the capsule '
+                             'configuration projection.')
+    else:
+        if type(reason) is not reason_type:
+            raise TypeError('not-representable preflight response has a '
+                            'wrong-kind or absent reason.')
+        if any(item is not None for item in evidence):
+            raise ValueError('not-representable preflight response evidence '
+                             'must be entirely null.')
+    return parsed_disposition
+
+
+def _validate_authority_preflight_complete_against_request_v1(
+    *,
+    request: ProviderAuthorityPreflightRequestV1,
+    resolved_cohort: ProviderAuthorityWorkerCohortV1,
+    execution_capsule: ProviderKubernetesExecutionCapsuleV1 |
+    ProviderKubernetesDownExecutionCapsuleV1,
+    executor_policy_proof: ProviderPolicyBoundaryProofV1,
+) -> None:
+    if resolved_cohort.manifest.canonical_bytes != (
+            request.expected_cohort_manifest.canonical_bytes):
+        raise ValueError('preflight response cohort manifest differs from the '
+                         'expected manifest.')
+    seed = request.seed
+    subject: ProviderLaunchPolicySubjectV1 | ProviderDownPolicySubjectV1
+    if request.action_kind is kernel_actions.ActionKind.LAUNCH:
+        assert type(seed) is ProviderLaunchPreflightSeedV1
+        assert type(execution_capsule) is ProviderKubernetesExecutionCapsuleV1
+        subject = project_provider_launch_policy_subject_v1(
+            seed.resource_identity, seed.source, seed.requested_target,
+            seed.resources, seed.topology, seed.replica_id, seed.retry_until_up,
+            execution_capsule)
+    else:
+        assert type(seed) is ProviderDownPreflightSeedV1
+        assert type(execution_capsule) is (
+            ProviderKubernetesDownExecutionCapsuleV1)
+        if (execution_capsule.cleanup_target.canonical_bytes
+                != seed.cleanup_target.canonical_bytes or
+                execution_capsule.config_projection.canonical_bytes
+                != seed.config_projection.canonical_bytes):
+            raise ValueError('down preflight response capsule differs from '
+                             'its seed.')
+        subject = project_provider_down_policy_subject_v1(
+            seed.requested_target, seed.workspace, seed.prior_launch_basis,
+            execution_capsule)
+    if (execution_capsule.config_projection.canonical_bytes
+            != seed.config_projection.canonical_bytes):
+        raise ValueError('preflight response configuration projection differs '
+                         'from its seed.')
+    subject_hash = subject.sha256
+    if (executor_policy_proof.policy_subject_sha256 != subject_hash or
+            executor_policy_proof.projection_before_sha256 != subject_hash or
+            executor_policy_proof.projection_after_sha256 != subject_hash):
+        raise ValueError('preflight response proof does not bind the projected '
+                         'policy subject.')
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchAuthorityPreflightResponseV1(_CanonicalContract):
+    """Closed authority preflight response for launch."""
+
+    version: int
+    contract: str
+    action_kind: kernel_actions.ActionKind
+    nonce: uuid.UUID
+    request_sha256: str
+    disposition: ProviderAuthorityPreflightDispositionV1
+    reason: ProviderLaunchNotRepresentableReasonV1 | None
+    resolved_cohort: ProviderAuthorityWorkerCohortV1 | None
+    execution_capsule: ProviderKubernetesExecutionCapsuleV1 | None
+    executor_policy_proof: ProviderPolicyBoundaryProofV1 | None
+    worker_identity: ProviderAuthorityWorkerIdentityV1 | None
+
+    _KEYS: ClassVar[
+        frozenset[str]] = _PROVIDER_AUTHORITY_PREFLIGHT_RESPONSE_KEYS_V1
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='launch preflight response version')
+        if self.contract != _PROVIDER_AUTHORITY_PREFLIGHT_CONTRACT_V1:
+            raise ValueError('launch preflight response contract is '
+                             'unsupported.')
+        object.__setattr__(
+            self, 'nonce',
+            _uuid(self.nonce, name='launch preflight response nonce'))
+        object.__setattr__(
+            self, 'request_sha256',
+            _sha256(self.request_sha256,
+                    name='launch preflight response request_sha256'))
+        disposition = _validate_authority_preflight_response_v1(
+            expected_action_kind=kernel_actions.ActionKind.LAUNCH,
+            action_kind=self.action_kind,
+            disposition=self.disposition,
+            reason=self.reason,
+            resolved_cohort=self.resolved_cohort,
+            execution_capsule=self.execution_capsule,
+            executor_policy_proof=self.executor_policy_proof,
+            worker_identity=self.worker_identity)
+        object.__setattr__(self, 'action_kind',
+                           kernel_actions.ActionKind.LAUNCH)
+        object.__setattr__(self, 'disposition', disposition)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls,
+                   value: Any) -> ProviderLaunchAuthorityPreflightResponseV1:
+        raw = _closed_action_kind_object(
+            value,
+            name='launch authority preflight response',
+            keys=cls._KEYS,
+            action_kind_name='launch preflight response.action_kind')
+        reason = (None if raw['reason'] is None else _enum_value(
+            ProviderLaunchNotRepresentableReasonV1,
+            raw['reason'],
+            name='launch preflight response.reason'))
+        return cls(
+            version=raw['version'],
+            contract=raw['contract'],
+            action_kind=raw['action_kind'],
+            nonce=raw['nonce'],
+            request_sha256=raw['request_sha256'],
+            disposition=raw['disposition'],
+            reason=reason,
+            resolved_cohort=(None if raw['resolved_cohort'] is None else
+                             ProviderAuthorityWorkerCohortV1.from_value(
+                                 raw['resolved_cohort'])),
+            execution_capsule=(None if raw['execution_capsule'] is None else
+                               ProviderKubernetesExecutionCapsuleV1.from_value(
+                                   raw['execution_capsule'])),
+            executor_policy_proof=(None
+                                   if raw['executor_policy_proof'] is None else
+                                   ProviderPolicyBoundaryProofV1.from_value(
+                                       raw['executor_policy_proof'])),
+            worker_identity=(None if raw['worker_identity'] is None else
+                             ProviderAuthorityWorkerIdentityV1.from_value(
+                                 raw['worker_identity'])))
+
+    @classmethod
+    def unavailable(
+        cls, request: ProviderAuthorityPreflightRequestV1
+    ) -> ProviderLaunchAuthorityPreflightResponseV1:
+        if (type(request) is not ProviderAuthorityPreflightRequestV1 or
+                request.action_kind is not kernel_actions.ActionKind.LAUNCH):
+            raise TypeError('launch unavailable response requires a launch '
+                            'preflight request.')
+        return cls(version=1,
+                   contract=_PROVIDER_AUTHORITY_PREFLIGHT_CONTRACT_V1,
+                   action_kind=kernel_actions.ActionKind.LAUNCH,
+                   nonce=request.nonce,
+                   request_sha256=request.request_sha256,
+                   disposition=ProviderAuthorityPreflightDispositionV1.
+                   NOT_REPRESENTABLE,
+                   reason=ProviderLaunchNotRepresentableReasonV1.
+                   PREFLIGHT_UNAVAILABLE_OR_INVALID,
+                   resolved_cohort=None,
+                   execution_capsule=None,
+                   executor_policy_proof=None,
+                   worker_identity=None)
+
+    def validate_request(self,
+                         request: ProviderAuthorityPreflightRequestV1) -> None:
+        if (type(request) is not ProviderAuthorityPreflightRequestV1 or
+                request.action_kind is not kernel_actions.ActionKind.LAUNCH or
+                self.nonce != request.nonce or
+                self.request_sha256 != request.request_sha256):
+            raise ValueError('launch preflight response does not match its '
+                             'request envelope.')
+        if self.disposition is ProviderAuthorityPreflightDispositionV1.COMPLETE:
+            assert self.resolved_cohort is not None
+            assert self.execution_capsule is not None
+            assert self.executor_policy_proof is not None
+            _validate_authority_preflight_complete_against_request_v1(
+                request=request,
+                resolved_cohort=self.resolved_cohort,
+                execution_capsule=self.execution_capsule,
+                executor_policy_proof=self.executor_policy_proof)
+
+    def canonical_value(self) -> JsonObject:
+        return _provider_authority_preflight_response_value_v1(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderDownAuthorityPreflightResponseV1(_CanonicalContract):
+    """Closed authority preflight response for down."""
+
+    version: int
+    contract: str
+    action_kind: kernel_actions.ActionKind
+    nonce: uuid.UUID
+    request_sha256: str
+    disposition: ProviderAuthorityPreflightDispositionV1
+    reason: ProviderDownNotRepresentableReasonV1 | None
+    resolved_cohort: ProviderAuthorityWorkerCohortV1 | None
+    execution_capsule: ProviderKubernetesDownExecutionCapsuleV1 | None
+    executor_policy_proof: ProviderPolicyBoundaryProofV1 | None
+    worker_identity: ProviderAuthorityWorkerIdentityV1 | None
+
+    _KEYS: ClassVar[
+        frozenset[str]] = _PROVIDER_AUTHORITY_PREFLIGHT_RESPONSE_KEYS_V1
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='down preflight response version')
+        if self.contract != _PROVIDER_AUTHORITY_PREFLIGHT_CONTRACT_V1:
+            raise ValueError('down preflight response contract is unsupported.')
+        object.__setattr__(
+            self, 'nonce',
+            _uuid(self.nonce, name='down preflight response nonce'))
+        object.__setattr__(
+            self, 'request_sha256',
+            _sha256(self.request_sha256,
+                    name='down preflight response request_sha256'))
+        disposition = _validate_authority_preflight_response_v1(
+            expected_action_kind=kernel_actions.ActionKind.DOWN,
+            action_kind=self.action_kind,
+            disposition=self.disposition,
+            reason=self.reason,
+            resolved_cohort=self.resolved_cohort,
+            execution_capsule=self.execution_capsule,
+            executor_policy_proof=self.executor_policy_proof,
+            worker_identity=self.worker_identity)
+        object.__setattr__(self, 'action_kind', kernel_actions.ActionKind.DOWN)
+        object.__setattr__(self, 'disposition', disposition)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderDownAuthorityPreflightResponseV1:
+        raw = _closed_action_kind_object(
+            value,
+            name='down authority preflight response',
+            keys=cls._KEYS,
+            action_kind_name='down preflight response.action_kind')
+        reason = (None if raw['reason'] is None else _enum_value(
+            ProviderDownNotRepresentableReasonV1,
+            raw['reason'],
+            name='down preflight response.reason'))
+        return cls(
+            version=raw['version'],
+            contract=raw['contract'],
+            action_kind=raw['action_kind'],
+            nonce=raw['nonce'],
+            request_sha256=raw['request_sha256'],
+            disposition=raw['disposition'],
+            reason=reason,
+            resolved_cohort=(None if raw['resolved_cohort'] is None else
+                             ProviderAuthorityWorkerCohortV1.from_value(
+                                 raw['resolved_cohort'])),
+            execution_capsule=(
+                None if raw['execution_capsule'] is None else
+                ProviderKubernetesDownExecutionCapsuleV1.from_value(
+                    raw['execution_capsule'])),
+            executor_policy_proof=(None
+                                   if raw['executor_policy_proof'] is None else
+                                   ProviderPolicyBoundaryProofV1.from_value(
+                                       raw['executor_policy_proof'])),
+            worker_identity=(None if raw['worker_identity'] is None else
+                             ProviderAuthorityWorkerIdentityV1.from_value(
+                                 raw['worker_identity'])))
+
+    @classmethod
+    def unavailable(
+        cls, request: ProviderAuthorityPreflightRequestV1
+    ) -> ProviderDownAuthorityPreflightResponseV1:
+        if (type(request) is not ProviderAuthorityPreflightRequestV1 or
+                request.action_kind is not kernel_actions.ActionKind.DOWN):
+            raise TypeError('down unavailable response requires a down '
+                            'preflight request.')
+        return cls(version=1,
+                   contract=_PROVIDER_AUTHORITY_PREFLIGHT_CONTRACT_V1,
+                   action_kind=kernel_actions.ActionKind.DOWN,
+                   nonce=request.nonce,
+                   request_sha256=request.request_sha256,
+                   disposition=ProviderAuthorityPreflightDispositionV1.
+                   NOT_REPRESENTABLE,
+                   reason=ProviderDownNotRepresentableReasonV1.
+                   PREFLIGHT_UNAVAILABLE_OR_INVALID,
+                   resolved_cohort=None,
+                   execution_capsule=None,
+                   executor_policy_proof=None,
+                   worker_identity=None)
+
+    def validate_request(self,
+                         request: ProviderAuthorityPreflightRequestV1) -> None:
+        if (type(request) is not ProviderAuthorityPreflightRequestV1 or
+                request.action_kind is not kernel_actions.ActionKind.DOWN or
+                self.nonce != request.nonce or
+                self.request_sha256 != request.request_sha256):
+            raise ValueError('down preflight response does not match its '
+                             'request envelope.')
+        if self.disposition is ProviderAuthorityPreflightDispositionV1.COMPLETE:
+            assert self.resolved_cohort is not None
+            assert self.execution_capsule is not None
+            assert self.executor_policy_proof is not None
+            _validate_authority_preflight_complete_against_request_v1(
+                request=request,
+                resolved_cohort=self.resolved_cohort,
+                execution_capsule=self.execution_capsule,
+                executor_policy_proof=self.executor_policy_proof)
+
+    def canonical_value(self) -> JsonObject:
+        return _provider_authority_preflight_response_value_v1(self)
+
+
+ProviderAuthorityPreflightResponseV1 = (
+    ProviderLaunchAuthorityPreflightResponseV1 |
+    ProviderDownAuthorityPreflightResponseV1)
+
+
+def _provider_authority_preflight_response_value_v1(
+    response: ProviderAuthorityPreflightResponseV1,) -> JsonObject:
+    reason = response.reason
+    return {
+        'version': 1,
+        'contract': _PROVIDER_AUTHORITY_PREFLIGHT_CONTRACT_V1,
+        'action_kind': response.action_kind.value,
+        'nonce': str(response.nonce),
+        'request_sha256': response.request_sha256,
+        'disposition': response.disposition.value,
+        'reason': None if reason is None else reason.value,
+        'resolved_cohort': (None if response.resolved_cohort is None else
+                            response.resolved_cohort.canonical_value()),
+        'execution_capsule': (None if response.execution_capsule is None else
+                              response.execution_capsule.canonical_value()),
+        'executor_policy_proof':
+            (None if response.executor_policy_proof is None else
+             response.executor_policy_proof.canonical_value()),
+        'worker_identity': (None if response.worker_identity is None else
+                            response.worker_identity.canonical_value()),
+    }
+
+
+def provider_authority_preflight_response_from_value_v1(
+        value: Any) -> ProviderAuthorityPreflightResponseV1:
+    """Decode the exact response union selected by its action discriminator."""
+
+    raw = _closed_object_shallow(
+        value,
+        name='authority preflight response',
+        keys=_PROVIDER_AUTHORITY_PREFLIGHT_RESPONSE_KEYS_V1)
+    kind = _action_kind(raw['action_kind'],
+                        name='authority preflight response.action_kind')
+    if kind is kernel_actions.ActionKind.LAUNCH:
+        return ProviderLaunchAuthorityPreflightResponseV1.from_value(value)
+    return ProviderDownAuthorityPreflightResponseV1.from_value(value)
 
 
 @dataclasses.dataclass(frozen=True)

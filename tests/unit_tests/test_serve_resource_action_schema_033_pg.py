@@ -51,6 +51,10 @@ _EVIDENCE_TABLES = (
     'serve_resource_action_shadow_coverage',
     'serve_resource_action_shadow_coverage_attempts',
 )
+_AUTHORITY_RELEASE_TABLES = (
+    'serve_resource_action_authority_releases',
+    'serve_resource_action_authority_release_cohorts',
+)
 _SERVICE_CHECKS = {
     'ck_services_resource_action_mode',
     'ck_services_resource_action_mode_timestamp',
@@ -599,7 +603,7 @@ def _install_old_feature_draft(engine: sqlalchemy.engine.Engine) -> None:
                                                           checkfirst=True)
 
 
-def test_serve_alembic_lineage_has_one_upstream_032_and_combined_033() -> None:
+def test_serve_alembic_lineage_has_033_then_release_ledger_034() -> None:
     engine = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
@@ -607,16 +611,19 @@ def test_serve_alembic_lineage_has_one_upstream_032_and_combined_033() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [revision.revision for revision in revisions]
     assert len(revision_ids) == len(set(revision_ids))
-    assert scripts.get_heads() == ['033']
+    assert scripts.get_heads() == ['034']
     revision_032 = scripts.get_revision('032')
     revision_033 = scripts.get_revision('033')
+    revision_034 = scripts.get_revision('034')
     assert Path(revision_032.path).name == (
         '032_serve_request_rejection_classification.py')
     assert revision_032.down_revision == '031'
     assert Path(
         revision_033.path).name == ('033_serve_resource_action_coverage.py')
     assert revision_033.down_revision == '032'
-    assert migration_utils.SERVE_VERSION == '033'
+    assert Path(revision_034.path).name == ('034_authority_release_ledger.py')
+    assert revision_034.down_revision == '033'
+    assert migration_utils.SERVE_VERSION == '034'
 
 
 def test_staged_and_head_schema_aliases_are_disjoint_and_complete() -> None:
@@ -684,6 +691,12 @@ def test_sqlite_031_to_032_to_033_adds_only_portable_columns(tmp_path) -> None:
     }
     assert set(replica.values()) == {None}
 
+    _upgrade(engine, '034')
+    assert _revision(engine) == '034'
+    assert not set(_AUTHORITY_RELEASE_TABLES).intersection(
+        sqlalchemy.inspect(engine).get_table_names())
+    assert _ordinary_rows(engine) == ordinary_rows
+
 
 def test_postgres_fresh_031_through_upstream_032_and_033(
         postgres_engine) -> None:
@@ -700,6 +713,121 @@ def test_postgres_fresh_031_through_upstream_032_and_033(
     assert daily[5:11] == (9, None, None, None, None, True)
     assert _ordinary_rows(engine) == ordinary_rows
     _assert_final_postgres_catalog(engine)
+
+
+def test_postgres_revision_034_adds_only_exact_release_ledger(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    ordinary_rows = _ordinary_rows(engine)
+
+    _upgrade(engine, '034')
+
+    assert _revision(engine) == '034'
+    inspector = sqlalchemy.inspect(engine)
+    assert set(_AUTHORITY_RELEASE_TABLES) <= set(inspector.get_table_names())
+    assert tuple(
+        inspector.get_pk_constraint(
+            action_schema.AUTHORITY_RELEASES.name)['constrained_columns']) == (
+                'namespace', 'helm_release_name')
+    assert tuple(
+        inspector.get_pk_constraint(
+            action_schema.AUTHORITY_RELEASE_COHORTS.name)
+        ['constrained_columns']) == ('namespace', 'helm_release_name',
+                                     'cohort_suffix')
+    assert _ordinary_rows(engine) == ordinary_rows
+
+
+def test_postgres_revision_034_rejects_same_name_hostile_check(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '033')
+    action_schema.RESOURCE_ACTION_AUTHORITY_RELEASE_METADATA.create_all(engine)
+    releases = action_schema.AUTHORITY_RELEASES.name
+    check = 'ck_serve_ra_authority_releases_revision'
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {releases} DROP CONSTRAINT {check}')
+        # Same table, columns, constraint name, and default presence as the
+        # shipped catalog, but a weakened expression.  Revision 034 must not
+        # adopt it by name alone.
+        connection.exec_driver_sql(
+            f'ALTER TABLE {releases} ADD CONSTRAINT {check} '
+            'CHECK (revision > 0)')
+
+    with pytest.raises(RuntimeError, match='incompatible check constraints'):
+        _upgrade(engine, '034')
+    assert _revision(engine) == '033'
+
+
+def test_postgres_revision_034_rejects_hostile_boolean_grouping(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '033')
+    action_schema.RESOURCE_ACTION_AUTHORITY_RELEASE_METADATA.create_all(engine)
+    releases = action_schema.AUTHORITY_RELEASES.name
+    check = 'ck_serve_ra_authority_releases_inventories'
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {releases} DROP CONSTRAINT {check}')
+        # This has the same tokens as the shipped expression if parentheses
+        # are discarded, but the disabled branch bypasses every inventory
+        # shape/hash check in the prefix.
+        connection.exec_driver_sql(
+            f'ALTER TABLE {releases} ADD CONSTRAINT {check} CHECK ('
+            "(jsonb_typeof(live_manifests) = 'array' AND "
+            "live_inventory_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "jsonb_typeof(tombstone_suffixes) = 'array' AND "
+            "tombstone_inventory_sha256 ~ '^[0-9a-f]{64}$' AND "
+            '(jsonb_array_length(live_manifests) + '
+            'jsonb_array_length(tombstone_suffixes)) <= 256 AND '
+            'enabled AND (jsonb_array_length(live_manifests) + '
+            'jsonb_array_length(tombstone_suffixes)) > 0) OR '
+            '(NOT enabled AND jsonb_array_length(live_manifests) = 0 AND '
+            'jsonb_array_length(tombstone_suffixes) = 0))')
+
+    with pytest.raises(RuntimeError, match='incompatible check constraints'):
+        _upgrade(engine, '034')
+    assert _revision(engine) == '033'
+
+
+def test_postgres_revision_034_rejects_wrong_existing_default(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '033')
+    action_schema.RESOURCE_ACTION_AUTHORITY_RELEASE_METADATA.create_all(engine)
+    releases = action_schema.AUTHORITY_RELEASES.name
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {releases} ALTER COLUMN revision SET DEFAULT 2')
+
+    with pytest.raises(RuntimeError, match='incompatible column'):
+        _upgrade(engine, '034')
+    assert _revision(engine) == '033'
+
+
+def test_postgres_revision_034_rejects_existing_mutation_trigger(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '033')
+    action_schema.RESOURCE_ACTION_AUTHORITY_RELEASE_METADATA.create_all(engine)
+    releases = action_schema.AUTHORITY_RELEASES.name
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'CREATE FUNCTION hostile_release_update() RETURNS trigger '
+            "LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END'")
+        connection.exec_driver_sql(
+            f'CREATE TRIGGER hostile_release_update BEFORE UPDATE ON '
+            f'{releases} FOR EACH ROW EXECUTE FUNCTION '
+            'hostile_release_update()')
+
+    with pytest.raises(RuntimeError, match='incompatible relation behavior'):
+        _upgrade(engine, '034')
+    assert _revision(engine) == '033'
 
 
 def test_postgres_already_upstream_032_preserves_exact_classification(
