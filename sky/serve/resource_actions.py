@@ -1869,7 +1869,7 @@ class ProviderAuthorityWorkerPodTemplateReleaseInputsV1(_CanonicalContract):
         _, release_digest, cohort_id_suffix = _authority_cohort_id_parts(
             cohort_id)
         expected_digest = hashlib.sha256(
-            f'{namespace}\n{full_name}\n{suffix}'.encode('utf-8')).hexdigest()
+            f'{namespace}\n{full_name}\n{suffix}'.encode()).hexdigest()
         if release_digest != expected_digest or cohort_id_suffix != suffix:
             raise ValueError('release-input cohort ID does not bind its '
                              'namespace/full name/suffix.')

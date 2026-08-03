@@ -90,8 +90,7 @@ class AuthorityWorkerRetirementScope:
     @property
     def singleton_name(self) -> str:
         release_scope = hashlib.sha256(
-            f'{self.namespace}\n{self.helm_full_name}'.encode(
-                'utf-8')).hexdigest()
+            f'{self.namespace}\n{self.helm_full_name}'.encode()).hexdigest()
         return (f'resource-action-authority-retirement:'
                 f'{self.installation_id}:{release_scope}')
 
@@ -461,7 +460,7 @@ class AuthorityWorkerRetirementVerifier:
         prefix, installation_id, scope_digest, suffix = parts
         expected_digest = hashlib.sha256(
             f'{self._scope.namespace}\n{self._scope.helm_full_name}\n{suffix}'.
-            encode('utf-8')).hexdigest()
+            encode()).hexdigest()
         if (prefix != 'ra' or installation_id != self._scope.installation_id or
                 scope_digest != expected_digest or
                 manifest.namespace != self._scope.namespace or

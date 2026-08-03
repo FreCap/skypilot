@@ -358,34 +358,39 @@ controllerService:
 # actions. This surface stays dark until an immutable image has been built and
 # its separately reviewed OCI qualification artifact is packaged by the chart.
 resourceActions:
+  # @schema additionalProperties: false
   authorityWorker:
     # @schema type: [boolean]
     enabled: false
     # Immutable installation UUID used to derive database-wide cohort IDs.
     # Never reuse or change this value while cohort or tombstone rows exist.
-    # @schema type: string
+    # @schema type: string; pattern: ^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
     installationId: ""
     # Cohort selected for new preparation references.  Existing DRAINING
     # cohorts remain listed until all of their frozen work is released.
-    # @schema type: string
+    # @schema type: string; maxLength: 42
     activeCohort: ""
     # Each cohort requires a <=42-character DNS-label suffix, exactly two
     # replicas, a manifest-digest-pinned image and distinct OCI config digest,
     # one chart-packaged qualification ref, and three installed-package refs.
     # @schema type: array; item: object
+    # @schema itemProperties: {"id":{"type":"string","minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"},"replicas":{"type":"integer","const":2},"image":{"type":"string","minLength":1,"pattern":"^.+@sha256:[0-9a-f]{64}$"},"imagePullPolicy":{"type":"string","const":"Always"},"ociConfigDigest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"qualificationArtifact":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","minLength":1,"maxLength":253,"pattern":"^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"},"byteSize":{"type":"integer","minimum":1,"maximum":65536},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"podTemplateContract":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_provider_preflight.py"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"artifactInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"callableInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
+    # @schema allOf: [{"type":"array","items":{"properties":{"id":{},"replicas":{},"image":{},"imagePullPolicy":{},"ociConfigDigest":{},"qualificationArtifact":{},"podTemplateContract":{},"artifactInventory":{},"callableInventory":{}},"additionalProperties":false,"required":["id","replicas","image","imagePullPolicy","ociConfigDigest","qualificationArtifact","podTemplateContract","artifactInventory","callableInventory"]}}]
     cohorts: []
     # Cohort IDs whose removed Deployment/ServiceAccount names remain visible
     # to the surviving API retirement verifier.  After the last cohort is
     # removed, keep enabled=true, activeCohort="", cohorts=[], and at least one
     # tombstone until every matching central row is RETIRED.
-    # @schema type: array; item: string
+    # @schema type: array; item: string; uniqueItems: true
+    # @schema allOf: [{"type":"array","items":{"minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"}}]
     retirementTombstones: []
     # @schema type: [integer]; minimum: 1; maximum: 65535
     healthPort: 46581
     # The future authenticated preflight endpoint.  The routing slice exposes
     # no mutation service and does not treat this Service as activation proof.
-    # @schema type: [integer]; minimum: 1; maximum: 65535
+    # @schema type: [integer]; minimum: 1; maximum: 65535; const: 46583
     preflightPort: 46583
+    # @schema additionalProperties: false
     auth:
       # This purpose-only Secret/key must differ from every external-LB auth
       # Secret/key. The controller also rejects equal mounted token bytes.
@@ -393,6 +398,7 @@ resourceActions:
       existingSecret: ""
       # @schema type: string
       key: tokens
+    # @schema additionalProperties: false
     tls:
       # @schema type: string
       existingSecret: ""

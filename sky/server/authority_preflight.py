@@ -350,7 +350,7 @@ class _BufferedSocket:
         self._connection.settimeout(remaining)
         try:
             chunk = self._connection.recv(8_192)
-        except (TimeoutError, socket.timeout) as e:
+        except TimeoutError as e:
             raise _HTTPFailure(408) from e
         if not chunk:
             raise _HTTPFailure(408)
@@ -580,7 +580,7 @@ class AuthorityPreflightServer:
                 return
             try:
                 connection, _ = listener.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 if self._stop_event.is_set():
