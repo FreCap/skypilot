@@ -3,7 +3,8 @@
 # Run from anywhere inside the repo; uses the current HEAD.
 #
 # Policy: install a wheel containing the FULL fork sky/ tree (every tracked
-# file under sky/**, tests excluded) onto the pinned upstream runtime base.
+# file under sky/**, tests excluded) plus every root module declared by
+# setup.py's py_modules onto the pinned upstream runtime base.
 # This is deliberate, not an optimization opportunity:
 #
 #   The base image is pinned to a June-20 nightly while the fork
@@ -71,6 +72,24 @@ while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(
 if [ "${#files[@]}" -eq 0 ]; then echo "  none — aborting" >&2; exit 1; fi
 echo "   ${#files[@]} tracked files under sky/"
 
+# Root ``py_modules`` are wheel inputs too.  The overlay context used to copy
+# only sky/**, so setuptools silently omitted a declared top-level module while
+# still producing an otherwise healthy wheel.  Resolve the literal setup.py
+# declaration, fail closed on missing/untracked sources, and project every
+# declared module into the build context below.
+root_module_files=()
+while IFS= read -r f; do
+  [ -n "$f" ] && root_module_files+=("$f")
+done < <(python3 boltz/overlay_source_manifest.py --setup setup.py)
+if [ "${#root_module_files[@]}" -eq 0 ]; then
+  echo "error: setup.py declares no root py_modules" >&2
+  exit 1
+fi
+for f in "${root_module_files[@]}"; do
+  git ls-files --error-unmatch -- "$f" >/dev/null
+done
+echo "   ${#root_module_files[@]} tracked setup.py py_module source(s)"
+
 # Informational only (does NOT gate the file set): compare the fork tree
 # against the base image's installed sky/ files so the log shows how much of
 # the wheel we shadow and how much the fork adds. Doubles as a sanity check
@@ -121,6 +140,10 @@ fi
 
 ctx="$(mktemp -d)"; trap 'rm -rf "$ctx"' EXIT
 for f in "${files[@]}"; do mkdir -p "$ctx/$(dirname "$f")"; cp "$f" "$ctx/$f"; done
+for f in "${root_module_files[@]}"; do
+  mkdir -p "$ctx/$(dirname "$f")"
+  cp "$f" "$ctx/$f"
+done
 template_files=()
 while IFS= read -r f; do [ -n "$f" ] && template_files+=("$f"); done < <(
   git ls-tree -r --name-only HEAD -- 'sky_templates')
@@ -195,6 +218,7 @@ docker run --rm --platform "$PLATFORM" \
   -e "EXPECTED_SKYPILOT_BUILD=${overlay_build}" \
   "$TAG" python -c "
 import importlib.metadata, inspect, os
+import skypilot_serve_system_oom_recovery_authorization
 import sky
 import sky.serve.controller, sky.serve.replica_managers, sky.serve.load_balancer
 from sky.utils import controller_utils
