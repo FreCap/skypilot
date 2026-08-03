@@ -473,79 +473,15 @@ export async function getPoolStatus({
       return { pools: [], controllerStopped: false };
     }
 
-    if (!includeJobCounts) {
-      return {
-        pools: poolData.map((pool) => ({ ...pool, jobCounts: {} })),
-        controllerStopped: false,
-      };
-    }
-
-    const hasBackendJobCounts = poolData.every((pool) =>
-      Object.prototype.hasOwnProperty.call(pool, 'job_status_counts')
-    );
-    if (hasBackendJobCounts) {
-      return {
-        pools: poolData.map((pool) => ({
-          ...pool,
-          jobCounts:
-            pool.job_status_counts &&
-            typeof pool.job_status_counts === 'object' &&
-            !Array.isArray(pool.job_status_counts)
-              ? pool.job_status_counts
-              : {},
-        })),
-        controllerStopped: false,
-      };
-    }
-
-    // Also fetch managed jobs to get job counts by pool
-    let jobsData = { jobs: [] };
-    try {
-      const jobsResponse = await dashboardCache.get(getManagedJobs, [
-        {
-          allUsers: true,
-          skipFinished: true,
-          fields: ['pool', 'status'],
-        },
-      ]);
-      if (!jobsResponse.controllerStopped) {
-        jobsData = jobsResponse;
-      }
-    } catch (jobsError) {
-      console.warn('Failed to fetch jobs for pool job counts:', jobsError);
-    }
-
-    // Process job counts by pool and status
-    const jobCountsByPool = {};
-    const terminalStatuses = [
-      'SUCCEEDED',
-      'FAILED',
-      'FAILED_SETUP',
-      'FAILED_PRECHECKS',
-      'FAILED_NO_RESOURCE',
-      'FAILED_CONTROLLER',
-      'CANCELLED',
-    ];
-
-    if (jobsData.jobs && Array.isArray(jobsData.jobs)) {
-      jobsData.jobs.forEach((job) => {
-        const poolName = job.pool;
-        const status = job.status;
-
-        if (poolName && !terminalStatuses.includes(status)) {
-          if (!jobCountsByPool[poolName]) {
-            jobCountsByPool[poolName] = {};
-          }
-          jobCountsByPool[poolName][status] =
-            (jobCountsByPool[poolName][status] || 0) + 1;
-        }
-      });
-    }
-
-    // Add job counts to each pool
     const pools = poolData.map((pool) => ({
       ...pool,
-      jobCounts: jobCountsByPool[pool.name] || {},
+      jobCounts:
+        includeJobCounts &&
+        pool.job_status_counts &&
+        typeof pool.job_status_counts === 'object' &&
+        !Array.isArray(pool.job_status_counts)
+          ? pool.job_status_counts
+          : {},
     }));
 
     return { pools, controllerStopped: false };
