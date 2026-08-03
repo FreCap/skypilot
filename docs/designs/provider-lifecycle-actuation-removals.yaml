@@ -15728,8 +15728,11 @@ artifacts:
     - id: frozen_mixed_version_get_job_status_compatibility_corpus_retained
       satisfied: false
       evidence: []
+    - id: shadow_event_schema_comparison_and_role_coverage_contract
+      satisfied: false
+      evidence: []
     telemetry:
-    - id: zero_unexplained_get_job_status_shadow_divergence_for_compatibility_window
+    - id: datadog_30m_all_roles_p95_500ms_and_zero_unexplained_shadow_divergence
       satisfied: false
       evidence: []
     release_window:
@@ -15774,6 +15777,9 @@ artifacts:
       satisfied: false
       evidence: []
     - id: frozen_v42_v43_and_local_policy_status_compatibility_corpus_retained
+      satisfied: false
+      evidence: []
+    - id: frozen_legacy_status_codegen_runner_error_and_payload_matrix_retained
       satisfied: false
       evidence: []
     telemetry:

@@ -8,11 +8,14 @@ with `PURSUE`. It adds the wire contract, worker-side advertisement, typed
 client gateway, and strict parser without changing any existing transport
 choice.
 
-C2 through C4 remain design-only. A fresh review of those milestones returned
+C2 through C4 remain design-only. Their first focused review returned
 `RESHAPE` because channel incarnation fencing, retry ownership, downstream
 typed-failure handling, and removal-ledger transitions were underspecified.
-This revision closes those findings. Runtime implementation remains blocked
-until an adversarial review passes against this exact amended commit.
+Commit `650935ca40` closed those findings, but review of that exact commit found
+four remaining blockers: nullable cluster incarnation, forced-refresh attempt
+accounting, objective shadow promotion evidence, and the exact legacy-adapter
+transcript. This revision closes those blockers. Runtime implementation remains
+blocked until an adversarial review passes against this exact amended commit.
 
 This design compares SkyPilot `4fc716827c` with dstack `c9ebdaad6b`. The useful
 dstack concept is one compatibility handshake before selecting a worker API.
@@ -215,12 +218,19 @@ The pickle column is unchanged, so this needs neither a handle-version bump nor
 a database migration.
 
 Global state adds one read that returns `cluster_hash` and tunnel metadata from
-the same cluster-table row. Every tunnel publish and clear uses a compare-and-
-set writer fenced by cluster name, the observed `cluster_hash` when non-null,
-and the complete observed prior tunnel metadata including generation. A
-zero-row publish means the cluster incarnation or tunnel identity changed. The
-caller terminates only its newly opened unpublished process and retries from a
-new row snapshot. A stale close cannot clear a replacement tunnel.
+the same cluster-table row. Every tunnel publish and clear uses one
+compare-and-set update fenced by cluster name, the exact observed cluster-hash
+state, and the complete observed prior tunnel metadata including generation.
+The hash predicate is equality for a non-null observation and SQL `IS NULL`
+for a null observation. Null is never a wildcard and the hash predicate is
+never omitted. The metadata predicate likewise uses `IS NULL` for a null prior
+value and equality for a non-null serialized value.
+
+The update must affect exactly one row. A zero-row result means the cluster
+incarnation or tunnel identity changed. A publisher terminates only its newly
+opened unpublished process and retries from a new same-row snapshot. A stale
+close leaves replacement metadata untouched. It may not weaken either
+predicate to preserve availability.
 
 `CloudVmRayResourceHandle.get_grpc_channel_with_snapshot()` constructs the
 channel and key from the same local `SSHTunnelInfo` and same-row cluster hash on
@@ -301,10 +311,57 @@ class SkyletTransportRouter:
                        legacy_runner): ...
 ```
 
-The narrow `legacy_runner` executes only the old SSH status read. It does not
-receive the backend as an authority object and remains explicitly temporary.
+The narrow `legacy_runner` is the temporary C4a adapter below. It does not
+receive the backend or handle as an authority object.
 `CloudVmRayBackend.get_job_status()` becomes one router delegation after
 authoritative promotion.
+
+### C4a legacy adapter transcript
+
+`sky/backends/skylet_legacy.py` defines the exact temporary boundary:
+
+```python
+class LegacyStatusCommandRunner(typing.Protocol):
+    def __call__(
+        self,
+        code: str,
+        *,
+        stream_logs: bool,
+        require_outputs: bool,
+        separate_stderr: bool,
+    ) -> tuple[int, str, str]: ...
+
+
+def get_job_status_via_ssh(
+    job_ids: list[int] | None,
+    *,
+    stream_logs: bool,
+    command_runner: LegacyStatusCommandRunner,
+) -> dict[int | None, job_lib.JobStatus | None]: ...
+```
+
+The backend supplies one callback with backend and handle already bound. The
+adapter executes this transcript exactly once and in this order:
+
+1. `code = job_lib.JobLibCodeGen.get_job_status(job_ids)`.
+2. Call `command_runner(code, stream_logs=stream_logs,
+   require_outputs=True, separate_stderr=True)` and unpack exactly
+   `(returncode, stdout, stderr)`.
+3. Call `subprocess_utils.handle_returncode(returncode, code,
+   'Failed to get job status.', stderr)` with those exact values.
+4. If `stdout` is empty after a zero return code, raise
+   `exceptions.CommandFailureException(command=code,
+   failure='produced no output', error_msg='Failed to get job status.',
+   detailed_reason=f'stderr="{stderr}"')`.
+5. Return `job_lib.load_statuses_payload(stdout)` unchanged.
+
+The adapter does not catch decoder failures, retry, negotiate capabilities,
+canonicalize protobuf values, choose a route, inspect the backend or handle,
+or make a second command call. `stream_logs=False` and `stream_logs=True` are
+forwarded unchanged. Nonzero return codes and malformed payloads propagate the
+same exception types and messages as the current inline body. For
+`job_ids=None`, the unchanged generated code asks the runtime for its latest
+job; its no-job payload decodes to `{None: None}`.
 
 ### Mode and shadow contract
 
@@ -322,12 +379,86 @@ current status path then runs exactly once and returns or raises exactly as it
 does in `off`. Shadow comparison records the final actual route, including an
 SSH fallback after initial gRPC selection, rather than the initial flag.
 
-Shadow qualification measures added wall-clock latency as well as decision
-divergence. A failed handshake that consumes the ordinary ten-second RPC
-deadline on every cache miss is not non-interfering merely because the final
-value matches. The test-cluster gate must prove cache-miss latency fits the
-existing polling budget or commit a separately reviewed smaller shadow-only
-deadline. Shadow adds no background queue, durable state, or telemetry store.
+### Datadog shadow event and promotion gate
+
+C3 emits one unsampled structured log after every shadow proposal and actual
+status completion on the test cluster. Existing Datadog log collection is the
+only sink. The event name is `skylet_transport_shadow_v1`; schema version is
+integer `1`; and the event has exactly these application fields:
+
+| Field | Type and allowed values |
+| --- | --- |
+| `event_name` | literal `skylet_transport_shadow_v1` |
+| `schema_version` | integer `1` |
+| `image_sha` | exact 40-character control-plane commit |
+| `process_role` | `api`, `controller`, or `executor` |
+| `mode` | literal `shadow` |
+| `method_contract` | literal `jobs.v1.JobsService/GetJobStatus/1` |
+| `proposed_route` | `grpc`, `legacy`, or `none` |
+| `actual_route` | `grpc`, `legacy`, or `none` |
+| `reason` | one value from the closed enum below |
+| `comparison` | `match`, `expected_compatibility_mismatch`, `unexplained_mismatch`, or `not_comparable` |
+| `outcome` | `success`, `error`, or `cancelled` |
+| `cache_status` | `hit`, `miss`, `uncached`, `not_applicable`, or `error` |
+| `boot_observed` | boolean |
+| `shadow_latency_ms` | nonnegative integer measured only around proposal negotiation and containment |
+
+The closed `reason` enum is:
+
+```text
+supported
+local_policy_disabled
+no_skylet_runtime
+capability_rpc_absent
+method_absent
+capability_unavailable
+capability_deadline
+capability_cancelled
+capability_resource_exhausted
+capability_auth
+capability_internal
+capability_protocol
+capability_malformed
+shadow_internal_error
+```
+
+No endpoint, RPC detail, credential, cluster hash, boot ID, job ID, exception
+string, or provider payload is emitted. `expected_compatibility_mismatch` is
+allowed only when `reason=capability_rpc_absent`, the proposal is legacy, and
+the characterized current path succeeds through gRPC. `not_comparable` is
+allowed only when either route is `none` or the actual outcome is error or
+cancelled. Equal non-none routes are `match`; every other successful unequal
+route is `unexplained_mismatch`.
+
+The Platform SkyPilot on-call is the promotion owner. After a five-minute
+warmup on the exact C3 image, the owner records Datadog query permalinks for one
+continuous 30-minute window. Traffic is generated deliberately so each of
+`api`, `controller`, and `executor` contributes at least 100 events and at
+least 20 `cache_status:miss` events. Missing role coverage fails the gate.
+
+The base query is:
+
+```text
+service:skypilot @event_name:skylet_transport_shadow_v1
+@schema_version:1 @image_sha:<exact-c3-sha> @mode:shadow
+```
+
+Promotion passes only when all three conditions hold in that exact window:
+
+1. The base query meets the role and cache-miss counts above.
+2. Datadog `p95(@shadow_latency_ms)` grouped by `@process_role` is at most
+   500 milliseconds for every role.
+3. The base query plus `@comparison:unexplained_mismatch` returns exactly zero
+   events.
+
+Any missing event field, unknown enum value, missing role, threshold breach,
+or unexplained divergence is a failed gate. Expected compatibility mismatches
+remain visible and counted but do not satisfy or bypass another condition. A
+failed handshake that consumes the ordinary ten-second deadline will therefore
+fail the latency gate if it materially affects the window. Changing the
+percentile, threshold, window, role counts, reason enum, or comparison rules
+requires another committed design review. Shadow adds no background queue,
+database, custom Datadog client, or Prometheus metric.
 
 ## Authoritative attempt and retry contract
 
@@ -358,13 +489,36 @@ Each route attempt takes these steps in order:
    constructed channel only when the complete provisional key is identical.
 6. Canonicalize the result or apply the exhaustive typed classification.
 
-Only a retryable, non-connection-refused gRPC `UNAVAILABLE` from the capability
-handshake or method call advances to another ordinary route attempt. Before
-retrying, the router invalidates the exact failed key. The next iteration
+Exactly two outcomes can advance the loop: retryable gRPC `UNAVAILABLE`, and
+the one allowed post-advertisement `UNIMPLEMENTED` forced-refresh transition.
+Every other outcome returns or raises from its current attempt. The transition
+table is exhaustive:
+
+| Current outcome | Attempt consumed | Key action | Sleep | Next state |
+| --- | --- | --- | --- | --- |
+| Success, approved legacy decision, or confirmed protocol-violation override | one | retain evidence as specified | zero | return |
+| Retryable non-connection-refused `UNAVAILABLE`, attempts 1 through 4 | one | invalidate the failed provisional key | one cancellation-aware backoff | next normal attempt |
+| Retryable non-connection-refused `UNAVAILABLE`, attempt 5 | one | invalidate the failed provisional key | zero | raise `SkyletUnavailableError` |
+| First advertised-method `UNIMPLEMENTED`, attempts 1 through 4 | one | invalidate and set the top-level one-shot refresh flag | zero | next forced-refresh attempt |
+| First advertised-method `UNIMPLEMENTED`, attempt 5 | one | invalidate | zero | raise `SkyletProtocolError` because refresh proof cannot fit the budget |
+| Terminal typed gRPC or known channel error | one | table-specific cache action | zero | raise typed error |
+| Request-context cancellation before an attempt starts | zero | no negative publication | zero | raise `asyncio.CancelledError` |
+
+Each normal or forced-refresh iteration consumes exactly one of the five
+attempt slots and obtains exactly one atomic channel snapshot when network
+routing is allowed. Local-policy legacy consumes one attempt but opens no
+channel. The loop counter never resets. Before a retryable-unavailable
+transition, the router invalidates the exact failed key. The next iteration
 always obtains a new atomic snapshot. A changed cluster hash, endpoint, or
 tunnel generation renegotiates under the new key; an unchanged key still
-forces a fresh handshake after invalidation. The backoff sleeps only when
-another attempt remains.
+forces a fresh handshake after invalidation.
+
+An exhausted all-`UNAVAILABLE` call therefore performs exactly five attempts,
+five network-bearing snapshots, and four sleeps. If advertised
+`UNIMPLEMENTED` occurs on attempt `k` where `k <= 4`, the forced refresh is
+attempt `k + 1` and there is no sleep between them. Any later retryable
+`UNAVAILABLE` uses only the remaining slots and the ordinary backoff rule. No
+path exceeds five attempts or four sleeps.
 
 The existing immediate connection-refused `UNAVAILABLE` case,
 `DEADLINE_EXCEEDED`, non-context `CANCELLED`, `RESOURCE_EXHAUSTED`, and known
@@ -376,13 +530,11 @@ attempt.
 
 ### Post-advertisement `UNIMPLEMENTED`
 
-An advertised method returning exact `UNIMPLEMENTED` consumes its current
-route attempt and sets a one-shot forced-refresh state for the same top-level
-call. If another attempt remains, the next iteration begins without backoff,
-invalidates the old key, obtains a new atomic channel snapshot, and performs
-the forced capability refresh. This uses the same five-attempt loop and never
-creates a nested retry budget. If no attempt remains, the call fails with a
-typed protocol error because no fresh compatibility evidence was established.
+An advertised method returning exact `UNIMPLEMENTED` follows the transition
+table above. The one-shot flag belongs to the top-level call, so cache loading,
+method invocation, and a boot change cannot reset it. The next outer iteration
+calls `force_refresh()` on its newly acquired snapshot and uses no nested
+helper or retry budget.
 
 The forced-refresh iteration follows these rules:
 
@@ -394,8 +546,9 @@ The forced-refresh iteration follows these rules:
    `UNIMPLEMENTED` is a confirmed protocol violation. The method is not called
    again.
 4. If a different boot advertises the method, invoke it once on the refreshed
-   snapshot. A second `UNIMPLEMENTED` is a protocol violation for only that new
-   logical key and does not trigger another refresh.
+   snapshot within that same attempt. A second `UNIMPLEMENTED` is a protocol
+   violation for only that new logical key, publishes the bounded override,
+   and returns legacy without another attempt or sleep.
 5. Unavailable, authentication, internal, cancellation, or malformed refresh
    evidence raises its typed result and never dispatches legacy.
 
@@ -484,7 +637,8 @@ its item boundary and receives no transport-policy responsibility.
 
 - Add persisted tunnel generation with strict old-pair and new-triple decoding.
 - Add the same-row cluster-hash and tunnel snapshot plus incarnation-fenced
-  compare-and-set publication and clearing.
+  compare-and-set publication and clearing, with null represented by an
+  explicit SQL `IS NULL` predicate rather than an omitted condition.
 - Return channel plus tunnel snapshot atomically from every handle path.
 - Add bounded single-flight capability caching with precise leader, waiter,
   fork, expiry, and honest boot-refresh behavior.
@@ -498,12 +652,14 @@ its item boundary and receives no transport-policy responsibility.
 - In shadow, negotiate only and execute the current path exactly once,
   containing negotiation, cancellation, parser, and logging failures.
 - Compare proposed route with actual existing selection in structured logs and
-  Datadog, including added cache-miss latency. Do not add a stats store and do
-  not dual-read every status call.
+  the exact unsampled Datadog event. Block C4a until the owned 30-minute role,
+  p95 latency, and zero-unexplained-divergence gate passes. Do not add a stats
+  store and do not dual-read every status call.
 
 ### C4: authoritative ordinary job status
 
-- Move SSH status execution into one temporary legacy adapter.
+- Move SSH status execution into one temporary legacy adapter with the exact
+  typed callback signature, five-operation transcript, and six-case matrix.
 - Delegate `CloudVmRayBackend.get_job_status()` to the router and move the
   characterized off/shadow compatibility branch into that one owner.
 - Use one five-attempt router loop with a new atomic snapshot per attempt,
@@ -554,9 +710,17 @@ its item boundary and receives no transport-policy responsibility.
   1, and new readers accept a pair written after rollback.
 - Every fast, exclusive-lock, shared-lock, and new-tunnel return proves channel
   endpoint and key came from the same tunnel object and same-row cluster hash.
-- A same-name cluster recreation between open and publish causes a zero-row
-  fenced write, terminates only the unpublished process, and leaves the
-  replacement row unchanged. A stale close cannot clear a new generation.
+- `test_tunnel_cas_null_hash_is_not_wildcard` seeds one row with null
+  `cluster_hash` and prior tunnel metadata, takes the same-row snapshot, then
+  deletes and reinserts that row in a separate transaction with the same name,
+  non-null `replacement-hash`, and byte-identical prior tunnel metadata.
+  Publishing with the old null observation must execute a hash `IS NULL`
+  predicate, affect zero rows solely because of the hash fence, terminate
+  exactly the unpublished process, and leave every replacement value
+  byte-identical.
+- The same executable recreation test is parameterized with an old non-null
+  hash and proves equality fencing. A stale-clear case changes only generation
+  after the snapshot and proves zero rows and no replacement-process kill.
 - Independent cluster-hash, endpoint, and generation changes are cache misses,
   including endpoint and PID reuse with a new generation.
 - N same-key callers make one load while key A never blocks key B. Failed and
@@ -579,11 +743,37 @@ its item boundary and receives no transport-policy responsibility.
   cancelled, malformed, and logging-failure shadow case runs the current path
   exactly once with the identical value or exception and never invokes the
   proposed method.
-- Comparison records final gRPC success or SSH fallback, uses only bounded
-  fields and reason tokens, and excludes endpoint, RPC details, credentials,
-  boot ID, and cluster hash from metric labels.
-- A cache-miss shadow failure remains within the accepted measured polling
-  latency budget.
+- Event-schema tests assert the exact fourteen field names, types, closed
+  reason enum, comparison truth table, integer latency, and omission of every
+  forbidden target or error detail. Unknown fields and enum values fail the
+  event builder before logging.
+- Comparison records final gRPC success or SSH fallback. Exact capability-RPC
+  absence plus actual gRPC success is the only expected mismatch; all other
+  successful unequal routes are unexplained.
+- A Datadog qualification fixture generates at least 100 unsampled events and
+  20 misses for each role. The recorded 30-minute query proves complete role
+  coverage, per-role p95 latency at most 500 milliseconds, and exactly zero
+  unexplained mismatches.
+
+### C4a legacy adapter tests
+
+The adapter test uses one recording `LegacyStatusCommandRunner`, asserts one
+call, and compares the command to the frozen current
+`JobLibCodeGen.get_job_status()` output for every row in this matrix:
+
+| Case | Inputs and runner result | Required assertion |
+| --- | --- | --- |
+| Latest no job | `job_ids=None`, `stream_logs=True`, `(0, message_utils.encode_payload({None: None}), '')` | exact latest-job code and flags; returns `{None: None}` |
+| One ID | `job_ids=[7]`, `stream_logs=False`, `(0, message_utils.encode_payload({7: JobStatus.RUNNING.value}), '')` | exact one-ID code and flags; returns typed status 7 |
+| Several IDs | `job_ids=[7, 9]`, `stream_logs=True`, `(0, message_utils.encode_payload({7: JobStatus.SUCCEEDED.value, 9: None}), '')` | exact list code and flags; preserves decoded known and `None` values |
+| Nonzero | one ID and `(23, 'ignored', 'remote failure')` | exact `handle_returncode` error text and stderr; decoder not called |
+| Empty stdout | one ID and `(0, '', 'remote warning')` | exact `CommandFailureException` fields from the transcript |
+| Malformed payload | one ID and `(0, 'not-a-payload', '')` | unchanged decoder exception; no retry or second runner call |
+
+Every row asserts `require_outputs is True`, `separate_stderr is True`, and
+the exact supplied `stream_logs` value. Separate AST checks prove the adapter
+accepts no backend or handle, contains the five transcript operations in
+order, and owns no route, cache, retry, or protobuf canonicalization branch.
 
 ### C4 retry, response, consumer, and ledger tests
 
@@ -595,6 +785,12 @@ its item boundary and receives no transport-policy responsibility.
   invalidation also forces a handshake.
 - Handshake and method failures share the same five-attempt budget. No test can
   observe a 25-attempt nested product.
+- Advertised `UNIMPLEMENTED` on attempts 1 and 4 consumes the next attempt for
+  forced refresh with zero intervening sleeps. On attempt 5 it raises protocol
+  error with no refresh. Same-boot confirmation makes no second method call;
+  changed-boot second `UNIMPLEMENTED` returns the bounded override with no
+  third attempt. Mixed unavailable and refresh transitions assert the exact
+  remaining attempt and sleep counts.
 - Connection-refused `UNAVAILABLE`, `DEADLINE_EXCEEDED`, non-context
   `CANCELLED`, `RESOURCE_EXHAUSTED`, and known tunnel acquisition failures are
   one-attempt typed unavailable outcomes. Cancellation before an attempt,
@@ -644,16 +840,21 @@ its item boundary and receives no transport-policy responsibility.
 9. Deploy C2's exact SHA with `--reuse-values` and action authority false.
    Repeated lookups on one v43 worker must retain generation and boot ID.
    Killing only the local tunnel must produce a new generation and cache miss
-   while retaining the worker boot ID.
+   while retaining the worker boot ID. Before deployment, the disposable
+   global-state test must prove a null observed hash cannot update a recreated
+   non-null row.
 10. Roll back to the C1 image, prove it reads the persisted triple and calls the
     worker, then roll forward and prove C2 reads any pair written by C1.
 11. Deploy C3 first in `off` and prove zero shadow events, then enable `shadow`
     only on the test cluster. Exercise v43 supported, v43 local-policy-disabled,
     v42 capability-absent, unreachable, tunnel-replaced, and worker-restarted
-    cases. Query existing Datadog logs for bounded decision and cache-miss
-    latency evidence.
-12. Deploy C4a and prove v42, local-policy, v43 gRPC, and characterized broad
-    fallback results are unchanged through the temporary adapter.
+    cases. After warmup, the Platform SkyPilot on-call records the exact
+    30-minute Datadog base, coverage, p95 latency, and zero-unexplained-
+    divergence query permalinks. Any failed condition blocks C4a.
+12. Deploy C4a only after the six-row generated-code, runner-argument,
+    nonzero, empty-output, malformed-payload, and no-job adapter matrix passes.
+    Prove v42, local-policy, v43 gRPC, and characterized broad fallback results
+    remain unchanged through the temporary adapter.
 13. Deploy C4b first in `off`, then `shadow`, then
     `authoritative_get_job_status` only on the test cluster. Exercise latest,
     known ID, unknown ID, no jobs, tunnel stop, timeout, cancellation, auth,
@@ -681,19 +882,24 @@ The compatibility matrix is explicit:
 
 C2 is non-authoritative but changes persisted tunnel metadata. Its rollback
 contract is bidirectional pair/triple readability, and every stale metadata
-writer is incarnation-fenced. The worker protocol is unchanged, so C2 neither
-bumps `SKYLET_VERSION` beyond 43 nor requires a worker restart.
+writer is incarnation-fenced with an explicit equality or SQL `IS NULL`
+predicate. The worker protocol is unchanged, so C2 neither bumps
+`SKYLET_VERSION` beyond 43 nor requires a worker restart.
 
-C3 defaults off. Shadow enablement is test-cluster-only and requires both
-decision-divergence and cache-miss latency evidence from existing Datadog
-collection. No telemetry table or client dependency is added.
+C3 defaults off. Shadow enablement is test-cluster-only. C4a is blocked until
+the exact unsampled Datadog event has 30 continuous minutes of required API,
+controller, and executor coverage, per-role p95 at most 500 milliseconds, and
+zero unexplained divergence on the exact image SHA. No telemetry table, custom
+Datadog client, or metric dependency is added.
 
 C4a is behavior-preserving but runtime-affecting because every legacy ordinary
-status call crosses the adapter. C4b deploys off, then shadow, then
-authoritative only on the test cluster while an immutable C3 or C4a rollback
-image remains available. Promotion requires the full error matrix, retry and
-re-key proof, typed Jobs and Serve behavior, unchanged system recovery, and
-manifest consistency. No production-wide default changes in C2 through C4.
+status call crosses the exact five-operation adapter transcript. Its six-case
+matrix and same-result live qualification are mandatory. C4b deploys off, then
+shadow, then authoritative only on the test cluster while an immutable C3 or
+C4a rollback image remains available. Promotion requires the full error
+matrix, exact attempt and sleep counts, retry and re-key proof, typed Jobs and
+Serve behavior, unchanged system recovery, and manifest consistency. No
+production-wide default changes in C2 through C4.
 
 ## Required legacy deletion after migration
 
@@ -713,6 +919,10 @@ introduces runtime symbols, add planned `PLA-M4-104` with null provenance for
 `SkyletRoutingMode.OFF`, `SkyletRoutingMode.SHADOW`, and the shadow comparator.
 After the runtime commit exists, a follow-up manifest commit records its exact
 40-character SHA and changes only `planned -> present` plus status history.
+Its test gate retains the exact event schema, comparison truth table, and role
+coverage contract. Its telemetry gate requires the recorded 30-minute Datadog
+window with all three roles, per-role p95 at most 500 milliseconds, and zero
+unexplained divergence before shadow code can later be removed.
 
 Before C4a introduces the adapter, add planned `PLA-M4-105` with null
 provenance for `sky.backends.skylet_legacy.get_job_status_via_ssh`. Activate it
@@ -729,7 +939,9 @@ locators:
 
 Keep row 061's historical `introduced_by`, `present` status, full history,
 gates, evidence, and blocker unchanged. A backend locator disappearing is not
-removal evidence.
+removal evidence. Row 105's permanent test gate retains the exact generated
+code, runner flags, nonzero, empty-output, malformed-payload, and no-job matrix
+after the temporary adapter is deleted.
 
 `PLA-M4-106` is existing debt, not a planned future artifact. It is `present`
 with `introduced_by: 069fa2a05dd978936eb65f9a9e85312bee254544`, the commit that
