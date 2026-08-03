@@ -21,8 +21,10 @@ class TestEncodeStatus:
             cluster_yaml="/path/to/cluster.yaml",
             launched_nodes=1,
             launched_resources=resources)
-        handle.skylet_ssh_tunnel = cloud_vm_ray_backend.SSHTunnelInfo(pid=1234,
-                                                                      port=1234)
+        handle.skylet_ssh_tunnel = cloud_vm_ray_backend.SSHTunnelInfo(
+            pid=1234,
+            port=1234,
+            generation='00000000-0000-0000-0000-000000000001')
         status_response = responses.StatusResponse(
             name="test-cluster",
             launched_at=1234567890,

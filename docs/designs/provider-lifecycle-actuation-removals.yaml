@@ -15691,6 +15691,202 @@ artifacts:
   - docs/designs/provider-lifecycle-actuation.md
   evidence: {}
   blocker: null
+- id: PLA-M4-104
+  milestone: M4
+  introduced_by: null
+  obligation: must_remove
+  disposition: delete_branch
+  scope:
+    domain: skylet_transport
+    store: process_memory
+    provider: skylet
+    operation: get_job_status_shadow_proposal_observation_and_rollback_modes
+  runtime_affecting: true
+  locators:
+  - kind: python_enum_member
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletRoutingMode
+    member: 'OFF'
+  - kind: python_enum_member
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletRoutingMode
+    member: SHADOW
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletTransportRouter.propose_get_job_status_route
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletTransportRouter.observe_current_get_job_status
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: GetJobStatusShadowObservation
+  - kind: python_call_within
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: CloudVmRayBackend.get_job_status
+    call: propose_get_job_status_route
+  - kind: python_call_within
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: CloudVmRayBackend.get_job_status
+    call: observe_current_get_job_status
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: _SkyletCapabilityRpcAbsentV1
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: _SKYLET_CAPABILITY_RPC_ABSENT_V1
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletTransportRouter._classify_get_capabilities_failure
+  - kind: python_symbol
+    path: sky/backends/skylet_transport.py
+    symbol: SkyletTransportRouter._emit_shadow_route_comparison
+  replacement: Authoritative capability-negotiated GetJobStatus route after rollback closure
+  dependencies: []
+  status: planned
+  status_history:
+  - planned
+  gates:
+    source:
+    - id: zero_get_job_status_shadow_proposal_observation_and_rollback_symbols
+      satisfied: false
+      evidence: []
+    test:
+    - id: frozen_mixed_version_get_job_status_compatibility_corpus_retained
+      satisfied: false
+      evidence: []
+    - id: shadow_event_schema_comparison_and_role_coverage_contract
+      satisfied: false
+      evidence: []
+    - id: decision_only_proposal_and_once_executed_inline_status_contract
+      satisfied: false
+      evidence: []
+    - id: split_api_role_never_executes_status_body_contract
+      satisfied: false
+      evidence: []
+    - id: typed_exact_capability_rpc_absence_publication_contract
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: datadog_30m_controller_executor_p95_500ms_zero_api_execution_and_zero_unexplained_shadow_divergence
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: authoritative_get_job_status_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: get_job_status_shadow_modes_own_no_schema
+      satisfied: true
+      evidence:
+      - The temporary shadow proposal, observation, and rollback modes own no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M4-105
+  milestone: M4
+  introduced_by: null
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: skylet_transport
+    store: process_memory
+    provider: skylet
+    operation: get_job_status_legacy_ssh_adapter
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/backends/skylet_legacy.py
+    symbol: get_job_status_via_ssh
+  replacement: Enforced authoritative GetJobStatus contract or explicit upgrade-required rejection
+  dependencies: []
+  status: planned
+  status_history:
+  - planned
+  gates:
+    source:
+    - id: zero_temporary_get_job_status_legacy_adapter
+      satisfied: false
+      evidence: []
+    test:
+    - id: enforced_grpc_capable_policy_for_every_reachable_ordinary_status_target
+      satisfied: false
+      evidence: []
+    - id: frozen_v42_v43_and_local_policy_status_compatibility_corpus_retained
+      satisfied: false
+      evidence: []
+    - id: frozen_legacy_status_codegen_runner_error_and_payload_matrix_retained
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_expected_or_unexplained_ordinary_status_legacy_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: ordinary_status_legacy_adapter_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: ordinary_status_legacy_adapter_owns_no_schema
+      satisfied: true
+      evidence:
+      - The temporary ordinary-status SSH adapter owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M4-106
+  milestone: M4
+  introduced_by: 069fa2a05dd978936eb65f9a9e85312bee254544
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: skylet_transport
+    store: process_memory
+    provider: skylet
+    operation: ordinary_get_job_status_legacy_codegen_and_decoder
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/skylet/job_lib_codegen.py
+    symbol: JobLibCodeGen.get_job_status
+  - kind: python_symbol
+    path: sky/skylet/job_lib.py
+    symbol: load_statuses_payload
+  replacement: Typed GetJobStatus protobuf response canonicalization in SkyletTransportRouter
+  dependencies:
+  - PLA-M4-105
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_ordinary_status_legacy_codegen_and_decoder_symbols
+      satisfied: false
+      evidence: []
+    test:
+    - id: system_recovery_status_legacy_path_remains_independent
+      satisfied: false
+      evidence: []
+    - id: frozen_ordinary_status_legacy_payload_corpus_retained
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_ordinary_status_legacy_payload_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: ordinary_status_legacy_payload_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: ordinary_status_legacy_payload_symbols_own_no_schema
+      satisfied: true
+      evidence:
+      - The ordinary-status legacy codegen and decoder own no database schema.
+  retained_references:
+  - tests/unit_tests/test_sky/backends/test_cloud_vm_ray_backend_system_oom_recovery.py
+  evidence: {}
+  blocker: null
 - id: PLA-M5-001
   milestone: M5
   introduced_by: 0a3fa136b881602ebff7c63bd09c45dbe881bbdb

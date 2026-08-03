@@ -22,6 +22,7 @@ import threading
 import time
 import typing
 from typing import Any, Optional
+import uuid
 
 import colorama
 import psutil
@@ -43,6 +44,7 @@ from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_file_sync
 from sky.backends import cloud_vm_resource_handle_serialization
 from sky.backends import skylet_client
+from sky.backends import skylet_transport
 from sky.backends import system_oom_recovery as backend_system_oom_recovery
 from sky.backends import task_codegen
 from sky.backends import wheel_utils
@@ -2278,6 +2280,106 @@ class RetryingVmProvisioner:
 class SSHTunnelInfo:
     port: int
     pid: int
+    generation: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _OwnedSkyletTunnelProcessV1:
+    """An exact process identity owned by this Python process."""
+
+    pid: int
+    process: psutil.Process
+
+
+_skylet_tunnel_process_ownership_pid = os.getpid()
+_skylet_tunnel_process_ownership_lock = threading.Lock()
+_skylet_tunnel_process_ownership: dict[str, _OwnedSkyletTunnelProcessV1] = {}
+
+
+def _reset_skylet_tunnel_process_ownership_after_fork() -> None:
+    """Drops inherited process authority and replaces the inherited lock."""
+    global _skylet_tunnel_process_ownership_pid
+    global _skylet_tunnel_process_ownership_lock
+    global _skylet_tunnel_process_ownership
+    _skylet_tunnel_process_ownership_pid = os.getpid()
+    _skylet_tunnel_process_ownership_lock = threading.Lock()
+    _skylet_tunnel_process_ownership = {}
+
+
+def _ensure_skylet_tunnel_process_ownership_pid() -> None:
+    if _skylet_tunnel_process_ownership_pid != os.getpid():
+        # Never acquire an inherited lock: another thread may have held it at
+        # fork time. Replacing both the lock and registry also drops all
+        # inherited signal authority.
+        _reset_skylet_tunnel_process_ownership_after_fork()
+
+
+def _register_skylet_tunnel_process(generation: str, pid: int) -> None:
+    """Registers a newly opened tunnel's exact psutil process identity."""
+    process = psutil.Process(pid)
+    _ensure_skylet_tunnel_process_ownership_pid()
+    with _skylet_tunnel_process_ownership_lock:
+        if generation in _skylet_tunnel_process_ownership:
+            raise RuntimeError(
+                f'Duplicate Skylet tunnel generation {generation!r}.')
+        _skylet_tunnel_process_ownership[generation] = (
+            _OwnedSkyletTunnelProcessV1(pid=pid, process=process))
+
+
+def _take_skylet_tunnel_process(
+        tunnel_info: SSHTunnelInfo) -> psutil.Process | None:
+    """Consumes signal authority for an exact generation and PID match."""
+    _ensure_skylet_tunnel_process_ownership_pid()
+    with _skylet_tunnel_process_ownership_lock:
+        owned = _skylet_tunnel_process_ownership.get(tunnel_info.generation)
+        if owned is None or owned.pid != tunnel_info.pid:
+            return None
+        del _skylet_tunnel_process_ownership[tunnel_info.generation]
+        return owned.process
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(
+        after_in_child=_reset_skylet_tunnel_process_ownership_after_fork)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _SkyletTunnelStateV1:
+    """A decoded tunnel bound to its same-row cluster observation."""
+
+    observed: global_user_state.ClusterSkyletSSHTunnelSnapshotV1
+    tunnel: SSHTunnelInfo | None
+
+
+def _decode_skylet_ssh_tunnel_metadata(metadata: object) -> SSHTunnelInfo:
+    """Strictly decodes the persisted pair or generation-bearing triple."""
+    if type(metadata) is not tuple or len(metadata) not in (2, 3):
+        raise ValueError('Skylet SSH tunnel metadata must be a pair or triple.')
+
+    port, pid = metadata[:2]
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError('Skylet SSH tunnel port must be an integer from 1 to '
+                         '65535.')
+    if type(pid) is not int or not 1 <= pid <= 2**31 - 1:
+        raise ValueError('Skylet SSH tunnel PID must be an integer from 1 to '
+                         '2147483647.')
+
+    if len(metadata) == 2:
+        generation = f'legacy:{pid}:{port}'
+    else:
+        generation = metadata[2]
+        if type(generation) is not str:
+            raise ValueError('Skylet SSH tunnel generation must be text.')
+        try:
+            parsed_generation = uuid.UUID(generation)
+        except (AttributeError, ValueError) as e:
+            raise ValueError(
+                'Skylet SSH tunnel generation must be a canonical UUID.') from e
+        if str(parsed_generation) != generation:
+            raise ValueError(
+                'Skylet SSH tunnel generation must be a canonical UUID.')
+
+    return SSHTunnelInfo(port=port, pid=pid, generation=generation)
 
 
 def _is_tunnel_healthy(tunnel: SSHTunnelInfo) -> bool:
@@ -2718,42 +2820,100 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                                                     cluster_config_file)
         self.docker_user = docker_user
 
-    def _get_skylet_ssh_tunnel(self) -> SSHTunnelInfo | None:
-        metadata = global_user_state.get_cluster_skylet_ssh_tunnel_metadata(
+    def _get_skylet_ssh_tunnel_state(self) -> _SkyletTunnelStateV1:
+        """Reads and strictly decodes one same-row tunnel observation."""
+        observed = global_user_state.get_cluster_skylet_ssh_tunnel_snapshot(
             self.cluster_name)
-        if metadata is None:
-            return None
-        return SSHTunnelInfo(port=metadata[0], pid=metadata[1])
+        if observed is None:
+            raise exceptions.SkyletUnavailableError(
+                f'Cluster row {self.cluster_name!r} is unavailable while '
+                'opening the Skylet tunnel.')
+        if observed.metadata is None:
+            return _SkyletTunnelStateV1(observed=observed, tunnel=None)
+        try:
+            tunnel = _decode_skylet_ssh_tunnel_metadata(observed.metadata)
+        except (TypeError, ValueError) as e:
+            raise exceptions.SkyletUnavailableError(
+                f'Cluster {self.cluster_name!r} has malformed Skylet SSH '
+                'tunnel metadata.') from e
+        return _SkyletTunnelStateV1(observed=observed, tunnel=tunnel)
 
-    def _set_skylet_ssh_tunnel(self, tunnel: SSHTunnelInfo | None) -> None:
-        global_user_state.set_cluster_skylet_ssh_tunnel_metadata(
-            self.cluster_name,
-            (tunnel.port, tunnel.pid) if tunnel is not None else None)
+    def _get_skylet_ssh_tunnel(self) -> SSHTunnelInfo | None:
+        """Compatibility facade for tests and read-only legacy callers."""
+        return self._get_skylet_ssh_tunnel_state().tunnel
 
-    def close_skylet_ssh_tunnel(self) -> None:
-        """Terminate the SSH tunnel process and clear its metadata."""
-        tunnel = self._get_skylet_ssh_tunnel()
+    def close_skylet_ssh_tunnel(
+        self,) -> skylet_transport.TunnelMutationResult | None:
+        """CAS-clear metadata before terminating the exact observed process."""
+        tunnel_state = self._get_skylet_ssh_tunnel_state()
+        tunnel = tunnel_state.tunnel
         if tunnel is None:
-            return
+            return None
+        if tunnel_state.observed.cluster_hash is None:
+            return (skylet_transport.TunnelMutationResult.
+                    UNFENCED_CLUSTER_INCARNATION)
+
         logger.debug('Closing Skylet SSH tunnel for cluster %r on port %d',
                      self.cluster_name, tunnel.port)
-        try:
+        outcome = (global_user_state.
+                   compare_and_set_cluster_skylet_ssh_tunnel_metadata(
+                       self.cluster_name,
+                       observed=tunnel_state.observed,
+                       replacement=None,
+                   ))
+        if outcome is skylet_transport.TunnelMutationResult.UPDATED:
             self._terminate_ssh_tunnel_process(tunnel)
-        finally:
-            self._set_skylet_ssh_tunnel(None)
+        return outcome
+
+    @staticmethod
+    def _make_grpc_channel_snapshot(
+        tunnel_state: _SkyletTunnelStateV1,
+    ) -> skylet_transport.SkyletChannelSnapshotV1:
+        tunnel = tunnel_state.tunnel
+        if tunnel is None:
+            raise exceptions.SkyletUnavailableError(
+                'Skylet SSH tunnel metadata is unavailable.')
+        endpoint = f'localhost:{tunnel.port}'
+        channel = grpc.insecure_channel(
+            endpoint,
+            options=[
+                # Task YAMLs can exceed gRPC's default 4MB receive limit.
+                ('grpc.max_receive_message_length', -1),
+                # Detect half-dead TCP connections instead of indefinitely
+                # stalling a request worker.
+                ('grpc.keepalive_time_ms', 30_000),
+                ('grpc.keepalive_timeout_ms', 10_000),
+                ('grpc.keepalive_permit_without_calls', 1),
+            ])
+        key = skylet_transport.SkyletChannelKeyV1(
+            cluster_hash=tunnel_state.observed.cluster_hash,
+            endpoint=endpoint,
+            tunnel_generation=tunnel.generation,
+        )
+        return skylet_transport.SkyletChannelSnapshotV1(channel=channel,
+                                                        key=key)
+
+    def get_grpc_channel_with_snapshot(
+            self) -> skylet_transport.SkyletChannelSnapshotV1:
+        """Returns a channel bound to a non-null cluster incarnation."""
+        return self._get_grpc_channel_snapshot(allow_unfenced_read_only=False)
+
+    def get_capability_channel_with_snapshot(
+            self) -> skylet_transport.SkyletCapabilityChannelSnapshotV1:
+        """Returns an uncached-capability-safe channel snapshot."""
+        snapshot = self._get_grpc_channel_snapshot(
+            allow_unfenced_read_only=True)
+        return skylet_transport.SkyletCapabilityChannelSnapshotV1(
+            channel=snapshot.channel, key=snapshot.key)
 
     def get_grpc_channel(self) -> 'grpc.Channel':
-        grpc_options = [
-            # The task YAMLs can be large, so the default
-            # max_receive_message_length of 4MB might not be enough.
-            ('grpc.max_receive_message_length', -1),
-            # Keepalive so half-dead TCP connections (cloud LB / proxy /
-            # NAT silently dropping a connection mid-stream) get failed by
-            # gRPC instead of stalling a worker thread inside __next__.
-            ('grpc.keepalive_time_ms', 30_000),
-            ('grpc.keepalive_timeout_ms', 10_000),
-            ('grpc.keepalive_permit_without_calls', 1),
-        ]
+        """Compatibility facade returning only the current gRPC channel."""
+        return self._get_grpc_channel_snapshot(
+            allow_unfenced_read_only=True).channel
+
+    def _get_grpc_channel_snapshot(
+        self, *, allow_unfenced_read_only: bool
+    ) -> skylet_transport.SkyletChannelSnapshotV1:
         # It's fine to not grab the lock here, as we're only reading,
         # and writes are very rare.
         # It's acceptable to read while another process is opening a tunnel,
@@ -2763,11 +2923,19 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         # For (2), for processes that read the "stale" tunnel, it will fail
         # and on the next retry, it will call get_grpc_channel again
         # and get the new tunnel.
-        tunnel = self._get_skylet_ssh_tunnel()
+        tunnel_state = self._get_skylet_ssh_tunnel_state()
+        tunnel = tunnel_state.tunnel
+        if tunnel_state.observed.cluster_hash is None:
+            if (allow_unfenced_read_only and tunnel is not None and
+                    _is_tunnel_healthy(tunnel)):
+                return self._make_grpc_channel_snapshot(tunnel_state)
+            raise exceptions.SkyletUnavailableError(
+                f'Cluster {self.cluster_name!r} has no fenced healthy Skylet '
+                'SSH tunnel; recovery is disabled for an unfenced '
+                'incarnation.')
         if tunnel is not None:
             if _is_tunnel_healthy(tunnel):
-                return grpc.insecure_channel(f'localhost:{tunnel.port}',
-                                             options=grpc_options)
+                return self._make_grpc_channel_snapshot(tunnel_state)
             logger.debug('Failed to connect to SSH tunnel for cluster '
                          f'{self.cluster_name!r} on port {tunnel.port}')
 
@@ -2795,14 +2963,36 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     # lock-free fast-path check but before we acquired the
                     # exclusive lock. Recheck while holding the lock to avoid
                     # replacing that new tunnel with a second one.
-                    tunnel = self._get_skylet_ssh_tunnel()
+                    tunnel_state = self._get_skylet_ssh_tunnel_state()
+                    tunnel = tunnel_state.tunnel
+                    if tunnel_state.observed.cluster_hash is None:
+                        raise exceptions.SkyletUnavailableError(
+                            f'Cluster {self.cluster_name!r} became unfenced '
+                            'while acquiring the Skylet tunnel lock.')
                     if tunnel is not None and _is_tunnel_healthy(tunnel):
-                        return grpc.insecure_channel(f'localhost:{tunnel.port}',
-                                                     options=grpc_options)
+                        return self._make_grpc_channel_snapshot(tunnel_state)
                     try:
-                        tunnel = self._open_and_update_skylet_tunnel()
-                        return grpc.insecure_channel(f'localhost:{tunnel.port}',
-                                                     options=grpc_options)
+                        open_result = self._open_and_update_skylet_tunnel(
+                            tunnel_state)
+                        if isinstance(open_result, SSHTunnelInfo):
+                            published_state = _SkyletTunnelStateV1(
+                                observed=tunnel_state.observed,
+                                tunnel=open_result)
+                            return self._make_grpc_channel_snapshot(
+                                published_state)
+                        if open_result is (skylet_transport.TunnelMutationResult
+                                           .UNFENCED_CLUSTER_INCARNATION):
+                            raise exceptions.SkyletUnavailableError(
+                                f'Cluster {self.cluster_name!r} has no '
+                                'incarnation fence for Skylet tunnel '
+                                'publication.')
+                        logger.debug(
+                            'Skylet tunnel publication conflicted for cluster '
+                            '%r; retrying from a fresh row snapshot.',
+                            self.cluster_name)
+                        remaining_timeout = _get_remaining_timeout()
+                        attempt += 1
+                        continue
                     except Exception as e:  # pylint: disable=broad-except
                         # Failed to open tunnel, release the lock and retry.
                         logger.warning(f'Failed to open tunnel for cluster '
@@ -2847,11 +3037,15 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             time.sleep(jitter)
 
             # Re-read the tunnel metadata and verify it's healthy.
-            tunnel = self._get_skylet_ssh_tunnel()
+            tunnel_state = self._get_skylet_ssh_tunnel_state()
+            tunnel = tunnel_state.tunnel
+            if tunnel_state.observed.cluster_hash is None:
+                raise exceptions.SkyletUnavailableError(
+                    f'Cluster {self.cluster_name!r} became unfenced while '
+                    'waiting for a Skylet tunnel.')
             if tunnel is not None:
                 if _is_tunnel_healthy(tunnel):
-                    return grpc.insecure_channel(f'localhost:{tunnel.port}',
-                                                 options=grpc_options)
+                    return self._make_grpc_channel_snapshot(tunnel_state)
                 logger.debug('Failed to connect to SSH tunnel for cluster '
                              f'{self.cluster_name!r} on port {tunnel.port}')
             # Tunnel is still unhealthy or missing, try again with updated
@@ -2863,22 +3057,37 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                            f'{self.cluster_name!r} to be ready.')
 
     def _terminate_ssh_tunnel_process(self, tunnel_info: SSHTunnelInfo) -> None:
-        """Terminate the SSH tunnel process."""
+        """Terminates a tunnel only through locally owned process identities."""
+        process = _take_skylet_tunnel_process(tunnel_info)
+        if process is None:
+            return
         try:
-            proc = psutil.Process(tunnel_info.pid)
-            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                logger.debug(
-                    f'Terminating SSH tunnel process {tunnel_info.pid}')
-                subprocess_utils.kill_children_processes(proc.pid)
+            if (not process.is_running() or
+                    process.status() == psutil.STATUS_ZOMBIE):
+                return
+            try:
+                descendants = process.children(recursive=True)
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                descendants = []
+            logger.debug(f'Terminating SSH tunnel process {tunnel_info.pid}')
+            subprocess_utils.kill_process_with_grace_period(process)
+            for descendant in descendants:
+                subprocess_utils.kill_process_with_grace_period(descendant)
         except psutil.NoSuchProcess:
             pass
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
                 f'Failed to cleanup SSH tunnel process {tunnel_info.pid}: {e}')
 
-    def _open_and_update_skylet_tunnel(self) -> SSHTunnelInfo:
+    def _open_and_update_skylet_tunnel(
+        self, tunnel_state: _SkyletTunnelStateV1
+    ) -> SSHTunnelInfo | skylet_transport.TunnelMutationResult:
         """Opens an SSH tunnel to the Skylet on the head node,
         updates the cluster handle, and persists it to the database."""
+        if tunnel_state.observed.cluster_hash is None:
+            return (skylet_transport.TunnelMutationResult.
+                    UNFENCED_CLUSTER_INCARNATION)
+
         max_attempts = 3
         tunnel_info = None
         # There could be a race condition here, as multiple processes may
@@ -2887,6 +3096,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             runners = self.get_command_runners()
             head_runner = runners[0]
             local_port = random.randint(10000, 65535)
+            generation = str(uuid.uuid4())
             try:
                 ssh_tunnel_proc = backend_utils.open_ssh_tunnel(
                     head_runner, (local_port, constants.SKYLET_GRPC_PORT))
@@ -2906,7 +3116,21 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     f'{e.error_msg}\n{e.detailed_reason}')
                 continue
             tunnel_info = SSHTunnelInfo(port=local_port,
-                                        pid=ssh_tunnel_proc.pid)
+                                        pid=ssh_tunnel_proc.pid,
+                                        generation=generation)
+            try:
+                _register_skylet_tunnel_process(generation, ssh_tunnel_proc.pid)
+            except Exception:  # pylint: disable=broad-except
+                # Registration can fail only after open_ssh_tunnel() returned
+                # a child owned by this process. Clean up through that exact
+                # Popen object rather than reconstructing from its numeric PID.
+                try:
+                    subprocess_utils.kill_process_with_grace_period(
+                        ssh_tunnel_proc)
+                except Exception as cleanup_error:  # pylint: disable=broad-except
+                    logger.warning('Failed to clean up unregistered Skylet SSH '
+                                   f'tunnel process: {cleanup_error}')
+                raise
             break
         else:
             raise RuntimeError('Failed to open an SSH tunnel after '
@@ -2918,12 +3142,21 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             grpc.channel_ready_future(
                 grpc.insecure_channel(f'localhost:{tunnel_info.port}')).result(
                     timeout=constants.SKYLET_GRPC_TIMEOUT_SECONDS)
-            # Clean up existing tunnel before setting up the new one.
-            old_tunnel = self._get_skylet_ssh_tunnel()
-            if old_tunnel is not None:
-                self._terminate_ssh_tunnel_process(old_tunnel)
-            self._set_skylet_ssh_tunnel(tunnel_info)
-            return tunnel_info
+            outcome = (global_user_state.
+                       compare_and_set_cluster_skylet_ssh_tunnel_metadata(
+                           self.cluster_name,
+                           observed=tunnel_state.observed,
+                           replacement=(tunnel_info.port, tunnel_info.pid,
+                                        tunnel_info.generation),
+                       ))
+            if outcome is skylet_transport.TunnelMutationResult.UPDATED:
+                old_tunnel = tunnel_state.tunnel
+                if old_tunnel is not None:
+                    self._terminate_ssh_tunnel_process(old_tunnel)
+                return tunnel_info
+
+            self._terminate_ssh_tunnel_process(tunnel_info)
+            return outcome
         except grpc.FutureTimeoutError as e:
             self._terminate_ssh_tunnel_process(tunnel_info)
             logger.warning(
