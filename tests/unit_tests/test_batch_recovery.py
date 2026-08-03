@@ -2710,6 +2710,87 @@ async def test_superseded_cleanup_fans_out_active_workers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_superseded_cleanup_bounds_active_worker_fanout(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    with batch_coordinator._active_workers_lock:
+        batch_coordinator._active_workers.update({
+            'worker-a': 17,
+            'worker-b': 18,
+            'worker-c': 19,
+            'worker-d': 20,
+        })
+
+    monkeypatch.setattr(coordinator, '_SUPERSEDED_CLEANUP_MAX_CONCURRENCY', 2)
+    release_exec = threading.Event()
+    two_execs_started = threading.Event()
+    third_exec_started = threading.Event()
+    state_lock = threading.Lock()
+    active_execs = 0
+    peak_execs = 0
+
+    def _exec(task, cluster_name):
+        del task, cluster_name
+        nonlocal active_execs, peak_execs
+        with state_lock:
+            active_execs += 1
+            peak_execs = max(peak_execs, active_execs)
+            if active_execs >= 2:
+                two_execs_started.set()
+            if active_execs >= 3:
+                third_exec_started.set()
+        release_exec.wait(timeout=5)
+        with state_lock:
+            active_execs -= 1
+        return 'shutdown-request'
+
+    monkeypatch.setattr(coordinator.sdk, 'exec', _exec)
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock(return_value=None))
+    monkeypatch.setattr(coordinator.sdk, 'cancel',
+                        mock.Mock(return_value='cancel-request'))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records', mock.Mock(return_value=[]))
+
+    cleanup = asyncio.create_task(
+        batch_coordinator.handle_superseded(timeout=2))
+    try:
+        assert await asyncio.to_thread(two_execs_started.wait, 1)
+        assert not await asyncio.to_thread(third_exec_started.wait, 0.1)
+    finally:
+        release_exec.set()
+        await asyncio.gather(cleanup, return_exceptions=True)
+
+    assert peak_execs == 2
+
+
+@pytest.mark.asyncio
+async def test_bounded_cleanup_propagates_worker_failure_without_deadlock(
+        monkeypatch):
+    monkeypatch.setattr(coordinator, '_SUPERSEDED_CLEANUP_MAX_CONCURRENCY', 1)
+    started = []
+
+    async def _fail_first(item):
+        started.append(item)
+        raise RuntimeError('unexpected cleanup failure')
+
+    cleanup = asyncio.create_task(
+        coordinator._run_bounded_async(['first', 'second'], func=_fail_first))
+    done, _ = await asyncio.wait({cleanup}, timeout=0.2)
+    try:
+        assert cleanup in done
+    finally:
+        if not cleanup.done():
+            cleanup.cancel()
+            await asyncio.gather(cleanup, return_exceptions=True)
+
+    with pytest.raises(RuntimeError, match='unexpected cleanup failure'):
+        cleanup.result()
+    assert started == ['first']
+
+
+@pytest.mark.asyncio
 async def test_superseded_cleanup_retires_cleaned_active_workers_immediately(
         monkeypatch):
     batch_coordinator = _make_coordinator()
@@ -3062,6 +3143,73 @@ async def test_superseded_cleanup_fans_out_durable_workers(monkeypatch):
                   'worker-b',
                   worker_job_id=18)
     ])
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_bounds_durable_worker_fanout(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    records = [{
+        'coordinator_token': batch_coordinator._worker_token,
+        'worker_cluster': f'worker-{index}',
+        'worker_job_name': f'batch-worker-1-owner-{index}',
+        'worker_job_id': None,
+        'launch_request_id': f'launch-{index}',
+    } for index in range(4)]
+
+    monkeypatch.setattr(coordinator, '_SUPERSEDED_CLEANUP_MAX_CONCURRENCY', 2)
+    release_launch_recovery = threading.Event()
+    two_launches_started = threading.Event()
+    third_launch_started = threading.Event()
+    state_lock = threading.Lock()
+    active_launches = 0
+    peak_launches = 0
+
+    def _get(request_id):
+        nonlocal active_launches, peak_launches
+        if request_id.startswith('launch-'):
+            with state_lock:
+                active_launches += 1
+                peak_launches = max(peak_launches, active_launches)
+                if active_launches >= 2:
+                    two_launches_started.set()
+                if active_launches >= 3:
+                    third_launch_started.set()
+            release_launch_recovery.wait(timeout=5)
+            with state_lock:
+                active_launches -= 1
+            return int(request_id.split('-')[-1]) + 17
+        if request_id.startswith('cancel-'):
+            return None
+        raise AssertionError(f'unexpected sdk.get request {request_id!r}')
+
+    def _cancel(cluster_name, job_ids):
+        del cluster_name
+        return f'cancel-{job_ids[0]}'
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(return_value=records))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_job_id',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record',
+                        mock.Mock(return_value=True))
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock(side_effect=_get))
+    monkeypatch.setattr(coordinator.sdk, 'cancel',
+                        mock.Mock(side_effect=_cancel))
+    monkeypatch.setattr(coordinator.sdk, 'queue', mock.Mock())
+
+    cleanup = asyncio.create_task(
+        batch_coordinator.handle_superseded(timeout=2))
+    try:
+        assert await asyncio.to_thread(two_launches_started.wait, 1)
+        assert not await asyncio.to_thread(third_launch_started.wait, 0.1)
+    finally:
+        release_launch_recovery.set()
+        await asyncio.gather(cleanup, return_exceptions=True)
+
+    assert peak_launches == 2
 
 
 @pytest.mark.asyncio

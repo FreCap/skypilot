@@ -43,6 +43,48 @@ from sky.server import constants as server_constants
 from sky.skylet import constants as skylet_constants
 
 logger = logging.getLogger(__name__)
+_SUPERSEDED_CLEANUP_MAX_CONCURRENCY = max(
+    1, min(32, (os.process_cpu_count() or 1) + 4))
+
+
+async def _run_bounded_async(items: list[Any], *, func) -> list[Any]:
+    """Run ``func(item)`` with bounded coroutine fanout.
+
+    ``handle_superseded()`` delegates sync SDK calls to ``asyncio.to_thread()``,
+    whose default executor already caps true parallelism. Matching that width
+    avoids queuing one cleanup coroutine per worker record while preserving the
+    throughput ceiling of the underlying thread pool.
+    """
+    if not items:
+        return []
+
+    work_queue: asyncio.Queue[tuple[int, Any]] = asyncio.Queue()
+    for index, item in enumerate(items):
+        work_queue.put_nowait((index, item))
+
+    results: list[Any] = [None] * len(items)
+    worker_count = min(_SUPERSEDED_CLEANUP_MAX_CONCURRENCY, len(items))
+
+    async def _worker() -> None:
+        while True:
+            try:
+                index, item = work_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                results[index] = await func(item)
+            finally:
+                work_queue.task_done()
+
+    workers = [asyncio.create_task(_worker()) for _ in range(worker_count)]
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    return results
 
 
 class SupersededCoordinator(RuntimeError):
@@ -341,8 +383,8 @@ class BatchCoordinator:
                 self._retire_active_worker(cluster_name, worker_job_id)
             return within_deadline
 
-        async def _cleanup_active_worker(cluster_name: str,
-                                         worker_job_id: int) -> bool:
+        async def _cleanup_active_worker(worker: tuple[str, int]) -> bool:
+            cluster_name, worker_job_id = worker
             shutdown_code = self._generate_shutdown_code()
             shutdown_task = sky.Task(
                 name=(f'batch-shutdown-{self._managed_job_id}-'
@@ -363,9 +405,8 @@ class BatchCoordinator:
             return await _cancel_exact(cluster_name, worker_job_id,
                                        self._worker_token)
 
-        active_cleanup_results = await asyncio.gather(
-            *(_cleanup_active_worker(cluster_name, worker_job_id)
-              for cluster_name, worker_job_id in workers_snapshot))
+        active_cleanup_results = await _run_bounded_async(
+            workers_snapshot, func=_cleanup_active_worker)
         if not all(active_cleanup_results):
             return
 
@@ -473,10 +514,12 @@ class BatchCoordinator:
                                            worker_job_id,
                                            record['coordinator_token'])
 
-            durable_cleanup_results = await asyncio.gather(
-                *(_cleanup_durable_worker(record)
-                  for record in records
-                  if record['coordinator_token'] == self._worker_token))
+            durable_cleanup_results = await _run_bounded_async(
+                [
+                    record for record in records
+                    if record['coordinator_token'] == self._worker_token
+                ],
+                func=_cleanup_durable_worker)
             if not all(durable_cleanup_results):
                 return
 
