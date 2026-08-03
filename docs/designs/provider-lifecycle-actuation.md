@@ -157,8 +157,10 @@ The next architecture has three additional workstreams.
 
 `InstanceLifecycleV1` remains the compatibility facet for the existing bulk
 entry points. M4 introduces a separately versioned, opt-in node-actuation facet
-for promoted providers. The exact M4 interface requires its own design review,
-but its responsibility boundary is fixed here:
+for promoted providers. The exact interface and its responsibility boundary
+are fixed here. A later runtime review may refine implementation details but
+cannot widen provider ownership or weaken the durable-effect rules without
+first amending and re-reviewing this canonical contract:
 
 - the provider facet owns raw discovery, one bounded mutation submission,
   provider-native identity, raw operation observation, status translation,
@@ -172,28 +174,65 @@ but its responsibility boundary is fixed here:
   throttling, or ambiguous-effect evidence permits retry, failover,
   compensation, or quarantine.
 
-The provider contract is command/query separated. A mutation method returns
-without polling for terminal readiness and yields bounded typed evidence with a
-serializable provider operation handle when one exists. Observation is a
-separate method. A logical cluster action may require several provider effects,
-such as an Azure NIC followed by a VM, a Kubernetes PVC followed by a
-Deployment, or an AWS instance batch followed by role tags. The runtime, not an
-in-memory provider call, must journal progress between those effects. The
-minimum semantic operations are:
+The provider contract is command/query separated and named
+`NodeActuationFacetV1`. Every argument and result below is an exact versioned,
+recursively immutable value. The facet methods have these exact semantic
+signatures:
 
 ```text
-discover(identity, scope) -> NodeInventory
-prepare(exact_action, inventory) -> ProviderEffectPlan
-submit_effect(exact_effect, idempotency_key) -> EffectEvidence
-observe_effect(effect_handle, identity) -> EffectObservation
-prove_absent(identity) -> AbsenceEvidence
+discover(scope, expected_incarnation) -> NodeInventoryV1
+prepare(exact_action, inventory) -> ProviderEffectPlanV1
+submit_effect(exact_effect, persisted_locator) -> EffectEvidenceV1
+observe_effect(effect_handle, persisted_locator) -> EffectObservationV1
+prove_absent(persisted_locator) -> AbsenceEvidenceV1
 ```
+
+`ClusterEffectReconcilerV1` is the sole cluster-domain adapter admitted to the
+durable action runtime for this facet. For one already-admitted
+`ClusterNextActionPlanV1`, it pins one exact `ActuationBindingV1`, invokes the
+bound facet's pure `prepare()`, validates the returned DAG and complete locator
+set, and writes the plan through the generic action and effect transaction. A
+failed effect-free transaction may recompute the pure plan, but only one
+byte-identical plan digest may commit for one plan revision; different bytes
+require a new revision. The generic runtime alone selects and claims a due
+effect, fences it, calls `submit_effect()`, schedules later `observe_effect()`
+or `prove_absent()` work, and journals every transition. The cluster adapter
+reduces that durable evidence into the next domain action or terminal
+`ProvisionRecord`; it owns no worker, queue, lease, heartbeat, retry clock,
+provider client, or second effect store.
+
+`discover()` performs one bounded provider-native traversal and preserves
+canonical provider IDs, duplicate and completeness evidence, provider scope,
+native state, role evidence, and incarnation match, missing, or mismatch. It
+never collapses resources by display name. `prepare()` is pure and cannot read
+credentials, configuration, clocks, randomness, the database, or the provider.
+`submit_effect()` performs at most one underlying provider mutation attempt.
+Any provider SDK retry must be disabled or surfaced as typed attempt evidence;
+one live fence can never conceal several submissions. `observe_effect()` and
+`prove_absent()` are read-only and distinguish the exact incarnation and effect
+attempt from a later same-name resource.
+
+`persisted_locator` is committed before provider I/O. It includes the logical
+effect ID, provider-native idempotency token when supported, deterministic
+resource identity or unforgeable attempt marker, provider account and region
+scope, expected incarnation, expected resource kinds, and bounded cardinality.
+It is not constructed or changed inside `submit_effect()`. The returned handle
+may add provider request or operation identity, but the runtime persists that
+evidence without replacing the base locator.
+
+A mutation method returns without polling for terminal readiness and yields
+bounded typed evidence with a serializable provider operation handle when one
+exists. Observation is a separate method. A logical cluster action may require
+several provider effects, such as an Azure NIC followed by a VM, a Kubernetes
+PVC followed by a Deployment, or an AWS instance batch followed by role tags.
+The runtime, not an in-memory provider call, journals progress between those
+effects.
 
 `exact_action` has a closed operation kind and the exact deterministic names,
 roles, identities, or requested create count chosen by the core planner.
-`prepare()` is pure and emits a bounded deterministic DAG of exact provider
-effects, identities, and dependencies. The runtime persists that whole plan
-before external I/O, then persists each effect intent before calling
+`prepare()` emits a bounded deterministic DAG of exact provider effects,
+identities, and dependencies. The runtime persists that whole plan before
+external I/O, then persists each effect intent and locator before calling
 `submit_effect()`. A returned effect may use a provider-supported batch only
 when every target has deterministic identity and per-target evidence. The
 facet cannot own cluster target-count policy, select a head, choose a new
@@ -256,6 +295,13 @@ the characterized partial-create, lost-response, restart, scale, stop,
 termination, and same-name-recreation corpus passes. Lack of live credentials
 permits an additive contract or offline shadow adapter to land, but never
 permits authoritative promotion or legacy removal.
+
+The first provider implementation must not become the abstraction by accident.
+DigitalOcean is the first characterization and promotion candidate, but a
+second provider must implement the same unchanged facet and shared planner
+contract before M4 can call the interface provider-general. Until then the
+contract is versioned and provider-neutral, while its runtime activation remains
+explicitly DigitalOcean-only.
 
 ### Durable action runtime as a declarative kernel
 
@@ -859,6 +905,93 @@ error, descriptor-derived legacy views, alias conformance, plugin replacement
 tests, and repository proof that no independent mutable provider inventory or
 lifecycle switch remains.
 
+#### Dependency-closed `ProviderDescriptorV1` contract
+
+`ProviderDescriptorV1` is the sole positive capability declaration for a
+promoted provider. It is not another boolean matrix and does not infer support
+from class inheritance or method presence. V1 has these closed facet kinds:
+
+- `OFFER_SOURCE`, whose implementation satisfies the existing `OfferSourceV1`
+  protocol and produces an existing `ProviderObservationSnapshotV1` concrete
+  value;
+- `NODE_ACTUATION`, whose implementation satisfies the exact
+  `NodeActuationFacetV1` contract above;
+- `VOLUME_ACTUATION`, whose implementation satisfies the separately reviewed
+  `VolumeActuationV1` contract;
+- `DEPLOY_SNAPSHOT`, whose implementation produces the exact provider deploy
+  snapshot reviewed for that provider; and
+- `RESOURCE_SUPPORT_PREDICATE`, whose pure predicate evaluates request-dependent
+  support without performing provider I/O.
+
+Adding a facet kind or changing a method schema requires a new descriptor
+schema or facet contract version. `ProviderFacetBindingV1` contains the facet
+kind, positive contract version, stable facet implementation digest, stable
+dispatch key, and its closed resource-support predicate contract when one
+exists. Bindings are sorted by facet-kind enum order and unique. The descriptor
+itself contains no callable, module, class, provider object, or other live
+implementation reference. All descriptor-owned metadata is composed only of
+exact frozen dataclasses, enums, bounded strings, integers, null, and tuples.
+No mutable mapping, list, provider SDK object, credential, configuration object,
+or provider response can be retained.
+
+The coordinator publishes the descriptor and a private immutable
+`ResolvedProviderFacetV1` dispatch tuple in the same registry snapshot. Each
+resolved entry binds one descriptor dispatch key and implementation digest to
+one exact sealed implementation object. The resolved tuple is not a capability
+inventory and cannot add an operation absent from the descriptor. Dispatch
+first resolves the exact descriptor generation, then requires one matching
+resolved entry. Replacement publishes a new whole snapshot and invalidates the
+old generation; no in-place map or facet mutation is supported.
+
+`ProviderOperationSubsetV1` is closed in V1 to `OFFER_READ`,
+`NODE_DISCOVERY`, `NODE_START_STOP`, `NODE_TERMINATE_OWNED`,
+`NODE_CREATE_OWNED_LIFECYCLE`, `VOLUME_OWNED_LIFECYCLE`, and
+`DEPLOY_SNAPSHOT_READ`. Each descriptor carries a sorted
+`ProviderOperationContractV1` tuple. One operation contract contains:
+
+- one operation subset;
+- its nonempty sorted required facet-kind tuple;
+- its sorted prerequisite operation-subset tuple;
+- its exact supported control-plane and durable-store mode pairs;
+- its resource-support predicate contract, or explicit `ALWAYS` only when the
+  facet contract proves support is request-independent; and
+- the exact conformance-matrix version that validates the declaration.
+
+Registration rejects duplicate subsets, duplicate facets, a missing required
+facet, a missing prerequisite operation, a cycle, an unknown contract version,
+an unverifiable implementation digest, an unsupported store-mode pair, or a
+resource-dependent operation declared `ALWAYS`. The coordinator computes the
+transitive closure for every operation and stores the canonical dependency
+closure in the immutable descriptor. A planner may select an operation only by
+requesting one exact subset and receiving its complete closure. It cannot join
+facets from two descriptor generations, mix a promoted facet with a legacy
+fallback, or treat one callable's presence as support.
+
+The V1 dependency rules include these minimum edges:
+
+- `OFFER_READ` requires `OFFER_SOURCE`;
+- `NODE_DISCOVERY` requires `NODE_ACTUATION`;
+- `NODE_START_STOP` requires `NODE_ACTUATION` and `NODE_DISCOVERY`;
+- `NODE_TERMINATE_OWNED` requires `NODE_ACTUATION` and `NODE_DISCOVERY`;
+- `NODE_CREATE_OWNED_LIFECYCLE` requires `NODE_ACTUATION`,
+  `NODE_DISCOVERY`, `NODE_START_STOP`, and `NODE_TERMINATE_OWNED`;
+- `VOLUME_OWNED_LIFECYCLE` requires `VOLUME_ACTUATION`; and
+- `DEPLOY_SNAPSHOT_READ` requires `DEPLOY_SNAPSHOT`.
+
+Any operation contract whose support rule is not `ALWAYS` must also include
+`RESOURCE_SUPPORT_PREDICATE` in its required facet tuple. The registrar rejects
+a predicate contract without that binding and rejects a predicate binding that
+is not referenced by any operation contract.
+
+The create subset deliberately includes resume and stop, deterministic role
+assignment including any head-role rename, termination, cleanup readback, and
+absence proof through the node facet. Create submission without that complete
+closure is not a valid descriptor capability. Compatibility `Cloud` and
+provisioner capability views for a promoted provider are pure projections of
+this same descriptor generation. Unpromoted providers keep their current
+legacy views; no second independently mutable positive-capability inventory is
+introduced.
+
 After the inventory is characterized, a transaction-like
 `ProviderRegistrationV1` coordinator becomes the only path for newly migrated
 registrations. One coordinator call validates an immutable
@@ -1014,7 +1147,7 @@ migrated methods have no fallback catch or direct SSH transport outside the
 router. Fallback for v40 and v42 workers remains until that enforced policy
 closes.
 
-#### Shared raw-offer normalization, filtering, and explicit cache policy
+#### Descriptor-owned offer observation and shared pure policy
 
 dstack separates raw provider inventory from shared requirement filtering,
 and cache construction while preserving provider input order. SkyPilot's
@@ -1023,31 +1156,42 @@ Cloud classes still repeat earlier feasibility work across
 `_get_feasible_launchable_resources()`, `regions_with_offering()`,
 `zones_provision_loop()`, price lookup, and accelerator matching.
 
-SkyPilot will introduce an opt-in immutable `RawOfferSnapshotV1`. A provider
-source owns credentialed inventory acquisition, freshness, provider-specific
-fields, input order, and declared modifiers. Shared pure code owns
-normalization, generic resource filtering, rejection reasons, and an explicit
-stable-order policy where ordering is semantically required. A separate exact
-inventory must identify each cache owner, key, freshness source, and
-invalidation rule before shared cache construction or any cache deletion is in
-scope. The optimizer and existing `PlacementOfferV1` remain the owners of
-cross-provider ranking and selected-offer propagation.
+SkyPilot will not add a parallel provider-neutral `RawOfferSnapshotV1` type.
+The existing `OfferSourceV1.capture_observation()` and
+`ProviderObservationSnapshotV1` contracts already own this boundary. A
+promoted provider binds `OfferSourceV1` as the `OFFER_SOURCE` facet of one
+dependency-closed `ProviderDescriptorV1`; its provider-specific concrete
+observation owns credentialed inventory acquisition, freshness,
+provider-specific fields, input order, and declared modifiers. Shared pure
+code owns normalization, generic resource filtering, rejection reasons, and an
+explicit stable-order policy where ordering is semantically required. A
+separate exact inventory must identify each cache owner, key, freshness source,
+and invalidation rule before shared cache construction or any cache deletion is
+in scope. The optimizer and existing immutable `PlacementOfferV1` remain the
+owners of cross-provider ranking and selected-offer propagation.
 
 The design does not copy dstack's fixed cache TTL, JSON-string cache keys,
 mutable offer modifiers, or assumption that one catalog implementation fits
 every provider. Freshness and invalidation are typed provider inputs. The first
-slice is a DigitalOcean shadow adapter over one frozen catalog snapshot. It
-compares candidate resources, region order, price, and fuzzy accelerator
-matches without changing the optimizer input. DigitalOcean's legacy empty
-hint and missing-rejection-reason behavior is characterized as absence; the
-shadow cannot claim reason parity that the legacy path does not expose.
+slice is a dormant DigitalOcean descriptor with one read-only `OFFER_SOURCE`
+facet and one provider-specific frozen observation concrete type. The same
+captured observation feeds the existing offer protocol and a pure shadow
+comparator for candidate resources, region order, price, fuzzy accelerator
+matches, and rejection evidence without changing optimizer input.
+DigitalOcean's legacy empty hint and missing-rejection-reason behavior is
+characterized as absence; the shadow cannot claim reason parity that the
+legacy path does not expose. Descriptor publication and shadow comparison
+grant no node-discovery or mutation capability.
 
-The removal gate is per provider. A promoted provider exposes only raw
-inventory and declared modifiers; its exact duplicated generic filter and
-ordering code is deleted. Cache deletion is a separate locator-specific gate
-after the cache inventory exists. Frozen optimizer corpora and bounded
-read-only catalog qualification must show identical or explicitly reviewed
-safer candidates and ordering before authority changes.
+The removal gate is per provider. A promoted provider exposes offer evidence
+only through its descriptor-bound source and declared modifiers; its exact
+duplicated generic filter and ordering code is deleted. Cache deletion is a
+separate locator-specific gate after the cache inventory exists. Frozen
+optimizer corpora and bounded read-only catalog qualification must show
+identical or explicitly reviewed safer candidates and ordering before
+authority changes. Historical references below to `RawOfferSnapshotV1` record
+rejected or superseded reviews only. They are non-normative and cannot define
+an implementation or removal replacement.
 
 #### Shared child-workload actuation for managed jobs and Serve
 
@@ -1127,10 +1271,15 @@ qualified durable action and child-workload owners or are explicitly retired.
 They make the future deletion complete, but do not claim that any M5 legacy
 path is removed in this preparatory slice.
 
-The implementation order is Skylet capability negotiation first, raw-offer
-normalization as an independent provider pilot, and child-workload actuation
-after the durable action kernel is qualified. This ordering avoids using a new
-shared facade to conceal the same duplicated lifecycle ownership underneath.
+The implementation order is Skylet capability negotiation first, then the
+read-only `ChildWorkloadObservationV1` migration, then the immutable
+dependency-closed descriptor, and then DigitalOcean offer observation and pure
+node-planner shadow through that descriptor. DigitalOcean node primitives and
+the durable effect reconciler follow while mutation remains disabled. A
+dependency-closed mutation subset can promote only after those foundations are
+qualified; child-workload mutation follows the same durable-action gate. This
+ordering avoids using a new shared facade to conceal the same duplicated
+lifecycle ownership underneath.
 
 ### Patterns explicitly not ported
 
@@ -5950,10 +6099,10 @@ M2 implementation is split into reviewed slices:
   placement-offer handoff, shadow comparison, actual-placement evidence, and
   dormant persistence/fence qualification. Authoritative promotion is gated on
   the M4 descriptor and actuation contract.
-- A later independent raw-offer slice starts with a DigitalOcean shadow over
-  one frozen catalog snapshot. It does not change M2's selected-offer handoff
-  and cannot remove provider feasibility code until its per-provider gate
-  closes.
+- A later descriptor-owned offer-observation slice starts with a DigitalOcean
+  `OFFER_SOURCE` shadow over one provider-specific frozen observation. It does
+  not change M2's selected-offer handoff and cannot remove provider feasibility
+  code until descriptor dependency closure and its per-provider gate close.
 
 Deployment proves candidate safety, optimizer winner, selected placement,
 pre-mutation revalidation, actual provisioning result, handle compatibility,
@@ -6024,10 +6173,10 @@ implementation.
 
 - introduce `SkyletCapabilitiesV1` and centralize read-only `GetJobStatus`
   transport selection before migrating any mutating Skylet method;
-- update this file with the exact node-actuation facet, operation evidence,
-  provider descriptor, shared cluster planner, reconciler transaction,
-  activation, and rollback contracts and pass a dedicated adversarial review
-  before implementation;
+- implement only the exact `NodeActuationFacetV1`, dependency-closed descriptor,
+  shared cluster planner, durable effect-reconciler, activation, and rollback
+  contracts defined in this file, after the amended bytes pass a dedicated
+  adversarial review;
 - add the read-only `ProviderRegistryAuditSnapshotV1`, classify expected
   partial registrations, and prove one-to-one identity where legacy registries
   overlap without adding a second registration owner;
@@ -6035,7 +6184,8 @@ implementation.
   only after the audit is characterized, then migrate registrations through
   the coordinator before making descriptor dispatch authoritative;
 - add the opt-in provider node-actuation facet and a shared cluster planner and
-  reconciler;
+  reconciler by reusing the durable action runtime rather than adding a second
+  cluster-specific claim, lease, heartbeat, or retry owner;
 - inventory each provider's deploy-variable inputs and freshness semantics,
   introduce a descriptor-owned typed snapshot, and remove the post-bulk
   `make_deploy_resources_variables()` callback one promoted provider at a time;
@@ -6107,17 +6257,23 @@ actual runtime commit SHA. The global post-bulk callback remains owned by
 
 `ProviderRegistrationV1` is the validated input to the existing coordinator.
 It contains the canonical provider name, immutable aliases, the complete set
-of migrated facets, expected legacy projections, and a stable verifiable
+of migrated facet bindings, the complete operation-contract and dependency
+declarations, expected legacy projections, and a stable verifiable
 implementation digest. It is rejected if an alias is ambiguous, a declared
-facet is incomplete, or its executable artifact fingerprint cannot be
-verified. It does not itself mutate a compatibility registry.
+facet is incomplete, dependency closure fails, or its executable artifact
+fingerprint cannot be verified. It does not itself mutate a compatibility
+registry.
 
 `ProviderDescriptorV1` is the coordinator's recursively immutable output. It
 contains schema version 1, canonical provider name, sorted aliases, stable
 implementation digest, process-local descriptor generation, registration
-source, expected-partial classification, and the exact optional facet objects.
-The process-local generation detects replacement within one process. It is not
-durable identity and never substitutes for the stable implementation digest.
+source, expected-partial classification, the canonical facet-binding tuple,
+the canonical operation-contract tuple, and the validated transitive closure
+for every operation. Its exact facet kinds, operation subsets, validation, and
+immutability rules are owned by the dependency-closed descriptor contract
+above, not by this DigitalOcean deploy-snapshot pilot. The process-local
+generation detects replacement within one process. It is not durable identity
+and never substitutes for the stable implementation digest.
 
 Shadow capture may use the dormant descriptor only as read-only evidence; it
 does not select lifecycle dispatch and the dynamically resolved second callback
@@ -6191,7 +6347,8 @@ DigitalOcean's `custom_resources` is not rendered by `do-ray.yml.j2`, and the
 cluster hash
 also has restoration and file-mount semantics unrelated to this provider
 projection. The snapshot may freeze a rendered provider delta, but it never
-owns raw catalog acquisition or competes with `RawOfferSnapshotV1`.
+owns raw catalog acquisition or implements the descriptor-bound
+`OfferSourceV1` and `ProviderObservationSnapshotV1` offer boundary.
 
 The snapshot provides within-attempt coherence only. It is not persisted before
 I/O, cannot recover a process crash, and is not an idempotency or effect fence.
@@ -6340,7 +6497,10 @@ stop at shadow mode.
 Status: rejected before any runtime commit by Review 28. This section is
 retained as an auditable rejected alternative and is not authorized for
 implementation. The active prerequisite is the typed resolved provider
-operation foundation below.
+operation foundation below. Its inventory-carrier, capability-token, planner,
+and `RawOfferSnapshotV1` terminology is non-normative historical evidence and
+is superseded by the active dependency-closed `ProviderDescriptorV1`, existing
+offer protocols, and exact `NodeActuationFacetV1` contracts above.
 
 This lifecycle audit is pinned to SkyPilot
 `e61407e93acc8e4566476feceb1da0166f48470d` and dstack
@@ -6893,10 +7053,14 @@ rollout is control-plane regression evidence only. It cannot claim a provider
 route or data-plane operation was exercised.
 
 This foundation adds no temporary compatibility machinery and closes no
-removal row. Existing `PLA-M4-102` and `PLA-M4-103` continue to track legacy
-DigitalOcean responsibilities, but this slice neither introduces nor removes
-those owners. The next slice may add a provider-local diagnostic facet only
-after its exact one-traversal contract and failure containment are accepted.
+removal row. `PLA-M4-102`, `PLA-M4-103`, and `PLA-M4-107` through
+`PLA-M4-115` track the exact legacy DigitalOcean planner, discovery, bulk run,
+wait, stop, terminate, compound create, projection, query, and mixed
+submit-observe owners. The separately stacked Skylet rows `PLA-M4-104` through
+`PLA-M4-106` retain their IDs and ownership. This foundation slice neither
+introduces nor removes those owners. The next slice may add a provider-local
+diagnostic facet only after its exact one-traversal contract and failure
+containment are accepted.
 
 #### M4 DigitalOcean authoritative query projection extraction
 
@@ -7116,6 +7280,128 @@ incarnation; a synchronous live fence must pass immediately before submission;
 and lost-response handling must quarantine until exact readback and absence
 proof close the ambiguity. The generation marker alone satisfies none of
 those gates.
+
+##### DigitalOcean descriptor and durable effect reconciliation
+
+The first new DigitalOcean slice is read-only. One dormant
+`ProviderDescriptorV1` binds its existing offer protocol implementation and one
+`NODE_ACTUATION` facet whose only eligible operation is `NODE_DISCOVERY`.
+`discover()` returns one immutable, duplicate-preserving inventory keyed by
+canonical numeric droplet ID. It records the credential or account-scope
+digest, requested region, cluster-tag match, incarnation marker classification,
+native state, legacy name, role evidence, page-family and cursor completeness,
+and every name or ID collision. The non-GPU tag-filtered and GPU account-wide
+list families remain separate evidence until the projector proves complete
+membership. A partial page family, scope mismatch, duplicate ID, duplicate
+name, unknown marker, or cross-family conflict makes the inventory ineligible
+for mutation. Legacy query projection and the pure planner may shadow from the
+same captured rows, but only the legacy query returns to callers. No mutation
+method or operation contract is published in this slice.
+
+Before the mutation closure can be eligible, the same bounded discovery owns
+an associated-resource preview for every exact candidate droplet and a complete
+region-scoped traversal of marker-owned volumes. The frozen inventory records
+canonical IDs, kind, ownership marker, attachment droplet IDs, response
+completeness, and the authorization scope needed to see each closed associated
+kind. V1 recognizes droplets, volumes, volume snapshots, snapshots, reserved
+IPs, and legacy floating IPs. A missing read scope, unknown associated kind,
+incomplete response, unmarked would-be cleanup target, or disagreement between
+the preview and volume traversal makes termination ineligible. The read-only
+`NODE_DISCOVERY` subset may still publish droplet evidence, but it cannot be
+used to infer mutation support from an incomplete associated inventory.
+
+The first mutation-capable descriptor is not create-only. It must publish the
+complete `NODE_CREATE_OWNED_LIFECYCLE` dependency closure, including discovery,
+resume and stop, deterministic role assignment, readback, cleanup termination,
+and exact absence proof. It reuses the generic durable action runtime as the
+only claim, lease, heartbeat, due-time, retry, and transaction owner. The
+`ClusterEffectReconcilerV1` adapter supplies desired roles, count, resume
+policy, selected placement, compensation policy, and terminal projection. No
+DigitalOcean-specific worker, queue, lease, or retry loop is added.
+
+For one new node, the descriptor-bound facet's `prepare()` emits this exact
+deterministic effect DAG, and `ClusterEffectReconcilerV1` persists it through
+the generic action runtime before any effect becomes runnable:
+
+```text
+CREATE_DROPLET -> CREATE_VOLUME -> ATTACH_VOLUME
+```
+
+The whole DAG, every logical effect ID, and every base readback locator commit
+before `CREATE_DROPLET` can issue provider I/O. The deterministic droplet and
+volume names derive from cluster incarnation plus stable planner slot and role,
+not UUID or provider page order. Each locator binds the descriptor
+implementation digest, account scope, region, cluster incarnation, logical
+effect ID, one reserved attempt marker, resource kind, deterministic name, and
+maximum cardinality one. The attachment locator is incomplete and
+non-runnable until the exact returned droplet and volume IDs have both been
+persisted; it then binds those two IDs and expected attachment relation.
+
+`CREATE_DROPLET` performs only the droplet-create request. Its response ID is
+persisted before any follow-up GET. `CREATE_VOLUME` performs only the
+volume-create request after the droplet effect is durably observed or adopted.
+`ATTACH_VOLUME` performs only the exact-ID attachment request after both create
+effects are durably observed or adopted. Provider GETs, list-by-marker
+reconciliation, and attachment inspection run only through
+`observe_effect()`. A provider-supported idempotency token is stored in the
+base locator and reused for the same logical effect. When DigitalOcean has no
+such token, a lost response enters `READBACK`; a successor performs complete
+bounded lookup by account, region, deterministic name, reserved attempt
+marker, resource kind, and incarnation. Exactly one matching object may be
+adopted. Multiple matches, incomplete traversal, mismatched immutable fields,
+or an unresolved zero result before the provider-specific ambiguity horizon
+quarantines the effect. Lease expiry never licenses a new random create.
+
+Resume, stop, head-role rename, and terminate are separate exact actions over
+canonical numeric droplet IDs. The shared planner, not provider code, selects
+`worker_only` targets and whether stopped nodes may resume. Immediately before
+each mutation, the reconciler re-reads the exact ID and verifies account scope,
+region, cluster tag, expected incarnation, and expected pre-state under the
+live action fence. The provider facet submits one power or rename action and
+returns its action handle when available; the reconciler owns every later
+observation, deadline, and retry decision.
+
+DigitalOcean's dangerous destroy-with-associated-resources endpoint is not a
+valid V1 effect. Its preview is authorization-scope-dependent and the endpoint
+can destroy snapshots, volume snapshots, reserved or floating IPs, and volumes
+that SkyPilot does not own. The provider facet instead prepares one ordinary
+exact-ID droplet delete followed by one exact-ID delete for each marker-owned
+volume. Every effect and locator commits before the droplet delete becomes
+runnable. User-owned snapshots, volume snapshots, reserved or floating IPs,
+and unmarked volumes are recorded as foreign associated evidence and are never
+submitted for deletion. An unknown associated kind blocks typed termination.
+
+`prove_absent()` succeeds only after complete reads prove the exact droplet and
+every listed owned volume absent, every expected attachment gone, and every
+persisted V1 effect locator excludes every recorded foreign associated ID. A
+foreign ID that remains visible is projected as retained or detached; its
+concurrent deletion by an external actor is evidence but is not a SkyPilot
+cleanup obligation and never licenses replay. No same-name replacement is
+mistaken for a target. If the provider cannot enumerate either the owned set or
+the foreign-preservation set completely, `NODE_TERMINATE_OWNED` is unsupported
+and the cluster remains on legacy routing. A not-found response for one child
+is not cluster absence evidence.
+
+Every effect follows the shared `PRE_INTENT`, `IN_FLIGHT`, `READBACK`,
+`COMPLETED`, or `QUARANTINED` phases. Immediately before provider bytes can be
+sent, one short PostgreSQL transaction validates the action claim, ownership
+epoch, desired generation, descriptor digest, exact operation closure,
+incarnation, and unchanged locator, then commits `IN_FLIGHT`. Returned handles,
+IDs, and certainty evidence commit under the same fences. A crash after any of
+the three create effects therefore resumes at readback for that exact effect,
+never at bulk `run_instances()` replay. Compensation is a new planned DAG over
+the recorded IDs and cannot erase the original evidence.
+
+Promotion requires crash injection before and after every provider request and
+evidence commit; lost-response, duplicate-name, partial-pagination,
+same-name-recreation, stale-lease, descriptor-replacement, `worker_only`,
+no-resume, stop, terminate, foreign-associated-resource preservation, and
+compound-absence conformance; a credentialed DigitalOcean create, resume,
+stop, down, and orphan-free canary; one measured compatibility release with
+zero unexplained legacy route; and a closed rollback window with no
+nonterminal, quarantined, or cleanup-bearing effect that the rollback image
+cannot reconcile. Until all gates pass, the descriptor and effect plans may be
+exercised only in read-only or disabled mode.
 
 The focused compatibility suite must prove:
 
@@ -12595,7 +12881,7 @@ still incomplete until the code is deleted and the row reaches `removed`.
 | parallel canonical-name and alias inventories across Cloud and provisioner registration | all migrated registrations flow through `ProviderRegistrationV1`, descriptor dispatch is authoritative, and both legacy views are derived | one compatibility release records zero unexplained audit mismatch, expected partial providers remain explicit, plugin replacement and alias conformance pass, and no independent mutable inventory remains |
 | import-time or hand-maintained provider-wide capability matrices for migrated facets | the immutable provider descriptor generates positive capability views and resource-dependent predicates | every declared capability has executable conformance and repository search finds no migrated parallel list |
 | generic retry, cache update, and failure classification in `RetryingVmProvisioner` | typed attempts and domain retry policy are authoritative | old and new failover traces agree on the characterization corpus |
-| generic feasibility and ordering bodies in `DigitalOcean._get_feasible_launchable_resources()`, `DigitalOcean.regions_with_offering()`, and `DigitalOcean.zones_provision_loop()` | the DigitalOcean `RawOfferSnapshotV1` source plus shared pure offer policy is authoritative | the frozen and bounded live DigitalOcean corpus preserves or explicitly improves candidates, price, region order, fuzzy matching, and the characterized absence of rejection hints; semantic search finds no second DigitalOcean generic filter or ordering owner |
+| generic feasibility and ordering bodies in `DigitalOcean._get_feasible_launchable_resources()`, `DigitalOcean.regions_with_offering()`, and `DigitalOcean.zones_provision_loop()` | the DigitalOcean descriptor-bound `OfferSourceV1`, provider-specific `ProviderObservationSnapshotV1`, and shared pure offer policy are authoritative | the frozen and bounded live DigitalOcean corpus preserves or explicitly improves candidates, price, region order, fuzzy matching, and the characterized absence of rejection hints; semantic search finds no second DigitalOcean generic filter or ordering owner |
 | gRPC exception fallback and direct SSH status transport in `CloudVmRayBackend.get_job_status()` | `SkyletCapabilitiesV1` and the bounded, incarnation-and-channel-keyed `GetJobStatus` router are authoritative | mixed old and new Skylet tests pass, handshakes are single-flight and boundedly refreshed, an enforced support policy upgrades every reachable ordinary Skylet to v43 or newer before use or rejects it with an explicit upgrade-required error, offline and long-lived clusters remain reachable until that policy rejects them, Datadog and structured logs support that policy with zero unexplained fallback for the compatibility interval, and this method contains no fallback catch or direct SSH transport outside the router |
 | central-PostgreSQL `FileLock` and synchronous provider-call ownership in `sky.volumes.server.core.volume_apply()` and `volume_delete()` | M3 action worker owns central volume create and delete | HA stale-worker, readback, UID replacement, and cleanup tests pass, the server gate is promoted, and both exact functions have no central-PostgreSQL provider-call branch |
 | `sky.server.daemons.refresh_volume_status_event`, its daemon registration, and its direct call into `sky.volumes.server.core.volume_refresh()` | the action reconciler and domain reducer own central-PostgreSQL volume observation | refresh parity and missed-wakeup recovery pass, no central-PostgreSQL daemon registration or direct call remains, and the separately supported SQLite refresh path retains an exact ledger row |
@@ -13864,6 +14150,12 @@ It does not close its removal rows, authorize descriptor dispatch, or qualify
 any provider mutation path.
 
 ### Review 27
+
+Reviews 27 and 28 below are retained as non-normative audit history. Review
+28 rejected the Review 27 runtime shape before implementation. Any reference in
+either review to a standalone raw-offer snapshot, inventory capability token,
+or planner authority is superseded by the active `ProviderDescriptorV1`,
+`OfferSourceV1`, and `NodeActuationFacetV1` contracts above.
 
 Verdict: `PURSUE` for the exact M4 shared cluster next-action planner and
 DigitalOcean inventory pilot contract at SHA-256
