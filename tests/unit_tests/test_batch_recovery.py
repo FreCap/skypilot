@@ -1325,6 +1325,48 @@ def test_cancel_fans_out_worker_shutdowns(monkeypatch):
     assert not batch_coordinator._active_workers
 
 
+def test_cancel_contains_thread_start_failure(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    batch_coordinator._active_workers.update({
+        'worker-a': 17,
+        'worker-b': 18,
+        'worker-c': 19,
+    })
+    shutdowns = []
+
+    def _shutdown_worker(cluster_name, worker_job_id=None):
+        shutdowns.append((cluster_name, worker_job_id))
+
+    class _FailingThread:
+        """Defers shutdown to join and simulates thread exhaustion."""
+
+        starts = 0
+
+        def __init__(self, target, args=()):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            type(self).starts += 1
+            if type(self).starts == 2:
+                raise RuntimeError('cannot start new thread')
+
+        def join(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', _shutdown_worker)
+    monkeypatch.setattr(coordinator.threading, 'Thread', _FailingThread)
+
+    with mock.patch.object(coordinator.logger, 'warning') as log_warning:
+        batch_coordinator.cancel()
+
+    assert shutdowns == [('worker-b', 18), ('worker-a', 17), ('worker-c', 19)]
+    log_warning.assert_called_once_with(
+        'Failed to start shutdown thread for %s; shutting down '
+        'synchronously: %s', 'worker-b', mock.ANY)
+    assert not batch_coordinator._active_workers
+
+
 def test_cancel_contains_worker_shutdown_failure(monkeypatch):
     batch_coordinator = _make_coordinator()
     batch_coordinator._active_workers.update({

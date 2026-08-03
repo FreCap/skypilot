@@ -222,6 +222,7 @@ jobs:
           import unicodedata
 
           import sky
+          import sky.batch.coordinator
           import sky.provision.ray_commands
           import sky.skylet.constants
           import sky.jobs.state

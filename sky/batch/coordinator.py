@@ -43,8 +43,9 @@ from sky.server import constants as server_constants
 from sky.skylet import constants as skylet_constants
 
 logger = logging.getLogger(__name__)
+_process_cpu_count = getattr(os, 'process_cpu_count', os.cpu_count)
 _SUPERSEDED_CLEANUP_MAX_CONCURRENCY = max(
-    1, min(32, (os.process_cpu_count() or 1) + 4))
+    1, min(32, (_process_cpu_count() or 1) + 4))
 
 
 async def _run_bounded_async(items: list[Any], *, func) -> list[Any]:
@@ -231,13 +232,20 @@ class BatchCoordinator:
         workers_snapshot = self._begin_cleanup()
         shutdown_threads = []
         for cluster_name, worker_job_id in workers_snapshot:
-            thread_ctx = contextvars.copy_context()
-            shutdown_thread = threading.Thread(target=thread_ctx.run,
-                                               args=(self._cancel_worker,
-                                                     cluster_name,
-                                                     worker_job_id))
-            shutdown_thread.start()
-            shutdown_threads.append(shutdown_thread)
+            try:
+                thread_ctx = contextvars.copy_context()
+                shutdown_thread = threading.Thread(target=thread_ctx.run,
+                                                   args=(self._cancel_worker,
+                                                         cluster_name,
+                                                         worker_job_id))
+                shutdown_thread.start()
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to start shutdown thread for %s; shutting down '
+                    'synchronously: %s', cluster_name, e)
+                self._cancel_worker(cluster_name, worker_job_id)
+            else:
+                shutdown_threads.append(shutdown_thread)
         for shutdown_thread in shutdown_threads:
             shutdown_thread.join()
 
