@@ -54,6 +54,7 @@ from sky.utils import controller_utils
 from sky.utils import dag_utils
 from sky.utils import status_lib
 from sky.utils import ux_utils
+from sky.utils.db import db_utils
 from sky.utils.plugin_extensions import ExternalClusterFailure
 from sky.utils.plugin_extensions import ExternalFailureSource
 
@@ -3063,6 +3064,8 @@ async def _finish_superseded_cleanup(
 
 
 async def main(controller_uuid: str):
+    db_utils.set_postgres_connection_metrics_process_role(
+        'managed-job-controller')
     logger.info(f'Starting controller {controller_uuid}')
 
     context_utils.hijack_sys_attrs()

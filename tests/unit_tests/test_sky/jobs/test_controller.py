@@ -39,6 +39,34 @@ from sky.utils import common
 from sky.utils import status_lib
 
 
+@pytest.mark.asyncio
+async def test_main_sets_connection_metric_role_before_initialization():
+
+    class StopInitialization(Exception):
+        pass
+
+    initialization_order = []
+
+    def _set_metrics_role(role):
+        initialization_order.append(('metrics-role', role))
+
+    def _hijack_context():
+        initialization_order.append(('context', None))
+        raise StopInitialization
+
+    with patch.object(
+            controller_lib.db_utils,
+            'set_postgres_connection_metrics_process_role',
+            side_effect=_set_metrics_role), patch.object(
+                controller_lib.context_utils,
+                'hijack_sys_attrs',
+                side_effect=_hijack_context), pytest.raises(StopInitialization):
+        await controller_lib.main('controller-uuid')
+
+    assert initialization_order == [('metrics-role', 'managed-job-controller'),
+                                    ('context', None)]
+
+
 class TestFileMountsBlobIdSnapshot:
     """The immutable per-job blob id is resolved once without loop stalls."""
 

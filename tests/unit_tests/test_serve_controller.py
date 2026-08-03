@@ -31,13 +31,18 @@ from sky.utils import yaml_utils
 
 @pytest.fixture(autouse=True)
 def _restore_consolidation_override():
-    """Keep the in-process controller marker scoped to each test."""
+    """Keep in-process controller markers scoped to each test."""
     marker = controller.constants.OVERRIDE_CONSOLIDATION_MODE
     original = os.environ.pop(marker, None)
+    original_metrics_role = (
+        controller.db_utils._postgres_connection_metrics_process_role_override)
+    controller.db_utils._postgres_connection_metrics_process_role_override = None
     yield
     os.environ.pop(marker, None)
     if original is not None:
         os.environ[marker] = original
+    controller.db_utils._postgres_connection_metrics_process_role_override = (
+        original_metrics_role)
 
 
 def test_update_ignores_stale_submitted_yaml_without_request_declaration():
@@ -73,6 +78,26 @@ def test_missing_declared_submitted_yaml_does_not_block_update(caplog):
 
     assert submitted is None
     assert 'is unavailable' in caplog.text
+
+
+def test_run_controller_sets_connection_metric_role_before_initialization(
+        monkeypatch):
+    initialization_order = []
+    monkeypatch.setattr(
+        controller.db_utils, 'set_postgres_connection_metrics_process_role',
+        lambda role: initialization_order.append(('metrics-role', role)))
+    monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
+                        lambda: initialization_order.append(('context', None)))
+    controller_instance = mock.Mock()
+    monkeypatch.setattr(controller, 'SkyServeController',
+                        mock.Mock(return_value=controller_instance))
+
+    controller.run_controller('pool', mock.Mock(), 1, '127.0.0.1', 20001,
+                              'fingerprint')
+
+    assert initialization_order[:2] == [('metrics-role', 'serve-controller'),
+                                        ('context', None)]
+    controller_instance.run.assert_called_once_with()
 
 
 def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):

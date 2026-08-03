@@ -45,6 +45,7 @@ from sky.utils import common_utils
 from sky.utils import context_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
+from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
 # Keep the historical controller-module patch surface for tests and plugins.
@@ -4202,6 +4203,7 @@ def run_controller(service_name: str,
                    controller_ip: str | None = None,
                    enforce_launch_fence: bool = False,
                    controller_socket: socket.socket | None = None):
+    db_utils.set_postgres_connection_metrics_process_role('serve-controller')
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()
