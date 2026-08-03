@@ -1297,13 +1297,7 @@ def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
                     'user_hash': job_info.username,
                 }
                 jobs.append(job_dict)
-            user_ids = {job['user_hash'] for job in jobs if job['user_hash']}
-            users = (global_user_state.get_users(user_ids) if user_ids else {})
-            for job_dict in jobs:
-                # Match job_lib.load_job_queue() for missing/legacy users.
-                user = users.get(job_dict['user_hash'])
-                job_dict['username'] = user.name if user is not None else None
-            return jobs
+            return job_lib.resolve_job_queue_users(jobs)
         except exceptions.SKYLET_GRPC_FALLBACK_ERRORS as e:
             logger.debug(f'gRPC failed, falling back to SSH: {e}')
 

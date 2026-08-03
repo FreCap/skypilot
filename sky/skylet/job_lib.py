@@ -1719,8 +1719,22 @@ def load_job_queue(payload: str) -> list[dict[str, Any]]:
     jobs = message_utils.decode_payload(payload)
     for job in jobs:
         job['status'] = JobStatus(job['status'])
-        job['user_hash'] = job['username']
-        user = global_user_state.get_user(job['user_hash'])
+    return resolve_job_queue_users(jobs)
+
+
+def resolve_job_queue_users(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Populate queue user hashes and resolve usernames in one batch."""
+    user_ids = set()
+    for job in jobs:
+        user_hash = job.get('user_hash')
+        if user_hash is None:
+            user_hash = job.get('username', '')
+            job['user_hash'] = user_hash
+        if user_hash:
+            user_ids.add(user_hash)
+    users = global_user_state.get_users(user_ids) if user_ids else {}
+    for job in jobs:
+        user = users.get(job['user_hash'])
         job['username'] = user.name if user is not None else None
     return jobs
 
