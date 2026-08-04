@@ -12,6 +12,20 @@ def test_unknown_event_is_rejected() -> None:
         observability.record('replica-secret-reason')
 
 
+def test_deprecated_events_get_only_placement_neutral_zero_children() -> None:
+    # pylint: disable=protected-access
+    counter = mock.Mock()
+    with mock.patch.object(observability, 'SYSTEM_OOM_RECOVERY_EVENTS',
+                           counter):
+        observability._initialize_deprecated_compatibility_series()
+
+    assert counter.labels.call_args_list == [
+        mock.call(event=event, provider='unknown', market='unknown')
+        for event in observability.DEPRECATED_COMPATIBILITY_EVENTS
+    ]
+    counter.labels.return_value.inc.assert_not_called()
+
+
 def test_unknown_provider_and_market_map_to_closed_other_labels() -> None:
     counter = mock.Mock()
     with mock.patch.object(observability, 'SYSTEM_OOM_RECOVERY_EVENTS',

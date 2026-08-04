@@ -4,11 +4,13 @@ from typing import Any
 
 import prometheus_client as prom
 
-EVENTS = frozenset({
+DEPRECATED_COMPATIBILITY_EVENTS = (
     'authorization_v1_selected',
     'authorization_v2_selected',
     'runtime_capability_v1_observed',
     'status_only_read',
+)
+EVENTS = frozenset(DEPRECATED_COMPATIBILITY_EVENTS + (
     'authorization_v3_candidate',
     'authorization_v3_ordinary',
     'authorization_v3_capable',
@@ -17,7 +19,7 @@ EVENTS = frozenset({
     'recovery_exhausted',
     'evidence_lost',
     'preemption_observed',
-})
+))
 PROVIDERS = frozenset({'aws', 'gcp', 'kubernetes', 'other', 'unknown'})
 MARKETS = frozenset({'on_demand', 'spot', 'other', 'unknown'})
 
@@ -25,6 +27,17 @@ SYSTEM_OOM_RECOVERY_EVENTS = prom.Counter(
     'sky_serve_system_oom_recovery_events_total',
     'Bounded SkyServe system-OOM recovery rollout events.',
     ('event', 'provider', 'market'))
+
+
+def _initialize_deprecated_compatibility_series() -> None:
+    """Expose zero baselines without claiming placement-specific coverage."""
+    for event in DEPRECATED_COMPATIBILITY_EVENTS:
+        SYSTEM_OOM_RECOVERY_EVENTS.labels(event=event,
+                                          provider='unknown',
+                                          market='unknown')
+
+
+_initialize_deprecated_compatibility_series()
 
 
 def record(event: str,
