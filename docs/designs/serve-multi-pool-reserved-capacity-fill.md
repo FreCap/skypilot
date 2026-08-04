@@ -199,9 +199,14 @@ in-cluster fence for API-client verification. Conflicting simultaneous
 expected UIDs for one context fail closed. Retargeting between observation, enqueue,
 restart, policy, optimization, client refresh, provider actuation, runtime
 bootstrap, setup, or job submission therefore cannot mutate or deliver data to
-a different physical cluster. A stale concurrent controller UID lookup may
-return only a newer live cache generation or failure, never its older
-observation. Ordinary demand placement remains available.
+a different physical cluster. Concurrent UID reads never publish out of
+generation order. A superseded forced launch-time read may return only the
+newer generation's live cache value or failure, never its own result. A
+non-forced observation whose successful read loses publication may return its
+own UID when no newer live entry exists: generations order lookup starts, not
+the reads themselves, and discarding that independently successful observation
+would spuriously withdraw the pool edge. Ordinary demand placement remains
+available.
 
 The process registry is deliberately conservative while a capture is active:
 an unleased same-context provider call, or a leased call that attempts a
@@ -326,6 +331,10 @@ An independent broker UID discovery that encounters the typed
 owner-or-initializer collision waits at most 30 seconds for that context to
 become ambient again, using one absolute monotonic deadline across capture
 replacement races, and then re-reads the UID from fresh ambient credentials.
+The retry retains its original lookup generation and follows the same
+publication rule: a non-forced observation can report its successful post-wait
+read without stealing cache ownership, while a superseded forced read remains
+failed closed unless the newer generation has published a live value.
 It performs this wait without a broker/cache lock and only when the caller has
 no fence token, so it cannot deadlock its own scope. Owner and initializer
 retirement wake waiters. Other identity errors, a timeout, a context mismatch,
