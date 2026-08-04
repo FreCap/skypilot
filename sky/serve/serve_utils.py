@@ -42,6 +42,7 @@ from sky.jobs import state as managed_job_state
 from sky.serve import auth_tokens
 from sky.serve import constants
 from sky.serve import controller_transport
+from sky.serve import provider_phase
 from sky.serve import request_aggregator
 from sky.serve import serve_state
 from sky.serve import serve_status_formatter
@@ -3878,6 +3879,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
         replica_cluster_name)
     provider_fence: contextlib.AbstractContextManager[None] = (
         contextlib.nullcontext())
+    provider_mode = provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
     if matching_info is not None:
         # Imported lazily to avoid the serve_utils -> reserved_capacity ->
         # serve_state import cycle during module initialization.  Log tailing
@@ -3886,8 +3888,12 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
         # the same physical Kubernetes cluster before any output is read.
         # pylint: disable-next=import-outside-toplevel
         from sky.serve import reserved_capacity
+        cleanup_fence = reserved_capacity.parse_protocol_v2_cleanup_fence(
+            matching_info)
         provider_fence = reserved_capacity.protocol_v2_provider_fence(
             matching_info, handle)
+        if cleanup_fence is not None:
+            provider_mode = provider_phase.ProviderPhaseMode.V2_FENCED
     if handle is None:
         if tail is not None:
             for line in final_lines_to_print:
@@ -3901,15 +3907,22 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     print(f'{colorama.Fore.YELLOW}Start streaming logs for task job '
           f'of {repnoun} {replica_id}...{colorama.Style.RESET_ALL}')
 
-    # Always tail the latest logs, which represent user setup & run.
+    # Always tail the latest logs, which represent user setup & run. A
+    # bounded read participates in the normal provider phases. Interactive
+    # follow deliberately holds only its immutable physical fence: keeping a
+    # process-wide phase open for an unbounded stream would starve every
+    # opposite-mode operation in the API process.
+    phase_context: contextlib.AbstractContextManager = (
+        contextlib.nullcontext()
+        if follow else provider_phase.provider_phase(provider_mode))
     if tail is None:
-        with provider_fence:
+        with phase_context, provider_fence:
             returncode = backend.tail_logs(handle, job_id=None, follow=follow)
         if returncode != 0:
             return (f'{colorama.Fore.RED}Failed to stream logs for {repnoun} '
                     f'{replica_id}.{colorama.Style.RESET_ALL}')
     elif not follow and tail > 0:
-        with provider_fence:
+        with phase_context, provider_fence:
             final = backend.tail_logs(handle,
                                       job_id=None,
                                       follow=follow,
