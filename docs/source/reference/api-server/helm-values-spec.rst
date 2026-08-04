@@ -1272,7 +1272,8 @@ Default: ``'sub'``
 
 Enable persistent storage for the API server, setting this to ``false`` is prone to data loss and should only be used for testing.
 
-When enabled, SkyPilot creates a PersistentVolumeClaim (PVC) to persist:
+When enabled, SkyPilot creates a PersistentVolumeClaim (PVC), or mounts the
+claim selected by ``storage.existingClaim``, to persist:
 
 - **Managed job logs**: Accessible via ``sky jobs logs <job_id>`` and ``sky jobs logs --controller <job_id>``
 - **File mounts**: Local files uploaded during managed job submission
@@ -1291,6 +1292,37 @@ Default: ``true``
 
   storage:
     enabled: true
+
+.. _helm-values-storage-existingClaim:
+
+``storage.existingClaim``
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Name of a PersistentVolumeClaim that already exists in the release namespace.
+When set, the chart mounts this claim and does not create or manage the default
+``<release>-state`` claim. Create and populate the claim before upgrading so a
+pod can never start against an empty volume.
+
+``storage.storageClassName``, ``storage.size``, ``storage.selector``,
+``storage.volumeName``, and ``storage.annotations`` configure only a claim that
+the chart creates; they do not mutate the external claim. Inspect and qualify
+that claim independently.
+
+This setting also supports a safe storage migration: first retain the legacy
+release-owned claim, provision and verify the replacement claim independently,
+copy the state while all legacy writers are stopped, and only then select the
+replacement. ``storage.accessMode`` remains the declared storage capability and
+must be ``ReadWriteMany`` when guarded HA is enabled; Helm cannot inspect an
+existing claim at render time.
+
+Default: ``""``
+
+.. code-block:: yaml
+
+  storage:
+    enabled: true
+    existingClaim: skypilot-state-rwx
+    accessMode: ReadWriteMany
 
 .. _helm-values-storage-storageClassName:
 

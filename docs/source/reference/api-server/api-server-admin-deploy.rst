@@ -1435,7 +1435,12 @@ To uninstall the API server, run:
 
     helm uninstall $RELEASE_NAME --namespace $NAMESPACE --wait
 
-This will delete the API server and all associated resources. ``--wait`` ensures that all the resources of SkyPilot API server are deleted before the command returns.
+This deletes resources still managed by the Helm release. ``--wait`` waits for
+those deletions before returning. A PVC annotated with
+``helm.sh/resource-policy: keep`` is deliberately orphaned, and a claim selected
+through ``storage.existingClaim`` is managed outside the release; Helm does not
+delete either claim. Inventory and remove retained storage separately only
+after its data-retention and rollback gates have passed.
 
 
 Other notes
@@ -1455,6 +1460,8 @@ You can customize the storage settings using the following values by creating a 
     storage:
       # Enable/disable persistent storage
       enabled: true
+      # Optional same-namespace PVC managed outside this Helm release.
+      existingClaim: ""
       # Storage class name - leave empty to use cluster default
       storageClassName: ""
       # Access modes - ReadWriteOnce or ReadWriteMany depending on storage class support

@@ -170,6 +170,14 @@ Compute full release name with optional fullnameOverride.
 {{- end -}}
 
 {{/*
+Return the state PVC selected by this release. An external claim is
+infrastructure-owned and must exist before any workload rollout begins.
+*/}}
+{{- define "skypilot.storageClaimName" -}}
+{{- default (printf "%s-state" (include "skypilot.fullname" .)) (get .Values.storage "existingClaim") -}}
+{{- end -}}
+
+{{/*
 Stable, release-scoped name for a proposed authority cohort's pre-apply
 manifest.  Do not use skypilot.fullname here: fullnameOverride is mutable,
 while namespace + Helm release name is the durable release anchor.

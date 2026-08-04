@@ -773,6 +773,15 @@ storage:
   # - storage.enabled=false: Supported - but file mounts and logs will be lost on pod restart. Consider configuring
   #   'jobs.bucket' in the SkyPilot config to use cloud storage for file mounts.
   enabled: true
+  # Mount a pre-existing PersistentVolumeClaim instead of creating the
+  # release-owned <fullname>-state claim. This is useful when storage is
+  # provisioned independently or when migrating an existing release to a new
+  # volume without deleting the legacy claim. The referenced claim must exist
+  # in the release namespace before Helm rolls any pod. storage.accessMode
+  # remains the operator's declared capability and must be ReadWriteMany in HA
+  # mode; the chart cannot inspect the referenced claim at render time.
+  # @schema type: string
+  existingClaim: ""
   # Storage class name - leave empty to use cluster default
   # For RWX storage with RollingUpdate, use a storage class that supports ReadWriteMany access mode:
   # - GKE: Create a Filestore-backed storage class (https://cloud.google.com/filestore/docs/accessing-fileshares)

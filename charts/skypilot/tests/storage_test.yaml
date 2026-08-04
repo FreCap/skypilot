@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: storage_test
+templates:
+  - templates/pvc.yaml
+tests:
+  - it: should create the release-owned state claim by default
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: PersistentVolumeClaim
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-state
+
+  - it: should not create a claim when an existing claim is selected
+    set:
+      storage.existingClaim: production-rwx-state
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should apply user annotations only to a release-owned claim
+    set:
+      storage.annotations:
+        helm.sh/resource-policy: keep
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
