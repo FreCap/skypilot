@@ -2258,42 +2258,122 @@ def _replica_row_on_pool(
     *,
     pool_key: str | None = None,
     physical_cluster_uid: str | None = None,
+    current_service_generation: int | None = None,
+    pool_gpus_per_replica: int | None = None,
 ) -> bool:
     """Whether a replica row's persisted location sits on the pool.
 
-    Relaxed placement identity (mirrors the #108 fill matcher's spirit):
-    Kubernetes + same context; a shape-carrying row must name the pool's
-    GPU (case-insensitive), a legacy shape-less row matches on context
-    alone (its bound pod still occupies the pool).
-    """
-    persisted_pool_key = getattr(info, 'reserved_fill_pool_key', None)
-    # unittest.mock.Mock synthesizes arbitrary attributes on getattr.  Treat
-    # only an actually persisted string as authority so legacy replica rows
-    # (and their test doubles) keep using location matching.
-    if isinstance(persisted_pool_key, str) and persisted_pool_key:
-        return pool_key is not None and persisted_pool_key == pool_key
-    persisted_uid = getattr(info, 'reserved_fill_physical_cluster_uid', None)
-    if (isinstance(persisted_uid, str) and persisted_uid and
-            physical_cluster_uid is not None):
-        if persisted_uid != physical_cluster_uid:
-            return False
-        location = getattr(info, 'location', None)
-        accelerators = (location or {}).get('accelerators') or {}
-        return (not accelerators or
-                any(name.lower() in gpu_names for name in accelerators))
+    Protocol-v2 launch provenance is one indivisible authority tuple: pool
+    key, immutable launch generation, physical cluster UID, and persisted
+    placement must all agree.  A partial or contradictory tuple fails closed;
+    it must not be re-attributed through a coincidentally matching context.
 
+    Only a row with all three origin fields absent is genuinely legacy and may
+    use the relaxed #108 placement identity: Kubernetes + same context; a
+    shape-carrying row must name the pool's GPU (case-insensitive), while a
+    legacy shape-less row matches on context alone (its bound pod still
+    occupies the pool).
+    """
+    identity: PoolIdentity | None = None
+    if pool_key is not None:
+        try:
+            identity = parse_pool_identity(pool_key)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    if identity is None or identity.protocol_version == PROTOCOL_V1:
+        # Preserve protocol-v1 attribution exactly during the rollout window.
+        # Its historical rows may carry only the v1 pool key, and pre-upgrade
+        # shape-less rows remain physical occupants of this context.
+        persisted_pool_key = getattr(info, 'reserved_fill_pool_key', None)
+        if isinstance(persisted_pool_key, str) and persisted_pool_key:
+            return persisted_pool_key == pool_key
+        persisted_uid = getattr(info, 'reserved_fill_physical_cluster_uid',
+                                None)
+        if (isinstance(persisted_uid, str) and persisted_uid and
+                physical_cluster_uid is not None):
+            if persisted_uid != physical_cluster_uid:
+                return False
+            location = getattr(info, 'location', None)
+            accelerators = (location or {}).get('accelerators') or {}
+            return (not accelerators or any(
+                isinstance(name, str) and name.lower() in gpu_names
+                for name in accelerators))
+        contexts = (context,) if isinstance(context, str) else context
+        location = getattr(info, 'location', None)
+        if not location:
+            return False
+        if str(location.get('cloud', '')).lower() != 'kubernetes':
+            return False
+        if location.get('region') not in contexts:
+            return False
+        accelerators = location.get('accelerators') or {}
+        accelerator_matches = any(
+            isinstance(name, str) and name.lower() in gpu_names
+            for name in accelerators)
+        return not accelerators or accelerator_matches
+
+    contexts = (context,) if isinstance(context, str) else context
     location = getattr(info, 'location', None)
-    if not location:
+    if not isinstance(location, Mapping) or not location:
         return False
     if str(location.get('cloud', '')).lower() != 'kubernetes':
         return False
-    contexts = (context,) if isinstance(context, str) else context
     if location.get('region') not in contexts:
         return False
     accelerators = location.get('accelerators') or {}
-    if not accelerators:
-        return True
-    return any(name.lower() in gpu_names for name in accelerators)
+    if not isinstance(accelerators, Mapping):
+        return False
+    exact_accelerator_shape = False
+    if (len(accelerators) == 1 and isinstance(pool_gpus_per_replica, int) and
+            not isinstance(pool_gpus_per_replica, bool) and
+            pool_gpus_per_replica > 0):
+        accelerator_name, accelerator_count = next(iter(accelerators.items()))
+        exact_accelerator_shape = (
+            isinstance(accelerator_name, str) and
+            accelerator_name.lower() in identity.gpu_names and
+            not isinstance(accelerator_count, bool) and
+            isinstance(accelerator_count, (int, float)) and
+            accelerator_count >= 1 and float(accelerator_count).is_integer() and
+            int(accelerator_count) == pool_gpus_per_replica)
+
+    # Read only real persisted attributes. unittest.mock.Mock synthesizes
+    # arbitrary attributes on getattr, which could otherwise turn a legacy
+    # test double into apparent provenance authority.
+    try:
+        persisted = vars(info)
+    except TypeError:
+        persisted = {}
+    persisted_pool_key = persisted.get('reserved_fill_pool_key')
+    persisted_generation = persisted.get('reserved_fill_service_generation')
+    persisted_uid = persisted.get('reserved_fill_physical_cluster_uid')
+    provenance = (persisted_pool_key, persisted_generation, persisted_uid)
+    if any(value is not None for value in provenance):
+        if (not isinstance(persisted_pool_key, str) or not persisted_pool_key or
+                persisted_pool_key != pool_key or
+                isinstance(persisted_generation, bool) or
+                not isinstance(persisted_generation, int) or
+                persisted_generation < 1 or
+                not isinstance(persisted_uid, str) or not persisted_uid or
+                physical_cluster_uid is None or
+                physical_cluster_uid != identity.physical_cluster_uid or
+                persisted_uid != physical_cluster_uid):
+            return False
+        if (current_service_generation is not None and
+            (isinstance(current_service_generation, bool) or
+             not isinstance(current_service_generation, int) or
+             current_service_generation < 1 or
+             persisted_generation > current_service_generation)):
+            return False
+        # Explicit provenance and placement form one authority tuple. Unlike a
+        # genuinely legacy row, a v2 row must prove its exact accelerator card
+        # and per-replica width too.
+        return exact_accelerator_shape
+
+    # Genuinely legacy rows retain the relaxed location fallback while the v1
+    # compatibility window is open.
+    return (not accelerators or any(
+        isinstance(name, str) and name.lower() in identity.gpu_names
+        for name in accelerators))
 
 
 def _row_was_launched(info: Any) -> bool:
@@ -2321,6 +2401,8 @@ def _occupying_debit(
     *,
     access_contexts: tuple[str, ...] | None = None,
     physical_cluster_uid: str | None = None,
+    claim_generations: Mapping[str, int] | None = None,
+    pool_gpus_per_replica: int | None = None,
 ) -> tuple[int, int, dict[str, int], int]:
     """Row-consistent scan of every service's replica rows on the pool.
 
@@ -2480,7 +2562,10 @@ def _occupying_debit(
                             contexts,
                             gpu_names,
                             pool_key=pool_key,
-                            physical_cluster_uid=physical_cluster_uid) and
+                            physical_cluster_uid=physical_cluster_uid,
+                            current_service_generation=(claim_generations or
+                                                        {}).get(name),
+                            pool_gpus_per_replica=pool_gpus_per_replica) and
                         _row_was_launched(info)):
                     unclaimed_fill += 1
                 continue
@@ -2489,7 +2574,10 @@ def _occupying_debit(
                     contexts,
                     gpu_names,
                     pool_key=pool_key,
-                    physical_cluster_uid=physical_cluster_uid):
+                    physical_cluster_uid=physical_cluster_uid,
+                    current_service_generation=(claim_generations or
+                                                {}).get(name),
+                    pool_gpus_per_replica=pool_gpus_per_replica):
                 continue
             is_fill = bool(getattr(info, 'reserved_fill', False))
             if not is_claimant and not is_fill:
@@ -3022,6 +3110,13 @@ def _run_round_locked(
                     'blackout.')
             query_ok = False
 
+    winning_widths = {
+        int(row['gpus_per_replica'] or 1)
+        for name, row in claim_rows.items()
+        if name not in mixed_width_losers
+    }
+    pool_gpus_per_replica = (next(iter(winning_widths))
+                             if len(winning_widths) == 1 else None)
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
     activity = {name: _activity_input(row) for name, row in claim_rows.items()}
     names = sorted(claims)
@@ -3113,7 +3208,9 @@ def _run_round_locked(
              pool_key,
              snapshot_time,
              access_contexts=access_contexts,
-             physical_cluster_uid=physical_cluster_uid)
+             physical_cluster_uid=physical_cluster_uid,
+             claim_generations=claim_generations,
+             pool_gpus_per_replica=pool_gpus_per_replica)
         # One row-consistent view: a claim's holdings_fill is only as
         # fresh as its owner's last heartbeat, while unclaimed_fill comes
         # from the live row scan above -- summing the two double-counts

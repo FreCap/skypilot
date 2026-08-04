@@ -596,6 +596,10 @@ Automated coverage must include:
   window;
 - one replica-table read and one utilization sample per service poll cycle;
 - identical H200 names in two contexts with exact-context launch selection;
+- complete launch-origin attribution in both autoscaler shelter and broker
+  occupancy scans: older/current tuples remain valid, while partial, future,
+  UID/context/exact-shape-mismatched tuples fail closed and only genuinely legacy
+  rows retain the legacy placement fallback;
 - context retargeting between decision and actuation with UID mismatch;
 - no row/thread on malformed, removed, benched, or superseded pool launches;
 - pool-local demand saturation and scale-down shelter;

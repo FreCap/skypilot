@@ -561,6 +561,111 @@ def _replica_stub(is_ready=True,
     return info
 
 
+class TestProtocolV2ReplicaPoolProvenance:
+    """Broker occupancy uses the same complete origin fence as shelter."""
+
+    _POOL = broker.make_pool_key('phx-context',
+                                 'H200',
+                                 protocol_version=broker.PROTOCOL_V2,
+                                 physical_cluster_uid='phx-cluster')
+
+    @classmethod
+    def _explicit_row(cls,
+                      *,
+                      pool_key=None,
+                      generation=4,
+                      physical_cluster_uid='phx-cluster',
+                      region='phx-context',
+                      gpu='H200'):
+        info = _replica_stub(region=region, gpu=gpu, reserved_fill=True)
+        info.reserved_fill_pool_key = pool_key or cls._POOL
+        info.reserved_fill_service_generation = generation
+        info.reserved_fill_physical_cluster_uid = physical_cluster_uid
+        return info
+
+    @classmethod
+    def _matches(cls, info, current_service_generation=5):
+        return broker._replica_row_on_pool(
+            info, ('phx-context',), ('h200',),
+            pool_key=cls._POOL,
+            physical_cluster_uid='phx-cluster',
+            current_service_generation=current_service_generation,
+            pool_gpus_per_replica=1)
+
+    def test_complete_matching_tuple_accepts_current_and_older_generation(self):
+        assert self._matches(self._explicit_row(generation=5))
+        assert self._matches(self._explicit_row(generation=4))
+
+    def test_complete_former_claimant_tuple_remains_physical_occupancy(self):
+        assert self._matches(self._explicit_row(),
+                             current_service_generation=None)
+
+    def test_partial_malformed_or_contradictory_tuple_fails_closed(self):
+        other_pool = broker.make_pool_key(
+            'phx-context',
+            'H200',
+            protocol_version=broker.PROTOCOL_V2,
+            physical_cluster_uid='replacement-cluster')
+        cases = []
+
+        partial = _replica_stub(region='phx-context',
+                                gpu='H200',
+                                reserved_fill=True)
+        partial.reserved_fill_pool_key = self._POOL
+        cases.append(partial)
+        cases.extend([
+            self._explicit_row(generation=True),
+            self._explicit_row(generation=6),
+            self._explicit_row(pool_key=other_pool),
+            self._explicit_row(physical_cluster_uid='replacement-cluster'),
+            self._explicit_row(region='other-context'),
+            self._explicit_row(gpu='A100'),
+        ])
+        shapeless = self._explicit_row()
+        shapeless.location['accelerators'] = {}
+        cases.append(shapeless)
+        wrong_width = self._explicit_row()
+        wrong_width.location['accelerators'] = {'H200': 8}
+        cases.append(wrong_width)
+        mixed_cards = self._explicit_row()
+        mixed_cards.location['accelerators'] = {'H200': 1, 'A100': 1}
+        cases.append(mixed_cards)
+
+        assert all(not self._matches(info) for info in cases)
+
+    def test_genuinely_legacy_row_retains_location_fallback(self):
+        legacy = _replica_stub(region='phx-context',
+                               gpu='H200',
+                               reserved_fill=True)
+        assert self._matches(legacy)
+        legacy.location['accelerators'] = {}
+        assert self._matches(legacy)
+
+    def test_occupancy_scan_applies_generation_only_to_live_claimant(
+            self, monkeypatch):
+        future_claimant = self._explicit_row(generation=6)
+        former_claimant = self._explicit_row(generation=6)
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos_grouped',
+            mock.Mock(return_value={
+                'svc-a': [future_claimant],
+                'svc-gone': [former_claimant],
+            }))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1)
+
+        # The future claimant row receives no holding.  A former claimant has
+        # no current generation fence, but its complete immutable launch tuple
+        # still proves one unclaimed physical occupant of this pool.
+        assert result == (0, 0, {'svc-a': 0}, 1)
+
+
 def _live_fill_rows(count):
     """Nonterminal fill rows backing a claimant's holdings on the pool.
 
