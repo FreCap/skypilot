@@ -135,3 +135,47 @@ run "commercial_pool_preserves_partition_identity_shapes" {
     error_message = "The partition output must expose the effective RBAC groups."
   }
 }
+
+# The pool ServiceAccount is what a node runs as, so it is the identity that
+# performs an idle teardown. Per-partition, because the grant cannot be scoped
+# to one cluster's pods and so is only safe where the namespace is not shared.
+run "self_teardown_defaults_off_and_is_per_partition" {
+  command = plan
+
+  assert {
+    condition = (
+      module.rbac["training"].self_teardown_role_name == null &&
+      module.rbac["inference"].self_teardown_role_name == null
+    )
+    error_message = "Partitions must not grant node self-teardown unless they ask for it."
+  }
+}
+
+run "self_teardown_reaches_only_the_partition_that_asked" {
+  command = plan
+
+  variables {
+    partitions = [
+      {
+        namespace             = "training"
+        group                 = "training"
+        pod_identity_role_arn = "arn:aws:iam::210987654321:role/skypilot-training"
+        allow_self_teardown   = true
+      },
+      {
+        namespace = "inference"
+        group     = "inference"
+      },
+    ]
+  }
+
+  assert {
+    condition     = module.rbac["training"].self_teardown_role_name == "training-self-teardown"
+    error_message = "A partition opting in must receive the self-teardown role."
+  }
+
+  assert {
+    condition     = module.rbac["inference"].self_teardown_role_name == null
+    error_message = "Opting one partition in must not grant self-teardown to the others."
+  }
+}

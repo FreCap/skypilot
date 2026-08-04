@@ -144,6 +144,91 @@ resource "kubernetes_role_v1" "pool" {
   depends_on = [kubernetes_namespace_v1.pool]
 }
 
+# Self-teardown for the pod ServiceAccount.
+#
+# Everything above is bound to `var.subjects` -- the CONTROL PLANE's identity.
+# That covers every operation the API server drives. It does not cover the one
+# SkyPilot operation that runs from inside the node, as the pod's own
+# ServiceAccount: the idle-timer teardown. `StopEvent` -> `terminate_instances`
+# lists the cluster's pods and deletes them plus their head Services, using
+# in-cluster credentials. With no binding for the ServiceAccount those calls
+# 403 every 60s forever; SkyPilot swallows the error to keep the skylet alive
+# and the API server keeps reporting a serene `AUTOSTOP Nm (down)`.
+#
+# Deliberately a SEPARATE, smaller Role rather than adding the ServiceAccount to
+# the subjects of the one above: that Role carries pods `create`, `pods/exec`
+# and `pods/portforward`, which would let any workload pod start pods and exec
+# into its neighbours. Teardown needs none of that.
+#
+# Verbs derived from sky/provision/kubernetes/instance.py:
+#   pods         list (filter_pods) + get/delete (_terminate_node)
+#   services     delete (_delete_services) + deletecollection over a label
+#                selector (_delete_cluster_services), which also reads
+#   events       create -- the best-effort "Cluster is autodowning." breadcrumb
+#                the server reads back to attribute the termination
+#   deployments  list only -- the high-availability-controller probe, which is
+#                already wrapped in try/except; granting it just removes 403
+#                noise. No delete: HA controllers are control-plane managed.
+resource "kubernetes_role_v1" "pool_sa_self_teardown" {
+  count = var.allow_self_teardown ? 1 : 0
+
+  metadata {
+    name      = "${var.name}-self-teardown"
+    namespace = var.namespace
+    labels    = local.labels
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["pods"]
+    verbs      = ["get", "list", "delete"]
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["services"]
+    verbs      = ["get", "list", "delete", "deletecollection"]
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["events"]
+    verbs      = ["create"]
+  }
+
+  rule {
+    api_groups = ["apps"]
+    resources  = ["deployments"]
+    verbs      = ["list"]
+  }
+
+  depends_on = [kubernetes_namespace_v1.pool]
+}
+
+resource "kubernetes_role_binding_v1" "pool_sa_self_teardown" {
+  count = var.allow_self_teardown ? 1 : 0
+
+  metadata {
+    name      = "${var.name}-self-teardown"
+    namespace = var.namespace
+    labels    = local.labels
+  }
+
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "Role"
+    name      = kubernetes_role_v1.pool_sa_self_teardown[0].metadata[0].name
+  }
+
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account_v1.pool_sa.metadata[0].name
+    namespace = var.namespace
+  }
+
+  depends_on = [kubernetes_namespace_v1.pool]
+}
+
 resource "kubernetes_role_binding_v1" "pool" {
   metadata {
     name      = var.name

@@ -105,6 +105,28 @@ variable "service_account_name" {
   }
 }
 
+variable "allow_self_teardown" {
+  description = <<-EOT
+    Bind the pool ServiceAccount to a minimal Role letting a SkyPilot node tear
+    ITSELF down. Required for `-i N --down` (autodown) and for a preemption
+    hook's teardown: those run inside the pod, as this ServiceAccount, not from
+    the control plane. Without it `sky launch -i N --down` cannot ever fire --
+    storing the autostop config needs no RBAC, so before SkyPilot's arm-time
+    preflight it silently reported `AUTOSTOP Nm (down)` while the cluster ran
+    forever.
+
+    The grant is namespaced and strictly teardown-shaped (no create, no exec, no
+    portforward), but Kubernetes RBAC cannot scope a verb to "pods this cluster
+    owns" -- there is no label/name selector for dynamically named pods. So in a
+    namespace shared by several users, any SkyPilot workload can delete another
+    user's SkyPilot pods in that same namespace. Leave this false for a shared
+    namespace where that is unacceptable; the cost is that autodown is
+    unavailable there and `sky launch --down` fails fast instead.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "allow_pvc_read" {
   description = <<-EOT
     Grant read (get/list) on persistentvolumeclaims in the namespace. Required when

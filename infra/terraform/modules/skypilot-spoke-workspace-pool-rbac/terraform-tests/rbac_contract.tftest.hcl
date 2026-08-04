@@ -147,3 +147,88 @@ run "an_external_namespace_preserves_the_other_resource_shapes" {
     error_message = "Disabling namespace ownership must not disable the namespaced service account or RBAC."
   }
 }
+
+# Autodown runs INSIDE the node, as the pool ServiceAccount. Before this the
+# module created that ServiceAccount and bound nothing to it, so `-i N --down`
+# 403'd forever while `sky status` still advertised the autostop.
+run "self_teardown_is_off_by_default" {
+  command = plan
+
+  assert {
+    condition = (
+      length(kubernetes_role_v1.pool_sa_self_teardown) == 0 &&
+      length(kubernetes_role_binding_v1.pool_sa_self_teardown) == 0 &&
+      output.self_teardown_role_name == null
+    )
+    error_message = "Self-teardown must be opt-in: it lets any pod in the namespace delete its neighbours' pods."
+  }
+}
+
+run "self_teardown_binds_the_service_account_to_teardown_verbs_only" {
+  command = plan
+
+  variables {
+    allow_self_teardown = true
+  }
+
+  # The binding must name the ServiceAccount itself. Binding only the control
+  # plane's Group -- which is what shipped -- leaves the node unable to delete
+  # itself, which is the whole bug.
+  assert {
+    condition = (
+      length(kubernetes_role_binding_v1.pool_sa_self_teardown) == 1 &&
+      length(kubernetes_role_binding_v1.pool_sa_self_teardown[0].subject) == 1 &&
+      kubernetes_role_binding_v1.pool_sa_self_teardown[0].subject[0].kind == "ServiceAccount" &&
+      kubernetes_role_binding_v1.pool_sa_self_teardown[0].subject[0].name == var.service_account_name &&
+      kubernetes_role_binding_v1.pool_sa_self_teardown[0].subject[0].namespace == var.namespace
+    )
+    error_message = "The self-teardown binding must name the pool ServiceAccount in the pool namespace."
+  }
+
+  assert {
+    condition     = kubernetes_role_binding_v1.pool_sa_self_teardown[0].role_ref[0].name == kubernetes_role_v1.pool_sa_self_teardown[0].metadata[0].name
+    error_message = "The self-teardown binding must reference the self-teardown role."
+  }
+
+  # terminate_instances: filter_pods (list) then delete each pod.
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool_sa_self_teardown[0].rule : rule
+      if toset(rule.api_groups) == toset([""]) &&
+      toset(rule.resources) == toset(["pods"]) &&
+      toset(rule.verbs) == toset(["get", "list", "delete"])
+    ]) == 1
+    error_message = "Self-teardown must grant exactly get/list/delete on namespaced pods."
+  }
+
+  # _delete_services, plus the label-selector deletecollection fallback.
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool_sa_self_teardown[0].rule : rule
+      if toset(rule.api_groups) == toset([""]) &&
+      toset(rule.resources) == toset(["services"]) &&
+      toset(rule.verbs) == toset(["get", "list", "delete", "deletecollection"])
+    ]) == 1
+    error_message = "Self-teardown must let the node delete its own head Services."
+  }
+
+  # Nothing that would let a workload pod start or enter other pods.
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool_sa_self_teardown[0].rule : rule
+      if length(setintersection(toset(rule.verbs), toset(["create", "patch", "update"]))) > 0 &&
+      length(setintersection(toset(rule.resources), toset(["pods", "pods/exec", "pods/portforward"]))) > 0
+    ]) == 0
+    error_message = "Self-teardown must never grant create/patch on pods or any pods/exec, pods/portforward."
+  }
+
+  # The control-plane Role is untouched by the opt-in.
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool.rule : rule
+      if toset(rule.resources) == toset(["pods"]) &&
+      toset(rule.verbs) == toset(["get", "list", "create", "patch", "delete"])
+    ]) == 1
+    error_message = "Enabling self-teardown must not alter the control-plane role."
+  }
+}
