@@ -81,7 +81,43 @@ class TestWorkspaceManagement(unittest.TestCase):
         # Verify the result
         self.assertEqual(result, new_workspaces)
 
-    @mock.patch('sky.workspaces.core.get_workspaces')
+    @mock.patch('sky.skypilot_config.get_skypilot_config_lock_path')
+    @mock.patch('sky.skypilot_config.to_dict')
+    @mock.patch('sky.skypilot_config.update_api_server_config_no_lock')
+    def test_internal_update_workspaces_config_rejects_stale_snapshot(
+            self, mock_update_no_lock, mock_to_dict, mock_lock_path):
+        """A validated workspace update cannot overwrite a newer config."""
+        mock_lock_path.return_value = self.config_path + '.lock'
+        mock_to_dict.return_value = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east']
+            },
+            'workspaces': {
+                'research': {
+                    'kubernetes': {
+                        'namespace': 'new-namespace'
+                    }
+                }
+            }
+        }
+        validated_snapshot = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east']
+            },
+            'workspaces': {
+                'research': {}
+            }
+        }
+        modifier = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, 'Please retry'):
+            core._update_workspaces_config(modifier,
+                                           expected_config=validated_snapshot)
+
+        modifier.assert_not_called()
+        mock_update_no_lock.assert_not_called()
+
+    @mock.patch('sky.skypilot_config.to_dict')
     @mock.patch(
         'sky.utils.resource_checker.check_no_active_resources_for_workspaces')
     @mock.patch('sky.utils.schemas.get_config_schema')
@@ -91,10 +127,9 @@ class TestWorkspaceManagement(unittest.TestCase):
     def test_update_workspace(self, mock_update_workspaces_config,
                               mock_sky_check, mock_validate_schema,
                               mock_get_schema, mock_check_resources,
-                              mock_get_workspaces):
+                              mock_to_dict):
         """Test updating a specific workspace."""
-        mock_get_workspaces.return_value = self.sample_config[
-            'workspaces'].copy()
+        mock_to_dict.return_value = self.sample_config.copy()
         mock_check_resources.return_value = None
         mock_get_schema.return_value = {
             'properties': {
@@ -123,6 +158,240 @@ class TestWorkspaceManagement(unittest.TestCase):
         # Verify the internal helper was called with a function
         mock_update_workspaces_config.assert_called_once()
         self.assertEqual(result, expected_workspaces)
+
+    @mock.patch('sky.check.check')
+    @mock.patch('sky.workspaces.core._update_workspaces_config')
+    @mock.patch(
+        'sky.workspaces.core._validate_workspace_config_changes_with_lock')
+    @mock.patch('sky.workspaces.core._validate_workspace_config')
+    @mock.patch('sky.skypilot_config.to_dict')
+    def test_update_workspace_passes_inherited_allowed_contexts(
+            self, mock_to_dict, mock_validate_config, mock_validate_changes,
+            mock_update_workspaces_config, mock_sky_check):
+        """Workspace update compares against current global contexts."""
+        current_workspace = {}
+        new_workspace = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east', 'ctx-phx']
+            }
+        }
+        current_server_config = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east']
+            },
+            'workspaces': {
+                'research': current_workspace
+            }
+        }
+        mock_to_dict.return_value = current_server_config
+        mock_update_workspaces_config.return_value = {'research': new_workspace}
+
+        result = core.update_workspace('research', new_workspace)
+
+        self.assertEqual(result, {'research': new_workspace})
+        mock_validate_config.assert_called_once_with('research', new_workspace)
+        mock_validate_changes.assert_called_once_with(
+            'research',
+            current_workspace,
+            new_workspace,
+            inherited_allowed_contexts=['ctx-east'])
+        mock_update_workspaces_config.assert_called_once_with(
+            mock.ANY, expected_config=current_server_config)
+        mock_sky_check.assert_called_once_with(quiet=True, workspace='research')
+
+    @mock.patch('sky.skypilot_config.get_skypilot_config_lock_path')
+    @mock.patch('sky.skypilot_config.update_api_server_config_no_lock')
+    @mock.patch('sky.skypilot_config.to_dict')
+    @mock.patch('sky.utils.schemas.get_config_schema')
+    @mock.patch('sky.utils.common_utils.validate_schema')
+    @mock.patch('sky.check.check')
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_workspaces')
+    @mock.patch('sky.users.permission.permission_service')
+    @mock.patch('sky.workspaces.utils.get_workspace_users')
+    @mock.patch(
+        'sky.workspaces.core._validate_workspace_config_changes_with_lock')
+    def test_update_config_passes_inherited_allowed_contexts(
+            self, mock_validate_changes, mock_get_users, mock_permission,
+            mock_check_resources, mock_sky_check, mock_validate_schema,
+            mock_get_schema, mock_to_dict, mock_update_no_lock, mock_lock_path):
+        """Full config update uses the old global value for comparison."""
+        current_workspace = {}
+        new_workspace = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east', 'ctx-phx']
+            }
+        }
+        current_config = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east']
+            },
+            'workspaces': {
+                'research': current_workspace
+            }
+        }
+        new_config = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east']
+            },
+            'workspaces': {
+                'research': new_workspace
+            }
+        }
+        mock_to_dict.return_value = current_config
+        mock_get_schema.return_value = {
+            'properties': {
+                'workspaces': {
+                    'additionalProperties': {}
+                }
+            }
+        }
+        mock_validate_schema.return_value = None
+        mock_get_users.return_value = ['*']
+        mock_check_resources.return_value = None
+        mock_lock_path.return_value = self.config_path + '.lock'
+
+        result = core.update_config(new_config)
+
+        self.assertEqual(result, new_config)
+        mock_validate_changes.assert_called_once_with(
+            'research',
+            current_workspace,
+            new_workspace,
+            inherited_allowed_contexts=['ctx-east'],
+            new_inherited_allowed_contexts=['ctx-east'])
+        mock_check_resources.assert_called_once_with([])
+        mock_update_no_lock.assert_called_once()
+        mock_permission.update_workspace_policy.assert_called_once_with(
+            'research', ['*'])
+        mock_sky_check.assert_called_once_with(quiet=True)
+
+    @mock.patch('sky.skypilot_config.get_skypilot_config_lock_path')
+    @mock.patch('sky.skypilot_config.update_api_server_config_no_lock')
+    @mock.patch('sky.skypilot_config.to_dict')
+    @mock.patch('sky.utils.schemas.get_config_schema')
+    @mock.patch('sky.utils.common_utils.validate_schema')
+    @mock.patch('sky.check.check')
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_workspaces')
+    @mock.patch('sky.users.permission.permission_service')
+    @mock.patch(
+        'sky.workspaces.core._validate_workspace_config_changes_with_lock')
+    def test_update_config_validates_changed_inherited_allowed_contexts(
+            self, mock_validate_changes, mock_permission, mock_check_resources,
+            mock_sky_check, mock_validate_schema, mock_get_schema, mock_to_dict,
+            mock_update_no_lock, mock_lock_path):
+        """A global default change validates inheriting workspaces."""
+        current_config = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east']
+            },
+            'workspaces': {
+                'research': {}
+            }
+        }
+        new_config = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east', 'ctx-phx']
+            },
+            'workspaces': {
+                'research': {}
+            }
+        }
+        mock_to_dict.return_value = current_config
+        mock_get_schema.return_value = {
+            'properties': {
+                'workspaces': {
+                    'additionalProperties': {}
+                }
+            }
+        }
+        mock_validate_schema.return_value = None
+        mock_check_resources.return_value = None
+        mock_lock_path.return_value = self.config_path + '.lock'
+
+        result = core.update_config(new_config)
+
+        self.assertEqual(result, new_config)
+        expected_validation_calls = [
+            mock.call('research', {}, {},
+                      inherited_allowed_contexts=['ctx-east'],
+                      new_inherited_allowed_contexts=['ctx-east', 'ctx-phx']),
+            mock.call(constants.SKYPILOT_DEFAULT_WORKSPACE, {}, {},
+                      inherited_allowed_contexts=['ctx-east'],
+                      new_inherited_allowed_contexts=['ctx-east', 'ctx-phx']),
+        ]
+        self.assertEqual(mock_validate_changes.call_args_list,
+                         expected_validation_calls)
+        mock_permission.update_workspace_policy.assert_not_called()
+        mock_update_no_lock.assert_called_once()
+        mock_sky_check.assert_called_once_with(quiet=True)
+
+    @mock.patch('sky.skypilot_config.get_skypilot_config_lock_path')
+    @mock.patch('sky.skypilot_config.update_api_server_config_no_lock')
+    @mock.patch('sky.skypilot_config.to_dict')
+    @mock.patch('sky.utils.schemas.get_config_schema')
+    @mock.patch('sky.utils.common_utils.validate_schema')
+    @mock.patch('sky.check.check')
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_workspaces')
+    @mock.patch('sky.users.permission.permission_service')
+    @mock.patch('sky.workspaces.utils.get_workspace_users')
+    @mock.patch(
+        'sky.workspaces.core._validate_workspace_config_changes_with_lock')
+    def test_update_config_rejects_stale_validation_snapshot(
+            self, mock_validate_changes, mock_get_users, mock_permission,
+            mock_check_resources, mock_sky_check, mock_validate_schema,
+            mock_get_schema, mock_to_dict, mock_update_no_lock, mock_lock_path):
+        """A full update cannot commit after its validated defaults drift."""
+        current_config = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east']
+            },
+            'workspaces': {
+                'research': {}
+            }
+        }
+        new_config = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east']
+            },
+            'workspaces': {
+                'research': {
+                    'kubernetes': {
+                        'allowed_contexts': ['ctx-east', 'ctx-phx']
+                    }
+                }
+            }
+        }
+        latest_config = {
+            'kubernetes': {
+                'allowed_contexts': ['other-context']
+            },
+            'workspaces': {
+                'research': {}
+            }
+        }
+        mock_to_dict.side_effect = [current_config, latest_config]
+        mock_get_schema.return_value = {
+            'properties': {
+                'workspaces': {
+                    'additionalProperties': {}
+                }
+            }
+        }
+        mock_validate_schema.return_value = None
+        mock_get_users.return_value = ['*']
+        mock_check_resources.return_value = None
+        mock_lock_path.return_value = self.config_path + '.lock'
+
+        with self.assertRaisesRegex(RuntimeError, 'Please retry'):
+            core.update_config(new_config)
+
+        mock_validate_changes.assert_called_once()
+        mock_update_no_lock.assert_not_called()
+        mock_permission.update_workspace_policy.assert_not_called()
+        mock_sky_check.assert_not_called()
 
     @mock.patch('sky.workspaces.core.get_workspaces')
     @mock.patch('sky.utils.schemas.get_config_schema')
@@ -687,6 +956,236 @@ class TestWorkspaceManagement(unittest.TestCase):
 
     @mock.patch('sky.workspaces.utils.get_workspace_users')
     @mock.patch('sky.users.permission.permission_service.get_users_for_role')
+    def test_compare_workspace_configs_inherited_allowed_contexts(
+            self, mock_get_users_for_role, mock_get_users):
+        """Local context overrides are compared to their inherited value."""
+        mock_get_users.return_value = []
+        mock_get_users_for_role.return_value = []
+
+        additive_override = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east', 'ctx-phx']
+            }
+        }
+        cases = [
+            ({}, additive_override, ['ctx-east'], True),
+            ({
+                'kubernetes': {}
+            }, additive_override, ['ctx-east'], True),
+            ({}, {
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east']
+                }
+            }, ['ctx-east'], True),
+            ({}, {
+                'kubernetes': {
+                    'allowed_contexts': 'all'
+                }
+            }, ['ctx-east'], True),
+            ({
+                'kubernetes': {
+                    'namespace': 'research'
+                }
+            }, {
+                'kubernetes': {
+                    'namespace': 'research',
+                    'allowed_contexts': ['ctx-east', 'ctx-phx']
+                }
+            }, ['ctx-east'], True),
+            ({}, {
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-phx']
+                }
+            }, ['ctx-east'], False),
+            ({
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east', 'ctx-phx']
+                }
+            }, {}, ['ctx-east'], False),
+            ({
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east']
+                }
+            }, {}, ['ctx-east'], False),
+            ({}, {
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east']
+                }
+            }, 'all', False),
+            ({}, {
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east']
+                }
+            }, None, False),
+            ({
+                'gcp': {
+                    'project_id': 'old-project'
+                }
+            }, {
+                'gcp': {
+                    'project_id': 'new-project'
+                },
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east', 'ctx-phx']
+                }
+            }, ['ctx-east'], False),
+        ]
+        for current_config, new_config, inherited, expected in cases:
+            with self.subTest(current=current_config,
+                              new=new_config,
+                              inherited=inherited):
+                result = core._compare_workspace_configs(
+                    current_config,
+                    new_config,
+                    inherited_allowed_contexts=inherited)
+                self.assertEqual(result.additive_allowed_contexts, expected)
+
+    @mock.patch('sky.workspaces.utils.get_workspace_users')
+    @mock.patch('sky.users.permission.permission_service.get_users_for_role')
+    def test_compare_workspace_configs_changed_global_allowed_contexts(
+            self, mock_get_users_for_role, mock_get_users):
+        """Full updates compare old and submitted inherited defaults."""
+        mock_get_users.return_value = []
+        mock_get_users_for_role.return_value = []
+
+        cases = [
+            ({}, {}, ['ctx-east'], ['ctx-east', 'ctx-phx'], True, False),
+            ({}, {}, ['ctx-east'], 'all', True, False),
+            ({}, {}, ['ctx-east', 'ctx-phx'], ['ctx-east'], False, False),
+            ({}, {}, 'all', ['ctx-east'], False, False),
+            ({}, {}, None, ['ctx-east'], False, False),
+            ({
+                'kubernetes': {
+                    'allowed_contexts': ['workspace-context']
+                }
+            }, {
+                'kubernetes': {
+                    'allowed_contexts': ['workspace-context']
+                }
+            }, ['ctx-east'], ['ctx-east', 'ctx-phx'], False, True),
+            ({
+                'gcp': {
+                    'project_id': 'old-project'
+                }
+            }, {
+                'gcp': {
+                    'project_id': 'new-project'
+                }
+            }, ['ctx-east'], ['ctx-east', 'ctx-phx'], False, False),
+        ]
+        for (current_config, new_config, current_inherited, new_inherited,
+             expected_additive, expected_user_only) in cases:
+            with self.subTest(current=current_config,
+                              new=new_config,
+                              current_inherited=current_inherited,
+                              new_inherited=new_inherited):
+                result = core._compare_workspace_configs(
+                    current_config,
+                    new_config,
+                    inherited_allowed_contexts=current_inherited,
+                    new_inherited_allowed_contexts=new_inherited)
+                self.assertEqual(result.additive_allowed_contexts,
+                                 expected_additive)
+                self.assertEqual(result.only_user_access_changes,
+                                 expected_user_only)
+
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_workspaces')
+    @mock.patch('sky.users.permission.permission_service.get_users_for_role')
+    @mock.patch('sky.global_user_state.get_all_users')
+    def test_validate_inherited_allowed_context_changes(self,
+                                                        mock_get_all_users,
+                                                        mock_get_users_for_role,
+                                                        mock_check_resources):
+        """Inherited additions skip the guard; replacement/removal do not."""
+        mock_get_all_users.return_value = []
+        mock_get_users_for_role.return_value = []
+        inherited = ['ctx-east']
+
+        core._validate_workspace_config_changes(
+            'research', {},
+            {'kubernetes': {
+                'allowed_contexts': ['ctx-east', 'ctx-phx']
+            }},
+            inherited_allowed_contexts=inherited)
+        mock_check_resources.assert_not_called()
+
+        guarded_cases = [
+            ({}, {
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-phx']
+                }
+            }),
+            ({
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east', 'ctx-phx']
+                }
+            }, {}),
+        ]
+        for current_config, new_config in guarded_cases:
+            with self.subTest(current=current_config, new=new_config):
+                mock_check_resources.reset_mock()
+                core._validate_workspace_config_changes(
+                    'research',
+                    current_config,
+                    new_config,
+                    inherited_allowed_contexts=inherited)
+                mock_check_resources.assert_called_once_with([('research',
+                                                               'update')])
+
+        mock_check_resources.reset_mock()
+        core._validate_workspace_config_changes(
+            'research', {}, {},
+            inherited_allowed_contexts=['ctx-east'],
+            new_inherited_allowed_contexts=['ctx-east', 'ctx-phx'])
+        mock_check_resources.assert_not_called()
+
+        core._validate_workspace_config_changes(
+            'research', {}, {},
+            inherited_allowed_contexts=['ctx-east', 'ctx-phx'],
+            new_inherited_allowed_contexts=['ctx-east'])
+        mock_check_resources.assert_called_once_with([('research', 'update')])
+
+    @mock.patch(
+        'sky.utils.resource_checker.check_users_workspaces_active_resources')
+    @mock.patch(
+        'sky.utils.resource_checker.check_no_active_resources_for_workspaces')
+    @mock.patch('sky.workspaces.utils.get_workspace_users')
+    @mock.patch('sky.users.permission.permission_service.get_users_for_role')
+    @mock.patch('sky.global_user_state.get_all_users')
+    def test_validate_inherited_context_addition_with_removed_user(
+            self, mock_get_all_users, mock_get_users_for_role, mock_get_users,
+            mock_check_resources, mock_check_users):
+        """An additive context does not bypass removed-user validation."""
+        mock_get_all_users.return_value = []
+        mock_get_users_for_role.return_value = []
+        mock_get_users.side_effect = lambda config, **_kw: config.get(
+            'allowed_users', [])
+        mock_check_users.return_value = ('', [], {})
+        current_config = {
+            'private': True,
+            'allowed_users': ['user1', 'user2'],
+        }
+        new_config = {
+            'private': True,
+            'allowed_users': ['user1'],
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east', 'ctx-phx']
+            }
+        }
+
+        core._validate_workspace_config_changes(
+            'research',
+            current_config,
+            new_config,
+            inherited_allowed_contexts=['ctx-east'])
+
+        mock_check_resources.assert_not_called()
+        mock_check_users.assert_called_once_with(['user1'], ['research'],
+                                                 resources=None)
+
+    @mock.patch('sky.workspaces.utils.get_workspace_users')
+    @mock.patch('sky.users.permission.permission_service.get_users_for_role')
     def test_compare_workspace_configs_additive_contexts_with_other_changes(
             self, mock_get_users_for_role, mock_get_users):
         """Additive contexts alongside any other change is not additive."""
@@ -862,7 +1361,7 @@ class TestWorkspaceManagement(unittest.TestCase):
 class TestWorkspaceNameBackwardCompatibility(unittest.TestCase):
     """Tests that existing workspaces with non-conforming names still work."""
 
-    @mock.patch('sky.skypilot_config.get_nested')
+    @mock.patch('sky.skypilot_config.to_dict')
     @mock.patch(
         'sky.utils.resource_checker.check_no_active_resources_for_workspaces')
     @mock.patch('sky.utils.schemas.get_config_schema')
@@ -871,16 +1370,18 @@ class TestWorkspaceNameBackwardCompatibility(unittest.TestCase):
     @mock.patch('sky.workspaces.core._update_workspaces_config')
     def test_update_existing_workspace_with_nonconforming_name(
             self, mock_update_config, mock_sky_check, mock_validate_schema,
-            mock_get_schema, mock_check_resources, mock_get_nested):
+            mock_get_schema, mock_check_resources, mock_to_dict):
         """Updating an existing workspace with a non-conforming name should
         succeed because we only validate names on creation."""
-        mock_get_nested.return_value = {
-            'default': {},
-            'My_Old.Workspace': {
-                'gcp': {
-                    'project_id': 'old-project'
+        mock_to_dict.return_value = {
+            'workspaces': {
+                'default': {},
+                'My_Old.Workspace': {
+                    'gcp': {
+                        'project_id': 'old-project'
+                    }
                 }
-            },
+            }
         }
         mock_check_resources.return_value = None
         mock_get_schema.return_value = {
