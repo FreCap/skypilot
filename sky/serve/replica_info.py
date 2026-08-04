@@ -628,12 +628,9 @@ class ReplicaInfo:
         # Launch-origin attribution: True only for sentinel (fill)
         # launches; set by _launch_replica before the row is persisted.
         # The broker's holdings split and the grant ceiling's demand
-        # exemption both key on it. A fill row re-driven after a
-        # controller crash mid-PENDING keeps the flag: the sentinel was
-        # consumed at original emission, so the recovery path carries the
-        # prior row's attribution into _launch_replica explicitly
-        # (prior_reserved_fill) -- otherwise the replacement row would
-        # read as demand-placed and stay ceiling-exempt for its lifetime.
+        # exemption both key on it. A controller restart never re-drives an
+        # interrupted fill row because its one-shot broker authority was
+        # consumed; recovery tears it down and lets a fresh round refill.
         self.reserved_fill: bool = False
         # Protocol-v2 origin fences for reserved fill. These are additive JSON
         # fields rather than a ReplicaInfo version bump: old readers already

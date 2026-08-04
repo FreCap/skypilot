@@ -629,7 +629,7 @@ def launch_cluster(
             result = cloud_launch_guard()
         except Exception as e:  # pylint: disable=broad-except
             reason = f'guard-error-{type(e).__name__}'
-            logger.warning('Failed to verify logical cloud launch authority; '
+            logger.warning('Failed to verify cloud launch authority; '
                            f'failing closed: reason={reason}.')
             return False, reason
         if isinstance(result, bool):
@@ -638,7 +638,7 @@ def launch_cluster(
                 isinstance(result[0], bool) and isinstance(result[1], str) and
                 result[1] and len(result[1]) <= 128):
             return result
-        logger.warning('Logical cloud launch guard returned an invalid result; '
+        logger.warning('Cloud launch guard returned an invalid result; '
                        'failing closed: reason=invalid-guard-result.')
         return False, 'invalid-guard-result'
 
@@ -747,7 +747,7 @@ def launch_cluster(
                 _cloud_guard_decision())
             if not cloud_launch_allowed:
                 raise _ReplicaLaunchSupersededError(
-                    f'Refusing superseded logical cloud launch for replica '
+                    f'Refusing superseded cloud launch for replica '
                     f'{replica_id}: reason={cloud_launch_reason}.')
             # This is the authoritative DB-backed check immediately before
             # every cloud mutation. The shared watchdog event is a second,
@@ -1284,6 +1284,61 @@ def _whole_gpu_capacity(
             count < 1 or not float(count).is_integer()):
         return None
     return int(count)
+
+
+def _protocol_v2_fill_cloud_launch_guard(
+    pool_key: str,
+    service_generation: int,
+    physical_cluster_uid: str,
+    kube_context: str,
+    accelerator: str,
+    accelerator_count: int,
+    resources_override: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Revalidate one protocol-v2 queued pin before a cloud mutation."""
+    if (isinstance(service_generation, bool) or
+            not isinstance(service_generation, int) or service_generation < 1):
+        return False, 'invalid-fill-service-generation'
+    if not isinstance(physical_cluster_uid, str) or not physical_cluster_uid:
+        return False, 'invalid-fill-physical-cluster-uid'
+    try:
+        identity = reserved_capacity_broker.parse_pool_identity(pool_key)
+    except (TypeError, ValueError):
+        return False, 'invalid-fill-pool-key'
+    if (identity.protocol_version != reserved_capacity_broker.PROTOCOL_V2 or
+            identity.physical_cluster_uid != physical_cluster_uid):
+        return False, 'fill-pool-identity-mismatch'
+    if (not isinstance(kube_context, str) or not kube_context or
+            not isinstance(accelerator, str) or not accelerator or
+            accelerator.casefold() not in identity.gpu_names or
+            isinstance(accelerator_count, bool) or
+            not isinstance(accelerator_count, int) or accelerator_count < 1):
+        return False, 'invalid-fill-expected-pin'
+    queued_context = resources_override.get('region')
+    queued_accelerators = resources_override.get('accelerators')
+    if (str(resources_override.get('cloud')).lower() != 'kubernetes' or
+            queued_context != kube_context):
+        return False, 'invalid-fill-kubernetes-context'
+    if (not isinstance(queued_accelerators, Mapping) or
+            len(queued_accelerators) != 1):
+        return False, 'invalid-fill-accelerator-shape'
+    queued_accelerator, queued_count = next(iter(queued_accelerators.items()))
+    if (not isinstance(queued_accelerator, str) or
+            queued_accelerator.casefold() != accelerator.casefold() or
+            queued_count != accelerator_count or
+            _whole_gpu_capacity(queued_accelerators) is None):
+        return False, 'fill-accelerator-shape-mismatch'
+    try:
+        observed_uid = (reserved_capacity.get_kubernetes_physical_cluster_uid(
+            kube_context, force_refresh=True))
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning('Failed to refresh the Kubernetes identity for a '
+                       'reserved-fill launch; failing closed: '
+                       f'{common_utils.format_exception(e)}')
+        return False, 'fill-physical-cluster-uid-refresh-failed'
+    if observed_uid != physical_cluster_uid:
+        return False, 'fill-physical-cluster-uid-mismatch'
+    return True, 'authorized'
 
 
 def _zero_cost_pool_key(
@@ -3287,6 +3342,35 @@ class SkyPilotReplicaManager(ReplicaManager):
             info for info in all_replica_infos
             if info.status == serve_state.ReplicaStatus.PENDING)
 
+        # A fill launch is opportunistic and its original broker authority is
+        # intentionally one-shot.  Re-driving its sentinel-stripped row would
+        # bypass the current protocol/generation/UID fences and could mutate a
+        # Kubernetes context that was retargeted while this controller was
+        # down.  Tear every interrupted fill down before considering the
+        # ordinary recovery wave; a fresh broker round can refill the slot.
+        interrupted_fill_replicas = [
+            info for info in to_up_replicas
+            if getattr(info, 'reserved_fill', False) is True
+        ]
+        for info in interrupted_fill_replicas:
+            logger.warning(
+                f'Replica {info.replica_id} is an interrupted reserved-fill '
+                'launch; scheduling immediate teardown instead of recovery '
+                're-drive.')
+            self._terminate_replica(info.replica_id,
+                                    sync_down_logs=False,
+                                    replica_drain_delay_seconds=0,
+                                    is_scale_down=True,
+                                    in_flight_drain_cap_seconds=0)
+        if interrupted_fill_replicas:
+            interrupted_fill_ids = {
+                info.replica_id for info in interrupted_fill_replicas
+            }
+            to_up_replicas = [
+                info for info in to_up_replicas
+                if info.replica_id not in interrupted_fill_ids
+            ]
+
         recovery_versions = sorted({
             info.version
             for info in to_up_replicas
@@ -3419,23 +3503,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{self._service_name} version '
                             f'{replica_info.version}')
                     prior_yaml_content = recovered_yaml_content
-                # Carry the prior row's launch-origin attribution: the fill
-                # sentinel was consumed at original emission, so without it
-                # the replacement row would flip a fill replica to
-                # demand-placed (permanently ceiling-exempt).
                 launch_kwargs: dict[str, Any] = {
                     'resources_override': replica_info.resources_override,
                     'existing_replica_infos': all_replica_infos,
                     'recovering_existing_replica': True,
-                    'prior_reserved_fill': bool(
-                        getattr(replica_info, 'reserved_fill', False)),
-                    'prior_reserved_fill_pool_key': getattr(
-                        replica_info, 'reserved_fill_pool_key', None),
-                    'prior_reserved_fill_service_generation': getattr(
-                        replica_info, 'reserved_fill_service_generation', None),
-                    'prior_reserved_fill_physical_cluster_uid': getattr(
-                        replica_info, 'reserved_fill_physical_cluster_uid',
-                        None),
                     'prior_is_zero_cost': bool(
                         getattr(replica_info, 'is_zero_cost', False)),
                     'prior_planned_capacity': prior_planned_capacity,
@@ -3661,10 +3732,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         replica_id: int,
         resources_override: dict[str, Any] | None = None,
         existing_replica_infos: list['ReplicaInfo'] | None = None,
-        prior_reserved_fill: bool = False,
-        prior_reserved_fill_pool_key: str | None = None,
-        prior_reserved_fill_service_generation: int | None = None,
-        prior_reserved_fill_physical_cluster_uid: str | None = None,
         prior_is_zero_cost: bool = False,
         prior_cost_rebalance_for_replica_id: int | None = None,
         prior_paid_capacity_pool_key: str | None = None,
@@ -3686,18 +3753,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         Returns whether a launch was actually enqueued: a zero-cost-only
         fill launch is skipped when no zero-cost location is ACTIVE, and
         the skip must leak nothing -- no replica row, no launch thread.
-
-        prior_reserved_fill: launch-origin attribution of the replica row
-        this launch replaces (recovery re-drive). The fill sentinel is
-        consumed at original emission, so a re-drive cannot re-derive it
-        from the persisted override; OR-ing the prior flag in keeps a
-        recovered fill replica counted as arbitrated (ceiling-governed)
-        capacity instead of silently converting it to demand.
-
-        prior_reserved_fill_pool_key/prior_reserved_fill_service_generation/
-        prior_reserved_fill_physical_cluster_uid: additive protocol-v2 origin
-        attribution preserved by a recovery re-drive. Recovery reuses the
-        already-persisted exact location and does not reacquire a new grant.
 
         prior_is_zero_cost: placement-cost provenance of a recovery row. The
         recovered exact pin remains on the same capacity, so preserve it even
@@ -3749,11 +3804,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # override key restricting the launch to zero-cost locations (plus,
         # under the broker, the grant epoch the decision was emitted
         # under). Pop them on a COPY: the caller may reuse the dict, and
-        # the popped copy is what gets persisted on the ReplicaInfo row --
-        # the recovery re-drive relaunches with the recorded
-        # (location-pinned) override and must not re-enter the
-        # fill-selection path (nor re-run the epoch fence: its round is
-        # long gone and the row already exists).
+        # the popped copy is what gets persisted on the ReplicaInfo row.
+        # Interrupted fill rows are torn down rather than recovery re-driven;
+        # only a new broker decision may enter this selection path again.
         zero_cost_only = False
         fill_grant_epoch: int | None = None
         fill_pool_key: str | None = None
@@ -3763,6 +3816,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         fill_allowed_location_keys: list[dict[str, Any]] | None = None
         fill_pool_identity: reserved_capacity_broker.PoolIdentity | None = None
         fill_exact_accelerator_shape: tuple[str, int] | None = None
+        fill_launch_context: str | None = None
+        fill_launch_accelerator_shape: tuple[str, int] | None = None
+        fill_cloud_launch_guard: (Callable[[], bool | tuple[bool, str]] |
+                                  None) = None
         cost_rebalance_for_replica_id = (prior_cost_rebalance_for_replica_id)
         if (resources_override is not None and
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
@@ -4096,30 +4153,30 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if fill_protocol_version == 2:
                     assert fill_pool_identity is not None
                     kube_context = location.region
-                    selected_accelerators = {
-                        str(accelerator).lower()
-                        for accelerator in (location.accelerators or {})
-                    }
+                    selected_shape = location.accelerators
                     if (str(location.cloud).lower() != 'kubernetes' or
                             not isinstance(kube_context, str) or
-                            not kube_context or not selected_accelerators or
-                            not selected_accelerators.issubset(
-                                fill_pool_identity.gpu_names)):
+                            not kube_context or
+                            not isinstance(selected_shape, dict) or
+                            len(selected_shape) != 1):
+                        self._release_unstarted_location_retry(location)
+                        self._log_fill_skip('selected pool location has no '
+                                            'exact Kubernetes accelerator '
+                                            'shape')
+                        return False
+                    selected_card, selected_count = next(
+                        iter(selected_shape.items()))
+                    if (not isinstance(selected_card, str) or
+                            not selected_card or
+                            _whole_gpu_capacity(selected_shape) is None or
+                            selected_card.casefold()
+                            not in fill_pool_identity.gpu_names):
                         self._release_unstarted_location_retry(location)
                         self._log_fill_skip('selected pool location has no '
                                             'matching Kubernetes accelerator '
                                             'identity')
                         return False
                     if fill_exact_accelerator_shape is not None:
-                        selected_shape = location.accelerators
-                        if (not isinstance(selected_shape, dict) or
-                                len(selected_shape) != 1):
-                            self._release_unstarted_location_retry(location)
-                            self._log_fill_skip('selected pool location has no '
-                                                'exact accelerator shape')
-                            return False
-                        selected_card, selected_count = next(
-                            iter(selected_shape.items()))
                         if ((str(selected_card).casefold(), selected_count)
                                 != fill_exact_accelerator_shape):
                             self._release_unstarted_location_retry(location)
@@ -4127,15 +4184,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 'selected pool location changed the carried '
                                 'exact accelerator shape')
                             return False
-                    observed_uid = (
-                        reserved_capacity.get_kubernetes_physical_cluster_uid(
-                            kube_context, force_refresh=True))
-                    if observed_uid != fill_physical_cluster_uid:
-                        self._release_unstarted_location_retry(location)
-                        self._log_fill_skip(
-                            'physical Kubernetes cluster identity changed '
-                            f'for context {kube_context!r}')
-                        return False
+                    fill_launch_context = kube_context
+                    fill_launch_accelerator_shape = (selected_card.casefold(),
+                                                     selected_count)
             else:
                 if paid_location_launch_budget is None:
                     paid_location_launch_budget = (
@@ -4236,6 +4287,30 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._log_fill_skip('persisted pool location changed the '
                                         'carried exact accelerator shape')
                     return False
+            if fill_protocol_version == 2:
+                assert isinstance(fill_pool_key, str)
+                assert isinstance(fill_service_generation, int)
+                assert isinstance(fill_physical_cluster_uid, str)
+                assert fill_launch_context is not None
+                assert fill_launch_accelerator_shape is not None
+                fill_card, fill_count = fill_launch_accelerator_shape
+                fill_cloud_launch_guard = functools.partial(
+                    _protocol_v2_fill_cloud_launch_guard,
+                    fill_pool_key,
+                    fill_service_generation,
+                    fill_physical_cluster_uid,
+                    fill_launch_context,
+                    fill_card,
+                    fill_count,
+                    resources_override,
+                )
+                guard_allowed, guard_reason = fill_cloud_launch_guard()
+                if not guard_allowed:
+                    self._release_unstarted_location_retry(location)
+                    self._log_fill_skip(
+                        'selected protocol-v2 pool pin failed its pre-launch '
+                        f'guard: {guard_reason}')
+                    return False
             # The location dictates the actual spot-ness of THIS launch
             # (a zero-cost reserved location is non-spot even though the
             # task as a whole is spot-managed).
@@ -4283,14 +4358,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         # over. Other (transient) launch errors say nothing about the
         # location's capacity, so they keep the default in-place retries.
         availability_max_retry = (1 if location is not None else None)
-        logical_cloud_launch_guard: (Callable[[], bool | tuple[bool, str]] |
-                                     None) = None
+        cloud_launch_guard = fill_cloud_launch_guard
         if (getattr(self, '_uses_logical_replicas', False) and
                 bool(getattr(self, '_logical_exact_accelerator_shapes', {})) and
-                not zero_cost_only and not prior_reserved_fill and
-                cost_rebalance_for_replica_id is None and
+                not zero_cost_only and cost_rebalance_for_replica_id is None and
                 not prior_unknown_capacity_replacement):
-            logical_cloud_launch_guard = lambda: (
+            assert cloud_launch_guard is None
+            cloud_launch_guard = lambda: (
                 self._queued_logical_launch_fence_decision(replica_id)[:2])
         launch_fence = self._replica_launch_fence_context(launch_version)
         recovery_intent: (system_recovery_state.SystemRecoveryLaunchIntent |
@@ -4422,18 +4496,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             info.replica_record_id = prior_replica_record_id
             info.created_at = prior_created_at
         # Persisted launch-origin attribution: the broker's holdings split
-        # and the ceiling's demand exemption key on this flag. OR in the
-        # replaced row's attribution on recovery re-drives (the sentinel
-        # only exists at original emission).
-        info.reserved_fill = bool(zero_cost_only or prior_reserved_fill)
-        info.reserved_fill_pool_key = (fill_pool_key if zero_cost_only else
-                                       prior_reserved_fill_pool_key)
-        info.reserved_fill_service_generation = (
-            fill_service_generation
-            if zero_cost_only else prior_reserved_fill_service_generation)
-        info.reserved_fill_physical_cluster_uid = (
-            fill_physical_cluster_uid
-            if zero_cost_only else prior_reserved_fill_physical_cluster_uid)
+        # and the ceiling's demand exemption key on this flag. Interrupted
+        # fill rows are torn down during recovery instead of re-driven, so
+        # only a fresh sentinel-authorized launch may set these fields.
+        info.reserved_fill = bool(zero_cost_only)
+        info.reserved_fill_pool_key = (fill_pool_key
+                                       if zero_cost_only else None)
+        info.reserved_fill_service_generation = (fill_service_generation
+                                                 if zero_cost_only else None)
+        info.reserved_fill_physical_cluster_uid = (fill_physical_cluster_uid
+                                                   if zero_cost_only else None)
         is_zero_cost = bool(prior_is_zero_cost or zero_cost_only)
         if not is_zero_cost and self._spot_placer is not None:
             candidates = self._spot_placer.zero_cost_locations()
@@ -4596,7 +4668,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'availability_max_retry': availability_max_retry,
                 'exact_resources_override': location is not None,
                 'pre_launch_guard': self._service_is_launch_authorized,
-                'cloud_launch_guard': logical_cloud_launch_guard,
+                'cloud_launch_guard': cloud_launch_guard,
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
                 'launch_fence': launch_fence,
                 'service_spec': launch_spec,
@@ -7956,8 +8028,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             if replica_id in superseded_launches:
                 rejection = getattr(t, 'exception', None)
                 logger.info(
-                    f'Cleaning up logical replica {replica_id}: its exact-card '
-                    'target was superseded before the first cloud mutation '
+                    f'Cleaning up replica {replica_id}: its cloud launch '
+                    'authority was superseded before the next cloud mutation '
                     f'({rejection}).')
                 self._terminate_replica(replica_id,
                                         sync_down_logs=False,

@@ -2372,6 +2372,23 @@ run: echo hi
         mock_sdk.launch.assert_not_called()
         mock_terminate.assert_not_called()
 
+    def test_cloud_guard_rechecks_before_each_retry(self, tmp_path):
+        cloud_guard = mock.Mock(
+            side_effect=[(True, 'authorized'), (False, 'pool-retargeted')])
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [RuntimeError('transient')],
+            cloud_launch_guard=cloud_guard)
+
+        assert isinstance(raised,
+                          replica_managers._ReplicaLaunchSupersededError)
+        assert 'reason=pool-retargeted' in str(raised)
+        assert cloud_guard.call_count == 2
+        assert mock_sdk.launch.call_count == 1
+        assert mock_sdk.stream_and_get.call_count == 1
+        # The first transient attempt is cleaned before authority is checked
+        # again; the rejected second attempt performs no cloud mutation.
+        mock_terminate.assert_called_once()
+
     def test_legacy_boolean_cloud_guard_remains_compatible(self, tmp_path):
         mock_sdk, mock_terminate, raised = self._run_launch_cluster(
             tmp_path, [None], cloud_launch_guard=lambda: False)
@@ -3786,6 +3803,44 @@ class TestLaunchOwnershipFence:
         assert (terminal.to_replica_status() ==
                 replica_managers.serve_state.ReplicaStatus.FAILED)
         assert terminal.unrecoverable_failure() is True
+
+    def test_superseded_fill_launch_releases_pin_and_schedules_cleanup(self):
+        mgr, infos = self._queued_manager([1])
+        info = infos[1]
+        info.status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        info.reserved_fill = True
+        location = mock.Mock()
+        info.get_spot_location.return_value = location
+        placer = mock.Mock()
+        placer.resolve_location.return_value = location
+        mgr._spot_placer = placer
+        launch_thread = mgr._launch_thread_pool[1]
+        launch_thread.format_exc = 'pool retargeted'
+        launch_thread.exception = (
+            replica_managers._ReplicaLaunchSupersededError('retargeted'))
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value=infos), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]), \
+             mock.patch.object(mgr, '_persist_replicas') as persist, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr,
+                               '_persist_spot_placement_state_if_dirty'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        placer.release_retry.assert_called_once_with(location)
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          in_flight_drain_cap_seconds=0)
+        persist.assert_not_called()
 
     def test_unfenced_external_lb_failure_does_not_bench_spot_location(self):
         mgr, infos = self._queued_manager([1])
@@ -11144,11 +11199,9 @@ class TestRecoveryRetryAndIsolation:
         def _launch(replica_id,
                     resources_override=None,
                     existing_replica_infos=None,
-                    prior_reserved_fill=False,
                     recovering_existing_replica=False,
                     **_kwargs):
             del resources_override, existing_replica_infos
-            del prior_reserved_fill
             assert recovering_existing_replica
             if replica_id == 2:
                 raise RuntimeError('boom')
@@ -11237,51 +11290,35 @@ class TestRecoveryRetryAndIsolation:
         assert runtime.replica_to_request_id[1] == 'request-1'
         worker.start.assert_called_once_with()
 
-    def test_redrive_preserves_reserved_fill_attribution(self):
-        # A fill replica surviving a controller respawn is re-driven with
-        # its persisted (sentinel-stripped) override; the replacement row
-        # must keep reserved_fill=True or the replica silently converts
-        # to ceiling-exempt "demand" and can starve peers forever. Demand
-        # rows must stay False.
+    @pytest.mark.parametrize('status', [
+        replica_managers.serve_state.ReplicaStatus.PENDING,
+        replica_managers.serve_state.ReplicaStatus.PROVISIONING,
+    ])
+    def test_recovery_tears_down_interrupted_fill_without_redrive(self, status):
         mgr = _make_manager()
-        mgr.yaml_content = 'dummy: yaml'
-        mgr.latest_version = 1
-        mgr._spot_placer = None
-        mgr._replica_to_request_id = {}
-        mgr._replica_to_launch_cancelled = {}
-        provisioning = replica_managers.serve_state.ReplicaStatus.PROVISIONING
-        fill_row = _fake_replica_info(1, status=provisioning)
+        fill_row = _fake_replica_info(1, status=status)
         fill_row.resources_override = None
         fill_row.reserved_fill = True
-        demand_row = _fake_replica_info(2, status=provisioning)
+        demand_row = _fake_replica_info(2, status=status)
         demand_row.resources_override = None
         demand_row.reserved_fill = False
-        demand_row.paid_capacity_pool_key = 'exact-paid-pool'
-        persisted: dict = {}
 
-        def _persist(_service_name, replica_id, info, **_kwargs):
-            persisted[replica_id] = info
-
-        with mock.patch('sky.serve.replica_managers._should_use_spot',
-                        return_value=False), \
-             mock.patch('sky.serve.replica_managers._get_resources_ports',
-                        return_value='8080'), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_utils.'
-                 'generate_replica_launch_log_file_name',
-                 return_value='/tmp/launch.log'), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.get_replica_infos',
-                 return_value=[fill_row, demand_row]), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.'
-                 'add_or_update_replica',
-                 side_effect=_persist), \
-             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[fill_row, demand_row]), \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate:
             mgr._recover_replica_operations()
-        assert persisted[1].reserved_fill is True
-        assert persisted[2].reserved_fill is False
-        assert persisted[2].paid_capacity_pool_key == 'exact-paid-pool'
+
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          in_flight_drain_cap_seconds=0)
+        launch.assert_called_once()
+        assert launch.call_args.args[0] == 2
+        assert launch.call_args.kwargs['recovering_existing_replica'] is True
 
     def test_provisioning_redrive_reenters_current_exact_card_budget(self):
         """Recovery cannot turn stale PROVISIONING intent into a new launch."""

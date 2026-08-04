@@ -1,8 +1,7 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: feature implementation and required CI complete after adversarial
-review; production rollout and the compatibility-cleanup merge gates remain
-open
+Status: feature implementation complete after adversarial review; final CI,
+production rollout, and the compatibility-cleanup merge gates remain open
 
 Last updated: 2026-08-04
 
@@ -437,7 +436,17 @@ measured card and its exact per-replica GPU count; the manager independently
 requires both the selected location and final persisted resource override to
 match that shape. It then re-reads the physical UID through that context. It
 never falls through to a different zero-cost context or paid capacity. The
-selected replica persists `reserved_fill_pool_key`,
+launch thread also carries a protocol-v2 pre-cloud guard. Immediately before
+every `sdk.launch` attempt, after any launch-pool queue delay, that guard again
+requires the exact pinned Kubernetes context/card/count and force-refreshes
+the context's physical UID; a mismatch fails closed before the cloud mutation.
+This closes context retargeting between row persistence and provider launch.
+An interrupted `PENDING` or `PROVISIONING` fill row is never recovery-re-driven:
+the new controller schedules immediate teardown and lets the broker refill the
+opportunistic slot under fresh authority. Ordinary demand recovery is
+unchanged.
+
+The selected replica persists `reserved_fill_pool_key`,
 `reserved_fill_service_generation`, and
 `reserved_fill_physical_cluster_uid`; the final transaction verifies that
 the carried and round protocol equal the durable gate, plus the authoritative
@@ -606,7 +615,10 @@ Automated coverage must include:
   occupancy scans: older/current tuples remain valid, while partial, future,
   UID/context/exact-shape-mismatched tuples fail closed and only genuinely legacy
   rows retain the legacy placement fallback;
-- context retargeting between decision and actuation with UID mismatch;
+- context retargeting both before persistence and after launch-pool queuing,
+  with the latter rejected by the per-attempt pre-cloud UID/shape guard;
+- recovery of interrupted fill rows schedules teardown without a second launch,
+  while ordinary demand recovery remains unchanged;
 - no row/thread on malformed, removed, benched, or superseded pool launches;
 - pool-local demand saturation and scale-down shelter;
 - legacy dynamic-state load and new per-pool dump/load; and
@@ -632,11 +644,11 @@ repository mypy completed with no issues across 881 files; pylint scored
 10.00/10; dashboard lint completed with no warnings; and `git diff --check`
 passed.
 
-Required feature CI on the final code-bearing head `1357dec79` completed all
-32 checks successfully. The mandatory unit job ran with
+Required feature CI on the preceding code-bearing head `1357dec79` completed
+all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
-xfailed, 197 warnings, and 103 subtests passed. A later documentation-only
-stack-link commit must retain the same green required checks before merge.
+xfailed, 197 warnings, and 103 subtests passed. The final pre-cloud launch
+guard head must retain the same green required checks before merge.
 
 Production acceptance requires two live pool claims for `boltz-l4-fleet`, a
 successful PHX H200 replica canary whose persisted location is PHX, unchanged

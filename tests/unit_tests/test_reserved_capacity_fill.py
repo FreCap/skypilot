@@ -1967,6 +1967,58 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertEqual(
             persist.call_args.kwargs['expected_service_generation'], 7)
 
+    def test_v2_queued_launch_guard_rechecks_uid_and_exact_pin(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        override = self._v2_override(location, exact_shape={'H200': 1})
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid',
+                 side_effect=['physical-uid', 'replacement-uid']) as get_uid, \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica',
+                               return_value=True), \
+             mock.patch.object(replica_managers,
+                               '_ReplicaLaunchThread') as launch_thread:
+            self.assertTrue(manager._launch_replica(7, override))
+
+            thread_call = launch_thread.call_args.kwargs
+            cloud_guard = thread_call['kwargs']['cloud_launch_guard']
+            self.assertIsNotNone(cloud_guard)
+            self.assertEqual(cloud_guard(),
+                             (False, 'fill-physical-cluster-uid-mismatch'))
+            self.assertEqual(get_uid.call_args_list, [
+                mock.call('phx-context', force_refresh=True),
+                mock.call('phx-context', force_refresh=True),
+            ])
+
+            # The guard reads the same override mapping launch_cluster will
+            # build its Task from, while retaining an immutable expected pin.
+            # A queued mutation must fail before another Kubernetes API read.
+            queued_override = thread_call['args'][6]
+            queued_override['accelerators'] = {'H200': 2}
+            get_uid.reset_mock()
+            get_uid.side_effect = None
+            get_uid.return_value = 'physical-uid'
+            self.assertEqual(cloud_guard(),
+                             (False, 'fill-accelerator-shape-mismatch'))
+            get_uid.assert_not_called()
+
     def test_abort_creates_no_record_and_keeps_id(self):
         placer = mock.Mock()
         placer.select_next_zero_cost_location.return_value = None
