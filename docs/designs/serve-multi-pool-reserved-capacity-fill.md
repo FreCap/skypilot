@@ -1,7 +1,7 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: implementation and local focused validation complete after adversarial
-review; PostgreSQL CI validation, rollout, and compatibility cleanup remain
+Status: feature implementation and required CI complete after adversarial
+review; production rollout and the compatibility-cleanup merge gates remain
 open
 
 Last updated: 2026-08-04
@@ -9,6 +9,12 @@ Last updated: 2026-08-04
 Canonical owner: this file. The implementation, rollout evidence, and the
 stacked compatibility-removal change must stay synchronized with this
 contract.
+
+Feature PR [#1261](https://github.com/boltz-bio/skypilot/pull/1261) is the
+revision-035 rollout change. Draft cleanup PR
+[#1263](https://github.com/boltz-bio/skypilot/pull/1263) is stacked directly
+above it in GitHub stack #1264 and must remain blocked until the cleanup gates
+in this design pass.
 
 ## Summary
 
@@ -624,7 +630,13 @@ and 28 passing subtests using the supported Kubernetes client 35.0.0; all 133
 affected Helm unit tests passed;
 repository mypy completed with no issues across 881 files; pylint scored
 10.00/10; dashboard lint completed with no warnings; and `git diff --check`
-passed. The skipped PostgreSQL cases remain a required CI merge gate.
+passed.
+
+Required feature CI on the final code-bearing head `1357dec79` completed all
+32 checks successfully. The mandatory unit job ran with
+`SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
+xfailed, 197 warnings, and 103 subtests passed. A later documentation-only
+stack-link commit must retain the same green required checks before merge.
 
 Production acceptance requires two live pool claims for `boltz-l4-fleet`, a
 successful PHX H200 replica canary whose persisted location is PHX, unchanged
@@ -633,17 +645,10 @@ fleet no larger than the configured `max_replicas`.
 
 ## Open gates
 
-- Implementation, deterministic concurrency coverage, and the focused local
-  SQLite/unit suites are complete. PostgreSQL-only modules skip during
-  collection on this development host because `testcontainers.postgres` is
-  unavailable and there is no usable Docker daemon; they must collect and pass
-  under the required PostgreSQL CI job before merge.
-- Revision 035 has not yet been exercised against a populated production-like
-  PostgreSQL database. The test includes a legacy writer held concurrently
-  with migration and verifies committed pre-migration state plus idempotent
-  re-upgrade.
+- Revision 035 migration, concurrency, demotion, and killed-session suites have
+  passed against real PostgreSQL in required CI. The production database
+  migration and token-bound activation remain to be executed during rollout.
 - The SkyPilot image has not yet been built or deployed.
 - The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
-- The compatibility cleanup PR must be authored in the implementation stack
-  before the feature PR is merge-ready and must remain blocked until the
-  rollout gates above pass.
+- Draft compatibility cleanup PR #1263 is authored in stack #1264 and must
+  remain blocked until the rollout gates above pass.
