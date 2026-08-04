@@ -452,8 +452,11 @@ def test_unleased_overlap_cannot_borrow_active_fence(monkeypatch, tmp_path):
             future = executor.submit(
                 kubernetes.active_physical_cluster_command_target, context)
             with pytest.raises(
-                    kubernetes.KubernetesPhysicalClusterIdentityError):
+                    kubernetes.KubernetesPhysicalClusterFenceBusyError
+            ) as exc_info:
                 future.result(timeout=5)
+            assert exc_info.value.context == context
+            assert exc_info.value.failure_generation == 0
 
     # Ordinary callers regain ambient behavior once no fenced scope exists.
     assert kubernetes.active_physical_cluster_command_target(context) is None
@@ -495,9 +498,16 @@ def test_unleased_overlap_fails_closed_while_fence_initializes(
     initializer.start()
     assert capture_started.wait(timeout=5)
     try:
-        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError,
-                           match='being initialized'):
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterFenceBusyError,
+                           match='being initialized') as exc_info:
             kubernetes._get_api_client(context)
+        assert exc_info.value.context == context
+        assert exc_info.value.failure_generation == 0
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterFenceBusyError,
+                           match='being initialized'):
+            with kubernetes.physical_cluster_uid_fence(
+                    context, 'physical-a', wait_for_initializer=False):
+                raise AssertionError('nonwaiting fence joined initializer')
         ambient_loader.assert_not_called()
     finally:
         release_capture.set()
@@ -506,6 +516,71 @@ def test_unleased_overlap_fails_closed_while_fence_initializes(
     assert not initializer.is_alive()
     assert not initializer_errors
     assert kubernetes.active_physical_cluster_command_target(context) is None
+
+
+def test_tokenless_waiter_retries_only_after_owner_retires(
+        monkeypatch, tmp_path):
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'retirement-context'
+    busy_seen = threading.Event()
+    wait_done = threading.Event()
+    result = []
+
+    def wait_for_owner() -> None:
+        try:
+            kubernetes.active_physical_cluster_command_target(context)
+        except kubernetes.KubernetesPhysicalClusterFenceBusyError as error:
+            busy_seen.set()
+            result.append(
+                kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                    context,
+                    time.monotonic() + 2, error.failure_generation))
+        finally:
+            wait_done.set()
+
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        waiter = threading.Thread(target=wait_for_owner)
+        waiter.start()
+        assert busy_seen.wait(timeout=2)
+        assert not wait_done.wait(timeout=0.05)
+    assert wait_done.wait(timeout=2)
+    waiter.join(timeout=2)
+    assert not waiter.is_alive()
+    assert result == [True]
+
+
+def test_physical_fence_retirement_wait_fails_closed(monkeypatch, tmp_path):
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'retirement-failure-context'
+
+    def expired_wait() -> bool:
+        try:
+            kubernetes.active_physical_cluster_command_target(context)
+        except kubernetes.KubernetesPhysicalClusterFenceBusyError as error:
+            return kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                context, time.monotonic(), error.failure_generation)
+        raise AssertionError('active owner was not reported busy')
+
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(expired_wait).result(timeout=2) is False
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError,
+                           match='cannot wait for ambient'):
+            kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                context, time.monotonic(), 0)
+
+    with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS[context] = 1
+    try:
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError,
+                           match='failed before ambient retry'):
+            kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                context,
+                time.monotonic() + 1, 0)
+    finally:
+        with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+            kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.pop(
+                context, None)
 
 
 def test_fenced_caller_cannot_escape_to_an_unleased_context(

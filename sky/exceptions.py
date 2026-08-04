@@ -848,6 +848,22 @@ class KubernetesPhysicalClusterIdentityError(RequestCancelled):
     """
 
 
+class KubernetesPhysicalClusterFenceBusyError(
+        KubernetesPhysicalClusterIdentityError):
+    """An unrelated process-local Kubernetes identity capture is active.
+
+    Unlike a UID mismatch or malformed durable fence, this condition is safe
+    for a tokenless observer to retry only after the exact registry generation
+    retires successfully.  The observer must never borrow the active capture.
+    """
+
+    def __init__(self, message: str, context: str,
+                 failure_generation: int) -> None:
+        super().__init__(message)
+        self.context = context
+        self.failure_generation = failure_generation
+
+
 class ProviderPhaseError(RuntimeError):
     """A process-local provider phase could not be entered safely."""
 
