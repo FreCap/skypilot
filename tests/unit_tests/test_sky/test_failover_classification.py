@@ -22,6 +22,8 @@ from sky.provision import failover_error_policy
 from sky.provision.aws import instance as aws_instance
 from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils as gcp_instance_utils
+from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 
 _CAPACITY_POLICY_SIGNATURES = {
     '_iter_error_chain': '(error)',
@@ -774,6 +776,7 @@ def _early_retry_provisioner(tmp_path, monkeypatch):
     provisioner = object.__new__(backend.RetryingVmProvisioner)
     provisioner.log_dir = str(tmp_path)
     provisioner._blocked_resources = set()
+    provisioner._extra_launch_context = {}
     monkeypatch.setattr(backend.os, 'system', lambda _: 0)
     monkeypatch.setattr(backend.rich_utils, 'force_update_status',
                         lambda _: None)
@@ -848,7 +851,7 @@ def test_retry_zones_preserves_structured_provider_failure(
     provisioner._active_cluster_hash = None
     provisioner._is_managed = False
     provisioner._workload_type = 'service'
-    provisioner._extra_launch_context = None
+    provisioner._extra_launch_context = {}
     to_provision = _to_provision()
     provider_error = _aggregate_error('InsufficientInstanceCapacity')
     provider_error.requested_count = 1
@@ -1000,7 +1003,7 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
     provisioner._active_cluster_hash = None
     provisioner._is_managed = False
     provisioner._workload_type = 'service'
-    provisioner._extra_launch_context = None
+    provisioner._extra_launch_context = {}
     provisioner._is_launched_by_jobs_controller = False
     to_provision = resources_lib.Resources(cloud=clouds.DO(),
                                            region='nyc3',
@@ -1527,6 +1530,101 @@ def test_provision_with_retries_preserves_nested_terminal_failure(
     assert exc_info.value.failover_history == [per_location_error]
     assert backend.classify_resources_unavailable_error(
         clouds.AWS(), exc_info.value) == 'capacity'
+
+
+@pytest.mark.parametrize(
+    ('retry_context', 'retry_count'),
+    [
+        ('retargeted-context', 1),
+        ('phx-context', 2),
+    ],
+)
+def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
+        tmp_path, monkeypatch, retry_context, retry_count):
+
+    def launchable_resources(context, count):
+
+        class _LaunchableResources:
+            """Minimal optimizer-selected resource candidate."""
+
+            cloud = clouds.Kubernetes()
+            region = context
+            accelerators = {'H200': count}
+
+            def assert_launchable(self):
+                return self
+
+        return _LaunchableResources()
+
+    initial_resources = launchable_resources('phx-context', 1)
+    retry_resources = launchable_resources(retry_context, retry_count)
+    pool_key = reserved_capacity_broker.make_pool_key(
+        'phx-context',
+        'H200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='physical-uid')
+    launch_context = reserved_capacity.make_protocol_v2_launch_fence(
+        pool_key=pool_key,
+        service_generation=7,
+        physical_cluster_uid='physical-uid',
+        kubernetes_context='phx-context',
+        accelerator='H200',
+        accelerator_count=1)
+    task = mock.Mock()
+    task.is_controller_task.return_value = False
+    task.num_nodes = 1
+    task.resources = {initial_resources}
+    task.best_resources = initial_resources
+    task.volume_mounts = None
+    dag = mock.Mock()
+    dag.tasks = [task]
+    provisioner = backend.RetryingVmProvisioner(
+        log_dir=str(tmp_path),
+        dag=dag,
+        optimize_target=mock.Mock(),
+        requested_features=set(),
+        local_wheel_path=tmp_path / 'wheel',
+        wheel_hash='',
+        extra_launch_context=launch_context,
+    )
+    config = backend.RetryingVmProvisioner.ToProvisionConfig(
+        cluster_name='svc-replica',
+        resources=initial_resources,
+        num_nodes=1,
+        prev_cluster_status=None,
+        prev_handle=None,
+        prev_cluster_ever_up=False,
+        prev_config_hash=None,
+    )
+    provider_attempt = mock.Mock(
+        side_effect=exceptions.ResourcesUnavailableError(
+            'first exact attempt unavailable'))
+    monkeypatch.setattr(provisioner, '_retry_zones', provider_attempt)
+    monkeypatch.setattr(clouds.Kubernetes, 'get_identity_from_context_name',
+                        lambda *_: ['user'])
+    monkeypatch.setattr(clouds.Kubernetes, 'check_features_are_supported',
+                        lambda *_: None)
+
+    def optimize(*args, **kwargs):
+        del args, kwargs
+        task.best_resources = retry_resources
+        return dag
+
+    monkeypatch.setattr(backend.optimizer.Optimizer, 'optimize', optimize)
+    monkeypatch.setattr(backend.rich_utils, 'force_update_status',
+                        lambda *_: None)
+
+    with pytest.raises(exceptions.RequestCancelled,
+                       match='retry candidate changed'):
+        provisioner.provision_with_retries(task,
+                                           config,
+                                           dryrun=False,
+                                           stream_logs=False,
+                                           skip_unnecessary_provisioning=False)
+
+    # The exact candidate reached the provider once. The optimizer's drifted
+    # candidate was rejected at the next iteration's terminal fence.
+    provider_attempt.assert_called_once()
 
 
 def test_quota_notification_has_generic_actionable_context(monkeypatch):

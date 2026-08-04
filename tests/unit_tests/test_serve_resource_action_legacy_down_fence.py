@@ -1,12 +1,16 @@
 """Identity fencing for legacy/shadow SkyServe teardown owners."""
+# pylint: disable=protected-access
 
+import contextlib
 from unittest import mock
 import uuid
 
 import pytest
 
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
+from sky.utils import common_utils
 from sky.utils import thread_utils
 
 
@@ -18,6 +22,61 @@ def _replica() -> replica_managers.ReplicaInfo:
                                         location=None,
                                         version=1,
                                         resources_override=None)
+
+
+def _protocol_v2_replica() -> replica_managers.ReplicaInfo:
+    info = _replica()
+    info.reserved_fill = True
+    info.reserved_fill_pool_key = reserved_capacity_broker.make_pool_key(
+        'phx-context',
+        'H200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='physical-a')
+    info.reserved_fill_service_generation = 1
+    info.reserved_fill_physical_cluster_uid = 'physical-a'
+    info.reserved_fill_kubernetes_context = 'phx-context'
+    info.location = {
+        'cloud': 'Kubernetes',
+        'region': 'phx-context',
+        'accelerators': {
+            'H200': 1,
+        },
+    }
+    info.resources_override = {
+        'cloud': 'Kubernetes',
+        'region': 'phx-context',
+        'accelerators': {
+            'H200': 1,
+        },
+    }
+    return info
+
+
+def _manager_for_down_test():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'svc'
+    manager._resource_action_mode = 'shadow'
+    manager._resource_scope = None
+    manager._is_pool = False
+    manager._launch_thread_pool = thread_utils.ThreadSafeDict()
+    manager._down_thread_pool = thread_utils.ThreadSafeDict()
+    manager._persist_replica = mock.Mock()
+    manager._schedule_failed_cleanup_retry = mock.Mock()
+    return manager
+
+
+def _protocol_v2_cluster_record():
+    handle = mock.Mock(
+        spec=replica_managers.cloud_vm_ray_backend.CloudVmRayResourceHandle)
+    handle.cluster_name = 'svc-1'
+    handle.launched_resources = mock.Mock(
+        cloud=replica_managers.clouds.Kubernetes(), region='phx-context')
+    return {
+        'workspace': 'workspace-a',
+        'handle': handle,
+        'cluster_hash': 'generation-a',
+    }
 
 
 def test_terminate_cluster_forwards_exact_resource_action_uuid(tmp_path):
@@ -59,6 +118,98 @@ def test_terminate_cluster_does_not_retry_identity_conflict(tmp_path):
                 '33333333-3333-4333-8333-333333333333'))
 
     down.assert_called_once()
+
+
+def test_protocol_v2_legacy_cleanup_forwards_hash_and_owner_guard(tmp_path):
+    cleanup_fence = replica_managers.reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+    guard = mock.Mock(return_value=True)
+    with mock.patch.object(replica_managers.context,
+                           'get',
+                           return_value=mock.MagicMock()), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=_protocol_v2_cluster_record()), \
+         mock.patch.object(replica_managers.kubernetes_adaptor,
+                           'physical_cluster_uid_fence',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch('sky.core.down') as down, \
+         mock.patch.object(replica_managers.time, 'sleep'):
+        replica_managers.terminate_cluster.__wrapped__(
+            'svc-1',
+            str(tmp_path / 'down.log'),
+            cleanup_fence=cleanup_fence,
+            continue_guard=guard)
+
+    down.assert_called_once_with('svc-1',
+                                 _expected_cluster_hash='generation-a',
+                                 _continue_guard=guard)
+
+
+def test_protocol_v2_action_cleanup_keeps_uuid_authoritative(tmp_path):
+    cleanup_fence = replica_managers.reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+    expected_uuid = '33333333-3333-4333-8333-333333333333'
+    guard = mock.Mock(return_value=True)
+    with mock.patch.object(replica_managers.context,
+                           'get',
+                           return_value=mock.MagicMock()), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=_protocol_v2_cluster_record()), \
+         mock.patch.object(
+             replica_managers.global_user_state,
+             'get_cluster_record_identity_snapshot',
+             return_value=mock.Mock()), \
+         mock.patch.object(replica_managers.kubernetes_adaptor,
+                           'physical_cluster_uid_fence',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch('sky.core.down') as down, \
+         mock.patch.object(replica_managers.time, 'sleep'):
+        replica_managers.terminate_cluster.__wrapped__(
+            'svc-1',
+            str(tmp_path / 'down.log'),
+            cleanup_fence=cleanup_fence,
+            expected_cluster_record_uuid=expected_uuid,
+            continue_guard=guard)
+
+    down.assert_called_once_with('svc-1',
+                                 _expected_cluster_record_uuid=expected_uuid,
+                                 _continue_guard=guard)
+
+
+def test_protocol_v2_rotated_uuid_rejects_before_provider_capture(tmp_path):
+    cleanup_fence = replica_managers.reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+    expected_uuid = '33333333-3333-4333-8333-333333333333'
+    with mock.patch.object(replica_managers.context,
+                           'get',
+                           return_value=mock.MagicMock()), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=_protocol_v2_cluster_record()), \
+         mock.patch.object(
+             replica_managers.global_user_state,
+             'get_cluster_record_identity_snapshot',
+             side_effect=(replica_managers.global_user_state.
+                          ClusterRecordIdentityConflictError('rotated'))), \
+         mock.patch.object(
+             replica_managers.kubernetes_adaptor,
+             'physical_cluster_uid_fence') as provider_fence, \
+         mock.patch('sky.core.down') as down, \
+         mock.patch.object(replica_managers.time, 'sleep'), \
+         pytest.raises(
+             replica_managers.global_user_state.
+             ClusterRecordIdentityConflictError,
+             match='rotated'):
+        replica_managers.terminate_cluster.__wrapped__(
+            'svc-1',
+            str(tmp_path / 'down.log'),
+            cleanup_fence=cleanup_fence,
+            expected_cluster_record_uuid=expected_uuid)
+
+    provider_fence.assert_not_called()
+    down.assert_not_called()
 
 
 def test_action_aware_replica_worker_carries_persisted_uuid(tmp_path):
@@ -138,3 +289,58 @@ def test_legacy_replica_worker_remains_name_only(tmp_path):
 
     assert safe_thread.call_args.kwargs['kwargs'][
         'expected_cluster_record_uuid'] is None
+
+
+def test_protocol_v2_absent_cluster_record_is_retained_for_retry(tmp_path):
+    manager = _manager_for_down_test()
+    info = _protocol_v2_replica()
+
+    with mock.patch.object(
+            replica_managers.serve_state,
+            'get_replica_info_with_resource_action_identity',
+            return_value=(info, None)), \
+         mock.patch.object(replica_managers.serve_utils,
+                           'generate_replica_log_file_name',
+                           return_value=str(tmp_path / 'replica.log')), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'cluster_with_name_exists',
+                           return_value=False):
+        manager._terminate_replica(1,
+                                   sync_down_logs=False,
+                                   replica_drain_delay_seconds=0,
+                                   is_scale_down=True)
+
+    assert info.status_property.sky_down_status == common_utils.ProcessStatus.FAILED
+    assert info.status_property.sky_launch_status == common_utils.ProcessStatus.FAILED
+    assert info.status == serve_state.ReplicaStatus.FAILED_CLEANUP
+    manager._persist_replica.assert_called_once_with(1, info)
+    manager._schedule_failed_cleanup_retry.assert_called_once_with(1)
+    assert 1 not in manager._down_thread_pool
+
+
+def test_malformed_protocol_v2_cleanup_authority_is_retained(tmp_path):
+    manager = _manager_for_down_test()
+    info = _protocol_v2_replica()
+    info.reserved_fill_kubernetes_context = 'retargeted-context'
+
+    with mock.patch.object(
+            replica_managers.serve_state,
+            'get_replica_info_with_resource_action_identity',
+            return_value=(info, None)), \
+         mock.patch.object(replica_managers.serve_utils,
+                           'generate_replica_log_file_name',
+                           return_value=str(tmp_path / 'replica.log')), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'cluster_with_name_exists') as cluster_exists:
+        manager._terminate_replica(1,
+                                   sync_down_logs=False,
+                                   replica_drain_delay_seconds=0,
+                                   is_scale_down=True)
+
+    cluster_exists.assert_not_called()
+    assert info.status_property.sky_down_status == common_utils.ProcessStatus.FAILED
+    assert info.status_property.sky_launch_status == common_utils.ProcessStatus.FAILED
+    assert info.status == serve_state.ReplicaStatus.FAILED_CLEANUP
+    manager._persist_replica.assert_called_once_with(1, info)
+    manager._schedule_failed_cleanup_retry.assert_called_once_with(1)
+    assert 1 not in manager._down_thread_pool

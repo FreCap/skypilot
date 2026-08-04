@@ -12,6 +12,8 @@ The module grants:
 
 - cluster-wide `get`/`list` access to nodes and pods;
 - cluster-wide `list` access to RuntimeClasses;
+- `get` access to only the `kube-system` Namespace object, whose UID lets
+  protocol-v2 reserved fill deduplicate context aliases and fence retargeting;
 - namespaced pod lifecycle, exec, and port-forward permissions;
 - namespaced service lifecycle and event-list permissions;
 - optional read-only access to persistent volume claims; and
@@ -65,6 +67,10 @@ The cluster-wide pod read permission is needed by SkyPilot's real-time
 GPU-availability view. The namespaced role is the workload isolation boundary.
 This module does not enforce which namespace a SkyPilot workspace chooses; the
 control-plane configuration must pin workloads to the intended namespace.
+The physical-cluster identity grant cannot be expressed with a namespaced
+Role because Namespace objects are cluster-scoped. It grants only the named
+`kube-system` object's non-secret metadata: no namespace list/watch, mutation,
+or read of another Namespace is allowed.
 
 `subjects` accepts `User` and `Group` subjects. Service-account subjects are not
 accepted because Kubernetes role-binding service-account subjects also require

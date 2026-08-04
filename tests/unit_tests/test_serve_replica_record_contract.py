@@ -6,9 +6,14 @@ from unittest import mock
 
 import pytest
 
+from sky import backends
 from sky import clouds
+from sky import exceptions
+from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import replica_info
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import spot_placer
 from sky.utils import common_utils
@@ -60,6 +65,44 @@ def _replica() -> replica_managers.ReplicaInfo:
     return replica
 
 
+def _protocol_v2_replica() -> replica_managers.ReplicaInfo:
+    replica = _replica()
+    context = 'phx-context'
+    physical_uid = 'physical-uid'
+    replica.location = spot_placer.Location(cloud=clouds.Kubernetes(),
+                                            region=context,
+                                            zone=None,
+                                            accelerators={
+                                                'H200': 1
+                                            },
+                                            use_spot=False).to_pickleable()
+    replica.resources_override = {
+        'cloud': clouds.Kubernetes(),
+        'region': context,
+        'accelerators': {
+            'H200': 1,
+        },
+    }
+    replica.reserved_fill_pool_key = reserved_capacity_broker.make_pool_key(
+        context,
+        'H200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid=physical_uid)
+    replica.reserved_fill_service_generation = 7
+    replica.reserved_fill_physical_cluster_uid = physical_uid
+    replica.reserved_fill_kubernetes_context = context
+    return replica
+
+
+def _protocol_v2_handle(
+        context: str = 'phx-context') -> backends.CloudVmRayResourceHandle:
+    handle = mock.Mock(spec=backends.CloudVmRayResourceHandle)
+    handle.cluster_name = 'svc-7'
+    handle.launched_resources = mock.Mock(cloud=clouds.Kubernetes(),
+                                          region=context)
+    return handle
+
+
 @pytest.mark.parametrize(('updates', 'expected'), [
     ({}, serve_state.ReplicaStatus.PENDING),
     ({
@@ -108,6 +151,103 @@ def test_storage_round_trip_is_lossless_and_does_not_mutate_source():
         'us-east-1': 'regional-image',
     }
     assert restored.status is serve_state.ReplicaStatus.READY
+
+
+@pytest.mark.parametrize('marker', [0, 1, 'yes'])
+def test_storage_rejects_non_boolean_reserved_fill_marker(marker):
+    replica = _replica()
+    setattr(replica, 'reserved_fill', marker)
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='must be a boolean'):
+        replica.to_storage_dict()
+
+    state = _replica().to_storage_dict()
+    state['reserved_fill'] = marker
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='must be a boolean'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+def test_protocol_v2_storage_round_trip_preserves_strict_cleanup_authority():
+    state = _protocol_v2_replica().to_storage_dict()
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    fence = reserved_capacity.parse_protocol_v2_cleanup_fence(restored)
+    assert fence == reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='physical-uid')
+
+
+def test_deserialized_malformed_v2_tuple_fails_closed_at_cleanup_parser():
+    state = _protocol_v2_replica().to_storage_dict()
+    state['resources_override']['region'] = 'replacement-context'
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='resource pin is malformed'):
+        reserved_capacity.parse_protocol_v2_cleanup_fence(restored)
+
+
+def test_protocol_v2_endpoint_resolution_enters_exact_physical_fence():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle()
+    cluster_record = {'name': 'svc-7', 'handle': handle}
+    uid_fence = mock.MagicMock()
+    uid_fence.return_value.__enter__.return_value = None
+
+    with mock.patch.object(kubernetes_adaptor,
+                           'physical_cluster_uid_fence', uid_fence), \
+         mock.patch.object(replica_managers.backend_utils,
+                           'get_endpoints',
+                           return_value={8080: '10.0.0.1:8080'}) as endpoint:
+        assert replica._resolve_url(  # pylint: disable=protected-access
+            cluster_record=cluster_record,
+            handle=handle) == ('http://10.0.0.1:8080')
+
+    uid_fence.assert_called_once_with('phx-context', 'physical-uid')
+    endpoint.assert_called_once_with('svc-7',
+                                     8080,
+                                     cluster_record=cluster_record)
+
+
+def test_protocol_v2_endpoint_uid_mismatch_precedes_provider_call():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle()
+    cluster_record = {'name': 'svc-7', 'handle': handle}
+    uid_fence = mock.MagicMock()
+    uid_fence.return_value.__enter__.side_effect = (
+        exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+
+    with mock.patch.object(kubernetes_adaptor,
+                           'physical_cluster_uid_fence', uid_fence), \
+         mock.patch.object(replica_managers.backend_utils,
+                           'get_endpoints') as endpoint, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='UID mismatch'):
+        replica._resolve_url(  # pylint: disable=protected-access
+            cluster_record=cluster_record,
+            handle=handle)
+
+    endpoint.assert_not_called()
+
+
+def test_protocol_v2_endpoint_rejects_retargeted_handle_before_uid_lookup():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle(context='replacement-context')
+    cluster_record = {'name': 'svc-7', 'handle': handle}
+
+    with mock.patch.object(
+            kubernetes_adaptor,
+            'physical_cluster_uid_fence') as uid_fence, \
+         mock.patch.object(replica_managers.backend_utils,
+                           'get_endpoints') as endpoint, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='durable replica handle'):
+        replica._resolve_url(  # pylint: disable=protected-access
+            cluster_record=cluster_record,
+            handle=handle)
+
+    uid_fence.assert_not_called()
+    endpoint.assert_not_called()
 
 
 def test_legacy_null_image_key_and_missing_fields_remain_compatible():

@@ -22,6 +22,30 @@ def test_value_error():
     assert str(deserialized) == 'test'
 
 
+def test_kubernetes_physical_identity_error_round_trip():
+    """Executor safety classification survives the API exception wire."""
+    error = exceptions.KubernetesPhysicalClusterIdentityError(
+        'physical target is uncertain')
+
+    deserialized = _serialize_deserialize(error)
+
+    assert isinstance(deserialized,
+                      exceptions.KubernetesPhysicalClusterIdentityError)
+    assert isinstance(deserialized, exceptions.RequestCancelled)
+    assert str(deserialized) == 'physical target is uncertain'
+
+
+def test_reserved_fill_launch_fence_error_round_trip():
+    """Terminal exact-placement drift survives the API exception wire."""
+    error = exceptions.ReservedFillLaunchFenceError('candidate changed')
+
+    deserialized = _serialize_deserialize(error)
+
+    assert isinstance(deserialized, exceptions.ReservedFillLaunchFenceError)
+    assert isinstance(deserialized, exceptions.RequestCancelled)
+    assert str(deserialized) == 'candidate changed'
+
+
 def test_exception_notes_are_restored_outside_constructor_kwargs():
     error = TypeError('test')
     setattr(error, '__notes__', ['when serializing dict item bad'])

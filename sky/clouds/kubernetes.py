@@ -1,6 +1,5 @@
 """Kubernetes."""
 from collections.abc import Iterator
-import concurrent.futures
 import fnmatch
 import math
 import os
@@ -38,6 +37,7 @@ from sky.utils import kubernetes_enums
 from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import schemas
+from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils import volume as volume_lib
 
@@ -274,7 +274,7 @@ class Kubernetes(clouds.Cloud):
             try:
                 # Run spot label check and network type detection concurrently
                 # as they are independent operations
-                with concurrent.futures.ThreadPoolExecutor(
+                with subprocess_utils.ContextThreadPoolExecutor(
                         max_workers=2) as executor:
                     spot_future = executor.submit(
                         kubernetes_utils.get_spot_label, context)

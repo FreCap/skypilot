@@ -21,12 +21,14 @@ import aiohttp
 import filelock
 
 from sky import backends
+from sky import clouds
 from sky import estimated_spend
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
@@ -546,6 +548,7 @@ def launch_cluster(
     pre_launch_guard: Callable[[], bool] | None = None,
     cloud_launch_guard: Callable[[], bool | tuple[bool, str]] | None = None,
     continue_guard: Callable[[], bool] | None = None,
+    cleanup_continue_guard: Callable[[], bool] | None = None,
     launch_fence: dict[str, Any] | None = None,
     service_spec: 'service_spec.SkyServiceSpec | None' = None,
     workspace: str | None = None,
@@ -599,6 +602,18 @@ def launch_cluster(
         raise RuntimeError(
             f'Failed to launch the sky serve replica cluster {cluster_name} '
             'due to failing to initialize sky.Task from yaml file.') from e
+
+    try:
+        protocol_v2_fence = reserved_capacity.parse_protocol_v2_launch_fence(
+            launch_fence or {})
+    except ValueError as error:
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Reserved-fill launch cleanup authority is malformed.') from error
+    cleanup_fence = (
+        None if protocol_v2_fence is None else
+        reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context=protocol_v2_fence.kubernetes_context,
+            physical_cluster_uid=protocol_v2_fence.physical_cluster_uid))
 
     def _check_is_cancelled() -> bool:
         is_cancelled = replica_to_launch_cancelled.get(replica_id, False)
@@ -826,6 +841,18 @@ def launch_cluster(
             raise
         except _UnfencedExternalLbLaunchError:
             raise
+        except reserved_capacity.ReservedFillLaunchFenceError:
+            # The executor/provisioner has proved that this durable request
+            # no longer matches its exact pool generation, Kubernetes
+            # context, physical UID, or accelerator pin. Retrying the same
+            # request and cleaning through that rejected authority can never
+            # repair it and may cross a retargeted alias.
+            raise
+        except exceptions.KubernetesPhysicalClusterIdentityError:
+            # Immediate cleanup through a retargeted alias would be the unsafe
+            # action.  Preserve the typed result for the manager, whose durable
+            # row drives only identity-fenced cleanup retries.
+            raise
         except (exceptions.InvalidClusterNameError,
                 exceptions.NoCloudAccessError,
                 exceptions.ResourcesMismatchError) as e:
@@ -894,7 +921,10 @@ def launch_cluster(
                 reason=typing.cast(str,
                                    availability_reason)) from capacity_error
 
-        terminate_cluster(cluster_name, log_file=log_file)
+        terminate_cluster(cluster_name,
+                          log_file=log_file,
+                          continue_guard=cleanup_continue_guard,
+                          cleanup_fence=cleanup_fence)
 
         if terminal:
             raise RuntimeError('Failed to launch the sky serve replica cluster '
@@ -1107,14 +1137,17 @@ class _ReplicaDrainTracker:
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::terminate_cluster
 @context.contextual
-def terminate_cluster(cluster_name: str,
-                      log_file: str,
-                      replica_drain_delay_seconds: int = 0,
-                      max_retry: int = 3,
-                      drain_deadline: float | None = None,
-                      drain_complete: Callable[[], bool] | None = None,
-                      continue_guard: Callable[[], bool] | None = None,
-                      expected_cluster_record_uuid: str | None = None) -> None:
+def terminate_cluster(
+    cluster_name: str,
+    log_file: str,
+    replica_drain_delay_seconds: int = 0,
+    max_retry: int = 3,
+    drain_deadline: float | None = None,
+    drain_complete: Callable[[], bool] | None = None,
+    continue_guard: Callable[[], bool] | None = None,
+    expected_cluster_record_uuid: str | None = None,
+    cleanup_fence: reserved_capacity.ProtocolV2CleanupFence | None = None
+) -> None:
     """Terminate the sky serve replica cluster."""
     from sky import core  # pylint: disable=import-outside-toplevel
 
@@ -1136,6 +1169,45 @@ def terminate_cluster(cluster_name: str,
     # down request to the durable cluster identity so failed-service purge can
     # clean up replicas after their controller is gone.
     cluster_record = global_user_state.get_cluster_from_name(cluster_name)
+    if cluster_record is None and cleanup_fence is not None:
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: its '
+            'durable cluster record is absent.')
+    if cleanup_fence is not None:
+        assert cluster_record is not None
+        handle = cluster_record.get('handle')
+        launched_resources = getattr(handle, 'launched_resources', None)
+        if (not isinstance(handle,
+                           cloud_vm_ray_backend.CloudVmRayResourceHandle) or
+                getattr(handle, 'cluster_name', None) != cluster_name or
+                launched_resources is None or
+                not isinstance(getattr(launched_resources, 'cloud', None),
+                               clouds.Kubernetes) or
+                getattr(launched_resources, 'region',
+                        None) != cleanup_fence.kubernetes_context):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: its '
+                'durable cluster handle does not match the fenced Kubernetes '
+                'context.')
+        expected_cluster_hash = cluster_record.get('cluster_hash')
+        if (not isinstance(expected_cluster_hash, str) or
+                not expected_cluster_hash):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: its '
+                'durable cluster generation hash is absent.')
+        if expected_cluster_record_uuid is not None:
+            # Validate an action UUID before entering the physical provider
+            # fence. It remains the authoritative generation fence under the
+            # cluster locks; the ordinary hash is only the legacy fallback.
+            exact_snapshot = (
+                global_user_state.get_cluster_record_identity_snapshot(
+                    cluster_name, expected_cluster_record_uuid))
+            if exact_snapshot is None:
+                raise global_user_state.ClusterRecordIdentityConflictError(
+                    f'Cluster {cluster_name!r} disappeared before protocol-v2 '
+                    'cleanup could validate its exact record UUID.')
+    else:
+        expected_cluster_hash = None
     cluster_workspace = (cluster_record.get('workspace')
                          if cluster_record is not None else None)
     # TODO(fcapponi): DEPRECATED resource-action retry owner. Remove at M5
@@ -1155,13 +1227,36 @@ def terminate_cluster(cluster_name: str,
             workspace_ctx: contextlib.AbstractContextManager = (
                 skypilot_config.local_active_workspace_ctx(cluster_workspace)
                 if cluster_workspace else contextlib.nullcontext())
-            with workspace_ctx:
-                core.down(
-                    cluster_name,
-                    _expected_cluster_record_uuid=expected_cluster_record_uuid)
+            provider_fence: contextlib.AbstractContextManager[None] = (
+                contextlib.nullcontext() if cleanup_fence is None else
+                kubernetes_adaptor.physical_cluster_uid_fence(
+                    cleanup_fence.kubernetes_context,
+                    cleanup_fence.physical_cluster_uid))
+            # Workspace selection owns kubeconfig/environment resolution, so
+            # establish it before capturing the immutable provider target.
+            with workspace_ctx, provider_fence:
+                if cleanup_fence is not None:
+                    if expected_cluster_record_uuid is not None:
+                        core.down(cluster_name,
+                                  _expected_cluster_record_uuid=(
+                                      expected_cluster_record_uuid),
+                                  _continue_guard=continue_guard)
+                    else:
+                        core.down(
+                            cluster_name,
+                            _expected_cluster_hash=(expected_cluster_hash),
+                            _continue_guard=continue_guard)
+                else:
+                    core.down(cluster_name,
+                              _expected_cluster_record_uuid=(
+                                  expected_cluster_record_uuid))
             logger.info(f'Replica cluster {cluster_name} terminated.')
             return
-        except exceptions.ClusterDoesNotExist:
+        except exceptions.ClusterDoesNotExist as error:
+            if cleanup_fence is not None:
+                raise exceptions.KubernetesPhysicalClusterIdentityError(
+                    f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: '
+                    'the exact cluster disappeared during teardown.') from error
             # The cluster is already terminated.
             logger.info(
                 f'Replica cluster {cluster_name} is already terminated.')
@@ -1170,6 +1265,11 @@ def terminate_cluster(cluster_name: str,
             # A different/null durable identity is not a transient provider
             # failure. Never turn the exact action fence into repeated
             # name-only teardown attempts.
+            raise
+        except exceptions.KubernetesPhysicalClusterIdentityError:
+            # A replacement target is not a transient provider failure.  The
+            # durable row remains cleanup-uncertain and a later reconciliation
+            # constructs a fresh capture after identity is restored.
             raise
         except Exception as e:  # pylint: disable=broad-except
             if retry_cnt >= max_retry:
@@ -1343,34 +1443,13 @@ def _protocol_v2_fill_cloud_launch_guard(
 
 def _interrupted_reserved_fill_protocol(info: 'ReplicaInfo') -> int:
     """Classify a durable interrupted fill row without guessing corruption."""
-    persisted = vars(info)
-    pool_key = persisted.get('reserved_fill_pool_key')
-    service_generation = persisted.get('reserved_fill_service_generation')
-    physical_cluster_uid = persisted.get('reserved_fill_physical_cluster_uid')
-    identity = None
-    if pool_key is not None:
-        if not isinstance(pool_key, str) or not pool_key:
-            raise ValueError('invalid reserved-fill pool key')
-        try:
-            identity = reserved_capacity_broker.parse_pool_identity(pool_key)
-        except (TypeError, ValueError) as e:
-            raise ValueError('invalid reserved-fill pool key') from e
-
-    legacy_generation = (service_generation is None or
-                         type(service_generation) is int and
-                         service_generation == 0)
-    if ((identity is None or
-         identity.protocol_version == reserved_capacity_broker.PROTOCOL_V1) and
-            legacy_generation and physical_cluster_uid is None):
-        return reserved_capacity_broker.PROTOCOL_V1
-    if (identity is not None and identity.protocol_version
-            == reserved_capacity_broker.PROTOCOL_V2 and
-            not isinstance(service_generation, bool) and
-            isinstance(service_generation, int) and service_generation > 0 and
-            isinstance(physical_cluster_uid, str) and physical_cluster_uid and
-            identity.physical_cluster_uid == physical_cluster_uid):
-        return reserved_capacity_broker.PROTOCOL_V2
-    raise ValueError('partial or contradictory protocol-v2 fill identity')
+    try:
+        cleanup_fence = reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+    except exceptions.KubernetesPhysicalClusterIdentityError as error:
+        raise ValueError(
+            'partial or contradictory protocol-v2 fill identity') from error
+    return (reserved_capacity_broker.PROTOCOL_V1
+            if cleanup_fence is None else reserved_capacity_broker.PROTOCOL_V2)
 
 
 def _zero_cost_pool_key(
@@ -2385,6 +2464,33 @@ class SkyPilotReplicaManager(ReplicaManager):
         ownership_lost = getattr(self, '_ownership_lost', None)
         return ownership_lost is None or not ownership_lost.is_set()
 
+    def _service_is_cleanup_authorized(self) -> bool:
+        """Fail cleanup closed unless this exact controller still owns it.
+
+        Cleanup deliberately ignores launch-blocking lifecycle statuses:
+        SHUTTING_DOWN is the normal state while a down worker is running. The
+        immutable service hash and controller PID/IP are the authority, so a
+        stale daemon worker cannot retry after controller replacement.
+        """
+        service_hash = getattr(self, '_service_hash', None)
+        if service_hash is None:
+            # Compatibility for direct/legacy managers without durable owner
+            # identity. New controllers always supply the full tuple.
+            return True
+        controller_owner = getattr(self, '_controller_owner', None)
+        if controller_owner is None:
+            return False
+        try:
+            owner = serve_state.get_service_controller_owner(self._service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to verify controller ownership before '
+                           'cleaning up a replica: '
+                           f'{common_utils.format_exception(e)}')
+            return False
+        return (owner is not None and owner.get('hash') == service_hash and
+                (owner.get('controller_pid'), owner.get('controller_ip'))
+                == controller_owner)
+
     def _replica_launch_fence_context(self,
                                       service_version: int | None = None
                                      ) -> dict[str, Any] | None:
@@ -3064,6 +3170,48 @@ class SkyPilotReplicaManager(ReplicaManager):
         logger.warning(f'Replica {replica_id} cleanup will retry in '
                        f'{delay_seconds}s (attempt {attempt}).')
 
+    def _record_cleanup_uncertain(self, info: ReplicaInfo,
+                                  message: str) -> None:
+        """Retain one row whose exact provider cleanup cannot be proven."""
+        logger.error(f'Replica {info.replica_id} cleanup is uncertain: '
+                     f'{message}')
+        if info.status_property.sky_launch_status in (
+                None, common_utils.ProcessStatus.SCHEDULED,
+                common_utils.ProcessStatus.INTERRUPTED):
+            # ReplicaStatusProperty otherwise reports PENDING/SHUTTING_DOWN
+            # before consulting sky_down_status, hiding this durable cleanup
+            # failure from reconciliation and operators.
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.FAILED)
+        info.status_property.service_ready_now = False
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+        self._persist_replica(info.replica_id, info)
+        self._schedule_failed_cleanup_retry(info.replica_id)
+
+    def _provider_identity_uncertain_replica_ids(self) -> set[int]:
+        """Return process-local rows awaiting a fresh identity proof."""
+        uncertain_ids = getattr(self, '_provider_identity_uncertain_ids', None)
+        if uncertain_ids is None:
+            new_uncertain_ids: set[int] = set()
+            self._provider_identity_uncertain_ids = new_uncertain_ids
+            return new_uncertain_ids
+        return typing.cast(set[int], uncertain_ids)
+
+    def _record_provider_identity_uncertain(self, info: ReplicaInfo,
+                                            message: str) -> None:
+        """Keep a replica off-route without misclassifying provider state."""
+        logger.error(
+            f'Replica {info.replica_id} provider identity is uncertain: '
+            f'{message}')
+        info.status_property.service_ready_now = False
+        uncertain_ids = self._provider_identity_uncertain_replica_ids()
+        uncertain_ids.add(info.replica_id)
+        replica_record_id = getattr(info, 'replica_record_id', None)
+        if isinstance(replica_record_id, str):
+            self._route_lease_registry().deactivate_record(
+                info.replica_id, replica_record_id)
+        self._persist_replica(info.replica_id, info)
+
     def __init__(self,
                  service_name: str,
                  spec: 'service_spec.SkyServiceSpec',
@@ -3374,6 +3522,18 @@ class SkyPilotReplicaManager(ReplicaManager):
             info for info in all_replica_infos
             if info.status == serve_state.ReplicaStatus.PENDING)
 
+        # Validate the complete cleanup-authority shape for every row before
+        # deciding whether it is a fill launch. In particular, a false or
+        # malformed marker carrying v2 fields must never fall through to the
+        # ordinary launch re-drive path.
+        try:
+            for info in to_up_replicas:
+                reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            raise RuntimeError(
+                'Could not validate interrupted reserved-fill identity; '
+                'retaining every durable row for recovery retry.') from error
+
         # A fill launch is opportunistic and its original broker authority is
         # intentionally one-shot.  Re-driving its sentinel-stripped row would
         # bypass the current protocol/generation/UID fences and could mutate a
@@ -3674,20 +3834,40 @@ class SkyPilotReplicaManager(ReplicaManager):
                          'wait_for_idle_before_termination', False) is True))
         ]
         recovery_wait_urls: dict[int, str | None] = {}
+        malformed_waiting_rows: dict[int, str] = {}
         if waiting_replicas and not self._is_pool:
-            try:
-                # One cluster/config snapshot for the whole recovery wave.
-                # Resolving ``info.url`` independently repeats cluster-record
-                # and provider-config reads around each endpoint lookup while
-                # the manager lock blocks every probe and autoscaler tick.
-                recovery_wait_urls = self._resolve_probe_urls(waiting_replicas)
-            except Exception as e:  # pylint: disable=broad-except
-                # URL resolution only enables early drain completion. Keep the
-                # bounded per-replica fallback rather than failing recovery.
-                logger.warning(
-                    'Failed to batch-resolve recovered drain endpoints; '
-                    'falling back to per-replica resolution: '
-                    f'{common_utils.format_exception(e)}')
+            ordinary_waiting_replicas = []
+            for info in waiting_replicas:
+                try:
+                    cleanup_fence = (
+                        reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                    malformed_waiting_rows[info.replica_id] = (
+                        common_utils.format_exception(error))
+                    continue
+                if cleanup_fence is None:
+                    ordinary_waiting_replicas.append(info)
+                else:
+                    # Endpoint evidence is only an early-drain optimization.
+                    # A recovered v2 row can safely consume its persisted
+                    # bounded deadline without any provider lookup here; exact
+                    # UID validation remains mandatory before teardown.
+                    recovery_wait_urls[info.replica_id] = None
+            if ordinary_waiting_replicas:
+                try:
+                    # One cluster/config snapshot for the whole recovery wave.
+                    # Resolving ``info.url`` independently repeats cluster-record
+                    # and provider-config reads around each endpoint lookup while
+                    # the manager lock blocks every probe and autoscaler tick.
+                    recovery_wait_urls.update(
+                        self._resolve_probe_urls(ordinary_waiting_replicas))
+                except Exception as e:  # pylint: disable=broad-except
+                    # URL resolution only enables early drain completion. Keep the
+                    # bounded per-replica fallback rather than failing recovery.
+                    logger.warning(
+                        'Failed to batch-resolve recovered drain endpoints; '
+                        'falling back to per-replica resolution: '
+                        f'{common_utils.format_exception(e)}')
         legacy_uncertain_ids = getattr(
             self, '_legacy_uncertain_logical_retirement_ids', None)
         if legacy_uncertain_ids is None:
@@ -3702,6 +3882,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._recovering_logical_retirement_ids = recovering_logical_ids
         for replica_info in to_down_replicas:
             try:
+                malformed_identity = malformed_waiting_rows.get(
+                    replica_info.replica_id)
+                if malformed_identity is not None:
+                    self._record_cleanup_uncertain(
+                        replica_info,
+                        'the recovered strict-drain row has malformed '
+                        f'physical identity: {malformed_identity}')
+                    continue
                 if self._is_legacy_uncertain_logical_retirement(replica_info):
                     logger.warning(
                         f'Keeping legacy logical retirement for replica '
@@ -4458,11 +4646,33 @@ class SkyPilotReplicaManager(ReplicaManager):
             cloud_launch_guard = lambda: (
                 self._queued_logical_launch_fence_decision(replica_id)[:2])
         launch_fence = self._replica_launch_fence_context(launch_version)
+        if fill_protocol_version == reserved_capacity_broker.PROTOCOL_V2:
+            assert isinstance(fill_pool_key, str)
+            assert isinstance(fill_service_generation, int)
+            assert isinstance(fill_physical_cluster_uid, str)
+            assert fill_launch_context is not None
+            assert fill_launch_accelerator_shape is not None
+            if launch_fence is None:
+                self._release_unstarted_location_retry(location)
+                self._log_fill_skip(
+                    'protocol-v2 fill requires a durable service-owner '
+                    'launch fence')
+                return False
+            fill_card, fill_count = fill_launch_accelerator_shape
+            launch_fence = dict(launch_fence)
+            launch_fence.update(
+                reserved_capacity.make_protocol_v2_launch_fence(
+                    pool_key=fill_pool_key,
+                    service_generation=fill_service_generation,
+                    physical_cluster_uid=fill_physical_cluster_uid,
+                    kubernetes_context=fill_launch_context,
+                    accelerator=fill_card,
+                    accelerator_count=fill_count))
         recovery_intent: (system_recovery_state.SystemRecoveryLaunchIntent |
                           None) = None
         recovery_launch_context: dict[str, Any] | None = None
         candidate_prerequisites = (
-            not recovering_existing_replica and
+            not recovering_existing_replica and not zero_cost_only and
             not getattr(self, '_is_pool', False) and
             getattr(self, '_resource_action_mode', 'legacy') == 'legacy' and
             getattr(self, '_enforce_launch_fence', True) and
@@ -4597,6 +4807,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                  if zero_cost_only else None)
         info.reserved_fill_physical_cluster_uid = (fill_physical_cluster_uid
                                                    if zero_cost_only else None)
+        info.reserved_fill_kubernetes_context = (fill_launch_context
+                                                 if zero_cost_only else None)
         is_zero_cost = bool(prior_is_zero_cost or zero_cost_only)
         if not is_zero_cost and self._spot_placer is not None:
             candidates = self._spot_placer.zero_cost_locations()
@@ -4761,6 +4973,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'pre_launch_guard': self._service_is_launch_authorized,
                 'cloud_launch_guard': cloud_launch_guard,
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
+                'cleanup_continue_guard': (self._service_is_cleanup_authorized),
                 'launch_fence': launch_fence,
                 'service_spec': launch_spec,
                 'service_name': self._service_name,
@@ -5972,6 +6185,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             backend = backends.CloudVmRayBackend()
             handle = global_user_state.get_handle_from_cluster_name(
                 info.cluster_name)
+            provider_fence = reserved_capacity.protocol_v2_provider_fence(
+                info, handle)
             if handle is None:
                 logger.error(f'Cannot find cluster {info.cluster_name} for '
                              f'replica {replica_id} in the cluster table. '
@@ -5996,8 +6211,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 job_ids = [str(service_job_id)]
             else:
                 job_ids = None
-            job_log_file_name = controller_utils.download_and_stream_job_log(
-                backend, handle, replica_job_logs_dir, job_ids)
+            with provider_fence:
+                job_log_file_name = (
+                    controller_utils.download_and_stream_job_log(
+                        backend, handle, replica_job_logs_dir, job_ids))
             if job_log_file_name is not None:
                 logger.info(f'\n== End of logs (Replica: {replica_id}) ==')
                 with open(log_file_name, 'a',
@@ -6027,6 +6244,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                         replica_id)
             assert info is not None
             resource_action_identity = None
+        info.status_property.is_scale_down = is_scale_down
+        info.status_property.purged = purge
+        info.status_property.wait_for_idle_before_termination = False
         # Revoke the exact process-local route before recovery terminalization,
         # log download, drain bookkeeping, or provider cleanup can block.  A
         # row recreation with the same numeric ID first retires only the prior
@@ -6038,6 +6258,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         expected_cluster_record_uuid = (
             str(resource_action_identity.sky_cluster_record_uuid)
             if resource_action_identity is not None else None)
+        try:
+            cleanup_fence = (
+                reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            self._record_cleanup_uncertain(info,
+                                           common_utils.format_exception(error))
+            return
 
         if info.system_recovery is not None:
 
@@ -6054,6 +6281,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             if recovery_info is not None:
                 info = recovery_info
 
+        # A recovery patch returns a fresh row, so reapply this teardown's
+        # durable intent before any later uncertainty is recorded.
+        info.status_property.is_scale_down = is_scale_down
+        info.status_property.purged = purge
+        info.status_property.wait_for_idle_before_termination = False
+
         # A controller restart loses the in-memory down worker.  Once a
         # logical retirement crossed the durable teardown boundary, its
         # prior worker may already have started even if the last persisted
@@ -6069,7 +6302,21 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         if sync_down_logs:
             try:
-                _download_and_stream_logs(info)
+                provider_fence: contextlib.AbstractContextManager[None] = (
+                    contextlib.nullcontext() if cleanup_fence is None else
+                    kubernetes_adaptor.physical_cluster_uid_fence(
+                        cleanup_fence.kubernetes_context,
+                        cleanup_fence.physical_cluster_uid))
+                with provider_fence:
+                    _download_and_stream_logs(info)
+            except exceptions.KubernetesPhysicalClusterIdentityError:
+                # Log sync is credential delivery through KubernetesCommandRunner.
+                # Never downgrade an identity mismatch to the historical
+                # best-effort logging path before cleanup.
+                self._record_cleanup_uncertain(
+                    info, 'the physical Kubernetes identity could not be '
+                    'proved while syncing logs')
+                return
             except Exception as e:  # pylint: disable=broad-except
                 # Logs aid diagnosis, but cannot be a prerequisite for
                 # stopping potentially billable infrastructure.
@@ -6080,16 +6327,17 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         logger.info(f'preempted: {info.status_property.preempted}, '
                     f'replica_id: {replica_id}')
-        info.status_property.is_scale_down = is_scale_down
-        info.status_property.purged = purge
-        info.status_property.wait_for_idle_before_termination = False
-
         # If the cluster does not exist, it means either the cluster never
         # exists (e.g., the cluster is scaled down before it gets a chance to
         # provision) or the cluster is preempted and cleaned up by the status
         # refresh. In this case, we skip spawning a new down thread to save
         # controller resources.
         if not global_user_state.cluster_with_name_exists(info.cluster_name):
+            if cleanup_fence is not None:
+                self._record_cleanup_uncertain(
+                    info, 'the durable cluster record is absent, so cleanup '
+                    'of partial resources cannot be proven')
+                return
             self._handle_sky_down_finish(info, format_exc=None)
             return
 
@@ -6118,7 +6366,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # Live endpoint resolution (one DB/provider lookup); a
                 # failure must never block the teardown -- it only costs
                 # the early-exit (bounded sleep to the deadline instead).
-                replica_url = info.url
+                provider_fence = (contextlib.nullcontext()
+                                  if cleanup_fence is None else
+                                  kubernetes_adaptor.physical_cluster_uid_fence(
+                                      cleanup_fence.kubernetes_context,
+                                      cleanup_fence.physical_cluster_uid))
+                with provider_fence:
+                    replica_url = info.url
+            except exceptions.KubernetesPhysicalClusterIdentityError:
+                self._record_cleanup_uncertain(
+                    info, 'the physical Kubernetes identity could not be '
+                    'proved while resolving the drain endpoint')
+                return
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning(
                     f'Failed to resolve the url of replica {replica_id} for '
@@ -6138,6 +6397,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'drain_deadline': drain_deadline,
                 'drain_complete': drain_complete,
                 'expected_cluster_record_uuid': expected_cluster_record_uuid,
+                'cleanup_fence': cleanup_fence,
+                'continue_guard': self._service_is_cleanup_authorized,
             },
         )
         legacy_runtime.down_thread_pool[replica_id] = t
@@ -6284,11 +6545,21 @@ class SkyPilotReplicaManager(ReplicaManager):
         if replica_url is _REPLICA_URL_NOT_PROVIDED:
             try:
                 replica_url = info.url
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                self._record_provider_identity_uncertain(
+                    info, 'the physical Kubernetes identity could not be '
+                    'proved while resolving the strict-drain endpoint: '
+                    f'{common_utils.format_exception(error)}')
+                self._wait_for_idle_trackers[info.replica_id] = (None, deadline)
+                return
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning('Unable to resolve replica '
                                f'{info.replica_id} url for strict drain: '
                                f'{common_utils.format_exception(e)}')
                 replica_url = None
+            else:
+                self._provider_identity_uncertain_replica_ids().discard(
+                    info.replica_id)
         if replica_url is not None and not self._is_pool:
             assert isinstance(replica_url, str), replica_url
             tracker = _ReplicaDrainTracker(self, replica_url, drain_started)
@@ -6299,7 +6570,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             replica_id: int,
             logical_retirement: tuple[int, int, int] | None = None,
             *,
-            replica_info: ReplicaInfo | None = None) -> None:
+            replica_info: ReplicaInfo | None = None,
+            replica_url: Any = _REPLICA_URL_NOT_PROVIDED) -> None:
         """Persist off-route state without admitting termination yet."""
         info = replica_info
         if info is None:
@@ -6309,9 +6581,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             return
         if (getattr(info.status_property, 'wait_for_idle_before_termination',
                     False) is True):
-            self._register_wait_for_idle(info)
+            self._register_wait_for_idle(info, replica_url=replica_url)
             return
-        if not global_user_state.cluster_with_name_exists(info.cluster_name):
+        identity_uncertain = (
+            replica_id in self._provider_identity_uncertain_replica_ids())
+        if (not identity_uncertain and
+                not global_user_state.cluster_with_name_exists(
+                    info.cluster_name)):
             self._terminate_replica(replica_id,
                                     sync_down_logs=False,
                                     replica_drain_delay_seconds=0,
@@ -6339,7 +6615,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         info.status_property.logical_retirement_bounded_deadline = False
         info.status_property.logical_retirement_committed = False
         self._persist_replica(replica_id, info)
-        self._register_wait_for_idle(info)
+        self._register_wait_for_idle(info, replica_url=replica_url)
 
     def _logical_retirement_state(self,
                                   info: ReplicaInfo,
@@ -7199,6 +7475,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             dict.fromkeys(info.cluster_name for info in tracked_infos.values()))
         cluster_status_fields = global_user_state.get_cluster_status_fields(
             cluster_names)
+        retry_url_infos = [
+            tracked_infos[replica_id]
+            for replica_id, (tracker, _) in tracker_items
+            if (tracker is None and replica_id in tracked_infos and
+                tracked_infos[replica_id].cluster_name in cluster_status_fields)
+        ]
+        retry_urls = (self._resolve_probe_urls(retry_url_infos)
+                      if retry_url_infos else {})
         for replica_id, tracked in tracker_items:
             tracker, deadline = tracked
             info = tracked_infos.get(replica_id)
@@ -7210,9 +7494,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if tracker is None:
                     # Endpoint discovery can fail transiently during recovery.
                     self._wait_for_idle_trackers.pop(replica_id, None)
-                    self._register_wait_for_idle(info, deadline=deadline)
+                    self._register_wait_for_idle(
+                        info,
+                        deadline=deadline,
+                        replica_url=retry_urls.get(replica_id))
                     retried = self._wait_for_idle_trackers.get(replica_id)
-                    tracker = retried[0] if retried is not None else None
+                    if retried is None:
+                        # A physical-identity failure is durably retained by
+                        # registration; do not turn the same pass into cleanup
+                        # admission or another provider lookup.
+                        continue
+                    tracker = retried[0]
+                    if (replica_id
+                            in self._provider_identity_uncertain_replica_ids()):
+                        continue
                 drained = tracker is not None and tracker()
             deadline_expired = time.monotonic() >= deadline
             logical_retirement = getattr(info.status_property,
@@ -7444,6 +7739,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                     launch_thread = launch_pool.get(replica_id)
                     if (launch_thread is not None and launch_thread.is_alive()):
                         continue
+                    try:
+                        cleanup_fence = (
+                            reserved_capacity.parse_protocol_v2_cleanup_fence(
+                                candidate))
+                    except exceptions.KubernetesPhysicalClusterIdentityError:
+                        # A malformed physical-identity row must flow through
+                        # _terminate_replica, which records FAILED_CLEANUP.
+                        continue
+                    if cleanup_fence is not None:
+                        # Cluster-table absence is not proof that protocol-v2
+                        # provider resources are absent. Never batch-delete
+                        # its durable cleanup authority.
+                        continue
                     absence_candidates.append(candidate)
                 existing_cluster_names = (
                     serve_utils.get_existing_replica_cluster_names(
@@ -7501,6 +7809,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
             accepted = 0
             absent_finished_launch_infos: list[ReplicaInfo] = []
+            logical_drain_infos: list[ReplicaInfo] = []
             seen_ids: set[int] = set()
             for replica_id in replica_ids:
                 if replica_id in seen_ids:
@@ -7557,11 +7866,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 card_ready_after,
                                 target_capacity_by_accelerator)):
                         continue
-                    self._defer_scale_down_until_idle(
-                        replica_id,
-                        logical_retirement=(version, reconcile_generation,
-                                            target_capacity),
-                        replica_info=info)
+                    logical_drain_infos.append(info)
 
                 # Only mutate the in-memory proof after durable acceptance.
                 # If persistence raises, the exception aborts the remainder and
@@ -7572,6 +7877,44 @@ class SkyPilotReplicaManager(ReplicaManager):
                     committed_by_accelerator[card] -= committed_width
                     ready_by_accelerator[card] -= ready_width
                 accepted += 1
+
+            # Resolve the accepted victim wave as one provider batch. Passing
+            # the pre-resolved URL into drain registration prevents a second
+            # per-victim UID proof. A failed group remains durably off-route
+            # and retries identity; it never commits teardown through a
+            # replacement alias.
+            if logical_drain_infos:
+                ordinary_drain_infos: list[ReplicaInfo] = []
+                identity_fenced_drain_infos: list[ReplicaInfo] = []
+                for info in logical_drain_infos:
+                    try:
+                        cleanup_fence = (reserved_capacity.
+                                         parse_protocol_v2_cleanup_fence(info))
+                    except exceptions.KubernetesPhysicalClusterIdentityError:
+                        # Let the grouped resolver retain malformed authority
+                        # as provider uncertainty without a teardown attempt.
+                        identity_fenced_drain_infos.append(info)
+                        continue
+                    if cleanup_fence is None:
+                        ordinary_drain_infos.append(info)
+                    else:
+                        identity_fenced_drain_infos.append(info)
+                for info in ordinary_drain_infos:
+                    self._defer_scale_down_until_idle(
+                        info.replica_id,
+                        logical_retirement=(version, reconcile_generation,
+                                            target_capacity),
+                        replica_info=info)
+                if identity_fenced_drain_infos:
+                    logical_drain_urls = self._resolve_probe_urls(
+                        identity_fenced_drain_infos)
+                    for info in identity_fenced_drain_infos:
+                        self._defer_scale_down_until_idle(
+                            info.replica_id,
+                            logical_retirement=(version, reconcile_generation,
+                                                target_capacity),
+                            replica_info=info,
+                            replica_url=logical_drain_urls.get(info.replica_id))
 
             if absent_finished_launch_infos:
                 self._remove_replicas(absent_finished_launch_infos)
@@ -7607,7 +7950,7 @@ class SkyPilotReplicaManager(ReplicaManager):
     _PREEMPTION_PREFILTER_PARALLELISM = 16
     _PROBE_ROUND_MAX_PARALLELISM = 256
 
-    def _cloud_instance_looks_alive(self, info: ReplicaInfo) -> bool:
+    def _cloud_instance_looks_alive(self, info: ReplicaInfo) -> bool | None:
         """Whether the cloud still reports this replica's instance(s) as UP.
 
         Cloud-API-only (one provider call, no SSH probe, no status lock, no
@@ -7634,14 +7977,23 @@ class SkyPilotReplicaManager(ReplicaManager):
         try:
             handle = global_user_state.get_handle_from_cluster_name(
                 info.cluster_name)
+            provider_fence = reserved_capacity.protocol_v2_provider_fence(
+                info, handle)
             if handle is None:
                 return False
             assert isinstance(handle, backends.CloudVmRayResourceHandle)
-            statuses = backend_utils.query_cluster_instance_statuses(handle)
+            with provider_fence:
+                statuses = backend_utils.query_cluster_instance_statuses(handle)
             if len(statuses) < handle.launched_nodes:
                 return False
             return all(status == status_lib.ClusterStatus.UP
                        for status, _ in statuses.values())
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            logger.error(
+                f'Preemption pre-filter has unknown provider identity for '
+                f'replica {info.replica_id} ({info.cluster_name}): '
+                f'{common_utils.format_exception(error)}')
+            return None
         except Exception as e:  # pylint: disable=broad-except
             logger.debug(f'Preemption pre-filter failed for replica '
                          f'{info.replica_id} ({info.cluster_name}); treating '
@@ -7681,6 +8033,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # cluster record from the cluster table.
         handle = global_user_state.get_handle_from_cluster_name(
             info.cluster_name)
+        provider_fence = reserved_capacity.protocol_v2_provider_fence(
+            info, handle)
         if handle is None:
             # A missing global-state row after a failed probe is conclusive for
             # a successfully launched interruptible replica: forced status
@@ -7694,9 +8048,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             # Pull the actual cluster status from the provider to distinguish
             # an infrastructure interruption from an application readiness
             # failure.
-            cluster_status, _ = backend_utils.refresh_cluster_status_handle(
-                info.cluster_name,
-                force_refresh_statuses=set(status_lib.ClusterStatus))
+            with provider_fence:
+                cluster_status, _ = (
+                    backend_utils.refresh_cluster_status_handle(
+                        info.cluster_name,
+                        force_refresh_statuses=set(status_lib.ClusterStatus)))
 
             if cluster_status in (status_lib.ClusterStatus.UP,
                                   status_lib.ClusterStatus.AUTOSTOPPING):
@@ -8867,12 +9223,28 @@ class SkyPilotReplicaManager(ReplicaManager):
         backend = backends.CloudVmRayBackend()
         to_fetch: list[tuple[ReplicaInfo, Any, list[int] | None, bool]] = []
         invalid_recovery_ids: list[int] = []
+        identity_uncertainties: list[tuple[int, str]] = []
+        fence_representatives: dict[tuple[str, str], tuple[ReplicaInfo,
+                                                           Any]] = {}
+        fence_group_replica_ids: dict[tuple[str, str], set[int]] = {}
         for info in infos:
             if not info.status_property.should_track_service_status():
                 continue
             cluster_record = cluster_records.get(info.cluster_name)
-            handle = None if cluster_record is None else info.handle(
-                cluster_record)
+            try:
+                cleanup_fence = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                if cleanup_fence is None:
+                    handle = (None if cluster_record is None else
+                              info.handle(cluster_record))
+                else:
+                    handle = (cluster_record.get('handle') if isinstance(
+                        cluster_record, dict) else None)
+                reserved_capacity.protocol_v2_provider_fence(info, handle)
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                identity_uncertainties.append(
+                    (info.replica_id, common_utils.format_exception(error)))
+                continue
             if handle is None:
                 # The walk runs lock-free, so the replica's cluster record can
                 # vanish mid-walk (a scale-down or preemption cleanup
@@ -8898,6 +9270,22 @@ class SkyPilotReplicaManager(ReplicaManager):
             else:
                 job_ids = [1] if self._is_pool else None
             to_fetch.append((info, handle, job_ids, with_recovery))
+            if cleanup_fence is not None:
+                key = (cleanup_fence.kubernetes_context,
+                       cleanup_fence.physical_cluster_uid)
+                fence_representatives.setdefault(key, (info, handle))
+                fence_group_replica_ids.setdefault(key,
+                                                   set()).add(info.replica_id)
+        for replica_id, message in identity_uncertainties:
+            with self.lock:
+                fresh = serve_state.get_replica_info_from_id(
+                    self._service_name, replica_id)
+                if (fresh is None or
+                        not fresh.status_property.should_track_service_status()
+                   ):
+                    continue
+                self._record_provider_identity_uncertain(
+                    fresh, f'job-status lookup was fenced off: {message}')
         for replica_id in invalid_recovery_ids:
             with self.lock:
                 fresh = serve_state.get_replica_info_from_id(
@@ -8914,31 +9302,57 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._terminate_replica(replica_id,
                                         sync_down_logs=True,
                                         replica_drain_delay_seconds=0)
-        if not to_fetch:
-            return
 
-        def _get_job_status(handle, job_ids, with_recovery):
+        def _get_job_status(info, handle, job_ids, with_recovery):
             # SSH into the replica's head node -- intentionally OUTSIDE
             # self.lock so an unreachable replica cannot wedge the round.
-            if with_recovery:
-                return backend.get_job_status_with_system_recovery(
-                    handle, job_ids, stream_logs=False)
-            return (backend.get_job_status(handle, job_ids,
-                                           stream_logs=False), {}, {})
+            with reserved_capacity.protocol_v2_provider_fence(info, handle):
+                if with_recovery:
+                    return backend.get_job_status_with_system_recovery(
+                        handle, job_ids, stream_logs=False)
+                return (backend.get_job_status(handle,
+                                               job_ids,
+                                               stream_logs=False), {}, {})
 
-        # The fetches are pure I/O; run them in parallel so one hung SSH
-        # (preempted spot) delays only its own replica's result, not the
-        # whole fleet's failure detection.
-        num_fetch_threads = min(len(to_fetch),
-                                self._PROBE_ROUND_MAX_PARALLELISM)
-        with mp_pool.ThreadPool(num_fetch_threads) as pool:
-            fetch_results = [
-                (info,
-                 pool.apply_async(_get_job_status,
-                                  (handle, job_ids, with_recovery)))
-                for info, handle, job_ids, with_recovery in to_fetch
+        with reserved_capacity.protocol_v2_provider_batch_fences(
+                fence_representatives) as fence_failures:
+            failed_replica_ids: set[int] = set()
+            for key, error in fence_failures.items():
+                if not isinstance(
+                        error,
+                        exceptions.KubernetesPhysicalClusterIdentityError):
+                    raise error
+                failed_replica_ids.update(fence_group_replica_ids[key])
+                for replica_id in fence_group_replica_ids[key]:
+                    with self.lock:
+                        fresh = serve_state.get_replica_info_from_id(
+                            self._service_name, replica_id)
+                        if (fresh is None or not fresh.status_property.
+                                should_track_service_status()):
+                            continue
+                        self._record_provider_identity_uncertain(
+                            fresh, 'job-status batch identity was fenced off: '
+                            f'{common_utils.format_exception(error)}')
+            admitted_fetches = [
+                item for item in to_fetch
+                if item[0].replica_id not in failed_replica_ids
             ]
-            self._handle_job_status_results(fetch_results)
+            if not admitted_fetches:
+                return
+            # The fetches are pure I/O; run them in parallel so one hung SSH
+            # (preempted spot) delays only its own replica's result, not the
+            # whole fleet's failure detection. The batch owners remain active
+            # until every nested per-operation fence has completed.
+            num_fetch_threads = min(len(admitted_fetches),
+                                    self._PROBE_ROUND_MAX_PARALLELISM)
+            with mp_pool.ThreadPool(num_fetch_threads) as pool:
+                fetch_results = [
+                    (info,
+                     pool.apply_async(_get_job_status,
+                                      (info, handle, job_ids, with_recovery)))
+                    for info, handle, job_ids, with_recovery in admitted_fetches
+                ]
+                self._handle_job_status_results(fetch_results)
 
     def _handle_job_status_results(
             self, fetch_results: list[tuple[ReplicaInfo, Any]]) -> None:
@@ -8955,6 +9369,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                     job_statuses = result_payload
                     recovery_infos = {}
                     recovery_detail_statuses = {}
+                self._provider_identity_uncertain_replica_ids().discard(
+                    info.replica_id)
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                with self.lock:
+                    fresh = serve_state.get_replica_info_from_id(
+                        self._service_name, info.replica_id)
+                    if (fresh is None or not fresh.status_property.
+                            should_track_service_status()):
+                        continue
+                    self._record_provider_identity_uncertain(
+                        fresh, 'job-status lookup was fenced off: '
+                        f'{common_utils.format_exception(error)}')
+                continue
             except exceptions.CommandError:
                 # If the job status fetch failed, it is likely that the
                 # cluster is preempted.
@@ -8969,7 +9396,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         continue
                     if not fresh.status_property.should_track_service_status():
                         continue
-                    is_preempted = self._handle_preemption(fresh)
+                    try:
+                        is_preempted = self._handle_preemption(fresh)
+                    except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                        self._record_provider_identity_uncertain(
+                            fresh, 'preemption classification was fenced off: '
+                            f'{common_utils.format_exception(error)}')
+                        continue
                     if (not is_preempted and fresh.system_recovery_disposition
                             == system_recovery_state.SystemRecoveryDisposition.
                             CAPABLE and
@@ -9075,29 +9508,80 @@ class SkyPilotReplicaManager(ReplicaManager):
         """
         cluster_records = global_user_state.get_clusters_from_names(
             [info.cluster_name for info in infos])
+        urls: dict[int, str | None] = {}
         handles: dict[int, backends.CloudVmRayResourceHandle] = {}
+        ordinary_infos: list[ReplicaInfo] = []
+        fenced_groups: dict[tuple[str, str], list[ReplicaInfo]] = {}
+
+        def _retain_identity_uncertainty(
+                info: ReplicaInfo,
+                error: exceptions.KubernetesPhysicalClusterIdentityError
+        ) -> None:
+            urls[info.replica_id] = None
+            self._record_provider_identity_uncertain(
+                info, 'endpoint resolution was fenced off: '
+                f'{common_utils.format_exception(error)}')
+
         for info in infos:
             cluster_record = cluster_records.get(info.cluster_name)
-            if cluster_record is None:
+            try:
+                cleanup_fence = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                _retain_identity_uncertainty(info, error)
                 continue
-            handle = info.handle(cluster_record)
-            if handle is None:
+            if cleanup_fence is None:
+                ordinary_infos.append(info)
+                if cluster_record is None:
+                    continue
+                handle = info.handle(cluster_record)
+                if handle is not None:
+                    handles[info.replica_id] = handle
                 continue
-            handles[info.replica_id] = handle
+            raw_handle = (cluster_record.get('handle') if isinstance(
+                cluster_record, dict) else None)
+            # Validate every member before entering a shared fence. This is a
+            # pure durable-state check; construction does not contact the
+            # provider. A missing/replaced handle aborts the batch without an
+            # unfenced endpoint read.
+            try:
+                reserved_capacity.protocol_v2_provider_fence(info, raw_handle)
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                _retain_identity_uncertainty(info, error)
+                continue
+            assert isinstance(raw_handle, backends.CloudVmRayResourceHandle)
+            handles[info.replica_id] = raw_handle
+            group_key = (cleanup_fence.kubernetes_context,
+                         cleanup_fence.physical_cluster_uid)
+            fenced_groups.setdefault(group_key, []).append(info)
         provider_configs = serve_utils.get_provider_configs_for_handles(handles)
 
-        urls: dict[int, str | None] = {}
-        for info in infos:
+        def _resolve(info: ReplicaInfo) -> None:
             cluster_record = cluster_records.get(info.cluster_name)
             handle = handles.get(info.replica_id)
             if cluster_record is None or handle is None:
                 urls[info.replica_id] = None
-                continue
+                return
             urls[info.replica_id] = info._resolve_url(  # pylint: disable=protected-access
                 cluster_record=cluster_record,
                 handle=handle,
                 provider_config=provider_configs.get(info.replica_id),
             )
+            self._provider_identity_uncertain_replica_ids().discard(
+                info.replica_id)
+
+        for info in ordinary_infos:
+            _resolve(info)
+        for group_infos in fenced_groups.values():
+            representative = group_infos[0]
+            try:
+                with reserved_capacity.protocol_v2_provider_fence(
+                        representative, handles[representative.replica_id]):
+                    for info in group_infos:
+                        _resolve(info)
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                for info in group_infos:
+                    _retain_identity_uncertainty(info, error)
         return urls
 
     def _reduce_candidate_probe(
@@ -9279,6 +9763,61 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     @with_lock
     def _probe_all_replicas(self) -> list[ReplicaInfo]:
+        """Run one probe round under one physical UID proof per pool."""
+        infos = serve_state.get_replica_infos(self._service_name)
+        tracked_infos = [
+            info for info in infos
+            if info.status_property.should_track_service_status()
+        ]
+        cluster_records = global_user_state.get_clusters_from_names(
+            [info.cluster_name for info in tracked_infos])
+        representatives: dict[tuple[str, str], tuple[ReplicaInfo, Any]] = {}
+        grouped_infos: dict[tuple[str, str], list[ReplicaInfo]] = {}
+        for info in tracked_infos:
+            try:
+                cleanup_fence = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                if cleanup_fence is None:
+                    self._provider_identity_uncertain_replica_ids().discard(
+                        info.replica_id)
+                    continue
+                cluster_record = cluster_records.get(info.cluster_name)
+                handle = (cluster_record.get('handle') if isinstance(
+                    cluster_record, dict) else None)
+                # Validate durable row/handle agreement before any owner
+                # thread is allowed to contact the provider.
+                reserved_capacity.protocol_v2_provider_fence(info, handle)
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                self._record_provider_identity_uncertain(
+                    info, 'probe-round physical identity was fenced off: '
+                    f'{common_utils.format_exception(error)}')
+                continue
+            key = (cleanup_fence.kubernetes_context,
+                   cleanup_fence.physical_cluster_uid)
+            representatives.setdefault(key, (info, handle))
+            grouped_infos.setdefault(key, []).append(info)
+
+        with reserved_capacity.protocol_v2_provider_batch_fences(
+                representatives) as fence_failures:
+            for key, error in fence_failures.items():
+                if not isinstance(
+                        error,
+                        exceptions.KubernetesPhysicalClusterIdentityError):
+                    raise error
+                for info in grouped_infos[key]:
+                    self._record_provider_identity_uncertain(
+                        info, 'probe-round physical identity was fenced off: '
+                        f'{common_utils.format_exception(error)}')
+            for key, group_infos in grouped_infos.items():
+                if key in fence_failures:
+                    continue
+                for info in group_infos:
+                    self._provider_identity_uncertain_replica_ids().discard(
+                        info.replica_id)
+            return self._probe_all_replicas_with_snapshot(infos)
+
+    def _probe_all_replicas_with_snapshot(
+            self, infos: list[ReplicaInfo]) -> list[ReplicaInfo]:
         """Readiness probe replicas.
 
         This function will probe all replicas to make sure the service is
@@ -9298,7 +9837,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._tick_version_spec_cache = {}
         probe_futures = []
         replica_to_probe = []
-        infos = serve_state.get_replica_infos(self._service_name)
         self._prune_system_recovery_process_guards(infos)
         self._route_lease_registry().prune({
             info.replica_id: info.replica_record_id
@@ -9312,7 +9850,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         })
         infos_to_probe = [
             info for info in infos
-            if info.status_property.should_track_service_status()
+            if (info.status_property.should_track_service_status() and
+                info.replica_id not in
+                self._provider_identity_uncertain_replica_ids())
         ]
         if not infos_to_probe:
             return infos
@@ -9400,16 +9940,42 @@ class SkyPilotReplicaManager(ReplicaManager):
             status_cluster_records = (global_user_state.get_clusters_from_names(
                 [info.cluster_name for info in status_infos])
                                       if status_infos else {})
+
+            def _status_handle(info: ReplicaInfo, record: Any) -> Any:
+                if (info.replica_id
+                        in self._provider_identity_uncertain_replica_ids()):
+                    return None
+                try:
+                    cleanup_fence = (
+                        reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                    if cleanup_fence is None:
+                        return None if record is None else info.handle(record)
+                    handle = (record.get('handle')
+                              if isinstance(record, dict) else None)
+                    reserved_capacity.protocol_v2_provider_fence(info, handle)
+                    return handle
+                except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                    self._record_provider_identity_uncertain(
+                        info, 'exact status handle was fenced off: '
+                        f'{common_utils.format_exception(error)}')
+                    return None
+
             for info in candidates:
                 record = status_cluster_records.get(info.cluster_name)
-                handle = None if record is None else info.handle(record)
+                handle = _status_handle(info, record)
+                if (info.replica_id
+                        in self._provider_identity_uncertain_replica_ids()):
+                    continue
                 candidate_status_inputs.append((info, handle))
             for replica_id, candidate in route_issue_candidates.items():
                 (info, generation, predicted_generation,
                  retry_submitted_adopted_at, route_url, readiness_path,
                  post_data, readiness_headers, job_id) = candidate
                 record = status_cluster_records.get(info.cluster_name)
-                handle = None if record is None else info.handle(record)
+                handle = _status_handle(info, record)
+                if (info.replica_id
+                        in self._provider_identity_uncertain_replica_ids()):
+                    continue
                 route_issue_inputs[replica_id] = (handle, generation,
                                                   predicted_generation,
                                                   retry_submitted_adopted_at,
@@ -9426,6 +9992,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 self._PROBE_ROUND_MAX_PARALLELISM)
         with mp_pool.ThreadPool(num_probe_threads) as pool, \
              contextlib.ExitStack() as route_suspension_rollback:
+            provider_identity_errors: dict[int, str] = {}
+            provider_identity_errors_lock = threading.Lock()
             pending_route_suspensions: list[
                 system_recovery_route_lease.RouteSuspension] = []
 
@@ -9440,6 +10008,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 _rollback_pending_route_suspensions)
 
             def _ordered_route_status(
+                info: ReplicaInfo,
                 handle: Any,
                 job_id: int,
             ) -> tuple[job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
@@ -9448,9 +10017,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                     return (None, None,
                             job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
                 try:
-                    status_payload = (
-                        recovery_backend.get_job_status_with_system_recovery(
-                            handle, [job_id], stream_logs=False))
+                    with reserved_capacity.protocol_v2_provider_fence(
+                            info, handle):
+                        status_payload = (recovery_backend.
+                                          get_job_status_with_system_recovery(
+                                              handle, [job_id],
+                                              stream_logs=False))
                     if status_payload is None:
                         raise ValueError('exact status payload is missing')
                     statuses, recovery_infos, detail_statuses = status_payload
@@ -9459,6 +10031,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         detail_statuses.get(
                             job_id,
                             job_lib.JobSystemRecoveryDetailStatus.MALFORMED))
+                except exceptions.KubernetesPhysicalClusterIdentityError:
+                    raise
                 except Exception as e:  # pylint: disable=broad-except
                     logger.warning(
                         f'Ordered route-issuance status fetch failed for '
@@ -9506,7 +10080,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                  retry_submitted_adopted_at, exact_route_url,
                  exact_readiness_path, exact_post_data, exact_headers,
                  job_id) = route_input
-                evidence = _ordered_route_status(handle, job_id)
+                try:
+                    evidence = _ordered_route_status(result_info, handle,
+                                                     job_id)
+                except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                    with provider_identity_errors_lock:
+                        provider_identity_errors[result_info.replica_id] = (
+                            'ordered route-status lookup was fenced off: '
+                            f'{common_utils.format_exception(error)}')
+                    return (result_info, succeeded, probe_time,
+                            request_started_at, None, False)
                 # A RETRY_SUBMITTED row may already carry a durable adoption
                 # fence from an earlier round. A probe that starts after that
                 # fence can register the predicted RECOVERED target here;
@@ -9543,7 +10126,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                     job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
                     None, job_lib.JobSystemRecoveryDetailStatus] | None, bool]:
                 request_started_at = time.monotonic()
-                result_info, succeeded, probe_time = info.probe_pool()
+                try:
+                    result_info, succeeded, probe_time = info.probe_pool()
+                    self._provider_identity_uncertain_replica_ids().discard(
+                        info.replica_id)
+                except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                    with provider_identity_errors_lock:
+                        provider_identity_errors[info.replica_id] = (
+                            'pool probe was fenced off: '
+                            f'{common_utils.format_exception(error)}')
+                    result_info, succeeded, probe_time = (info, False,
+                                                          time.time())
                 return (result_info, succeeded, probe_time, request_started_at,
                         None, False)
 
@@ -9585,6 +10178,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                       None, job_lib.JobSystemRecoveryDetailStatus] | None,
                 bool]] = [future.get() for future in probe_futures]
 
+            if provider_identity_errors:
+                infos_by_id = {info.replica_id: info for info in infos_to_probe}
+                for replica_id, message in provider_identity_errors.items():
+                    identity_info = infos_by_id.get(replica_id)
+                    if identity_info is not None:
+                        self._record_provider_identity_uncertain(
+                            identity_info, message)
+
             # Candidate release requires ABSENT + nonterminal status from the
             # exact job in the same reconciliation cycle as the fresh probe.
             # These few short-lived candidates share the probe pool; capable
@@ -9594,8 +10195,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                         not isinstance(info.service_job_id, int) or
                         info.service_job_id < 1):
                     return None
-                return recovery_backend.get_job_status_with_system_recovery(
-                    handle, [info.service_job_id], stream_logs=False)
+                with reserved_capacity.protocol_v2_provider_fence(info, handle):
+                    return (
+                        recovery_backend.get_job_status_with_system_recovery(
+                            handle, [info.service_job_id], stream_logs=False))
 
             candidate_status_futures = {
                 info.replica_id:
@@ -9609,6 +10212,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                              status_future) in candidate_status_futures.items():
                 try:
                     status_payload = status_future.get()
+                except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                    self._record_provider_identity_uncertain(
+                        candidate_info,
+                        'candidate status lookup was fenced off: '
+                        f'{common_utils.format_exception(error)}')
+                    candidate_cycle_evidence[replica_id] = (False, False)
+                    continue
                 except Exception as e:  # pylint: disable=broad-except
                     logger.warning(
                         f'Exact candidate status fetch failed for replica '
@@ -9706,9 +10316,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                     alive_flags = prefilter_pool.map(
                         self._cloud_instance_looks_alive,
                         failed_interruptible_infos)
+                for failed_info, alive in zip(failed_interruptible_infos,
+                                              alive_flags):
+                    if alive is None:
+                        self._record_provider_identity_uncertain(
+                            failed_info,
+                            'cloud liveness could not prove the physical '
+                            'Kubernetes identity')
                 possibly_preempted_ids = {
-                    failed_info.replica_id for failed_info, alive in zip(
-                        failed_interruptible_infos, alive_flags) if not alive
+                    failed_info.replica_id
+                    for failed_info, alive in zip(failed_interruptible_infos,
+                                                  alive_flags)
+                    if alive is False
                 }
 
             changed_only_readiness_persistence = getattr(
@@ -9720,6 +10339,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             for future_result in probe_results:
                 (info, probe_succeeded, probe_time, probe_monotonic_started_at,
                  _, _) = future_result
+                if (info.replica_id
+                        in self._provider_identity_uncertain_replica_ids()):
+                    # Provider identity is UNKNOWN, not a negative readiness,
+                    # preemption, or job-health observation. Keep the row
+                    # durably off-route and retry identity next round.
+                    info.status_property.service_ready_now = False
+                    continue
                 readiness_fingerprint_before = None
                 changed_only_eligible_before = False
                 if changed_only_readiness_persistence:
@@ -9733,7 +10359,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         info.replica_id in possibly_preempted_ids):
                     # Durable legacy interruption/down intent wins before any
                     # OOM observation or probe reduction can revive routing.
-                    is_preempted = self._handle_preemption(info)
+                    try:
+                        is_preempted = self._handle_preemption(info)
+                    except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                        self._record_provider_identity_uncertain(
+                            info, 'forced preemption refresh was fenced off: '
+                            f'{common_utils.format_exception(error)}')
+                        continue
                     if is_preempted:
                         preempted_replica_ids.add(info.replica_id)
                         continue
@@ -10110,15 +10742,18 @@ class SkyPilotReplicaManager(ReplicaManager):
         record = serve_state.get_service_from_name(self._service_name)
         assert record is not None, (f'{self._service_name} not found on '
                                     'controller records.')
-        ready_replica_urls = []
         active_versions = set(record['active_versions'])
-        for info in serve_state.get_replica_infos(self._service_name):
+        ready_infos = [
+            info for info in serve_state.get_replica_infos(self._service_name)
             if (info.status == serve_state.ReplicaStatus.READY and
-                    info.version in active_versions and
-                    self.system_recovery_allows_routing(info)):
-                assert info.url is not None, info
-                ready_replica_urls.append(info.url)
-        return ready_replica_urls
+                info.version in active_versions and
+                self.system_recovery_allows_routing(info))
+        ]
+        resolved_urls = self._resolve_probe_urls(ready_infos)
+        return [
+            url for info in ready_infos
+            if (url := resolved_urls.get(info.replica_id)) is not None
+        ]
 
     def _route_lease_registry(
             self) -> system_recovery_route_lease.ManagerRouteLeaseRegistry:

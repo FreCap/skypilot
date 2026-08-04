@@ -14,6 +14,7 @@ Covers:
 # pylint: disable=unused-argument,invalid-name,line-too-long
 # pylint: disable=missing-class-docstring,unnecessary-dunder-call
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -748,6 +749,233 @@ def _fake_replica_info(replica_id, status=None):
     info.system_recovery_launch_intent = None
     info.system_recovery = None
     return info
+
+
+def _stamp_protocol_v2_fill(info,
+                            context='phx',
+                            physical_uid='phx-uid',
+                            card='H200',
+                            generation=9):
+    info.reserved_fill = True
+    info.reserved_fill_pool_key = (
+        replica_managers.reserved_capacity_broker.make_pool_key(
+            context,
+            card,
+            protocol_version=(
+                replica_managers.reserved_capacity_broker.PROTOCOL_V2),
+            physical_cluster_uid=physical_uid))
+    info.reserved_fill_service_generation = generation
+    info.reserved_fill_physical_cluster_uid = physical_uid
+    info.reserved_fill_kubernetes_context = context
+    info.location = {
+        'cloud': 'Kubernetes',
+        'region': context,
+        'accelerators': {
+            card: 1,
+        },
+    }
+    info.resources_override = {
+        'cloud': 'Kubernetes',
+        'region': context,
+        'accelerators': {
+            card: 1,
+        },
+    }
+    return info
+
+
+def _protocol_v2_handle(info, context='phx'):
+    handle = mock.Mock(spec=replica_managers.backends.CloudVmRayResourceHandle)
+    handle.cluster_name = info.cluster_name
+    handle.cluster_yaml = '/tmp/protocol-v2-cluster.yaml'
+    handle.launched_resources = mock.Mock(cloud=clouds.Kubernetes(),
+                                          region=context)
+    return handle
+
+
+def test_probe_url_v2_group_reuses_one_outer_physical_fence():
+    infos = []
+    records = {}
+    for replica_id in (1, 2):
+        info = replica_managers.ReplicaInfo(replica_id=replica_id,
+                                            cluster_name=f'svc-{replica_id}',
+                                            replica_port='8080',
+                                            is_spot=False,
+                                            location=None,
+                                            version=1,
+                                            resources_override=None)
+        _stamp_protocol_v2_fill(info)
+        handle = _protocol_v2_handle(info)
+        infos.append(info)
+        records[info.cluster_name] = {
+            'name': info.cluster_name,
+            'handle': handle,
+        }
+    mgr = _make_manager()
+    mgr._persist_replica = mock.Mock()
+    active_scopes = 0
+    physical_uid_reads = 0
+
+    @contextlib.contextmanager
+    def _physical_fence(context, physical_uid):
+        nonlocal active_scopes, physical_uid_reads
+        assert (context, physical_uid) == ('phx', 'phx-uid')
+        if active_scopes == 0:
+            physical_uid_reads += 1
+        active_scopes += 1
+        try:
+            yield
+        finally:
+            active_scopes -= 1
+
+    with mock.patch.object(replica_managers.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=records), \
+         mock.patch.object(replica_managers.serve_utils,
+                           'get_provider_configs_for_handles',
+                           return_value={}), \
+         mock.patch.object(replica_managers.kubernetes_adaptor,
+                           'physical_cluster_uid_fence',
+                           side_effect=_physical_fence), \
+         mock.patch.object(replica_managers.backend_utils,
+                           'get_endpoints',
+                           return_value={8080: '10.0.0.1:8080'}):
+        urls = mgr._resolve_probe_urls(infos)
+
+    assert urls == {
+        1: 'http://10.0.0.1:8080',
+        2: 'http://10.0.0.1:8080',
+    }
+    assert physical_uid_reads == 1
+
+
+def test_v2_job_status_batch_reuses_one_physical_uid_proof():
+    infos = []
+    records = {}
+    for replica_id in (1, 2):
+        info = replica_managers.ReplicaInfo(replica_id=replica_id,
+                                            cluster_name=f'svc-{replica_id}',
+                                            replica_port='-',
+                                            is_spot=False,
+                                            location=None,
+                                            version=1,
+                                            resources_override=None)
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        _stamp_protocol_v2_fill(info)
+        handle = _protocol_v2_handle(info)
+        infos.append(info)
+        records[info.cluster_name] = {
+            'name': info.cluster_name,
+            'handle': handle,
+        }
+    mgr = _make_manager()
+    mgr._is_pool = True
+    backend = mock.Mock()
+    backend.get_job_status.return_value = {1: job_lib.JobStatus.RUNNING}
+    active_scopes = 0
+    physical_uid_reads = 0
+    scope_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def _physical_fence(context, physical_uid):
+        nonlocal active_scopes, physical_uid_reads
+        assert (context, physical_uid) == ('phx', 'phx-uid')
+        with scope_lock:
+            if active_scopes == 0:
+                physical_uid_reads += 1
+            active_scopes += 1
+        try:
+            yield
+        finally:
+            with scope_lock:
+                active_scopes -= 1
+
+    def _consume(results):
+        for _, result in results:
+            result.get()
+
+    mgr._handle_job_status_results = _consume
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=infos), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=records), \
+         mock.patch.object(replica_managers.backends,
+                           'CloudVmRayBackend',
+                           return_value=backend), \
+         mock.patch.object(replica_managers.kubernetes_adaptor,
+                           'physical_cluster_uid_fence',
+                           side_effect=_physical_fence):
+        mgr._fetch_job_status()
+
+    assert physical_uid_reads == 1
+    assert backend.get_job_status.call_count == 2
+
+
+def test_v2_cloud_liveness_uid_mismatch_is_unknown_not_preempted():
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    _stamp_protocol_v2_fill(info)
+    handle = _protocol_v2_handle(info)
+    mgr = _make_manager()
+    provider_fence = mock.MagicMock()
+    provider_fence.return_value.__enter__.side_effect = (
+        exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+
+    with mock.patch.object(
+            replica_managers.global_user_state,
+            'get_handle_from_cluster_name',
+            return_value=handle), \
+         mock.patch.object(replica_managers.kubernetes_adaptor,
+                           'physical_cluster_uid_fence', provider_fence), \
+         mock.patch.object(
+             replica_managers.backend_utils,
+             'query_cluster_instance_statuses') as query_statuses:
+        assert mgr._cloud_instance_looks_alive(info) is None
+
+    query_statuses.assert_not_called()
+    assert info.status_property.preempted is False
+
+
+def test_v2_forced_preemption_uid_mismatch_never_refreshes_or_marks_loss():
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    _stamp_protocol_v2_fill(info)
+    handle = _protocol_v2_handle(info)
+    mgr = _make_manager()
+    mgr._spot_placer = mock.Mock()
+    mgr._is_interruptible_replica = mock.Mock(return_value=True)
+    provider_fence = mock.MagicMock()
+    provider_fence.return_value.__enter__.side_effect = (
+        exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+
+    with mock.patch.object(
+            replica_managers.global_user_state,
+            'get_handle_from_cluster_name',
+            return_value=handle), \
+         mock.patch.object(replica_managers.kubernetes_adaptor,
+                           'physical_cluster_uid_fence', provider_fence), \
+         mock.patch.object(
+             replica_managers.backend_utils,
+             'refresh_cluster_status_handle') as refresh_status, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='UID mismatch'):
+        mgr._handle_preemption(info)
+
+    refresh_status.assert_not_called()
+    assert info.status_property.preempted is False
 
 
 def _system_recovery_replica(
@@ -2095,6 +2323,7 @@ class TestLaunchClusterRetry:
         """
         observed_workspaces = kwargs.pop('observed_workspaces', None)
         launch_side_effect = kwargs.pop('launch_side_effect', None)
+        terminate_side_effect = kwargs.pop('terminate_side_effect', None)
         raised = None
         task = mock.MagicMock()
         resource = mock.MagicMock()
@@ -2111,6 +2340,8 @@ class TestLaunchClusterRetry:
                        ) as mock_backoff:
             mock_backoff.return_value.current_backoff.return_value = (
                 backoff_seconds)
+            if terminate_side_effect is not None:
+                mock_terminate.side_effect = terminate_side_effect
             if launch_side_effect is not None:
                 mock_sdk.launch.side_effect = launch_side_effect
             elif observed_workspaces is None:
@@ -2135,7 +2366,7 @@ class TestLaunchClusterRetry:
                     replica_to_request_id=thread_utils.ThreadSafeDict(),
                     replica_to_launch_cancelled=replica_to_launch_cancelled,
                     **kwargs)
-            except RuntimeError as e:
+            except (RuntimeError, exceptions.ReservedFillLaunchFenceError) as e:
                 raised = e
         return mock_sdk, mock_terminate, raised
 
@@ -2410,6 +2641,49 @@ run: echo hi
         mock_sdk.launch.assert_not_called()
         mock_terminate.assert_not_called()
 
+    def test_wire_launch_fence_rejection_is_terminal_without_cleanup(
+            self, tmp_path):
+        fence_error = exceptions.ReservedFillLaunchFenceError(
+            'durable pool generation changed')
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [fence_error, None])
+
+        assert raised is fence_error
+        assert mock_sdk.launch.call_count == 1
+        assert mock_sdk.stream_and_get.call_count == 1
+        mock_terminate.assert_not_called()
+
+    def test_failed_launch_cleanup_stops_after_controller_replacement(
+            self, tmp_path):
+        cleanup_guard = mock.Mock(return_value=False)
+        real_terminate_cluster = replica_managers.terminate_cluster
+
+        def _refuse_stale_cleanup(*_args, **kwargs):
+            guard = kwargs['continue_guard']
+            assert guard is cleanup_guard
+            return real_terminate_cluster(*_args, **kwargs)
+
+        with mock.patch.object(
+                replica_managers.global_user_state,
+                'get_cluster_from_name',
+                return_value={
+                    'name': 'svc-1',
+                    'workspace': None,
+                }), \
+             mock.patch('sky.core.down') as core_down:
+            mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+                tmp_path, [RuntimeError('transient'), None],
+                cleanup_continue_guard=cleanup_guard,
+                terminate_side_effect=_refuse_stale_cleanup)
+
+        assert isinstance(raised, RuntimeError)
+        assert 'service lifecycle ownership was lost' in str(raised)
+        assert mock_sdk.launch.call_count == 1
+        assert mock_sdk.stream_and_get.call_count == 1
+        mock_terminate.assert_called_once()
+        cleanup_guard.assert_called_once_with()
+        core_down.assert_not_called()
+
     def test_inflight_owner_watchdog_cancels_request(self, tmp_path):
         allowed = threading.Event()
         watchdog_observed_loss = threading.Event()
@@ -2600,6 +2874,7 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         assert call.kwargs['kwargs']['exact_resources_override'] is True
         assert callable(call.kwargs['kwargs']['pre_launch_guard'])
         assert callable(call.kwargs['kwargs']['continue_guard'])
+        assert callable(call.kwargs['kwargs']['cleanup_continue_guard'])
         # retry_until_up must be False: failover is owned by the placer.
         assert call.kwargs['args'][-1] is False
 
@@ -6688,6 +6963,172 @@ class TestLogicalCapacityPlanning:
         assert (kwargs['replica_url']
                 is replica_managers._REPLICA_URL_NOT_PROVIDED)
 
+    def test_recovery_v2_strict_drain_skips_endpoint_provider_lookup(self):
+        retiring = _stamp_protocol_v2_fill(
+            self._recoverable_logical_retirement(1))
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._is_pool = False
+        mgr._register_wait_for_idle = mock.Mock()
+        mgr._resolve_probe_urls = mock.Mock()
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_yaml_contents',
+                               return_value={}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={retiring.cluster_name: ('UP', 1)}), \
+             mock.patch.object(
+                 replica_managers.kubernetes_adaptor,
+                 'physical_cluster_uid_fence') as provider_fence:
+            mgr._recover_replica_operations()
+
+        mgr._resolve_probe_urls.assert_not_called()
+        provider_fence.assert_not_called()
+        mgr._register_wait_for_idle.assert_called_once_with(retiring,
+                                                            replica_url=None)
+
+    def test_initial_v2_strict_drain_uid_mismatch_stays_off_route(self):
+        retiring = _stamp_protocol_v2_fill(
+            self._recoverable_logical_retirement(1))
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._persist_replica = mock.Mock()
+        mgr._terminate_replica = mock.Mock()
+        handle = _protocol_v2_handle(retiring)
+        provider_fence = mock.MagicMock()
+        provider_fence.return_value.__enter__.side_effect = (
+            exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+
+        with mock.patch.object(
+                replica_managers.global_user_state,
+                'get_handle_from_cluster_name',
+                return_value=handle), \
+             mock.patch.object(replica_managers.kubernetes_adaptor,
+                               'physical_cluster_uid_fence', provider_fence), \
+             mock.patch.object(replica_managers.backend_utils,
+                               'get_endpoints') as endpoints:
+            mgr._register_wait_for_idle(retiring)
+
+        endpoints.assert_not_called()
+        assert retiring.status_property.service_ready_now is False
+        assert retiring.status_property.sky_down_status == (
+            common_utils.ProcessStatus.SCHEDULED)
+        assert mgr._wait_for_idle_trackers[retiring.replica_id][0] is None
+        mgr._persist_replica.assert_called_once_with(retiring.replica_id,
+                                                     retiring)
+        mgr._terminate_replica.assert_not_called()
+
+    def test_retry_v2_strict_drain_uid_mismatch_stays_off_route(self):
+        retiring = _stamp_protocol_v2_fill(
+            self._recoverable_logical_retirement(1))
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._persist_replica = mock.Mock()
+        mgr._terminate_replica = mock.Mock()
+        mgr._wait_for_idle_trackers = {
+            retiring.replica_id: (None, replica_managers.time.monotonic() + 300)
+        }
+        handle = _protocol_v2_handle(retiring)
+        provider_fence = mock.MagicMock()
+        provider_fence.return_value.__enter__.side_effect = (
+            exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value={retiring.replica_id: retiring}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={retiring.cluster_name: ('UP', 1)}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_clusters_from_names',
+                 return_value={
+                     retiring.cluster_name: {
+                         'name': retiring.cluster_name,
+                         'handle': handle,
+                     }
+                 }), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'get_provider_configs_for_handles',
+                               return_value={}), \
+             mock.patch.object(replica_managers.kubernetes_adaptor,
+                               'physical_cluster_uid_fence', provider_fence), \
+             mock.patch.object(replica_managers.backend_utils,
+                               'get_endpoints') as endpoints:
+            mgr._refresh_wait_for_idle()
+
+        endpoints.assert_not_called()
+        assert retiring.status_property.service_ready_now is False
+        assert retiring.status_property.sky_down_status == (
+            common_utils.ProcessStatus.SCHEDULED)
+        assert mgr._wait_for_idle_trackers[retiring.replica_id][0] is None
+        mgr._persist_replica.assert_called_once_with(retiring.replica_id,
+                                                     retiring)
+        mgr._terminate_replica.assert_not_called()
+
+    def test_retry_v2_strict_drain_batches_group_identity_failure(self):
+        retiring = []
+        records = {}
+        for replica_id in (1, 2):
+            info = _stamp_protocol_v2_fill(
+                self._recoverable_logical_retirement(replica_id))
+            retiring.append(info)
+            records[info.cluster_name] = {
+                'name': info.cluster_name,
+                'handle': _protocol_v2_handle(info),
+            }
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._persist_replica = mock.Mock()
+        mgr._terminate_replica = mock.Mock()
+        deadline = replica_managers.time.monotonic() + 300
+        mgr._wait_for_idle_trackers = {
+            info.replica_id: (None, deadline) for info in retiring
+        }
+        provider_fence = mock.MagicMock()
+        provider_fence.return_value.__enter__.side_effect = (
+            exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value={info.replica_id: info for info in retiring}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={info.cluster_name: ('UP', 1)
+                               for info in retiring}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_clusters_from_names',
+                 return_value=records), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'get_provider_configs_for_handles',
+                               return_value={}), \
+             mock.patch.object(replica_managers.kubernetes_adaptor,
+                               'physical_cluster_uid_fence', provider_fence), \
+             mock.patch.object(replica_managers.backend_utils,
+                               'get_endpoints') as endpoints:
+            mgr._refresh_wait_for_idle()
+
+        endpoints.assert_not_called()
+        # Durable validation constructs a context for each row, but only the
+        # one shared group scope is entered and contacts the provider.
+        assert provider_fence.return_value.__enter__.call_count == 1
+        for info in retiring:
+            assert info.status_property.service_ready_now is False
+            assert mgr._wait_for_idle_trackers[info.replica_id][0] is None
+        assert mgr._provider_identity_uncertain_replica_ids() == {1, 2}
+        assert mgr._persist_replica.call_count == 2
+        mgr._terminate_replica.assert_not_called()
+
     @pytest.mark.parametrize('confirmed_generation', [None, 4])
     def test_recovery_adopts_old_epoch_retirement_and_preserves_deadline(
             self, confirmed_generation):
@@ -9643,6 +10084,50 @@ class TestFailedCleanupReconciliation:
         assert (info.status_property.sky_down_status ==
                 common_utils.ProcessStatus.SCHEDULED)
 
+    def test_down_worker_guard_allows_shutdown_but_rejects_new_owner(self):
+        manager = _make_manager()
+        manager._is_pool = False
+        manager._resource_scope = None
+        manager._service_hash = 'service-hash-a'
+        manager._controller_owner = (123, '10.0.0.1')
+        manager._down_thread_pool = thread_utils.ThreadSafeDict()
+        info = self._info()
+        same_owner = {
+            'hash': 'service-hash-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'status': replica_managers.serve_state.ServiceStatus.SHUTTING_DOWN,
+        }
+        replacement_owner = {
+            **same_owner,
+            'controller_pid': 456,
+            'controller_ip': '10.0.0.2',
+        }
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'generate_replica_log_file_name',
+                               return_value='/tmp/replica.log'), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'cluster_with_name_exists',
+                               return_value=True), \
+             mock.patch.object(manager, '_persist_replica'), \
+             mock.patch('sky.serve.replica_managers.thread_utils.SafeThread',
+                        return_value=mock.Mock()) as safe_thread:
+            manager._terminate_replica(1,
+                                       sync_down_logs=False,
+                                       replica_drain_delay_seconds=0,
+                                       is_scale_down=True)
+
+        guard = safe_thread.call_args.kwargs['kwargs']['continue_guard']
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_service_controller_owner',
+                               side_effect=[same_owner, replacement_owner]):
+            assert guard() is True
+            assert guard() is False
+
 
 class TestPaidLocationLaunchBudget:
 
@@ -11354,17 +11839,7 @@ class TestRecoveryRetryAndIsolation:
         fill_row.cluster_name = (
             replica_managers.serve_utils.generate_replica_cluster_name(
                 'svc', 1, 'incarnation-a'))
-        fill_row.resources_override = None
-        fill_row.reserved_fill = True
-        fill_row.reserved_fill_pool_key = (
-            replica_managers.reserved_capacity_broker.make_pool_key(
-                'phx',
-                'H200',
-                protocol_version=(
-                    replica_managers.reserved_capacity_broker.PROTOCOL_V2),
-                physical_cluster_uid='phx-uid'))
-        fill_row.reserved_fill_service_generation = 7
-        fill_row.reserved_fill_physical_cluster_uid = 'phx-uid'
+        _stamp_protocol_v2_fill(fill_row, generation=7)
         request_terminal = False
         quiescence_polls = 0
         events = []
@@ -11527,17 +12002,7 @@ class TestRecoveryRetryAndIsolation:
         current.cluster_name = (
             replica_managers.serve_utils.generate_replica_cluster_name(
                 'svc', 2, 'incarnation-a'))
-        current.resources_override = None
-        current.reserved_fill = True
-        current.reserved_fill_pool_key = (
-            replica_managers.reserved_capacity_broker.make_pool_key(
-                'phx',
-                'H200',
-                protocol_version=(
-                    replica_managers.reserved_capacity_broker.PROTOCOL_V2),
-                physical_cluster_uid='phx-uid'))
-        current.reserved_fill_service_generation = 9
-        current.reserved_fill_physical_cluster_uid = 'phx-uid'
+        _stamp_protocol_v2_fill(current)
 
         with mock.patch.object(
                 replica_managers.serve_state,
@@ -11562,6 +12027,37 @@ class TestRecoveryRetryAndIsolation:
         assert [call.args[0] for call in terminate.call_args_list] == [1, 2]
         launch.assert_not_called()
 
+    @pytest.mark.parametrize(('marker', 'carry_v2_identity'), [
+        (False, True),
+        ('yes', False),
+    ])
+    def test_recovery_rejects_rows_that_could_bypass_fill_classification(
+            self, marker, carry_v2_identity):
+        mgr = _make_manager()
+        info = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PENDING)
+        info.resources_override = None
+        if carry_v2_identity:
+            _stamp_protocol_v2_fill(info)
+        info.reserved_fill = marker
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[info]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'quiesce_service_replica_launch_requests') as quiesce, \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             pytest.raises(RuntimeError,
+                           match='validate interrupted reserved-fill'):
+            mgr._recover_replica_operations()
+
+        quiesce.assert_not_called()
+        launch.assert_not_called()
+        terminate.assert_not_called()
+
     @pytest.mark.parametrize('scope,cluster_matches', [
         (None, True),
         ('incarnation-a', False),
@@ -11578,17 +12074,7 @@ class TestRecoveryRetryAndIsolation:
                 'svc', 1, 'incarnation-a'))
         fill_row.cluster_name = (expected_name
                                  if cluster_matches else 'svc-1-wrong-scope')
-        fill_row.resources_override = None
-        fill_row.reserved_fill = True
-        fill_row.reserved_fill_pool_key = (
-            replica_managers.reserved_capacity_broker.make_pool_key(
-                'phx',
-                'H200',
-                protocol_version=(
-                    replica_managers.reserved_capacity_broker.PROTOCOL_V2),
-                physical_cluster_uid='phx-uid'))
-        fill_row.reserved_fill_service_generation = 9
-        fill_row.reserved_fill_physical_cluster_uid = 'phx-uid'
+        _stamp_protocol_v2_fill(fill_row)
 
         with mock.patch.object(
                 replica_managers.serve_state,

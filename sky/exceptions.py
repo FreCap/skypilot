@@ -839,6 +839,19 @@ class RequestCancelled(Exception):
     pass
 
 
+class KubernetesPhysicalClusterIdentityError(RequestCancelled):
+    """A fenced Kubernetes operation cannot prove its physical target.
+
+    This is a first-party wire exception so an API executor can preserve the
+    safety classification across ``sdk.stream_and_get()``.  Callers must not
+    retry, fail over, or clean up through the unresolved context alias.
+    """
+
+
+class ReservedFillLaunchFenceError(RequestCancelled):
+    """A durable reserved-fill launch no longer matches its exact pin."""
+
+
 class ApiServerConnectionError(RuntimeError):
     """Raised when the API server cannot be connected."""
 

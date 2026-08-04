@@ -16,7 +16,10 @@ autoscaler the broker's feed + grant instead of a privately measured free
 level. With a single live claim the broker's fast path reproduces the
 standalone behavior exactly.
 """
+import asyncio
 from collections.abc import Callable
+from collections.abc import Mapping
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -29,6 +32,9 @@ import time
 import typing
 from typing import Any, Optional
 
+from sky import backends
+from sky import clouds
+from sky import exceptions
 from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.catalog import kubernetes_catalog
@@ -43,6 +49,8 @@ if typing.TYPE_CHECKING:
     from sky.serve import autoscalers
 
 logger = sky_logging.init_logger(__name__)
+
+ReservedFillLaunchFenceError = exceptions.ReservedFillLaunchFenceError
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,6 +122,374 @@ class FillPoolBudget:
 
     edge_cap: int
     edge_floor: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ProtocolV2LaunchFence:
+    """Immutable reserved-fill authority persisted with one API request."""
+
+    protocol_version: int
+    pool_key: str
+    service_generation: int
+    physical_cluster_uid: str
+    kubernetes_context: str
+    accelerator: str
+    accelerator_count: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ProtocolV2CleanupFence:
+    """Physical authority reconstructed from one durable replica row."""
+
+    kubernetes_context: str
+    physical_cluster_uid: str
+
+
+def protocol_v2_provider_fence(
+    replica_info: Any,
+    handle: 'backends.CloudVmRayResourceHandle | None' = None,
+) -> contextlib.AbstractContextManager[None]:
+    """Return the exact provider fence for one durable replica row.
+
+    Genuine ordinary and protocol-v1 rows need no physical identity fence.
+    A protocol-v2 row must also prove that the supplied durable handle still
+    names the same Kubernetes cluster/context before any provider operation is
+    allowed.  Malformed rows and missing/replaced handles fail closed.
+    """
+    cleanup_fence = parse_protocol_v2_cleanup_fence(replica_info)
+    if cleanup_fence is None:
+        return contextlib.nullcontext()
+    cluster_name = getattr(replica_info, 'cluster_name', None)
+    launched_resources = getattr(handle, 'launched_resources', None)
+    if (not isinstance(cluster_name, str) or not cluster_name or
+            not isinstance(handle, backends.CloudVmRayResourceHandle) or
+            getattr(handle, 'cluster_name', None) != cluster_name or
+            launched_resources is None or
+            not isinstance(getattr(launched_resources, 'cloud', None),
+                           clouds.Kubernetes) or
+            getattr(launched_resources, 'region',
+                    None) != cleanup_fence.kubernetes_context):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'The durable replica handle does not match its fenced Kubernetes '
+            'context.')
+    return kubernetes.physical_cluster_uid_fence(
+        cleanup_fence.kubernetes_context, cleanup_fence.physical_cluster_uid)
+
+
+@dataclasses.dataclass
+class _ProtocolV2BatchFenceHolder:
+    """Process-local owner that keeps one physical target pinned."""
+
+    ready: threading.Event
+    release: threading.Event
+    thread: threading.Thread | None = None
+    error: BaseException | None = None
+
+
+@contextlib.contextmanager
+def protocol_v2_provider_batch_fences(
+    representatives: Mapping[tuple[str, str], tuple[Any, Any]],
+) -> typing.Iterator[dict[tuple[str, str], BaseException]]:
+    """Pin each physical target once for a complete provider batch.
+
+    A single caller context cannot hold two Kubernetes contexts at once. One
+    short-lived owner thread per physical target therefore keeps the
+    process-wide capture alive while batch workers enter their normal central
+    per-operation fence. Those nested entries reuse the capture and UID proof
+    instead of racing to initialize one proof per fast worker.
+
+    Entry failures are returned by group so callers can isolate only the rows
+    whose provider identity is uncertain. Unexpected failures remain typed in
+    the result and must be re-raised by callers.
+    """
+    holders: dict[tuple[str, str], _ProtocolV2BatchFenceHolder] = {}
+    failures: dict[tuple[str, str], BaseException] = {}
+
+    # Two durable UIDs for one mutable context cannot both be authoritative in
+    # a batch. Reject every conflicting group before choosing a winner based
+    # on thread scheduling.
+    keys_by_context: dict[str, list[tuple[str, str]]] = {}
+    for key in representatives:
+        keys_by_context.setdefault(key[0], []).append(key)
+    conflicted_keys = {
+        key for keys in keys_by_context.values()
+        if len({candidate[1] for candidate in keys}) > 1 for key in keys
+    }
+    for key in conflicted_keys:
+        failures[key] = exceptions.KubernetesPhysicalClusterIdentityError(
+            'One Kubernetes context has conflicting physical-cluster UIDs in '
+            'the same provider batch.')
+
+    def _hold(replica_info: Any, handle: Any,
+              holder: _ProtocolV2BatchFenceHolder) -> None:
+        try:
+            with protocol_v2_provider_fence(replica_info, handle):
+                holder.ready.set()
+                holder.release.wait()
+        except asyncio.CancelledError as error:
+            holder.error = error
+            holder.ready.set()
+            raise
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            holder.error = error
+            holder.ready.set()
+
+    try:
+        for key, (replica_info, handle) in representatives.items():
+            if key in conflicted_keys:
+                continue
+            holder = _ProtocolV2BatchFenceHolder(threading.Event(),
+                                                 threading.Event())
+            thread = threading.Thread(target=_hold,
+                                      args=(replica_info, handle, holder),
+                                      daemon=True,
+                                      name='reserved-fill-provider-fence')
+            holder.thread = thread
+            holders[key] = holder
+            thread.start()
+        for key, holder in holders.items():
+            holder.ready.wait()
+            if holder.error is not None:
+                failures[key] = holder.error
+        yield failures
+    finally:
+        for holder in holders.values():
+            holder.release.set()
+        for holder in holders.values():
+            assert holder.thread is not None
+            holder.thread.join()
+
+
+def _normalize_positive_whole_count(value: Any) -> int | None:
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+            not math.isfinite(value) or value < 1 or
+            not float(value).is_integer()):
+        return None
+    return int(value)
+
+
+def parse_protocol_v2_cleanup_fence(
+        replica_info: Any) -> ProtocolV2CleanupFence | None:
+    """Return a complete v2 cleanup fence, legacy None, or fail closed.
+
+    Protocol-v2 rows deployed before the explicit context field retain the
+    selected context in their immutable placement ``location``.  New rows
+    persist both and require equality, so a partial/corrupt row can never turn
+    cleanup into a name-only operation.
+    """
+    persisted = vars(replica_info)
+    pool_key = persisted.get('reserved_fill_pool_key')
+    generation = persisted.get('reserved_fill_service_generation')
+    physical_uid = persisted.get('reserved_fill_physical_cluster_uid')
+    explicit_context = persisted.get('reserved_fill_kubernetes_context')
+    has_identity_fields = any(value is not None
+                              for value in (pool_key, generation, physical_uid,
+                                            explicit_context))
+    reserved_fill = persisted.get('reserved_fill', False)
+    if reserved_fill is not True:
+        if reserved_fill is not False:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Reserved-fill cleanup marker is malformed.')
+        if has_identity_fields:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'A non-fill replica carries reserved-fill cleanup authority.')
+        return None
+    identity = None
+    if pool_key is not None:
+        if not isinstance(pool_key, str) or not pool_key:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Reserved-fill cleanup identity is malformed.')
+        try:
+            identity = reserved_capacity_broker.parse_pool_identity(pool_key)
+        except (TypeError, ValueError) as error:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Reserved-fill cleanup identity is malformed.') from error
+
+    legacy_generation = (generation is None or
+                         type(generation) is int and generation == 0)
+    if (identity is None or
+            identity.protocol_version == reserved_capacity_broker.PROTOCOL_V1):
+        if (legacy_generation and physical_uid is None and
+                explicit_context is None):
+            return None
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill cleanup identity is incomplete.')
+
+    if (identity.protocol_version != reserved_capacity_broker.PROTOCOL_V2 or
+            type(generation) is not int or generation < 1 or
+            not isinstance(physical_uid, str) or not physical_uid or
+            identity.physical_cluster_uid != physical_uid):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill cleanup identity is incomplete.')
+    raw_location = persisted.get('location')
+    if not isinstance(raw_location, Mapping):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill cleanup location is missing.')
+    location_context = raw_location.get('region')
+    location_cloud = raw_location.get('cloud')
+    if (not isinstance(location_context, str) or not location_context or
+            not isinstance(location_cloud, str) or
+            location_cloud.casefold() != 'kubernetes'):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill cleanup location is malformed.')
+    if explicit_context is None:
+        context = location_context
+    elif (not isinstance(explicit_context, str) or not explicit_context or
+          explicit_context != location_context):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill cleanup contexts are contradictory.')
+    else:
+        context = explicit_context
+    resources_override = persisted.get('resources_override')
+    if not isinstance(resources_override, Mapping):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill cleanup resource pin is missing.')
+    resource_cloud = resources_override.get('cloud')
+    is_kubernetes_cloud = (isinstance(resource_cloud, clouds.Kubernetes) or
+                           isinstance(resource_cloud, str) and
+                           resource_cloud.casefold() == 'kubernetes')
+    resource_context = resources_override.get('region')
+    resource_accelerators = resources_override.get('accelerators')
+    location_accelerators = raw_location.get('accelerators')
+    if (not is_kubernetes_cloud or resource_context != context or
+            not isinstance(resource_accelerators, Mapping) or
+            len(resource_accelerators) != 1 or
+            not isinstance(location_accelerators, Mapping) or
+            len(location_accelerators) != 1):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill cleanup resource pin is malformed.')
+    resource_card, resource_count = next(iter(resource_accelerators.items()))
+    location_card, location_count = next(iter(location_accelerators.items()))
+    normalized_resource_count = _normalize_positive_whole_count(resource_count)
+    normalized_location_count = _normalize_positive_whole_count(location_count)
+    if (not isinstance(resource_card, str) or not resource_card or
+            not isinstance(location_card, str) or
+            resource_card.casefold() != location_card.casefold() or
+            resource_card.casefold() not in identity.gpu_names or
+            normalized_resource_count is None or
+            normalized_location_count is None or
+            normalized_location_count != normalized_resource_count):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill cleanup accelerator pin is contradictory.')
+    return ProtocolV2CleanupFence(kubernetes_context=context,
+                                  physical_cluster_uid=physical_uid)
+
+
+def parse_protocol_v2_launch_fence(
+    launch_context: Mapping[str, Any],) -> ProtocolV2LaunchFence | None:
+    """Parse a complete durable protocol-v2 launch tuple, or no tuple.
+
+    Any claimed reserved-fill launch field makes the whole tuple mandatory.
+    This keeps mixed-version or attacker-supplied partial contexts from
+    silently degrading into an ordinary Serve launch.
+    """
+    if not isinstance(launch_context, Mapping):
+        raise ValueError('Reserved-fill launch context must be a mapping.')
+    claimed_keys = {
+        key for key in launch_context if isinstance(key, str) and
+        key.startswith(constants.RESERVED_FILL_LAUNCH_FENCE_PREFIX)
+    }
+    if not claimed_keys:
+        return None
+    expected_keys = set(constants.RESERVED_FILL_LAUNCH_FENCE_KEYS)
+    if claimed_keys != expected_keys:
+        raise ValueError('Reserved-fill launch context is incomplete.')
+
+    protocol_version = launch_context[
+        constants.RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY]
+    pool_key = launch_context[constants.RESERVED_FILL_LAUNCH_POOL_KEY]
+    service_generation = launch_context[
+        constants.RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY]
+    physical_cluster_uid = launch_context[
+        constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY]
+    kubernetes_context = launch_context[
+        constants.RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY]
+    accelerator = launch_context[constants.RESERVED_FILL_LAUNCH_ACCELERATOR_KEY]
+    accelerator_count = launch_context[
+        constants.RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY]
+
+    if (type(protocol_version) is not int or  # pylint: disable=unidiomatic-typecheck
+            protocol_version != reserved_capacity_broker.PROTOCOL_V2):
+        raise ValueError('Reserved-fill launch protocol must be v2.')
+    if not isinstance(pool_key, str) or not pool_key:
+        raise ValueError('Reserved-fill launch pool key is invalid.')
+    if (type(service_generation) is not int or  # pylint: disable=unidiomatic-typecheck
+            service_generation < 1):
+        raise ValueError('Reserved-fill service generation is invalid.')
+    for value, field_name in ((physical_cluster_uid, 'physical cluster UID'),
+                              (kubernetes_context, 'Kubernetes context'),
+                              (accelerator, 'accelerator')):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f'Reserved-fill {field_name} is invalid.')
+    if (type(accelerator_count) is not int or  # pylint: disable=unidiomatic-typecheck
+            accelerator_count < 1):
+        raise ValueError('Reserved-fill accelerator count is invalid.')
+
+    try:
+        identity = reserved_capacity_broker.parse_pool_identity(pool_key)
+    except (TypeError, ValueError) as error:
+        raise ValueError('Reserved-fill launch pool key is invalid.') from error
+    if (identity.protocol_version != reserved_capacity_broker.PROTOCOL_V2 or
+            identity.physical_cluster_uid != physical_cluster_uid):
+        raise ValueError('Reserved-fill launch pool identity is contradictory.')
+    canonical_accelerator = accelerator.casefold()
+    if canonical_accelerator not in identity.gpu_names:
+        raise ValueError('Reserved-fill accelerator is outside its pool.')
+
+    return ProtocolV2LaunchFence(protocol_version=protocol_version,
+                                 pool_key=pool_key,
+                                 service_generation=service_generation,
+                                 physical_cluster_uid=physical_cluster_uid,
+                                 kubernetes_context=kubernetes_context,
+                                 accelerator=canonical_accelerator,
+                                 accelerator_count=accelerator_count)
+
+
+def make_protocol_v2_launch_fence(
+    *,
+    pool_key: str,
+    service_generation: int,
+    physical_cluster_uid: str,
+    kubernetes_context: str,
+    accelerator: str,
+    accelerator_count: int,
+) -> dict[str, Any]:
+    """Build the canonical durable tuple for one selected fill location."""
+    launch_context = {
+        constants.RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY:
+            reserved_capacity_broker.PROTOCOL_V2,
+        constants.RESERVED_FILL_LAUNCH_POOL_KEY: pool_key,
+        constants.RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY: service_generation,
+        constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY: physical_cluster_uid,
+        constants.RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY: kubernetes_context,
+        constants.RESERVED_FILL_LAUNCH_ACCELERATOR_KEY: accelerator.casefold(),
+        constants.RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY: accelerator_count,
+    }
+    # Keep producer and consumer validation identical.
+    fence = parse_protocol_v2_launch_fence(launch_context)
+    assert fence is not None
+    return launch_context
+
+
+def validate_protocol_v2_launch_resources(
+    fence: ProtocolV2LaunchFence,
+    resources: Any,
+) -> None:
+    """Require one final provider candidate to retain the durable exact pin."""
+    if (resources is None or
+            not isinstance(getattr(resources, 'cloud', None), clouds.Kubernetes)
+            or getattr(resources, 'region', None) != fence.kubernetes_context):
+        raise ValueError('Reserved-fill Kubernetes context changed.')
+    accelerators = getattr(resources, 'accelerators', None)
+    if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
+        raise ValueError('Reserved-fill accelerator shape changed.')
+    accelerator, count = next(iter(accelerators.items()))
+    if (not isinstance(accelerator, str) or
+            accelerator.casefold() != fence.accelerator or
+            isinstance(count, bool) or not isinstance(count, (int, float)) or
+            count < 1 or not float(count).is_integer() or
+            int(count) != fence.accelerator_count):
+        raise ValueError('Reserved-fill accelerator shape changed.')
 
 
 def allocate_fill_pool_budgets(
@@ -481,16 +857,23 @@ def query_pool_observation(
 def query_pool_group_observation(
     context: str,
     shapes: dict[str, int],
+    *,
+    expected_physical_cluster_uid: str | None = None,
 ) -> reserved_capacity_broker.PoolObservation:
     """Measure several accelerator names in one Kubernetes context query."""
     try:
-        _, _, available = kubernetes_catalog.list_accelerators_realtime(
-            gpus_only=True,
-            name_filter=None,
-            region_filter=context,
-            quantity_filter=None,
-            case_sensitive=False,
-            require_price=False)
+        provider_fence = (contextlib.nullcontext()
+                          if expected_physical_cluster_uid is None else
+                          kubernetes.physical_cluster_uid_fence(
+                              context, expected_physical_cluster_uid))
+        with provider_fence:
+            _, _, available = kubernetes_catalog.list_accelerators_realtime(
+                gpus_only=True,
+                name_filter=None,
+                region_filter=context,
+                quantity_filter=None,
+                case_sensitive=False,
+                require_price=False)
     except Exception as e:  # pylint: disable=broad-except
         logger.warning('Reserved-capacity group poll failed for context '
                        f'{context!r}: {common_utils.format_exception(e)}')
@@ -1047,8 +1430,11 @@ def _broker_cycle_v2(
             allocation = reserved_capacity_broker.run_round_if_stale(
                 service_name,
                 spec.pool_key,
-                functools.partial(query_pool_group_observation, spec.context,
-                                  dict(spec.shapes)),
+                functools.partial(
+                    query_pool_group_observation,
+                    spec.context,
+                    dict(spec.shapes),
+                    expected_physical_cluster_uid=(spec.physical_cluster_uid)),
                 poll_interval_seconds(),
                 expected_protocol_version=reserved_capacity_broker.PROTOCOL_V2,
                 expected_service_generation=generation)

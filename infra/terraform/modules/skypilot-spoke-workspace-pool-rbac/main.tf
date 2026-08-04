@@ -38,6 +38,9 @@ resource "kubernetes_service_account_v1" "pool_sa" {
 #    allocatable. Read-only. Launch/scheduling does NOT need this — it's the
 #    capacity-reporting path only; without it those views 403 "cannot list pods at the
 #    cluster scope" (the pod-lifecycle pods perms in the Role below are namespaced).
+#  - kube-system Namespace: protocol-v2 reserved fill reads this one immutable
+#    Namespace UID to deduplicate aliases and fence a context retarget. No Namespace
+#    list/watch or access to other Namespace objects is needed.
 resource "kubernetes_cluster_role_v1" "pool" {
   metadata {
     name   = var.name
@@ -54,6 +57,13 @@ resource "kubernetes_cluster_role_v1" "pool" {
     api_groups = [""]
     resources  = ["pods"]
     verbs      = ["get", "list"]
+  }
+
+  rule {
+    api_groups     = [""]
+    resources      = ["namespaces"]
+    resource_names = ["kube-system"]
+    verbs          = ["get"]
   }
 
   # runtimeclasses: SkyPilot lists these on launch to detect the GPU RuntimeClass.

@@ -149,20 +149,30 @@ class Backend(Generic[_ResourceHandleType]):
 
     @timeline.event
     @usage_lib.messages.usage.update_runtime('teardown')
-    def teardown(self,
-                 handle: _ResourceHandleType,
-                 terminate: bool,
-                 purge: bool = False,
-                 *,
-                 expected_cluster_record_uuid: str | None = None) -> None:
-        if expected_cluster_record_uuid is None:
+    def teardown(
+            self,
+            handle: _ResourceHandleType,
+            terminate: bool,
+            purge: bool = False,
+            *,
+            expected_cluster_record_uuid: str | None = None,
+            expected_cluster_hash: str | None = None,
+            continue_guard: typing.Callable[[], bool] | None = None) -> None:
+        if (expected_cluster_record_uuid is not None and
+                expected_cluster_hash is not None):
+            raise ValueError('Expected cluster-record UUID and legacy cluster '
+                             'hash fences are mutually exclusive.')
+        if (expected_cluster_record_uuid is None and
+                expected_cluster_hash is None and continue_guard is None):
             self._teardown(handle, terminate, purge)
         else:
             self._teardown(
                 handle,
                 terminate,
                 purge,
-                expected_cluster_record_uuid=expected_cluster_record_uuid)
+                expected_cluster_record_uuid=expected_cluster_record_uuid,
+                expected_cluster_hash=expected_cluster_hash,
+                continue_guard=continue_guard)
 
     def register_info(self, **kwargs) -> None:
         """Register backend-specific information."""
@@ -219,5 +229,7 @@ class Backend(Generic[_ResourceHandleType]):
                   terminate: bool,
                   purge: bool = False,
                   *,
-                  expected_cluster_record_uuid: str | None = None):
+                  expected_cluster_record_uuid: str | None = None,
+                  expected_cluster_hash: str | None = None,
+                  continue_guard: typing.Callable[[], bool] | None = None):
         raise NotImplementedError

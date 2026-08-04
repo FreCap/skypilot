@@ -928,7 +928,9 @@ def down(cluster_name: str,
          graceful: bool = False,
          graceful_timeout: int | None = None,
          user_initiated: bool = False,
-         _expected_cluster_record_uuid: str | None = None) -> None:
+         _expected_cluster_record_uuid: str | None = None,
+         _expected_cluster_hash: str | None = None,
+         _continue_guard: typing.Callable[[], bool] | None = None) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Tears down a cluster.
 
@@ -956,13 +958,25 @@ def down(cluster_name: str,
         sky.exceptions.NotSupportedError: the specified cluster is the managed
           jobs controller.
     """
-    if _expected_cluster_record_uuid is None:
-        handle = global_user_state.get_handle_from_cluster_name(cluster_name)
-    else:
+    if (_expected_cluster_record_uuid is not None and
+            _expected_cluster_hash is not None):
+        raise ValueError('Expected cluster-record UUID and legacy cluster hash '
+                         'fences are mutually exclusive.')
+    if _expected_cluster_record_uuid is not None:
         snapshot = global_user_state.get_cluster_record_identity_snapshot(
             cluster_name, _expected_cluster_record_uuid)
         handle = None if snapshot is None else snapshot.handle
+    elif _expected_cluster_hash is not None:
+        handle = global_user_state.get_handle_from_cluster_name(
+            cluster_name, existing_cluster_hash=_expected_cluster_hash)
+    else:
+        handle = global_user_state.get_handle_from_cluster_name(cluster_name)
     if handle is None:
+        if (_expected_cluster_hash is not None and
+                global_user_state.cluster_with_name_exists(cluster_name)):
+            raise global_user_state.ClusterRecordIdentityConflictError(
+                f'Cluster {cluster_name!r} no longer has expected generation '
+                f'{_expected_cluster_hash!r}.')
         raise exceptions.ClusterDoesNotExist(
             f'Cluster {cluster_name!r} does not exist.')
 
@@ -984,11 +998,20 @@ def down(cluster_name: str,
                              terminate=True)
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
-    _maybe_run_down_hooks(handle, backend, cluster_name)
+    # Serve's internal cleanup fences are revalidated only after the backend
+    # owns both cluster locks.  Running user hooks before that proof would let
+    # a stale same-name cleanup execute commands on a successor generation.
+    if (_expected_cluster_record_uuid is None and
+            _expected_cluster_hash is None and _continue_guard is None):
+        _maybe_run_down_hooks(handle, backend, cluster_name)
     teardown_kwargs: dict[str, Any] = {}
     if _expected_cluster_record_uuid is not None:
         teardown_kwargs['expected_cluster_record_uuid'] = (
             _expected_cluster_record_uuid)
+    if _expected_cluster_hash is not None:
+        teardown_kwargs['expected_cluster_hash'] = _expected_cluster_hash
+    if _continue_guard is not None:
+        teardown_kwargs['continue_guard'] = _continue_guard
     backend.teardown(handle, terminate=True, purge=purge, **teardown_kwargs)
 
 

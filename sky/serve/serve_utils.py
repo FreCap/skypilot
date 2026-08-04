@@ -4,6 +4,7 @@ import collections
 from collections.abc import Callable
 from collections.abc import Iterator
 import concurrent.futures
+import contextlib
 import contextvars
 import dataclasses
 import datetime
@@ -1865,13 +1866,79 @@ def _get_service_status(
 
     if with_replica_info:
         replica_infos = serve_state.get_replica_infos(service_name)
+        logical = bool(record.get('logical_replica_semantics'))
+        # Pre-fetch cluster records in one batched DB query instead of
+        # letting each to_info_dict() do its own. With a long failure
+        # history this was an N+1.
+        cluster_names = [info.cluster_name for info in replica_infos]
+        cluster_records = global_user_state.get_clusters_from_names(
+            cluster_names)
+        rate_cache: dict[str, float] = {}
+        # Local import avoids the serve_utils -> reserved_capacity ->
+        # serve_state cycle. Group protocol-v2 rows by physical target so a
+        # large status response performs one UID proof per pool, while each
+        # nested endpoint lookup reuses that exact active fence.
+        # pylint: disable-next=import-outside-toplevel
+        from sky.serve import reserved_capacity
+
+        serialized_by_id: dict[int, dict[str, Any]] = {}
+        ordinary_infos: list[Any] = []
+        fenced_groups: dict[tuple[str, str], list[Any]] = {}
+        identity_uncertain_infos: list[Any] = []
+        validated_handles: dict[int, Any] = {}
+        for info in replica_infos:
+            cluster_record = cluster_records.get(info.cluster_name)
+            try:
+                cleanup_fence = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                if cleanup_fence is None:
+                    ordinary_infos.append(info)
+                    continue
+                handle = (cluster_record.get('handle') if isinstance(
+                    cluster_record, dict) else None)
+                reserved_capacity.protocol_v2_provider_fence(info, handle)
+            except exceptions.KubernetesPhysicalClusterIdentityError:
+                identity_uncertain_infos.append(info)
+                continue
+            validated_handles[info.replica_id] = handle
+            group_key = (cleanup_fence.kubernetes_context,
+                         cleanup_fence.physical_cluster_uid)
+            fenced_groups.setdefault(group_key, []).append(info)
+
+        def _serialize(info: Any, cluster_record: Any) -> None:
+            serialized_by_id[info.replica_id] = info.to_info_dict(
+                with_handle=True,
+                with_url=not pool,
+                cluster_record=cluster_record,
+                rate_cache=rate_cache,
+            )
+
+        for info in ordinary_infos:
+            _serialize(info, cluster_records[info.cluster_name])
+        for info in identity_uncertain_infos:
+            _serialize(info, None)
+        for group_infos in fenced_groups.values():
+            representative = group_infos[0]
+            try:
+                with reserved_capacity.protocol_v2_provider_fence(
+                        representative,
+                        validated_handles[representative.replica_id]):
+                    for info in group_infos:
+                        _serialize(info, cluster_records[info.cluster_name])
+            except exceptions.KubernetesPhysicalClusterIdentityError:
+                for info in group_infos:
+                    _serialize(info, None)
+
+        replica_records = [
+            serialized_by_id[info.replica_id] for info in replica_infos
+        ]
+        record['replica_info'] = replica_records
         full_status_counts: collections.defaultdict[str, int] = (
             collections.defaultdict(int))
         full_capacity_counts: collections.defaultdict[str, int] = (
             collections.defaultdict(int))
-        logical = bool(record.get('logical_replica_semantics'))
-        for info in replica_infos:
-            status = info.status.value
+        for info, replica_record in zip(replica_infos, replica_records):
+            status = replica_record['status'].value
             full_status_counts[status] += 1
             planned_capacity = getattr(info, 'planned_capacity', 1)
             if (not isinstance(planned_capacity, int) or
@@ -1880,21 +1947,6 @@ def _get_service_status(
             full_capacity_counts[status] += planned_capacity if logical else 1
         _set_replica_status_aggregates(record, dict(full_status_counts),
                                        dict(full_capacity_counts))
-        # Pre-fetch cluster records in one batched DB query instead of
-        # letting each to_info_dict() do its own. With a long failure
-        # history this was an N+1.
-        cluster_names = [info.cluster_name for info in replica_infos]
-        cluster_records = global_user_state.get_clusters_from_names(
-            cluster_names)
-        rate_cache: dict[str, float] = {}
-        record['replica_info'] = [
-            info.to_info_dict(
-                with_handle=True,
-                with_url=not pool,
-                cluster_record=cluster_records[info.cluster_name],
-                rate_cache=rate_cache,
-            ) for info in replica_infos
-        ]
         if pool:
             record['job_status_counts'] = (
                 managed_job_state.get_nonterminal_job_status_counts_by_pool(
@@ -2644,6 +2696,71 @@ def get_orphaned_service_cluster_status_fields(
     }
 
 
+def replica_cleanup_requires_terminal_history(
+        replica_infos: list['replica_managers.ReplicaInfo']) -> bool:
+    """Whether cleanup must quiesce terminal launch-request history.
+
+    Protocol-v2 launch handlers can remain unproved after their request row is
+    terminal. Partial v2 authority is treated identically: cleanup cannot
+    safely downgrade malformed durable state to the legacy active-only scan.
+    """
+    # Local to avoid the Serve/request payload import cycle documented below.
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import reserved_capacity
+
+    # pylint: enable=import-outside-toplevel
+
+    for info in replica_infos:
+        try:
+            if (reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+                    is not None):
+                return True
+        except exceptions.KubernetesPhysicalClusterIdentityError:
+            return True
+    return False
+
+
+def _partition_replica_cleanup_targets(
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    existing_cluster_names: set[str],
+) -> tuple[list[tuple['replica_managers.ReplicaInfo', Any]], list[str]]:
+    """Separate cleanup targets from rows whose provider absence is unknown.
+
+    Legacy rows retain the historical cluster-table absence behavior. A
+    protocol-v2 row is removable only after its exact context/UID-fenced down
+    succeeds; local cluster-record absence is not provider-absence evidence.
+    Malformed v2 authority is likewise retained for operator repair.
+    """
+    # Local to avoid payloads -> task -> service_spec -> serve_utils ->
+    # reserved_capacity_broker -> request_wire -> payloads during import.
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import reserved_capacity
+
+    # pylint: enable=import-outside-toplevel
+
+    to_terminate: list[tuple[replica_managers.ReplicaInfo, Any]] = []
+    unresolved_cluster_names: list[str] = []
+    for info in replica_infos:
+        try:
+            cleanup_fence = (
+                reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            logger.error('Refusing name-only cleanup for replica cluster '
+                         f'{info.cluster_name!r}: '
+                         f'{common_utils.format_exception(error)}')
+            unresolved_cluster_names.append(info.cluster_name)
+            continue
+        if info.cluster_name in existing_cluster_names:
+            to_terminate.append((info, cleanup_fence))
+        elif cleanup_fence is not None:
+            logger.error(
+                'Retaining protocol-v2 replica cluster '
+                f'{info.cluster_name!r}: its SkyPilot cluster record is '
+                'absent but provider absence is not independently proven.')
+            unresolved_cluster_names.append(info.cluster_name)
+    return to_terminate, unresolved_cluster_names
+
+
 def _terminate_failed_services(service_name: str,
                                expected_service_hash: str | None,
                                service_status: serve_state.ServiceStatus | None,
@@ -2769,7 +2886,11 @@ def _terminate_failed_services_locked(
 
     replica_infos = serve_state.get_replica_infos(service_name)
     if not quiesce_service_replica_launch_requests(
-            service_name, replica_infos, continue_guard=_still_owns):
+            service_name,
+            replica_infos,
+            continue_guard=_still_owns,
+            include_terminal_history=(
+                replica_cleanup_requires_terminal_history(replica_infos))):
         return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
                 'could not be purged because its replica launch requests '
                 'could not be quiesced; durable cleanup inventory was '
@@ -2837,17 +2958,18 @@ def _terminate_failed_services_locked(
     # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove this
     # failed-service purge submission path at M5 for eligible authoritative
     # services after durable down actions cover purge and rollback.
-    to_terminate = [
-        info for info in replica_infos
-        if info.cluster_name in existing_cluster_names
-    ]
+    to_terminate, unresolved_cluster_names = (
+        _partition_replica_cleanup_targets(replica_infos,
+                                           existing_cluster_names))
+    remaining_replica_clusters.extend(unresolved_cluster_names)
     if to_terminate:
         try:
             teardown_identities = (
                 serve_state.get_replica_resource_action_identities(
-                    service_name, [info.replica_id for info in to_terminate]))
+                    service_name,
+                    [info.replica_id for info, _ in to_terminate]))
             if set(teardown_identities) != {
-                    info.replica_id for info in to_terminate
+                    info.replica_id for info, _ in to_terminate
             }:
                 raise RuntimeError(
                     'Replica inventory changed while snapshotting teardown '
@@ -2877,20 +2999,26 @@ def _terminate_failed_services_locked(
                 return _still_owns()
 
         def _terminate_replica_cluster(
-                info: 'replica_managers.ReplicaInfo') -> str | None:
+            cleanup_target: tuple['replica_managers.ReplicaInfo', Any]
+        ) -> str | None:
             # Reuse the normal replica down path (sdk.down with retries);
             # logs go to the replica's log file like a regular teardown.
+            info, cleanup_fence = cleanup_target
             log_file_name = generate_replica_log_file_name(
                 service_name, info.replica_id, resource_scope)
             try:
                 identity = teardown_identities[info.replica_id]
-                replica_managers.terminate_cluster(
-                    info.cluster_name,
-                    log_file_name,
-                    continue_guard=(_worker_still_owns),
-                    expected_cluster_record_uuid=(str(
-                        identity.sky_cluster_record_uuid) if identity
-                                                  is not None else None))
+                terminate_kwargs: dict[str, Any] = {
+                    'continue_guard': _worker_still_owns,
+                    'expected_cluster_record_uuid':
+                        (str(identity.sky_cluster_record_uuid)
+                         if identity is not None else None),
+                }
+                if cleanup_fence is not None:
+                    terminate_kwargs['cleanup_fence'] = cleanup_fence
+                replica_managers.terminate_cluster(info.cluster_name,
+                                                   log_file_name,
+                                                   **terminate_kwargs)
                 return None
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate replica cluster '
@@ -2901,9 +3029,8 @@ def _terminate_failed_services_locked(
 
         termination_failures = subprocess_utils.run_in_parallel(
             _terminate_replica_cluster, to_terminate)
-        remaining_replica_clusters = [
-            f'{name!r}' for name in termination_failures if name is not None
-        ]
+        remaining_replica_clusters.extend(
+            name for name in termination_failures if name is not None)
 
     if not _still_owns():
         return _purge_ownership_failure(service_name,
@@ -2923,7 +3050,8 @@ def _terminate_failed_services_locked(
                 expected_lifecycle_epoch=lifecycle_epoch):
             return _purge_ownership_failure(
                 service_name, 'ownership lost while retaining failed cleanup')
-        remaining_identity = ', '.join(remaining_replica_clusters)
+        remaining_identity = ', '.join(
+            repr(name) for name in remaining_replica_clusters)
         return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
                 'could not be purged because some replica clusters could not '
                 'be terminated. The service name and cleanup metadata remain '
@@ -3005,7 +3133,11 @@ def _terminate_orphaned_service_children_impl(
 
         replica_infos = serve_state.get_replica_infos(service_name)
         if not quiesce_service_replica_launch_requests(
-                service_name, replica_infos, continue_guard=_still_orphaned):
+                service_name,
+                replica_infos,
+                continue_guard=_still_orphaned,
+                include_terminal_history=(
+                    replica_cleanup_requires_terminal_history(replica_infos))):
             return (f'{colorama.Fore.YELLOW}orphaned service '
                     f'{service_name!r} could not be purged because its replica '
                     'launch requests could not be quiesced; durable child '
@@ -3073,16 +3205,16 @@ def _terminate_orphaned_service_children_impl(
         # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove
         # this orphan purge submission path at M5 for eligible authoritative
         # services after durable down actions cover purge and rollback.
-        to_terminate = [
-            info for info in replica_infos
-            if info.cluster_name in existing_cluster_names
-        ]
+        to_terminate, unresolved_cluster_names = (
+            _partition_replica_cleanup_targets(replica_infos,
+                                               existing_cluster_names))
         try:
             teardown_identities = (
                 serve_state.get_replica_resource_action_identities(
-                    service_name, [info.replica_id for info in to_terminate]))
+                    service_name,
+                    [info.replica_id for info, _ in to_terminate]))
             if set(teardown_identities) != {
-                    info.replica_id for info in to_terminate
+                    info.replica_id for info, _ in to_terminate
             }:
                 raise RuntimeError(
                     'Replica inventory changed while snapshotting teardown '
@@ -3093,22 +3225,27 @@ def _terminate_orphaned_service_children_impl(
                     'replica teardown identities could not be verified: '
                     f'{common_utils.format_exception(e)}.'
                     f'{colorama.Style.RESET_ALL}')
-        termination_failures = []
-        for info in to_terminate:
+        termination_failures = list(unresolved_cluster_names)
+        for info, cleanup_fence in to_terminate:
             if not _still_orphaned():
                 return _purge_ownership_failure(
                     service_name,
                     'ownership lost before orphan replica cleanup')
             try:
                 identity = teardown_identities[info.replica_id]
+                terminate_kwargs: dict[str, Any] = {
+                    'continue_guard': _still_orphaned,
+                    'expected_cluster_record_uuid':
+                        (str(identity.sky_cluster_record_uuid)
+                         if identity is not None else None),
+                }
+                if cleanup_fence is not None:
+                    terminate_kwargs['cleanup_fence'] = cleanup_fence
                 replica_managers.terminate_cluster(
                     info.cluster_name,
                     generate_replica_log_file_name(service_name,
                                                    info.replica_id),
-                    continue_guard=_still_orphaned,
-                    expected_cluster_record_uuid=(str(
-                        identity.sky_cluster_record_uuid) if identity
-                                                  is not None else None))
+                    **terminate_kwargs)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate orphan replica cluster '
                              f'{info.cluster_name!r}: '
@@ -3739,6 +3876,18 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     backend = backends.CloudVmRayBackend()
     handle = global_user_state.get_handle_from_cluster_name(
         replica_cluster_name)
+    provider_fence: contextlib.AbstractContextManager[None] = (
+        contextlib.nullcontext())
+    if matching_info is not None:
+        # Imported lazily to avoid the serve_utils -> reserved_capacity ->
+        # serve_state import cycle during module initialization.  Log tailing
+        # is a remote command just like status and cleanup: a protocol-v2
+        # reserved-fill row must prove that its durable handle still targets
+        # the same physical Kubernetes cluster before any output is read.
+        # pylint: disable-next=import-outside-toplevel
+        from sky.serve import reserved_capacity
+        provider_fence = reserved_capacity.protocol_v2_provider_fence(
+            matching_info, handle)
     if handle is None:
         if tail is not None:
             for line in final_lines_to_print:
@@ -3754,18 +3903,20 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
 
     # Always tail the latest logs, which represent user setup & run.
     if tail is None:
-        returncode = backend.tail_logs(handle, job_id=None, follow=follow)
+        with provider_fence:
+            returncode = backend.tail_logs(handle, job_id=None, follow=follow)
         if returncode != 0:
             return (f'{colorama.Fore.RED}Failed to stream logs for {repnoun} '
                     f'{replica_id}.{colorama.Style.RESET_ALL}')
     elif not follow and tail > 0:
-        final = backend.tail_logs(handle,
-                                  job_id=None,
-                                  follow=follow,
-                                  tail=tail,
-                                  stream_logs=False,
-                                  require_outputs=True,
-                                  process_stream=True)
+        with provider_fence:
+            final = backend.tail_logs(handle,
+                                      job_id=None,
+                                      follow=follow,
+                                      tail=tail,
+                                      stream_logs=False,
+                                      require_outputs=True,
+                                      process_stream=True)
         if isinstance(final, int) or (final[0] != 0 and final[0] != 101):
             if tail is not None:
                 for line in final_lines_to_print:

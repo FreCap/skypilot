@@ -1,8 +1,9 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: feature implementation and final adversarial review are complete;
-required CI, production rollout, and the compatibility-cleanup merge gates
-remain open
+Status: feature PR merged; the production PostgreSQL cutover and protocol-v2
+activation are complete; the durable executor/provider fence hotfix is locally
+complete and adversarially reviewed; its merge/deployment, pool-identity RBAC,
+the PHX canary, and the compatibility-cleanup merge gates remain open
 
 Last updated: 2026-08-04
 
@@ -10,8 +11,8 @@ Canonical owner: this file. The implementation, rollout evidence, and the
 stacked compatibility-removal change must stay synchronized with this
 contract.
 
-Feature PR [#1261](https://github.com/boltz-bio/skypilot/pull/1261) is the
-revision-035 rollout change. Draft cleanup PR
+Merged feature PR [#1261](https://github.com/boltz-bio/skypilot/pull/1261) is
+the revision-035 rollout change. Draft cleanup PR
 [#1263](https://github.com/boltz-bio/skypilot/pull/1263) is stacked directly
 above it in GitHub stack #1264 and must remain blocked until the cleanup gates
 in this design pass.
@@ -128,13 +129,154 @@ position is the deterministic survivor and the duplicate edge is rejected.
 Physical identity is cached for at most one poll interval. Lookup uses a
 bounded read of the `kube-system` namespace UID. A failed lookup withdraws only
 that edge and feeds it zero; it never substitutes the context string as
-identity. Every fill launch first selects an exact carried location and then
+identity. The protocol-v2 broker also runs its realtime availability listing
+inside a capture pinned to that edge's expected UID. A context retarget during
+measurement is therefore a blackout, never capacity evidence that can grant
+or drain holdings belonging to the prior physical cluster. Every fill launch
+first selects an exact carried location and then
 performs a forced UID refresh through that location's context before
-persistence or provider actuation. It compares the result with the carried
-identity, so retargeting a kubeconfig context between observation and
-actuation fails closed with no row or launch thread. A stale concurrent UID
-lookup may return only a newer live cache generation or failure, never its
-older observation. Ordinary demand placement remains available.
+persistence. Its durable API launch context then carries seven fields: protocol,
+pool key, service generation, physical UID, Kubernetes context, and exact
+accelerator name/count. Presence of any one requires all seven, a complete
+normal Serve owner fence, and a controller-originated request. Protocol must
+be exact integer `2`; generation and count must be positive exact integers
+(not booleans); strings must be nonempty; and the parsed v2 pool key must
+encode the same UID and contain the canonical accelerator. API ingress rejects
+every partial, malformed, contradictory, or non-Serve tuple before scheduling
+a request. Absence of all seven is ordinary demand or protocol v1 and performs no
+physical-identity read. The tuple is copied into the immutable PostgreSQL
+request body and must survive request/executor restart without consulting
+controller memory. It is bound to the same service incarnation as the normal
+owner fence. Round epoch is intentionally absent: the epoch is consumed by the
+atomic `persist_fill_replica` transaction, after which that durable pending row
+is the reservation carried into launch.
+
+After request recovery, admin policy, and optimization, the executor requires
+the final selected resources to retain the exact Kubernetes context and shape.
+That early check is not the last placement authority: immediately before every
+provider attempt, the retrying provisioner revalidates the attempt's selected
+resources against the durable tuple. The attempt must still use Kubernetes,
+the exact context, and the canonical accelerator name/count. A mismatch is a
+terminal request cancellation before provider-side actuation; it is never
+eligible for retry or failover. Thus an internal retry, optimizer alternative,
+or admin-policy alternative cannot leave the fenced context or shape after the
+executor's final-plan check. The executor also activates a process-local
+provider fence for that context/expected UID across provisioning, runtime
+bootstrap, workdir sync, setup, and job submission. Fence activation captures
+one immutable, least-readable kubeconfig target, reads its `kube-system`
+Namespace UID, and admits the scope only when it matches the durable UID.
+External exec-auth contexts retain their captured exec credential contract but
+cannot change endpoint; the synthetic in-cluster region and the provider's
+normalized `None` context resolve to the same fenced target.
+
+Every Kubernetes API wrapper used by the operation, including calls from its
+Pod-creation thread pool, borrows the capture-pinned raw client. Transparent
+refresh cannot reread the ambient kubeconfig while a fence is active. Client
+replacement waits for outstanding call leases, while calls sharing one proved
+client remain concurrent; the fence must not serialize multi-Pod creation by
+holding a refresh mutex across each network call. Every external-context
+`kubectl` command path, including exec, port-forward, and rsync, receives the
+same capture-pinned kubeconfig rather than the ambient context. In-cluster
+commands retain explicit `--kubeconfig /dev/null` isolation and the fixed
+service-account endpoint/token mount, while `None` resolves to the active
+in-cluster fence for API-client verification. Conflicting simultaneous
+expected UIDs for one context fail closed. Retargeting between observation, enqueue,
+restart, policy, optimization, client refresh, provider actuation, runtime
+bootstrap, setup, or job submission therefore cannot mutate or deliver data to
+a different physical cluster. A stale concurrent controller UID lookup may
+return only a newer live cache generation or failure, never its older
+observation. Ordinary demand placement remains available.
+
+The process registry is deliberately conservative while a capture is active:
+an unleased same-context provider call, or a leased call that attempts a
+second context, fails closed instead of borrowing the capture or falling back
+to ambient configuration. Explicitly supported fan-out propagates the lease.
+An unrelated ordinary request that overlaps this short scope may therefore
+retry after the scope retires; outside an active scope its historical ambient
+behavior is unchanged.
+
+The durable physical fence continues after launch for every alias-sensitive
+replica lifecycle read. Endpoint discovery, readiness routing, job-status SSH,
+candidate/recovery status, interruption detection, drain registration, status
+serialization, active-route enumeration, and interactive replica log tailing
+must reconstruct the protocol-v2 context/UID authority before contacting
+Kubernetes. A durable cluster handle used by those reads must also remain a
+Kubernetes handle for the same cluster name and context. An identity or handle
+mismatch produces unknown/off-route evidence; it is never reclassified as
+preemption, application failure, an absent job, or a valid replacement
+endpoint. The load-balancer controller
+re-gates both cold and warm route-cache entries on every synchronization. If
+no protocol-v2 replica can prove its physical identity, its verified-ready
+count is zero and the empty mapping explicitly retires prior routes rather
+than triggering the generic spurious-empty safeguard.
+
+Lifecycle reconciliation batches this verification by durable
+`(Kubernetes context, physical cluster UID)`. One synchronization or probe
+round captures and verifies each physical pool once; nested per-replica reads
+reuse that active capture. Parallel worker calls enter the fence inside the
+worker (`ContextVar` state is not implicitly inherited by legacy thread pools)
+and concurrent scopes for the same pool coalesce on one initializer.
+Consequently a 1,000-replica pool does not issue 1,000 namespace UID reads per
+probe interval.
+
+Cleanup is bound to the same physical authority. Immediate failed-launch
+cleanup and every later log-sync/down retry for a protocol-v2 fill reconstruct
+the exact context/UID fence from durable launch and replica state before any
+provider or command-runner call. This applies equally to ordinary replica
+retirement, interrupted-fill recovery, failed-controller cleanup,
+failed-service purge, and orphan purge. A missing, partial, unreadable, or
+mismatched identity performs no cleanup through that alias; the replica and
+cluster rows stay visible as cleanup-uncertain and retry only under a matching
+capture. Provider identity is independent from the SkyPilot cluster-row
+generation: cleanup also snapshots the nonempty durable `cluster_hash`, unless
+an action-owned `cluster_record_uuid` is available, in which case that UUID is
+authoritative. The chosen UUID-or-hash fence is revalidated after acquiring
+both cluster locks and again after status refresh, before request cancellation,
+credential checks, status/provider calls, or row removal. The service-owner
+continuation guard is likewise rechecked under those locks. Exact cleanup
+skips name-only launch-request cancellation, pre-lock and post-lock
+`force_unlock`, and pre-lock teardown hooks because each can otherwise affect a
+queued or already-created same-name successor. Final legacy row removal uses
+the same `cluster_hash`; action cleanup uses its exact UUID and handle. A
+missing SkyPilot cluster record is not independent proof that a
+protocol-v2 provider object is absent, so bulk scale-down and service-purge
+absence fast paths retain that row and prevent parent deletion. Partial
+resources on the original cluster can therefore remain until its identity is
+restored or an operator independently proves absence and explicitly purges
+them, but the replacement cluster is never used as cleanup evidence or mutated
+by name.
+
+Cleanup also carries an exact durable SkyPilot cluster-record generation. A
+resource-action record UUID is authoritative when present; a nonempty legacy
+cluster hash is the fail-closed fallback for older/null-action rows. The
+backend acquires both the cluster-status and resource-operation locks without
+force-unlocking either one, re-proves that exact UUID or hash before the first
+tunnel, credential, status, or provider interaction, and proves it again after
+status refresh. Exact cleanup suppresses pre-lock teardown hooks and both
+pre-lock and under-lock name-wide request cancellation, since any of those
+could affect a queued same-name successor. Final database removal uses the
+same UUID or hash predicate. A missing, rotated, or changed generation and an
+owner-continuation failure therefore perform no teardown effect and leave the
+replica cleanup-uncertain for later reconciliation.
+
+The control-plane identity on every configured pool must therefore have the
+exact cluster-scoped permission `get` on the core `namespaces` resource with
+`resourceNames: ["kube-system"]`. It does not need namespace `list`, mutation,
+or access to any other Namespace object. The chart renders this rule directly
+in its API ClusterRole for an in-cluster candidate; putting it only in the
+default `rbac.clusterRules` value would let `helm upgrade --reuse-values`
+silently retain the old incomplete list. The reusable spoke workspace-pool
+RBAC module owns the same grant for remote pool identities alongside its
+existing cluster-wide read contract. Externally managed kubeconfig identities
+must receive an equivalent grant from their operator.
+
+An operator must verify both
+`kubectl auth can-i get namespace/kube-system` and a nonempty `.metadata.uid`
+through every configured context before expecting a protocol-v2 edge to become
+authoritative. This feature-specific preflight must not become a general
+Kubernetes credential-check requirement: ordinary demand placement does not
+need it. Missing permission is a safe pool-local blackout, not a reason to
+weaken identity to a context name or another alias-sensitive value.
 
 There is at most one pool edge for a service in a context. Overlapping but
 non-identical accelerator groups remain invalid across services and are also
@@ -478,11 +620,13 @@ measured card and its exact per-replica GPU count; the manager independently
 requires both the selected location and final persisted resource override to
 match that shape. It then re-reads the physical UID through that context. It
 never falls through to a different zero-cost context or paid capacity. The
-launch thread also carries a protocol-v2 pre-cloud guard. Immediately before
+launch thread also carries an early protocol-v2 guard. Immediately before
 every `sdk.launch` attempt, after any launch-pool queue delay, that guard again
 requires the exact pinned Kubernetes context/card/count and force-refreshes
-the context's physical UID; a mismatch fails closed before the cloud mutation.
-This closes context retargeting between row persistence and provider launch.
+the context's physical UID. It prevents a known-stale request from being
+enqueued; it is not provider-actuation proof. The durable tuple and
+provider-fenced executor path above remain authoritative across queueing,
+request recovery, policy/optimizer changes, and Kubernetes client refresh.
 Protocol-v2 fill is admitted only when the service's nonempty durable
 `resource_scope` equals its service-incarnation hash; its replica cluster name
 must be the deterministic name for that exact service scope and replica ID.
@@ -686,10 +830,28 @@ shelter them.
 
 ## Deployment and rollback
 
-1. Merge revision 035, normalized claims, pool-aware runtime, and tests while
+1. Merge revision 035, normalized claims, pool-aware runtime, the durable
+   launch tuple/provider fence, and tests while
    the durable protocol gate remains v1. Protocol-v1 one-pool behavior is
    unchanged and multi-context fill remains mechanically inactive.
-2. Complete the supported one-way API request-store cutover to PostgreSQL, run
+2. Upgrade every API/controller/executor role to the fenced image, then apply
+   the reusable spoke workspace-pool RBAC module (or equivalent
+   operator-managed RBAC) to every remote candidate. An already-active v2
+   deployment must keep remote UID reads denied until all roles run the fenced
+   image. If it already has an authorized in-cluster fill candidate, disable
+   fill before the Helm upgrade because the chart RBAC and image change are
+   applied together; re-enable it only after rollout verification. This avoids
+   either mixed direction: a new controller with an old executor that ignores
+   the tuple, or an old controller that omits it for a new executor.
+
+   Verify the control-plane subject can get exactly the `kube-system`
+   Namespace and read its nonempty UID through each configured context. Keep
+   this permission in the same declarative ownership path as the rest of the
+   pool RBAC. A separately named live ClusterRole and binding may serve as a
+   fix-forward bridge, but must not take ownership of or patch the declarative
+   system's existing roles. Remove the binding first and prove UID reads remain
+   healthy through the declarative grants before removing the bridge role.
+3. Complete the supported one-way API request-store cutover to PostgreSQL, run
    the migration Job, wait for its Pod to become terminal, then replace every
    API/controller/executor process. Resource
    action authority remains explicitly disabled during the 034-to-035 mixed
@@ -719,7 +881,7 @@ shelter them.
    later new-code rollout cannot silently disable the guard. The separately
    attested resource-action authority-worker role is outside reserved-fill
    launch execution and is not coupled to this protocol gate.
-3. Verify healthy legacy rounds, then run the zero-argument explicit activation
+4. Verify healthy legacy rounds, then run the zero-argument explicit activation
    action inside an API pod. The action takes the global broker lock,
    mechanically verifies exact Serve schema head 035, exact API-request schema
    head 008, plus stable all-ready API and, in HA mode, controller and executor
@@ -734,12 +896,12 @@ shelter them.
    the one-row gate transaction. Verify the durable protocol gate reads v2 and
    contains the common digest, canonical Deployment generation/UID
    inventories, and combined pod/process inventory count/hash.
-4. Let every live fill controller atomically adopt an authoritative v2 claim
+5. Let every live fill controller atomically adopt an authoritative v2 claim
    set. Verify generation/edge-count integrity, integer grants, and fresh 035
    resource-action evidence before separately re-enabling any authority mode.
-5. Update `boltz-l4-fleet` to append the PHX H200 context. Confirm two claims,
+6. Update `boltz-l4-fleet` to append the PHX H200 context. Confirm two claims,
    independent rounds, an exact-context/UID H200 canary, and the global cap.
-6. Keep the stacked cleanup PR blocked until the observation window and
+7. Keep the stacked cleanup PR blocked until the observation window and
    rollback gate below pass.
 
 Normal rollback must happen while the v2 image still runs: disable fill (or
@@ -849,8 +1011,47 @@ Automated coverage must include:
   occupancy scans: older/current tuples remain valid, while partial, future,
   UID/context/exact-shape-mismatched tuples fail closed and only genuinely legacy
   rows retain the legacy placement fallback;
-- context retargeting both before persistence and after launch-pool queuing,
-  with the latter rejected by the per-attempt pre-cloud UID/shape guard;
+- all-or-none durable launch-tuple validation at ingress, including each
+  missing/mistyped field, non-Serve origin, pool/UID/card contradictions, and
+  immutable PostgreSQL request-body round-trip across executor restart;
+- replica JSON persistence preserves an exact boolean fill marker: integer,
+  string, partial, and contradictory values fail closed after durable-row
+  deserialization rather than being truthiness-coerced into legacy or v2;
+- context retargeting before persistence and after enqueue, plus final-plan
+  context/card/count changes from admin policy or optimization. Executor
+  rejection invokes neither backend provisioning nor a provider call;
+- retry/failover after a matching initial plan, where a later provisioning
+  attempt selects another context or accelerator shape. The mismatched attempt
+  terminates before any provider call and cannot fail over again;
+- provider-fence races after the executor's initial read, including a positive
+  kubeconfig refresh interval, a second Kubernetes API wrapper, concurrent
+  Pod-creation thread-pool calls without serialization, the normalized
+  in-cluster context, capture-pinned `kubectl` exec/rsync, and simultaneous
+  conflicting UIDs for one context;
+- retargeting during restart drain, ordinary drain registration, endpoint
+  discovery, status serialization, warm and cold load-balancer route sync,
+  job-status SSH, candidate status, and interruption detection yields no
+  provider call, READY evidence, stale retained route, preemption, or cleanup
+  through the replacement cluster; a multi-replica round performs one UID
+  verification per physical pool rather than one per replica;
+- a physical-identity failure after partial launch never invokes an unfenced
+  immediate terminate or later down/log-sync worker. The durable row remains
+  cleanup-uncertain while the alias is mismatched, and a restored matching
+  identity permits the exact fenced cleanup retry;
+- failed-controller, failed-service, orphan-purge, interrupted-fill, and bulk
+  scale-down paths retain protocol-v2 rows when cluster-record or physical
+  absence is unproven, and do not finalize parent deletion around them;
+- a stale cleanup blocked behind cluster locks cannot run hooks, cancel
+  requests, force-unlock, refresh status, contact the provider, or remove state
+  after either its resource-action UUID or legacy cluster hash has been
+  replaced; both identities are re-proved after status refresh and final
+  removal remains generation-predicated;
+- cleanup blocked on cluster locks revalidates the action UUID, or the
+  nonempty legacy `cluster_hash` fallback, plus service ownership before any
+  hook, request cancellation, force-unlock, credential/status read, provider
+  mutation, or row removal. Same-name row recreation, action-UUID rotation,
+  and service-owner takeover therefore leave the successor untouched and the
+  stale row cleanup-uncertain;
 - recovery of interrupted fill rows schedules batched teardown without a
   second launch, including an already-accepted launch whose cluster record is
   initially absent: terminal cancellation without executor acknowledgement is
@@ -864,7 +1065,11 @@ Automated coverage must include:
 - no row/thread on malformed, removed, benched, or superseded pool launches;
 - pool-local demand saturation and scale-down shelter;
 - legacy dynamic-state load and new per-pool dump/load; and
-- unchanged aggregate status plus additive per-pool status.
+- unchanged aggregate status plus additive per-pool status; and
+- the chart API ClusterRole and reusable spoke RBAC module each grant only
+  `get` on the named `kube-system` Namespace for physical-cluster identity,
+  without namespace `list` or mutation, including a chart upgrade that reuses
+  values from a pre-feature release.
 
 Focused validation commands:
 
@@ -902,6 +1107,19 @@ suites.
 Docker is unavailable locally, so real-PostgreSQL execution remains a required
 CI gate rather than being reported as local evidence.
 
+Hotfix pre-PR validation on 2026-08-04 reran the complete affected executor,
+provider-fence, Kubernetes adaptor/command, controller, replica lifecycle,
+strict-drain, status, and teardown suite successfully. The one excluded
+unchanged fixture asserts that mode `000` makes a file unreadable and cannot
+hold when pytest itself runs as root; every other test in that backend file,
+including the new under-lock UUID/hash races, passed. The full chart suite
+passed all 315 tests, the reusable spoke RBAC module passed all 12 Terraform
+tests, and the checked-in formatter gate completed with mypy clean across 883
+files and production pylint at 10.00/10. Shell syntax, Python compilation,
+Terraform formatting, and `git diff --check` also passed. Independent
+adversarial review found no remaining release blocker in the lifecycle-wide
+physical-cluster or cluster-generation fence.
+
 Required feature CI on the preceding code-bearing head `1357dec79` completed
 all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
@@ -916,11 +1134,31 @@ fleet no larger than the configured `max_replicas`.
 
 ## Open gates
 
-- Revision 035 migration, concurrency, demotion, and killed-session suites have
-  passed against real PostgreSQL in required CI. The production database
-  migration, request-store PostgreSQL cutover, and token-bound activation
-  remain to be executed during rollout.
-- The SkyPilot image has not yet been built or deployed.
-- The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
+- Required feature CI passed, release `1.1.1089` was deployed, the production
+  request store completed its one-way PostgreSQL cutover, and token-bound
+  protocol-v2 activation persisted the expected release identity on
+  2026-08-04.
+- Release `1.1.1089` has only the controller-side pre-enqueue UID check. Keep
+  the remote pool-identity RBAC denied while the durable tuple and
+  provider-fenced executor hotfix is reviewed, merged, built, and deployed.
+  Attest every API/controller/executor Pod at the one hotfix digest before
+  applying either research-cluster bridge grant.
+- The first live v2 poll proved that the east pool identity lacks the required
+  `kube-system` Namespace read; an exact read with the same running API
+  principal through the mounted PHX context proved PHX lacks it too. The live
+  east edge withdrew as designed while ordinary east demand serving remained
+  healthy. This rollout activated v2 before completing the intended RBAC
+  prerequisite and is fixing forward under that designed pool-local blackout.
+  Merge and apply the reusable RBAC correction before treating either pool
+  claim as authoritative.
+- The no-platform-PR production bridge is a separately named ClusterRole and
+  ClusterRoleBinding, `skypilot-physical-cluster-identity-reader`, on east and
+  PHX, bound to EKS group
+  `rescluster-k8s-prod-east1-preemptible-inference`. It remains an explicit
+  drift item until both platform pool roots consume the fixed module. At that
+  point remove the bridge binding, prove both exact UID reads still pass, and
+  then remove the bridge role.
+- The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`, and the
+  exact-context H200 canary plus east regression check remain open.
 - Draft compatibility cleanup PR #1263 is authored in stack #1264 and must
   remain blocked until the rollout gates above pass.

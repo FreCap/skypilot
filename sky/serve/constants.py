@@ -41,6 +41,34 @@ REPLICA_LAUNCH_FENCE_KEYS = (
     REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY,
 )
 
+# Protocol-v2 reserved-fill authority carried in the durable API launch row.
+# Unlike the underscore-prefixed resources_override fields below, these values
+# survive the controller-to-API queue boundary and are revalidated by the
+# executor immediately before provisioning.
+RESERVED_FILL_LAUNCH_FENCE_PREFIX = 'sky_serve_reserved_fill_'
+RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}protocol_version')
+RESERVED_FILL_LAUNCH_POOL_KEY = f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}pool_key'
+RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}service_generation')
+RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}physical_cluster_uid')
+RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}kubernetes_context')
+RESERVED_FILL_LAUNCH_ACCELERATOR_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}accelerator')
+RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}accelerator_count')
+RESERVED_FILL_LAUNCH_FENCE_KEYS = (
+    RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY,
+    RESERVED_FILL_LAUNCH_POOL_KEY,
+    RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY,
+    RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY,
+    RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY,
+    RESERVED_FILL_LAUNCH_ACCELERATOR_KEY,
+    RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY,
+)
+
 # Server-only allowlist for the first same-VM system-OOM recovery rollout.
 # The value is a versioned JSON document binding an exact service incarnation
 # to a safety-profile digest.  It is read only by the API server and is never

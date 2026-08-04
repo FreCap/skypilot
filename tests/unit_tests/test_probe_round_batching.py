@@ -511,18 +511,19 @@ class TestProbeRoundBatching(unittest.TestCase):
             replica_managers.SkyPilotReplicaManager.
             _readiness_persistence_fingerprint(info), (False, 3.0, 4.0, 5.0))
 
-        source = textwrap.dedent(
-            inspect.getsource(
-                inspect.unwrap(replica_managers.SkyPilotReplicaManager.
-                               _probe_all_replicas)))
         assignments = set()
-        for node in ast.walk(ast.parse(source)):
-            if not isinstance(node, ast.Assign):
-                continue
-            for target in node.targets:
-                target_source = ast.unparse(target)
-                if target_source.startswith('info.'):
-                    assignments.add(target_source)
+        for method in (
+                replica_managers.SkyPilotReplicaManager._probe_all_replicas,
+                replica_managers.SkyPilotReplicaManager.
+                _probe_all_replicas_with_snapshot):
+            source = textwrap.dedent(inspect.getsource(inspect.unwrap(method)))
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(node, ast.Assign):
+                    continue
+                for target in node.targets:
+                    target_source = ast.unparse(target)
+                    if target_source.startswith('info.'):
+                        assignments.add(target_source)
         self.assertEqual(
             assignments, {
                 'info.status_property.service_ready_now',

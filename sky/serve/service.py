@@ -34,6 +34,7 @@ from sky.serve import constants
 from sky.serve import controller
 from sky.serve import lb_k8s
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -430,34 +431,100 @@ def _cleanup(service_name: str,
     # controller from registering a new cluster, while the owner check and
     # the fenced delete below reject a successor service or controller.
     _assert_owner('after cluster inventory snapshot')
-    absent_replica_infos = [
-        info for info in replica_infos
-        if info.cluster_name not in existing_cluster_names
-    ]
-    if absent_replica_infos:
+
+    def _set_to_failed_cleanup(info: replica_managers.ReplicaInfo,
+                               reason: str | None = None) -> None:
+        nonlocal failed
+        # Set replica status to `FAILED_CLEANUP` and preserve its durable row.
+        # In particular, absence from SkyPilot's cluster table is not proof
+        # that a protocol-v2 Kubernetes object is absent.
+        if info.status_property.sky_launch_status in (
+                None, replica_managers.common_utils.ProcessStatus.SCHEDULED,
+                replica_managers.common_utils.ProcessStatus.INTERRUPTED):
+            # These launch states otherwise dominate ``sky_down_status`` in
+            # status rendering (PENDING/SHUTTING_DOWN). The launch barrier has
+            # already quiesced them, so publish the retained row accurately as
+            # FAILED_CLEANUP.
+            info.status_property.sky_launch_status = (
+                replica_managers.common_utils.ProcessStatus.FAILED)
+        info.status_property.sky_down_status = (
+            replica_managers.common_utils.ProcessStatus.FAILED)
+        _persist_replica(info)
+        failed = True
+        suffix = '' if reason is None else f': {reason}'
+        logger.error(f'Replica {info.replica_id} failed to terminate{suffix}.')
+
+    absent_legacy_infos: list[replica_managers.ReplicaInfo] = []
+    cleanup_entries: list[tuple[replica_managers.ReplicaInfo,
+                                reserved_capacity.ProtocolV2CleanupFence |
+                                None]] = []
+    for info in replica_infos:
+        try:
+            cleanup_fence = (
+                reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            _set_to_failed_cleanup(
+                info, 'durable Kubernetes cleanup identity is malformed or '
+                f'incomplete ({common_utils.format_exception(error)})')
+            continue
+        if info.cluster_name not in existing_cluster_names:
+            if cleanup_fence is None:
+                absent_legacy_infos.append(info)
+            else:
+                _set_to_failed_cleanup(
+                    info, 'the SkyPilot cluster record is absent but '
+                    'provider absence is not independently proven')
+            continue
+        cleanup_entries.append((info, cleanup_fence))
+
+    if absent_legacy_infos:
         removed = serve_state.remove_replicas(
-            service_name, [info.replica_id for info in absent_replica_infos],
+            service_name, [info.replica_id for info in absent_legacy_infos],
             expected_service_hash=service_hash,
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=expected_owner,
             expected_replica_record_ids={
                 info.replica_id: info.replica_record_id
-                for info in absent_replica_infos
+                for info in absent_legacy_infos
             })
         if not removed:
             raise ServiceOwnershipLostError(
                 'Lost lifecycle ownership while bulk-removing absent '
                 'replicas.')
-        logger.info(f'Removed {len(absent_replica_infos)} replica records '
-                    'whose clusters are absent from the cluster inventory.')
+        logger.info(f'Removed {len(absent_legacy_infos)} legacy replica '
+                    'records whose clusters are absent from the cluster '
+                    'inventory.')
+
+    teardown_identities: dict[int, serve_state.ReplicaResourceActionIdentity |
+                              None] = {}
+    if cleanup_entries:
+        cleanup_replica_ids = [info.replica_id for info, _ in cleanup_entries]
+        try:
+            # Snapshot every action-owned cluster-record UUID before starting
+            # any worker.  Context/physical-UID fencing prevents a kubeconfig
+            # alias from changing clusters, while this independent fence
+            # prevents a same-name cluster-table replacement on that cluster
+            # from being consumed by stale service cleanup.
+            teardown_identities = (
+                serve_state.get_replica_resource_action_identities(
+                    service_name, cleanup_replica_ids))
+            if set(teardown_identities) != set(cleanup_replica_ids):
+                raise RuntimeError(
+                    'Replica inventory changed while snapshotting teardown '
+                    'identities.')
+        except Exception as error:  # pylint: disable=broad-except
+            reason = ('durable replica teardown identities could not be '
+                      'verified '
+                      f'({common_utils.format_exception(error)})')
+            for info, _ in cleanup_entries:
+                _set_to_failed_cleanup(info, reason)
+            cleanup_entries = []
     # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove this
     # whole-service thread loop at M5 for eligible authoritative services after
     # durable down actions cover cleanup and rollback.
     info2thr: dict[replica_managers.ReplicaInfo,
                    thread_utils.SafeThread] = dict()
-    for info in replica_infos:
-        if info.cluster_name not in existing_cluster_names:
-            continue
+    for info, cleanup_fence in cleanup_entries:
         _assert_owner(f'before scheduling replica {info.replica_id} cleanup')
         # Use the durable exact cluster identity from the replica row. New
         # incarnation-scoped names truncate long service prefixes to stay
@@ -465,9 +532,18 @@ def _cleanup(service_name: str,
         # with the full service name can miss a live, billable cluster.
         log_file_name = serve_utils.generate_replica_log_file_name(
             service_name, info.replica_id, resource_scope)
+        teardown_identity = teardown_identities[info.replica_id]
+        terminate_kwargs: dict[str, Any] = {
+            'continue_guard': _still_owns,
+            'expected_cluster_record_uuid':
+                (str(teardown_identity.sky_cluster_record_uuid)
+                 if teardown_identity is not None else None),
+        }
+        if cleanup_fence is not None:
+            terminate_kwargs['cleanup_fence'] = cleanup_fence
         t = thread_utils.SafeThread(target=replica_managers.terminate_cluster,
                                     args=(info.cluster_name, log_file_name),
-                                    kwargs={'continue_guard': _still_owns})
+                                    kwargs=terminate_kwargs)
         info2thr[info] = t
         # Set replica status to `SHUTTING_DOWN`
         info.status_property.sky_launch_status = (
@@ -476,15 +552,6 @@ def _cleanup(service_name: str,
             replica_managers.common_utils.ProcessStatus.SCHEDULED)
         _persist_replica(info)
         logger.info(f'Scheduling to terminate replica {info.replica_id} ...')
-
-    def _set_to_failed_cleanup(info: replica_managers.ReplicaInfo) -> None:
-        nonlocal failed
-        # Set replica status to `FAILED_CLEANUP`
-        info.status_property.sky_down_status = (
-            replica_managers.common_utils.ProcessStatus.FAILED)
-        _persist_replica(info)
-        failed = True
-        logger.error(f'Replica {info.replica_id} failed to terminate.')
 
     # Please reference to sky/serve/replica_managers.py::_refresh_process_pool.
     # TODO(tian): Refactor to use the same logic and code.
@@ -1187,7 +1254,10 @@ def _run_cleanup_and_finalize(service_name: str,
             service_name,
             replica_infos,
             continue_guard=lambda: serve_state.service_owner_matches(
-                service_name, service_hash, (controller_pid, controller_ip))):
+                service_name, service_hash, (controller_pid, controller_ip)),
+            include_terminal_history=(
+                serve_utils.replica_cleanup_requires_terminal_history(
+                    replica_infos))):
         logger.warning(f'Refusing to acknowledge teardown of {service_name!r} '
                        'until all replica launch requests are terminal.')
         return

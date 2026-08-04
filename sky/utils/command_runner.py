@@ -1591,6 +1591,65 @@ class KubernetesCommandRunner(CommandRunner):
         else:
             return f'pod/{self.pod_name}'
 
+    def _resolve_kubectl_target(self) -> tuple[str | None, str | None, bool]:
+        """Resolve one active physical-cluster fence for a kubectl call.
+
+        Returns ``(kubeconfig_path, context_name, is_capture_pinned)``.  The
+        adaptor lookup is intentionally lazy: command runners are constructed
+        by the Kubernetes provisioner, which also imports this module.
+        """
+        # Importing at module scope forms a cycle through
+        # sky.provision.kubernetes.instance.
+        # pylint: disable-next=import-outside-toplevel
+        from sky.adaptors import kubernetes as kubernetes_adaptor
+
+        target = kubernetes_adaptor.active_physical_cluster_command_target(
+            self.context)
+        if target is None:
+            if self.context is None:
+                return '/dev/null', None, False
+            return None, self.context, False
+
+        invalid_target = (not isinstance(target.context_name, str) or
+                          not target.context_name or
+                          not isinstance(target.expected_uid, str) or
+                          not target.expected_uid or
+                          not isinstance(target.token, str) or not target.token)
+        if target.in_cluster:
+            invalid_target = (invalid_target or
+                              target.provider_context is not None or
+                              target.kubeconfig_path is not None or
+                              (self.context is not None and
+                               self.context != target.context_name))
+            if not invalid_target:
+                # Keep kubectl's established in-cluster authentication path.
+                # The adaptor lookup above maps provider ``None`` to the exact
+                # active in-cluster capture and fails closed on a mismatch.
+                return '/dev/null', None, True
+        else:
+            invalid_target = (invalid_target or self.context is None or
+                              target.provider_context != self.context or
+                              target.context_name != self.context or
+                              not isinstance(target.kubeconfig_path, str) or
+                              not target.kubeconfig_path)
+            if not invalid_target:
+                return target.kubeconfig_path, target.context_name, True
+
+        raise kubernetes_adaptor.KubernetesPhysicalClusterIdentityError(
+            'Kubernetes command target does not match its active physical-'
+            'cluster fence.')
+
+    def _kubectl_auth_args(self) -> tuple[list[str], bool]:
+        """Return exact kubectl target flags and whether they are pinned."""
+        kubeconfig_path, context_name, is_capture_pinned = (
+            self._resolve_kubectl_target())
+        auth_args: list[str] = []
+        if kubeconfig_path is not None:
+            auth_args += ['--kubeconfig', kubeconfig_path]
+        if context_name is not None:
+            auth_args += ['--context', context_name]
+        return auth_args, is_capture_pinned
+
     def port_forward_command(
             self,
             port_forward: list[tuple[int, int]],
@@ -1609,19 +1668,11 @@ class KubernetesCommandRunner(CommandRunner):
         del ssh_mode  # unused
         assert port_forward and len(port_forward) == 1, (
             'Only one port is supported for Kubernetes port-forward.')
+        auth_args, _ = self._kubectl_auth_args()
         kubectl_args = [
-            '--pod-running-timeout', f'{connect_timeout}s', '-n', self.namespace
+            '--pod-running-timeout', f'{connect_timeout}s', '-n',
+            self.namespace, *auth_args
         ]
-        # The same logic to either set `--context` to the k8s context where
-        # the sky cluster is hosted, or `--kubeconfig` to /dev/null for
-        # in-cluster k8s is used below in the `run()` method.
-        if self.context:
-            kubectl_args += ['--context', self.context]
-        # If context is none, it means the cluster is hosted on in-cluster k8s.
-        # In this case, we need to set KUBECONFIG to /dev/null to avoid looking
-        # for the cluster in whatever active context is set in the kubeconfig.
-        else:
-            kubectl_args += ['--kubeconfig', '/dev/null']
         local_port, remote_port = port_forward[0]
         local_port_str = f'{local_port}' if local_port is not None else ''
 
@@ -1689,15 +1740,11 @@ class KubernetesCommandRunner(CommandRunner):
                                       f'for now, but got: {port_forward}')
         if connect_timeout is None:
             connect_timeout = _DEFAULT_CONNECT_TIMEOUT
+        auth_args, _ = self._kubectl_auth_args()
         kubectl_args = [
-            '--pod-running-timeout', f'{connect_timeout}s', '-n', self.namespace
+            '--pod-running-timeout', f'{connect_timeout}s', '-n',
+            self.namespace, *auth_args
         ]
-        if self.context:
-            kubectl_args += ['--context', self.context]
-        # If context is none, it means we are using incluster auth. In this
-        # case, need to set KUBECONFIG to /dev/null to avoid using kubeconfig.
-        if self.context is None:
-            kubectl_args += ['--kubeconfig', '/dev/null']
 
         kubectl_args += [self.kube_identifier]
         if self.container is not None:
@@ -1848,6 +1895,12 @@ class KubernetesCommandRunner(CommandRunner):
             exceptions.CommandError: rsync command failed.
         """
 
+        # Resolve the active capture before any subprocess or local path work.
+        # A malformed/mismatched fenced target raises the dedicated identity
+        # error and cannot fall back to the ambient kubeconfig.
+        kubeconfig_path, pinned_context, is_capture_pinned = (
+            self._resolve_kubectl_target())
+
         # Build command.
         helper_path = shlex.quote(
             os.path.join(os.path.abspath(os.path.dirname(__file__)),
@@ -1860,6 +1913,13 @@ class KubernetesCommandRunner(CommandRunner):
         encoded_namespace_context = (namespace_context.replace(
             '@', '%40').replace(':', '%3A').replace('/',
                                                     '%2F').replace('+', '%2B'))
+        prefix_env = ''
+        if is_capture_pinned and pinned_context is not None:
+            assert kubeconfig_path is not None
+            prefix_env = ('SKYPILOT_K8S_KUBECONFIG='
+                          f'{shlex.quote(kubeconfig_path)} '
+                          'SKYPILOT_K8S_CONTEXT='
+                          f'{shlex.quote(pinned_context)} ')
         self._rsync(
             source,
             target,
@@ -1869,7 +1929,7 @@ class KubernetesCommandRunner(CommandRunner):
             log_path=log_path,
             stream_logs=stream_logs,
             max_retry=max_retry,
-            prefix_command=(f'chmod +x {helper_path} && ' + (
+            prefix_command=(f'chmod +x {helper_path} && {prefix_env}' + (
                 '' if self.container is None else
                 f'SKYPILOT_K8S_EXEC_CONTAINER={shlex.quote(self.container)} ')),
             # rsync with `kubectl` as the rsh command will cause ~/xx parsed as

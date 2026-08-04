@@ -1,6 +1,5 @@
 """Setup dependencies & services for instances."""
 from collections.abc import Callable
-from concurrent import futures
 import functools
 import hashlib
 import os
@@ -189,7 +188,7 @@ def _hint_worker_log_path(cluster_name: str, cluster_info: common.ClusterInfo,
         logger.info(f'Logs of worker nodes can be found at: {worker_log_path}')
 
 
-class SSHThreadPoolExecutor(futures.ThreadPoolExecutor):
+class SSHThreadPoolExecutor(subprocess_utils.ContextThreadPoolExecutor):
     """ThreadPoolExecutor that kills children processes on exit."""
 
     def __exit__(self, exc_type, exc_val, exc_tb):

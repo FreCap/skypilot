@@ -93,3 +93,35 @@ def test_down_reloads_and_propagates_expected_cluster_record_uuid(monkeypatch):
         terminate=True,
         purge=False,
         expected_cluster_record_uuid=record_uuid)
+
+
+def test_down_reloads_and_propagates_expected_cluster_hash_and_guard(
+        monkeypatch):
+    cluster_name = 'legacy-fenced'
+    cluster_hash = 'generation-a'
+    handle = mock.MagicMock()
+    backend = mock.MagicMock()
+    guard = mock.MagicMock(return_value=True)
+    handle_reader = mock.MagicMock(return_value=handle)
+    hooks = mock.MagicMock()
+    monkeypatch.setattr(global_user_state, 'get_handle_from_cluster_name',
+                        handle_reader)
+    monkeypatch.setattr(core.backend_utils, 'get_backend_from_handle',
+                        lambda candidate: backend)
+    monkeypatch.setattr(core.usage_lib,
+                        'record_cluster_name_for_current_operation',
+                        lambda name: None)
+    monkeypatch.setattr(core, '_maybe_run_down_hooks', hooks)
+
+    core.down(cluster_name,
+              _expected_cluster_hash=cluster_hash,
+              _continue_guard=guard)
+
+    handle_reader.assert_called_once_with(cluster_name,
+                                          existing_cluster_hash=cluster_hash)
+    hooks.assert_not_called()
+    backend.teardown.assert_called_once_with(handle,
+                                             terminate=True,
+                                             purge=False,
+                                             expected_cluster_hash=cluster_hash,
+                                             continue_guard=guard)

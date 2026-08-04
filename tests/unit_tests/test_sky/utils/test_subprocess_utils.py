@@ -1,4 +1,5 @@
 """Unit tests for subprocess_utils.py."""
+import contextvars
 import logging
 import multiprocessing
 import signal
@@ -11,6 +12,7 @@ from unittest import mock
 import psutil
 import pytest
 
+from sky.provision import instance_setup
 from sky.utils import subprocess_utils
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,46 @@ def mock_cpu_count():
 
 
 # Test functions to replace test methods
+
+
+def test_context_thread_pool_executor_captures_each_submission():
+    marker = contextvars.ContextVar('thread_pool_test_marker', default='unset')
+    with subprocess_utils.ContextThreadPoolExecutor(max_workers=1) as executor:
+        marker.set('first')
+        first = executor.submit(marker.get)
+        marker.set('second')
+        second = executor.submit(marker.get)
+
+    assert first.result() == 'first'
+    assert second.result() == 'second'
+    assert marker.get() == 'second'
+
+
+def test_run_in_parallel_copies_context_per_item():
+    marker = contextvars.ContextVar('run_in_parallel_test_marker',
+                                    default='unset')
+    marker.set('parent')
+
+    def read_then_mutate(index):
+        observed = marker.get()
+        marker.set(f'worker-{index}')
+        return observed
+
+    assert subprocess_utils.run_in_parallel(
+        read_then_mutate, [0, 1], num_threads=2) == ['parent', 'parent']
+    assert marker.get() == 'parent'
+
+
+def test_ssh_thread_pool_executor_copies_context(monkeypatch):
+    monkeypatch.setattr(subprocess_utils, 'kill_children_processes',
+                        lambda: None)
+    marker = contextvars.ContextVar('ssh_thread_pool_test_marker',
+                                    default='unset')
+    marker.set('fenced')
+    with instance_setup.SSHThreadPoolExecutor(max_workers=1) as executor:
+        observed = executor.submit(marker.get).result()
+
+    assert observed == 'fenced'
 
 
 def test_empty_process_list(mock_sleep):

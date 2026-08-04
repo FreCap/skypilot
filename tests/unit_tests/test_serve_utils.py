@@ -15,6 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy import orm
 
 from sky import clouds
+from sky import exceptions
 from sky.resources import Resources
 from sky.serve import constants
 from sky.serve import controller_transport
@@ -25,6 +26,23 @@ from sky.serve import serve_utils
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+
+
+def test_cleanup_history_mode_is_strong_for_v2_and_malformed_rows():
+    info = mock.Mock()
+    with mock.patch(
+            'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+            return_value=None):
+        assert not serve_utils.replica_cleanup_requires_terminal_history([info])
+    with mock.patch(
+            'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+            return_value=types.SimpleNamespace()):
+        assert serve_utils.replica_cleanup_requires_terminal_history([info])
+    with mock.patch(
+            'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+            side_effect=exceptions.KubernetesPhysicalClusterIdentityError(
+                'partial v2 state')):
+        assert serve_utils.replica_cleanup_requires_terminal_history([info])
 
 
 @contextlib.contextmanager
@@ -1529,6 +1547,49 @@ def test_child_only_purge_skips_absent_clusters_with_one_inventory_snapshot():
     remove.assert_called_once_with('orphan', 9)
 
 
+def test_child_only_purge_retains_absent_protocol_v2_cluster():
+    lifecycle_lock = mock.MagicMock(epoch=9)
+    replica = mock.Mock(replica_id=1, cluster_name='orphan-r1')
+    cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                          physical_cluster_uid='phx-uid')
+    with mock.patch.object(serve_utils,
+                           'get_service_lifecycle_lock',
+                           return_value=lifecycle_lock), \
+         mock.patch.object(serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hash', return_value=None), \
+         mock.patch.object(serve_state,
+                           'get_orphaned_service_child_mode',
+                           return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[replica]), \
+         mock.patch.object(
+             serve_utils,
+             'quiesce_service_replica_launch_requests',
+             return_value=True) as quiesce, \
+         mock.patch.object(serve_state,
+                           'get_ephemeral_storage_cleanup_intents',
+                           return_value=[]), \
+         mock.patch.object(serve_utils.global_user_state,
+                           'get_cluster_status_fields', return_value={}), \
+         mock.patch(
+             'sky.serve.reserved_capacity.'
+             'parse_protocol_v2_cleanup_fence',
+             return_value=cleanup_fence), \
+         mock.patch('sky.serve.replica_managers.terminate_cluster'
+                   ) as terminate, \
+         mock.patch.object(serve_state,
+                           'remove_orphaned_service_children') as remove:
+        message = serve_utils._terminate_orphaned_service_children_impl(
+            'orphan', True)
+
+    assert message is not None and 'cluster termination failed' in message
+    assert quiesce.call_args.kwargs['include_terminal_history'] is True
+    terminate.assert_not_called()
+    remove.assert_not_called()
+
+
 def test_orphaned_service_cluster_fields_require_consolidation():
     with mock.patch.object(serve_utils,
                            'is_consolidation_mode',
@@ -1947,6 +2008,58 @@ class TestServiceStatusEndpointSnapshot:
         info.handle = mock.Mock(return_value=handle)
         return info, handle
 
+    def _v2_replica(self, name):
+        # pylint: disable=import-outside-toplevel
+        from sky import backends
+        from sky.serve import replica_managers
+        from sky.serve import reserved_capacity_broker
+
+        info = replica_managers.ReplicaInfo(replica_id=int(name.split('-')[-1]),
+                                            cluster_name=name,
+                                            replica_port='8080',
+                                            is_spot=False,
+                                            location=None,
+                                            version=1,
+                                            resources_override=None)
+        info.status_property.sky_launch_status = (
+            replica_managers.common_utils.ProcessStatus.SUCCEEDED)
+        info.status_property.service_ready_now = True
+        info.status_property.first_ready_time = 1.0
+        info.reserved_fill = True
+        info.reserved_fill_pool_key = reserved_capacity_broker.make_pool_key(
+            'phx-context',
+            'H200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-uid')
+        info.reserved_fill_service_generation = 7
+        info.reserved_fill_physical_cluster_uid = 'physical-uid'
+        info.reserved_fill_kubernetes_context = 'phx-context'
+        info.location = {
+            'cloud': 'Kubernetes',
+            'region': 'phx-context',
+            'zone': None,
+            'accelerators': {
+                'H200': 1,
+            },
+        }
+        info.resources_override = {
+            'cloud': 'Kubernetes',
+            'region': 'phx-context',
+            'accelerators': {
+                'H200': 1,
+            },
+        }
+        handle = mock.Mock(spec=backends.CloudVmRayResourceHandle)
+        handle.cluster_name = name
+        handle.cluster_yaml = '/tmp/phx.yaml'
+        handle.launched_resources = Resources(
+            cloud=clouds.Kubernetes(),
+            instance_type=('4CPU--16GB--H200:1'),
+            region='phx-context',
+            accelerators={'H200': 1})
+        handle.launched_nodes = 1
+        return info, handle
+
     def test_summary_reports_logical_and_physical_capacity_counts(self):
         service_record = {
             'name': 'svc-a',
@@ -2051,6 +2164,162 @@ class TestServiceStatusEndpointSnapshot:
         for info, _ in replicas_and_handles:
             info.handle.assert_called_once_with(
                 cluster_records[info.cluster_name])
+
+    def test_v2_status_group_uses_one_uid_read_for_all_replicas(self):
+        replicas_and_handles = [
+            self._v2_replica(f'r-{index}') for index in (1, 2)
+        ]
+        replicas = [info for info, _ in replicas_and_handles]
+        cluster_records = {
+            info.cluster_name: {
+                'name': info.cluster_name,
+                'launched_at': index,
+                'handle': handle,
+            } for index, (info,
+                         handle) in enumerate(replicas_and_handles, start=1)
+        }
+        depth = 0
+        uid_reads = 0
+
+        @contextlib.contextmanager
+        def _physical_fence(context, physical_uid):
+            nonlocal depth, uid_reads
+            assert (context, physical_uid) == ('phx-context', 'physical-uid')
+            if depth == 0:
+                uid_reads += 1
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+        record = {'name': 'svc-a', 'pool': False, 'version': 1}
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=replicas), \
+             mock.patch.object(serve_utils.global_user_state,
+                               'get_clusters_from_names',
+                               return_value=cluster_records), \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence',
+                 side_effect=_physical_fence), \
+             mock.patch('sky.backends.backend_utils.get_endpoints',
+                        return_value={8080: '10.0.0.1:8080'}):
+            status = serve_utils._get_service_status(
+                'svc-a', pool=False, with_target_num_replicas=False)
+
+        assert status is not None
+        assert uid_reads == 1
+        assert [item['endpoint'] for item in status['replica_info']] == [
+            'http://10.0.0.1:8080',
+            'http://10.0.0.1:8080',
+        ]
+
+    def test_v2_pool_status_group_still_proves_uid_once(self):
+        replicas_and_handles = [
+            self._v2_replica(f'r-{index}') for index in (1, 2)
+        ]
+        replicas = [info for info, _ in replicas_and_handles]
+        for info in replicas:
+            info.replica_port = '-'
+        cluster_records = {
+            info.cluster_name: {
+                'name': info.cluster_name,
+                'launched_at': index,
+                'handle': handle,
+            } for index, (info,
+                         handle) in enumerate(replicas_and_handles, start=1)
+        }
+        depth = 0
+        uid_reads = 0
+
+        @contextlib.contextmanager
+        def _physical_fence(context, physical_uid):
+            nonlocal depth, uid_reads
+            assert (context, physical_uid) == ('phx-context', 'physical-uid')
+            if depth == 0:
+                uid_reads += 1
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+        record = {'name': 'pool-a', 'pool': True, 'version': 1}
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=replicas), \
+             mock.patch.object(serve_utils.global_user_state,
+                               'get_clusters_from_names',
+                               return_value=cluster_records), \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence',
+                 side_effect=_physical_fence), \
+             mock.patch('sky.backends.backend_utils.get_endpoints') as endpoint, \
+             mock.patch.object(
+                 serve_utils.managed_job_state,
+                 'get_nonterminal_job_status_counts_by_pool',
+                 return_value={}), \
+             mock.patch.object(
+                 serve_utils.managed_job_state,
+                 'get_nonterminal_job_ids_by_pool_grouped',
+                 return_value={}):
+            status = serve_utils._get_service_status(
+                'pool-a',
+                pool=True,
+                with_yaml=False,
+                with_target_num_replicas=False)
+
+        assert status is not None
+        assert uid_reads == 1
+        assert [item['endpoint'] for item in status['replica_info']
+               ] == [None, None]
+        endpoint.assert_not_called()
+
+    def test_v2_status_uid_mismatch_omits_replacement_provider_data(self):
+        info, handle = self._v2_replica('r-1')
+        cluster_record = {
+            'name': info.cluster_name,
+            'launched_at': 9,
+            'handle': handle,
+        }
+        provider_fence = mock.MagicMock()
+        provider_fence.return_value.__enter__.side_effect = (
+            exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+        record = {'name': 'svc-a', 'pool': False, 'version': 1}
+
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(serve_utils.global_user_state,
+                               'get_clusters_from_names',
+                               return_value={info.cluster_name: cluster_record}), \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence',
+                 provider_fence), \
+             mock.patch('sky.backends.backend_utils.get_endpoints') as endpoint:
+            status = serve_utils._get_service_status(
+                'svc-a', pool=False, with_target_num_replicas=False)
+
+        assert status is not None
+        replica = status['replica_info'][0]
+        assert replica['status'] is serve_state.ReplicaStatus.UNKNOWN
+        assert replica['endpoint'] is None
+        assert replica['handle'] is None
+        assert replica['launched_at'] is None
+        assert replica['provider_identity_uncertain'] is True
+        assert replica['cloud'] == 'Kubernetes'
+        assert 'hourly_cost' not in replica
+        endpoint.assert_not_called()
 
 
 class TestTerminalStatuses:
@@ -2184,6 +2453,82 @@ class TestStreamReplicaLogsZeroByteFallback:
         captured = capsys.readouterr()
         assert 'MAIN-CONTENT' in captured.out
         assert 'SHOULD-NOT-APPEAR' not in captured.out
+
+
+class TestStreamReplicaLogsPhysicalIdentityFence:
+
+    def test_remote_tail_runs_inside_exact_replica_fence(self, tmp_path):
+
+        class _FakeHandle:
+            pass
+
+        main_log = tmp_path / 'replica_1.log'
+        launch_log = tmp_path / 'replica_1_launch.log'
+        launch_log.write_text('launch complete\n')
+        info = types.SimpleNamespace(replica_id=1,
+                                     cluster_name='replica-cluster',
+                                     status=serve_state.ReplicaStatus.READY)
+        handle = _FakeHandle()
+        entered = False
+
+        @contextlib.contextmanager
+        def _fence():
+            nonlocal entered
+            entered = True
+            try:
+                yield
+            finally:
+                entered = False
+
+        backend = mock.Mock()
+
+        def _tail_logs(*args, **kwargs):
+            del args, kwargs
+            assert entered, 'remote log command escaped its physical fence'
+            return (0, 'remote output\n')
+
+        backend.tail_logs.side_effect = _tail_logs
+        with mock.patch(
+                'sky.serve.serve_utils._get_healthy_service_log_owner_record',
+                return_value=({
+                    'pool': True,
+                    'resource_scope': None,
+                    'status': serve_state.ServiceStatus.READY,
+                }, None)), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_replica_log_file_name',
+                 return_value=str(main_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_replica_launch_log_file_name',
+                 return_value=str(launch_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_replica_info_from_id',
+                 return_value=info), \
+             mock.patch(
+                 'sky.serve.serve_utils.global_user_state.'
+                 'get_handle_from_cluster_name',
+                 return_value=handle), \
+             mock.patch.object(serve_utils.backends,
+                               'CloudVmRayResourceHandle', _FakeHandle), \
+             mock.patch.object(serve_utils.backends,
+                               'CloudVmRayBackend', return_value=backend), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.protocol_v2_provider_fence',
+                 return_value=_fence()) as provider_fence:
+            serve_utils.stream_replica_logs('svc',
+                                            replica_id=1,
+                                            follow=False,
+                                            tail=1,
+                                            pool=True)
+
+        provider_fence.assert_called_once_with(info, handle)
+        backend.tail_logs.assert_called_once_with(handle,
+                                                  job_id=None,
+                                                  follow=False,
+                                                  tail=1,
+                                                  stream_logs=False,
+                                                  require_outputs=True,
+                                                  process_stream=True)
 
 
 class TestStartInFlight:
@@ -3096,7 +3441,7 @@ class TestTerminateFailedServices:
              mock.patch(
                  'sky.serve.serve_utils.'
                  'quiesce_service_replica_launch_requests',
-                 return_value=True), \
+                 return_value=True) as quiesce, \
              mock.patch(
                  'sky.serve.serve_utils.global_user_state.'
                  'get_cluster_status_fields',
@@ -3142,6 +3487,7 @@ class TestTerminateFailedServices:
                         side_effect=lb_side_effect) as delete_lb:
             result = serve_utils._terminate_failed_services(
                 'svc', 'incarnation-a', None)
+        self.quiesce = quiesce
         return (terminated, remove_service, delete_lb, result.message,
                 set_owner_status, remove_directory)
 
@@ -3341,6 +3687,45 @@ class TestTerminateFailedServices:
                                                'incarnation-a',
                                                expected_lifecycle_epoch=17)
         assert message is None
+
+    def test_protocol_v2_absent_cluster_retains_parent_and_history_barrier(
+            self):
+        info = self._replica(1, 'svc-1')
+        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                              physical_cluster_uid='phx-uid')
+        with mock.patch(
+                'sky.serve.reserved_capacity.'
+                'parse_protocol_v2_cleanup_fence',
+                return_value=cleanup_fence):
+            (terminated, remove_service, _, message, set_owner_status,
+             _) = self._run([info], exists=lambda _name: False)
+
+        assert not terminated
+        remove_service.assert_not_called()
+        assert message is not None and 'could not be purged' in message
+        assert set_owner_status.call_args.args[4] == (
+            serve_state.ServiceStatus.FAILED_CLEANUP)
+        assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
+
+    def test_protocol_v2_present_cluster_forwards_exact_cleanup_fence(self):
+        info = self._replica(1, 'svc-1')
+        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                              physical_cluster_uid='phx-uid')
+        with mock.patch(
+                'sky.serve.reserved_capacity.'
+                'parse_protocol_v2_cleanup_fence',
+                return_value=cleanup_fence):
+            _, remove_service, _, message, _, _ = self._run(
+                [info], exists=lambda _name: True)
+
+        assert message is None
+        remove_service.assert_called_once()
+        assert self.termination_kwargs == [{
+            'continue_guard': mock.ANY,
+            'expected_cluster_record_uuid': None,
+            'cleanup_fence': cleanup_fence,
+        }]
+        assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
 
     def test_failed_final_cas_never_restores_over_successor(self, tmp_path):
         incarnation_a = tmp_path / 'svc-inc-a'
