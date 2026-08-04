@@ -1133,20 +1133,28 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         autoscaler.fill_demand_sample = mock.Mock(return_value=demand_sample)
 
         allocations = [
-            reserved_capacity_broker.Allocation(grant=1,
-                                                feed=1,
-                                                round_id=1,
-                                                epoch=3,
-                                                snapshot_time=time.time(),
-                                                protocol_version=2,
-                                                service_generation=1),
-            reserved_capacity_broker.Allocation(grant=1,
-                                                feed=1,
-                                                round_id=1,
-                                                epoch=5,
-                                                snapshot_time=time.time(),
-                                                protocol_version=2,
-                                                service_generation=1),
+            reserved_capacity_broker.Allocation(
+                grant=1,
+                feed=1,
+                round_id=1,
+                epoch=3,
+                snapshot_time=time.time(),
+                protocol_version=2,
+                service_generation=1,
+                observed_free=4,
+                observed_free_by_accelerator={'a100': 4},
+                observed_at=time.time()),
+            reserved_capacity_broker.Allocation(
+                grant=1,
+                feed=1,
+                round_id=1,
+                epoch=5,
+                snapshot_time=time.time(),
+                protocol_version=2,
+                service_generation=1,
+                observed_free=7,
+                observed_free_by_accelerator={'h200': 7},
+                observed_at=time.time()),
         ]
         with mock.patch.object(
                 reserved_capacity,
@@ -1166,7 +1174,10 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
                                return_value=1) as replace, \
              mock.patch.object(reserved_capacity_broker,
                                'run_round_if_stale',
-                               side_effect=allocations) as run_round:
+                               side_effect=allocations) as run_round, \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_record_allocation_observation') as record_observation:
             reserved_capacity._broker_cycle_v2(autoscaler, placer, 'svc',
                                                [east, phx], 'service-hash',
                                                (123, 'controller-ip'))
@@ -1184,6 +1195,11 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         for call in run_round.call_args_list:
             self.assertEqual(call.kwargs['expected_protocol_version'], 2)
             self.assertEqual(call.kwargs['expected_service_generation'], 1)
+        self.assertEqual(record_observation.call_count, 2)
+        self.assertEqual(record_observation.call_args_list[0].args,
+                         (placer, (east,), allocations[0]))
+        self.assertEqual(record_observation.call_args_list[1].args,
+                         (placer, (phx,), allocations[1]))
         self.assertEqual(set(autoscaler.info()['fill_by_pool']),
                          {edges[0]['pool_key'], edges[1]['pool_key']})
 
@@ -3667,10 +3683,31 @@ class TestBrokerPollerCycle(unittest.TestCase):
         self.assertEqual(autoscaler._fill_snapshot_time, 1.0)
 
     def test_no_allocation_feeds_zero_without_grant(self):
-        autoscaler, _, _, _ = self._run_cycle(allocation=None)
+        with mock.patch.object(
+                reserved_capacity,
+                '_record_allocation_observation') as record_observation:
+            autoscaler, _, _, _ = self._run_cycle(allocation=None)
+        record_observation.assert_not_called()
         self.assertIsNone(autoscaler._fill_grant)
         self.assertIsNotNone(autoscaler._fill_snapshot_time)
         self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+
+    def test_allocation_records_only_committed_observation(self):
+        allocation = reserved_capacity_broker.Allocation(
+            grant=3,
+            feed=2,
+            round_id=1,
+            epoch=4,
+            snapshot_time=1.0,
+            observed_free=7,
+            observed_free_by_accelerator={'a100': 7},
+            observed_at=1.0)
+        with mock.patch.object(
+                reserved_capacity,
+                '_record_allocation_observation') as record_observation:
+            self._run_cycle(allocation)
+        record_observation.assert_called_once()
+        self.assertIs(record_observation.call_args.args[2], allocation)
 
     def test_same_context_accelerators_share_one_broker_group(self):
         other = dict(_K8S_KEY, accelerators={'H100': 1})

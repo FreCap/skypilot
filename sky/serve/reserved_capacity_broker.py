@@ -75,6 +75,10 @@ _ROUND_FRESH_FRACTION = 0.9
 PROTOCOL_V1 = 1
 PROTOCOL_V2 = 2
 _SUPPORTED_PROTOCOLS = frozenset((PROTOCOL_V1, PROTOCOL_V2))
+# Additive metadata inside the existing per-service exact-card JSON.  `$`
+# cannot begin a valid SkyServe service name, so old readers safely ignore it
+# while continuing to find their own service entry.
+_OBSERVED_FREE_BY_ACCELERATOR_KEY = '$skypilot-observed-free-v1'
 
 # This is the fixed container name emitted by the SkyPilot Helm chart.  The
 # activation gate deliberately does not accept an operator-selected container:
@@ -412,6 +416,12 @@ class Allocation:
     # no shaped launch.  The aggregate feed is always clamped to this mapping
     # when present.
     feed_by_accelerator: dict[str, int] | None = None
+    # Raw provider observation from the successfully published round.  These
+    # fields are all absent for old, blackout, rejected, or corrupt rounds.
+    # They are placement evidence only; feed/grant remain launch authority.
+    observed_free: int | None = None
+    observed_free_by_accelerator: dict[str, int] | None = None
+    observed_at: float | None = None
 
 
 # Keep the historical broker import and pickle identities as a direct facade.
@@ -2247,6 +2257,54 @@ def _allocate_feed_by_accelerator(
     return result
 
 
+def _normalize_persisted_accelerator_counts(
+    raw_counts: Any,
+    pool_key: str,
+    *,
+    expected_total: int | None = None,
+) -> dict[str, int]:
+    """Validate one exact-card mapping read from a published round."""
+    if not isinstance(raw_counts, dict):
+        raise TypeError('exact-card entry must be an object')
+    allowed_cards = set(parse_pool_identity(pool_key).gpu_names)
+    normalized: dict[str, int] = {}
+    for raw_card, raw_count in raw_counts.items():
+        if (not isinstance(raw_card, str) or not raw_card or
+                isinstance(raw_count, bool) or not isinstance(raw_count, int) or
+                raw_count < 0):
+            raise ValueError('invalid exact-card entry')
+        card = raw_card.casefold()
+        if card not in allowed_cards:
+            raise ValueError(
+                f'exact-card entry {card!r} is outside pool {pool_key!r}')
+        if card in normalized:
+            raise ValueError('duplicate exact-card entry')
+        if raw_count > 0:
+            normalized[card] = raw_count
+    if expected_total is not None and sum(
+            normalized.values()) != expected_total:
+        raise ValueError('exact-card observation does not sum to its '
+                         f'aggregate ({sum(normalized.values())} != '
+                         f'{expected_total})')
+    return normalized
+
+
+def _service_feed_payload_for_epoch(raw_payload: str | None) -> str | None:
+    """Canonicalize shaped service authority without observation metadata."""
+    if raw_payload is None:
+        return None
+    try:
+        decoded = json.loads(raw_payload)
+    except (TypeError, json.JSONDecodeError):
+        # Preserve malformed payload identity so replacing it with valid state
+        # still advances the epoch.
+        return raw_payload
+    if not isinstance(decoded, dict):
+        return raw_payload
+    decoded.pop(_OBSERVED_FREE_BY_ACCELERATOR_KEY, None)
+    return json.dumps(decoded, sort_keys=True)
+
+
 def _reject_mixed_gpus_per_replica(
     pool_key: str,
     rows: dict[str, dict[str, Any]],
@@ -2808,25 +2866,17 @@ def _allocation_from_round(
     raw_grants = json.loads(round_row['raw_grants'] or '{}')
     raw_feed_by_accelerator = round_row.get('feed_by_accelerator')
     feed_by_accelerator: dict[str, int] | None = None
+    observed_free: int | None = None
+    observed_free_by_accelerator: dict[str, int] | None = None
+    observed_at: float | None = None
+    all_feed_by_accelerator: dict[str, Any] | None = None
     if raw_feed_by_accelerator is not None:
         try:
-            all_feed_by_accelerator = json.loads(raw_feed_by_accelerator)
-            raw_service_feed = all_feed_by_accelerator[service_name]
-            if not isinstance(raw_service_feed, dict):
-                raise TypeError('service exact-card feed must be an object')
-            normalized_service_feed: dict[str, int] = {}
-            for raw_card, raw_count in raw_service_feed.items():
-                if (not isinstance(raw_card, str) or not raw_card or
-                        isinstance(raw_count, bool) or
-                        not isinstance(raw_count, int) or raw_count < 0):
-                    raise ValueError('invalid exact-card feed entry')
-                card = raw_card.casefold()
-                if card in normalized_service_feed:
-                    raise ValueError('duplicate exact-card feed entry')
-                if raw_count > 0:
-                    normalized_service_feed[card] = raw_count
-            feed_by_accelerator = normalized_service_feed
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            decoded = json.loads(raw_feed_by_accelerator)
+            if not isinstance(decoded, dict):
+                raise TypeError('exact-card feed envelope must be an object')
+            all_feed_by_accelerator = decoded
+        except (TypeError, json.JSONDecodeError) as error:
             # A present exact-card allocation is authoritative.  Corruption
             # cannot degrade into an aggregate launch that may select another
             # card from the same physical pool.
@@ -2834,6 +2884,52 @@ def _allocation_from_round(
                 'Reserved-fill round has malformed exact-card feed for '
                 f'{service_name!r}/{pool_key}: {error}')
             feed_by_accelerator = {}
+        if all_feed_by_accelerator is not None:
+            try:
+                feed_by_accelerator = _normalize_persisted_accelerator_counts(
+                    all_feed_by_accelerator[service_name], pool_key)
+            except (KeyError, TypeError, ValueError,
+                    json.JSONDecodeError) as error:
+                # Parse service launch authority independently from the raw
+                # observation metadata below.  Either side can fail closed
+                # without poisoning the other.
+                logger.error(
+                    'Reserved-fill round has malformed exact-card feed for '
+                    f'{service_name!r}/{pool_key}: {error}')
+                feed_by_accelerator = {}
+            raw_observation = all_feed_by_accelerator.get(
+                _OBSERVED_FREE_BY_ACCELERATOR_KEY)
+            if raw_observation is not None:
+                try:
+                    raw_observed_free = round_row.get('last_observed_free')
+                    if (isinstance(raw_observed_free, bool) or
+                            not isinstance(raw_observed_free, int) or
+                            raw_observed_free < 0):
+                        raise ValueError('invalid aggregate observation')
+                    raw_observed_at = round_row.get('last_observed_free_ts')
+                    if (isinstance(raw_observed_at, bool) or
+                            not isinstance(raw_observed_at, (int, float)) or
+                            not math.isfinite(raw_observed_at)):
+                        raise ValueError('invalid observation timestamp')
+                    snapshot_time = float(round_row['snapshot_time'])
+                    if float(raw_observed_at) != snapshot_time:
+                        raise ValueError('observation timestamp does not match '
+                                         'the round snapshot')
+                    observed_free_by_accelerator = (
+                        _normalize_persisted_accelerator_counts(
+                            raw_observation,
+                            pool_key,
+                            expected_total=raw_observed_free))
+                    observed_free = raw_observed_free
+                    observed_at = float(raw_observed_at)
+                except (KeyError, TypeError, ValueError,
+                        json.JSONDecodeError) as error:
+                    logger.error(
+                        'Reserved-fill round has malformed measured capacity '
+                        f'for {pool_key}: {error}')
+                    observed_free = None
+                    observed_free_by_accelerator = None
+                    observed_at = None
     edge_cap = None
     physical_cluster_uid = None
     if claim_row is not None:
@@ -2869,19 +2965,22 @@ def _allocation_from_round(
                     pool_key).physical_cluster_uid
             except (TypeError, ValueError, json.JSONDecodeError):
                 physical_cluster_uid = None
-    allocation = Allocation(grant=grant,
-                            feed=feed,
-                            round_id=int(round_row['round_id']),
-                            epoch=int(round_row['epoch']),
-                            snapshot_time=float(round_row['snapshot_time']),
-                            demand_gate_grant=_demand_gate_grant(
-                                grant, raw_for_gate),
-                            protocol_version=protocol_version,
-                            service_generation=service_generation,
-                            physical_cluster_uid=physical_cluster_uid,
-                            edge_cap=edge_cap,
-                            pool_key=pool_key,
-                            feed_by_accelerator=feed_by_accelerator)
+    allocation = Allocation(
+        grant=grant,
+        feed=feed,
+        round_id=int(round_row['round_id']),
+        epoch=int(round_row['epoch']),
+        snapshot_time=float(round_row['snapshot_time']),
+        demand_gate_grant=_demand_gate_grant(grant, raw_for_gate),
+        protocol_version=protocol_version,
+        service_generation=service_generation,
+        physical_cluster_uid=physical_cluster_uid,
+        edge_cap=edge_cap,
+        pool_key=pool_key,
+        feed_by_accelerator=feed_by_accelerator,
+        observed_free=observed_free,
+        observed_free_by_accelerator=(observed_free_by_accelerator),
+        observed_at=observed_at)
     _cache_allocation(service_name, allocation, claim_row)
     return allocation
 
@@ -3128,7 +3227,7 @@ def _run_round_locked(
     query_ok = observation is not None and observation.free_slots is not None
     confirmed_phantom = False
     measured_by_accelerator: dict[str, int] | None = None
-    if query_ok and protocol_version == PROTOCOL_V2:
+    if query_ok:
         assert observation is not None
         try:
             measured_by_accelerator = _normalize_exact_card_observation(
@@ -3255,6 +3354,7 @@ def _run_round_locked(
             assert (observation is not None and
                     observation.free_slots is not None)
             free = max(0, int(observation.free_slots))
+            observed_free = free
             last_free, last_free_ts = free, snapshot_time
         # The gate must survive the fast path. Left alone, a lone claimant
         # publishes a None grant, the autoscaler applies no ceiling at all,
@@ -3506,9 +3606,14 @@ def _run_round_locked(
         grants = dict(damped)
 
     feed_by_accelerator = (_allocate_feed_by_accelerator(
-        feeds, measured_by_accelerator, observed_free)
-                           if protocol_version == PROTOCOL_V2 and query_ok else
-                           None)
+        feeds, measured_by_accelerator, observed_free) if query_ok else None)
+    service_feed_by_accelerator = (json.dumps(feed_by_accelerator,
+                                              sort_keys=True)
+                                   if feed_by_accelerator is not None else None)
+    if feed_by_accelerator is not None:
+        assert measured_by_accelerator is not None
+        feed_by_accelerator[_OBSERVED_FREE_BY_ACCELERATOR_KEY] = dict(
+            measured_by_accelerator)
     serialized_feed_by_accelerator = (json.dumps(feed_by_accelerator,
                                                  sort_keys=True) if
                                       feed_by_accelerator is not None else None)
@@ -3526,11 +3631,12 @@ def _run_round_locked(
     feeds_changed = ((protocol_version == PROTOCOL_V2 or len(claims) != 1) and
                      round_row is not None and
                      json.loads(round_row['feeds'] or '{}') != feeds)
-    previous_feed_by_accelerator = (round_row.get('feed_by_accelerator')
+    previous_feed_by_accelerator = (_service_feed_payload_for_epoch(
+        round_row.get('feed_by_accelerator'))
                                     if round_row is not None else None)
     exact_feed_changed = (protocol_version == PROTOCOL_V2 and
                           round_row is not None and previous_feed_by_accelerator
-                          != serialized_feed_by_accelerator)
+                          != service_feed_by_accelerator)
     published_claim_generations = (claim_generations
                                    if protocol_version == PROTOCOL_V2 else {})
     metadata_changed = (
@@ -3621,6 +3727,8 @@ def _run_round_locked(
             'round_id': round_id,
             'epoch': new_epoch,
             'snapshot_time': snapshot_time,
+            'last_observed_free': last_free,
+            'last_observed_free_ts': last_free_ts,
         },
         protocol_version=protocol_version,
         service_generation=service_generation,

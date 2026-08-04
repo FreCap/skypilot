@@ -838,8 +838,14 @@ def test_v2_round_single_claimant_is_integer_generation_fenced(
     assert allocation.edge_cap == 3
     assert allocation.pool_key == pool
     assert allocation.feed_by_accelerator == {'h200': 3}
+    assert allocation.observed_free == 10
+    assert allocation.observed_free_by_accelerator == {'h200': 10}
+    assert allocation.observed_at == allocation.snapshot_time
     assert publish.call_args.kwargs['protocol_version'] == broker.PROTOCOL_V2
     assert json.loads(publish.call_args.kwargs['feed_by_accelerator']) == {
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 10
+        },
         'svc-a': {
             'h200': 3
         }
@@ -854,6 +860,36 @@ def test_v2_round_single_claimant_is_integer_generation_fenced(
         accelerator_names=('h200',),
         physical_cluster_uid='phx-cluster',
         service_generation=7)
+
+
+def test_cas_lost_writer_returns_no_measured_capacity(_broker_db, monkeypatch):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    edge = _v2_edge(pool)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[edge]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                        mock.Mock(return_value=False))
+    query = mock.Mock(
+        return_value=broker.PoolObservation(10, ('H200',), (('h200', 10),)))
+
+    allocation = broker.run_round_if_stale(
+        'svc-a',
+        pool,
+        query,
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+
+    assert allocation is None
+    query.assert_called_once_with()
 
 
 def test_v2_confirmed_phantom_preserves_generation_and_healthy_sibling(
@@ -930,6 +966,8 @@ def test_v2_confirmed_phantom_preserves_generation_and_healthy_sibling(
     assert phantom is not None
     assert phantom.grant == 0
     assert phantom.feed == 0
+    assert phantom.observed_free is None
+    assert phantom.observed_free_by_accelerator is None
     assert phantom.service_generation == 7
     remove_pool.assert_not_called()
     phantom_publish = publish.call_args
@@ -1190,7 +1228,16 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
     assert allocation.feed_by_accelerator is None
     assert allocation.demand_gate_grant == 2
 
-    round_row['feed_by_accelerator'] = json.dumps({'svc-a': {'h200': 1}})
+    round_row['last_observed_free'] = 3
+    round_row['last_observed_free_ts'] = round_row['snapshot_time']
+    round_row['feed_by_accelerator'] = json.dumps({
+        'svc-a': {
+            'h200': 1
+        },
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 3
+        },
+    })
     allocation = broker._allocation_from_round(
         'svc-a',
         pool,
@@ -1201,6 +1248,54 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
     assert allocation is not None
     assert allocation.feed == 1
     assert allocation.feed_by_accelerator == {'h200': 1}
+    assert allocation.observed_free == 3
+    assert allocation.observed_free_by_accelerator == {'h200': 3}
+    assert allocation.observed_at == round_row['snapshot_time']
+
+    # Observation corruption suppresses only bench-release evidence; valid
+    # service launch authority remains intact.
+    round_row['feed_by_accelerator'] = json.dumps({
+        'svc-a': {
+            'h200': 1
+        },
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 2
+        },
+    })
+    allocation = broker._allocation_from_round(
+        'svc-a',
+        pool,
+        round_row,
+        protocol_version=broker.PROTOCOL_V2,
+        service_generation=7,
+        claim_row=edge)
+    assert allocation is not None
+    assert allocation.feed == 1
+    assert allocation.feed_by_accelerator == {'h200': 1}
+    assert allocation.observed_free is None
+
+    # Service corruption still fails launch authority closed, independently
+    # of a valid committed observation.
+    round_row['feed_by_accelerator'] = json.dumps({
+        'svc-a': {
+            'h200': 'bad'
+        },
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 3
+        },
+    })
+    allocation = broker._allocation_from_round(
+        'svc-a',
+        pool,
+        round_row,
+        protocol_version=broker.PROTOCOL_V2,
+        service_generation=7,
+        claim_row=edge)
+    assert allocation is not None
+    assert allocation.feed == 0
+    assert allocation.feed_by_accelerator == {}
+    assert allocation.observed_free == 3
+    assert allocation.observed_free_by_accelerator == {'h200': 3}
 
     round_row['feed_by_accelerator'] = '{malformed'
     allocation = broker._allocation_from_round(
@@ -1213,6 +1308,8 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
     assert allocation is not None
     assert allocation.feed == 0
     assert allocation.feed_by_accelerator == {}
+    assert allocation.observed_free is None
+    assert allocation.observed_free_by_accelerator is None
     broker.clear_caches()
 
 
@@ -1282,6 +1379,31 @@ class TestSingleClaimantFastPath:
         assert alloc is not None
         assert alloc.grant is None
         assert alloc.feed == 0
+        assert alloc.observed_free is None
+        assert alloc.observed_free_by_accelerator is None
+
+    def test_v1_publishes_committed_exact_card_observation(self):
+        _upsert('svc-a')
+        alloc = _run('svc-a',
+                     observation=broker.PoolObservation(7, ('A100',),
+                                                        (('a100', 7),)))
+        assert alloc is not None
+        assert alloc.grant is None
+        assert alloc.feed == 7
+        assert alloc.feed_by_accelerator == {'a100': 7}
+        assert alloc.observed_free == 7
+        assert alloc.observed_free_by_accelerator == {'a100': 7}
+        assert alloc.observed_at == alloc.snapshot_time
+
+    def test_invalid_exact_card_split_is_a_blackout(self):
+        _upsert('svc-a')
+        alloc = _run('svc-a',
+                     observation=broker.PoolObservation(7, ('A100',),
+                                                        (('a100', 6),)))
+        assert alloc is not None
+        assert alloc.feed == 0
+        assert alloc.observed_free is None
+        assert alloc.observed_free_by_accelerator is None
 
 
 @pytest.mark.usefixtures('_broker_db')
@@ -1379,14 +1501,22 @@ class TestMultiClaimantRounds:
     def test_fresh_round_is_read_not_redriven(self, clock):
         _upsert('svc-a')
         _upsert('svc-b')
-        first = _run('svc-a', free=10)
+        observation = broker.PoolObservation(10, ('A100',), (('a100', 10),))
+        first = _run('svc-a', observation=observation)
         assert first is not None
+        assert first.observed_free == 10
+        assert first.observed_free_by_accelerator == {'a100': 10}
         query = mock.Mock(side_effect=AssertionError('must not re-query'))
         clock.advance(10)  # well inside the freshness window
         again = broker.run_round_if_stale('svc-b', _POOL, query, 60.0)
         assert again is not None
         assert again.round_id == first.round_id
         assert again.epoch == first.epoch
+        assert again.observed_free == first.observed_free
+        assert (again.observed_free_by_accelerator ==
+                first.observed_free_by_accelerator)
+        assert again.observed_at == first.observed_at
+        query.assert_not_called()
 
     def test_claimant_after_round_waits_for_next(self, clock):
         _upsert('svc-a')
@@ -1728,6 +1858,62 @@ class TestClaimLifecycle:
 
 @pytest.mark.usefixtures('_broker_db')
 class TestEpochFencing:
+
+    def test_raw_observation_only_change_does_not_bump_v2_epoch(
+            self, clock, monkeypatch):
+        pool = broker.make_pool_key('phx-context', ('H200', 'H100'),
+                                    protocol_version=broker.PROTOCOL_V2,
+                                    physical_cluster_uid='phx-cluster')
+        edge = _v2_edge(pool, effective_cap=3)
+        edge['accelerator_names'] = ['H200', 'H100']
+        rounds = {}
+
+        def _publish(pool_key, **kwargs):
+            rounds[pool_key] = dict(kwargs)
+            rounds[pool_key]['fence_pending'] = False
+            return True
+
+        monkeypatch.setattr(broker, 'get_protocol_version',
+                            mock.Mock(return_value=broker.PROTOCOL_V2))
+        monkeypatch.setattr(serve_state,
+                            'get_authoritative_reserved_fill_claims',
+                            mock.Mock(return_value=[edge]))
+        monkeypatch.setattr(serve_state,
+                            'prune_authoritative_reserved_fill_claim_sets',
+                            mock.Mock(return_value=[]))
+        monkeypatch.setattr(serve_state, 'get_reserved_fill_round',
+                            mock.Mock(side_effect=rounds.get))
+        monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                            _publish)
+
+        def _run_v2(by_card):
+            observation = broker.PoolObservation(sum(by_card.values()),
+                                                 tuple(by_card),
+                                                 tuple(by_card.items()))
+            return broker.run_round_if_stale(
+                'svc-a',
+                pool,
+                mock.Mock(return_value=observation),
+                60.0,
+                expected_protocol_version=broker.PROTOCOL_V2,
+                expected_service_generation=7)
+
+        first = _run_v2({'h200': 10, 'h100': 0})
+        assert first is not None
+        assert first.feed_by_accelerator == {'h200': 3}
+
+        clock.advance(61)
+        raw_only = _run_v2({'h200': 11, 'h100': 0})
+        assert raw_only is not None
+        assert raw_only.observed_free == 11
+        assert raw_only.feed_by_accelerator == {'h200': 3}
+        assert raw_only.epoch == first.epoch
+
+        clock.advance(61)
+        card_changed = _run_v2({'h200': 0, 'h100': 11})
+        assert card_changed is not None
+        assert card_changed.feed_by_accelerator == {'h100': 3}
+        assert card_changed.epoch == first.epoch + 1
 
     def test_epoch_bumps_only_on_allocation_change(self, clock):
         _upsert('svc-a')

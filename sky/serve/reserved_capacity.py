@@ -1176,6 +1176,25 @@ def _record_pool_observation(
     placer.observe_zero_cost_capacity(free_by_location, observed_at)
 
 
+def _record_allocation_observation(
+    placer: 'spot_placer_lib.SpotPlacer',
+    locations: Sequence['spot_placer_lib.Location'],
+    allocation: 'reserved_capacity_broker.Allocation',
+) -> None:
+    """Record only capacity carried by a successfully published round."""
+    if (allocation.observed_free is None or
+            allocation.observed_free_by_accelerator is None or
+            allocation.observed_at is None):
+        return
+    observation = reserved_capacity_broker.PoolObservation(
+        free_slots=allocation.observed_free,
+        gpu_names=tuple(allocation.observed_free_by_accelerator),
+        free_slots_by_accelerator=tuple(
+            allocation.observed_free_by_accelerator.items()))
+    _record_pool_observation(placer, locations, observation,
+                             allocation.observed_at)
+
+
 def _broker_cycle(
     autoscaler: 'autoscalers.Autoscaler',
     placer: 'spot_placer_lib.SpotPlacer',
@@ -1271,15 +1290,10 @@ def _broker_cycle(
                     f'stale for {service_name!r}; feeding 0 slots.')
         return
 
-    def _observe_pool() -> 'reserved_capacity_broker.PoolObservation':
-        observation = query_pool_group_observation(context, grouped_shapes)
-        _record_pool_observation(placer, zero_cost, observation, time.time())
-        return observation
-
     allocation = reserved_capacity_broker.run_round_if_stale(
-        service_name, pool_key, _observe_pool, poll_interval_seconds())
-    # Whoever drove the round, adopt its published count.
-    _record_round_observation(placer, zero_cost, pool_key, time.time())
+        service_name, pool_key,
+        lambda: query_pool_group_observation(context, grouped_shapes),
+        poll_interval_seconds())
     if allocation is None:
         # No allocation this cycle (claim rejected/expired, round lock
         # timeout, or the fresh round predates our claim): feed zero free
@@ -1289,6 +1303,7 @@ def _broker_cycle(
         logger.info('Reserved-fill broker: no allocation for '
                     f'{service_name!r} this cycle; feeding 0 free slots.')
         return
+    _record_allocation_observation(placer, zero_cost, allocation)
     autoscaler.collect_reserved_capacity(allocation.feed,
                                          keys,
                                          allocation.snapshot_time,
@@ -1298,39 +1313,6 @@ def _broker_cycle(
     logger.info(f'Reserved-fill broker: {service_name!r} feed='
                 f'{allocation.feed} grant={allocation.grant} '
                 f'(round {allocation.round_id}, epoch {allocation.epoch}).')
-
-
-def _record_round_observation(
-    placer: 'spot_placer_lib.SpotPlacer',
-    locations: Sequence['spot_placer_lib.Location'],
-    pool_key: str,
-    now: float,
-) -> None:
-    """Replay the pool's published free-slot count into the placer.
-
-    One poller drives each round; every other service reads the published
-    result. Recording only when we drove the round would leave a service that
-    rarely wins the round without a count, and therefore benched, which is the
-    common case once several services share a pool. This runs every cycle off
-    the same row `_pool_capacity_hint` already trusts.
-    """
-    round_row = serve_state.get_reserved_fill_round(pool_key)
-    if round_row is None:
-        return
-    free = round_row.get('last_observed_free')
-    observed_at = round_row.get('last_observed_free_ts')
-    if free is None or observed_at is None:
-        return
-    try:
-        observed_at = float(observed_at)
-        free = int(free)
-    except (TypeError, ValueError):
-        return
-    if now - observed_at > (poll_interval_seconds() *
-                            constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS):
-        return
-    placer.observe_zero_cost_capacity(
-        {location: free for location in locations}, observed_at)
 
 
 def _pool_capacity_hint(spec: FillPoolSpec, holdings: int, launchable: bool,
@@ -1522,25 +1504,19 @@ def _broker_cycle_v2(
     snapshots: dict[str, dict[str, Any]] = {}
     for spec, budget in zip(specs, budgets):
 
-        def _observe_pool(
+        def _query_pool(
             spec: FillPoolSpec = spec
         ) -> 'reserved_capacity_broker.PoolObservation':
-            # Each pool's reading is recorded against that pool's own
-            # locations only, so a cluster with free capacity never marks a
-            # peer cluster launchable.
-            observation = query_pool_group_observation(
+            return query_pool_group_observation(
                 spec.context,
                 dict(spec.shapes),
                 expected_physical_cluster_uid=spec.physical_cluster_uid)
-            _record_pool_observation(placer, spec.locations, observation,
-                                     time.time())
-            return observation
 
         try:
             allocation = reserved_capacity_broker.run_round_if_stale(
                 service_name,
                 spec.pool_key,
-                _observe_pool,
+                _query_pool,
                 poll_interval_seconds(),
                 expected_protocol_version=reserved_capacity_broker.PROTOCOL_V2,
                 expected_service_generation=generation)
@@ -1551,9 +1527,10 @@ def _broker_cycle_v2(
                            f'{service_name!r}/{spec.pool_key}: '
                            f'{common_utils.format_exception(error)}')
             allocation = None
-        # Whoever drove this pool's round, adopt its published count.
-        _record_round_observation(placer, spec.locations, spec.pool_key,
-                                  time.time())
+        if allocation is not None:
+            # Every controller consumes the committed round, including peers
+            # whose fresh-round path deliberately skipped `_query_pool`.
+            _record_allocation_observation(placer, spec.locations, allocation)
         # A lock timeout or other transient round miss must not cull existing
         # fill from this one pool.  Carry only the last real exact-generation
         # grant as scale-down shelter.  Live launch authority still fails

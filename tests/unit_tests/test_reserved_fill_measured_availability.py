@@ -22,7 +22,7 @@ or through `active_locations()`, so the tests below drive all of them:
            |- _pool_capacity_hint  -> per-card demand target
            `- compute_feeds        -> the fill feed
 """
-# pylint: disable=protected-access,no-member
+# pylint: disable=protected-access,no-member,missing-class-docstring
 import time
 from unittest import mock
 
@@ -511,6 +511,18 @@ class TestBrokerWiresTheObservationIntoThePlacer:
             gpu_names=(),
             free_slots_by_accelerator=by_accelerator)
 
+    @staticmethod
+    def _allocation(free_slots, by_accelerator, observed_at):
+        return reserved_capacity_broker.Allocation(
+            grant=1,
+            feed=1,
+            round_id=1,
+            epoch=1,
+            snapshot_time=observed_at,
+            observed_free=free_slots,
+            observed_free_by_accelerator=by_accelerator,
+            observed_at=observed_at)
+
     def test_per_accelerator_split_is_recorded_per_location(self):
         placer = _placer(benched=_EAST)
         reserved_capacity._record_pool_observation(
@@ -567,75 +579,45 @@ class TestBrokerWiresTheObservationIntoThePlacer:
         assert _PHX_H200 not in placer.location2observed_free
         assert placer._effective_status(_PHX_H200) == _PREEMPTED
 
-
-class TestRoundReplayReachesEveryPoller:
-    """A service that did not drive the round must still get the count.
-
-    One poller drives each round and the others read the published result.
-    Recording only on the driving path leaves a service that rarely wins the
-    round permanently benched, which is the common case once several services
-    share a pool.
-    """
-
-    @staticmethod
-    def _round_row(free, observed_at):
-        return {
-            'last_observed_free': free,
-            'last_observed_free_ts': observed_at
-        }
-
-    def test_a_published_round_releases_a_non_driving_poller(self):
-        placer = _placer(benched=_EAST, benched_at=time.time() - 60)
-        now = time.time()
-        with mock.patch.object(reserved_capacity.serve_state,
-                               'get_reserved_fill_round',
-                               return_value=self._round_row(106, now - 5)):
-            reserved_capacity._record_round_observation(placer, _EAST, 'pool',
-                                                        now)
-        assert placer._effective_status(_EAST_A100_80GB) == _ACTIVE
-        assert len(_drain(placer, limit=106)) == 106
-
-    def test_a_stale_round_is_not_replayed(self):
-        placer = _placer(benched=_EAST, benched_at=time.time() - 60)
-        now = time.time()
-        with mock.patch.object(reserved_capacity.serve_state,
-                               'get_reserved_fill_round',
-                               return_value=self._round_row(106, now - 86_400)):
-            reserved_capacity._record_round_observation(placer, _EAST, 'pool',
-                                                        now)
-        assert placer._effective_status(_EAST_A100_80GB) == _PREEMPTED
-
-    def test_a_missing_or_empty_round_is_tolerated(self):
-        placer = _placer(benched=_EAST)
-        now = time.time()
-        for row in (None, {}, self._round_row(None, now),
-                    self._round_row(5, None), self._round_row('x', now)):
-            with mock.patch.object(reserved_capacity.serve_state,
-                                   'get_reserved_fill_round',
-                                   return_value=row):
-                reserved_capacity._record_round_observation(
-                    placer, _EAST, 'pool', now)
-        assert placer._effective_status(_EAST_A100_80GB) == _PREEMPTED
-
-    def test_a_zero_free_round_leaves_the_pool_benched(self):
-        placer = _placer(benched=_EAST, benched_at=time.time() - 60)
-        now = time.time()
-        with mock.patch.object(reserved_capacity.serve_state,
-                               'get_reserved_fill_round',
-                               return_value=self._round_row(0, now - 5)):
-            reserved_capacity._record_round_observation(placer, _EAST, 'pool',
-                                                        now)
-        assert placer._effective_status(_EAST_A100_80GB) == _PREEMPTED
-
-    def test_replay_is_scoped_to_the_pool_locations(self):
+    def test_committed_allocation_records_only_its_pool_and_cards(self):
         placer = _placer(benched=(*_EAST, *_PHX),
-                         benched_at=time.time() - 60,
                          locations=[*_EAST, *_PHX, _AWS_SPOT_L4])
-        now = time.time()
-        with mock.patch.object(reserved_capacity.serve_state,
-                               'get_reserved_fill_round',
-                               return_value=self._round_row(106, now - 5)):
-            reserved_capacity._record_round_observation(placer, _EAST, 'pool',
-                                                        now)
+        observed_at = time.time()
+        reserved_capacity._record_allocation_observation(
+            placer, _EAST,
+            self._allocation(165, {
+                'a100-80gb': 165,
+                'a100': 0,
+            }, observed_at))
+
+        assert placer.location2observed_free[_EAST_A100_80GB] == (165,
+                                                                  observed_at)
+        assert placer.location2observed_free[_EAST_A100] == (0, observed_at)
+        assert _PHX_H200 not in placer.location2observed_free
         assert placer._effective_status(_EAST_A100_80GB) == _ACTIVE
+        assert placer._effective_status(_EAST_A100) == _PREEMPTED
         assert placer._effective_status(_PHX_H200) == _PREEMPTED
+
+    def test_committed_round_older_than_bench_does_not_release(self):
+        now = time.time()
+        placer = _placer(benched=(_EAST_A100_80GB,),
+                         benched_at=now,
+                         locations=[_EAST_A100_80GB, _AWS_SPOT_L4])
+        reserved_capacity._record_allocation_observation(
+            placer, (_EAST_A100_80GB,),
+            self._allocation(165, {'a100-80gb': 165}, now - 60))
+
+        assert placer._effective_status(_EAST_A100_80GB) == _PREEMPTED
+
+    def test_old_or_blackout_allocation_does_not_change_measurement(self):
+        placer = _placer(benched=_EAST)
+        old_round = reserved_capacity_broker.Allocation(grant=1,
+                                                        feed=1,
+                                                        round_id=1,
+                                                        epoch=1,
+                                                        snapshot_time=1.0)
+        reserved_capacity._record_allocation_observation(
+            placer, _EAST, old_round)
+
+        assert not hasattr(placer, 'location2observed_free')
+        assert placer._effective_status(_EAST_A100_80GB) == _PREEMPTED
