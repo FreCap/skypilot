@@ -2704,11 +2704,13 @@ class ControllerManager:
             raise
         finally:
             if not superseded:
+                cleanup_succeeded = False
                 try:
                     await self._cleanup(job_id,
                                         pool=pool,
                                         graceful=graceful,
                                         graceful_timeout=graceful_timeout)
+                    cleanup_succeeded = True
                     logger.info(
                         f'Cluster of managed job {job_id} has been cleaned up.')
                 except Exception as e:  # pylint: disable=broad-except
@@ -2767,7 +2769,16 @@ class ControllerManager:
                     logger.warning('Failed to revoke API server access token '
                                    f'for job {job_id}: {e}')
 
-                await scheduler.job_done_async(job_id)
+                if cleanup_succeeded or pool is not None:
+                    await scheduler.job_done_async(job_id)
+                else:
+                    # Keep the job visible to the status reconciler until
+                    # provider cleanup succeeds. Marking it DONE here would
+                    # exclude a terminal job from ordinary status sweeps and
+                    # leave its cluster row accruing estimated spend forever.
+                    logger.warning(
+                        f'Deferring scheduler finalization for managed job '
+                        f'{job_id} until cluster cleanup succeeds.')
 
     async def start_job(
         self,

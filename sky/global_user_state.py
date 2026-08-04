@@ -2391,6 +2391,31 @@ def get_managed_cluster_status_fields(
 
 
 @metrics_lib.time_me
+def get_managed_job_cluster_cleanup_candidates() -> dict[str, str | None]:
+    """Returns managed-job cluster names and their durable workload ids.
+
+    Rows written before workload attribution was added have a NULL
+    ``workload_type`` and ``workload_id``. Include those legacy managed rows so
+    the managed-jobs reconciler can prove ownership from the generated cluster
+    name before attempting cleanup. Rows attributed to another workload type
+    are excluded here.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.query(
+            cluster_table.c.name,
+            cluster_table.c.workload_id,
+        ).filter(
+            cluster_table.c.is_managed == int(True),
+            sqlalchemy.or_(
+                cluster_table.c.workload_type == 'managed_job',
+                cluster_table.c.workload_type.is_(None),
+            ),
+        ).all()
+    return {row.name: row.workload_id for row in rows}
+
+
+@metrics_lib.time_me
 def get_cluster_image_consumers(
     cluster_names: list[str],
 ) -> dict[str, tuple[str | None, str | None] | None]:

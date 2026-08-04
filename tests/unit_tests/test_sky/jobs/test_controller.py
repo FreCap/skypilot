@@ -3631,8 +3631,9 @@ class TestRunJobLoopOwnershipCleanup:
             await manager.run_job_loop(3, '/dev/null')
 
         set_failed.assert_not_awaited()
-        job_done.assert_awaited_once_with(3)
+        job_done.assert_not_awaited()
         assert 'Preserving terminal job status' in caplog.text
+        assert 'Deferring scheduler finalization' in caplog.text
         assert 'worker connection timed out' in caplog.text
 
     @pytest.mark.asyncio
@@ -3673,7 +3674,7 @@ class TestRunJobLoopOwnershipCleanup:
             managed_job_state.ManagedJobStatus.FAILED_CONTROLLER)
         assert kwargs['override_terminal']
         assert 'worker connection timed out' in kwargs['failure_reason']
-        job_done.assert_awaited_once_with(3)
+        job_done.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('cleanup_error', [
