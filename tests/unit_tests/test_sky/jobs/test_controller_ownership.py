@@ -38,6 +38,50 @@ def _mock_managed_jobs_db_conn(tmp_path, monkeypatch):
         engine.dispose()
 
 
+def _forbid_task_row_materialization(monkeypatch):
+    """Fail if an exact recheck materializes task rows instead of aggregates."""
+    original_execute = state.orm.Session.execute
+
+    class _ScalarResultProxy:
+        """Reject scalar result materialization for exact task rechecks."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def all(self):
+            raise AssertionError(
+                'exact task rechecks must not materialize every task row')
+
+    class _ResultProxy:
+        """Reject row materialization for exact task rechecks."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def all(self):
+            raise AssertionError(
+                'exact task rechecks must not materialize every task row')
+
+        def scalars(self):
+            return _ScalarResultProxy(self._inner.scalars())
+
+    def _wrap_if_task_select(self, statement, *args, **kwargs):
+        result = original_execute(self, statement, *args, **kwargs)
+        if isinstance(statement, sqlalchemy.sql.Select):
+            sql_text = str(statement)
+            if 'FROM spot' in sql_text and 'JOIN' not in sql_text:
+                return _ResultProxy(result)
+        return result
+
+    monkeypatch.setattr(state.orm.Session, 'execute', _wrap_if_task_select)
+
+
 class TestManagedJobControllerOwnership:
     """Outer controller generation must be part of a scheduler claim."""
 
@@ -271,6 +315,68 @@ class TestManagedJobControllerOwnership:
             state.ManagedJobScheduleState.DONE.value)
         assert observed_owners == [owner, owner]
 
+    def test_failure_exact_recheck_stays_aggregate_and_preserves_reason(
+            self, _mock_managed_jobs_db_conn, monkeypatch):
+        job_id = self._seed_waiting_job()
+        owner = ('96d9d1f6-8ba4-402b-85f5-27db321fd504', 22)
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+                    controller_pid=111,
+                    controller_pid_started_at=1.0,
+                    controller_instance_id=owner[0],
+                    controller_generation=owner[1]))
+            session.execute(state.spot_table.delete().where(
+                state.spot_table.c.spot_job_id == job_id))
+            session.execute(state.spot_table.insert(), [{
+                'spot_job_id': job_id,
+                'task_id': 0,
+                'task_name': 'active-task',
+                'status': state.ManagedJobStatus.RUNNING.value,
+            }, {
+                'spot_job_id': job_id,
+                'task_id': 1,
+                'task_name': 'succeeded-task',
+                'status': state.ManagedJobStatus.SUCCEEDED.value,
+            }] + [{
+                'spot_job_id': job_id,
+                'task_id': task_id,
+                'task_name': f'succeeded-task-{task_id}',
+                'status': state.ManagedJobStatus.SUCCEEDED.value,
+            } for task_id in range(2, 200)])
+            session.execute(state.spot_table.update().where(
+                state.spot_table.c.spot_job_id == job_id,
+                state.spot_table.c.task_id == 1).values(
+                    failure_reason='older failure'))
+            session.commit()
+
+        monkeypatch.setattr(state, 'get_current_controller_owner',
+                            lambda: owner)
+        monkeypatch.setattr(state, '_lock_current_controller_owner',
+                            lambda _session, _owner: None)
+        _forbid_task_row_materialization(monkeypatch)
+        snapshot = {
+            'schedule_state': state.ManagedJobScheduleState.ALIVE,
+            'controller_pid': 111,
+            'controller_pid_started_at': 1.0,
+            'controller_instance_id': owner[0],
+            'controller_generation': owner[1],
+        }
+
+        assert state.set_failed_controller_if_current_snapshot(
+            job_id, **snapshot, failure_reason='controller died')
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            row = session.execute(
+                sqlalchemy.select(
+                    state.spot_table.c.status,
+                    state.spot_table.c.failure_reason).where(
+                        state.spot_table.c.spot_job_id == job_id).order_by(
+                            state.spot_table.c.task_id.asc())).first()
+        assert row.status == state.ManagedJobStatus.FAILED_CONTROLLER.value
+        assert row.failure_reason == (
+            'controller died. Previously: older failure')
+
     def test_replacement_finishes_terminal_cleanup_from_stale_owner(
             self, _mock_managed_jobs_db_conn, monkeypatch):
         job_id = self._seed_waiting_job()
@@ -313,3 +419,45 @@ class TestManagedJobControllerOwnership:
             current_owner[0],
             current_owner[1],
         )
+
+    def test_terminal_cleanup_exact_recheck_stays_aggregate(
+            self, _mock_managed_jobs_db_conn, monkeypatch):
+        job_id = self._seed_waiting_job()
+        owner = ('96d9d1f6-8ba4-402b-85f5-27db321fd504', 22)
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+                    controller_pid=111,
+                    controller_pid_started_at=1.0,
+                    controller_instance_id=owner[0],
+                    controller_generation=owner[1]))
+            session.execute(state.spot_table.delete().where(
+                state.spot_table.c.spot_job_id == job_id))
+            session.execute(state.spot_table.insert(), [{
+                'spot_job_id': job_id,
+                'task_id': task_id,
+                'task_name': f'task-{task_id}',
+                'status': state.ManagedJobStatus.SUCCEEDED.value,
+                'end_at': 10.0 + task_id,
+            } for task_id in range(200)])
+            session.commit()
+
+        monkeypatch.setattr(state, 'get_current_controller_owner',
+                            lambda: owner)
+        monkeypatch.setattr(state, '_lock_current_controller_owner',
+                            lambda _session, _owner: None)
+        _forbid_task_row_materialization(monkeypatch)
+
+        assert state.finish_controller_cleanup_if_current_snapshot(
+            job_id,
+            schedule_state=state.ManagedJobScheduleState.ALIVE,
+            controller_pid=111,
+            controller_pid_started_at=1.0,
+            controller_instance_id=owner[0],
+            controller_generation=owner[1])
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            row = session.execute(
+                sqlalchemy.select(state.job_info_table.c.schedule_state).where(
+                    state.job_info_table.c.spot_job_id == job_id)).one()
+        assert row.schedule_state == state.ManagedJobScheduleState.DONE.value

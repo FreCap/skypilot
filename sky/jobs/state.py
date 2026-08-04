@@ -1199,6 +1199,37 @@ def _controller_snapshot_conditions(
     ]
 
 
+def _locked_task_recheck_summary(
+    session: orm.Session,
+    job_id: int,
+    terminal_status_values: list[str],
+) -> tuple[int, int, str | None]:
+    """Return one exact locked task summary for destructive refresh writes."""
+    locked_rows = sqlalchemy.select(
+        spot_table.c.task_id,
+        spot_table.c.status,
+        spot_table.c.failure_reason,
+    ).where(spot_table.c.spot_job_id == job_id).with_for_update().subquery()
+    row = session.execute(
+        sqlalchemy.select(
+            sqlalchemy.func.count(  # pylint: disable=not-callable
+                locked_rows.c.task_id).label('task_count'),
+            sqlalchemy.func.sum(
+                sqlalchemy.case(
+                    (~locked_rows.c.status.in_(terminal_status_values), 1),
+                    else_=0)).label('nonterminal_task_count'),
+            sqlalchemy.func.max(
+                sqlalchemy.case((locked_rows.c.failure_reason.is_not(None),
+                                 locked_rows.c.failure_reason),
+                                else_=None)).label('existing_failure_reason'),
+        )).one()
+    return (
+        int(row.task_count or 0),
+        int(row.nonterminal_task_count or 0),
+        row.existing_failure_reason,
+    )
+
+
 def set_failed_controller_if_current_snapshot(
     job_id: int,
     *,
@@ -1221,6 +1252,9 @@ def set_failed_controller_if_current_snapshot(
     if owner is not None and recorded_owner != owner:
         return False
 
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         if owner is not None:
@@ -1237,18 +1271,13 @@ def set_failed_controller_if_current_snapshot(
             session.rollback()
             return False
 
-        task_rows = session.execute(
-            sqlalchemy.select(spot_table.c.status, spot_table.c.failure_reason).
-            where(spot_table.c.spot_job_id == job_id).with_for_update()).all()
-        if not task_rows or all(
-                ManagedJobStatus(row.status).is_terminal()
-                for row in task_rows):
+        task_count, nonterminal_task_count, existing_reason = (
+            _locked_task_recheck_summary(session, job_id,
+                                         terminal_status_values))
+        if task_count == 0 or nonterminal_task_count == 0:
             session.rollback()
             return False
 
-        existing_reason = next(
-            (row.failure_reason for row in task_rows if row.failure_reason),
-            None)
         persisted_reason = failure_reason
         if existing_reason:
             persisted_reason += f'. Previously: {existing_reason}'
@@ -1286,6 +1315,9 @@ def finish_controller_cleanup_if_current_snapshot(
     stamps the completing generation on the durable row.
     """
     owner = get_current_controller_owner()
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         if owner is not None:
@@ -1301,12 +1333,9 @@ def finish_controller_cleanup_if_current_snapshot(
         if job_row is None:
             session.rollback()
             return False
-        task_statuses = session.execute(
-            sqlalchemy.select(spot_table.c.status).where(
-                spot_table.c.spot_job_id ==
-                job_id).with_for_update()).scalars().all()
-        if (not task_statuses or any(not ManagedJobStatus(status).is_terminal()
-                                     for status in task_statuses)):
+        task_count, nonterminal_task_count, _ = _locked_task_recheck_summary(
+            session, job_id, terminal_status_values)
+        if task_count == 0 or nonterminal_task_count > 0:
             session.rollback()
             return False
 
