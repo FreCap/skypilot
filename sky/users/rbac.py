@@ -199,6 +199,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'GET'
     },
     {
+        'path': '/serve/:service_name/pricing',
+        'method': 'GET'
+    },
+    {
         'path': '/serve/logs',
         'method': 'POST'
     },

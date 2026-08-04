@@ -33,9 +33,12 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     execution_quiescence_version = (
         server_constants.MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION)
     assert execution_quiescence_version == 70
+    pricing_version = (server_constants.MIN_SERVE_DASHBOARD_PRICING_API_VERSION)
+    assert pricing_version == 71
     assert (server_constants.MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION
             < server_constants.API_VERSION)
-    assert server_constants.API_VERSION == execution_quiescence_version
+    assert execution_quiescence_version < pricing_version
+    assert server_constants.API_VERSION == pricing_version
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():
@@ -237,3 +240,115 @@ def test_replica_page_validates_query_contract(params):
     response = _client().get('/serve/svc/replicas', params=params)
 
     assert response.status_code == 422
+
+
+def test_pricing_route_passes_raw_repeated_ids_without_executor():
+    payload = {
+        'available': True,
+        'service_name': 'svc',
+        'service_hash': 'hash-a',
+        'observed_at': 42.0,
+        'price_basis': 'version_catalog',
+        'aggregate': None,
+        'replicas': [],
+    }
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_dashboard,
+                           'get_service_pricing',
+                           return_value=payload) as get_pricing, \
+         mock.patch.object(server.executor,
+                           'schedule_request_async',
+                           new_callable=mock.AsyncMock) as schedule:
+        response = _client().get('/serve/svc/pricing',
+                                 params=[('expected_service_hash', 'hash-a'),
+                                         ('replica_id', '7'),
+                                         ('replica_id', '7')])
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    get_pricing.assert_called_once_with('svc', 'hash-a', [7, 7])
+    schedule.assert_not_awaited()
+
+
+def test_pricing_route_no_id_mode_passes_none():
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(
+             server.serve_dashboard,
+             'get_service_pricing',
+             return_value={
+                 'available': True,
+                 'service_name': 'svc',
+                 'service_hash': 'hash-a',
+                 'observed_at': 42.0,
+                 'price_basis': 'version_catalog',
+                 'aggregate': {},
+                 'replicas': [],
+             }) as get_pricing:
+        response = _client().get('/serve/svc/pricing',
+                                 params={'expected_service_hash': 'hash-a'})
+
+    assert response.status_code == 200
+    get_pricing.assert_called_once_with('svc', 'hash-a', None)
+
+
+def test_pricing_route_reports_non_consolidated_capability():
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=False), \
+         mock.patch.object(server.serve_dashboard,
+                           'get_service_pricing') as get_pricing:
+        response = _client().get('/serve/svc/pricing',
+                                 params={'expected_service_hash': 'hash-a'})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'available': False,
+        'reason': 'non_consolidated',
+        'service_name': 'svc',
+        'service_hash': 'hash-a',
+        'observed_at': None,
+        'price_basis': 'version_catalog',
+        'aggregate': None,
+        'replicas': [],
+    }
+    get_pricing.assert_not_called()
+
+
+@pytest.mark.parametrize(('error', 'status_code'), [
+    (serve_dashboard.ServiceNotFoundError('svc'), 404),
+    (serve_dashboard.ServiceHashMismatchError('svc'), 409),
+])
+def test_pricing_route_maps_snapshot_fence_failures(error, status_code):
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_dashboard,
+                           'get_service_pricing',
+                           side_effect=error):
+        response = _client().get('/serve/svc/pricing',
+                                 params={'expected_service_hash': 'hash-a'})
+
+    assert response.status_code == status_code
+
+
+@pytest.mark.parametrize('params', [
+    [],
+    [('expected_service_hash', '')],
+    [('expected_service_hash', 'hash-a'), ('replica_id', '0')],
+    [('expected_service_hash', 'hash-a'), ('replica_id', '-1')],
+    [('expected_service_hash', 'hash-a'), ('replica_id', str(2**31))],
+    [('expected_service_hash', 'hash-a'), ('replica_id', 'not-an-int')],
+    [('expected_service_hash', 'hash-a')] +
+    [('replica_id', str(index + 1)) for index in range(101)],
+])
+def test_pricing_route_validates_raw_query_before_topology(params):
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode') as consolidation:
+        response = _client().get('/serve/svc/pricing', params=params)
+
+    assert response.status_code == 422
+    consolidation.assert_not_called()

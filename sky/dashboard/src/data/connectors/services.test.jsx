@@ -13,6 +13,7 @@ import { apiClient } from '@/data/connectors/client';
 import {
   electServiceVersion,
   getServiceHistory,
+  getServicePricing,
   getServiceReplicaSummaries,
   getServiceReplicas,
   getServicePlacement,
@@ -24,6 +25,7 @@ import {
   normalizeServiceReplicaSummary,
   normalizeServicePlacement,
   normalizeReplica,
+  normalizeServicePricing,
 } from '@/data/connectors/services';
 
 const REQUEST_ID = 'req-123';
@@ -879,6 +881,7 @@ describe('direct replica projections', () => {
         replicas: [
           {
             replica_id: 7,
+            pricing_fingerprint: 'fp-7',
             status: 'FAILED_CLEANUP',
             version: 3,
             created_at: 190,
@@ -906,6 +909,7 @@ describe('direct replica projections', () => {
       replicas: [
         {
           id: 7,
+          pricingFingerprint: 'fp-7',
           status: 'FAILED_CLEANUP',
           createdAt: 190,
           directProjection: true,
@@ -967,6 +971,334 @@ describe('direct replica projections', () => {
     ).resolves.toMatchObject({
       reason: 'non_consolidated',
       legacyFallback: true,
+    });
+  });
+});
+
+describe('persisted service pricing', () => {
+  function pricingResponse(payload, { status = 200, apiVersion = '71' } = {}) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: () => apiVersion },
+      json: async () => payload,
+    };
+  }
+
+  function aggregatePayload(overrides = {}) {
+    return {
+      available: true,
+      service_name: 'svc/name',
+      service_hash: 'hash/a',
+      observed_at: 123,
+      price_basis: 'version_catalog',
+      aggregate: {
+        available: true,
+        unavailable_reason: null,
+        coverage: 'partial',
+        known_hourly_cost: 1.5,
+        spot_hourly_cost: 0.5,
+        non_spot_hourly_cost: 1,
+        tracked_replica_count: 3,
+        priced_replica_count: 2,
+        excluded_replica_count: 1,
+        exclusion_reasons: { missing_version_catalog: 1 },
+      },
+      replicas: [],
+      ...overrides,
+    };
+  }
+
+  it('requests and normalizes an aggregate-only version-catalog projection', async () => {
+    apiClient.get.mockResolvedValue(pricingResponse(aggregatePayload()));
+
+    const result = await getServicePricing({
+      serviceName: 'svc/name',
+      serviceHash: 'hash/a',
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/serve/svc%2Fname/pricing?expected_service_hash=hash%2Fa'
+    );
+    expect(result).toMatchObject({
+      available: true,
+      serviceName: 'svc/name',
+      serviceHash: 'hash/a',
+      priceBasis: 'version_catalog',
+      replicas: [],
+      aggregate: {
+        available: true,
+        coverage: 'partial',
+        estimatedHourlyCost: 1.5,
+        spotHourlyCost: 0.5,
+        nonSpotHourlyCost: 1,
+        costTrackedReplicaCount: 3,
+        pricedReplicaCount: 2,
+        hourlyCostExcludedReplicaCount: 1,
+        hourlyCostExclusionReasons: { missing_version_catalog: 1 },
+      },
+    });
+  });
+
+  it.each([
+    [
+      'empty',
+      {
+        known_hourly_cost: 0,
+        spot_hourly_cost: 0,
+        non_spot_hourly_cost: 0,
+        tracked_replica_count: 0,
+        priced_replica_count: 0,
+        excluded_replica_count: 0,
+        exclusion_reasons: {},
+      },
+    ],
+    [
+      'complete',
+      {
+        known_hourly_cost: 0,
+        spot_hourly_cost: 0,
+        non_spot_hourly_cost: 0,
+        tracked_replica_count: 2,
+        priced_replica_count: 2,
+        excluded_replica_count: 0,
+        exclusion_reasons: {},
+      },
+    ],
+    [
+      'none',
+      {
+        known_hourly_cost: null,
+        spot_hourly_cost: null,
+        non_spot_hourly_cost: null,
+        tracked_replica_count: 2,
+        priced_replica_count: 0,
+        excluded_replica_count: 2,
+        exclusion_reasons: { missing_version_catalog: 2 },
+      },
+    ],
+  ])(
+    'preserves %s coverage instead of conflating it with zero',
+    (coverage, values) => {
+      const normalized = normalizeServicePricing(
+        aggregatePayload({
+          aggregate: {
+            available: true,
+            unavailable_reason: null,
+            coverage,
+            ...values,
+          },
+        })
+      );
+
+      expect(normalized.aggregate).toMatchObject({
+        coverage,
+        estimatedHourlyCost: values.known_hourly_cost,
+        costTrackedReplicaCount: values.tracked_replica_count,
+      });
+    }
+  );
+
+  it('keeps aggregate oversize unavailable without manufacturing totals', () => {
+    const normalized = normalizeServicePricing(
+      aggregatePayload({
+        aggregate: {
+          available: false,
+          unavailable_reason: 'projection_too_large',
+          coverage: null,
+          known_hourly_cost: null,
+          spot_hourly_cost: null,
+          non_spot_hourly_cost: null,
+          tracked_replica_count: null,
+          priced_replica_count: null,
+          excluded_replica_count: null,
+          exclusion_reasons: null,
+        },
+      })
+    );
+
+    expect(normalized.aggregate).toEqual({
+      available: false,
+      unavailableReason: 'projection_too_large',
+      coverage: null,
+      estimatedHourlyCost: null,
+      spotHourlyCost: null,
+      nonSpotHourlyCost: null,
+      costTrackedReplicaCount: null,
+      pricedReplicaCount: null,
+      hourlyCostExcludedReplicaCount: null,
+      hourlyCostExclusionReasons: null,
+    });
+  });
+
+  it('deduplicates row IDs and settles priced, excluded, and absent rows', async () => {
+    apiClient.get.mockResolvedValue(
+      pricingResponse(
+        aggregatePayload({
+          aggregate: null,
+          replicas: [
+            {
+              replica_id: 7,
+              pricing_fingerprint: 'fp-7',
+              hourly_cost: 0,
+              price_source: 'zero_cost_provenance',
+              hourly_cost_exclusion_reason: null,
+            },
+            {
+              replica_id: 8,
+              pricing_fingerprint: 'fp-8',
+              hourly_cost: null,
+              price_source: null,
+              hourly_cost_exclusion_reason: 'missing_version_catalog',
+            },
+            {
+              replica_id: 9,
+              pricing_fingerprint: null,
+              hourly_cost: null,
+              price_source: null,
+              hourly_cost_exclusion_reason: 'not_current_or_uncertain',
+            },
+          ],
+        })
+      )
+    );
+
+    const result = await getServicePricing({
+      serviceName: 'svc/name',
+      serviceHash: 'hash/a',
+      replicaIds: [7, 8, 7, 9],
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/serve/svc%2Fname/pricing?expected_service_hash=hash%2Fa&replica_id=7&replica_id=8&replica_id=9'
+    );
+    expect(result.aggregate).toBeNull();
+    expect(result.replicas).toEqual([
+      {
+        id: 7,
+        pricingFingerprint: 'fp-7',
+        hourlyCost: 0,
+        priceSource: 'zero_cost_provenance',
+        hourlyCostExclusionReason: null,
+      },
+      {
+        id: 8,
+        pricingFingerprint: 'fp-8',
+        hourlyCost: null,
+        priceSource: null,
+        hourlyCostExclusionReason: 'missing_version_catalog',
+      },
+      {
+        id: 9,
+        pricingFingerprint: null,
+        hourlyCost: null,
+        priceSource: null,
+        hourlyCostExclusionReason: 'not_current_or_uncertain',
+      },
+    ]);
+  });
+
+  it('rejects raw oversize and non-positive IDs before contacting the server', async () => {
+    await expect(
+      getServicePricing({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        replicaIds: Array(101).fill(1),
+      })
+    ).rejects.toThrow('at most 100');
+    await expect(
+      getServicePricing({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        replicaIds: [0],
+      })
+    ).rejects.toThrow('positive integers');
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it('rejects overlapping modes, incomplete settlement, and unsafe fingerprints', async () => {
+    apiClient.get.mockResolvedValueOnce(
+      pricingResponse(
+        aggregatePayload({
+          replicas: [
+            {
+              replica_id: 7,
+              pricing_fingerprint: 'fp-7',
+              hourly_cost: 1,
+              price_source: 'version_catalog',
+              hourly_cost_exclusion_reason: null,
+            },
+          ],
+        })
+      )
+    );
+    await expect(
+      getServicePricing({ serviceName: 'svc/name', serviceHash: 'hash/a' })
+    ).rejects.toThrow('response mode was malformed');
+
+    apiClient.get.mockResolvedValueOnce(
+      pricingResponse(
+        aggregatePayload({
+          aggregate: null,
+          replicas: [
+            {
+              replica_id: 7,
+              pricing_fingerprint: 'fp-7',
+              hourly_cost: 1,
+              price_source: 'version_catalog',
+              hourly_cost_exclusion_reason: null,
+            },
+          ],
+        })
+      )
+    );
+    await expect(
+      getServicePricing({
+        serviceName: 'svc/name',
+        serviceHash: 'hash/a',
+        replicaIds: [7, 8],
+      })
+    ).rejects.toThrow('did not settle every replica');
+
+    expect(
+      normalizeServicePricing(
+        aggregatePayload({
+          aggregate: null,
+          replicas: [
+            {
+              replica_id: 7,
+              pricing_fingerprint: null,
+              hourly_cost: 1,
+              price_source: 'version_catalog',
+              hourly_cost_exclusion_reason: null,
+            },
+          ],
+        })
+      )
+    ).toBeNull();
+  });
+
+  it('capability-gates pricing 404s without restoring full status', async () => {
+    apiClient.get.mockResolvedValueOnce(
+      pricingResponse({}, { status: 404, apiVersion: '70' })
+    );
+    await expect(
+      getServicePricing({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).resolves.toMatchObject({
+      available: false,
+      reason: 'unsupported',
+      legacyFallback: false,
+    });
+
+    apiClient.get.mockResolvedValueOnce(
+      pricingResponse({}, { status: 404, apiVersion: '71' })
+    );
+    await expect(
+      getServicePricing({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).resolves.toMatchObject({
+      available: false,
+      reason: 'not_found',
+      legacyFallback: false,
     });
   });
 });

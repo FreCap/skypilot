@@ -1,6 +1,7 @@
 """Spot Placer for SpotHedge."""
 
 import collections
+from collections.abc import Mapping
 import dataclasses
 import enum
 import math
@@ -51,6 +52,9 @@ _PREEMPTION_RETRY_SECONDS_DEFAULT = 600
 _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
 _PLACEMENT_SNAPSHOT_MAX_LOCATIONS = 500
 _PLACEMENT_CATALOG_SCHEMA_VERSION = 1
+# Public reader contract for bounded consumers such as the dashboard.  The
+# placement JSON remains versioned independently of the API wire version.
+PLACEMENT_CATALOG_SCHEMA_VERSION = _PLACEMENT_CATALOG_SCHEMA_VERSION
 _PLACEMENT_CATALOG_MAX_LOCATIONS = 100_000
 
 
@@ -340,6 +344,143 @@ def locations_match_placement(replica_location: Location,
     return True
 
 
+@dataclasses.dataclass(frozen=True)
+class CatalogLocationIndex:
+    """Precomputed pure indexes for exact and legacy catalog matching."""
+
+    exact: dict[Location, tuple[Location, ...]]
+    shape: dict[tuple[str, str, str | None, bool, str], tuple[Location, ...]]
+    coordinates: dict[tuple[str, str, str | None], tuple[Location, ...]]
+
+    @classmethod
+    def from_locations(
+            cls,
+            candidates: typing.Iterable[Location]) -> 'CatalogLocationIndex':
+        exact: dict[Location, list[Location]] = collections.defaultdict(list)
+        shape: dict[tuple[str, str, str | None, bool, str],
+                    list[Location]] = collections.defaultdict(list)
+        coordinates: dict[tuple[str, str, str | None],
+                          list[Location]] = collections.defaultdict(list)
+        # pylint: disable=protected-access
+        for candidate in candidates:
+            exact[candidate].append(candidate)
+            cloud_name = str(candidate.cloud)
+            shape[(cloud_name, candidate.region, candidate.zone,
+                   candidate.use_spot,
+                   candidate._accel_key(
+                       include_instance_type=False))].append(candidate)
+            coordinates[(cloud_name, candidate.region,
+                         candidate.zone)].append(candidate)
+        # pylint: enable=protected-access
+        return cls(
+            exact={
+                key: tuple(value) for key, value in exact.items()
+            },
+            shape={
+                key: tuple(value) for key, value in shape.items()
+            },
+            coordinates={
+                key: tuple(value) for key, value in coordinates.items()
+            },
+        )
+
+    def matches(self, location: Location) -> tuple[Location, ...]:
+        """Return exact or legacy-compatible candidates in priority order."""
+        exact = self.exact.get(location, ())
+        if exact:
+            return exact
+        cloud_name = str(location.cloud)
+        if location.instance_type is None:
+            # pylint: disable=protected-access
+            shape = self.shape.get(
+                (cloud_name, location.region, location.zone, location.use_spot,
+                 location._accel_key(include_instance_type=False)), ())
+            # pylint: enable=protected-access
+            if shape:
+                return shape
+        fully_shape_less = (location.accelerators is None and
+                            location.image_id is None and
+                            location.container_image is None and
+                            location.disk_tier is None and
+                            location.ephemeral_storage is None and
+                            location.instance_type is None)
+        if not fully_shape_less:
+            return ()
+        return self.coordinates.get(
+            (cloud_name, location.region, location.zone), ())
+
+
+def _catalog_location_matches(
+    location: Location,
+    candidates: typing.Iterable[Location] | CatalogLocationIndex,
+) -> list[Location]:
+    """Return exact or legacy-compatible catalog candidates in priority order.
+
+    Exact identity wins.  An instance-type-less row next tries the historical
+    shape identity, and a fully shape-less row finally falls back to exact
+    cloud/region/zone coordinates.  The caller decides whether multiple
+    legacy matches are admissible; dashboard pricing deliberately is strict,
+    while operational placement retains its temporary cheapest-match mode.
+    """
+    if isinstance(candidates, CatalogLocationIndex):
+        return list(candidates.matches(location))
+    if isinstance(candidates, Mapping) and location in candidates:
+        # Preserve SpotPlacer's common exact-key path as O(1). Returning the
+        # supplied identity matches its historical resolve_location behavior.
+        return [location]
+    # Operational placement resolves against mutable status maps. Preserve its
+    # one-pass lookup rather than allocating three full indexes per status
+    # transition; bounded dashboard reads explicitly pass a request-local
+    # prebuilt index above.
+    candidates = list(candidates)
+    exact = [candidate for candidate in candidates if candidate == location]
+    if exact:
+        return exact
+    if location.instance_type is None:
+        # pylint: disable=protected-access
+        shape_matches = [
+            candidate for candidate in candidates
+            if candidate.cloud.is_same_cloud(location.cloud) and candidate.
+            region == location.region and candidate.zone == location.zone and
+            candidate.use_spot == location.use_spot and candidate._accel_key(
+                include_instance_type=False) == location._accel_key(
+                    include_instance_type=False)
+        ]
+        # pylint: enable=protected-access
+        if shape_matches:
+            return shape_matches
+    fully_shape_less = (location.accelerators is None and
+                        location.image_id is None and
+                        location.container_image is None and
+                        location.disk_tier is None and
+                        location.ephemeral_storage is None and
+                        location.instance_type is None)
+    if not fully_shape_less:
+        return []
+    return [
+        candidate for candidate in candidates
+        if candidate.cloud.is_same_cloud(location.cloud) and
+        candidate.region == location.region and candidate.zone == location.zone
+    ]
+
+
+def match_catalog_location_strict(
+    location: Location,
+    candidates: typing.Iterable[Location] | CatalogLocationIndex
+) -> tuple[Location | None, bool]:
+    """Resolve only exact or unambiguous legacy placement identity.
+
+    Returns ``(location, False)`` for a unique match, ``(None, True)`` for an
+    ambiguous legacy match, and ``(None, False)`` when no catalog entry is
+    compatible.  This is pure: it performs no provider, task, or resource
+    lookup.
+    """
+    matches = _catalog_location_matches(location, candidates)
+    if len(matches) == 1:
+        return matches[0], False
+    return None, len(matches) > 1
+
+
 class LocationStatus(enum.Enum):
     """Location Spot Status."""
     ACTIVE = 'ACTIVE'
@@ -351,6 +492,10 @@ class PlacementCatalog:
     """Complete immutable placement candidates and their nominal costs."""
 
     entries: tuple[tuple[Location, float], ...]
+    # The entry cost is per node.  New catalogs persist the task's immutable
+    # node count; None is retained only for catalogs written before this
+    # additive field existed.
+    num_nodes: int | None = None
 
     @staticmethod
     def _serialize_location(location: Location) -> dict[str, Any]:
@@ -441,7 +586,12 @@ class PlacementCatalog:
                                    f'location {location}: {e}')
                     cost = float('inf')
             entries.append((location, cost))
-        return cls(tuple(entries))
+        num_nodes = task.num_nodes
+        if (isinstance(num_nodes, bool) or not isinstance(num_nodes, int) or
+                num_nodes < 1):
+            raise ValueError('Placement catalog num_nodes must be a positive '
+                             f'integer. Got: {num_nodes!r}')
+        return cls(tuple(entries), num_nodes=num_nodes)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> 'PlacementCatalog':
@@ -449,9 +599,17 @@ class PlacementCatalog:
         if not isinstance(data, dict):
             raise ValueError('Placement catalog must be a mapping.')
         schema_version = data.get('schema_version')
-        if schema_version != _PLACEMENT_CATALOG_SCHEMA_VERSION:
+        if (isinstance(schema_version, bool) or
+                not isinstance(schema_version, int) or
+                schema_version != _PLACEMENT_CATALOG_SCHEMA_VERSION):
             raise ValueError('Unsupported placement catalog schema version: '
                              f'{schema_version!r}.')
+        num_nodes = data.get('num_nodes')
+        if (num_nodes is not None and
+            (isinstance(num_nodes, bool) or not isinstance(num_nodes, int) or
+             num_nodes < 1)):
+            raise ValueError('Placement catalog num_nodes must be a positive '
+                             'integer or absent.')
         raw_entries = data.get('entries')
         if not isinstance(raw_entries, list):
             raise ValueError('Placement catalog entries must be a list.')
@@ -481,7 +639,12 @@ class PlacementCatalog:
                 raise ValueError('Placement catalog hourly cost must be a '
                                  'non-negative finite number or null.')
             else:
-                cost = float(raw_cost)
+                try:
+                    cost = float(raw_cost)
+                except OverflowError as exc:
+                    raise ValueError(
+                        'Placement catalog hourly cost must be a non-negative '
+                        'finite number or null.') from exc
                 if not math.isfinite(cost) or cost < 0:
                     raise ValueError('Placement catalog hourly cost must be a '
                                      'non-negative finite number or null.')
@@ -489,16 +652,19 @@ class PlacementCatalog:
         if entries != sorted(entries, key=lambda item: item[0].sort_key()):
             raise ValueError(
                 'Placement catalog entries must be deterministically sorted.')
-        return cls(tuple(entries))
+        return cls(tuple(entries), num_nodes=num_nodes)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             'schema_version': _PLACEMENT_CATALOG_SCHEMA_VERSION,
             'entries': [{
                 'location': self._serialize_location(location),
                 'hourly_cost': cost if math.isfinite(cost) else None,
             } for location, cost in self.entries],
         }
+        if self.num_nodes is not None:
+            result['num_nodes'] = self.num_nodes
+        return result
 
     def costs(self) -> dict[Location, float]:
         """Return a mutable runtime map with one value for every location."""
@@ -844,39 +1010,12 @@ class SpotPlacer:
         all shape fields retain the coordinates-only fallback under the same
         rule.
         """
-        if location in self.location2status:
-            return location
-        if location.instance_type is None:
-            # pylint: disable=protected-access
-            shape_matches = [
-                key for key in self.location2status
-                if key.cloud.is_same_cloud(location.cloud) and
-                key.region == location.region and key.zone == location.zone and
-                key.use_spot == location.use_spot and key._accel_key(
-                    include_instance_type=False) == location._accel_key(
-                        include_instance_type=False)
-            ]
-            # pylint: enable=protected-access
-            if len(shape_matches) == 1:
-                return shape_matches[0]
-            if allow_ambiguous_legacy_shape and shape_matches:
-                return self._min_cost_location(shape_matches)
-        fully_shape_less = (location.accelerators is None and
-                            location.image_id is None and
-                            location.container_image is None and
-                            location.disk_tier is None and
-                            location.ephemeral_storage is None and
-                            location.instance_type is None)
-        if not fully_shape_less:
-            return None
-        matches = [
-            key for key in self.location2status
-            if key.cloud.is_same_cloud(location.cloud) and
-            key.region == location.region and key.zone == location.zone
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        if allow_ambiguous_legacy_shape and matches:
+        resolved, ambiguous = match_catalog_location_strict(
+            location, self.location2status)
+        if resolved is not None:
+            return resolved
+        if allow_ambiguous_legacy_shape and ambiguous:
+            matches = _catalog_location_matches(location, self.location2status)
             return self._min_cost_location(matches)
         return None
 
