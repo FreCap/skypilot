@@ -2,6 +2,9 @@
 {{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $haEnabled := get $haConfig "enabled" | default false -}}
+{{- $rollingUpdate := .Values.apiService.rollingUpdate | default (dict) -}}
+{{- $rollingUpdateMaxSurge := dig "maxSurge" 1 $rollingUpdate -}}
+{{- $rollingUpdateMaxUnavailable := dig "maxUnavailable" 0 $rollingUpdate -}}
 {{- if and (not .Values.storage.enabled) (not (empty (get .Values.storage "existingClaim"))) -}}
 {{- fail "storage.existingClaim requires storage.enabled=true" -}}
 {{- end -}}
@@ -199,6 +202,13 @@
 {{- if ne .Values.apiService.upgradeStrategy "RollingUpdate" -}}
 {{- fail "apiService.highAvailability.enabled=true requires apiService.upgradeStrategy=RollingUpdate" -}}
 {{- end -}}
+{{- $rollingUpdateMaxUnavailableString := toString $rollingUpdateMaxUnavailable -}}
+{{- if and (ne $rollingUpdateMaxUnavailableString "0") (ne $rollingUpdateMaxUnavailableString "0%") -}}
+{{- fail "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxUnavailable=0 or 0%" -}}
+{{- end -}}
+{{- if ne (toString $rollingUpdateMaxSurge) "1" -}}
+{{- fail "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1" -}}
+{{- end -}}
 {{- if not .Values.storage.enabled -}}
 {{- fail "apiService.highAvailability.enabled=true requires storage.enabled=true" -}}
 {{- end -}}
@@ -253,6 +263,10 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.apiService.replicas }}
+  {{- if $haEnabled }}
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  {{- end }}
   {{- if eq .Values.apiService.upgradeStrategy "RollingUpdate" }}
   {{- if and (not .Values.apiService.dbConnectionSecretName) (not .Values.apiService.dbConnectionString) }}
   {{- fail "External database must be configured via .apiService.dbConnectionSecretName or .apiService.dbConnectionString when using RollingUpdate strategy" }}
@@ -260,14 +274,13 @@ spec:
   {{- if and .Values.storage.enabled (ne .Values.storage.accessMode "ReadWriteMany") }}
   {{- fail "Local storage with ReadWriteOnce access mode is not supported when using RollingUpdate strategy. Either use Recreate upgrade strategy, set storage.enabled to false, or use ReadWriteMany access mode with a compatible storage class (e.g., NFS-backed storage like Google Filestore)." }}
   {{- end }}
-  {{- $rollingUpdate := .Values.apiService.rollingUpdate | default (dict) }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
       {{- /* dig (not `default`) so an explicit 0 is honored — Go templates treat
              0 as empty, which would silently fall back to the default. */}}
-      maxSurge: {{ dig "maxSurge" 1 $rollingUpdate }}
-      maxUnavailable: {{ dig "maxUnavailable" 0 $rollingUpdate }}
+      maxSurge: {{ $rollingUpdateMaxSurge }}
+      maxUnavailable: {{ $rollingUpdateMaxUnavailable }}
   {{- else }}
   strategy:
     type: Recreate

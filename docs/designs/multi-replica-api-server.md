@@ -1,12 +1,12 @@
 # Production-Grade Multi-Replica API Server
 
 Status: M0-M4 merged in PR #1070 and live-accepted on the isolated deployment;
-the split-role metrics-completeness correction is merged; the Rainier
-production storage/request-store cutover and live scrape acceptance are
-pending; production fleet rollout and M5 compatibility cleanup remain
-fleet-gated
+the split-role metrics-completeness correction is merged and Rainier's
+PostgreSQL request-store cutover is complete; the Rainier RWX storage,
+role-split HA, and live scrape acceptance are pending; production fleet rollout
+and M5 compatibility cleanup remain fleet-gated
 
-Last updated: 2026-08-04
+Last updated: 2026-08-07
 
 Canonical owner: this file. External plans and pull request descriptions must
 link here rather than restating a divergent contract.
@@ -48,6 +48,13 @@ still has one API replica, `apiService.highAvailability.enabled=false`,
 EBS CSI driver and no RWX storage class. Production activation therefore
 requires an infrastructure and data migration; changing only the Deployment
 strategy is invalid and the chart correctly rejects it.
+
+Rainier completed the one-way PostgreSQL request-store cutover in release
+1.1.1089. As of 2026-08-07 its production configuration keeps that backend and
+durable cutover gate explicit, but still uses one all-role API pod with
+`Recreate` and the 200-Gi `gp2` claim with the chart's `ReadWriteOnce` default.
+The request-store prerequisite is therefore complete; the RWX state migration,
+role split, and guarded rolling activation remain pending.
 
 That preflight also records the operational reason to complete the migration.
 One Recreate upgrade produced a 94-second interval with no Ready API pod, and a
@@ -545,9 +552,22 @@ The chart enforces:
   default claim in that mode. The declared `storage.accessMode` remains part of
   the HA guard, and rollout preflight must separately prove the live referenced
   claim is bound and actually advertises `ReadWriteMany`.
-- RollingUpdate uses `maxUnavailable: 0`.
-- API Deployments set `minReadySeconds`, a bounded progress deadline, pre-stop
-  drain, and a termination grace period longer than the drain budget.
+- Guarded HA pins RollingUpdate to zero unavailable replicas
+  (`maxUnavailable: 0` or `0%`) and an absolute `maxSurge: 1`.
+  Compatibility-mode RollingUpdate retains its existing configurable values,
+  but HA rendering fails before producing manifests when either invariant is
+  violated. The absolute single surge gives every role a replacement slot
+  without allowing percentage rounding or an operator override to multiply its
+  per-role temporary capacity. Helm and the post-seed reconciler may roll all
+  three Deployments concurrently, so rollout preflight must prove aggregate
+  cluster headroom for one surge API, executor, and controller pod (up to three
+  temporary pods), not one temporary pod total.
+- Guarded API Deployments set `minReadySeconds: 10` and
+  `progressDeadlineSeconds: 600`, in addition to the pre-stop drain and a
+  termination grace period longer than the drain budget. Ten continuously
+  Ready seconds keep a newly started endpoint from immediately consuming the
+  old pod's availability slot; the finite progress deadline matches the
+  control-plane module's 600-second Helm and rollout-status budget.
 - API Service selectors match only API pods.
 - API, executor, and controller Deployments have distinct labels and commands.
 - With `apiService.metrics.enabled=true`, all three Deployments expose the
@@ -561,6 +581,16 @@ The chart enforces:
   on one node when the cluster has capacity.
 - PodDisruptionBudgets preserve one API, executor, and controller pod.
 - Migration hooks finish before Deployments roll.
+- A successful DB-backed config seed restarts and waits for the API, executor,
+  and controller Deployments when guarded HA is active, because every split
+  role loads shared server configuration in memory. Compatibility mode retains
+  its API-only restart and wait. Reconciliation is complete only after every
+  selected Deployment reports a successful rollout within the same bounded
+  600-second per-Deployment budget.
+- The reusable control-plane module owns workload naming and rejects Helm
+  `fullnameOverride`; callers use its `release_name` input so rendered service
+  accounts and Deployments match Terraform-managed identities and post-seed
+  reconciliation targets.
 - A revision-specific migration Job is removed after success and retained long
   enough on failure for diagnosis.
 - The test deployment creates an isolated `skypilot-ha-efs` StorageClass using
@@ -1885,3 +1915,23 @@ metrics listener cannot bind, and a post-start listener failure terminates the
 role; both runtime and Helm validation reject a role-health and metrics port
 collision. Rollout acceptance treats every role target and scrape interval as
 required evidence.
+
+### Review 13: guarded-rollout completion
+
+The exact-head rollout review found that the control-plane module's post-seed
+reconciler targets Deployments derived from `release_name`, while the chart
+also permits `fullnameOverride`. A caller using that escape hatch could seed
+the database successfully and then fail to restart the actual workloads,
+leaving stale configuration in memory. Deriving only the Deployment names
+dynamically would still leave Terraform-managed workload identities pointing
+at the release-derived service account, so the module now rejects
+`fullnameOverride` and retains `release_name` as its single naming authority.
+
+The same review made the capacity boundary explicit. Both Helm and the
+post-seed reconciler may roll API, executor, and controller Deployments at the
+same time. `maxSurge: 1` is therefore a per-role bound, not a whole-release
+bound, and activation must prove aggregate headroom for as many as three surge
+pods. Serializing only post-seed waits would not protect Helm upgrades. The HA
+guard accepts the equivalent zero-unavailable forms `0` and `0%`, but keeps
+the surge bound as absolute integer `1` so percentage rounding cannot silently
+increase temporary capacity. Focused boundary tests cover all three choices.

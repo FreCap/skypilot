@@ -486,7 +486,7 @@ class ControlPlaneModuleSourceTest(unittest.TestCase):
             self.config_seed_hcl,
         )
 
-    def test_api_restart_uses_helm_readiness_budget(self) -> None:
+    def test_role_restarts_use_helm_readiness_budget(self) -> None:
         self.assertRegex(
             self.config_seed_hcl,
             r'(?m)^\s*api_server_rollout_timeout_seconds\s*=\s*600$',
@@ -500,6 +500,25 @@ class ControlPlaneModuleSourceTest(unittest.TestCase):
             r'(?m)^\s*timeout\s*=\s*'
             r'local\.api_server_rollout_timeout_seconds$',
         )
+
+    def test_config_reconcile_selects_split_roles_from_helm_ha(self) -> None:
+        self.assertIn(
+            'split_role_high_availability_enabled = try(',
+            self.module_hcl,
+        )
+        self.assertIn(
+            'local.extra_helm_values_decoded.apiService.highAvailability.'
+            'enabled == true',
+            self.module_hcl,
+        )
+        self.assertIn(
+            'SKYPILOT_HIGH_AVAILABILITY_ENABLED                   = '
+            'tostring(local.split_role_high_availability_enabled)',
+            self.config_seed_hcl,
+        )
+        self.assertIn('deployment_suffixes=(api-server)', self.config_seed_hcl)
+        self.assertIn('deployment_suffixes+=(executor controller)',
+                      self.config_seed_hcl)
 
 
 if __name__ == '__main__':

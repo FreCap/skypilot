@@ -181,3 +181,15 @@ run "rejects_request_store_from_escape_hatch" {
 
   expect_failures = [helm_release.skypilot]
 }
+
+run "rejects_fullname_override_from_escape_hatch" {
+  command = plan
+
+  variables {
+    extra_helm_values = <<-EOT
+      fullnameOverride: renamed-control-plane
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}

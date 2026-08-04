@@ -124,9 +124,21 @@ The module therefore runs a Kubernetes Job that locks and updates the
 Any script, desired configuration, pruning-mode, or helper-image change creates
 a new immutable seed Job. Only script, configuration, or pruning-mode changes
 advance `config_generation`; after a successful seed, a bounded local-exec
-restarts and waits for `<release_name>-api-server`. Helper-image-only changes
+restarts and waits for `<release_name>-api-server` in compatibility mode. When
+`apiService.highAvailability.enabled=true`, it restarts all three split-role
+Deployments (`api-server`, `executor`, and `controller`) and waits for each
+within the same 600-second per-Deployment budget. Helper-image-only changes
 therefore update the Job and any enabled login init containers without causing
-a second API rollout after Helm has already rolled the pod template.
+a second runtime rollout after Helm has already rolled the pod templates.
+The reconciler issues all selected restarts before waiting, and Helm may also
+roll the three Deployments concurrently. HA rollout preflight must therefore
+prove aggregate cluster headroom for one temporary surge pod per role (up to
+three temporary pods), not one surge pod total.
+
+The module owns the chart workload names as well as their cloud identities.
+Set `release_name` to choose that name; `extra_helm_values.fullnameOverride` is
+rejected so the rendered service account and Deployments cannot diverge from
+the identities and post-seed reconciliation targets managed by Terraform.
 
 Existing state created before this split has an image-coupled
 `config_generation`. If the API server has already rolled to the desired image,
