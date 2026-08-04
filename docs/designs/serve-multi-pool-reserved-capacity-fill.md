@@ -211,6 +211,36 @@ Malformed protocol-v2 rows remain identity-uncertain and are never downgraded
 into the legacy phase. One round continues to perform one UID proof per
 physical v2 pool.
 
+Each service controller owns one exclusive provider-reconciliation
+coordinator. Recovery, job-status reconciliation, complete readiness-probe
+rounds, load-balancer route synchronization and standalone active-URL reads,
+the launch/down mutation refresher, autoscaler scale-down and logical-drain
+reconciliation, route-prober-triggered teardown, and the provider portion of
+each deferred down worker all enroll in that coordinator. Any path that also
+needs the replica manager's state lock acquires the coordinator first and
+`self.lock` second. This order is invariant: a lock-holding reconciliation may
+not wait for an opposite provider phase while another reconciliation holds
+that phase and waits for `self.lock`.
+
+The per-controller coordinator serializes complete mixed rounds; the
+process-global same-mode phase gate still prevents an enrolled v2 provider
+phase from overlapping an enrolled ordinary/tokenless phase in another
+controller or a no-manager worker. The v2 reserved-capacity poller enrolls its
+actual observation in that process phase before entering the broker's
+round-lock callback. It does not acquire the process phase while already
+holding the broker lock. Provider-bearing worker futures inherit their exact
+per-row lease explicitly and are fully joined before their round and phase are
+released. One batch owner proves each physical v2 pool once per phase.
+
+Coordinator ownership covers provider reconciliation, not unrelated latency.
+It is never held across a deferred drain sleep or across the asynchronous
+launch HTTP request. A down worker waits for its drain first, then acquires the
+coordinator around the actual provider operation and reconstructs its durable
+v2 fence (or enters the ordinary phase). A launch failure follows the same
+rule for its immediate cleanup. Thus long user-visible drains and remote
+launches do not stop status/scaling progress, while every local Kubernetes
+operation remains ordered with mixed lifecycle phases.
+
 An independent broker UID discovery that encounters the typed
 owner-or-initializer collision waits at most 30 seconds for that context to
 become ambient again, using one absolute monotonic deadline across capture
@@ -1102,6 +1132,15 @@ Automated coverage must include:
   futures and exceptional/early-return paths fully join and retire owners,
   malformed v2 rows never enter the legacy phase, shared reduction preserves
   fleet state, and one UID proof is performed per v2 pool per round;
+- coordinator barrier tests overlap recovery, job status, probe, cold/warm LB
+  route sync and active-URL reads, mutation refresh, physical/logical
+  scale-down, route-retirement teardown, and deferred provider cleanup;
+  provider-bearing paths serialize before `self.lock`, while drain sleeps and
+  asynchronous launch HTTP do not hold the coordinator, and exceptional paths
+  release both coordinator and process phase for the next reconciliation;
+- v2 broker observations enter the process phase before the broker callback,
+  never while its round lock is already held, and one observation performs one
+  UID proof for each physical pool;
 - broker UID discovery waits only for the typed active owner/initializer
   collision, wakes on successful or failed retirement, survives repeated
   capture replacement with one 30-second absolute deadline, rejects a caller
