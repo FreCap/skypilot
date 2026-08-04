@@ -18,6 +18,44 @@ function isNodeNotReadyForGpus(nodeData) {
   return !isReady || isCordoned || isTainted;
 }
 
+/**
+ * Zero-valued preemptible accounting for a fresh per-GPU-type aggregate.
+ */
+function emptyPreemptible() {
+  return { gpu_preemptible: 0, gpu_preemptible_breakdown: {} };
+}
+
+/**
+ * Fold a node's preemptible accelerator counts into a per-GPU-type aggregate.
+ *
+ * Not-ready nodes are skipped: their whole capacity is already reported as
+ * `gpu_not_ready`, so it is not part of the used block that the preemptible
+ * segment subdivides, and counting it here would overdraw the bar.
+ */
+function addPreemptibleFromNode(aggregate, nodeData, isNodeNotReady) {
+  if (isNodeNotReady) return;
+  aggregate.gpu_preemptible += nodeData['accelerators_preemptible'] || 0;
+  const breakdown = nodeData['preemptible_breakdown'];
+  if (!breakdown) return;
+  for (const [label, qty] of Object.entries(breakdown)) {
+    aggregate.gpu_preemptible_breakdown[label] =
+      (aggregate.gpu_preemptible_breakdown[label] || 0) + qty;
+  }
+}
+
+/**
+ * Fold one per-GPU-type aggregate's preemptible accounting into another.
+ */
+function mergePreemptible(target, source) {
+  target.gpu_preemptible += source.gpu_preemptible || 0;
+  for (const [label, qty] of Object.entries(
+    source.gpu_preemptible_breakdown || {}
+  )) {
+    target.gpu_preemptible_breakdown[label] =
+      (target.gpu_preemptible_breakdown[label] || 0) + qty;
+  }
+}
+
 // Fetch GPU data for a single context - used for progressive loading
 // Returns processed GPU data for one context that can be merged into state
 export async function getContextGPUData(context) {
@@ -53,6 +91,8 @@ export async function getContextGPUData(context) {
           memory_gb: nodeData['memory_gb'] ?? null,
           cpu_free: nodeData['cpu_free'] ?? null,
           memory_free_gb: nodeData['memory_free_gb'] ?? null,
+          gpu_preemptible: nodeData['accelerators_preemptible'] ?? null,
+          gpu_preemptible_breakdown: nodeData['preemptible_breakdown'] ?? null,
         });
 
         // Aggregate GPU data per context
@@ -65,6 +105,7 @@ export async function getContextGPUData(context) {
               gpu_free: 0,
               gpu_not_ready: 0,
               context: context,
+              ...emptyPreemptible(),
             };
           }
           gpuToData[gpuName].gpu_total += totalCount;
@@ -72,6 +113,7 @@ export async function getContextGPUData(context) {
           if (isNodeNotReady) {
             gpuToData[gpuName].gpu_not_ready += totalCount;
           }
+          addPreemptibleFromNode(gpuToData[gpuName], nodeData, isNodeNotReady);
           gpuToData[gpuName].gpu_requestable_qty_per_node = totalCount;
         }
       }
@@ -177,6 +219,7 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
                 gpu_free: 0,
                 gpu_not_ready: 0,
                 context: context,
+                ...emptyPreemptible(),
               };
             }
             gpuToData[gpuName].gpu_total += totalCount;
@@ -184,6 +227,11 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
             if (isNodeNotReady) {
               gpuToData[gpuName].gpu_not_ready += totalCount;
             }
+            addPreemptibleFromNode(
+              gpuToData[gpuName],
+              nodeData,
+              isNodeNotReady
+            );
             gpuToData[gpuName].gpu_requestable_qty_per_node = totalCount;
           }
         }
@@ -194,12 +242,17 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
             allGPUsSummary[gpuName].gpu_free += gpuToData[gpuName].gpu_free;
             allGPUsSummary[gpuName].gpu_not_ready +=
               gpuToData[gpuName].gpu_not_ready;
+            mergePreemptible(allGPUsSummary[gpuName], gpuToData[gpuName]);
           } else {
             allGPUsSummary[gpuName] = {
               gpu_total: gpuToData[gpuName].gpu_total,
               gpu_free: gpuToData[gpuName].gpu_free,
               gpu_not_ready: gpuToData[gpuName].gpu_not_ready,
               gpu_name: gpuName,
+              gpu_preemptible: gpuToData[gpuName].gpu_preemptible,
+              gpu_preemptible_breakdown: {
+                ...gpuToData[gpuName].gpu_preemptible_breakdown,
+              },
             };
           }
         }
@@ -255,6 +308,9 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
             is_ready: nodeIsReady,
             is_cordoned: nodeIsCordoned,
             taints: nodeTaints,
+            gpu_preemptible: nodeData['accelerators_preemptible'] ?? null,
+            gpu_preemptible_breakdown:
+              nodeData['preemptible_breakdown'] ?? null,
           };
 
           // If this node provides a GPU type not found via GPU availability,
@@ -272,6 +328,7 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
                 gpu_free: 0,
                 gpu_not_ready: 0,
                 gpu_name: acceleratorType,
+                ...emptyPreemptible(),
               };
             }
             const existingGpuEntry = perContextGPUsData[context].find(
@@ -285,6 +342,7 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
                 gpu_total: 0,
                 gpu_free: 0,
                 context: context,
+                ...emptyPreemptible(),
               });
             }
           }

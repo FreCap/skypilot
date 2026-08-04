@@ -73,6 +73,55 @@ describe('Kubernetes infrastructure gateway characterization', () => {
     expect(getContextGPUData).toBe(getContextGPUDataDirect);
   });
 
+  it('sums preemptible accelerators across the nodes of a GPU type', async () => {
+    apiClient.post.mockResolvedValue(dispatchResponse('node-request'));
+    apiClient.get.mockResolvedValue(
+      resultResponse({
+        'node-a': {
+          name: 'node-a',
+          accelerator_type: 'A100',
+          total: { accelerator_count: 8 },
+          free: { accelerators_available: 0 },
+          is_ready: true,
+          accelerators_preemptible: 5,
+          preemptible_breakdown: { 'inference-low (-1000)': 5 },
+        },
+        'node-b': {
+          name: 'node-b',
+          accelerator_type: 'A100',
+          total: { accelerator_count: 8 },
+          free: { accelerators_available: 1 },
+          is_ready: true,
+          accelerators_preemptible: 3,
+          preemptible_breakdown: {
+            'inference-low (-1000)': 2,
+            'drill (-500)': 1,
+          },
+        },
+        // Not ready: its capacity is reported whole as `gpu_not_ready`, so its
+        // preemptible count must not also land in the used split.
+        'node-c': {
+          name: 'node-c',
+          accelerator_type: 'A100',
+          total: { accelerator_count: 8 },
+          free: { accelerators_available: 0 },
+          is_ready: false,
+          accelerators_preemptible: 8,
+          preemptible_breakdown: { 'inference-low (-1000)': 8 },
+        },
+      })
+    );
+
+    const { perContextGPUs } = await getContextGPUData('prod');
+    expect(perContextGPUs).toHaveLength(1);
+    expect(perContextGPUs[0].gpu_preemptible).toBe(8);
+    expect(perContextGPUs[0].gpu_preemptible_breakdown).toEqual({
+      'inference-low (-1000)': 7,
+      'drill (-500)': 1,
+    });
+    expect(perContextGPUs[0].gpu_not_ready).toBe(8);
+  });
+
   it('submits and polls once while preserving node readiness projection', async () => {
     apiClient.post.mockResolvedValue(dispatchResponse('node-request'));
     apiClient.get.mockResolvedValue(
@@ -111,6 +160,8 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_free: 2,
           gpu_not_ready: 4,
           context: 'prod',
+          gpu_preemptible: 0,
+          gpu_preemptible_breakdown: {},
         },
         {
           gpu_name: 'A100',
@@ -119,6 +170,8 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_free: 1,
           gpu_not_ready: 2,
           context: 'prod',
+          gpu_preemptible: 0,
+          gpu_preemptible_breakdown: {},
         },
       ],
       perNodeGPUs: [
@@ -136,6 +189,8 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           memory_gb: 64,
           cpu_free: 8,
           memory_free_gb: 32,
+          gpu_preemptible: null,
+          gpu_preemptible_breakdown: null,
         },
         {
           node_name: 'node-a',
@@ -151,6 +206,8 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           memory_gb: null,
           cpu_free: null,
           memory_free_gb: null,
+          gpu_preemptible: null,
+          gpu_preemptible_breakdown: null,
         },
       ],
       error: null,
@@ -231,6 +288,8 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_free: 3,
           gpu_not_ready: 0,
           gpu_name: 'L4',
+          gpu_preemptible: 0,
+          gpu_preemptible_breakdown: {},
         },
       ],
       perContextGPUs: [
@@ -241,6 +300,8 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_free: 3,
           gpu_not_ready: 0,
           context: 'alpha',
+          gpu_preemptible: 0,
+          gpu_preemptible_breakdown: {},
         },
       ],
       perNodeGPUs: [
@@ -258,6 +319,8 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           is_ready: true,
           is_cordoned: false,
           taints: [],
+          gpu_preemptible: null,
+          gpu_preemptible_breakdown: null,
         },
       ],
       contextStats: {},
