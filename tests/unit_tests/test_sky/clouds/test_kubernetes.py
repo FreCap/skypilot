@@ -1,5 +1,6 @@
 """Tests for Kubernetes cloud implementation."""
 
+import contextvars
 import copy
 import os
 import unittest
@@ -2619,6 +2620,32 @@ class TestKubernetesUnsupportedFeaturesForResources(unittest.TestCase):
         """Set up test fixtures."""
         # Clear any cached results
         kubernetes.Kubernetes.logged_unreachable_contexts.clear()
+
+    def test_feature_probe_threads_copy_context(self):
+        marker = contextvars.ContextVar('kubernetes_feature_probe_marker',
+                                        default='unset')
+        marker.set('fenced')
+        observed = []
+
+        def get_spot_label(_context):
+            observed.append(marker.get())
+            return None, None
+
+        def detect_network_type(_context, _network_tier):
+            observed.append(marker.get())
+            return (kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE,
+                    None)
+
+        resources = mock.MagicMock(region='test-context', network_tier=None)
+        with patch('sky.provision.kubernetes.utils.get_spot_label',
+                   side_effect=get_spot_label), patch.object(
+                       kubernetes.Kubernetes,
+                       '_detect_network_type',
+                       side_effect=detect_network_type):
+            kubernetes.Kubernetes._unsupported_features_for_resources(
+                resources, region='test-context')
+
+        self.assertCountEqual(observed, ['fenced', 'fenced'])
 
     @patch('sky.clouds.kubernetes.Kubernetes.existing_allowed_contexts')
     @patch('sky.provision.kubernetes.utils.get_spot_label')

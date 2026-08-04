@@ -16,6 +16,7 @@ from sky import provision
 from sky import resources as resources_lib
 from sky import sky_logging
 from sky.adaptors import aws
+from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.jobs.server import utils as server_jobs_utils
 from sky.provision import common as provision_common
@@ -182,6 +183,11 @@ def bulk_provision(
         except exceptions.ExecutionPausedError:
             # Pausing to wait on an external condition: keep the resources for
             # resume, do not tear down.
+            raise
+        except kubernetes_adaptor.KubernetesPhysicalClusterIdentityError:
+            # The kubeconfig target changed after durable placement. Cleanup
+            # through that alias could mutate the replacement cluster, so
+            # propagate the fail-closed signal without provider teardown.
             raise
         except Exception as exc:  # pylint: disable=broad-except
             zone_str = 'all zones'

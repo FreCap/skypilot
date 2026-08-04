@@ -8,16 +8,32 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
 from unittest import mock
 
 import paramiko
 import pytest
 
 from sky import exceptions
+from sky.adaptors import kubernetes
 from sky.utils import auth_utils
 from sky.utils import command_runner
 from sky.utils import common_utils
 from sky.utils import interactive_utils
+
+
+def _physical_cluster_command_target(
+        *,
+        context_name: str = 'ctx',
+        provider_context: str | None = 'ctx',
+        kubeconfig_path: str | None = '/tmp/capture-kubeconfig',
+        in_cluster: bool = False) -> types.SimpleNamespace:
+    return types.SimpleNamespace(context_name=context_name,
+                                 provider_context=provider_context,
+                                 expected_uid='physical-uid',
+                                 kubeconfig_path=kubeconfig_path,
+                                 in_cluster=in_cluster,
+                                 token='capture-token')
 
 
 def test_docker_runner_passes_proxy_command_to_inner_hop() -> None:
@@ -407,6 +423,210 @@ def test_kubernetes_runner_rsync_does_not_set_exec_container_envvar_by_default(
         runner.rsync('/tmp/src', '/tmp/dst', up=True, stream_logs=False)
 
     assert 'SKYPILOT_K8S_EXEC_CONTAINER=' not in captured['command']
+
+
+def test_kubernetes_runner_run_uses_capture_pinned_target(monkeypatch) -> None:
+    captured = {}
+    target = _physical_cluster_command_target()
+    monkeypatch.setenv('KUBECONFIG', '/tmp/ambient-retarget')
+
+    def fake_run_with_log(command: str, *args, **kwargs):
+        del args, kwargs
+        captured['command'] = command
+        return 0, '', ''
+
+    with mock.patch(
+            'sky.adaptors.kubernetes.active_physical_cluster_command_target',
+            return_value=target) as get_target, \
+         mock.patch.object(command_runner.log_lib,
+                           'run_with_log',
+                           side_effect=fake_run_with_log):
+        runner = command_runner.KubernetesCommandRunner((('ns', 'ctx'), 'pod'))
+        runner.run('echo hello', require_outputs=True, stream_logs=False)
+
+    get_target.assert_called_once_with('ctx')
+    command = captured['command']
+    assert '--kubeconfig /tmp/capture-kubeconfig --context ctx' in command
+    assert '/tmp/ambient-retarget' not in command
+
+
+def test_kubernetes_runner_port_forward_uses_capture_pinned_target(
+        monkeypatch) -> None:
+    target = _physical_cluster_command_target()
+    monkeypatch.setenv('KUBECONFIG', '/tmp/ambient-retarget')
+
+    with mock.patch(
+            'sky.adaptors.kubernetes.active_physical_cluster_command_target',
+            return_value=target) as get_target:
+        runner = command_runner.KubernetesCommandRunner((('ns', 'ctx'), 'pod'))
+        command = runner.port_forward_command([(1234, 5678)])
+
+    get_target.assert_called_once_with('ctx')
+    kubeconfig_index = command.index('--kubeconfig')
+    assert command[kubeconfig_index:kubeconfig_index + 4] == [
+        '--kubeconfig', '/tmp/capture-kubeconfig', '--context', 'ctx'
+    ]
+    assert '/tmp/ambient-retarget' not in command
+
+
+def test_kubernetes_runner_rsync_exports_capture_pinned_target(
+        monkeypatch) -> None:
+    captured = {}
+    target = _physical_cluster_command_target()
+    monkeypatch.setenv('KUBECONFIG', '/tmp/ambient-retarget')
+
+    def fake_run_with_log(command: str, *args, **kwargs):
+        del args, kwargs
+        captured['command'] = command
+        return 0, '', ''
+
+    with mock.patch(
+            'sky.adaptors.kubernetes.active_physical_cluster_command_target',
+            return_value=target) as get_target, \
+         mock.patch.object(command_runner.log_lib,
+                           'run_with_log',
+                           side_effect=fake_run_with_log):
+        runner = command_runner.KubernetesCommandRunner((('ns', 'ctx'), 'pod'))
+        runner.rsync('/tmp/src', '/tmp/dst', up=True, stream_logs=False)
+
+    get_target.assert_called_once_with('ctx')
+    command = captured['command']
+    assert ('SKYPILOT_K8S_KUBECONFIG=/tmp/capture-kubeconfig '
+            'SKYPILOT_K8S_CONTEXT=ctx ') in command
+    assert '/tmp/ambient-retarget' not in command
+
+
+def test_kubernetes_runner_in_cluster_fence_keeps_in_cluster_kubectl(
+        monkeypatch) -> None:
+    captured = {}
+    target = _physical_cluster_command_target(context_name='in-cluster',
+                                              provider_context=None,
+                                              kubeconfig_path=None,
+                                              in_cluster=True)
+
+    def fake_run_with_log(command: str, *args, **kwargs):
+        del args, kwargs
+        captured['command'] = command
+        return 0, '', ''
+
+    with mock.patch(
+            'sky.adaptors.kubernetes.active_physical_cluster_command_target',
+            return_value=target) as get_target, \
+         mock.patch.object(command_runner.log_lib,
+                           'run_with_log',
+                           side_effect=fake_run_with_log):
+        runner = command_runner.KubernetesCommandRunner((('ns', None), 'pod'))
+        runner.run('echo hello', require_outputs=True, stream_logs=False)
+
+    get_target.assert_called_once_with(None)
+    assert '--kubeconfig /dev/null' in captured['command']
+    assert '--context' not in captured['command']
+    assert 'capture-kubeconfig' not in captured['command']
+
+
+def test_kubernetes_runner_rejects_cross_context_command_before_subprocess(
+) -> None:
+    """A command cannot escape an active fence through another context."""
+    token_reset = kubernetes._PHYSICAL_CLUSTER_UID_FENCE_TOKENS.set({  # pylint: disable=protected-access
+        'context-a': 'token-a'
+    })
+    try:
+        runner = command_runner.KubernetesCommandRunner(
+            (('ns', 'context-b'), 'pod'))
+        with mock.patch.object(command_runner.log_lib,
+                               'run_with_log') as run_with_log, \
+             pytest.raises(
+                 exceptions.KubernetesPhysicalClusterIdentityError,
+                 match='unleased context'):
+            runner.run('echo hello')
+    finally:
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_TOKENS.reset(token_reset)  # pylint: disable=protected-access
+
+    run_with_log.assert_not_called()
+
+
+@pytest.mark.parametrize('operation', ['run', 'port-forward', 'rsync'])
+def test_kubernetes_runner_mismatched_capture_fails_before_subprocess(
+        operation) -> None:
+    # An external fence without its capture file is malformed. The runner must
+    # not fall back to `--context ctx`, even when an ambient kubeconfig exists.
+    target = _physical_cluster_command_target(kubeconfig_path=None)
+    runner = command_runner.KubernetesCommandRunner((('ns', 'ctx'), 'pod'))
+
+    with mock.patch(
+            'sky.adaptors.kubernetes.active_physical_cluster_command_target',
+            return_value=target), \
+         mock.patch.object(command_runner.log_lib,
+                           'run_with_log') as run_with_log, \
+         mock.patch.object(runner, '_rsync') as rsync, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='physical-cluster fence'):
+        if operation == 'run':
+            runner.run('echo hello')
+        elif operation == 'port-forward':
+            runner.port_forward_command([(1234, 5678)])
+        else:
+            runner.rsync('/tmp/src', '/tmp/dst', up=True)
+
+    run_with_log.assert_not_called()
+    rsync.assert_not_called()
+
+
+def test_kubernetes_rsync_helper_uses_pinned_target_not_ambient(
+        tmp_path) -> None:
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    fake_kubectl = fake_bin / 'kubectl'
+    fake_kubectl.write_text('#!/bin/bash\nprintf "<%s>\\n" "$@"\n',
+                            encoding='utf-8')
+    fake_kubectl.chmod(0o700)
+    helper = (os.path.dirname(command_runner.__file__) +
+              '/kubernetes/rsync_helper.sh')
+    env = dict(os.environ,
+               PATH=f'{fake_bin}:{os.environ["PATH"]}',
+               KUBECONFIG='/tmp/ambient-retarget',
+               SKYPILOT_K8S_KUBECONFIG='/tmp/capture-kubeconfig',
+               SKYPILOT_K8S_CONTEXT='ctx')
+
+    result = subprocess.run([helper, 'pod@ns+ambient', 'rsync', '--server'],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            env=env)
+
+    assert '</tmp/capture-kubeconfig>' in result.stdout
+    assert '<ctx>' in result.stdout
+    assert '/tmp/ambient-retarget' not in result.stdout
+    assert '<ambient>' not in result.stdout
+    assert result.stdout.index(
+        '</tmp/capture-kubeconfig>') < result.stdout.index('<ctx>')
+
+
+def test_kubernetes_rsync_helper_rejects_partial_pinned_target(
+        tmp_path) -> None:
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    invocation_marker = tmp_path / 'kubectl-called'
+    fake_kubectl = fake_bin / 'kubectl'
+    fake_kubectl.write_text(f'#!/bin/bash\ntouch {invocation_marker}\n',
+                            encoding='utf-8')
+    fake_kubectl.chmod(0o700)
+    helper = (os.path.dirname(command_runner.__file__) +
+              '/kubernetes/rsync_helper.sh')
+    env = dict(os.environ,
+               PATH=f'{fake_bin}:{os.environ["PATH"]}',
+               SKYPILOT_K8S_KUBECONFIG='/tmp/capture-kubeconfig')
+    env.pop('SKYPILOT_K8S_CONTEXT', None)
+
+    result = subprocess.run([helper, 'pod@ns+ctx', 'rsync', '--server'],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=env)
+
+    assert result.returncode != 0
+    assert 'Pinned Kubernetes rsync target is incomplete.' in result.stderr
+    assert not invocation_marker.exists()
 
 
 def test_get_pod_primary_container_prefers_ray_node() -> None:
@@ -1014,7 +1234,7 @@ class TestRsyncTimeout:
 
         assert 'timed out' in str(exc_info.value).lower()
         # No rsync attempt should have run.
-        assert calls == []
+        assert not calls
 
     def test_deadline_stops_retries_even_with_budget_for_max_retry(
             self) -> None:

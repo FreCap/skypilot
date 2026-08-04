@@ -48,12 +48,21 @@ else
     echo "Assuming resource is a pod: $resource_name" >&2
 fi
 
-if [ -z "$context" ] || [ "$context_lower" = "none" ]; then
+kubectl_cmd_base=(kubectl exec "$resource_type/$resource_name" -n "$namespace" -c "$container")
+if [ -n "${SKYPILOT_K8S_KUBECONFIG:-}" ] || [ -n "${SKYPILOT_K8S_CONTEXT:-}" ]; then
+    # A provider fence supplies both values as one indivisible target.  Never
+    # let a partial environment silently fall back to the ambient kubeconfig.
+    if [ -z "${SKYPILOT_K8S_KUBECONFIG:-}" ] || [ -z "${SKYPILOT_K8S_CONTEXT:-}" ]; then
+        echo "Pinned Kubernetes rsync target is incomplete." >&2
+        exit 1
+    fi
+    kubectl_cmd_base+=(--kubeconfig "$SKYPILOT_K8S_KUBECONFIG" --context "$SKYPILOT_K8S_CONTEXT")
+elif [ -z "$context" ] || [ "$context_lower" = "none" ]; then
     # If context is none, it means we are using incluster auth. In this case,
     # we need to set KUBECONFIG to /dev/null to avoid using kubeconfig file.
-    kubectl_cmd_base="kubectl exec \"$resource_type/$resource_name\" -n \"$namespace\" -c \"$container\" --kubeconfig=/dev/null --"
+    kubectl_cmd_base+=(--kubeconfig /dev/null)
 else
-    kubectl_cmd_base="kubectl exec \"$resource_type/$resource_name\" -n \"$namespace\" -c \"$container\" --context=\"$context\" --"
+    kubectl_cmd_base+=(--context "$context")
 fi
 
 # Execute command on remote pod, waiting for rsync to be available first.
@@ -66,4 +75,4 @@ MAX_WAIT_COUNT=$((MAX_WAIT_TIME_SECONDS * 2))
 # Use --norc --noprofile to prevent bash from sourcing startup files that might
 # output to stdout and corrupt the rsync protocol. All debug output must go to
 # stderr (>&2) to keep stdout clean for rsync communication.
-eval "${kubectl_cmd_base% --} -i -- bash --norc --noprofile -c 'count=0; until which rsync >/dev/null 2>&1; do if [ \$count -ge $MAX_WAIT_COUNT ]; then echo \"Error when trying to rsync files to kubernetes cluster. Package installation may have failed.\" >&2; exit 1; fi; sleep 0.5; count=\$((count+1)); done; exec \"\$@\"' -- \"\$@\""
+"${kubectl_cmd_base[@]}" -i -- bash --norc --noprofile -c 'count=0; until which rsync >/dev/null 2>&1; do if [ $count -ge '"$MAX_WAIT_COUNT"' ]; then echo "Error when trying to rsync files to kubernetes cluster. Package installation may have failed." >&2; exit 1; fi; sleep 0.5; count=$((count+1)); done; exec "$@"' -- "$@"

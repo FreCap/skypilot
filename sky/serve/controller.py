@@ -22,6 +22,7 @@ import fastapi
 from fastapi import responses
 import uvicorn
 
+from sky import exceptions
 from sky import global_user_state
 from sky import serve
 from sky import sky_logging
@@ -523,8 +524,10 @@ class SkyServeController:
         [boltz fork] Resolving a replica's url and gpu_type is expensive, so
         cluster records and provider configs for newly-READY replicas are each
         fetched in one batched lookup. The resulting endpoint/accelerator data
-        is cached for the replica's lifetime. A warm sync performs neither
-        lookup.
+        is cached for the replica's lifetime. Ordinary warm-cache rows perform
+        neither lookup. Protocol-v2 reserved-fill rows re-read their durable
+        handle and re-prove the physical Kubernetes identity on every sync;
+        rows sharing one physical pool reuse one UID fence/read for the round.
         A brand-new replica whose gpu_type cannot be resolved yet is reported
         as 'unknown' until it is.
 
@@ -532,12 +535,13 @@ class SkyServeController:
         capacity-hint computation, so the async sync handler issues no
         extra replica-list DB reads.
 
-        Returns the (url -> info) mapping and the number of READY, active
-        replicas seen -- which can exceed len(mapping) when a READY replica's
-        endpoint is transiently unresolvable this round. The load balancer uses
-        that count to tell an authoritative zero (no READY replicas) apart from
-        a spurious empty map (READY replicas exist but none resolved), so it
-        never blanks a healthy routing set on a transient blip.
+        Returns the (url -> info) mapping and the number of identity-verified
+        READY, active replicas seen -- which can exceed len(mapping) when a
+        verified replica's endpoint is transiently unresolvable this round.
+        The load balancer uses that count to tell an authoritative zero (no
+        verified READY replicas) apart from a spurious empty map (verified
+        replicas exist but none resolved), so a physical-cluster retarget
+        explicitly clears old routes instead of preserving them as transient.
         """
         runtime_snapshot = serve_state.get_service_runtime_snapshot(
             self._service_name, require_version=True)
@@ -562,44 +566,90 @@ class SkyServeController:
                 info.version in active_versions and
                 self._replica_manager.system_recovery_allows_routing(info))
         ]
-        uncached_cluster_names = [
-            info.cluster_name
-            for info in ready_infos
-            if (info.replica_id not in self._lb_replica_cache or
-                getattr(self, '_lb_replica_cache_record_ids', {}).get(
-                    info.replica_id) != info.replica_record_id)
+
+        def _is_recovery_capable(info: 'replica_managers.ReplicaInfo') -> bool:
+            return (info.system_recovery_disposition ==
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+
+        def _retire_unverified_route(info: 'replica_managers.ReplicaInfo',
+                                     error: Exception) -> None:
+            if _is_recovery_capable(info):
+                self._replica_manager.retire_system_recovery_route(info)
+            logger.error(
+                'Withholding READY replica %s because its physical '
+                'Kubernetes identity could not be verified: %s',
+                info.replica_id, common_utils.format_exception(error))
+
+        def _cached_route(
+            info: 'replica_managers.ReplicaInfo'
+        ) -> tuple[str, str, int] | None:
+            cached = self._lb_replica_cache.get(info.replica_id)
+            if getattr(self, '_lb_replica_cache_record_ids',
+                       {}).get(info.replica_id) != info.replica_record_id:
+                return None
+            return cached
+
+        # Strictly classify every candidate before deciding that a warm cache
+        # can avoid its durable-handle lookup. A malformed row must never
+        # degrade to the ordinary/legacy path.
+        cleanup_fences: dict[int, reserved_capacity.ProtocolV2CleanupFence |
+                             None] = {}
+        identity_rejected_ids: set[int] = set()
+        for info in ready_infos:
+            try:
+                cleanup_fences[id(info)] = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+            except exceptions.KubernetesPhysicalClusterIdentityError as e:
+                identity_rejected_ids.add(id(info))
+                _retire_unverified_route(info, e)
+
+        cluster_lookup_infos = [
+            info for info in ready_infos
+            if id(info) not in identity_rejected_ids and (cleanup_fences[id(
+                info)] is not None or _cached_route(info) is None)
         ]
+        cluster_names = list(
+            dict.fromkeys(info.cluster_name for info in cluster_lookup_infos))
         cluster_records: dict[str, dict[str, Any] | None] = {}
-        if uncached_cluster_names:
+        if cluster_names:
             cluster_records = global_user_state.get_clusters_from_names(
-                uncached_cluster_names)
+                cluster_names)
 
         # get_endpoints normally reads and parses each cluster YAML to obtain
         # its provider config. That is another fleet-sized DB N+1. Reuse the
         # records above to collect the YAML paths, then fetch all YAMLs in one
         # query before resolving endpoints.
-        uncached_handles: dict[int, Any] = {}
-        for info in ready_infos:
-            if (info.replica_id in self._lb_replica_cache and
-                    getattr(self, '_lb_replica_cache_record_ids', {}).get(
-                        info.replica_id) == info.replica_record_id):
-                continue
+        handles: dict[int, Any] = {}
+        for info in cluster_lookup_infos:
             cluster_record = cluster_records.get(info.cluster_name)
             if cluster_record is None:
                 continue
-            handle = info.handle(cluster_record)
-            uncached_handles[info.replica_id] = handle
+            if cleanup_fences[id(info)] is None:
+                handle = info.handle(cluster_record)
+            else:
+                # A v2 row must validate the exact durable handle instead of
+                # letting a convenience accessor assert or fetch by name.
+                handle = (cluster_record.get('handle') if isinstance(
+                    cluster_record, dict) else None)
+            handles[id(info)] = handle
+        uncached_handles = {
+            info.replica_id: handles[id(info)]
+            for info in cluster_lookup_infos
+            if _cached_route(info) is None and id(info) in handles
+        }
         provider_configs = serve_utils.get_provider_configs_for_handles(
             uncached_handles)
 
-        for info in ready_infos:
-            is_capable = (
-                info.system_recovery_disposition ==
-                system_recovery_state.SystemRecoveryDisposition.CAPABLE)
-            cached = self._lb_replica_cache.get(info.replica_id)
-            if getattr(self, '_lb_replica_cache_record_ids',
-                       {}).get(info.replica_id) != info.replica_record_id:
-                cached = None
+        # First resolve/cache candidates under their physical-cluster fence.
+        # The emission pass below retains the caller's original row order so
+        # URL-collision handling remains deterministic even though pool fences
+        # are batched.
+        route_candidates: dict[int, tuple[str, str, int]] = {}
+
+        def _resolve_route_candidate(
+                info: 'replica_managers.ReplicaInfo') -> None:
+            is_capable = _is_recovery_capable(info)
+            cached = _cached_route(info)
             if cached is None:
                 cluster_record = cluster_records.get(info.cluster_name)
                 if cluster_record is None:
@@ -608,8 +658,8 @@ class SkyServeController:
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its cluster record is not available yet; '
                                    'skipping for this sync.')
-                    continue
-                handle = uncached_handles.get(info.replica_id)
+                    return
+                handle = handles.get(id(info))
                 url = info._resolve_url(  # pylint: disable=protected-access
                     cluster_record=cluster_record,
                     handle=handle,
@@ -626,7 +676,7 @@ class SkyServeController:
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its endpoint is not resolvable yet; '
                                    'skipping for this sync.')
-                    continue
+                    return
                 # gpu_type/gpu_count are used by instance-aware load
                 # balancing policies. They derive from the replica's
                 # launched accelerators, which are fixed for the replica's
@@ -642,6 +692,62 @@ class SkyServeController:
                         except (TypeError, ValueError):
                             gpu_count = 1
                 cached = (url, gpu_type, gpu_count)
+            route_candidates[id(info)] = cached
+
+        verified_ready_count = 0
+        v2_groups: dict[tuple[str, str], list[tuple[
+            replica_managers.ReplicaInfo,
+            contextlib.AbstractContextManager[None]]]] = {}
+        legacy_infos: list[replica_managers.ReplicaInfo] = []
+        for info in ready_infos:
+            if id(info) in identity_rejected_ids:
+                continue
+            cleanup_fence = cleanup_fences[id(info)]
+            if cleanup_fence is None:
+                legacy_infos.append(info)
+                continue
+            try:
+                # Construction performs the row/handle checks synchronously;
+                # entering one representative below performs the shared
+                # physical UID read for the whole pool.
+                provider_fence = reserved_capacity.protocol_v2_provider_fence(
+                    info, handle=handles.get(id(info)))
+            except exceptions.KubernetesPhysicalClusterIdentityError as e:
+                identity_rejected_ids.add(id(info))
+                _retire_unverified_route(info, e)
+                continue
+            key = (cleanup_fence.kubernetes_context,
+                   cleanup_fence.physical_cluster_uid)
+            v2_groups.setdefault(key, []).append((info, provider_fence))
+
+        for info in legacy_infos:
+            verified_ready_count += 1
+            _resolve_route_candidate(info)
+
+        for grouped_infos in v2_groups.values():
+            try:
+                # Every row in this group has already validated its own
+                # durable handle. Keeping the representative fence open makes
+                # all endpoint reads use the same captured physical target.
+                with grouped_infos[0][1]:
+                    for info, _ in grouped_infos:
+                        _resolve_route_candidate(info)
+            except exceptions.KubernetesPhysicalClusterIdentityError as e:
+                # Treat the group as one coherent snapshot: a provider fence
+                # failure invalidates candidates resolved earlier in the same
+                # scope as well as any warm cached routes.
+                for info, _ in grouped_infos:
+                    route_candidates.pop(id(info), None)
+                    identity_rejected_ids.add(id(info))
+                    _retire_unverified_route(info, e)
+                continue
+            verified_ready_count += len(grouped_infos)
+
+        for info in ready_infos:
+            cached = route_candidates.get(id(info))
+            if cached is None:
+                continue
+            is_capable = _is_recovery_capable(info)
             url, gpu_type, gpu_count = cached
             try:
                 normalized_url = (
@@ -766,7 +872,7 @@ class SkyServeController:
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
         self._lb_replica_cache_record_ids = replica_cache_record_ids
-        return replica_info, len(ready_infos)
+        return replica_info, verified_ready_count
 
     def _url_to_replica_id_map(self) -> dict[str, int]:
         """Invert the translation cache (url -> replica id)."""

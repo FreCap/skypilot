@@ -17,6 +17,7 @@ from unittest import mock
 
 import pytest
 
+from sky import exceptions
 from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import controller
@@ -1534,8 +1535,12 @@ def _sync_full(ctrl: controller.SkyServeController,
          mock.patch.object(
              controller.global_user_state,
              'get_clusters_from_names',
-             side_effect=lambda names: {name: {'handle': mock.sentinel.handle}
-                                        for name in names}), \
+             side_effect=lambda names: {
+                 name: {
+                     'handle': _FakeHandle(None, f'{name}.yaml')
+                 }
+                 for name in names
+             }), \
          mock.patch.object(
              controller.global_user_state,
              'get_cluster_yaml_dict_multiple',
@@ -1643,7 +1648,7 @@ class TestGetLbReplicaInfo:
         info._url = unusable_url
         replica_info, num_ready = _sync_full(ctrl, [info])
 
-        assert replica_info == {}
+        assert not replica_info
         assert num_ready == 1
         retire.assert_called_once_with(info)
 
@@ -1656,7 +1661,7 @@ class TestGetLbReplicaInfo:
 
         replica_info, num_ready = _sync_full(ctrl, [info])
 
-        assert replica_info == {}
+        assert not replica_info
         assert num_ready == 1
 
     @pytest.mark.parametrize('capable_url,ordinary_url,canonical_url', [
@@ -1911,6 +1916,127 @@ class TestGetLbReplicaInfo:
         get_yamls.assert_called_once_with([shared_yaml])
         assert infos[0].last_provider_config == {'shared': True}
         assert infos[1].last_provider_config == {'shared': True}
+
+    def test_v2_cold_sync_batches_one_physical_fence_per_pool(self):
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'H200': 8}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'H200': 8}),
+        ]
+        cleanup_fence = controller.reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='research-usw2-h200',
+            physical_cluster_uid='uid-a')
+        active_fence_depth = 0
+        fence_calls = []
+        fence_entries = 0
+
+        class _PhysicalFence:
+
+            def __enter__(self):
+                nonlocal active_fence_depth, fence_entries
+                assert active_fence_depth == 0
+                active_fence_depth += 1
+                fence_entries += 1
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                nonlocal active_fence_depth
+                active_fence_depth -= 1
+
+        def _provider_fence(info, *, handle=None):
+            # Each durable row proves its own handle before the physical pool
+            # fence is entered once for the group.
+            assert handle is not None
+            fence_calls.append(info.replica_id)
+            return _PhysicalFence()
+
+        for info in infos:
+
+            def _resolve_url(*,
+                             cluster_record=None,
+                             handle=None,
+                             provider_config=None,
+                             _info=info):
+                del cluster_record, handle, provider_config
+                assert active_fence_depth == 1
+                return _info._url
+
+            info._resolve_url = mock.Mock(  # type: ignore[method-assign]
+                side_effect=_resolve_url)
+
+        with mock.patch.object(controller.reserved_capacity,
+                               'parse_protocol_v2_cleanup_fence',
+                               return_value=cleanup_fence), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'protocol_v2_provider_fence',
+                                   side_effect=_provider_fence):
+            replica_info, num_ready = _sync_full(ctrl, infos)
+
+        assert set(replica_info) == {
+            'http://1.1.1.1:8080', 'http://2.2.2.2:8080'
+        }
+        assert num_ready == 2
+        assert fence_calls == [1, 2]
+        assert fence_entries == 1
+        assert active_fence_depth == 0
+
+    @pytest.mark.parametrize('warm_cache', [False, True])
+    def test_v2_retarget_clears_cold_or_warm_route_authoritatively(
+            self, warm_cache):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'H200': 8})
+        cleanup_fence = controller.reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='research-usw2-h200',
+            physical_cluster_uid='uid-a')
+        observed_uid = 'uid-a' if warm_cache else 'uid-b'
+        provider_fence_calls = 0
+
+        class _PhysicalFence:
+
+            def __enter__(self):
+                if observed_uid != cleanup_fence.physical_cluster_uid:
+                    raise exceptions.KubernetesPhysicalClusterIdentityError(
+                        'context was retargeted')
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                return None
+
+        def _provider_fence(_info, *, handle=None):
+            nonlocal provider_fence_calls
+            assert handle is not None
+            provider_fence_calls += 1
+            return _PhysicalFence()
+
+        with mock.patch.object(controller.reserved_capacity,
+                               'parse_protocol_v2_cleanup_fence',
+                               return_value=cleanup_fence), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'protocol_v2_provider_fence',
+                                   side_effect=_provider_fence):
+            if warm_cache:
+                initial_info, initial_count = _sync_full(ctrl, [info])
+                assert list(initial_info) == ['http://1.1.1.1:8080']
+                assert initial_count == 1
+                assert info.replica_id in ctrl._lb_replica_cache
+                observed_uid = 'uid-b'
+
+            replica_info, num_ready = _sync_full(ctrl, [info])
+
+        # A physical retarget is authoritative absence, not a transient URL
+        # miss: returning zero makes the LB apply the empty set immediately.
+        assert not replica_info
+        assert num_ready == 0
+        assert info.replica_id not in ctrl._lb_replica_cache
+        assert provider_fence_calls == (2 if warm_cache else 1)
+        assert info.url_resolutions == (1 if warm_cache else 0)
 
     def test_uses_runtime_snapshot_not_joined_service_read(self):
         ctrl = _make_controller()

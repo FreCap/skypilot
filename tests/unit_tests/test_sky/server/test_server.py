@@ -766,6 +766,183 @@ async def test_serve_launch_endpoint_attaches_owner_precondition():
     assert condition.service_hash == 'incarnation-a'
 
 
+def _protocol_v2_reserved_fill_launch_context() -> dict[str, object]:
+    from sky.serve import reserved_capacity
+    from sky.serve import reserved_capacity_broker
+
+    pool_key = reserved_capacity_broker.make_pool_key(
+        'phx-context',
+        'H200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='physical-uid')
+    context: dict[str, object] = {
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 3,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+    }
+    context.update(
+        reserved_capacity.make_protocol_v2_launch_fence(
+            pool_key=pool_key,
+            service_generation=7,
+            physical_cluster_uid='physical-uid',
+            kubernetes_context='phx-context',
+            accelerator='H200',
+            accelerator_count=1))
+    return context
+
+
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_accepts_complete_durable_fence():
+    from sky import execution
+    from sky.serve import reserved_capacity
+    from sky.server.requests import payloads
+    from sky.server.requests import preconditions
+    from sky.server.requests import requests as requests_lib
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='svc-replica',
+        is_launched_by_sky_serve_controller=True,
+        extra_launch_context=_protocol_v2_reserved_fill_launch_context())
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule:
+        await server.launch(launch_body, request)
+
+    condition = mock_schedule.await_args.kwargs['precondition']
+    assert isinstance(condition, preconditions.ServiceReplicaLaunchPrecondition)
+    queued_body = mock_schedule.await_args.kwargs['request_body']
+    assert (queued_body.extra_launch_context ==
+            _protocol_v2_reserved_fill_launch_context())
+    # Exercise the production durable JSON codec used to recover an enqueued
+    # launch after API-server restart, not merely the in-memory scheduler call.
+    durable_request = requests_lib.Request(
+        request_id='launch-request-id',
+        name='sky.launch',
+        entrypoint=execution.launch,
+        request_body=queued_body,
+        status=requests_lib.RequestStatus.PENDING,
+        created_at=123.0,
+        user_id='user-1',
+        schedule_type=requests_lib.ScheduleType.LONG)
+    restored = requests_lib.Request.from_durable_values(
+        durable_request.durable_values())
+    assert restored.request_body.extra_launch_context == (
+        _protocol_v2_reserved_fill_launch_context())
+    assert reserved_capacity.parse_protocol_v2_launch_fence(
+        restored.request_body.extra_launch_context) is not None
+
+
+@pytest.mark.parametrize('missing_key',
+                         server.serve_constants.RESERVED_FILL_LAUNCH_FENCE_KEYS)
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_rejects_each_missing_fence_field_before_queue(
+        missing_key):
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_context = _protocol_v2_reserved_fill_launch_context()
+    launch_context.pop(missing_key)
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=launch_context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='protocol-v2') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.parametrize(('field', 'invalid_value'), [
+    (server.serve_constants.RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY, '2'),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_POOL_KEY, 2),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY, '7'),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY, 7),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY, 7),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_ACCELERATOR_KEY, 7),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY, 1.0),
+])
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_rejects_each_mistyped_fence_field_before_queue(
+        field, invalid_value):
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_context = _protocol_v2_reserved_fill_launch_context()
+    launch_context[field] = invalid_value
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=launch_context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='protocol-v2') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_rejects_contradictory_fence_before_queue():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    context = _protocol_v2_reserved_fill_launch_context()
+    context[server.serve_constants.
+            RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY] = 'replacement-uid'
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='protocol-v2') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_rejects_non_serve_caller():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='user-cluster',
+        is_launched_by_sky_serve_controller=False,
+        extra_launch_context=_protocol_v2_reserved_fill_launch_context())
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='ordinary SkyServe') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
 def _unbound_system_recovery_launch_context() -> dict[str, object]:
     from sky.serve import system_oom_recovery
 

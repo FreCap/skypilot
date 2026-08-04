@@ -8,6 +8,7 @@ that the launch path pins to zero-cost ACTIVE locations (skipping entirely
 when none is available -- fill must never spill to paid capacity).
 """
 # pylint: disable=protected-access
+import contextlib
 import dataclasses
 import threading
 import time
@@ -18,6 +19,10 @@ from unittest import mock
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer as _make_placer
 
+from sky import backends
+from sky import clouds
+from sky import exceptions
+from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import replica_managers
@@ -116,6 +121,177 @@ def _stale_timestamp():
     return time.time() - (reserved_capacity.poll_interval_seconds() *
                           constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS +
                           30)
+
+
+def _protocol_v2_cleanup_info(**overrides):
+    values = {
+        'cluster_name': 'svc-1',
+        'reserved_fill': True,
+        'reserved_fill_pool_key': reserved_capacity_broker.make_pool_key(
+            'research-ctx',
+            'H200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-a'),
+        'reserved_fill_service_generation': 1,
+        'reserved_fill_physical_cluster_uid': 'physical-a',
+        'reserved_fill_kubernetes_context': 'research-ctx',
+        'location': {
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'accelerators': {
+                'H200': 1,
+            },
+        },
+        'resources_override': {
+            'cloud': 'Kubernetes',
+            'region': 'research-ctx',
+            'accelerators': {
+                'H200': 1,
+            },
+        },
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+class TestProtocolV2CleanupFence(unittest.TestCase):
+    """Durable cleanup authority is exact or fails closed."""
+
+    def test_exact_v2_and_whole_float_counts_are_accepted(self):
+        info = _protocol_v2_cleanup_info()
+        info.location['accelerators']['H200'] = 1.0
+        info.resources_override['accelerators']['H200'] = 1.0
+
+        fence = reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+
+        self.assertEqual(
+            fence,
+            reserved_capacity.ProtocolV2CleanupFence(
+                kubernetes_context='research-ctx',
+                physical_cluster_uid='physical-a'))
+
+    def test_legacy_and_ordinary_rows_need_no_physical_fence(self):
+        ordinary = types.SimpleNamespace(reserved_fill=False)
+        legacy = types.SimpleNamespace(reserved_fill=True,
+                                       reserved_fill_pool_key=None,
+                                       reserved_fill_service_generation=None,
+                                       reserved_fill_physical_cluster_uid=None,
+                                       reserved_fill_kubernetes_context=None)
+        self.assertIsNone(
+            reserved_capacity.parse_protocol_v2_cleanup_fence(ordinary))
+        self.assertIsNone(
+            reserved_capacity.parse_protocol_v2_cleanup_fence(legacy))
+
+    def test_partial_authority_on_non_fill_row_is_rejected(self):
+        info = types.SimpleNamespace(
+            reserved_fill=False,
+            reserved_fill_physical_cluster_uid='physical-a')
+        with self.assertRaises(
+                exceptions.KubernetesPhysicalClusterIdentityError):
+            reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+
+    def test_reserved_fill_marker_must_be_an_exact_bool(self):
+        for marker in (1, 0, 'yes', None):
+            with self.subTest(marker=marker):
+                info = types.SimpleNamespace(reserved_fill=marker)
+                with self.assertRaises(
+                        exceptions.KubernetesPhysicalClusterIdentityError):
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+
+    def test_v2_resource_pin_must_be_exact(self):
+        mutations = (
+            lambda info: info.location['accelerators'].__setitem__('H200', 1.5),
+            lambda info: info.resources_override['accelerators'].__setitem__(
+                'H200', True),
+            lambda info: info.resources_override.__setitem__(
+                'region', 'retargeted-context'),
+            lambda info: info.resources_override.__setitem__(
+                'accelerators', {'A100': 1}),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                info = _protocol_v2_cleanup_info()
+                mutate(info)
+                with self.assertRaises(
+                        exceptions.KubernetesPhysicalClusterIdentityError):
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+
+    @staticmethod
+    def _handle(context='research-ctx', cloud=None, cluster_name='svc-1'):
+        handle = mock.Mock(spec=backends.CloudVmRayResourceHandle)
+        handle.cluster_name = cluster_name
+        handle.launched_resources = types.SimpleNamespace(cloud=cloud or
+                                                          clouds.Kubernetes(),
+                                                          region=context)
+        return handle
+
+    def test_provider_fence_validates_handle_before_entering_uid_fence(self):
+        info = _protocol_v2_cleanup_info()
+        handle = self._handle()
+        uid_fence = mock.MagicMock()
+        uid_fence.return_value.__enter__.return_value = None
+
+        with mock.patch.object(kubernetes_adaptor, 'physical_cluster_uid_fence',
+                               uid_fence):
+            with reserved_capacity.protocol_v2_provider_fence(info, handle):
+                pass
+
+        uid_fence.assert_called_once_with('research-ctx', 'physical-a')
+
+    def test_provider_fence_rejects_replaced_handle_without_provider_call(self):
+        info = _protocol_v2_cleanup_info()
+        handles = (
+            None,
+            self._handle(cluster_name='replacement'),
+            self._handle(context='replacement-context'),
+            self._handle(cloud=clouds.AWS()),
+        )
+        with mock.patch.object(kubernetes_adaptor,
+                               'physical_cluster_uid_fence') as uid_fence:
+            for handle in handles:
+                with self.subTest(handle=handle), self.assertRaises(
+                        exceptions.KubernetesPhysicalClusterIdentityError):
+                    reserved_capacity.protocol_v2_provider_fence(info, handle)
+        uid_fence.assert_not_called()
+
+    def test_provider_batch_keeps_one_uid_proof_alive_for_all_workers(self):
+        first = _protocol_v2_cleanup_info(cluster_name='svc-1')
+        second = _protocol_v2_cleanup_info(cluster_name='svc-2')
+        first_handle = self._handle(cluster_name='svc-1')
+        second_handle = self._handle(cluster_name='svc-2')
+        key = ('research-ctx', 'physical-a')
+        active = 0
+        uid_reads = 0
+        lock = threading.Lock()
+
+        @contextlib.contextmanager
+        def _uid_fence(context, physical_uid):
+            nonlocal active, uid_reads
+            self.assertEqual((context, physical_uid), key)
+            with lock:
+                if active == 0:
+                    uid_reads += 1
+                active += 1
+            try:
+                yield
+            finally:
+                with lock:
+                    active -= 1
+
+        with mock.patch.object(kubernetes_adaptor,
+                               'physical_cluster_uid_fence',
+                               side_effect=_uid_fence):
+            with reserved_capacity.protocol_v2_provider_batch_fences(
+                {key: (first, first_handle)}) as failures:
+                self.assertEqual(failures, {})
+                with reserved_capacity.protocol_v2_provider_fence(
+                        first, first_handle):
+                    pass
+                with reserved_capacity.protocol_v2_provider_fence(
+                        second, second_handle):
+                    pass
+
+        self.assertEqual(uid_reads, 1)
 
 
 class TestFlagOff(unittest.TestCase):
@@ -1736,6 +1912,8 @@ def _make_manager(placer):
     # they are intended to exercise.
     manager._service_hash = 'service-hash'
     manager._resource_scope = 'service-hash'
+    manager._controller_owner = (123, '10.0.0.1')
+    manager._enforce_launch_fence = True
     manager.yaml_content = 'unused: patched helpers below'
     manager._spot_placer = placer
     manager._launch_thread_pool = {}
@@ -1785,6 +1963,73 @@ class TestZeroCostSelection(unittest.TestCase):
         placer = _make_placer({self.k8s: 0.0, other: 0.0, self.paid: 0.2})
         selected = placer.select_next_zero_cost_location()
         self.assertEqual(selected, self.k8s)
+
+
+class TestProtocolV2DurableLaunchFence(unittest.TestCase):
+    """Durable fill context accepts only a complete, coherent v2 tuple."""
+
+    def setUp(self):
+        self.pool_key = reserved_capacity_broker.make_pool_key(
+            'phx-context', ['H200', 'L4'],
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-uid')
+
+    def _context(self):
+        return reserved_capacity.make_protocol_v2_launch_fence(
+            pool_key=self.pool_key,
+            service_generation=7,
+            physical_cluster_uid='physical-uid',
+            kubernetes_context='phx-context',
+            accelerator='H200',
+            accelerator_count=1)
+
+    def test_round_trip_canonicalizes_accelerator(self):
+        context = self._context()
+        fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
+        self.assertIsNotNone(fence)
+        assert fence is not None
+        self.assertEqual(fence.protocol_version, 2)
+        self.assertEqual(fence.pool_key, self.pool_key)
+        self.assertEqual(fence.service_generation, 7)
+        self.assertEqual(fence.physical_cluster_uid, 'physical-uid')
+        self.assertEqual(fence.kubernetes_context, 'phx-context')
+        self.assertEqual(fence.accelerator, 'h200')
+        self.assertEqual(fence.accelerator_count, 1)
+        self.assertEqual(
+            context[constants.RESERVED_FILL_LAUNCH_ACCELERATOR_KEY], 'h200')
+
+    def test_ordinary_context_has_no_fill_fence(self):
+        self.assertIsNone(
+            reserved_capacity.parse_protocol_v2_launch_fence(
+                {constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc'}))
+
+    def test_partial_or_unknown_prefixed_context_is_rejected(self):
+        for context in ({
+                constants.RESERVED_FILL_LAUNCH_POOL_KEY: self.pool_key,
+        }, {
+                **self._context(),
+                f'{constants.RESERVED_FILL_LAUNCH_FENCE_PREFIX}unknown': True,
+        }):
+            with self.subTest(context=context), self.assertRaises(ValueError):
+                reserved_capacity.parse_protocol_v2_launch_fence(context)
+
+    def test_malformed_or_contradictory_context_is_rejected(self):
+        cases = []
+        for key, value in (
+            (constants.RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY, True),
+            (constants.RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY, 0),
+            (constants.RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY, 1.0),
+            (constants.RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY, ''),
+            (constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY,
+             'replacement-uid'),
+            (constants.RESERVED_FILL_LAUNCH_ACCELERATOR_KEY, 'A100'),
+        ):
+            context = self._context()
+            context[key] = value
+            cases.append((key, context))
+        for key, context in cases:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                reserved_capacity.parse_protocol_v2_launch_fence(context)
 
 
 class TestFillLaunchPath(unittest.TestCase):
@@ -2012,6 +2257,17 @@ class TestFillLaunchPath(unittest.TestCase):
             self.assertTrue(manager._launch_replica(7, override))
 
             thread_call = launch_thread.call_args.kwargs
+            durable_fence = thread_call['kwargs']['launch_fence']
+            self.assertIsNotNone(durable_fence)
+            parsed_fence = reserved_capacity.parse_protocol_v2_launch_fence(
+                durable_fence)
+            self.assertIsNotNone(parsed_fence)
+            self.assertEqual(parsed_fence.pool_key, override[_POOL_KEY])
+            self.assertEqual(parsed_fence.service_generation, 7)
+            self.assertEqual(parsed_fence.physical_cluster_uid, 'physical-uid')
+            self.assertEqual(parsed_fence.kubernetes_context, 'phx-context')
+            self.assertEqual(parsed_fence.accelerator, 'h200')
+            self.assertEqual(parsed_fence.accelerator_count, 1)
             cloud_guard = thread_call['kwargs']['cloud_launch_guard']
             self.assertIsNotNone(cloud_guard)
             self.assertEqual(cloud_guard(),
@@ -2541,6 +2797,61 @@ class TestQueryFreeSlots(unittest.TestCase):
         self.assertEqual(observation.free_slots_by_accelerator,
                          (('a100', 3), ('a100-80gb', 2)))
         query.assert_called_once()
+
+    def test_protocol_v2_group_observation_runs_inside_physical_uid_fence(self):
+        entered = False
+
+        @contextlib.contextmanager
+        def _uid_fence(context, expected_uid):
+            nonlocal entered
+            self.assertEqual(context, 'research-ctx')
+            self.assertEqual(expected_uid, 'physical-uid')
+            entered = True
+            try:
+                yield
+            finally:
+                entered = False
+
+        def _query(**kwargs):
+            self.assertTrue(
+                entered, 'realtime availability escaped its physical UID fence')
+            self.assertEqual(kwargs['region_filter'], 'research-ctx')
+            return ({}, {}, {'A100': 3})
+
+        with mock.patch.object(reserved_capacity.kubernetes,
+                               'physical_cluster_uid_fence',
+                               side_effect=_uid_fence) as uid_fence, \
+             mock.patch.object(reserved_capacity.kubernetes_catalog,
+                               'list_accelerators_realtime',
+                               side_effect=_query) as query:
+            observation = reserved_capacity.query_pool_group_observation(
+                'research-ctx', {'a100': 1},
+                expected_physical_cluster_uid='physical-uid')
+
+        self.assertEqual(observation.free_slots, 3)
+        uid_fence.assert_called_once_with('research-ctx', 'physical-uid')
+        query.assert_called_once()
+
+    def test_protocol_v2_group_identity_mismatch_is_blackout(self):
+
+        @contextlib.contextmanager
+        def _uid_mismatch(*_args, **_kwargs):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'context was retargeted')
+            yield  # pragma: no cover  # pylint: disable=unreachable
+
+        with mock.patch.object(reserved_capacity.kubernetes,
+                               'physical_cluster_uid_fence',
+                               side_effect=_uid_mismatch), \
+             mock.patch.object(
+                 reserved_capacity.kubernetes_catalog,
+                 'list_accelerators_realtime') as query:
+            observation = reserved_capacity.query_pool_group_observation(
+                'research-ctx', {'a100': 1},
+                expected_physical_cluster_uid='physical-uid')
+
+        self.assertIsNone(observation.free_slots)
+        query.assert_not_called()
 
     def test_same_shape_different_counts_use_largest_deterministically(self):
         # A100:1 and A100:8 entries over one pool draw from the same

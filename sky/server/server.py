@@ -47,6 +47,7 @@ from sky.recipes import server as recipes_rest
 from sky.schemas.api import responses
 from sky.serve import constants as serve_constants
 from sky.serve import lb_rbac_preflight
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import system_oom_recovery as serve_system_oom_recovery
@@ -899,6 +900,21 @@ async def launch(launch_body: payloads.LaunchBody,
     has_system_recovery_context = (
         serve_system_oom_recovery.has_v3_system_oom_recovery_context(
             launch_context))
+    try:
+        reserved_fill_launch_fence = (
+            reserved_capacity.parse_protocol_v2_launch_fence(launch_context))
+    except ValueError as error:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Reserved-fill launches require a complete, valid '
+            'protocol-v2 launch fence.') from error
+    if reserved_fill_launch_fence is not None:
+        if (not launch_body.is_launched_by_sky_serve_controller or
+                has_system_recovery_context):
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail='Reserved-fill launches require an ordinary SkyServe '
+                'replica launch with a valid protocol-v2 fence.')
     if has_system_recovery_context:
         if not launch_body.is_launched_by_sky_serve_controller:
             raise fastapi.HTTPException(
@@ -940,7 +956,7 @@ async def launch(launch_body: payloads.LaunchBody,
             serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
         controller_ip = launch_context.get(
             serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
-        if ((has_launch_fence or
+        if ((has_launch_fence or reserved_fill_launch_fence is not None or
              serve_utils.is_external_load_balancer_mode()) and
             (not isinstance(service_name, str) or not service_name or
              not isinstance(service_hash, str) or not service_hash or

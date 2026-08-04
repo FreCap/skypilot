@@ -966,7 +966,10 @@ rbac:
     - apiGroups: [""]
       resources: ["persistentvolumeclaims"]
       verbs: ["*"]
-  # Cluster-scoped rules for API server.
+  # Configurable cluster-scoped rules for API server. The template also adds
+  # exact get access to the kube-system Namespace for reserved-fill physical
+  # cluster identity; keeping that required rule outside this list makes it
+  # survive upgrades that reuse values from a pre-feature release.
   clusterRules:
     # Required for getting node resources.
     - apiGroups: [ "" ]

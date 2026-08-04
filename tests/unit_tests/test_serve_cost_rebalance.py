@@ -704,6 +704,7 @@ class TestPinnedReplacementLaunch:
             'pre_launch_guard',
             'cloud_launch_guard',
             'continue_guard',
+            'cleanup_continue_guard',
             'launch_fence',
             'service_spec',
             'service_name',
@@ -720,6 +721,10 @@ class TestPinnedReplacementLaunch:
         assert continue_guard.__self__ is manager
         assert (continue_guard.__func__
                 is type(manager)._launch_owner_watchdog_allows_continue)
+        cleanup_continue_guard = launch_kwargs['cleanup_continue_guard']
+        assert cleanup_continue_guard.__self__ is manager
+        assert (cleanup_continue_guard.__func__
+                is type(manager)._service_is_cleanup_authorized)
         assert launch_kwargs['launch_fence'] is None
         assert launch_kwargs['service_spec'] is None
         assert launch_kwargs['service_name'] == 'svc'
@@ -1023,7 +1028,10 @@ class TestWaitForIdleRecovery:
             candidate_ready_observed_at=None,
             system_recovery=None)
 
-        with mock.patch.object(replica_managers.serve_state,
+        with mock.patch.object(manager,
+                               '_resolve_probe_urls',
+                               return_value={1: 'http://replica'}), \
+             mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]), \
              mock.patch.object(replica_managers.global_user_state,

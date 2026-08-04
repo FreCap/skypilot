@@ -56,6 +56,25 @@ run "default_permissions_match_the_skypilot_pool_contract" {
 
   assert {
     condition = length([
+      for rule in kubernetes_cluster_role_v1.pool.rule : rule
+      if toset(rule.api_groups) == toset([""]) &&
+      toset(rule.resources) == toset(["namespaces"]) &&
+      toset(rule.resource_names) == toset(["kube-system"]) &&
+      toset(rule.verbs) == toset(["get"])
+    ]) == 1
+    error_message = "The cluster role must grant only named kube-system Namespace get for reserved-fill physical identity."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_cluster_role_v1.pool.rule : rule
+      if contains(rule.resources, "namespaces")
+    ]) == 1
+    error_message = "The module must not add a second or broader Namespace permission."
+  }
+
+  assert {
+    condition = length([
       for rule in kubernetes_role_v1.pool.rule : rule
       if toset(rule.api_groups) == toset([""]) &&
       toset(rule.resources) == toset(["pods"]) &&

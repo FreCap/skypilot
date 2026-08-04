@@ -32,6 +32,14 @@ tests:
       - isKind:
           of: ClusterRole
         documentIndex: 0
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["namespaces"]
+            resourceNames: ["kube-system"]
+            verbs: ["get"]
+        documentIndex: 0
       - isKind:
           of: ClusterRoleBinding
         documentIndex: 1
@@ -80,6 +88,68 @@ tests:
           count: 9
       - isKind:
           of: ServiceAccount
+        documentIndex: 0
+
+  - it: should add physical-cluster identity access to reused legacy cluster rules
+    release:
+      name: test-release
+      namespace: test-namespace
+    set:
+      rbac.create: false
+      rbac.bindExistingServiceAccount: true
+      rbac.serviceAccountName: external-api
+      rbac.manageRbacPolicies: false
+      rbac.clusterRules:
+        - apiGroups: [""]
+          resources: ["nodes"]
+          verbs: ["get", "list"]
+    asserts:
+      - hasDocuments:
+          count: 8
+      - isKind:
+          of: ClusterRole
+        documentIndex: 0
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: ["namespaces"]
+              resourceNames: ["kube-system"]
+              verbs: ["get"]
+            - apiGroups: [""]
+              resources: ["nodes"]
+              verbs: ["get", "list"]
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["storageclasses"]
+              verbs: ["get", "list", "watch"]
+        documentIndex: 0
+
+  - it: should render required identity access with empty reused cluster rules
+    release:
+      name: test-release
+      namespace: test-namespace
+    set:
+      rbac.create: false
+      rbac.bindExistingServiceAccount: true
+      rbac.serviceAccountName: external-api
+      rbac.manageRbacPolicies: false
+      rbac.clusterRules: []
+    asserts:
+      - hasDocuments:
+          count: 8
+      - isKind:
+          of: ClusterRole
+        documentIndex: 0
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: ["namespaces"]
+              resourceNames: ["kube-system"]
+              verbs: ["get"]
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["storageclasses"]
+              verbs: ["get", "list", "watch"]
         documentIndex: 0
 
   - it: should keep workload and config policies in their respective namespaces

@@ -384,6 +384,14 @@ def _decode_replica_resource_state(
     return decoded
 
 
+def _exact_reserved_fill_marker(value: Any) -> bool:
+    """Return one durable fill marker without truthiness coercion."""
+    if type(value) is not bool:  # pylint: disable=unidiomatic-typecheck
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Stored reserved_fill marker must be a boolean.')
+    return value
+
+
 def _set_ordinary_system_recovery_defaults(replica: Any) -> None:
     replica.system_recovery_launch_intent = None
     replica.system_recovery_disposition = (
@@ -638,6 +646,7 @@ class ReplicaInfo:
         self.reserved_fill_pool_key: str | None = None
         self.reserved_fill_service_generation: int | None = None
         self.reserved_fill_physical_cluster_uid: str | None = None
+        self.reserved_fill_kubernetes_context: str | None = None
         # Placement-cost provenance, not launch intent. True means the
         # replica occupies capacity the placer classifies as zero cost.
         self.is_zero_cost: bool = False
@@ -709,6 +718,8 @@ class ReplicaInfo:
         disposition = self.system_recovery_disposition
         recovery = self.system_recovery
         quarantine = self.system_recovery_quarantine
+        reserved_fill = _exact_reserved_fill_marker(
+            vars(self).get('reserved_fill', False))
 
         def _process_status_value(
             status: common_utils.ProcessStatus | None,) -> str | None:
@@ -732,13 +743,15 @@ class ReplicaInfo:
                 getattr(self, 'unknown_capacity_replacement', False)),
             'logical_bridge_capacity_verified': bool(
                 getattr(self, 'logical_bridge_capacity_verified', False)),
-            'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
+            'reserved_fill': reserved_fill,
             'reserved_fill_pool_key': getattr(self, 'reserved_fill_pool_key',
                                               None),
             'reserved_fill_service_generation': getattr(
                 self, 'reserved_fill_service_generation', None),
             'reserved_fill_physical_cluster_uid': getattr(
                 self, 'reserved_fill_physical_cluster_uid', None),
+            'reserved_fill_kubernetes_context': getattr(
+                self, 'reserved_fill_kubernetes_context', None),
             'is_zero_cost': bool(getattr(self, 'is_zero_cost', False)),
             'cost_rebalance_for_replica_id': getattr(
                 self, 'cost_rebalance_for_replica_id', None),
@@ -832,12 +845,15 @@ class ReplicaInfo:
             state.get('unknown_capacity_replacement', False))
         replica.logical_bridge_capacity_verified = bool(
             state.get('logical_bridge_capacity_verified', False))
-        replica.reserved_fill = bool(state.get('reserved_fill', False))
+        replica.reserved_fill = _exact_reserved_fill_marker(
+            state.get('reserved_fill', False))
         replica.reserved_fill_pool_key = state.get('reserved_fill_pool_key')
         replica.reserved_fill_service_generation = state.get(
             'reserved_fill_service_generation')
         replica.reserved_fill_physical_cluster_uid = state.get(
             'reserved_fill_physical_cluster_uid')
+        replica.reserved_fill_kubernetes_context = state.get(
+            'reserved_fill_kubernetes_context')
         replica.is_zero_cost = bool(state.get('is_zero_cost', False))
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
@@ -1012,13 +1028,35 @@ class ReplicaInfo:
         handle: backends.CloudVmRayResourceHandle | None = None,
         provider_config: dict[str, Any] | None = None,
     ) -> str | None:
+        # Imported lazily to break replica_info -> reserved_capacity ->
+        # serve_state -> replica_info during module initialization. Endpoint
+        # resolution is a provider operation and must reconstruct its physical
+        # authority from the durable row, never from caller-supplied context.
+        # pylint: disable-next=import-outside-toplevel
+        from sky.serve import reserved_capacity
+
+        cleanup_fence = reserved_capacity.parse_protocol_v2_cleanup_fence(self)
         if handle is None:
             if cluster_record is _NOT_PROVIDED:
-                handle = self.handle()
+                handle = global_user_state.get_handle_from_cluster_name(
+                    self.cluster_name)
             elif cluster_record is None:
-                return None
+                handle = None
             else:
-                handle = self.handle(cluster_record)
+                if cleanup_fence is not None:
+                    if not isinstance(cluster_record, dict):
+                        raise exceptions.KubernetesPhysicalClusterIdentityError(
+                            'The durable replica cluster record is malformed.')
+                    record_name = cluster_record.get('name')
+                    if (record_name is not None and
+                            record_name != self.cluster_name):
+                        raise exceptions.KubernetesPhysicalClusterIdentityError(
+                            'The durable replica cluster record was replaced.')
+                    handle = cluster_record.get('handle')
+                else:
+                    handle = self.handle(cluster_record)
+        provider_fence = reserved_capacity.protocol_v2_provider_fence(
+            self, handle)
         if handle is None:
             return None
         if self.replica_port == '-':
@@ -1028,16 +1066,15 @@ class ReplicaInfo:
             # would error out when trying to get the endpoint.
             return None
         replica_port_int = int(self.replica_port)
+        endpoint_kwargs = {}
+        if (cluster_record is not _NOT_PROVIDED and cluster_record is not None):
+            endpoint_kwargs['cluster_record'] = cluster_record
+        if provider_config is not None:
+            endpoint_kwargs['provider_config'] = provider_config
         try:
-            endpoint_kwargs = {}
-            if (cluster_record is not _NOT_PROVIDED and
-                    cluster_record is not None):
-                endpoint_kwargs['cluster_record'] = cluster_record
-            if provider_config is not None:
-                endpoint_kwargs['provider_config'] = provider_config
-            endpoint_dict = backend_utils.get_endpoints(self.cluster_name,
-                                                        replica_port_int,
-                                                        **endpoint_kwargs)
+            with provider_fence:
+                endpoint_dict = backend_utils.get_endpoints(
+                    self.cluster_name, replica_port_int, **endpoint_kwargs)
         except exceptions.ClusterNotUpError:
             return None
         endpoint = endpoint_dict.get(replica_port_int, None)
@@ -1093,6 +1130,20 @@ class ReplicaInfo:
             rate_cache: optional per-status-request pricing cache shared by
                 replicas with identical launched resources.
         """
+        # Local import avoids the replica_info -> reserved_capacity ->
+        # serve_state import cycle. Presentation must isolate a stale physical
+        # target to this row and must never publish a replacement handle's
+        # endpoint, cost, or provider metadata.
+        # pylint: disable-next=import-outside-toplevel
+        from sky.serve import reserved_capacity
+
+        provider_identity_uncertain = False
+        try:
+            cleanup_fence = (
+                reserved_capacity.parse_protocol_v2_cleanup_fence(self))
+        except exceptions.KubernetesPhysicalClusterIdentityError:
+            cleanup_fence = None
+            provider_identity_uncertain = True
         if cluster_record is _NOT_PROVIDED:
             cluster_record = global_user_state.get_cluster_from_name(
                 self.cluster_name,
@@ -1101,8 +1152,19 @@ class ReplicaInfo:
         # Resolve the handle once. When the cluster row is missing, the
         # handle is also missing (they live in the same row), so
         # short-circuit to avoid an extra DB lookup.
-        if cluster_record is None:
+        if cluster_record is None or provider_identity_uncertain:
             handle = None
+            if cleanup_fence is not None:
+                provider_identity_uncertain = True
+        elif cleanup_fence is not None:
+            handle = (cluster_record.get('handle') if isinstance(
+                cluster_record, dict) else None)
+            try:
+                reserved_capacity.protocol_v2_provider_fence(self, handle)
+            except exceptions.KubernetesPhysicalClusterIdentityError:
+                provider_identity_uncertain = True
+                cluster_record = None
+                handle = None
         else:
             handle = self.handle(cluster_record)
         created_at = getattr(self, 'created_at', None)
@@ -1118,23 +1180,35 @@ class ReplicaInfo:
             # successful readiness probe. This includes placement queueing,
             # cloud provisioning, setup, and application startup.
             time_to_ready_seconds = ready_at - created_at
+        endpoint = None
+        if with_url and not provider_identity_uncertain:
+            try:
+                endpoint = self._resolve_url(cluster_record=cluster_record,
+                                             handle=handle)
+            except exceptions.KubernetesPhysicalClusterIdentityError:
+                provider_identity_uncertain = True
+                cluster_record = None
+                handle = None
         info_dict = {
             'replica_id': self.replica_id,
             'name': self.cluster_name,
-            'status': self.status,
+            'status': (serve_state.ReplicaStatus.UNKNOWN
+                       if provider_identity_uncertain else self.status),
             'version': self.version,
             'replica_info_version': self._version,
             # Immutable logical width selected when this physical backend was
             # placed. It is one for ordinary and legacy physical replicas.
             'planned_capacity': int(getattr(self, 'planned_capacity', 1)),
-            'endpoint':
-                (self._resolve_url(cluster_record=cluster_record, handle=handle)
-                 if with_url else None),
+            'endpoint': endpoint,
             'is_spot': self.is_spot,
             'launched_at': (cluster_record['launched_at']
                             if cluster_record is not None else None),
             'ready_at': ready_at,
             'time_to_ready_seconds': time_to_ready_seconds,
+            # Additive evidence for status consumers: UNKNOWN here means the
+            # durable physical pool identity could not be proved, not an
+            # ordinary application/readiness failure.
+            'provider_identity_uncertain': provider_identity_uncertain,
         }
         # Always populate the small derived strings — new clients read
         # these instead of touching the handle, and the cost is just a
@@ -1201,15 +1275,26 @@ class ReplicaInfo:
         """
         probe_time = time.time()
         try:
-            handle = backend_utils.check_cluster_available(
-                self.cluster_name, operation='probing pool')
-            if handle is None:
-                return self, False, probe_time
-            backend = backend_utils.get_backend_from_handle(handle)
-            statuses = backend.get_job_status(handle, [1], stream_logs=False)
+            # See _resolve_url for the import-cycle rationale.
+            # pylint: disable-next=import-outside-toplevel
+            from sky.serve import reserved_capacity
+            durable_handle = global_user_state.get_handle_from_cluster_name(
+                self.cluster_name)
+            with reserved_capacity.protocol_v2_provider_fence(
+                    self, durable_handle):
+                handle = backend_utils.check_cluster_available(
+                    self.cluster_name, operation='probing pool')
+                if handle is None:
+                    return self, False, probe_time
+                with reserved_capacity.protocol_v2_provider_fence(self, handle):
+                    backend = backend_utils.get_backend_from_handle(handle)
+                    statuses = backend.get_job_status(handle, [1],
+                                                      stream_logs=False)
             if statuses[1] == job_lib.JobStatus.SUCCEEDED:
                 return self, True, probe_time
             return self, False, probe_time
+        except exceptions.KubernetesPhysicalClusterIdentityError:
+            raise
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Error when probing pool of {self.cluster_name}: '
                          f'{common_utils.format_exception(e)}.')
@@ -1343,6 +1428,7 @@ class ReplicaInfo:
         state.setdefault('reserved_fill_pool_key', None)
         state.setdefault('reserved_fill_service_generation', None)
         state.setdefault('reserved_fill_physical_cluster_uid', None)
+        state.setdefault('reserved_fill_kubernetes_context', None)
 
         if version < 7:
             # Rows written before version 7 carry the full list of failed
