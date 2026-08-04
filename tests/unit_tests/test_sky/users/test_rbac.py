@@ -54,6 +54,10 @@ class TestGetViewerAllowlist:
             'path': '/serve/:service_name/replicas',
             'method': 'GET'
         } in allowlist
+        assert {
+            'path': '/serve/:service_name/pricing',
+            'method': 'GET'
+        } in allowlist
 
     def test_launch_is_NOT_on_default_allowlist(self):
         with mock.patch('sky.skypilot_config.get_nested', return_value={}):

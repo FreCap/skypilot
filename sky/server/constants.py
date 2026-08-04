@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 70  # Durable request execution-quiescence acknowledgement
+API_VERSION = 71  # Persisted SkyServe dashboard pricing
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -127,6 +127,9 @@ MIN_SERVE_DASHBOARD_DIRECT_READS_API_VERSION = (
 
 # Minimum API version with batched summaries and paginated replica reads.
 MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67
+
+# Minimum API version with bounded persisted SkyServe pricing reads.
+MIN_SERVE_DASHBOARD_PRICING_API_VERSION = 71
 
 # Minimum server version accepting the private expected-cluster-record UUID on
 # controller-originated down requests. Older servers ignore unknown payload

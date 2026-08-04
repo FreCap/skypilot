@@ -91,6 +91,48 @@ run: echo hi
         restored = spot_placer.PlacementCatalog.from_dict(serialized)
         assert restored.to_dict() == serialized
 
+    def test_new_catalog_round_trip_persists_strict_node_count(self):
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        catalog = spot_placer.PlacementCatalog(((paid, 0.2),), num_nodes=3)
+
+        serialized = catalog.to_dict()
+
+        assert serialized['num_nodes'] == 3
+        assert spot_placer.PlacementCatalog.from_dict(serialized).num_nodes == 3
+
+    @pytest.mark.parametrize('num_nodes', [True, False, 0, -1, 1.5, '2'])
+    def test_catalog_rejects_invalid_node_count(self, num_nodes):
+        serialized = self._single_catalog_dict()
+        serialized['num_nodes'] = num_nodes
+
+        with pytest.raises(ValueError, match='num_nodes'):
+            spot_placer.PlacementCatalog.from_dict(serialized)
+
+    def test_catalog_rejects_overflowing_hourly_cost(self):
+        serialized = self._single_catalog_dict()
+        serialized['entries'][0]['hourly_cost'] = 10**1000
+
+        with pytest.raises(ValueError, match='hourly cost'):
+            spot_placer.PlacementCatalog.from_dict(serialized)
+
+    @staticmethod
+    def _single_catalog_dict():
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        return spot_placer.PlacementCatalog(((paid, 0.2),)).to_dict()
+
+    def test_catalog_rejects_boolean_schema_version(self):
+        serialized = self._single_catalog_dict()
+        serialized['schema_version'] = True
+
+        with pytest.raises(ValueError, match='schema version'):
+            spot_placer.PlacementCatalog.from_dict(serialized)
+
     def test_runtime_lookup_never_resolves_a_complete_catalog(self):
         reserved = make_location('research-ctx',
                                  accelerators={'A100': 1},
@@ -485,6 +527,23 @@ class TestInstanceTypeLocationIdentity:
             legacy, allow_ambiguous_legacy_shape=True) == first
         assert placer.is_launch_admissible(legacy, selected_at=100)
 
+    def test_strict_catalog_match_reports_legacy_ambiguity(self):
+        first = make_location('us-east-1', {'L4': 1},
+                              cloud_name='AWS',
+                              instance_type='g6.xlarge')
+        second = make_location('us-east-1', {'L4': 1},
+                               cloud_name='AWS',
+                               instance_type='g6.2xlarge')
+        legacy = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+
+        assert spot_placer.match_catalog_location_strict(
+            legacy, [first, second]) == (None, True)
+        assert spot_placer.match_catalog_location_strict(legacy,
+                                                         [first]) == (first,
+                                                                      False)
+        assert spot_placer.match_catalog_location_strict(
+            second, [first, second]) == (second, False)
+
     def test_ambiguous_legacy_failure_benches_cheapest_matching_shape(self):
         first = make_location('us-east-1', {'L4': 1},
                               cloud_name='AWS',
@@ -511,6 +570,25 @@ class TestInstanceTypeLocationIdentity:
         assert make_placer({
             current: 1.0
         }).resolve_location(equivalent) == equivalent
+
+    def test_exact_mapping_match_does_not_scan_catalog(self):
+        current = make_location('us-east-1', {'L4': 1},
+                                cloud_name='AWS',
+                                instance_type='g6.xlarge')
+        equivalent = make_location('us-east-1', {'L4': 1},
+                                   cloud_name='AWS',
+                                   instance_type='g6.xlarge')
+
+        class _ExactOnlyMapping(dict):
+
+            def __iter__(self):
+                raise AssertionError('exact mapping lookup must not iterate')
+
+        candidates = _ExactOnlyMapping(
+            {current: spot_placer.LocationStatus.ACTIVE})
+
+        assert spot_placer.match_catalog_location_strict(
+            equivalent, candidates) == (equivalent, False)
 
     def test_failed_type_can_fall_back_to_sibling_type_in_same_region(self):
         cheapest = make_location('us-east-1', {'L4': 1},
