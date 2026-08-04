@@ -2,10 +2,11 @@
 
 Status: feature and durable executor/provider-fence PRs are merged and deployed;
 the production PostgreSQL cutover, protocol-v2 activation, and pool-identity
-RBAC are complete; live acceptance exposed a mixed legacy/v2 provider-phase
-collision and an inherited workspace-context eligibility gap, whose corrective
-hotfix, redeployment, PHX canary, and compatibility-cleanup merge gates remain
-open
+RBAC are complete; measured-capacity PR #1269 and UID-race PR #1271 are merged
+and deployed, but live acceptance exposed a shared-round-reader bench gap, a
+mixed legacy/v2 provider-phase collision, and an inherited workspace-context
+eligibility gap, whose corrective hotfix, redeployment, PHX canary, and
+compatibility-cleanup merge gates remain open
 
 Last updated: 2026-08-04
 
@@ -1408,6 +1409,19 @@ Terraform formatting, and `git diff --check` also passed. Independent
 adversarial review found no remaining release blocker in the lifecycle-wide
 physical-cluster or cluster-generation fence.
 
+Production diagnosis on 2026-08-04 separated three independent refill
+failures. Merged PR #1269 lets a successfully observed zero-cost location
+override an older placement bench, and merged PR #1271 keeps concurrent
+non-forced UID observations from discarding their own successful reads. Helm
+revision 333 deployed both as release `1.1.1095`. A post-deploy broker sample
+then proved the residual shared-reader gap: the east pool persisted 102 free
+slots and a 100-replica `boltz-l4-fleet` feed while the service reported one
+fill holding and continued paid placement. The controller that read the fresh
+shared round without driving its query callback did not receive #1269's local
+placer observation. The committed-round observation metadata and reader-side
+application in this corrective change close that owner/peer asymmetry without
+cross-pool or cross-card leakage.
+
 Required feature CI on the preceding code-bearing head `1357dec79` completed
 all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
@@ -1422,11 +1436,14 @@ fleet no larger than the configured `max_replicas`.
 
 ## Open gates
 
-- Required feature and durable provider-fence CI passed. Release `1.1.1091`
-  (merge `663a7ab2cc93fde36f4d8b0119051307679d94bc`) is deployed at one
-  attested image digest. The production request store completed its one-way
-  PostgreSQL cutover, Serve is at schema head 035, token-bound protocol v2 is
-  active, and the exact `kube-system` Namespace read is present on east and PHX.
+- Required feature and durable provider-fence CI passed. Helm revision 333
+  currently runs release `1.1.1095` (merge
+  `912555e6ee160aff404aca0db89337d2981493a1`) with merged PRs #1269 and #1271.
+  The production request store completed its one-way PostgreSQL cutover, Serve
+  is at schema head 035, token-bound protocol v2 is active, and the exact
+  `kube-system` Namespace read is present on east and PHX. The corrective
+  shared-round/provider-phase/workspace release, its required CI, and its
+  mixed-round observation are still open.
 - Live version 51 acceptance retained east serving health and brought up its
   paid fallback, but correctly omitted PHX from the immutable placement
   catalog because the inference workspace still inherited the global east-only
@@ -1442,6 +1459,11 @@ fleet no larger than the configured `max_replicas`.
   drift item until both platform pool roots consume the fixed module. At that
   point remove the bridge binding, prove both exact UID reads still pass, and
   then remove the bridge role.
+- The Helm release is declaratively owned by boltz-platform Terragrunt, whose
+  `skypilot-pin.json` remains at `1.1.1084`. Revisions 331 through 333 and this
+  requested corrective Helm rollout are intentional direct-deploy drift; a
+  later Terragrunt apply will revert them unless the pin is reconciled. This
+  rollout deliberately creates no boltz-platform PR, per operator direction.
 - The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`. After
   the corrective rollout, the workspace update, fresh service version, exact
   two-edge zero-cost claim/replica canary, H200 model endpoint check, and east
