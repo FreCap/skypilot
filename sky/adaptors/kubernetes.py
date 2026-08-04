@@ -125,8 +125,44 @@ _PHYSICAL_CLUSTER_UID_FENCE_TOKENS: contextvars.ContextVar[dict[
 # Canonical context -> capture target and active scope count.
 _PHYSICAL_CLUSTER_UID_FENCES: dict[str, _PhysicalClusterUidFenceEntry] = {}
 _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS: dict[str, str] = {}
+_PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS: dict[str, int] = {}
+_PHYSICAL_CLUSTER_UID_FENCE_PID = os.getpid()
 _MAX_FENCED_KUBECONFIG_BYTES = 16 * 1024 * 1024
 _FENCED_KUBECONFIG_CAPTURE_TIMEOUT_SECONDS = 30
+
+
+def _reset_physical_cluster_uid_fences_after_fork() -> None:
+    """Replace inherited synchronization and authority in a forked child."""
+    global _PHYSICAL_CLUSTER_UID_FENCES_LOCK  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCES_CONDITION  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCE_TOKENS  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCES  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCE_PID  # pylint: disable=global-statement
+    # A vanished parent thread may own the old mutex.  Never acquire it and do
+    # not unlink capture paths: those files remain owned by the parent scope.
+    lock = threading.Lock()
+    _PHYSICAL_CLUSTER_UID_FENCES_LOCK = lock
+    _PHYSICAL_CLUSTER_UID_FENCES_CONDITION = threading.Condition(lock)
+    _PHYSICAL_CLUSTER_UID_FENCE_TOKENS = contextvars.ContextVar(
+        'physical_cluster_uid_fence_tokens', default=None)
+    _PHYSICAL_CLUSTER_UID_FENCES = {}
+    _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS = {}
+    _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS = {}
+    _PHYSICAL_CLUSTER_UID_FENCE_PID = os.getpid()
+
+
+def _ensure_physical_cluster_uid_fence_process() -> None:
+    if os.getpid() != _PHYSICAL_CLUSTER_UID_FENCE_PID:
+        # Defensive fallback for an embedding that did not run at-fork hooks.
+        # This check must precede every access to the possibly inherited lock.
+        _reset_physical_cluster_uid_fences_after_fork()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(
+        after_in_child=_reset_physical_cluster_uid_fences_after_fork)
 
 
 def _canonical_physical_cluster_fence_context(context: str | None) -> str:
@@ -137,6 +173,7 @@ def _canonical_physical_cluster_fence_context(context: str | None) -> str:
 def active_physical_cluster_command_target(
         context: str | None) -> PhysicalClusterUidFenceTarget | None:
     """Return the capture-pinned command target for an active UID fence."""
+    _ensure_physical_cluster_uid_fence_process()
     canonical_context = _canonical_physical_cluster_fence_context(context)
     caller_tokens = _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.get() or {}
     caller_token = caller_tokens.get(canonical_context)
@@ -271,6 +308,8 @@ def physical_cluster_uid_fence(
         raise ValueError('Kubernetes physical-cluster fence needs a context.')
     if not isinstance(expected_uid, str) or not expected_uid:
         raise ValueError('Kubernetes physical-cluster fence needs a UID.')
+    _ensure_physical_cluster_uid_fence_process()
+    scope_pid = _PHYSICAL_CLUSTER_UID_FENCE_PID
     canonical_context = _canonical_physical_cluster_fence_context(context)
     inherited_tokens = _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.get() or {}
     inherited_token = inherited_tokens.get(canonical_context)
@@ -373,22 +412,27 @@ def physical_cluster_uid_fence(
     try:
         yield
     finally:
-        _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.reset(token_reset)
-        retired_path: str | None = None
-        with _PHYSICAL_CLUSTER_UID_FENCES_LOCK:
-            current = _PHYSICAL_CLUSTER_UID_FENCES.get(canonical_context)
-            if (current is None or current.target.expected_uid != expected_uid):
-                # The registry is private and every mutation is lock-guarded;
-                # this is a defensive fail-closed assertion against corruption.
-                raise RuntimeError(
-                    'Kubernetes physical-cluster fence registry changed '
-                    'unexpectedly.')
-            if current.count == 1:
-                retired = _PHYSICAL_CLUSTER_UID_FENCES.pop(canonical_context)
-                retired_path = retired.target.kubeconfig_path
-            else:
-                current.count -= 1
-        _remove_capture_file(retired_path)
+        if (os.getpid() == scope_pid and
+                _PHYSICAL_CLUSTER_UID_FENCE_PID == scope_pid):
+            _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.reset(token_reset)
+            retired_path: str | None = None
+            with _PHYSICAL_CLUSTER_UID_FENCES_LOCK:
+                current = _PHYSICAL_CLUSTER_UID_FENCES.get(canonical_context)
+                if (current is None or
+                        current.target.expected_uid != expected_uid):
+                    # The registry is private and every mutation is
+                    # lock-guarded; this is a defensive fail-closed assertion
+                    # against corruption.
+                    raise RuntimeError(
+                        'Kubernetes physical-cluster fence registry changed '
+                        'unexpectedly.')
+                if current.count == 1:
+                    retired = _PHYSICAL_CLUSTER_UID_FENCES.pop(
+                        canonical_context)
+                    retired_path = retired.target.kubeconfig_path
+                else:
+                    current.count -= 1
+            _remove_capture_file(retired_path)
 
 
 @dataclasses.dataclass(frozen=True)

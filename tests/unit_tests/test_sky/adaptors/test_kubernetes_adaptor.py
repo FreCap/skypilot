@@ -6,7 +6,9 @@ import contextvars
 import gc
 import json
 import os
+import select
 import shlex
+import signal
 import sys
 import tempfile
 import threading
@@ -564,6 +566,81 @@ def test_stale_copied_fence_context_cannot_reenter_or_borrow(
                               context)
         with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError):
             stale_context.run(enter_fence)
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='requires os.fork')
+def test_physical_fence_registry_resets_locked_state_after_fork(tmp_path):
+    """A child starts ambient even when a vanished thread owned the mutex."""
+    context = 'fork-context'
+    capture_path = tmp_path / 'parent-capture.yaml'
+    capture_path.write_text('parent-owned', encoding='utf-8')
+    target = kubernetes.PhysicalClusterUidFenceTarget(
+        context_name=context,
+        provider_context=context,
+        expected_uid='parent-uid',
+        kubeconfig_path=str(capture_path),
+        in_cluster=False,
+        token='parent-token')
+    with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCES[context] = (
+            kubernetes._PhysicalClusterUidFenceEntry(target, 1))
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS[
+            'initializing-context'] = 'parent-uid'
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS[context] = 7
+    token_reset = kubernetes._PHYSICAL_CLUSTER_UID_FENCE_TOKENS.set(
+        {context: 'parent-token'})
+
+    parent_locked = threading.Event()
+    parent_release = threading.Event()
+
+    def hold_parent_lock() -> None:
+        with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+            parent_locked.set()
+            assert parent_release.wait(timeout=10)
+
+    holder = threading.Thread(target=hold_parent_lock)
+    holder.start()
+    assert parent_locked.wait(timeout=2)
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        result = b'failure'
+        try:
+            assert kubernetes.active_physical_cluster_command_target(
+                context) is None
+            assert not kubernetes._PHYSICAL_CLUSTER_UID_FENCES
+            assert not kubernetes._PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS
+            assert not kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS
+            assert kubernetes._PHYSICAL_CLUSTER_UID_FENCE_TOKENS.get() is None
+            assert capture_path.exists()
+            result = b'ok'
+        except BaseException:  # pylint: disable=broad-exception-caught
+            pass
+        os.write(write_fd, result)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        readable, _, _ = select.select([read_fd], [], [], 5)
+        if not readable:
+            os.kill(child_pid, signal.SIGKILL)
+            pytest.fail('forked child deadlocked on physical fence registry')
+        assert os.read(read_fd, 16) == b'ok'
+    finally:
+        os.close(read_fd)
+        parent_release.set()
+        holder.join(timeout=2)
+        _, status = os.waitpid(child_pid, 0)
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_TOKENS.reset(token_reset)
+        with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+            kubernetes._PHYSICAL_CLUSTER_UID_FENCES.clear()
+            kubernetes._PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS.clear()
+            kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.clear()
+    assert not holder.is_alive()
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert capture_path.exists()
 
 
 def test_wrapper_leaves_capture_for_fresh_ambient_client(monkeypatch, tmp_path):
