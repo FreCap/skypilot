@@ -76,11 +76,7 @@ def _replica(replica_id, name, expected_mode, harness, serialized):
                                  cluster_name=name,
                                  planned_capacity=1)
 
-    def _to_info_dict(*,
-                      with_handle,
-                      with_url,
-                      cluster_record,
-                      rate_cache):
+    def _to_info_dict(*, with_handle, with_url, cluster_record, rate_cache):
         del cluster_record, rate_cache
         if with_url:
             assert harness.current_mode() is expected_mode
@@ -107,7 +103,10 @@ def _replica(replica_id, name, expected_mode, harness, serialized):
 def _prepared(name, v2_infos, ordinary_infos):
     infos = [*v2_infos, *ordinary_infos]
     prepared = serve_utils._PreparedServiceStatus(
-        record={'name': name, 'pool': False},
+        record={
+            'name': name,
+            'pool': False
+        },
         pool=False,
         include_replica_info=True,
         replica_infos=infos,
@@ -116,16 +115,14 @@ def _prepared(name, v2_infos, ordinary_infos):
                 'name': info.cluster_name,
                 'handle': f'handle-{info.cluster_name}',
                 'launched_at': 1,
-            }
-            for info in infos
+            } for info in infos
         },
         ordinary_infos=list(ordinary_infos),
     )
     if v2_infos:
         prepared.fenced_groups[_PHYSICAL_KEY] = list(v2_infos)
         prepared.validated_handles.update({
-            info.replica_id: f'handle-{info.cluster_name}'
-            for info in v2_infos
+            info.replica_id: f'handle-{info.cluster_name}' for info in v2_infos
         })
     return prepared
 
@@ -186,6 +183,46 @@ class TestStatusProviderPhaseFanout:
         assert proofs == [('v2-z', 'handle-v2-z')]
         assert prepare.call_count == 2
 
+    def test_conflicting_uids_for_one_context_fail_both_closed(self):
+        harness = _PhaseHarness()
+        serialized = []
+        first = _replica(1, 'first', _V2, harness, serialized)
+        second = _replica(2, 'second', _V2, harness, serialized)
+        prepared = _prepared('svc', [first], [])
+        second_key = (_PHYSICAL_KEY[0], 'replacement-uid')
+        prepared.replica_infos.append(second)
+        prepared.cluster_records[second.cluster_name] = {
+            'name': second.cluster_name,
+            'handle': 'handle-second',
+            'launched_at': 1,
+        }
+        prepared.fenced_groups[second_key] = [second]
+        prepared.validated_handles[second.replica_id] = 'handle-second'
+
+        with mock.patch.object(serve_utils,
+                               '_prepare_service_status',
+                               return_value=prepared), \
+             mock.patch.object(serve_utils.provider_phase,
+                               'provider_phase') as phase, \
+             mock.patch('sky.serve.reserved_capacity.'
+                        'protocol_v2_provider_fence') as physical_fence:
+            status = _decode(
+                serve_utils.get_service_status_pickled(['svc'], pool=False))[0]
+
+        assert [item['status'] for item in status['replica_info']] == [
+            serve_state.ReplicaStatus.UNKNOWN,
+            serve_state.ReplicaStatus.UNKNOWN,
+        ]
+        assert all(item['provider_identity_uncertain']
+                   for item in status['replica_info'])
+        assert all(item['endpoint'] is None for item in status['replica_info'])
+        # Durable placement metadata remains; neither contradictory target is
+        # entered or selected as the scheduling-dependent winner.
+        assert all(
+            item['cloud'] == 'Kubernetes' for item in status['replica_info'])
+        phase.assert_not_called()
+        physical_fence.assert_not_called()
+
     @pytest.mark.parametrize('timed_out_mode', [_V2, _AMBIENT])
     def test_phase_timeout_keeps_partition_as_strict_unknown(
             self, timed_out_mode):
@@ -216,8 +253,7 @@ class TestStatusProviderPhaseFanout:
                         'protocol_v2_provider_fence',
                         side_effect=_physical_fence):
             status = _decode(
-                serve_utils.get_service_status_pickled(['svc'],
-                                                       pool=False))[0]
+                serve_utils.get_service_status_pickled(['svc'], pool=False))[0]
 
         assert harness.attempts == [_V2, _AMBIENT]
         records = {item['name']: item for item in status['replica_info']}

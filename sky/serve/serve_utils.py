@@ -1981,10 +1981,10 @@ def _sanitize_provider_uncertain_status(
     return replica_record
 
 
-def _provider_uncertain_replica_status(
-        info: Any,
-        *,
-        strip_placement_metadata: bool = False) -> dict[str, Any]:
+def _provider_uncertain_replica_status(info: Any,
+                                       *,
+                                       strip_placement_metadata: bool = False
+                                      ) -> dict[str, Any]:
     """Serialize durable fields only; no provider or replacement metadata."""
     replica_record = info.to_info_dict(with_handle=True,
                                        with_url=False,
@@ -2025,8 +2025,7 @@ def _uncertain_results(
 ) -> list[tuple[_PreparedServiceStatus, int, dict[str, Any]]]:
     return [(prepared, info.replica_id,
              _provider_uncertain_replica_status(
-                 info,
-                 strip_placement_metadata=strip_placement_metadata))
+                 info, strip_placement_metadata=strip_placement_metadata))
             for prepared, info in entries]
 
 
@@ -2105,6 +2104,24 @@ def _global_v2_status_groups(
     return groups
 
 
+def _reject_conflicting_v2_status_groups(
+    groups: dict[tuple[str, str], list[_PreparedReplicaStatus]],) -> None:
+    """Fail every contradictory UID for one mutable context closed."""
+    keys_by_context: dict[str, list[tuple[str, str]]] = {}
+    for key in groups:
+        keys_by_context.setdefault(key[0], []).append(key)
+    conflicted_keys = [
+        key for keys in keys_by_context.values()
+        if len({candidate[1] for candidate in keys}) > 1 for key in keys
+    ]
+    for key in conflicted_keys:
+        entries = groups.pop(key)
+        logger.warning(
+            'Service status rejected conflicting physical-cluster '
+            'UIDs for Kubernetes context %r.', key[0])
+        _store_serialized_results(_uncertain_results(entries))
+
+
 def _ordinary_status_partitions(
     prepared_statuses: list[_PreparedServiceStatus],
 ) -> list[list[_PreparedReplicaStatus]]:
@@ -2129,6 +2146,7 @@ def _serialize_prepared_statuses_synchronously(
     """Run v2 then ambient serialization without child-thread admission."""
     _seed_identity_uncertain_statuses(prepared_statuses)
     v2_groups = _global_v2_status_groups(prepared_statuses)
+    _reject_conflicting_v2_status_groups(v2_groups)
     if v2_groups:
         try:
             with provider_phase.provider_phase(
@@ -2181,6 +2199,7 @@ def _serialize_prepared_statuses_with_fanout(
     """Serialize a batch under one fully joined v2 and ambient root each."""
     _seed_identity_uncertain_statuses(prepared_statuses)
     v2_groups = _global_v2_status_groups(prepared_statuses)
+    _reject_conflicting_v2_status_groups(v2_groups)
     if v2_groups:
         v2_work = list(v2_groups.values())
         try:
