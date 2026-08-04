@@ -126,6 +126,14 @@ class AutostopServiceImpl(autostopv1_pb2_grpc.AutostopServiceServicer):
                 autostop_lib.set_hooks(
                     autostop_lib.hooks_from_protobuf(request.hooks))
             return autostopv1_pb2.SetAutostopResponse()
+        except exceptions.NotSupportedError as e:
+            # The node refuses a config it cannot execute (e.g. an
+            # autodown it has no permission to perform). This is a
+            # permanent property of the request, not a transient
+            # failure: FAILED_PRECONDITION keeps the client from
+            # retrying and carries the message through as a
+            # NotSupportedError instead of an internal error.
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 

@@ -28,6 +28,7 @@ from sky.container_images import consumers as container_image_consumers
 from sky.execution_autostop import _check_autostop_feasibility_early
 from sky.execution_autostop import (
     _compute_set_autostop_args_for_hooks_only_relaunch)
+from sky.execution_autostop import apply_launch_autostop
 from sky.execution_autostop import autostop_requested_features
 from sky.serve import constants as serve_constants
 from sky.serve import serve_state
@@ -687,13 +688,20 @@ def _execute_dag(
             if idle_minutes_to_autostop is not None:
                 assert isinstance(backend, backends.CloudVmRayBackend)
                 assert isinstance(handle, backends.CloudVmRayResourceHandle)
-                backend.set_autostop(handle,
-                                     idle_minutes_to_autostop,
-                                     wait_for,
-                                     down,
-                                     hook=hook,
-                                     hook_timeout=hook_timeout,
-                                     hooks=hooks_payload)
+                apply_launch_autostop(
+                    backend,
+                    handle,
+                    idle_minutes_to_autostop,
+                    wait_for,
+                    down,
+                    hook=hook,
+                    hook_timeout=hook_timeout,
+                    hooks=hooks_payload,
+                    # A node that cannot execute the teardown only fails
+                    # the launch when the user is the one who asked for
+                    # it; SkyPilot's own leak backstops degrade instead.
+                    refusal_is_fatal=(not is_managed and controller is None),
+                    job_logger=job_logger)
             elif hooks_payload is not None:
                 # Hooks can fire on preemption/down independent of
                 # autostop — persist them even when autostop is disabled.

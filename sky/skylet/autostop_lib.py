@@ -24,8 +24,10 @@ import time
 import typing
 from typing import Any, Optional
 
+from sky import exceptions
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
+from sky.skylet import autostop_preflight
 from sky.skylet import configs
 from sky.skylet import constants
 from sky.skylet import log_lib
@@ -196,7 +198,25 @@ def set_autostop(idle_minutes: int,
             clients talking to a v7+ skylet still get their autostop
             hook routed into the generalized hooks list.
         hook_timeout: DEPRECATED timeout for the single hook.
+
+    Raises:
+        exceptions.NotSupportedError: this node provably cannot execute
+            the requested autodown (see ``autostop_preflight``). Raised
+            before anything is persisted, so the cluster is left with no
+            autostop rather than one that silently never fires.
     """
+    denial_reason = autostop_preflight.autodown_denial_reason(
+        idle_minutes, down)
+    if denial_reason is not None:
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.NotSupportedError(
+                f'Auto-down was requested but {denial_reason}. Grant the '
+                'ServiceAccount the missing permission (or drop the custom '
+                '`kubernetes.pod_config.spec.serviceAccountName` so SkyPilot '
+                'manages the RBAC itself), or relaunch without `--down` / '
+                '`--idle-minutes-to-autostop` and tear the cluster down with '
+                '`sky down`.')
+
     boot_time = psutil.boot_time()
 
     autostop_config = AutostopConfig(idle_minutes, boot_time, backend, wait_for,
