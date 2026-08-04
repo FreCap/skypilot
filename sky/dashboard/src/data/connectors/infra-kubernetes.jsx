@@ -1,5 +1,6 @@
 import { apiClient } from '@/data/connectors/client';
 import { getErrorMessageFromResponse } from '@/data/utils';
+import { emptyPreemptible, mergePreemptible } from '@/utils/gpuUtils';
 
 /**
  * Returns true iff `nodeData` (a `KubernetesNodeInfo`-shaped object from
@@ -19,13 +20,6 @@ function isNodeNotReadyForGpus(nodeData) {
 }
 
 /**
- * Zero-valued preemptible accounting for a fresh per-GPU-type aggregate.
- */
-function emptyPreemptible() {
-  return { gpu_preemptible: 0, gpu_preemptible_breakdown: {} };
-}
-
-/**
  * Fold a node's preemptible accelerator counts into a per-GPU-type aggregate.
  *
  * Not-ready nodes are skipped: their whole capacity is already reported as
@@ -40,19 +34,6 @@ function addPreemptibleFromNode(aggregate, nodeData, isNodeNotReady) {
   for (const [label, qty] of Object.entries(breakdown)) {
     aggregate.gpu_preemptible_breakdown[label] =
       (aggregate.gpu_preemptible_breakdown[label] || 0) + qty;
-  }
-}
-
-/**
- * Fold one per-GPU-type aggregate's preemptible accounting into another.
- */
-function mergePreemptible(target, source) {
-  target.gpu_preemptible += source.gpu_preemptible || 0;
-  for (const [label, qty] of Object.entries(
-    source.gpu_preemptible_breakdown || {}
-  )) {
-    target.gpu_preemptible_breakdown[label] =
-      (target.gpu_preemptible_breakdown[label] || 0) + qty;
   }
 }
 
