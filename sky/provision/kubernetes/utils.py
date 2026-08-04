@@ -13,7 +13,7 @@ import re
 import threading
 import time
 import typing
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import ijson
 
@@ -2916,6 +2916,10 @@ class V1Container:
 class V1PodSpec:
     containers: list[V1Container]
     node_name: str | None
+    # Scheduling priority resolved by the Priority admission controller from
+    # `priorityClassName`. Pods without a priority class resolve to 0.
+    priority: int = 0
+    priority_class_name: str | None = None
 
 
 @dataclasses.dataclass
@@ -2927,27 +2931,48 @@ class V1Pod:
     @classmethod
     def from_dict(cls, data: dict) -> 'V1Pod':
         """Create V1Pod from a dictionary."""
-        return cls(metadata=V1ObjectMeta(
-            name=data['metadata']['name'],
-            labels=data['metadata'].get('labels', {}),
-            namespace=data['metadata'].get('namespace'),
-        ),
-                   status=V1PodStatus(phase=data['status'].get('phase'),),
-                   spec=V1PodSpec(
-                       node_name=data['spec'].get('nodeName'),
-                       containers=[
-                           V1Container(resources=V1ResourceRequirements(
-                               requests=container.get('resources', {}).get(
-                                   'requests') or None))
-                           for container in data['spec'].get('containers', [])
-                       ]))
+        return cls(
+            metadata=V1ObjectMeta(
+                name=data['metadata']['name'],
+                labels=data['metadata'].get('labels', {}),
+                namespace=data['metadata'].get('namespace'),
+            ),
+            status=V1PodStatus(phase=data['status'].get('phase'),),
+            spec=V1PodSpec(
+                node_name=data['spec'].get('nodeName'),
+                priority=data['spec'].get('priority') or 0,
+                priority_class_name=data['spec'].get('priorityClassName'),
+                containers=[
+                    V1Container(
+                        resources=V1ResourceRequirements(requests=container.get(
+                            'resources', {}).get('requests') or None))
+                    for container in data['spec'].get('containers', [])
+                ]))
+
+
+class PriorityTier(NamedTuple):
+    """A scheduling priority tier that accelerators can be attributed to.
+
+    Two priority classes may share the same value, so the class name is part
+    of the identity to keep them distinguishable in the breakdown.
+    """
+    priority: int
+    class_name: str | None
+
+    @property
+    def label(self) -> str:
+        """Display label, e.g. 'inference-low (-1000)' or 'priority 0'."""
+        if self.class_name is None:
+            return f'priority {self.priority}'
+        return f'{self.class_name} ({self.priority})'
 
 
 @_retry_on_error(resource_type='pod')
 def get_allocated_resources_by_node(
     *,
     context: str | None = None,
-) -> tuple[dict[str, int], dict[str, tuple[float, float]]]:
+) -> tuple[dict[str, int], dict[str, tuple[float, float]], dict[str, dict[
+        PriorityTier, int]]]:
     """Gets allocated GPU, CPU, and memory by each node by fetching pods in
     all namespaces in kubernetes cluster indicated by context.
 
@@ -2955,9 +2980,12 @@ def get_allocated_resources_by_node(
     API call for better performance.
 
     Returns:
-        Tuple of (allocated_gpu_qty_by_node, allocated_cpu_memory_by_node):
+        Tuple of (allocated_gpu_qty_by_node, allocated_cpu_memory_by_node,
+        allocated_gpu_qty_by_node_by_priority):
         - allocated_gpu_qty_by_node: Dict mapping node name to allocated GPU count
         - allocated_cpu_memory_by_node: Dict mapping node name to (allocated_cpu, allocated_memory_gb) tuple
+        - allocated_gpu_qty_by_node_by_priority: Dict mapping node name to the
+          GPU count allocated at each scheduling priority tier on that node
     """
     if context is None:
         context = get_current_kube_config_context_name()
@@ -2977,6 +3005,9 @@ def get_allocated_resources_by_node(
         allocated_qty_by_node: dict[str, int] = collections.defaultdict(int)
         allocated_cpu_memory_by_node: dict[str, tuple[
             float, float]] = collections.defaultdict(lambda: (0.0, 0.0))
+        allocated_qty_by_node_by_priority: dict[str, dict[
+            PriorityTier, int]] = collections.defaultdict(
+                lambda: collections.defaultdict(int))
         for item_dict in ijson.items(response,
                                      'items.item',
                                      buf_size=IJSON_BUFFER_SIZE):
@@ -3010,13 +3041,18 @@ def get_allocated_resources_by_node(
 
             if pod_allocated_qty > 0:
                 allocated_qty_by_node[pod.spec.node_name] += pod_allocated_qty
+                tier = PriorityTier(pod.spec.priority,
+                                    pod.spec.priority_class_name)
+                allocated_qty_by_node_by_priority[
+                    pod.spec.node_name][tier] += pod_allocated_qty
             if pod_allocated_cpu > 0 or pod_allocated_memory_gb > 0:
                 current_cpu, current_memory = allocated_cpu_memory_by_node[
                     pod.spec.node_name]
                 allocated_cpu_memory_by_node[pod.spec.node_name] = (
                     current_cpu + pod_allocated_cpu,
                     current_memory + pod_allocated_memory_gb)
-        return allocated_qty_by_node, allocated_cpu_memory_by_node
+        return (allocated_qty_by_node, allocated_cpu_memory_by_node,
+                allocated_qty_by_node_by_priority)
     finally:
         response.release_conn()
 
@@ -3032,7 +3068,8 @@ def get_allocated_gpu_qty_by_node(
     Note: For better performance when you also need CPU/memory allocation,
     use get_allocated_resources_by_node() instead.
     """
-    allocated_qty_by_node, _ = get_allocated_resources_by_node(context=context)
+    allocated_qty_by_node, _, _ = get_allocated_resources_by_node(
+        context=context)
     return allocated_qty_by_node
 
 
@@ -4241,14 +4278,16 @@ def get_kubernetes_node_info(
     # Get the allocated resources (GPU, CPU, memory) by each node in a single call
     allocated_qty_by_node: dict[str, int] = collections.defaultdict(int)
     allocated_cpu_memory_by_node: dict[str, tuple[float, float]] = {}
+    allocated_qty_by_node_by_priority: dict[str, dict[PriorityTier, int]] = {}
     error_on_get_allocated_resources = False
     # Get resource allocation. For GPU allocation, only call if there are GPU nodes
     # (same as master branch). For CPU/memory, we always need it for all nodes.
     if has_accelerator_nodes:
         # When there are GPU nodes, get both GPU and CPU/memory in one call
         try:
-            allocated_qty_by_node, allocated_cpu_memory_by_node = get_allocated_resources_by_node(
-                context=context)
+            (allocated_qty_by_node, allocated_cpu_memory_by_node,
+             allocated_qty_by_node_by_priority) = (
+                 get_allocated_resources_by_node(context=context))
         except kubernetes.api_exception() as e:
             if e.status == 403:
                 error_on_get_allocated_resources = True
@@ -4259,7 +4298,7 @@ def get_kubernetes_node_info(
         # When there are no GPU nodes, we still need CPU/memory allocation
         # This is an extra API call compared to master branch
         try:
-            _, allocated_cpu_memory_by_node = get_allocated_resources_by_node(
+            _, allocated_cpu_memory_by_node, _ = get_allocated_resources_by_node(
                 context=context)
         except kubernetes.api_exception() as e:
             if e.status == 403:
@@ -4267,6 +4306,20 @@ def get_kubernetes_node_info(
                 pass
             else:
                 raise
+
+    # Accelerators are attributed as "preemptible" when the pod holding them
+    # sits below the cluster's top scheduling priority tier: a workload in the
+    # top tier can evict them, so they are reclaimable rather than committed.
+    # The top tier is derived from the accelerator-holding pods themselves
+    # instead of a fixed threshold, so a cluster that runs everything at one
+    # priority reports nothing preemptible, and a cluster that reserves a high
+    # class for production reports the tiers underneath it. Pods that hold no
+    # accelerators (system daemons and the like) never enter this set.
+    top_priority: int | None = None
+    for tiers in allocated_qty_by_node_by_priority.values():
+        for tier in tiers:
+            if top_priority is None or tier.priority > top_priority:
+                top_priority = tier.priority
 
     node_info_dict: dict[str, models.KubernetesNodeInfo] = {}
     has_multi_host_tpu = False
@@ -4369,6 +4422,20 @@ def get_kubernetes_node_info(
             allocated_qty = allocated_qty_by_node[node.metadata.name]
             accelerators_available = accelerator_count - allocated_qty
 
+        # Split what this node has allocated into the tiers below the top one.
+        # Left as None when pod allocation is unknown, so the caller can tell
+        # "nothing is preemptible" apart from "we could not look".
+        accelerators_preemptible: int | None = None
+        preemptible_breakdown: dict[str, int] | None = None
+        if not error_on_get_allocated_resources and top_priority is not None:
+            preemptible_breakdown = {
+                tier.label: qty
+                for tier, qty in allocated_qty_by_node_by_priority.get(
+                    node.metadata.name, {}).items()
+                if tier.priority < top_priority
+            }
+            accelerators_preemptible = sum(preemptible_breakdown.values())
+
         # Exclude multi-host TPUs from being processed.
         # TODO(Doyoung): Remove the logic when adding support for
         # multi-host TPUs.
@@ -4389,6 +4456,8 @@ def get_kubernetes_node_info(
             is_ready=node_is_ready,
             is_cordoned=node.is_cordoned(),
             taints=node_taints,
+            accelerators_preemptible=accelerators_preemptible,
+            preemptible_breakdown=preemptible_breakdown,
         )
     hint = ''
     if has_multi_host_tpu:

@@ -7,6 +7,24 @@ import { canonicalizeGpuName } from '@/utils/gpuUtils';
 import { trackInfraAction } from '@/lib/analytics';
 import { PluginSlot } from '@/plugins/PluginSlot';
 
+// Tooltip text for the preemptible segment: the priority classes holding
+// those accelerators, largest first, e.g.
+//   "66 preemptible (reclaimable by higher-priority workloads)
+//    inference-low (-1000): 60
+//    drill (-500): 6"
+const buildPreemptibleTitle = (preemptible, breakdown) => {
+  const header =
+    `${preemptible} preemptible ` +
+    `(reclaimable by higher-priority workloads)`;
+  const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) {
+    return header;
+  }
+  return [header, ...entries.map(([label, qty]) => `${label}: ${qty}`)].join(
+    '\n'
+  );
+};
+
 const GpuUtilizationBar = ({
   gpu,
   heightClass = 'h-4',
@@ -15,13 +33,20 @@ const GpuUtilizationBar = ({
   const total = gpu?.gpu_total || 0;
   const notReady = gpu?.gpu_not_ready || 0;
   const free = gpu?.gpu_free || 0;
-  const used = Math.max(0, total - free - notReady);
+  const allUsed = Math.max(0, total - free - notReady);
+  // Accelerators held below the cluster's top priority tier. Clamped to what
+  // is actually in use so a stale or partial reading can never render a
+  // segment wider than the used block it splits.
+  const preemptible = Math.min(Math.max(0, gpu?.gpu_preemptible || 0), allUsed);
+  const used = allUsed - preemptible;
   const notReadyLabel = `${notReady} not ready`;
   const usedLabel = `${used} used`;
+  const preemptibleLabel = `${preemptible} preemptible`;
   const freeLabel = `${free} free`;
   const toPercentage = total > 0 ? (value) => (value / total) * 100 : () => 0;
   const notReadyPercentage = toPercentage(notReady);
   const usedPercentage = toPercentage(used);
+  const preemptiblePercentage = toPercentage(preemptible);
   const freePercentage = toPercentage(free);
 
   return (
@@ -50,6 +75,21 @@ const GpuUtilizationBar = ({
           className="bg-yellow-500 h-full flex items-center justify-center text-white font-medium overflow-hidden whitespace-nowrap px-1"
         >
           {usedPercentage > 15 && usedLabel}
+        </div>
+      )}
+      {preemptiblePercentage > 0 && (
+        <div
+          style={{
+            width: `${preemptiblePercentage}%`,
+            fontSize: 'clamp(8px, 1.2vw, 12px)',
+          }}
+          title={buildPreemptibleTitle(
+            preemptible,
+            gpu?.gpu_preemptible_breakdown
+          )}
+          className="bg-amber-300 h-full flex items-center justify-center text-amber-900 font-medium overflow-hidden whitespace-nowrap px-1"
+        >
+          {preemptiblePercentage > 15 && preemptibleLabel}
         </div>
       )}
       {freePercentage > 0 && (
