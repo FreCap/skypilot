@@ -332,7 +332,5 @@ class TestSelectionGateBoundsTheBatch:
         # unbounded, which is what the fill tier is supposed to do.
         placer = _make_zero_cost_placer(benched_at=None)
         placer.location2cost = {_K8S_A100_80GB: 0.0, _K8S_A100: 0.0}
-        selected = [
-            placer.select_next_zero_cost_location() for _ in range(218)
-        ]
+        selected = [placer.select_next_zero_cost_location() for _ in range(218)]
         assert all(location is not None for location in selected)

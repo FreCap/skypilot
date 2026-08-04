@@ -30,6 +30,7 @@ from spot_placer_test_utils import make_location
 
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_allocation as allocation
+from sky.serve import reserved_capacity_broker
 from sky.serve import spot_placer
 
 # Two Kubernetes fill pools on two different clusters, each with its own
@@ -505,8 +506,6 @@ class TestBrokerWiresTheObservationIntoThePlacer:
 
     @staticmethod
     def _observation(free_slots, by_accelerator=None):
-        from sky.serve import (
-            reserved_capacity_broker)  # pylint: disable=import-outside-toplevel
         return reserved_capacity_broker.PoolObservation(
             free_slots=free_slots,
             gpu_names=(),
