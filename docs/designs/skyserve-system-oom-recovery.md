@@ -17,19 +17,25 @@ persisted active slot matches its live Service selector. The two-pass marker
 audit is invalid because the eligible inventory changed between snapshots; no
 remote marker scans were performed. Datadog and the live endpoint expose no
 recovery-counter family because labeled Prometheus counters are lazy until a
-child label tuple is instantiated. Transition PR #1258 preinitializes only the
-four deprecated compatibility events at the placement-neutral
+child label tuple is instantiated. Transition PR #1258, merged as
+`004870a6f20ed6a4e783575a858795a0a66e65a8`, preinitializes only the four
+deprecated compatibility events at the placement-neutral
 `provider="unknown",market="unknown"` tuple with value zero. That correction is
-not deployed, the seven-day clock has not started, and no missing-series
-interval earns removal-gate credit. This restacked #1183 branch removes those
-sentinels together with the deprecated readers; it remains draft and undeployed
-with all seven global gates open._
+published in release 1.1.1087 but not deployed. Draft boltz-platform PR #7823
+is the Terraform/Helm deployment authority for that exact release. The
+seven-day clock has not started, and no missing-series interval earns
+removal-gate credit. This restacked #1183 branch removes those sentinels
+together with the deprecated readers; it remains draft and undeployed with all
+seven global gates open._
 
 _Last updated: 2026-08-04_
 
-_Design baseline: transition PR #1258 at
-`3ec9e23eedc23569b7a2bc5df408338781da763b`, based on
-`origin/improvements` at `6498c6594d3f13019bcfbbd3d368ff8cff88116d`._
+_Design baseline: transition PR #1258 implementation
+`3ec9e23eedc23569b7a2bc5df408338781da763b`, merged as
+`004870a6f20ed6a4e783575a858795a0a66e65a8`. PR #1183 has base
+`improvements` at that merge commit; its restacked cleanup implementation
+commit `ae7dd8bf99b35c13d96cfa6555d0ff78673f57b6` is the direct child, and the
+current branch adds only the cleanup-contract test/design correction above it._
 
 ## Context and decision
 
@@ -1422,14 +1428,26 @@ The transition stack was rebuilt from `origin/improvements`. #1182 is merged,
 evidence PR #1235 is merged at
 `6736c157ea944fdb3cf1e5f69cc1928ae3d706c0`, and authorization generator PR
 #1248 is merged at `462302373792830adb647a224d74d50571ddb86d` and published as
-exact release 1.1.1079. #1183 is now restacked onto current release 1.1.1082
-base `e8b237e2c7dad71c981b260e6adbe7f39047cff4` as the authored steady-state
-cleanup while preserving the merged v3 generator, production parser, strict
+exact release 1.1.1079. The zero-series transition correction #1258 is merged
+as `004870a6f20ed6a4e783575a858795a0a66e65a8` and published as exact release
+1.1.1087. #1183 now has that merge commit as its `improvements` base. Its
+restacked cleanup implementation commit
+`ae7dd8bf99b35c13d96cfa6555d0ff78673f57b6` is the direct child, and the
+current branch adds only the cleanup-contract test/design correction above it.
+The cleanup preserves the merged v3 generator, production parser, strict
 singleton-AWS matcher, overlay packaging fixes, and their tests.
 The cleanup stays draft until all numbered gates pass and must be refreshed
 against the then-live `improvements` base before merge. #1182 links the draft
 #1183 cleanup explicitly; #1183 links back and names the seven gates below as
 its exact merge condition.
+
+Production deployment remains platform-owned. Draft
+[boltz-platform PR #7823](https://github.com/boltz-bio/boltz-platform/pull/7823)
+at `7039ca9eb2225aa7a3e168e6609f627403585522` is the Terraform/Helm authority
+that pins release 1.1.1087, stacked on its still-human-gated migration cleanup
+base `740a7ab9af2759a706bff6cd81d87380fbb04659`. It is undeployed. A direct Helm
+upgrade or rollback is neither the desired-state authority nor removal-gate
+evidence.
 
 ### PR 1: merged inert runtime foundation
 
@@ -1507,9 +1525,12 @@ readers and other transition paths.
 
 ### PR 3 / #1183: `[Serve] Remove deprecated direct-shell OOM recovery`
 
-_[PR #1183](https://github.com/boltz-bio/skypilot/pull/1183), refreshed onto
-release 1.1.1082 base `e8b237e2c7dad71c981b260e6adbe7f39047cff4`
-and retained as a draft, undeployed removal change._
+_[PR #1183](https://github.com/boltz-bio/skypilot/pull/1183), with base
+`improvements` at merged #1258 commit
+`004870a6f20ed6a4e783575a858795a0a66e65a8`; cleanup implementation commit
+`ae7dd8bf99b35c13d96cfa6555d0ff78673f57b6` is its direct child, followed only
+by the cleanup-contract test/design correction. It remains a draft, undeployed
+removal change._
 
 This accepts only authorization document v3, removes authorization-document
 readers v1/v2, removes the direct-shell Docker parser and runtime
@@ -1529,7 +1550,7 @@ deploy or merge until every gate below is evidenced.
 
 | Deprecated/rejected path | Transition behavior | Removal |
 | --- | --- | --- |
-| Authorization document v1 and direct-shell Docker parser | Deprecated in #1182; never selected by a new production authorization | Removed in authored #1183; merge remains blocked until all seven gates pass; the 1.1.1082 image/configuration change reopened gate 2, so all seven are currently open |
+| Authorization document v1 and direct-shell Docker parser | Deprecated in #1182; never selected by a new production authorization | Removed in authored #1183; merge remains blocked until all seven gates pass; the successive live image/configuration changes through 1.1.1084 keep gate 2 open, so all seven are currently open |
 | Authorization document v2 | Deprecated in #1182; typed `OwnedContainerSpec` lacks the exact authorization-v3 provider/identity/memory envelope | Authorization reader removed in authored #1183; runtime profile and marker/capability v2 remain |
 | Marker schema v1 and `subreaper-v1+local-docker-empty-inventory-v1` | Read-only compatibility in #1182 for already-generated artifacts | Removed in authored #1183; merge remains blocked on capability telemetry and two-pass remote marker audit |
 | Status-only old-runtime recovery decoding | Deprecated in #1182; missing detail can never grant recovery authority | Python compatibility state removed in authored #1183; protobuf zero and old/missing payloads map to `MALFORMED` |
@@ -2501,6 +2522,14 @@ structured logs supply diagnostic correlation but are not lifecycle authority.
   telemetry cannot prove zero increase. The eligible image also changed
   1.1.1082 to 1.1.1083 to 1.1.1084 that day, so all seven cleanup gates remain
   open and the seven-day clock has not started.
+- PR #1258 is merged as
+  `004870a6f20ed6a4e783575a858795a0a66e65a8` and its zero-series correction is
+  published in exact release 1.1.1087. Draft boltz-platform PR #7823 at
+  `7039ca9eb2225aa7a3e168e6609f627403585522` is the sole Terraform/Helm
+  desired-state authority for deploying that release. It remains undeployed,
+  so this availability does not start the seven-day observation clock or close
+  any of the seven production gates. PR #1183 remains draft on base
+  `004870a6f20ed6a4e783575a858795a0a66e65a8`.
 - The two historical `boltz-l4-fleet` version-spec quarantines are not
   recovery-state quarantine. Version 39 produced 24 terminal never-ready
   replicas (18 `FAILED_INITIAL_DELAY`, six `FAILED`) and zero Ready replicas;
@@ -2521,11 +2550,11 @@ run-30785990709 placement-validation failure, #7779 correction, #7788 merge,
 the successful zero-replica workflows, revision-318/319 audits, and the
 revision-321-through-324 rollout sequence do not complete the removal gates,
 and #1183 remains draft. Revision 319 historically passed gate 2 for its exact
-1.1.1067 snapshot, but the 1.1.1082 image/configuration change reopened that
-gate. Revision 323/324 proves only bounded process-environment absence and a
-pre-activation ordinary-state count; the complete gate-2 audit must be
-repeated. Gate 1 additionally requires every ambiguity and compatibility shape
-below.
+1.1.1067 snapshot, but the successive live image/configuration changes through
+1.1.1084 reopened that gate. Revision 323/324 proves only bounded
+process-environment absence and a pre-activation ordinary-state count; the
+complete gate-2 audit must be repeated. Gate 1 additionally requires every
+ambiguity and compatibility shape below.
 The post-activation all-row audit (gate 1), live eligible-runtime inventory
 (gate 3),
 seven-day telemetry window (gate 4), two-pass marker inventory (gate 5), real
@@ -2539,11 +2568,12 @@ all remain open.
    authorization-v3 `CAPABLE` replica has its exact ordinary launch request ID,
    service job ID, runtime profile 2, and matching supervisor-marker/capability
    v2.
-2. **OPEN after the 1.1.1082 image/configuration change.** The exhaustive
-   1.1.1067 audit found no authorization and passed this gate only for the exact
-   revision-319 snapshot. Revision 323/324 confirms that the 1.1.1082 API
-   process environment still omits authorization, but has not repeated the
-   complete Helm-values, rendered deployment, Secret/config source, and live
+2. **OPEN after the successive image/configuration changes through
+   1.1.1084.** The exhaustive 1.1.1067 audit found no authorization and passed
+   this gate only for the exact revision-319 snapshot. Revision 323/324
+   confirms that an earlier 1.1.1082 API process environment omitted
+   authorization, but the live 1.1.1084 audit has not repeated the complete
+   Helm-values, rendered deployment, Secret/config source, and live
    API/controller audit. Environment omission alone cannot close the gate.
 3. **OPEN.** Every API/controller and eligible replica image meets the approved
    controller/job-detail/Skylet/library versions and emits only controller

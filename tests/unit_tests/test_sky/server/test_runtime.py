@@ -893,9 +893,9 @@ def test_metrics_enabled_requires_literal_true(monkeypatch, value, expected):
     assert runtime._metrics_enabled() is expected  # pylint: disable=protected-access
 
 
-def test_controller_role_metrics_expose_system_oom_counter_and_zero_baselines(
+def test_controller_role_metrics_expose_only_explicit_system_oom_sample(
         monkeypatch, tmp_path):
-    """Exercise child and cold-zero emission through the real endpoint."""
+    """Exercise steady-state counter emission through the real endpoint."""
     repository_root = pathlib.Path(runtime.__file__).resolve().parents[2]
     child_env = os.environ.copy()
     child_env['PROMETHEUS_MULTIPROC_DIR'] = str(tmp_path)
@@ -945,27 +945,17 @@ def test_controller_role_metrics_expose_system_oom_counter_and_zero_baselines(
             line for line in payload.splitlines()
             if line.startswith('sky_serve_system_oom_recovery_events_total{')
         ]
-        assert len(samples) == 5, payload
-        recovery_samples = [
-            sample for sample in samples if 'event="recovery_started"' in sample
-        ]
-        assert len(recovery_samples) == 1, payload
-        assert 'provider="aws"' in recovery_samples[0]
-        assert 'market="on_demand"' in recovery_samples[0]
-        assert recovery_samples[0].endswith(' 1.0')
-        for event in (
+        assert samples == [
+            'sky_serve_system_oom_recovery_events_total{'
+            'event="recovery_started",market="on_demand",provider="aws"} 1.0'
+        ], payload
+        for removed_event in (
                 'authorization_v1_selected',
                 'authorization_v2_selected',
                 'runtime_capability_v1_observed',
                 'status_only_read',
         ):
-            baseline_samples = [
-                sample for sample in samples if f'event="{event}"' in sample
-            ]
-            assert len(baseline_samples) == 1, payload
-            assert 'provider="unknown"' in baseline_samples[0]
-            assert 'market="unknown"' in baseline_samples[0]
-            assert baseline_samples[0].endswith(' 0.0')
+            assert f'event="{removed_event}"' not in payload
     finally:
         background.stop()
     assert background.is_stopping
