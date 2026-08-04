@@ -634,19 +634,29 @@ def get_kubernetes_physical_cluster_uid(
         # flight.  Returning this request's now-stale UID would let a forced
         # launch-time check accept the identity that was current before a
         # context retarget, even though the newer observation already fenced
-        # it.  Use only the newer generation's still-live cache entry; if it
-        # has none, fail closed.
+        # it.  Prefer the newer generation's still-live cache entry.
         current = _PHYSICAL_CLUSTER_UID_CACHE.get(context)
-        if current is None:
+        if current is not None:
+            current_uid, current_expires_at, current_generation = current
+            if (current_generation > lookup_generation and
+                    time.monotonic() < current_expires_at):
+                return current_uid
+            if current_generation > lookup_generation:
+                _PHYSICAL_CLUSTER_UID_CACHE.pop(context, None)
+        # No newer entry to defer to. A forced caller is fencing a launch, so
+        # it keeps failing closed: it asked for an identity read strictly
+        # after its own decision point and cannot prove this one is it.
+        if force_refresh:
             return None
-        current_uid, current_expires_at, current_generation = current
-        if (current_generation <= lookup_generation or
-                time.monotonic() >= current_expires_at):
-            if current_generation <= lookup_generation:
-                return None
-            _PHYSICAL_CLUSTER_UID_CACHE.pop(context, None)
-            return None
-        return current_uid
+        # An observation-path reader, by contrast, just completed its own
+        # successful read of this very context. Discarding it takes the fill
+        # pool edge down for the whole cycle (`resolve_fill_pool_specs` drops
+        # any candidate that resolves to None), which switches reserved fill
+        # off fleet-wide whenever two services poll the same context at once.
+        # The generation stamp orders lookup STARTS, not the reads themselves,
+        # so a losing reader's value is not demonstrably older anyway. Report
+        # it without publishing: the newer generation still owns the cache.
+        return uid
 
 
 def group_zero_cost_fill_pools(
