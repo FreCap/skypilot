@@ -429,6 +429,12 @@ databaseConnection:
 requestStore:
   # @schema enum: [sqlite, postgres]; required: true
   backend: sqlite
+  # Opt into exact built-in PostgreSQL storage/queue enforcement in every
+  # request process before activating multi-pool reserved-capacity fill.
+  # This remains optional so --reuse-values upgrades from older chart
+  # revisions safely render the compatibility default.
+  # @schema type: boolean
+  enforceBuiltinExecutionQuiescenceBackends: false
   # Shared maintenance gate used by the one-way SQLite cutover command.
   # @schema type: string; minLength: 1; required: true
   cutoverGatePath: /root/.sky/api-request-cutover.json

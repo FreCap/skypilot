@@ -278,6 +278,173 @@ reserved_fill_claims_table = sqlalchemy.Table(
     sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float),
 )
 
+# Durable protocol switch for the reserved-fill broker.  Revision 035 starts
+# this singleton at v1; protocol v2 is activated only by an explicit operator
+# action after every broker process has been replaced.  Keeping the rollout
+# proof beside the switch makes the transition auditable and prevents a
+# multi-context service spec from implicitly changing the database protocol.
+reserved_fill_protocol_state_table = sqlalchemy.Table(
+    'reserved_fill_protocol_state',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('protocol_version',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='1'),
+    # Global allocation fence for protocol-v2 claim-set incarnations.  It is
+    # deliberately owned by the never-deleted singleton instead of a service
+    # row, so disabling or recreating a same-name service cannot reuse a
+    # generation carried by an old round or queued launch decision.
+    sqlalchemy.Column('claim_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('image_digest', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('deployment_generation',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('deployment_uid', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('pod_inventory_count',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('pod_inventory_sha256',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('changed_at',
+                      sqlalchemy.Float,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.CheckConstraint('id = 1',
+                               name='ck_reserved_fill_protocol_singleton'),
+    sqlalchemy.CheckConstraint('protocol_version IN (1, 2)',
+                               name='ck_reserved_fill_protocol_version'),
+    sqlalchemy.CheckConstraint('claim_generation >= 0',
+                               name='ck_reserved_fill_claim_generation'),
+    sqlalchemy.CheckConstraint(
+        "((image_digest IS NULL AND deployment_generation IS NULL AND "
+        "deployment_uid IS NULL AND pod_inventory_count IS NULL AND "
+        "pod_inventory_sha256 IS NULL) OR "
+        "(image_digest IS NOT NULL AND deployment_generation IS NOT NULL "
+        "AND deployment_uid IS NOT NULL AND pod_inventory_count IS NOT NULL "
+        "AND pod_inventory_sha256 IS NOT NULL))",
+        name='ck_reserved_fill_protocol_proof_all_or_none'),
+    sqlalchemy.CheckConstraint(
+        'protocol_version <> 2 OR image_digest IS NOT NULL',
+        name='ck_reserved_fill_protocol_v2_has_proof'),
+    sqlalchemy.CheckConstraint(
+        "image_digest IS NULL OR (length(image_digest) = 71 AND "
+        "substr(image_digest, 1, 7) = 'sha256:')",
+        name='ck_reserved_fill_protocol_image_digest'),
+    sqlalchemy.CheckConstraint(
+        'deployment_generation IS NULL OR '
+        'length(deployment_generation) > 0',
+        name='ck_reserved_fill_protocol_deployment_generation'),
+    sqlalchemy.CheckConstraint(
+        'deployment_uid IS NULL OR length(deployment_uid) > 0',
+        name='ck_reserved_fill_protocol_deployment_uid'),
+    sqlalchemy.CheckConstraint(
+        'pod_inventory_count IS NULL OR pod_inventory_count > 0',
+        name='ck_reserved_fill_protocol_pod_inventory_count'),
+    sqlalchemy.CheckConstraint(
+        'pod_inventory_sha256 IS NULL OR '
+        'length(pod_inventory_sha256) = 64',
+        name='ck_reserved_fill_protocol_pod_inventory_sha256'),
+)
+
+# One authoritative marker per service.  The normalized edge rows below are
+# consumable only when all rows match this generation and edge_count.  A
+# generation-zero migration_shadow is deliberately inert: v1 reads the legacy
+# row, while v2 fails closed until the owning controller atomically adopts it.
+reserved_fill_service_claim_sets_table = sqlalchemy.Table(
+    'reserved_fill_service_claim_sets',
+    Base.metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('claim_set_state',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='migration_shadow'),
+    sqlalchemy.Column('generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('edge_count',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('semantic_hash', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('global_headroom',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('utilization_ceiling',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('utilization_state', sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('heartbeat_ts',
+                      sqlalchemy.Float,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.CheckConstraint(
+        "claim_set_state IN ('migration_shadow', 'authoritative_v2')",
+        name='ck_reserved_fill_claim_set_state'),
+    sqlalchemy.CheckConstraint('generation >= 0',
+                               name='ck_reserved_fill_claim_set_generation'),
+    sqlalchemy.CheckConstraint('edge_count >= 0',
+                               name='ck_reserved_fill_claim_set_edge_count'),
+    sqlalchemy.CheckConstraint(
+        'global_headroom IS NULL OR global_headroom >= 0',
+        name='ck_reserved_fill_claim_set_headroom'),
+    sqlalchemy.CheckConstraint(
+        'utilization_ceiling IS NULL OR utilization_ceiling >= 0',
+        name='ck_reserved_fill_claim_set_utilization'),
+)
+
+# Protocol-v2 normalized claim edges.  ``pool_key`` is the versioned physical
+# UID key used by v2 rounds; ``legacy_pool_key`` retains the context-based v1
+# identity used only by the stable rollback projection.  Activity columns are
+# retained for a lossless migration shadow but authoritative v2 writers keep
+# them NULL: the one utilization governor lives on the service-set row.
+reserved_fill_pool_claims_table = sqlalchemy.Table(
+    'reserved_fill_pool_claims',
+    Base.metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('pool_key', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('legacy_pool_key', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pool_position', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('access_context', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('physical_cluster_uid',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('accelerator_names', sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('service_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False),
+    sqlalchemy.Column('weight', sqlalchemy.Float),
+    sqlalchemy.Column('floor_replicas', sqlalchemy.Integer),
+    sqlalchemy.Column('gpus_per_replica', sqlalchemy.Integer),
+    sqlalchemy.Column('holdings_fill', sqlalchemy.Integer),
+    sqlalchemy.Column('effective_cap', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('launchable', sqlalchemy.Integer, server_default='1'),
+    sqlalchemy.Column('demonstrated_need',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('boot_hold', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('activity_ts', sqlalchemy.Float, server_default=None),
+    sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float, nullable=False),
+    sqlalchemy.CheckConstraint('pool_position >= 0',
+                               name='ck_reserved_fill_pool_position'),
+    sqlalchemy.CheckConstraint('service_generation >= 0',
+                               name='ck_reserved_fill_pool_generation'),
+    sqlalchemy.CheckConstraint('effective_cap IS NULL OR effective_cap >= 0',
+                               name='ck_reserved_fill_pool_effective_cap'),
+)
+sqlalchemy.Index('reserved_fill_pool_claims_pool_idx',
+                 reserved_fill_pool_claims_table.c.pool_key)
+sqlalchemy.Index('reserved_fill_pool_claims_service_generation_idx',
+                 reserved_fill_pool_claims_table.c.service_name,
+                 reserved_fill_pool_claims_table.c.service_generation)
+
 # Latest published broker round per pool (overwritten in place each round).
 # Grants/feeds are the authoritative allocation record readers act on; the
 # remaining columns are the broker's cross-round memory (damping baselines,
@@ -295,11 +462,27 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     # against it (see reserved_capacity_broker.current_epoch) -- per-pool,
     # so one pool's grant churn never fences another pool's launches.
     sqlalchemy.Column('epoch', sqlalchemy.Integer),
+    # Protocol and per-service generations are part of the grant fence.  Old
+    # rows and old writers resolve to protocol v1 with an empty generation map.
+    sqlalchemy.Column('protocol_version',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='1'),
+    sqlalchemy.Column('claim_generations',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='{}'),
     # JSON {service: grant}; null grant = single-claimant fast path (no
     # ceiling, #108 identity).
     sqlalchemy.Column('grants', sqlalchemy.Text),
     # JSON {service: feed}; sum(feeds) <= observed free by construction.
     sqlalchemy.Column('feeds', sqlalchemy.Text),
+    # JSON {service: {accelerator: feed}} when the pool query returned an
+    # exact-card split.  NULL preserves compatibility with rounds written
+    # before exact-card publication (or providers that cannot report it).
+    # For a non-NULL value, each service's card counts sum to at most its
+    # aggregate feed and pool-wide card counts never exceed the measurement.
+    sqlalchemy.Column('feed_by_accelerator', sqlalchemy.Text),
     # JSON {service: raw undamped entitlement} of THIS round; next round's
     # damping baseline (a move must persist across two rounds to apply).
     sqlalchemy.Column('raw_grants', sqlalchemy.Text),
@@ -353,15 +536,17 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     sqlalchemy.Column('fence_pending', sqlalchemy.Integer, server_default='0'),
 )
 
-# Singleton lease row (id=1). The epoch only moves forward; it is the round
+# Singleton lease row (id=1). The epoch only moves forward. It is the round
 # writer's OWNERSHIP TOKEN and the round's ENTRY POINT: CAS-advanced (and
 # committed) BEFORE the writer reads any claim/round state and before its
-# slow cluster query, and the publish only lands while the lease still
-# holds that exact token -- so everything a successful publish persisted
-# was read AFTER the token (see acquire_reserved_fill_lease_token). A
-# replacement writer (e.g. after the original's advisory-lock session died
-# mid-query) advances it again, so the stale writer's publish fails and
-# its observation is discarded.
+# slow cluster query, and the publish only lands while the lease still holds
+# that exact token. Fill persists also advance it on the exact advisory-lock
+# session and validate it in the replica insert transaction. A replacement
+# round advances the same epoch before scanning, so silent advisory-session
+# loss cannot place a stale persist inside the scan-to-publish window (see
+# advance_reserved_fill_persist_token and acquire_reserved_fill_lease_token).
+# A replacement writer after a lost round likewise advances it, so the stale
+# publish fails and its observation is discarded.
 # Fencing for actuation is the per-pool round epoch above.
 reserved_fill_lease_table = sqlalchemy.Table(
     'reserved_fill_lease',

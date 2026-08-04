@@ -2372,6 +2372,23 @@ run: echo hi
         mock_sdk.launch.assert_not_called()
         mock_terminate.assert_not_called()
 
+    def test_cloud_guard_rechecks_before_each_retry(self, tmp_path):
+        cloud_guard = mock.Mock(
+            side_effect=[(True, 'authorized'), (False, 'pool-retargeted')])
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [RuntimeError('transient')],
+            cloud_launch_guard=cloud_guard)
+
+        assert isinstance(raised,
+                          replica_managers._ReplicaLaunchSupersededError)
+        assert 'reason=pool-retargeted' in str(raised)
+        assert cloud_guard.call_count == 2
+        assert mock_sdk.launch.call_count == 1
+        assert mock_sdk.stream_and_get.call_count == 1
+        # The first transient attempt is cleaned before authority is checked
+        # again; the rejected second attempt performs no cloud mutation.
+        mock_terminate.assert_called_once()
+
     def test_legacy_boolean_cloud_guard_remains_compatible(self, tmp_path):
         mock_sdk, mock_terminate, raised = self._run_launch_cluster(
             tmp_path, [None], cloud_launch_guard=lambda: False)
@@ -3786,6 +3803,44 @@ class TestLaunchOwnershipFence:
         assert (terminal.to_replica_status() ==
                 replica_managers.serve_state.ReplicaStatus.FAILED)
         assert terminal.unrecoverable_failure() is True
+
+    def test_superseded_fill_launch_releases_pin_and_schedules_cleanup(self):
+        mgr, infos = self._queued_manager([1])
+        info = infos[1]
+        info.status = replica_managers.serve_state.ReplicaStatus.PROVISIONING
+        info.reserved_fill = True
+        location = mock.Mock()
+        info.get_spot_location.return_value = location
+        placer = mock.Mock()
+        placer.resolve_location.return_value = location
+        mgr._spot_placer = placer
+        launch_thread = mgr._launch_thread_pool[1]
+        launch_thread.format_exc = 'pool retargeted'
+        launch_thread.exception = (
+            replica_managers._ReplicaLaunchSupersededError('retargeted'))
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value=infos), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]), \
+             mock.patch.object(mgr, '_persist_replicas') as persist, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr,
+                               '_persist_spot_placement_state_if_dirty'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        placer.release_retry.assert_called_once_with(location)
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          in_flight_drain_cap_seconds=0)
+        persist.assert_not_called()
 
     def test_unfenced_external_lb_failure_does_not_bench_spot_location(self):
         mgr, infos = self._queued_manager([1])
@@ -8956,7 +9011,8 @@ class TestLaunchReplicaSnapshotAccumulation:
                  return_value='/tmp/launch.log'), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
+             mock.patch(
+                 'sky.serve.replica_managers._ReplicaLaunchThread') as thread:
             manager._launch_replica(replica_id=1,
                                     existing_replica_infos=shared_snapshot)
             manager._launch_replica(replica_id=2,
@@ -8969,6 +9025,7 @@ class TestLaunchReplicaSnapshotAccumulation:
         assert placer.select_next_location.call_count == 2
         assert all(not call.args
                    for call in placer.select_next_location.call_args_list)
+        assert thread.call_count == 2
 
     def test_fresh_scan_path_does_not_leak_appends(self):
         # pylint: disable=protected-access
@@ -10202,7 +10259,8 @@ class TestPaidLocationLaunchBudget:
                         return_value=True), \
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
-             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread') \
+                     as thread:
             resources_override = {'use_spot': True}
             if reserved_fill:
                 resources_override = {
@@ -10221,6 +10279,10 @@ class TestPaidLocationLaunchBudget:
         assert persisted_location.use_spot is False
         assert manager._next_replica_id == 2
         assert len(manager._launch_thread_pool) == 1
+        if reserved_fill:
+            # A pinned fill never asks the API request queue to replay a
+            # BrokenProcessPool generation whose original worker is ambiguous.
+            assert thread.call_args.kwargs['args'][-1] is False
 
     def test_initial_exhausted_envelope_memoizes_paid_override(self):
         paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
@@ -11144,11 +11206,9 @@ class TestRecoveryRetryAndIsolation:
         def _launch(replica_id,
                     resources_override=None,
                     existing_replica_infos=None,
-                    prior_reserved_fill=False,
                     recovering_existing_replica=False,
                     **_kwargs):
             del resources_override, existing_replica_infos
-            del prior_reserved_fill
             assert recovering_existing_replica
             if replica_id == 2:
                 raise RuntimeError('boom')
@@ -11237,51 +11297,337 @@ class TestRecoveryRetryAndIsolation:
         assert runtime.replica_to_request_id[1] == 'request-1'
         worker.start.assert_called_once_with()
 
-    def test_redrive_preserves_reserved_fill_attribution(self):
-        # A fill replica surviving a controller respawn is re-driven with
-        # its persisted (sentinel-stripped) override; the replacement row
-        # must keep reserved_fill=True or the replica silently converts
-        # to ceiling-exempt "demand" and can starve peers forever. Demand
-        # rows must stay False.
+    @pytest.mark.parametrize('status', [
+        replica_managers.serve_state.ReplicaStatus.PENDING,
+        replica_managers.serve_state.ReplicaStatus.PROVISIONING,
+    ])
+    def test_recovery_tears_down_interrupted_fill_without_redrive(self, status):
         mgr = _make_manager()
-        mgr.yaml_content = 'dummy: yaml'
-        mgr.latest_version = 1
-        mgr._spot_placer = None
-        mgr._replica_to_request_id = {}
-        mgr._replica_to_launch_cancelled = {}
-        provisioning = replica_managers.serve_state.ReplicaStatus.PROVISIONING
-        fill_row = _fake_replica_info(1, status=provisioning)
+        fill_row = _fake_replica_info(1, status=status)
         fill_row.resources_override = None
         fill_row.reserved_fill = True
-        demand_row = _fake_replica_info(2, status=provisioning)
-        demand_row.resources_override = None
+        demand_row = _fake_replica_info(2, status=status)
+        demand_row.resources_override = {
+            'region': 'us-east-1',
+            'accelerators': {
+                'A100': 1,
+            },
+        }
         demand_row.reserved_fill = False
         demand_row.paid_capacity_pool_key = 'exact-paid-pool'
-        persisted: dict = {}
 
-        def _persist(_service_name, replica_id, info, **_kwargs):
-            persisted[replica_id] = info
-
-        with mock.patch('sky.serve.replica_managers._should_use_spot',
-                        return_value=False), \
-             mock.patch('sky.serve.replica_managers._get_resources_ports',
-                        return_value='8080'), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_utils.'
-                 'generate_replica_launch_log_file_name',
-                 return_value='/tmp/launch.log'), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.get_replica_infos',
-                 return_value=[fill_row, demand_row]), \
-             mock.patch(
-                 'sky.serve.replica_managers.serve_state.'
-                 'add_or_update_replica',
-                 side_effect=_persist), \
-             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[fill_row, demand_row]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'quiesce_service_replica_launch_requests',
+                 return_value=True) as quiesce, \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate:
             mgr._recover_replica_operations()
-        assert persisted[1].reserved_fill is True
-        assert persisted[2].reserved_fill is False
-        assert persisted[2].paid_capacity_pool_key == 'exact-paid-pool'
+
+        quiesce.assert_called_once_with(
+            'svc', [fill_row],
+            continue_guard=mgr._service_is_launch_authorized,
+            include_terminal_history=False)
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          in_flight_drain_cap_seconds=0)
+        launch.assert_called_once()
+        assert launch.call_args.args[0] == 2
+        assert launch.call_args.kwargs['recovering_existing_replica'] is True
+        assert (launch.call_args.kwargs['resources_override'] ==
+                demand_row.resources_override)
+        assert (launch.call_args.kwargs['prior_paid_capacity_pool_key'] ==
+                'exact-paid-pool')
+
+    def test_recovery_quiesces_accepted_fill_launch_before_teardown(self):
+        mgr = _make_manager()
+        mgr._resource_scope = 'incarnation-a'
+        mgr._service_hash = 'incarnation-a'
+        fill_row = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        fill_row.cluster_name = (
+            replica_managers.serve_utils.generate_replica_cluster_name(
+                'svc', 1, 'incarnation-a'))
+        fill_row.resources_override = None
+        fill_row.reserved_fill = True
+        fill_row.reserved_fill_pool_key = (
+            replica_managers.reserved_capacity_broker.make_pool_key(
+                'phx',
+                'H200',
+                protocol_version=(
+                    replica_managers.reserved_capacity_broker.PROTOCOL_V2),
+                physical_cluster_uid='phx-uid'))
+        fill_row.reserved_fill_service_generation = 7
+        fill_row.reserved_fill_physical_cluster_uid = 'phx-uid'
+        request_terminal = False
+        quiescence_polls = 0
+        events = []
+
+        def _status(**kwargs):
+            nonlocal quiescence_polls
+            if 'request_ids' not in kwargs:
+                assert kwargs == {
+                    'all_status': True,
+                    'cluster_names': [fill_row.cluster_name],
+                    '_include_request_names': ['sky.launch'],
+                    '_execution_quiescence_candidates_only': True,
+                    'fields': [
+                        'request_id', 'name', 'cluster_name',
+                        'execution_generation', 'status',
+                        'execution_quiescence_required',
+                        'execution_quiesced_generation', 'execution_quiesced_at'
+                    ],
+                }
+                events.append('discovery-status')
+                return [
+                    types.SimpleNamespace(
+                        request_id='launch-request',
+                        name='sky.launch',
+                        cluster_name=fill_row.cluster_name,
+                        execution_generation=7,
+                        status=('CANCELLED' if request_terminal else 'RUNNING'),
+                        execution_quiescence_required=True,
+                        execution_quiesced_generation=(7 if request_terminal
+                                                       else None),
+                        execution_quiesced_at=(1.0
+                                               if request_terminal else None),
+                    )
+                ]
+            assert kwargs == {
+                'request_ids': ['launch-request'],
+                'fields': [
+                    'request_id', 'name', 'cluster_name', 'status',
+                    'execution_generation', 'execution_quiescence_required',
+                    'execution_quiesced_generation', 'execution_quiesced_at'
+                ],
+                '_exact_request_ids': True,
+                '_use_body': True,
+            }
+            events.append('quiescence-status')
+            quiescence_polls += 1
+            return [
+                types.SimpleNamespace(
+                    request_id='launch-request',
+                    name='sky.launch',
+                    cluster_name=fill_row.cluster_name,
+                    status='CANCELLED',
+                    execution_generation=7,
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=(None if quiescence_polls == 1
+                                                   else 7),
+                    execution_quiesced_at=(None
+                                           if quiescence_polls == 1 else 1.0),
+                )
+            ]
+
+        def _cancel(request_ids, *, all_users, silent):
+            assert request_ids == ['launch-request']
+            assert all_users and silent
+            events.append('cancel')
+            return 'cancel-request'
+
+        def _await(request_id):
+            nonlocal request_terminal
+            assert request_id == 'cancel-request'
+            events.append('await')
+            request_terminal = True
+
+        def _terminate(*_args, **_kwargs):
+            assert request_terminal
+            events.append('terminate')
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[fill_row]), \
+             mock.patch.object(replica_managers.serve_utils.sdk,
+                               'api_status',
+                               side_effect=_status), \
+             mock.patch.object(replica_managers.serve_utils.sdk,
+                               'api_cancel',
+                               side_effect=_cancel), \
+             mock.patch.object(replica_managers.serve_utils.sdk,
+                               'stream_and_get',
+                               side_effect=_await), \
+             mock.patch.object(
+                 replica_managers.serve_utils.versions,
+                 'get_remote_api_version',
+                 return_value=replica_managers.serve_utils.server_constants.
+                 MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 '_LAUNCH_QUIESCE_POLL_SECONDS', 0), \
+             mock.patch.object(mgr,
+                               '_service_is_launch_authorized',
+                               return_value=True), \
+             mock.patch.object(mgr,
+                               '_terminate_replica',
+                               side_effect=_terminate):
+            mgr._recover_replica_operations()
+
+        assert events == [
+            'discovery-status', 'cancel', 'await', 'quiescence-status',
+            'quiescence-status', 'discovery-status', 'terminate'
+        ]
+
+    def test_recovery_batches_interrupted_fill_quiescence(self):
+        mgr = _make_manager()
+        fill_rows = [
+            _fake_replica_info(
+                replica_id,
+                status=replica_managers.serve_state.ReplicaStatus.PENDING)
+            for replica_id in (1, 2)
+        ]
+        for info in fill_rows:
+            info.resources_override = None
+            info.reserved_fill = True
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=fill_rows), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'quiesce_service_replica_launch_requests',
+                 return_value=True) as quiesce, \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate:
+            mgr._recover_replica_operations()
+
+        quiesce.assert_called_once_with(
+            'svc',
+            fill_rows,
+            continue_guard=mgr._service_is_launch_authorized,
+            include_terminal_history=False)
+        assert [call.args[0] for call in terminate.call_args_list] == [1, 2]
+        launch.assert_not_called()
+
+    def test_recovery_partitions_legacy_and_protocol_v2_fill_barriers(self):
+        mgr = _make_manager()
+        mgr._resource_scope = 'incarnation-a'
+        mgr._service_hash = 'incarnation-a'
+        legacy = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PENDING)
+        legacy.cluster_name = 'svc-1'
+        legacy.resources_override = None
+        legacy.reserved_fill = True
+        legacy.reserved_fill_pool_key = (
+            replica_managers.reserved_capacity_broker.make_pool_key(
+                'east', 'L4'))
+        legacy.reserved_fill_service_generation = 0
+        legacy.reserved_fill_physical_cluster_uid = None
+        current = _fake_replica_info(
+            2, status=replica_managers.serve_state.ReplicaStatus.PENDING)
+        current.cluster_name = (
+            replica_managers.serve_utils.generate_replica_cluster_name(
+                'svc', 2, 'incarnation-a'))
+        current.resources_override = None
+        current.reserved_fill = True
+        current.reserved_fill_pool_key = (
+            replica_managers.reserved_capacity_broker.make_pool_key(
+                'phx',
+                'H200',
+                protocol_version=(
+                    replica_managers.reserved_capacity_broker.PROTOCOL_V2),
+                physical_cluster_uid='phx-uid'))
+        current.reserved_fill_service_generation = 9
+        current.reserved_fill_physical_cluster_uid = 'phx-uid'
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[legacy, current]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'quiesce_service_replica_launch_requests',
+                 return_value=True) as quiesce, \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate:
+            mgr._recover_replica_operations()
+
+        assert quiesce.call_args_list == [
+            mock.call('svc', [current],
+                      continue_guard=mgr._service_is_launch_authorized,
+                      include_terminal_history=True),
+            mock.call('svc', [legacy],
+                      continue_guard=mgr._service_is_launch_authorized,
+                      include_terminal_history=False),
+        ]
+        assert [call.args[0] for call in terminate.call_args_list] == [1, 2]
+        launch.assert_not_called()
+
+    @pytest.mark.parametrize('scope,cluster_matches', [
+        (None, True),
+        ('incarnation-a', False),
+    ])
+    def test_recovery_rejects_unscoped_or_misnamed_protocol_v2_fill(
+            self, scope, cluster_matches):
+        mgr = _make_manager()
+        mgr._resource_scope = scope
+        mgr._service_hash = 'incarnation-a'
+        fill_row = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PENDING)
+        expected_name = (
+            replica_managers.serve_utils.generate_replica_cluster_name(
+                'svc', 1, 'incarnation-a'))
+        fill_row.cluster_name = (expected_name
+                                 if cluster_matches else 'svc-1-wrong-scope')
+        fill_row.resources_override = None
+        fill_row.reserved_fill = True
+        fill_row.reserved_fill_pool_key = (
+            replica_managers.reserved_capacity_broker.make_pool_key(
+                'phx',
+                'H200',
+                protocol_version=(
+                    replica_managers.reserved_capacity_broker.PROTOCOL_V2),
+                physical_cluster_uid='phx-uid'))
+        fill_row.reserved_fill_service_generation = 9
+        fill_row.reserved_fill_physical_cluster_uid = 'phx-uid'
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[fill_row]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'quiesce_service_replica_launch_requests') as quiesce, \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             pytest.raises(RuntimeError, match='validate interrupted'):
+            mgr._recover_replica_operations()
+
+        quiesce.assert_not_called()
+        launch.assert_not_called()
+        terminate.assert_not_called()
+
+    def test_recovery_retains_fill_when_launch_quiescence_is_uncertain(self):
+        mgr = _make_manager()
+        fill_row = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PENDING)
+        fill_row.resources_override = None
+        fill_row.reserved_fill = True
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[fill_row]), \
+             mock.patch.object(replica_managers.serve_utils.sdk,
+                               'api_status',
+                               side_effect=RuntimeError('status unavailable')), \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             pytest.raises(RuntimeError,
+                           match='Could not quiesce interrupted'):
+            mgr._recover_replica_operations()
+
+        launch.assert_not_called()
+        terminate.assert_not_called()
 
     def test_provisioning_redrive_reenters_current_exact_card_budget(self):
         """Recovery cannot turn stale PROVISIONING intent into a new launch."""

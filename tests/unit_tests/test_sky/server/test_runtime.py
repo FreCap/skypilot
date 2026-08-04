@@ -1,6 +1,7 @@
 """Role-isolation tests for the API server process supervisors."""
 
 import http.client
+import json
 import os
 import pathlib
 import socket
@@ -16,6 +17,7 @@ from sky.jobs import managed_job_refresh_thread
 from sky.jobs.server import server as jobs_server
 from sky.serve import constants as serve_constants
 from sky.server import runtime
+from sky.server.requests import cutover as request_cutover
 from sky.server.requests import registry as request_registry
 
 _SYSTEM_OOM_METRIC_CHILD_SCRIPT = """
@@ -43,6 +45,112 @@ def _args() -> SimpleNamespace:
                            metrics_port=9090,
                            role_health_port=46581,
                            authority_preflight_port=46583)
+
+
+@pytest.mark.parametrize(('phase', 'backend_kind', 'raises'), [
+    ('blocked', 'sqlite', False),
+    ('blocked', 'postgres', True),
+    ('blocked', 'postgres-subclass', True),
+    ('blocked', 'custom', True),
+    ('cutover-complete', 'postgres', False),
+    ('cutover-complete', 'sqlite', True),
+    ('cutover-complete', 'postgres-subclass', True),
+])
+def test_completed_request_store_cutover_fails_closed(tmp_path, monkeypatch,
+                                                      phase, backend_kind,
+                                                      raises):
+    gate = tmp_path / 'api-request-cutover.json'
+    gate.write_text(json.dumps({
+        'format_version': 1,
+        'phase': phase,
+        'source_path': '/root/.sky/api_server/requests.db',
+    }),
+                    encoding='utf-8')
+    monkeypatch.setenv(request_cutover.CUTOVER_GATE_PATH_ENV_VAR, str(gate))
+
+    class PluginPostgresBackend(runtime.request_postgres.PostgresRequestBackend
+                               ):
+        pass
+
+    if backend_kind == 'postgres':
+        backend = runtime.request_postgres.PostgresRequestBackend()
+        monkeypatch.setenv(runtime.request_postgres.REQUEST_BACKEND_ENV_VAR,
+                           runtime.request_postgres.POSTGRES_REQUEST_BACKEND)
+    elif backend_kind == 'postgres-subclass':
+        backend = PluginPostgresBackend()
+        monkeypatch.setenv(runtime.request_postgres.REQUEST_BACKEND_ENV_VAR,
+                           runtime.request_postgres.POSTGRES_REQUEST_BACKEND)
+    else:
+        backend = (runtime.requests_lib.SqliteRequestBackend()
+                   if backend_kind == 'sqlite' else object())
+        monkeypatch.setenv(runtime.request_postgres.REQUEST_BACKEND_ENV_VAR,
+                           'sqlite')
+    monkeypatch.setattr(runtime.request_storage, 'get_request_backend',
+                        lambda: backend)
+
+    if raises:
+        with pytest.raises(RuntimeError,
+                           match='before the import|Refusing stale SQLite'):
+            # pylint: disable-next=protected-access
+            runtime._guard_completed_request_store_cutover()
+    else:
+        # pylint: disable-next=protected-access
+        runtime._guard_completed_request_store_cutover()
+
+
+def test_active_reserved_fill_v2_requires_backend_guard(monkeypatch):
+    monkeypatch.setattr(runtime.serve_state, 'get_reserved_fill_protocol_state',
+                        lambda: {'protocol_version': 2})
+    monkeypatch.delenv(
+        runtime.request_postgres.EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR,
+        raising=False)
+
+    with pytest.raises(RuntimeError, match='enforcement is disabled'):
+        # pylint: disable-next=protected-access
+        runtime._guard_active_reserved_fill_protocol('executor')
+
+
+def test_active_reserved_fill_v2_revalidates_backend_guard(monkeypatch):
+    monkeypatch.setattr(runtime.serve_state, 'get_reserved_fill_protocol_state',
+                        lambda: {'protocol_version': 2})
+    monkeypatch.setenv(
+        runtime.request_postgres.EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR,
+        'true')
+    validate = mock.Mock()
+    monkeypatch.setattr(runtime.request_postgres,
+                        'require_builtin_execution_quiescence_backends',
+                        validate)
+
+    # pylint: disable-next=protected-access
+    runtime._guard_active_reserved_fill_protocol('executor')
+
+    validate.assert_called_once_with(required=True)
+
+
+def test_reserved_fill_v1_preserves_unguarded_backend_compatibility(
+        monkeypatch):
+    monkeypatch.setattr(runtime.serve_state, 'get_reserved_fill_protocol_state',
+                        lambda: {'protocol_version': 1})
+    validate = mock.Mock()
+    monkeypatch.setattr(runtime.request_postgres,
+                        'require_builtin_execution_quiescence_backends',
+                        validate)
+
+    # pylint: disable-next=protected-access
+    runtime._guard_active_reserved_fill_protocol('executor')
+
+    validate.assert_not_called()
+
+
+def test_active_reserved_fill_v2_does_not_gate_authority_worker(monkeypatch):
+    state_reader = mock.Mock(return_value={'protocol_version': 2})
+    monkeypatch.setattr(runtime.serve_state, 'get_reserved_fill_protocol_state',
+                        state_reader)
+
+    # pylint: disable-next=protected-access
+    runtime._guard_active_reserved_fill_protocol('authority-worker')
+
+    state_reader.assert_not_called()
 
 
 def test_role_drain_marker_fails_readiness_before_shutdown(

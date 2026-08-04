@@ -2,8 +2,11 @@
 import collections
 import copy
 import dataclasses
+import datetime
 import enum
+import functools
 import json
+import math
 import pickle
 import time
 import typing
@@ -25,7 +28,9 @@ from sky.serve import paid_capacity
 from sky.serve import serve_state_schema
 from sky.serve.serve_statuses import ReplicaStatus
 from sky.serve.serve_statuses import ServiceStatus
+from sky.server.requests import postgres_schema as request_postgres_schema
 from sky.utils import common_utils
+from sky.utils import locks
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
 
@@ -61,6 +66,12 @@ serve_ha_recovery_script_table = (
 service_lifecycle_fences_table = (
     serve_state_schema.service_lifecycle_fences_table)
 reserved_fill_claims_table = serve_state_schema.reserved_fill_claims_table
+reserved_fill_protocol_state_table = (
+    serve_state_schema.reserved_fill_protocol_state_table)
+reserved_fill_service_claim_sets_table = (
+    serve_state_schema.reserved_fill_service_claim_sets_table)
+reserved_fill_pool_claims_table = (
+    serve_state_schema.reserved_fill_pool_claims_table)
 reserved_fill_rounds_table = serve_state_schema.reserved_fill_rounds_table
 reserved_fill_lease_table = serve_state_schema.reserved_fill_lease_table
 demand_capacity_observations_table = (
@@ -72,6 +83,27 @@ create_table = serve_state_schema.create_table
 _db_manager = serve_state_schema._db_manager  # pylint: disable=protected-access
 ensure_tables_initialized = serve_state_schema.ensure_tables_initialized
 get_database_engine = serve_state_schema.get_database_engine
+
+RESERVED_FILL_PROTOCOL_V1 = 1
+RESERVED_FILL_PROTOCOL_V2 = 2
+RESERVED_FILL_CLAIM_SET_MIGRATION_SHADOW = 'migration_shadow'
+RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 = 'authoritative_v2'
+
+
+@dataclasses.dataclass(frozen=True)
+class ReservedFillWriterInstance:
+    """One recent API request-server lease relevant to fill execution."""
+
+    instance_id: str
+    role: str
+    pod_name: str | None
+    pod_uid: str | None
+    version: str
+    ready: bool
+    draining: bool
+    request_storage_backend: str
+    request_queue_backend: str
+    execution_quiescence_capable: bool
 
 
 def claim_service_lifecycle_epoch(service_name: str,
@@ -236,6 +268,24 @@ def _ephemeral_storage_generation_from_yaml(
     return storage_generation if isinstance(storage_generation, str) else None
 
 
+_ReservedFillLockedFunction = typing.TypeVar('_ReservedFillLockedFunction',
+                                             bound=typing.Callable[..., Any])
+
+
+def _with_reserved_fill_broker_lock(
+    function: _ReservedFillLockedFunction,) -> _ReservedFillLockedFunction:
+    """Serialize service-name creation/teardown with broker state changes."""
+
+    @functools.wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
+        with lock.acquire(blocking=True):
+            return function(*args, **kwargs)
+
+    return typing.cast(_ReservedFillLockedFunction, wrapped)
+
+
+@_with_reserved_fill_broker_lock
 def add_service(name: str,
                 controller_job_id: int,
                 policy: str,
@@ -541,10 +591,21 @@ def set_service_controller_ip(service_name: str,
         session.commit()
 
 
+@_with_reserved_fill_broker_lock
 def remove_service(service_name: str) -> None:
     """Removes a service from the database."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.service_name ==
+                service_name))
+        session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.service_name == service_name))
         session.execute(
             sqlalchemy.delete(paid_capacity_claims_table).where(
                 paid_capacity_claims_table.c.service_name == service_name))
@@ -593,6 +654,7 @@ def service_uses_logical_replica_semantics(service_name: str) -> bool:
     return bool(row[0]) if row is not None else False
 
 
+@_with_reserved_fill_broker_lock
 def remove_service_completely(
     service_name: str,
     expected_service_hash: str,
@@ -662,6 +724,13 @@ def remove_service_completely(
         session.execute(
             sqlalchemy.delete(reserved_fill_claims_table).where(
                 reserved_fill_claims_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.service_name ==
+                service_name))
         session.execute(
             sqlalchemy.delete(paid_capacity_claims_table).where(
                 paid_capacity_claims_table.c.service_name == service_name))
@@ -2270,6 +2339,36 @@ def _replica_from_state(
     return replica_managers.ReplicaInfo.from_storage_dict(replica_state)
 
 
+def _lock_service_owner_row_in_session(
+    session: orm.Session,
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+    *,
+    require_launch_allowed: bool,
+) -> sqlalchemy.engine.Row | None:
+    """Lock and return one valid service controller owner row."""
+    _lifecycle_epoch_matches_in_session(session, service_name, None)
+    owner = session.execute(
+        sqlalchemy.select(services_table.c.hash,
+                          services_table.c.controller_pid,
+                          services_table.c.controller_ip,
+                          services_table.c.status,
+                          services_table.c.resource_scope).where(
+                              services_table.c.name ==
+                              service_name).with_for_update()).fetchone()
+    if (owner is None or owner[0] != expected_service_hash or
+        (expected_controller_owner is not None and
+         (owner[1], owner[2]) != expected_controller_owner)):
+        return None
+    if require_launch_allowed and owner[3] in {
+            status.value
+            for status in ServiceStatus.replica_launch_blocking_statuses()
+    }:
+        return None
+    return owner
+
+
 def _lock_service_owner_in_session(
     session: orm.Session,
     service_name: str,
@@ -2279,22 +2378,12 @@ def _lock_service_owner_in_session(
     require_launch_allowed: bool,
 ) -> bool:
     """Lock and validate one service controller owner."""
-    _lifecycle_epoch_matches_in_session(session, service_name, None)
-    owner = session.execute(
-        sqlalchemy.select(services_table.c.hash,
-                          services_table.c.controller_pid,
-                          services_table.c.controller_ip,
-                          services_table.c.status).where(
-                              services_table.c.name ==
-                              service_name).with_for_update()).fetchone()
-    if (owner is None or owner[0] != expected_service_hash or
-        (expected_controller_owner is not None and
-         (owner[1], owner[2]) != expected_controller_owner)):
-        return False
-    return (not require_launch_allowed or owner[3] not in {
-        status.value
-        for status in ServiceStatus.replica_launch_blocking_statuses()
-    })
+    return _lock_service_owner_row_in_session(
+        session,
+        service_name,
+        expected_service_hash,
+        expected_controller_owner,
+        require_launch_allowed=require_launch_allowed) is not None
 
 
 def _lock_system_recovery_service_owner_in_session(
@@ -5144,6 +5233,998 @@ def _upsert_insert_func(engine: sqlalchemy.engine.Engine):
     raise ValueError('Unsupported database dialect')
 
 
+def _require_reserved_fill_v2_postgresql(
+        engine: sqlalchemy.engine.Engine) -> None:
+    """Require central PostgreSQL for normalized protocol-v2 state."""
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError('Reserved-fill protocol v2 requires the central '
+                           'PostgreSQL Serve database.')
+
+
+def get_recent_reserved_fill_writer_instances(
+        stale_after_seconds: int) -> tuple[ReservedFillWriterInstance, ...]:
+    """Return database-wide live leases for fill request-server roles."""
+    if (isinstance(stale_after_seconds, bool) or
+            not isinstance(stale_after_seconds, int) or
+            stale_after_seconds <= 0):
+        raise ValueError('Writer-instance stale horizon must be positive.')
+    engine = _db_manager.get_engine()
+    _require_reserved_fill_v2_postgresql(engine)
+    cutoff = (sqlalchemy.func.clock_timestamp() -
+              datetime.timedelta(seconds=stale_after_seconds))
+    statement = sqlalchemy.select(
+        request_postgres_schema.SERVER_INSTANCES.c.instance_id,
+        request_postgres_schema.SERVER_INSTANCES.c.role,
+        request_postgres_schema.SERVER_INSTANCES.c.pod_name,
+        request_postgres_schema.SERVER_INSTANCES.c.pod_uid,
+        request_postgres_schema.SERVER_INSTANCES.c.version,
+        request_postgres_schema.SERVER_INSTANCES.c.ready,
+        request_postgres_schema.SERVER_INSTANCES.c.draining_at,
+        request_postgres_schema.SERVER_INSTANCES.c.request_storage_backend,
+        request_postgres_schema.SERVER_INSTANCES.c.request_queue_backend,
+        request_postgres_schema.SERVER_INSTANCES.c.execution_quiescence_capable,
+    ).where(
+        request_postgres_schema.SERVER_INSTANCES.c.role.in_(
+            ('all', 'api', 'controller', 'executor')),
+        request_postgres_schema.SERVER_INSTANCES.c.heartbeat_at >= cutoff)
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(statement).mappings().all()
+    except sqlalchemy_exc.SQLAlchemyError as error:
+        raise RuntimeError(
+            'The live writer-process inventory could not be read.') from error
+    result = []
+    for row in rows:
+        instance_id = str(row['instance_id'])
+        role = row['role']
+        version = row['version']
+        ready = row['ready']
+        request_storage_backend = row['request_storage_backend']
+        request_queue_backend = row['request_queue_backend']
+        execution_quiescence_capable = row['execution_quiescence_capable']
+        if (not instance_id or not isinstance(role, str) or not role or
+                not isinstance(version, str) or not version or
+                not isinstance(ready, bool) or
+                not isinstance(request_storage_backend, str) or
+                not request_storage_backend or
+                not isinstance(request_queue_backend, str) or
+                not request_queue_backend or
+                not isinstance(execution_quiescence_capable, bool)):
+            raise RuntimeError(
+                'A live writer-process inventory row is malformed.')
+        result.append(
+            ReservedFillWriterInstance(
+                instance_id=instance_id,
+                role=role,
+                pod_name=row['pod_name'],
+                pod_uid=row['pod_uid'],
+                version=version,
+                ready=ready,
+                draining=row['draining_at'] is not None,
+                request_storage_backend=(request_storage_backend),
+                request_queue_backend=(request_queue_backend),
+                execution_quiescence_capable=(execution_quiescence_capable)))
+    return tuple(
+        sorted(result,
+               key=lambda item:
+               (item.role, item.pod_uid or '', item.instance_id)))
+
+
+def _reserved_fill_protocol_row_in_session(
+        session: orm.Session,
+        engine: sqlalchemy.engine.Engine,
+        *,
+        for_update: bool = False) -> sqlalchemy.engine.Row:
+    """Return the singleton protocol row, seeding v1 for metadata-only DBs."""
+    insert_stmt = _upsert_insert_func(engine)(
+        reserved_fill_protocol_state_table).values(
+            id=1,
+            protocol_version=RESERVED_FILL_PROTOCOL_V1,
+            claim_generation=0,
+            changed_at=0.0)
+    insert_stmt = insert_stmt.on_conflict_do_nothing(index_elements=['id'])
+    session.execute(insert_stmt)
+    query = sqlalchemy.select(reserved_fill_protocol_state_table).where(
+        reserved_fill_protocol_state_table.c.id == 1)
+    if for_update:
+        query = query.with_for_update()
+    row = session.execute(query).fetchone()
+    if row is None:
+        raise RuntimeError('Reserved-fill protocol singleton is missing.')
+    return row
+
+
+def _next_reserved_fill_claim_generation_in_session(
+        session: orm.Session, protocol_row: sqlalchemy.engine.Row) -> int:
+    """Allocate one globally unique protocol-v2 claim generation.
+
+    The caller must have selected the protocol singleton ``FOR UPDATE`` (or
+    opened SQLite's immediate transaction).  The singleton outlives every
+    service claim set, making the allocated value immune to disable/re-enable
+    and same-name service reuse ABA.
+    """
+    previous = int(protocol_row.claim_generation)
+    if previous < 0:
+        raise RuntimeError('Reserved-fill claim generation is negative.')
+    # PostgreSQL BIGINT's positive range is the durable wire contract.
+    if previous >= 2**63 - 1:
+        raise RuntimeError('Reserved-fill claim generation is exhausted.')
+    generation = previous + 1
+    updated = session.execute(
+        sqlalchemy.update(reserved_fill_protocol_state_table).where(
+            reserved_fill_protocol_state_table.c.id == 1,
+            reserved_fill_protocol_state_table.c.claim_generation ==
+            previous).values(claim_generation=generation))
+    if updated.rowcount != 1:
+        raise RuntimeError('Reserved-fill claim generation allocation lost '
+                           'its singleton fence.')
+    return generation
+
+
+def get_reserved_fill_protocol_state() -> dict[str, Any]:
+    """Return the durable reserved-fill protocol and its rollout proof."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = _reserved_fill_protocol_row_in_session(session, engine)
+        result = dict(row._mapping)  # pylint: disable=protected-access
+        session.commit()
+    return result
+
+
+def _canonical_reserved_fill_accelerators(value: Any) -> tuple[str, ...] | None:
+    """Return one canonical accelerator tuple, or ``None`` when malformed."""
+    if isinstance(value, str):
+        raw_names = (value,)
+    elif isinstance(value, list):
+        raw_names = tuple(value)
+    else:
+        return None
+    if not raw_names or any(
+            not isinstance(name, str) or not name or name != name.strip()
+            for name in raw_names):
+        return None
+    return tuple(sorted({name.lower() for name in raw_names}))
+
+
+def _demotion_legacy_projection(
+    claim_set: sqlalchemy.engine.Row,
+    edge: sqlalchemy.engine.Row,
+    *,
+    global_generation: int,
+) -> dict[str, Any] | None:
+    """Validate one authoritative edge and derive its complete v1 projection."""
+    try:
+        generation = int(claim_set.generation)
+        edge_generation = int(edge.service_generation)
+        edge_count = int(claim_set.edge_count)
+        pool_position = int(edge.pool_position)
+        weight = float(edge.weight)
+        floor_replicas = int(edge.floor_replicas)
+        gpus_per_replica = int(edge.gpus_per_replica)
+        holdings_fill = int(edge.holdings_fill)
+        effective_cap = (None if edge.effective_cap is None else int(
+            edge.effective_cap))
+        launchable = int(edge.launchable)
+        heartbeat_ts = float(edge.heartbeat_ts)
+        encoded_accelerators = json.loads(edge.accelerator_names)
+        legacy_pool_key = json.loads(edge.legacy_pool_key)
+        physical_pool_key = json.loads(edge.pool_key)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    accelerators = _canonical_reserved_fill_accelerators(encoded_accelerators)
+    legacy_accelerators = (_canonical_reserved_fill_accelerators(
+        legacy_pool_key[1]) if isinstance(legacy_pool_key, list) and
+                           len(legacy_pool_key) == 2 else None)
+    physical_accelerators = (_canonical_reserved_fill_accelerators(
+        physical_pool_key[2]) if isinstance(physical_pool_key, list) and
+                             len(physical_pool_key) == 3 and
+                             physical_pool_key[0] == 'v2' else None)
+    if (generation <= 0 or generation > global_generation or
+            edge_generation != generation or edge_count != 1 or
+            not isinstance(claim_set.semantic_hash, str) or
+            not claim_set.semantic_hash or pool_position < 0 or
+            not math.isfinite(weight) or weight <= 0 or floor_replicas < 0 or
+            gpus_per_replica <= 0 or holdings_fill < 0 or
+        (effective_cap is not None and effective_cap < 0) or
+            launchable not in (0, 1) or not math.isfinite(heartbeat_ts) or
+            heartbeat_ts < 0 or accelerators is None or
+            legacy_accelerators != accelerators or
+            physical_accelerators != accelerators or
+            legacy_pool_key[0] != edge.access_context or
+            physical_pool_key[1] != edge.physical_cluster_uid or
+            not isinstance(edge.access_context, str) or
+            not edge.access_context or
+            not isinstance(edge.physical_cluster_uid, str) or
+            not edge.physical_cluster_uid or
+            edge.demonstrated_need is not None or edge.boot_hold is not None or
+            edge.activity_ts is not None):
+        return None
+    return {
+        'legacy_pool_key': edge.legacy_pool_key,
+        'weight': weight,
+        'floor_replicas': floor_replicas,
+        'gpus_per_replica': gpus_per_replica,
+        'holdings_fill': holdings_fill,
+        'effective_cap': effective_cap,
+        'launchable': launchable,
+        'demonstrated_need': None,
+        'boot_hold': None,
+        'activity_ts': None,
+        'heartbeat_ts': heartbeat_ts,
+    }
+
+
+def _legacy_projection_matches(row: sqlalchemy.engine.Row,
+                               projection: dict[str, Any]) -> bool:
+    """Whether a persisted legacy row is exactly the rebuilt projection."""
+    expected = dict(projection)
+    expected['pool_key'] = expected.pop('legacy_pool_key')
+    return all(
+        getattr(row, column) == value for column, value in expected.items())
+
+
+def set_reserved_fill_protocol_version(
+    protocol_version: int,
+    *,
+    expected_protocol_version: int,
+    image_digest: str | None = None,
+    deployment_generation: str | None = None,
+    deployment_uid: str | None = None,
+    pod_inventory_count: int | None = None,
+    pod_inventory_sha256: str | None = None,
+    changed_at: float | None = None,
+    rollout_proof: dict[str, Any] | None = None,
+) -> bool:
+    """CAS the durable protocol gate after the caller takes the broker lock.
+
+    The state layer records and validates the immutable rollout proof.  The
+    activation command is responsible for collecting that proof from the
+    fully rolled-out Deployment while holding the exact global broker lock.
+    Demotion fails closed while any authoritative service still owns multiple
+    edges.  Queued launches are fenced separately by
+    ``add_replica_if_round_epoch`` comparing their carried protocol with this
+    row in the insert transaction.
+    """
+    if protocol_version not in (RESERVED_FILL_PROTOCOL_V1,
+                                RESERVED_FILL_PROTOCOL_V2):
+        raise ValueError('Reserved-fill protocol must be 1 or 2.')
+    if expected_protocol_version not in (RESERVED_FILL_PROTOCOL_V1,
+                                         RESERVED_FILL_PROTOCOL_V2):
+        raise ValueError('Expected reserved-fill protocol must be 1 or 2.')
+    if protocol_version == expected_protocol_version:
+        raise ValueError('Reserved-fill protocol transition must change it.')
+    if rollout_proof is not None:
+        if not isinstance(rollout_proof, dict):
+            raise TypeError('Reserved-fill rollout_proof must be a mapping.')
+        if (image_digest is not None or deployment_generation is not None or
+                deployment_uid is not None or pod_inventory_count is not None or
+                pod_inventory_sha256 is not None):
+            raise ValueError('Pass rollout proof either as fields or as one '
+                             'mapping, not both.')
+        image_digest = rollout_proof.get(
+            'image_digest', rollout_proof.get('expected_image_digest'))
+        observed_digest = rollout_proof.get('observed_image_digest',
+                                            image_digest)
+        if observed_digest != image_digest:
+            raise ValueError('Expected and observed rollout image digests do '
+                             'not match.')
+        raw_generation = rollout_proof.get('deployment_generation')
+        if raw_generation is not None and not isinstance(raw_generation, bool):
+            deployment_generation = str(raw_generation)
+        deployment_uid = rollout_proof.get('deployment_uid')
+        pod_inventory_count = rollout_proof.get('pod_inventory_count')
+        pod_inventory_sha256 = rollout_proof.get('pod_inventory_sha256')
+    if protocol_version == RESERVED_FILL_PROTOCOL_V2:
+        if (not isinstance(image_digest, str) or len(image_digest) != 71 or
+                not image_digest.startswith('sha256:') or
+                any(character not in '0123456789abcdef'
+                    for character in image_digest[7:])):
+            raise ValueError('Protocol-v2 activation requires a sha256 image '
+                             'digest.')
+        if (not isinstance(deployment_generation, str) or
+                not deployment_generation.strip()):
+            raise ValueError('Protocol-v2 activation requires a Deployment '
+                             'generation proof.')
+        if not isinstance(deployment_uid, str) or not deployment_uid:
+            raise ValueError('Protocol-v2 activation requires a Deployment '
+                             'UID proof.')
+        if (isinstance(pod_inventory_count, bool) or
+                not isinstance(pod_inventory_count, int) or
+                pod_inventory_count <= 0):
+            raise ValueError('Protocol-v2 activation requires a positive pod '
+                             'inventory count.')
+        if (not isinstance(pod_inventory_sha256, str) or
+                len(pod_inventory_sha256) != 64 or
+                any(character not in '0123456789abcdef'
+                    for character in pod_inventory_sha256)):
+            raise ValueError('Protocol-v2 activation requires a pod inventory '
+                             'sha256 proof.')
+    transition_time = time.time() if changed_at is None else float(changed_at)
+    engine = _db_manager.get_engine()
+    _require_reserved_fill_v2_postgresql(engine)
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        row = _reserved_fill_protocol_row_in_session(session,
+                                                     engine,
+                                                     for_update=True)
+        if int(row.protocol_version) != expected_protocol_version:
+            session.rollback()
+            return False
+        if protocol_version == RESERVED_FILL_PROTOCOL_V1:
+            # The table lock closes the PostgreSQL predicate gap: a v1 writer
+            # that does not know about the protocol singleton cannot insert a
+            # new legacy-only row after the inventory check and before the gate
+            # flip.  Current v2 writers also take the singleton row first, so
+            # this preserves their existing lock order.
+            session.execute(
+                sqlalchemy.text(
+                    'LOCK TABLE reserved_fill_service_claim_sets, '
+                    'reserved_fill_pool_claims, reserved_fill_claims '
+                    'IN SHARE ROW EXCLUSIVE MODE'))
+            authoritative_sets = session.execute(
+                sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
+                    reserved_fill_service_claim_sets_table.c.claim_set_state ==
+                    RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2).with_for_update()
+            ).fetchall()
+            service_names = [
+                str(item.service_name) for item in authoritative_sets
+            ]
+            normalized_rows = []
+            if service_names:
+                normalized_rows = session.execute(
+                    sqlalchemy.select(reserved_fill_pool_claims_table).where(
+                        reserved_fill_pool_claims_table.c.service_name.in_(
+                            service_names)).with_for_update()).fetchall()
+            legacy_rows = session.execute(
+                sqlalchemy.select(
+                    reserved_fill_claims_table).with_for_update()).fetchall()
+            normalized_by_service: dict[str, list[Any]] = (
+                collections.defaultdict(list))
+            for normalized in normalized_rows:
+                normalized_by_service[str(
+                    normalized.service_name)].append(normalized)
+            legacy_by_service = {
+                str(legacy.service_name): legacy for legacy in legacy_rows
+            }
+            authoritative_names = set(service_names)
+            if set(legacy_by_service) - authoritative_names:
+                # A legacy-only row would become authoritative at the v1 gate
+                # flip but has no normalized source from which this transaction
+                # can prove and rebuild it.
+                session.rollback()
+                return False
+            projections: dict[str, dict[str, Any]] = {}
+            for claim_set in authoritative_sets:
+                name = str(claim_set.service_name)
+                edges = normalized_by_service.get(name, [])
+                if len(edges) != 1:
+                    session.rollback()
+                    return False
+                projection = _demotion_legacy_projection(
+                    claim_set,
+                    edges[0],
+                    global_generation=int(row.claim_generation))
+                if projection is None:
+                    session.rollback()
+                    return False
+                projections[name] = projection
+            # Rebuild every projection even when a legacy writer moved or
+            # partially corrupted the old row while v2 remained authoritative.
+            for name, projection in projections.items():
+                _write_reserved_fill_legacy_projection_in_session(
+                    session, engine, name, projection)
+            rebuilt_rows = session.execute(
+                sqlalchemy.select(
+                    reserved_fill_claims_table).with_for_update()).fetchall()
+            rebuilt_by_service = {
+                str(legacy.service_name): legacy for legacy in rebuilt_rows
+            }
+            if (set(rebuilt_by_service) != authoritative_names or
+                    any(not _legacy_projection_matches(rebuilt_by_service[name],
+                                                       projection)
+                        for name, projection in projections.items())):
+                session.rollback()
+                return False
+        updated = session.execute(
+            sqlalchemy.update(reserved_fill_protocol_state_table).where(
+                reserved_fill_protocol_state_table.c.id == 1,
+                reserved_fill_protocol_state_table.c.protocol_version ==
+                expected_protocol_version).values(
+                    protocol_version=protocol_version,
+                    image_digest=(image_digest if image_digest is not None else
+                                  row.image_digest),
+                    deployment_generation=(deployment_generation
+                                           if deployment_generation is not None
+                                           else row.deployment_generation),
+                    deployment_uid=(deployment_uid if deployment_uid is not None
+                                    else row.deployment_uid),
+                    pod_inventory_count=(pod_inventory_count
+                                         if pod_inventory_count is not None else
+                                         row.pod_inventory_count),
+                    pod_inventory_sha256=(pod_inventory_sha256
+                                          if pod_inventory_sha256 is not None
+                                          else row.pod_inventory_sha256),
+                    changed_at=transition_time))
+        if updated.rowcount != 1:
+            session.rollback()
+            return False
+        session.commit()
+    return True
+
+
+def _reserved_fill_json(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        # Validate caller-provided serialized state before persisting it.
+        json.loads(value)
+        return value
+    return json.dumps(value, sort_keys=True, separators=(',', ':'))
+
+
+def _reserved_fill_decoded_json(value: Any) -> Any:
+    if value is None or not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_reserved_fill_pool_edge(edge: dict[str, Any],
+                                       heartbeat_ts: float) -> dict[str, Any]:
+    """Validate and normalize one complete-set edge for durable storage."""
+    required_text = ('pool_key', 'legacy_pool_key', 'access_context',
+                     'physical_cluster_uid')
+    normalized = dict(edge)
+    for name in required_text:
+        value = normalized.get(name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f'Reserved-fill edge {name} must be non-empty.')
+    position = normalized.get('pool_position')
+    if (isinstance(position, bool) or not isinstance(position, int) or
+            position < 0):
+        raise ValueError('Reserved-fill edge pool_position must be a '
+                         'nonnegative integer.')
+    for name in ('floor_replicas', 'gpus_per_replica', 'holdings_fill'):
+        value = normalized.get(name)
+        if (isinstance(value, bool) or not isinstance(value, int) or
+                value < 0 or (name == 'gpus_per_replica' and value == 0)):
+            raise ValueError(f'Reserved-fill edge {name} is invalid.')
+    cap = normalized.get('effective_cap')
+    if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or
+                            cap < 0):
+        raise ValueError('Reserved-fill edge effective_cap is invalid.')
+    weight = normalized.get('weight')
+    if (isinstance(weight, bool) or not isinstance(weight, (int, float)) or
+            float(weight) <= 0):
+        raise ValueError('Reserved-fill edge weight must be positive.')
+    accelerator_names = normalized.get('accelerator_names')
+    if not isinstance(accelerator_names, (list, tuple)) or not all(
+            isinstance(name, str) and name for name in accelerator_names):
+        raise ValueError('Reserved-fill edge accelerator_names is invalid.')
+    return {
+        'pool_key': normalized['pool_key'],
+        'legacy_pool_key': normalized['legacy_pool_key'],
+        'pool_position': position,
+        'access_context': normalized['access_context'],
+        'physical_cluster_uid': normalized['physical_cluster_uid'],
+        'accelerator_names': _reserved_fill_json(list(accelerator_names)),
+        'weight': float(weight),
+        'floor_replicas': normalized['floor_replicas'],
+        'gpus_per_replica': normalized['gpus_per_replica'],
+        'holdings_fill': normalized['holdings_fill'],
+        'effective_cap': cap,
+        'launchable': int(bool(normalized.get('launchable', True))),
+        # Protocol v2 advances utilization exactly once on the set row.
+        'demonstrated_need': None,
+        'boot_hold': None,
+        'activity_ts': None,
+        'heartbeat_ts': float(heartbeat_ts),
+    }
+
+
+def _write_reserved_fill_legacy_projection_in_session(
+        session: orm.Session, engine: sqlalchemy.engine.Engine,
+        service_name: str, edge: dict[str, Any] | None) -> None:
+    if edge is None:
+        session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.service_name == service_name))
+        return
+    values = {
+        'service_name': service_name,
+        'pool_key': edge['legacy_pool_key'],
+        'weight': edge['weight'],
+        'floor_replicas': edge['floor_replicas'],
+        'gpus_per_replica': edge['gpus_per_replica'],
+        'holdings_fill': edge['holdings_fill'],
+        'effective_cap': edge['effective_cap'],
+        'launchable': edge['launchable'],
+        'demonstrated_need': None,
+        'boot_hold': None,
+        'activity_ts': None,
+        'heartbeat_ts': edge['heartbeat_ts'],
+    }
+    insert_stmt = _upsert_insert_func(engine)(
+        reserved_fill_claims_table).values(**values)
+    insert_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=['service_name'],
+        set_={
+            key: getattr(insert_stmt.excluded, key)
+            for key in values
+            if key != 'service_name'
+        })
+    session.execute(insert_stmt)
+
+
+def replace_reserved_fill_claim_set(
+    service_name: str,
+    *,
+    semantic_hash: str,
+    global_headroom: int,
+    utilization_ceiling: int,
+    utilization_state: Any,
+    edges: typing.Sequence[dict[str, Any]],
+    heartbeat_ts: float,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+) -> int | None:
+    """Owner-fenced atomic replacement of one complete protocol-v2 set.
+
+    Callers acquire the global reserved-fill broker lock before entering.
+    ``None`` means the protocol or service owner fence was lost; otherwise the
+    returned monotonic generation names every row written by this transaction.
+    """
+    if not isinstance(semantic_hash, str) or not semantic_hash:
+        raise ValueError('Reserved-fill semantic_hash must be non-empty.')
+    for name, value in (('global_headroom', global_headroom),
+                        ('utilization_ceiling', utilization_ceiling)):
+        if (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f'Reserved-fill {name} must be nonnegative.')
+    normalized_edges = [
+        _normalize_reserved_fill_pool_edge(edge, heartbeat_ts) for edge in edges
+    ]
+    if not normalized_edges:
+        raise ValueError('Reserved-fill authoritative set cannot be empty.')
+    pool_keys = [edge['pool_key'] for edge in normalized_edges]
+    positions = [edge['pool_position'] for edge in normalized_edges]
+    if len(set(pool_keys)) != len(pool_keys):
+        raise ValueError('Reserved-fill pool keys must be unique per service.')
+    if len(set(positions)) != len(positions):
+        raise ValueError('Reserved-fill pool positions must be unique.')
+    normalized_edges.sort(key=lambda edge: edge['pool_position'])
+    engine = _db_manager.get_engine()
+    _require_reserved_fill_v2_postgresql(engine)
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        protocol = _reserved_fill_protocol_row_in_session(session,
+                                                          engine,
+                                                          for_update=True)
+        if int(protocol.protocol_version) != RESERVED_FILL_PROTOCOL_V2:
+            session.rollback()
+            return None
+        owner = _lock_service_owner_row_in_session(session,
+                                                   service_name,
+                                                   expected_service_hash,
+                                                   expected_controller_owner,
+                                                   require_launch_allowed=False)
+        if owner is None:
+            session.rollback()
+            return None
+        resource_scope = owner.resource_scope
+        if (not isinstance(resource_scope, str) or not resource_scope or
+                resource_scope != expected_service_hash):
+            # Protocol selection is global: a legacy/pre-scope service cannot
+            # remain on v1 after activation. Withdraw any prior v2 authority in
+            # this owner-locked transaction so it cannot absorb grants it can
+            # never launch.
+            session.execute(
+                sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                    reserved_fill_pool_claims_table.c.service_name ==
+                    service_name))
+            session.execute(
+                sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
+                    reserved_fill_service_claim_sets_table.c.service_name ==
+                    service_name))
+            session.execute(
+                sqlalchemy.delete(reserved_fill_claims_table).where(
+                    reserved_fill_claims_table.c.service_name == service_name))
+            session.commit()
+            return None
+        previous = session.execute(
+            sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.service_name ==
+                service_name).with_for_update()).fetchone()
+        previous_edges = session.execute(
+            sqlalchemy.select(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name ==
+                service_name).with_for_update()).fetchall()
+        previous_generation = 0 if previous is None else int(
+            previous.generation)
+        if previous_generation > int(protocol.claim_generation):
+            raise RuntimeError('Reserved-fill claim-set generation exceeds '
+                               'the global generation fence.')
+        unchanged = (previous is not None and previous_generation > 0 and
+                     previous.claim_set_state
+                     == RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 and
+                     previous.semantic_hash == semantic_hash and
+                     len(previous_edges) == int(previous.edge_count) and
+                     {row.pool_key for row in previous_edges
+                     } == set(pool_keys) and all(
+                         int(row.service_generation) == previous_generation
+                         for row in previous_edges))
+        generation = (previous_generation if unchanged else
+                      _next_reserved_fill_claim_generation_in_session(
+                          session, protocol))
+        set_values = {
+            'service_name': service_name,
+            'claim_set_state': RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2,
+            'generation': generation,
+            'edge_count': len(normalized_edges),
+            'semantic_hash': semantic_hash,
+            'global_headroom': global_headroom,
+            'utilization_ceiling': utilization_ceiling,
+            'utilization_state': _reserved_fill_json(utilization_state),
+            'heartbeat_ts': float(heartbeat_ts),
+        }
+        set_insert = _upsert_insert_func(engine)(
+            reserved_fill_service_claim_sets_table).values(**set_values)
+        set_insert = set_insert.on_conflict_do_update(
+            index_elements=['service_name'],
+            set_={
+                key: getattr(set_insert.excluded, key)
+                for key in set_values
+                if key != 'service_name'
+            })
+        session.execute(set_insert)
+        for edge in normalized_edges:
+            edge_values = {
+                'service_name': service_name,
+                'service_generation': generation,
+                **edge,
+            }
+            edge_insert = _upsert_insert_func(engine)(
+                reserved_fill_pool_claims_table).values(**edge_values)
+            edge_insert = edge_insert.on_conflict_do_update(
+                index_elements=['service_name', 'pool_key'],
+                set_={
+                    key: getattr(edge_insert.excluded, key)
+                    for key in edge_values
+                    if key not in ('service_name', 'pool_key')
+                })
+            session.execute(edge_insert)
+        session.execute(
+            sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name == service_name,
+                reserved_fill_pool_claims_table.c.pool_key.not_in(pool_keys)))
+        _write_reserved_fill_legacy_projection_in_session(
+            session, engine, service_name, normalized_edges[0])
+        session.commit()
+    return generation
+
+
+def get_reserved_fill_service_claim_set(
+        service_name: str) -> dict[str, Any] | None:
+    """Return one raw set and its ordered edges for poller reconciliation."""
+    engine = _db_manager.get_engine()
+    _require_reserved_fill_v2_postgresql(engine)
+    with orm.Session(engine) as session:
+        protocol = _reserved_fill_protocol_row_in_session(session, engine)
+        set_row = session.execute(
+            sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.service_name ==
+                service_name)).fetchone()
+        if set_row is None:
+            return None
+        edge_rows = session.execute(
+            sqlalchemy.select(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name ==
+                service_name).order_by(
+                    reserved_fill_pool_claims_table.c.pool_position,
+                    reserved_fill_pool_claims_table.c.pool_key)).fetchall()
+    result = dict(set_row._mapping)  # pylint: disable=protected-access
+    result['utilization_state'] = _reserved_fill_decoded_json(
+        result.get('utilization_state'))
+    edges = []
+    for row in edge_rows:
+        edge = dict(row._mapping)  # pylint: disable=protected-access
+        edge['accelerator_names'] = _reserved_fill_decoded_json(
+            edge.get('accelerator_names'))
+        edges.append(edge)
+    result['edges'] = edges
+    generation = int(result['generation'])
+    result['integrity_valid'] = (
+        int(protocol.protocol_version) == RESERVED_FILL_PROTOCOL_V2 and
+        result['claim_set_state'] == RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2
+        and generation > 0 and generation <= int(protocol.claim_generation) and
+        len(edges) == int(result['edge_count']) and
+        all(int(edge['service_generation']) == generation for edge in edges))
+    return result
+
+
+def get_authoritative_reserved_fill_claims(
+    pool_key: str | None = None,
+    *,
+    expired_before: float | None = None,
+) -> list[dict[str, Any]]:
+    """Read exactly one representation selected by the durable gate.
+
+    Protocol v1 returns only legacy rows.  Protocol v2 returns only complete,
+    current-generation authoritative normalized sets; shadows, corrupt sets,
+    and expired sets contribute nothing and never fall back to legacy.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        protocol = _reserved_fill_protocol_row_in_session(session, engine)
+        version = int(protocol.protocol_version)
+        if version == RESERVED_FILL_PROTOCOL_V1:
+            query = sqlalchemy.select(reserved_fill_claims_table)
+            if pool_key is not None:
+                query = query.where(
+                    reserved_fill_claims_table.c.pool_key == pool_key)
+            if expired_before is not None:
+                query = query.where(
+                    reserved_fill_claims_table.c.heartbeat_ts >= expired_before)
+            rows = session.execute(query).fetchall()
+            session.commit()
+            result = []
+            for row in rows:
+                claim = dict(row._mapping)  # pylint: disable=protected-access
+                claim.update({
+                    'protocol_version': RESERVED_FILL_PROTOCOL_V1,
+                    'service_generation': 0,
+                    'legacy_pool_key': claim['pool_key'],
+                    'access_context': None,
+                    'physical_cluster_uid': None,
+                    'accelerator_names': None,
+                    'pool_position': 0,
+                })
+                result.append(claim)
+            return result
+        _require_reserved_fill_v2_postgresql(engine)
+        global_generation = int(protocol.claim_generation)
+        set_query = sqlalchemy.select(
+            reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.claim_set_state ==
+                RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2)
+        if expired_before is not None:
+            set_query = set_query.where(reserved_fill_service_claim_sets_table.
+                                        c.heartbeat_ts >= expired_before)
+        set_rows = session.execute(set_query).fetchall()
+        sets = {str(row.service_name): row for row in set_rows}
+        if not sets:
+            session.commit()
+            return []
+        edge_rows = session.execute(
+            sqlalchemy.select(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name.in_(
+                    sets))).fetchall()
+        session.commit()
+    grouped: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in edge_rows:
+        edge = dict(row._mapping)  # pylint: disable=protected-access
+        grouped[str(edge['service_name'])].append(edge)
+    result = []
+    for service_name, set_row in sets.items():
+        edges = grouped.get(service_name, [])
+        generation = int(set_row.generation)
+        if (generation <= 0 or generation > global_generation or
+                len(edges) != int(set_row.edge_count) or any(
+                    int(edge['service_generation']) != generation
+                    for edge in edges) or (expired_before is not None and any(
+                        float(edge['heartbeat_ts']) < expired_before
+                        for edge in edges))):
+            continue
+        for edge in edges:
+            if pool_key is not None and edge['pool_key'] != pool_key:
+                continue
+            edge['protocol_version'] = RESERVED_FILL_PROTOCOL_V2
+            edge['accelerator_names'] = _reserved_fill_decoded_json(
+                edge.get('accelerator_names'))
+            result.append(edge)
+    return sorted(result,
+                  key=lambda edge:
+                  (str(edge['service_name']), int(edge['pool_position'])))
+
+
+def remove_reserved_fill_claim_set(
+    service_name: str,
+    *,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+) -> bool:
+    """Atomically remove normalized state and its legacy projection."""
+    engine = _db_manager.get_engine()
+    _require_reserved_fill_v2_postgresql(engine)
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        if not _lock_service_owner_in_session(session,
+                                              service_name,
+                                              expected_service_hash,
+                                              expected_controller_owner,
+                                              require_launch_allowed=False):
+            session.rollback()
+            return False
+        normalized = session.execute(
+            sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name ==
+                service_name)).rowcount
+        claim_set = session.execute(
+            sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.service_name ==
+                service_name)).rowcount
+        legacy = session.execute(
+            sqlalchemy.delete(reserved_fill_claims_table).where(
+                reserved_fill_claims_table.c.service_name ==
+                service_name)).rowcount
+        session.commit()
+    return bool(normalized or claim_set or legacy)
+
+
+def remove_authoritative_reserved_fill_claim(
+    service_name: str,
+    pool_key: str | None,
+    *,
+    expected_service_generation: int | None = None,
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+) -> bool:
+    """Remove one v2 edge and generation-fence every remaining edge."""
+    if pool_key is None and expected_service_hash is not None:
+        return remove_reserved_fill_claim_set(
+            service_name,
+            expected_service_hash=expected_service_hash,
+            expected_controller_owner=expected_controller_owner)
+    engine = _db_manager.get_engine()
+    _require_reserved_fill_v2_postgresql(engine)
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        protocol = _reserved_fill_protocol_row_in_session(session,
+                                                          engine,
+                                                          for_update=True)
+        if int(protocol.protocol_version) != RESERVED_FILL_PROTOCOL_V2:
+            session.rollback()
+            return False
+        if expected_service_hash is not None and not _lock_service_owner_in_session(
+                session,
+                service_name,
+                expected_service_hash,
+                expected_controller_owner,
+                require_launch_allowed=False):
+            session.rollback()
+            return False
+        set_row = session.execute(
+            sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.service_name ==
+                service_name).with_for_update()).fetchone()
+        if (set_row is None or set_row.claim_set_state
+                != RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 or
+            (expected_service_generation is not None and
+             int(set_row.generation) != expected_service_generation)):
+            session.rollback()
+            return False
+        if int(set_row.generation) > int(protocol.claim_generation):
+            raise RuntimeError('Reserved-fill claim-set generation exceeds '
+                               'the global generation fence.')
+        if pool_key is None:
+            session.execute(
+                sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                    reserved_fill_pool_claims_table.c.service_name ==
+                    service_name))
+            session.execute(
+                sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
+                    reserved_fill_service_claim_sets_table.c.service_name ==
+                    service_name))
+            _write_reserved_fill_legacy_projection_in_session(
+                session, engine, service_name, None)
+            session.commit()
+            return True
+        rows = session.execute(
+            sqlalchemy.select(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name ==
+                service_name).order_by(
+                    reserved_fill_pool_claims_table.c.pool_position,
+                    reserved_fill_pool_claims_table.c.pool_key).with_for_update(
+                    )).fetchall()
+        edges = [
+            dict(row._mapping)  # pylint: disable=protected-access
+            for row in rows
+        ]
+        if not any(edge['pool_key'] == pool_key for edge in edges):
+            session.rollback()
+            return False
+        remaining = [edge for edge in edges if edge['pool_key'] != pool_key]
+        if not remaining:
+            session.execute(
+                sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                    reserved_fill_pool_claims_table.c.service_name ==
+                    service_name))
+            session.execute(
+                sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
+                    reserved_fill_service_claim_sets_table.c.service_name ==
+                    service_name))
+            _write_reserved_fill_legacy_projection_in_session(
+                session, engine, service_name, None)
+            session.commit()
+            return True
+        generation = _next_reserved_fill_claim_generation_in_session(
+            session, protocol)
+        session.execute(
+            sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name == service_name,
+                reserved_fill_pool_claims_table.c.pool_key == pool_key))
+        session.execute(
+            sqlalchemy.update(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name ==
+                service_name).values(service_generation=generation))
+        invalidated_hash = f'reconciled:{generation}'
+        session.execute(
+            sqlalchemy.update(reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.service_name ==
+                service_name).values(generation=generation,
+                                     edge_count=len(remaining),
+                                     semantic_hash=invalidated_hash))
+        remaining[0]['service_generation'] = generation
+        _write_reserved_fill_legacy_projection_in_session(
+            session, engine, service_name, remaining[0])
+        session.commit()
+    return True
+
+
+def prune_authoritative_reserved_fill_claim_sets(
+        expired_before: float) -> list[str]:
+    """Delete expired authoritative sets and their rollback projections."""
+    engine = _db_manager.get_engine()
+    _require_reserved_fill_v2_postgresql(engine)
+    with orm.Session(engine) as session:
+        _begin_immediate_if_sqlite(session, engine)
+        rows = session.execute(
+            sqlalchemy.select(
+                reserved_fill_service_claim_sets_table.c.service_name).where(
+                    reserved_fill_service_claim_sets_table.c.claim_set_state ==
+                    RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2,
+                    reserved_fill_service_claim_sets_table.c.heartbeat_ts
+                    < expired_before).with_for_update()).fetchall()
+        names = [str(row[0]) for row in rows]
+        if names:
+            session.execute(
+                sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                    reserved_fill_pool_claims_table.c.service_name.in_(names)))
+            session.execute(
+                sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
+                    reserved_fill_service_claim_sets_table.c.service_name.in_(
+                        names),
+                    reserved_fill_service_claim_sets_table.c.heartbeat_ts
+                    < expired_before))
+            session.execute(
+                sqlalchemy.delete(reserved_fill_claims_table).where(
+                    reserved_fill_claims_table.c.service_name.in_(names)))
+        session.commit()
+    return names
+
+
+def remove_authoritative_reserved_fill_claims_for_pool(
+        pool_key: str) -> list[tuple[str, str]]:
+    """Remove every authoritative edge on one pool under the caller's lock."""
+    claims = get_authoritative_reserved_fill_claims(pool_key=pool_key)
+    removed: list[tuple[str, str]] = []
+    for claim in claims:
+        service_name = str(claim['service_name'])
+        if remove_authoritative_reserved_fill_claim(
+                service_name,
+                pool_key,
+                expected_service_generation=int(claim['service_generation'])):
+            removed.append((service_name, pool_key))
+    return removed
+
+
+def prune_authoritative_reserved_fill_claims(
+        expired_before: float) -> list[str]:
+    """Compatibility name for pruning complete expired v2 claim sets."""
+    return prune_authoritative_reserved_fill_claim_sets(expired_before)
+
+
 def upsert_reserved_fill_claim(
     service_name: str,
     *,
@@ -5350,6 +6431,42 @@ def upsert_demand_capacity_observation(
         session.commit()
 
 
+def advance_reserved_fill_persist_token(lock_connection: Any) -> int | None:
+    """Advance the global lease epoch before one fill-row persist.
+
+    PostgreSQL callers pass the DBAPI session that owns the broker advisory
+    lock.  If that session dies after this commit, a replacement round advances
+    the same epoch before scanning replicas.  The stale persist transaction
+    therefore either validates and locks this exact token before the replacement
+    (so its row commits before the replacement scan), or observes the
+    replacement token and fails closed.
+
+    The persist does not refresh ``expires_at``: only a driven broker round is a
+    lease heartbeat.  ``None`` means the int4 epoch is malformed or exhausted.
+    """
+    max_epoch = 2**31 - 1
+    cursor = lock_connection.cursor()
+    try:
+        cursor.execute(
+            'INSERT INTO reserved_fill_lease (id, epoch, expires_at) '
+            'VALUES (1, 1, NULL) '
+            'ON CONFLICT (id) DO UPDATE SET epoch = '
+            'reserved_fill_lease.epoch + 1 '
+            'WHERE reserved_fill_lease.epoch >= 0 '
+            'AND reserved_fill_lease.epoch < %s RETURNING epoch', (max_epoch,))
+        result = cursor.fetchone()
+        lock_connection.commit()
+    except BaseException:
+        lock_connection.rollback()
+        raise
+    finally:
+        cursor.close()
+    if result is None:
+        return None
+    token = int(result[0])
+    return token if token > 0 else None
+
+
 def acquire_reserved_fill_lease_token(
         *, now: float, expires_at: float) -> tuple[int, bool] | None:
     """Reads, expiry-checks and CAS-advances the global lease atomically.
@@ -5430,23 +6547,27 @@ def acquire_reserved_fill_lease_token(
     return token, lease_expired
 
 
-def publish_reserved_fill_round(pool_key: str,
-                                *,
-                                round_id: int,
-                                snapshot_time: float,
-                                epoch: int,
-                                grants: str,
-                                feeds: str,
-                                raw_grants: str,
-                                feed_state: str,
-                                sum_holdings: int,
-                                last_observed_free: int | None,
-                                last_observed_free_ts: float | None,
-                                phantom_streak: int,
-                                shrink_baseline: int | None,
-                                lease_token: int,
-                                lease_expires_at: float,
-                                utilization_state: str | None = None) -> bool:
+def publish_reserved_fill_round(
+        pool_key: str,
+        *,
+        round_id: int,
+        snapshot_time: float,
+        epoch: int,
+        grants: str,
+        feeds: str,
+        raw_grants: str,
+        feed_state: str,
+        sum_holdings: int,
+        last_observed_free: int | None,
+        last_observed_free_ts: float | None,
+        phantom_streak: int,
+        shrink_baseline: int | None,
+        lease_token: int,
+        lease_expires_at: float,
+        utilization_state: str | None = None,
+        protocol_version: int = RESERVED_FILL_PROTOCOL_V1,
+        claim_generations: dict[str, int] | str | None = None,
+        feed_by_accelerator: str | None = None) -> bool:
     """Publishes a round iff the lease still holds the writer's token.
 
     `epoch` is the POOL's fencing epoch, stored on the round row (per-pool:
@@ -5474,6 +6595,12 @@ def publish_reserved_fill_round(pool_key: str,
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        protocol = _reserved_fill_protocol_row_in_session(session,
+                                                          engine,
+                                                          for_update=True)
+        if int(protocol.protocol_version) != protocol_version:
+            session.rollback()
+            return False
         count = session.query(reserved_fill_lease_table).filter(
             reserved_fill_lease_table.c.id == 1,
             reserved_fill_lease_table.c.epoch == lease_token).update({
@@ -5487,8 +6614,11 @@ def publish_reserved_fill_round(pool_key: str,
             'round_id': round_id,
             'snapshot_time': snapshot_time,
             'epoch': epoch,
+            'protocol_version': protocol_version,
+            'claim_generations': _reserved_fill_json(claim_generations or {}),
             'grants': grants,
             'feeds': feeds,
+            'feed_by_accelerator': feed_by_accelerator,
             'raw_grants': raw_grants,
             'feed_state': feed_state,
             'sum_holdings': sum_holdings,
@@ -5532,6 +6662,57 @@ def _is_sqlite_busy_error(error: sqlalchemy_exc.OperationalError) -> bool:
     return 'locked' in message or 'busy' in message
 
 
+def _reserved_fill_pool_key_protocol(pool_key: Any) -> int | None:
+    """Strictly identify the protocol embedded in one broker pool key."""
+    if not isinstance(pool_key, str) or not pool_key:
+        return None
+    try:
+        decoded = json.loads(pool_key)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, list):
+        return None
+    if (len(decoded) == 2 and isinstance(decoded[0], str) and decoded[0]):
+        protocol_version = RESERVED_FILL_PROTOCOL_V1
+        encoded_names = decoded[1]
+    elif (len(decoded) == 3 and decoded[0] == 'v2' and
+          isinstance(decoded[1], str) and decoded[1]):
+        protocol_version = RESERVED_FILL_PROTOCOL_V2
+        encoded_names = decoded[2]
+    else:
+        return None
+    if isinstance(encoded_names, str):
+        names = (encoded_names,)
+    elif isinstance(encoded_names, list):
+        names = tuple(encoded_names)
+    else:
+        return None
+    if not names or not all(isinstance(name, str) and name for name in names):
+        return None
+    return protocol_version
+
+
+def _reserved_fill_replica_row_values(
+        service_name: str, replica_id: int,
+        replica_info: 'replica_managers.ReplicaInfo', *, pool_key: str,
+        expected_protocol_version: int) -> dict[str, Any] | None:
+    """Build a row only for exact, protocol-attributed fill provenance."""
+    if getattr(replica_info, 'reserved_fill', None) is not True:
+        return None
+    persisted_pool_key = getattr(replica_info, 'reserved_fill_pool_key', None)
+    if (persisted_pool_key != pool_key or
+            _reserved_fill_pool_key_protocol(persisted_pool_key)
+            != expected_protocol_version):
+        return None
+    row_values = _replica_row_values(service_name, replica_id, replica_info)
+    replica_state = row_values.get('replica_state')
+    if (not isinstance(replica_state, dict) or
+            replica_state.get('reserved_fill') is not True or
+            replica_state.get('reserved_fill_pool_key') != pool_key):
+        return None
+    return row_values
+
+
 def add_replica_if_round_epoch(
     service_name: str,
     replica_id: int,
@@ -5540,66 +6721,57 @@ def add_replica_if_round_epoch(
     pool_key: str,
     expected_epoch: int,
     expected_service_hash: str | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    expected_protocol_version: int = RESERVED_FILL_PROTOCOL_V1,
+    expected_service_generation: int | None = None,
+    expected_physical_cluster_uid: str | None = None,
+    expected_lease_token: int | None = None,
 ) -> bool:
-    """Persists a fill replica row iff the launch's allocation is current.
+    """Persist a fill row iff every protocol, set, claim, and round fence holds.
 
-    Three predicates, all evaluated atomically with the row insert:
-
-    - Round epoch: the launch path's cheap epoch pre-check is TOCTOU (a
-      broker round can publish a new epoch between that check and the row
-      persist, making a stale fill launch durable against capacity
-      already re-fed to a peer), so the recheck is atomic with the
-      persist. A missing round row fails open (persists), mirroring the
-      pre-check: no broker ever ran, there is no newer allocation to
-      defer to.
-    - fence_pending fails CLOSED: the marker means every grant issued
-      before a lease-dead gap is suspect, and only an epoch-bumping
-      publish may clear it. Without this predicate a pool whose marker
-      can never be cleared (its claims are gone, so no round is ever
-      published) would let a stalled controller's pre-gap decision pass
-      the epoch check indefinitely.
-    - Live same-pool claim: the launching service must still hold a claim
-      on this pool. A disabled/pruned/moved claimant's queued fill launch
-      would otherwise start against a slot the broker no longer
-      attributes to it (its rows only count as unclaimed occupancy in the
-      round debit -- see _occupying_debit).
-
-    The atomicity needs a dialect split:
-
-    - PostgreSQL: the round and claim rows are read FOR SHARE in the
-      insert's transaction, blocking concurrent round/claim UPDATEs until
-      commit, so neither predicate can move between the read and the
-      insert.
-    - sqlite: FOR SHARE is a no-op AND the legacy sqlite3 transaction mode
-      does not even open a transaction for the SELECT, so the two-statement
-      shape keeps the exact read/publish/insert interleaving it was meant
-      to close (or, under WAL snapshot upgrades, aborts with a BUSY error
-      instead of fencing). Chosen shape: ONE conditional statement --
-      INSERT ... SELECT literals WHERE NOT EXISTS(round with a DIFFERENT
-      epoch or a pending fence) AND EXISTS(live same-pool claim) --
-      because a single DML statement is atomic under sqlite's writer lock
-      by construction: the predicates are evaluated inside the very
-      statement that writes the row, leaving no window at all and no
-      BEGIN IMMEDIATE/busy-handshake choreography to maintain. rowcount 0
-      means a fence held (nothing written). SQLITE_BUSY-family errors
-      (another writer holding the lock past the busy timeout) are retried
-      a few times and then degrade into a fence-skip: the launch is simply
-      re-emitted on a later tick, exactly like a fenced pre-check.
-
-    Callers must additionally serialize this persist against broker
-    rounds via the cross-process broker lock (see
-    reserved_capacity_broker.persist_fill_replica): the epoch predicate
-    alone cannot see a round that has finished its debit scan but not yet
-    published.
-
-    Returns whether the row was persisted; False = a predicate failed (or
-    sqlite stayed busy), nothing was written, the caller must skip the
-    launch exactly like a fenced pre-check.
+    Callers additionally take the global broker lock.  PostgreSQL production
+    callers advance the global lease epoch on that exact advisory-lock session
+    and pass ``expected_lease_token``; this transaction locks and validates the
+    token, closing silent advisory-session loss around a round's scan-to-publish
+    window.  In v2, the service generation is the cross-pool fence: any budget
+    repartition invalidates queued decisions from every edge before this insert
+    can land.
     """
+    if expected_protocol_version not in (RESERVED_FILL_PROTOCOL_V1,
+                                         RESERVED_FILL_PROTOCOL_V2):
+        raise ValueError('Expected reserved-fill protocol must be 1 or 2.')
+    if (expected_lease_token is not None and
+        (isinstance(expected_lease_token, bool) or
+         not isinstance(expected_lease_token, int) or
+         expected_lease_token <= 0)):
+        raise ValueError(
+            'Expected reserved-fill lease token must be a positive '
+            'integer.')
     engine = _db_manager.get_engine()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.SQLITE.value:
+        # A PostgreSQL fill persist is safe only when its caller minted the
+        # token on the exact session holding the advisory broker lock.  Lock
+        # auto-detection deliberately has a FileLock fallback, so enforcing
+        # this at the transaction boundary is essential: a transient
+        # detection failure must not turn a production persist into the
+        # historical tokenless SQLite path.
+        if expected_lease_token is None:
+            return False
         with orm.Session(engine) as session:
+            protocol = _reserved_fill_protocol_row_in_session(session,
+                                                              engine,
+                                                              for_update=True)
+            if int(protocol.protocol_version) != expected_protocol_version:
+                session.rollback()
+                return False
+            if expected_lease_token is not None:
+                lease = session.execute(
+                    sqlalchemy.select(reserved_fill_lease_table.c.epoch).where(
+                        reserved_fill_lease_table.c.id ==
+                        1).with_for_update()).fetchone()
+                if (lease is None or int(lease.epoch) != expected_lease_token):
+                    session.rollback()
+                    return False
             _lifecycle_epoch_matches_in_session(session, service_name, None)
             owner = session.execute(
                 sqlalchemy.select(
@@ -5616,41 +6788,120 @@ def add_replica_if_round_epoch(
             row = session.execute(
                 sqlalchemy.select(
                     reserved_fill_rounds_table.c.epoch,
-                    reserved_fill_rounds_table.c.fence_pending).where(
+                    reserved_fill_rounds_table.c.fence_pending,
+                    reserved_fill_rounds_table.c.protocol_version,
+                    reserved_fill_rounds_table.c.claim_generations).where(
                         reserved_fill_rounds_table.c.pool_key ==
                         pool_key).with_for_update(read=True)).fetchone()
-            if row is not None and (int(row[0]) != expected_epoch or
-                                    bool(row[1])):
+            if (row is not None and
+                (int(row.epoch) != expected_epoch or bool(row.fence_pending) or
+                 int(row.protocol_version) != expected_protocol_version)):
                 session.rollback()
                 return False
-            claim = session.execute(
-                sqlalchemy.select(reserved_fill_claims_table.c.service_name).
-                where(reserved_fill_claims_table.c.service_name == service_name,
-                      reserved_fill_claims_table.c.pool_key ==
-                      pool_key).with_for_update(read=True)).fetchone()
-            if claim is None:
+            if expected_protocol_version == RESERVED_FILL_PROTOCOL_V1:
+                # Preserve the v1 missing-round behavior: the carried protocol
+                # still fences activation, and no v2 decision can use it.
+                claim = session.execute(
+                    sqlalchemy.select(
+                        reserved_fill_claims_table.c.service_name).where(
+                            reserved_fill_claims_table.c.service_name ==
+                            service_name, reserved_fill_claims_table.c.pool_key
+                            == pool_key).with_for_update(read=True)).fetchone()
+                if claim is None:
+                    session.rollback()
+                    return False
+            else:
+                if (row is None or expected_service_generation is None or
+                        expected_service_generation <= 0 or
+                        not expected_physical_cluster_uid):
+                    session.rollback()
+                    return False
+                try:
+                    round_generations = json.loads(row.claim_generations or
+                                                   '{}')
+                except (TypeError, ValueError):
+                    session.rollback()
+                    return False
+                if (round_generations.get(service_name)
+                        != expected_service_generation):
+                    session.rollback()
+                    return False
+                set_row = session.execute(
+                    sqlalchemy.select(reserved_fill_service_claim_sets_table).
+                    where(reserved_fill_service_claim_sets_table.c.service_name
+                          == service_name).with_for_update(
+                              read=True)).fetchone()
+                edge_rows = session.execute(
+                    sqlalchemy.select(reserved_fill_pool_claims_table).where(
+                        reserved_fill_pool_claims_table.c.service_name ==
+                        service_name).with_for_update(read=True)).fetchall()
+                matching = next(
+                    (edge for edge in edge_rows if edge.pool_key == pool_key),
+                    None)
+                if (set_row is None or set_row.claim_set_state
+                        != RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 or
+                        int(set_row.generation) != expected_service_generation
+                        or int(set_row.generation) > int(
+                            protocol.claim_generation) or
+                        len(edge_rows) != int(set_row.edge_count) or any(
+                            int(edge.service_generation) !=
+                            expected_service_generation
+                            for edge in edge_rows) or matching is None or
+                        matching.physical_cluster_uid
+                        != expected_physical_cluster_uid or getattr(
+                            replica_info, 'reserved_fill_service_generation',
+                            None) != expected_service_generation or
+                        getattr(replica_info,
+                                'reserved_fill_physical_cluster_uid',
+                                None) != expected_physical_cluster_uid):
+                    session.rollback()
+                    return False
+            row_values = _reserved_fill_replica_row_values(
+                service_name,
+                replica_id,
+                replica_info,
+                pool_key=pool_key,
+                expected_protocol_version=expected_protocol_version)
+            if row_values is None:
                 session.rollback()
                 return False
-            row_values = _replica_row_values(service_name, replica_id,
-                                             replica_info)
             insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
                 **row_values)
             session.execute(insert_stmt)
             session.commit()
         return True
-    # sqlite: every fence predicate is the WHERE clause of the insert
-    # itself.
-    row_values = _replica_row_values(service_name, replica_id, replica_info)
+    # Protocol v2 belongs to the PostgreSQL central state path.  Keep v1's
+    # historical single-statement SQLite fence for local controllers.
+    if expected_protocol_version != RESERVED_FILL_PROTOCOL_V1:
+        return False
+    with orm.Session(engine) as session:
+        _reserved_fill_protocol_row_in_session(session, engine)
+        session.commit()
+    row_values = _reserved_fill_replica_row_values(
+        service_name,
+        replica_id,
+        replica_info,
+        pool_key=pool_key,
+        expected_protocol_version=expected_protocol_version)
+    if row_values is None:
+        return False
     stale_round = sqlalchemy.select(
         reserved_fill_rounds_table.c.pool_key).where(
             reserved_fill_rounds_table.c.pool_key == pool_key,
-            sqlalchemy.or_(reserved_fill_rounds_table.c.epoch != expected_epoch,
-                           reserved_fill_rounds_table.c.fence_pending
-                           != 0)).exists()
+            sqlalchemy.or_(
+                reserved_fill_rounds_table.c.epoch != expected_epoch,
+                reserved_fill_rounds_table.c.fence_pending != 0,
+                reserved_fill_rounds_table.c.protocol_version
+                != expected_protocol_version)).exists()
     live_claim = sqlalchemy.select(
         reserved_fill_claims_table.c.service_name).where(
             reserved_fill_claims_table.c.service_name == service_name,
             reserved_fill_claims_table.c.pool_key == pool_key).exists()
+    current_protocol = sqlalchemy.select(
+        reserved_fill_protocol_state_table.c.id).where(
+            reserved_fill_protocol_state_table.c.id == 1,
+            reserved_fill_protocol_state_table.c.protocol_version ==
+            expected_protocol_version).exists()
     current_incarnation = sqlalchemy.true()
     if expected_service_hash is not None:
         owner_predicates = [
@@ -5669,7 +6920,8 @@ def add_replica_if_round_epoch(
     select_stmt = sqlalchemy.select(*[
         sqlalchemy.literal(row_values[column.name], type_=column.type)
         for column in columns
-    ]).where(sqlalchemy.not_(stale_round), live_claim, current_incarnation)
+    ]).where(sqlalchemy.not_(stale_round), live_claim, current_protocol,
+             current_incarnation)
     insert_stmt = sqlite.insert(replicas_table).from_select(
         [column.name for column in columns], select_stmt)
     for attempt in range(_SQLITE_FENCE_BUSY_RETRIES):

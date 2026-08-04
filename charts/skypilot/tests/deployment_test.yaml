@@ -206,12 +206,30 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
             value: /root/.sky/api-request-cutover.json
+
+  - it: should default the quiescence guard false for legacy reused values
+    set:
+      # Helm --reuse-values can supply an old coalesced requestStore object
+      # that predates this field. Null exercises the same missing-value path.
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: null
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "false"
 
   - it: should enable the PostgreSQL request store for one compatibility pod
     set:
       requestStore.backend: postgres
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
       apiService.dbConnectionSecretName: external-db
     asserts:
       - contains:
@@ -219,6 +237,11 @@ tests:
           content:
             name: SKYPILOT_API_REQUEST_BACKEND
             value: postgres
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "true"
 
   - it: should render stateless API replicas for role-split HA
     set:
@@ -448,6 +471,22 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: 'environment variable "SKYPILOT_API_REQUEST_BACKEND" is duplicated or reserved by the chart'
+
+  - it: should reject quiescence enforcement with the SQLite request store
+    set:
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.enforceBuiltinExecutionQuiescenceBackends=true requires requestStore.backend=postgres"
+
+  - it: should reject an environment override of the quiescence backend guard
+    set:
+      apiService.extraEnvs:
+        - name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+          value: "true"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" is duplicated or reserved by the chart'
 
   - it: should use RollingUpdate strategy when configured with external database via secret
     set:
@@ -742,11 +781,17 @@ tests:
           path: metadata.name
           value: custom-fullname-api-server
       - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+      - equal:
           path: spec.selector.matchLabels.app
           value: custom-fullname-api
       - equal:
           path: spec.template.metadata.labels.app
           value: custom-fullname-api
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -1725,10 +1770,11 @@ tests:
             name: SOME_OTHER_ENV
             value: "x"
       # The four HA role and identity variables extend the prior baseline.
-      # A duplicate POD_IP would push the count to 19.
+      # The chart-owned quiescence guard extends the baseline by one.
+      # A duplicate POD_IP would push the count to 20.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 18
+          count: 19
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -1739,10 +1785,11 @@ tests:
               fieldPath: status.podIP
     asserts:
       # The four HA role and identity variables extend the prior baseline.
-      # A duplicate POD_IP would push the count to 18.
+      # The chart-owned quiescence guard extends the baseline by one.
+      # A duplicate POD_IP would push the count to 19.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 17
+          count: 18
 
   - it: should allow custom GCP workload identity env when native credentials are disabled
     set:

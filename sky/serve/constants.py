@@ -634,6 +634,17 @@ RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY = '_reserved_fill_grant_epoch'
 # round epoch -- a global comparison would let pool A's grant churn fence
 # pool B's unrelated fill launches.
 RESERVED_FILL_POOL_KEY_OVERRIDE_KEY = '_reserved_fill_pool_key'
+# Internal protocol-v2 launch fences. These values are consumed by the
+# replica manager before Resources.copy(): they must never reach a provider
+# request.
+RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY = (
+    '_reserved_fill_protocol_version')
+RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY = (
+    '_reserved_fill_service_generation')
+RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY = (
+    '_reserved_fill_physical_cluster_uid')
+RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY = (
+    '_reserved_fill_allowed_locations')
 
 # Internal resources_override marker for a cost-rebalance launch.  The value is
 # the incumbent replica id.  ReplicaManager consumes it before sky.launch and

@@ -23,7 +23,10 @@ def test_serve_state_schema_uses_one_metadata_graph():
         'replicas',
         'reserved_fill_claims',
         'reserved_fill_lease',
+        'reserved_fill_pool_claims',
+        'reserved_fill_protocol_state',
         'reserved_fill_rounds',
+        'reserved_fill_service_claim_sets',
         'serve_ha_recovery_script',
         'service_lifecycle_fences',
         'services',
@@ -38,7 +41,10 @@ def test_serve_state_schema_uses_one_metadata_graph():
         serve_state.replicas_table,
         serve_state.reserved_fill_claims_table,
         serve_state.reserved_fill_lease_table,
+        serve_state.reserved_fill_pool_claims_table,
+        serve_state.reserved_fill_protocol_state_table,
         serve_state.reserved_fill_rounds_table,
+        serve_state.reserved_fill_service_claim_sets_table,
         serve_state.serve_ha_recovery_script_table,
         serve_state.service_lifecycle_fences_table,
         serve_state.services_table,
@@ -55,6 +61,46 @@ def test_serve_state_schema_uses_one_metadata_graph():
         'serve_resource_action_shadow_samples',
         'serve_resource_action_shadow_attempts',
     } & set(serve_state.Base.metadata.tables))
+
+
+def test_reserved_fill_protocol_owns_global_claim_generation():
+    generation = (
+        serve_state.reserved_fill_protocol_state_table.c.claim_generation)
+    assert isinstance(generation.type, sqlalchemy.BigInteger)
+    assert not generation.nullable
+    assert str(generation.server_default.arg) == '0'
+
+
+def test_reserved_fill_round_persists_optional_exact_card_feed():
+    column = serve_state.reserved_fill_rounds_table.c.feed_by_accelerator
+    assert isinstance(column.type, sqlalchemy.Text)
+    # NULL distinguishes rounds written before exact-card telemetry from a
+    # present empty allocation, which authorizes no shaped launch.
+    assert column.nullable
+    assert column.server_default is None
+
+
+def test_reserved_fill_protocol_persists_rollout_inventory_evidence():
+    protocol = serve_state.reserved_fill_protocol_state_table.c
+    assert isinstance(protocol.deployment_uid.type, sqlalchemy.Text)
+    assert isinstance(protocol.pod_inventory_count.type, sqlalchemy.Integer)
+    assert isinstance(protocol.pod_inventory_sha256.type, sqlalchemy.Text)
+    assert protocol.deployment_uid.nullable
+    assert protocol.pod_inventory_count.nullable
+    assert protocol.pod_inventory_sha256.nullable
+    constraint_names = {
+        constraint.name for constraint in
+        serve_state.reserved_fill_protocol_state_table.constraints
+    }
+    assert {
+        'ck_reserved_fill_protocol_proof_all_or_none',
+        'ck_reserved_fill_protocol_v2_has_proof',
+        'ck_reserved_fill_protocol_image_digest',
+        'ck_reserved_fill_protocol_deployment_generation',
+        'ck_reserved_fill_protocol_deployment_uid',
+        'ck_reserved_fill_protocol_pod_inventory_count',
+        'ck_reserved_fill_protocol_pod_inventory_sha256',
+    } <= constraint_names
 
 
 def test_resource_action_existing_table_columns_are_dialect_portable():

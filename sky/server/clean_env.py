@@ -43,6 +43,14 @@ def set_clean_server_env(env: dict[str, str]) -> None:
         _clean_server_env = dict(env)
 
 
+def restore_clean_server_env(env: dict[str, str]) -> None:
+    """Replace a fresh worker's live env and adopt the clean snapshot."""
+    global _clean_server_env
+    os.environ.clear()
+    os.environ.update(env)
+    _clean_server_env = dict(env)
+
+
 def get_clean_server_env() -> dict[str, str] | None:
     """Return a copy of the server's pre-request-pollution env, or None.
 

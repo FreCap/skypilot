@@ -298,7 +298,7 @@ def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
                                          migration_utils.SERVE_VERSION)
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '034'
+        engine, migration_utils.SERVE_DB_NAME) == '035'
 
     inspector = sqlalchemy.inspect(engine)
     assert {
@@ -451,7 +451,7 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
     with pytest.raises(RuntimeError, match='additive and cannot be downgraded'):
         alembic_command.downgrade(config, '031')
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '034'
+        engine, migration_utils.SERVE_DB_NAME) == '035'
 
 
 def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
@@ -487,7 +487,7 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
                            match='additive and cannot be downgraded'):
             alembic_command.downgrade(config, '031')
         assert migration_utils.get_current_alembic_revision(
-            engine, migration_utils.SERVE_DB_NAME) == '034'
+            engine, migration_utils.SERVE_DB_NAME) == '035'
     finally:
         engine.dispose()
 
@@ -566,22 +566,29 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
             waiter_ttl_seconds=60.0,
             expected_controller_owner=None)
 
+    fill_pool_key = '["test-context","a100"]'
     with orm.Session(engine) as session:
         session.execute(serve_state.reserved_fill_claims_table.insert().values(
             service_name='svc',
-            pool_key='test-fill-pool',
+            pool_key=fill_pool_key,
             weight=1,
             floor_replicas=1,
             gpus_per_replica=1,
             holdings_fill=1,
             heartbeat_ts=100.0))
+        session.execute(serve_state.reserved_fill_lease_table.insert().values(
+            id=1, epoch=1))
         session.commit()
+    duplicate_fill_replica = _replica(4, version=2)
+    duplicate_fill_replica.reserved_fill = True
+    duplicate_fill_replica.reserved_fill_pool_key = fill_pool_key
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         serve_state.add_replica_if_round_epoch('svc',
                                                4,
-                                               _replica(4, version=2),
-                                               pool_key='test-fill-pool',
-                                               expected_epoch=1)
+                                               duplicate_fill_replica,
+                                               pool_key=fill_pool_key,
+                                               expected_epoch=1,
+                                               expected_lease_token=1)
 
     with orm.Session(engine) as session:
         rows = session.execute(

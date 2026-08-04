@@ -293,6 +293,12 @@ REQUEST_COLUMNS = [
     COL_IGNORE_RETURN_VALUE,
     COL_RETRYABLE,
 ]
+REQUEST_QUERY_FIELDS = frozenset(REQUEST_COLUMNS) | frozenset({
+    'execution_generation',
+    'execution_quiescence_required',
+    'execution_quiesced_generation',
+    'execution_quiesced_at',
+})
 
 
 class ScheduleType(enum.Enum):
@@ -350,6 +356,9 @@ class Request:
     heartbeat_at: float | None = None
     cancel_requested_at: float | None = None
     cancel_acknowledged_at: float | None = None
+    execution_quiescence_required: bool = False
+    execution_quiesced_generation: int | None = None
+    execution_quiesced_at: float | None = None
     interrupted_reason: str | None = None
     # PostgreSQL-only, server-owned context for actor-aware operational
     # events. It is intentionally absent from the client RequestPayload and
@@ -453,6 +462,11 @@ class Request:
             'heartbeat_at': self.heartbeat_at,
             'cancel_requested_at': self.cancel_requested_at,
             'cancel_acknowledged_at': self.cancel_acknowledged_at,
+            'execution_quiescence_required':
+                (self.execution_quiescence_required),
+            'execution_quiesced_generation':
+                (self.execution_quiesced_generation),
+            'execution_quiesced_at': self.execution_quiesced_at,
             'interrupted_reason': self.interrupted_reason,
             'event_context': self.event_context,
         }
@@ -514,6 +528,13 @@ class Request:
             heartbeat_at=values.get('heartbeat_at'),
             cancel_requested_at=values.get('cancel_requested_at'),
             cancel_acknowledged_at=values.get('cancel_acknowledged_at'),
+            execution_quiescence_required=bool(
+                values.get('execution_quiescence_required', False)),
+            execution_quiesced_generation=(
+                int(values['execution_quiesced_generation'])
+                if values.get('execution_quiesced_generation') is not None else
+                None),
+            execution_quiesced_at=values.get('execution_quiesced_at'),
             interrupted_reason=values.get('interrupted_reason'),
             event_context=values.get('event_context'),
         )
@@ -1539,6 +1560,8 @@ class RequestTaskFilter:
 
     Args:
         status: a list of statuses of the requests to filter on.
+        request_ids: exact request IDs to filter on. Unlike the legacy status
+            endpoint's request-ID matching, these are not prefixes.
         cluster_names: a list of cluster names to filter requests on.
         exclude_request_names: a list of request names to exclude from results.
             Mutually exclusive with include_request_names.
@@ -1557,6 +1580,10 @@ class RequestTaskFilter:
         retention_safe: internal GC guard that excludes correlated requests
             until their exact resource-action attempt is settled. PostgreSQL
             enforces this; SQLite has no central resource-action correlation.
+        execution_quiescence_candidates_only: include active rows plus
+            terminal rows governed by the API008 execution-quiescence
+            contract. Used with ``cluster_names`` for bounded cancellation
+            barriers.
         limit: the number of requests to show. If None, show all requests.
 
     Raises:
@@ -1564,6 +1591,7 @@ class RequestTaskFilter:
             provided.
     """
     status: list[RequestStatus] | None = None
+    request_ids: list[str] | None = None
     cluster_names: list[str] | None = None
     user_id: str | None = None
     exclude_request_names: list[str] | None = None
@@ -1572,6 +1600,7 @@ class RequestTaskFilter:
     include_missing_finished_at: bool = False
     finished_after: float | None = None
     retention_safe: bool = False
+    execution_quiescence_candidates_only: bool = False
     limit: int | None = None
     fields: list[str] | None = None
     sort: bool = False
@@ -1582,6 +1611,15 @@ class RequestTaskFilter:
             raise ValueError(
                 'Only one of exclude_request_names or include_request_names '
                 'can be provided, not both.')
+        if self.fields is not None:
+            invalid_fields = set(self.fields) - REQUEST_QUERY_FIELDS
+            if invalid_fields:
+                raise ValueError('Unsupported request status fields: '
+                                 f'{sorted(invalid_fields)}')
+        if (self.limit is not None and
+            (not isinstance(self.limit, int) or isinstance(self.limit, bool) or
+             self.limit < 0)):
+            raise ValueError('Request status limit must be a non-negative int.')
 
     def build_query(self) -> tuple[str, list[Any]]:
         """Build the SQL query and filter parameters.
@@ -1592,39 +1630,62 @@ class RequestTaskFilter:
         filters = []
         filter_params: list[Any] = []
         if self.status is not None:
-            status_list_str = ','.join(
-                repr(status.value) for status in self.status)
-            filters.append(f'status IN ({status_list_str})')
+            if not self.status:
+                filters.append('1=0')
+            else:
+                placeholders = ','.join('?' for _ in self.status)
+                filters.append(f'status IN ({placeholders})')
+                filter_params.extend(status.value for status in self.status)
+        if self.request_ids is not None:
+            if len(self.request_ids) == 0:
+                # Empty IN () is invalid SQL. An empty list matches nothing.
+                filters.append('1=0')
+            else:
+                placeholders = ','.join('?' for _ in self.request_ids)
+                filters.append(f'request_id IN ({placeholders})')
+                filter_params.extend(self.request_ids)
+        if self.execution_quiescence_candidates_only:
+            active_statuses = RequestStatus.active_statuses()
+            placeholders = ','.join('?' for _ in active_statuses)
+            # SQLite has no API008 durable execution metadata. Its candidate
+            # set therefore contains active rows only.
+            filters.append(f'status IN ({placeholders})')
+            filter_params.extend(status.value for status in active_statuses)
         if self.include_request_names is not None:
-            request_names_str = ','.join(
-                repr(name) for name in self.include_request_names)
-            filters.append(f'name IN ({request_names_str})')
+            if not self.include_request_names:
+                filters.append('1=0')
+            else:
+                placeholders = ','.join('?' for _ in self.include_request_names)
+                filters.append(f'name IN ({placeholders})')
+                filter_params.extend(self.include_request_names)
         if self.exclude_request_names is not None:
-            exclude_request_names_str = ','.join(
-                repr(name) for name in self.exclude_request_names)
-            filters.append(f'name NOT IN ({exclude_request_names_str})')
+            if self.exclude_request_names:
+                placeholders = ','.join('?' for _ in self.exclude_request_names)
+                filters.append(f'name NOT IN ({placeholders})')
+                filter_params.extend(self.exclude_request_names)
         if self.cluster_names is not None:
             if len(self.cluster_names) == 0:
                 # Empty IN () is invalid SQL in PostgreSQL.
                 # An empty list means "match nothing".
                 filters.append('1=0')
             else:
-                cluster_names_str = ','.join(
-                    repr(name) for name in self.cluster_names)
-                filters.append(f'{COL_CLUSTER_NAME} IN ({cluster_names_str})')
+                placeholders = ','.join('?' for _ in self.cluster_names)
+                filters.append(f'{COL_CLUSTER_NAME} IN ({placeholders})')
+                filter_params.extend(self.cluster_names)
         if self.user_id is not None:
             filters.append(f'{COL_USER_ID} = ?')
             filter_params.append(self.user_id)
         if self.finished_before is not None:
             if self.include_missing_finished_at:
-                terminal_statuses = ','.join(
-                    repr(status.value)
-                    for status in RequestStatus.finished_status())
+                terminal_statuses = RequestStatus.finished_status()
+                placeholders = ','.join('?' for _ in terminal_statuses)
                 filters.append(
                     '(finished_at < ? OR (finished_at IS NULL AND '
-                    f'status IN ({terminal_statuses}) AND created_at < ?))')
+                    f'status IN ({placeholders}) AND created_at < ?))')
+                filter_params.append(self.finished_before)
                 filter_params.extend(
-                    [self.finished_before, self.finished_before])
+                    status.value for status in terminal_statuses)
+                filter_params.append(self.finished_before)
             else:
                 filters.append('finished_at < ?')
                 filter_params.append(self.finished_before)

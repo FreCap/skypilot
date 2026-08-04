@@ -25,6 +25,7 @@ from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.serve import auth_tokens
+from sky.serve import serve_state
 from sky.server import clean_env as clean_env_module
 from sky.server import config as server_config
 from sky.server import constants as server_constants
@@ -36,12 +37,14 @@ from sky.server import plugins
 from sky.server.blob import blob_storage as bs
 from sky.server.events import store as operational_event_store
 from sky.server.requests import authority_worker_retirement
+from sky.server.requests import cutover as request_cutover
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import registry as request_registry
 from sky.server.requests import request_names
 from sky.server.requests import requests as requests_lib
+from sky.server.requests import storage as request_storage
 from sky.skylet import constants
 from sky.usage import usage_lib
 from sky.users import permission
@@ -93,6 +96,32 @@ def _uses_postgres_requests() -> bool:
             request_postgres.POSTGRES_REQUEST_BACKEND)
 
 
+def _guard_completed_request_store_cutover() -> None:
+    """Fail closed if a one-way cutover resolves back to stale storage."""
+    backend = request_storage.get_request_backend()
+    request_cutover.require_completed_cutover_backend(
+        postgres_configured=_uses_postgres_requests(),
+        postgres_backend=type(backend)
+        is request_postgres.PostgresRequestBackend,
+        sqlite_backend=type(backend) is requests_lib.SqliteRequestBackend)
+
+
+def _guard_active_reserved_fill_protocol(role: str) -> None:
+    """Require the prepared backend invariant after protocol-v2 activation."""
+    if role not in ('all', 'api', 'controller', 'executor'):
+        return
+    state = serve_state.get_reserved_fill_protocol_state()
+    if int(state['protocol_version']) != 2:
+        return
+    if not request_postgres.execution_quiescence_backend_guard_enabled():
+        raise RuntimeError(
+            'Reserved-fill protocol v2 is active, but execution-quiescence '
+            'backend enforcement is disabled. Demote protocol v2 before '
+            'disabling the guard.')
+    request_postgres.require_builtin_execution_quiescence_backends(
+        required=True)
+
+
 def _controller_cutover_quiescence_seconds() -> float:
     value = os.environ.get(_CONTROLLER_CUTOVER_QUIESCENCE_ENV_VAR, '70')
     try:
@@ -123,11 +152,13 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
     logger.info(f'Initializing SkyPilot {role} role')
     plugins.load_plugins(
         plugins.ExtensionContext(context=plugins.PluginContext.MAIN))
+    _guard_completed_request_store_cutover()
     usage_lib.maybe_show_privacy_policy()
 
     db_utils.set_max_connections(1)
     logger.info('Initializing database engines')
     database_migrations.initialize_central_databases()
+    _guard_active_reserved_fill_protocol(role)
     logger.info('Database engines initialized')
 
     requests_recovered = False

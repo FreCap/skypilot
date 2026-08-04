@@ -78,6 +78,37 @@ def require_legacy_submissions_allowed() -> None:
             'cutover completes.')
 
 
+def require_completed_cutover_backend(*, postgres_configured: bool,
+                                      postgres_backend: bool,
+                                      sqlite_backend: bool) -> None:
+    """Refuse stale-source startup after the one-way cutover completes."""
+    path = gate_path()
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f'API request cutover gate {path} cannot be read safely.'
+        ) from error
+    phase = payload.get('phase') if isinstance(payload, dict) else None
+    if phase not in ('blocked', 'cutover-complete'):
+        raise RuntimeError(
+            f'API request cutover gate {path} has invalid phase {phase!r}.')
+    if phase == 'blocked' and (postgres_configured or postgres_backend or
+                               not sqlite_backend):
+        raise RuntimeError(
+            'The API request-store cutover is blocked for legacy drain, but '
+            'the resolved runtime is not the built-in SQLite backend. Refusing '
+            'startup before the import committed cutover-complete.')
+    if phase == 'cutover-complete' and (not postgres_configured or
+                                        not postgres_backend):
+        raise RuntimeError(
+            'The one-way API request-store cutover is complete, but the '
+            'resolved request storage backend is not the built-in PostgreSQL '
+            'backend. Refusing stale SQLite recovery.')
+
+
 def _write_gate(payload: dict[str, Any]) -> pathlib.Path:
     path = gate_path()
     path.parent.mkdir(parents=True, exist_ok=True)

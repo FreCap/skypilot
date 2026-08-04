@@ -30,9 +30,12 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     action_fence_version = (
         server_constants.MIN_RESOURCE_ACTION_EXPECTED_CLUSTER_UUID_API_VERSION)
     assert action_fence_version == 69
+    execution_quiescence_version = (
+        server_constants.MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION)
+    assert execution_quiescence_version == 70
     assert (server_constants.MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION
             < server_constants.API_VERSION)
-    assert server_constants.API_VERSION == action_fence_version
+    assert server_constants.API_VERSION == execution_quiescence_version
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():

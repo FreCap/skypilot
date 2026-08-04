@@ -136,6 +136,12 @@ rules:
       - patch
       {{- end }}
       - delete
+  # Reserved-fill protocol transitions bind the activating Pod to this
+  # release's API Deployment through Pod -> ReplicaSet -> Deployment owner
+  # UIDs.  A selector-only proof could be redirected to an unrelated rollout.
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets" ]
+    verbs: [ "get" ]
   - apiGroups: [ "" ]
     resources: [ "services" ]
     verbs:

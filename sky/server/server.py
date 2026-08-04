@@ -68,6 +68,7 @@ from sky.server import stream_utils
 from sky.server import version_check
 from sky.server import versions
 from sky.server import websocket_utils
+from sky.server.auth import loopback as auth_loopback
 from sky.server.auth import middleware as auth_middleware
 from sky.server.auth import oauth2_proxy
 from sky.server.auth import sessions as auth_sessions
@@ -1948,20 +1949,29 @@ async def api_cancel(request: fastapi.Request,
     )
 
 
-@app.get('/api/status')
-async def api_status(
-    request_ids: list[str] | None = fastapi.Query(
-        None, description='Request ID prefixes to get status for.'),
-    all_status: bool = fastapi.Query(
-        False, description='Get finished requests as well.'),
-    limit: int | None = fastapi.Query(
-        None, description='Number of requests to show.'),
-    fields: list[str] | None = fastapi.Query(
-        None, description='Fields to get. If None, get all fields.'),
-    cluster_name: str | None = fastapi.Query(
-        None, description='Filter requests by cluster name.'),
+async def _api_status(
+    request_ids: list[str] | None,
+    all_status: bool,
+    limit: int | None,
+    fields: list[str] | None,
+    cluster_name: str | None,
+    cluster_names: list[str] | None,
+    include_request_names: list[str] | None,
+    execution_quiescence_candidates_only: bool,
+    exact_request_ids: bool,
 ) -> list[payloads.RequestPayload]:
-    """Gets the list of requests."""
+    """Shared GET/POST request-status projection."""
+    if cluster_name is not None and cluster_names is not None:
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='cluster_name and cluster_names are mutually exclusive.')
+    if execution_quiescence_candidates_only:
+        # This filter is an internal safety protocol, not a general request-
+        # history escape hatch. Keep the allowlist owned by the server.
+        include_request_names = [
+            server_constants.REQUEST_NAME_PREFIX +
+            request_names.RequestName.CLUSTER_LAUNCH.value
+        ]
     if request_ids is None:
         statuses = None
         if not all_status:
@@ -1969,17 +1979,31 @@ async def api_status(
         request_tasks = await requests_lib.get_request_tasks_async(
             req_filter=requests_lib.RequestTaskFilter(
                 status=statuses,
-                cluster_names=[cluster_name] if cluster_name else None,
-                exclude_request_names=[
-                    server_constants.REQUEST_NAME_PREFIX + d.value
-                    for d in daemons.HIDDEN_REQUEST_NAMES
-                ],
+                cluster_names=(cluster_names if cluster_names is not None else
+                               [cluster_name] if cluster_name else None),
+                exclude_request_names=(
+                    None if include_request_names is not None else [
+                        server_constants.REQUEST_NAME_PREFIX + d.value
+                        for d in daemons.HIDDEN_REQUEST_NAMES
+                    ]),
+                include_request_names=include_request_names,
                 limit=limit,
                 fields=fields,
                 sort=True,
+                execution_quiescence_candidates_only=(
+                    execution_quiescence_candidates_only),
             ))
         # encode_requests does a sync get_all_users() DB read; offload it so
         # the event loop is not blocked.
+        return await asyncio.to_thread(requests_lib.encode_requests,
+                                       request_tasks)
+    elif exact_request_ids:
+        request_tasks = await requests_lib.get_request_tasks_async(
+            req_filter=requests_lib.RequestTaskFilter(
+                request_ids=request_ids,
+                fields=fields,
+                sort=True,
+            ))
         return await asyncio.to_thread(requests_lib.encode_requests,
                                        request_tasks)
     else:
@@ -1995,6 +2019,61 @@ async def api_status(
         # read so the event loop is not blocked.
         return await asyncio.to_thread(requests_lib.encode_requests,
                                        matched_request_tasks)
+
+
+@app.get('/api/status')
+async def api_status(
+    request_ids: list[str] | None = fastapi.Query(
+        None, description='Request ID prefixes to get status for.'),
+    all_status: bool = fastapi.Query(
+        False, description='Get finished requests as well.'),
+    limit: int | None = fastapi.Query(
+        None, description='Number of requests to show.'),
+    fields: list[str] | None = fastapi.Query(
+        None, description='Fields to get. If None, get all fields.'),
+    cluster_name: str | None = fastapi.Query(
+        None, description='Filter requests by cluster name.'),
+) -> list[payloads.RequestPayload]:
+    """Gets the list of requests."""
+    return await _api_status(request_ids, all_status, limit, fields,
+                             cluster_name, None, None, False, False)
+
+
+@app.post('/api/status/query')
+async def api_status_query(
+    request: fastapi.Request,
+    body: payloads.RequestStatusBody,
+) -> list[payloads.RequestPayload]:
+    """Body-backed request-status query for large internal filter sets."""
+    internal_mode = (body.include_request_names is not None or
+                     body.execution_quiescence_candidates_only or
+                     body.exact_request_ids)
+    launch_request_name = (server_constants.REQUEST_NAME_PREFIX +
+                           request_names.RequestName.CLUSTER_LAUNCH.value)
+    if (body.include_request_names is not None and
+            body.include_request_names != [launch_request_name]):
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='The internal request-name filter is server-owned.')
+    if internal_mode:
+        controller_origin = getattr(request.state, 'controller_origin', None)
+        locally_trusted = auth_loopback.is_loopback_request(request)
+        if controller_origin is None and not locally_trusted:
+            raise fastapi.HTTPException(
+                status_code=403,
+                detail=('Only the current controller can use internal '
+                        'request-status filters.'))
+    return await _api_status(
+        body.request_ids,
+        body.all_status,
+        body.limit,
+        body.fields,
+        body.cluster_name,
+        body.cluster_names,
+        body.include_request_names,
+        body.execution_quiescence_candidates_only,
+        body.exact_request_ids,
+    )
 
 
 @app.get('/dashboard_config')

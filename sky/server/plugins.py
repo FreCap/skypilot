@@ -580,6 +580,19 @@ def load_plugins(
                 plugin.install(extension_context)
                 _PLUGINS[class_path] = plugin
 
+        if (extension_context.context
+                in (PluginContext.MAIN, PluginContext.UVICORN,
+                    PluginContext.EXECUTOR) and os.environ.get(
+                        'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS')
+                == 'true'):
+            # Each process context has independent module globals and plugins
+            # can opt into only one context. Validate after installation in
+            # the process that will actually submit or execute requests; a
+            # healthy MAIN lease cannot attest a UVICORN/EXECUTOR override.
+            # pylint: disable=import-outside-toplevel
+            from sky.server.requests import postgres as request_postgres
+            request_postgres.require_builtin_execution_quiescence_backends()
+
         _plugins_loaded = True
         return registration_session.complete()
 

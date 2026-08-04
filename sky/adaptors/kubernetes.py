@@ -11,9 +11,11 @@ kubeconfig (e.g. for short-lived certs).
 """
 import base64
 from collections.abc import Callable
+import contextlib
 import copy
 import dataclasses
 import functools
+import hmac
 import json
 import logging
 import os
@@ -1249,6 +1251,63 @@ def core_api_from_api_client(  # pylint: disable=redefined-outer-name
         api_client: Any) -> Any:
     """Build an uncached CoreV1 facade without taking client ownership."""
     return kubernetes.client.CoreV1Api(api_client=api_client)
+
+
+@contextlib.contextmanager
+def in_cluster_core_and_apps_apis_for_token(
+        token: str) -> typing.Iterator[tuple[Any, Any]]:
+    """Yield Core/Apps facades authenticated by exactly ``token``.
+
+    The explicit in-cluster load prevents kubeconfig fallback.  Comparing the
+    installed bearer credential with the caller's mounted-token snapshot binds
+    unverified JWT identity parsing to the credential Kubernetes authenticates.
+    Refresh is disabled so projected-token rotation cannot decouple that
+    identity from either API read during the activation transaction.
+    """
+    if not isinstance(token, str) or not token:
+        raise ValueError('An in-cluster service-account token is required.')
+    api_client_instance: Any | None = None
+    try:
+        api_client_instance = _get_api_client(in_cluster_context_name())
+        configuration = getattr(api_client_instance, 'configuration', None)
+        if configuration is None:
+            raise kubernetes.config.config_exception.ConfigException(
+                'In-cluster authentication configuration is missing.')
+        api_keys = getattr(configuration, 'api_key', None)
+        if not isinstance(api_keys, dict):
+            raise kubernetes.config.config_exception.ConfigException(
+                'In-cluster authentication keyring is malformed.')
+        authorization = api_keys.get('authorization')
+        if not isinstance(authorization, str):
+            raise kubernetes.config.config_exception.ConfigException(
+                'In-cluster authentication did not install a bearer token.')
+        scheme, separator, configured_token = authorization.partition(' ')
+        if (not separator or scheme.lower() != 'bearer' or
+                not hmac.compare_digest(configured_token, token)):
+            raise kubernetes.config.config_exception.ConfigException(
+                'The mounted in-cluster token changed during client binding.')
+        configuration_attributes = getattr(configuration, '__dict__', None)
+        if not isinstance(configuration_attributes, dict):
+            raise kubernetes.config.config_exception.ConfigException(
+                'In-cluster authentication configuration is malformed.')
+        # Some Kubernetes client versions bind the token loader directly onto
+        # this instance.  Removing the override makes the class method read the
+        # frozen api_key below; clearing only refresh_api_key_hook is not a
+        # sufficient no-rotation guarantee on those versions.
+        configuration_attributes.pop('get_api_key_with_prefix', None)
+        configuration.refresh_api_key_hook = None
+        frozen_authorization = api_keys.get('authorization')
+        if (not isinstance(frozen_authorization, str) or
+                not hmac.compare_digest(frozen_authorization, authorization)):
+            raise kubernetes.config.config_exception.ConfigException(
+                'In-cluster authentication changed while being frozen.')
+        core = kubernetes.client.CoreV1Api(api_client=api_client_instance)
+        apps = kubernetes.client.AppsV1Api(api_client=api_client_instance)
+        del authorization, configured_token
+        yield core, apps
+    finally:
+        if api_client_instance is not None:
+            _close_api_client_resources(api_client_instance)
 
 
 def _get_api_client(context: str | None = None) -> Any:

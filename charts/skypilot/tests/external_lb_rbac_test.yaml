@@ -34,6 +34,13 @@ tests:
       - contains:
           path: rules
           content:
+            apiGroups: ["apps"]
+            resources: ["replicasets"]
+            verbs: ["get"]
+        documentIndex: 8
+      - contains:
+          path: rules
+          content:
             apiGroups: [""]
             resources: ["pods/log"]
             verbs: ["get"]

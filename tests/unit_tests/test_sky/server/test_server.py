@@ -1625,3 +1625,67 @@ def test_dashboard_config_endpoint_serializes_external_links(monkeypatch):
             'regex': 'https://grafana.example.com/.*'
         }]
     }
+
+
+@pytest.mark.asyncio
+async def test_status_query_rejects_caller_selected_internal_request_names():
+    from sky.server.requests import payloads
+
+    request = mock.Mock(spec=fastapi.Request)
+    request.state.auth_user = None
+    body = payloads.RequestStatusBody(
+        include_request_names=['sky.internal-daemon'])
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        await server.api_status_query(request, body)
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_status_query_internal_filters_require_controller(monkeypatch):
+    from sky.server.requests import payloads
+
+    request = mock.Mock(spec=fastapi.Request)
+    request.state.auth_user = mock.Mock(id='viewer')
+    request.state.controller_origin = None
+    monkeypatch.setattr(server.auth_loopback, 'is_loopback_request',
+                        lambda _request: False)
+    body = payloads.RequestStatusBody(cluster_names=['service-replica-1'],
+                                      include_request_names=['sky.launch'],
+                                      execution_quiescence_candidates_only=True)
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        await server.api_status_query(request, body)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_status_query_accepts_current_controller_and_owns_allowlist(
+        monkeypatch):
+    from sky.server.requests import payloads
+
+    request = mock.Mock(spec=fastapi.Request)
+    request.state.auth_user = None
+    request.state.controller_origin = ('controller-instance', 7)
+    monkeypatch.setattr(server.auth_loopback, 'is_loopback_request',
+                        lambda _request: False)
+    captured = []
+
+    async def get_request_tasks(req_filter):
+        captured.append(req_filter)
+        return []
+
+    monkeypatch.setattr(server.requests_lib, 'get_request_tasks_async',
+                        get_request_tasks)
+    monkeypatch.setattr(server.requests_lib, 'encode_requests',
+                        lambda requests: requests)
+    body = payloads.RequestStatusBody(cluster_names=['service-replica-1'],
+                                      include_request_names=['sky.launch'],
+                                      execution_quiescence_candidates_only=True,
+                                      fields=['request_id', 'name', 'status'])
+
+    assert await server.api_status_query(request, body) == []
+    assert len(captured) == 1
+    assert captured[0].include_request_names == ['sky.launch']

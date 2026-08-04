@@ -56,6 +56,8 @@ def test_request_body_env_vars_includes_expected_keys(monkeypatch):
     monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI, 'db-uri')
     monkeypatch.setenv(serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR, 'false')
     monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'controller')
+    monkeypatch.setenv('SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS',
+                       'true')
     monkeypatch.setenv('SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS', '70')
     monkeypatch.setenv('SKYPILOT_POD_UID', 'pod-uid')
     monkeypatch.setenv(constants.SKY_API_SERVER_URL_ENV_VAR,
@@ -71,6 +73,7 @@ def test_request_body_env_vars_includes_expected_keys(monkeypatch):
     assert constants.ENV_VAR_DB_CONNECTION_URI not in local_env
     assert serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR not in local_env
     assert 'SKYPILOT_API_SERVER_ROLE' not in local_env
+    assert 'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS' not in local_env
     assert 'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS' not in local_env
     assert 'SKYPILOT_POD_UID' not in local_env
     assert constants.SKY_API_SERVER_URL_ENV_VAR not in local_env
@@ -87,6 +90,7 @@ def test_request_body_env_vars_includes_expected_keys(monkeypatch):
     assert constants.CLIENT_USER_HASH_ENV_VAR not in remote_env
     assert serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR not in remote_env
     assert 'SKYPILOT_API_SERVER_ROLE' not in remote_env
+    assert 'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS' not in remote_env
     assert 'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS' not in remote_env
     assert 'SKYPILOT_POD_UID' not in remote_env
     assert constants.SKY_API_SERVER_URL_ENV_VAR not in remote_env

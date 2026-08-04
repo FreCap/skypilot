@@ -52,7 +52,7 @@ SPOT_JOBS_VERSION = '027'  # ordered managed-job scheduler lookup
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '034'  # durable authority-worker Helm release ledger
+SERVE_VERSION = '035'  # multi-pool reserved-fill protocol and claim sets
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'
@@ -68,7 +68,7 @@ RECIPES_VERSION = '001'
 RECIPES_LOCK_PATH = f'~/.sky/locks/.{RECIPES_DB_NAME}.lock'
 
 API_REQUESTS_DB_NAME = 'api_requests_db'
-API_REQUESTS_VERSION = '007'
+API_REQUESTS_VERSION = '008'
 API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
 
 LIFECYCLE_ACTIONS_DB_NAME = 'lifecycle_actions_db'

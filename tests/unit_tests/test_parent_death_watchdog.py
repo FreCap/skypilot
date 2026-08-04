@@ -10,6 +10,7 @@ arm/no-arm guard with injected fakes (no real sleeping, no real processes).
 """
 # pylint: disable=protected-access
 import functools
+import os
 import threading
 
 import pytest
@@ -154,6 +155,9 @@ def test_executor_initializer_arms_watchdog_only_in_child(
     plugins_loaded = []
 
     def _load_plugins(context):
+        assert os.environ['SKYPILOT_API_REQUEST_BACKEND'] == 'postgres'
+        assert os.environ[
+            'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS'] == 'true'
         plugins_loaded.append(context)
         initialization_order.append('plugins')
 
@@ -161,8 +165,26 @@ def test_executor_initializer_arms_watchdog_only_in_child(
     monkeypatch.setattr(executor.metrics_lib,
                         'register_multiproc_cleanup_atexit', lambda: None)
     clean_envs = []
-    monkeypatch.setattr(executor.clean_env_module, 'set_clean_server_env',
-                        clean_envs.append)
+    clean_snapshot = {
+        'FOO': 'BAR',
+        'SKYPILOT_API_REQUEST_BACKEND': 'postgres',
+        'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS': 'true',
+    }
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'sqlite')
+    monkeypatch.setenv('SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS',
+                       'false')
+
+    def _restore_clean_server_env(environment):
+        clean_envs.append(environment)
+        os.environ['SKYPILOT_API_REQUEST_BACKEND'] = environment[
+            'SKYPILOT_API_REQUEST_BACKEND']
+        os.environ[
+            'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS'] = environment[
+                'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS']
+        initialization_order.append('clean-env')
+
+    monkeypatch.setattr(executor.clean_env_module, 'restore_clean_server_env',
+                        _restore_clean_server_env)
     fake_threads = []
 
     def _fake_thread(*args, **kwargs):
@@ -172,14 +194,14 @@ def test_executor_initializer_arms_watchdog_only_in_child(
 
     monkeypatch.setattr(executor.threading, 'Thread', _fake_thread)
 
-    executor.executor_initializer('short', clean_env={'FOO': 'BAR'})
+    executor.executor_initializer('short', clean_env=clean_snapshot)
 
     assert armed == ([True] if has_parent else [])
     # Existing initializer behavior still runs regardless of the guard.
     assert metrics_roles == [expected_metrics_role]
-    assert initialization_order == ['metrics-role', 'plugins']
+    assert initialization_order == ['metrics-role', 'clean-env', 'plugins']
     assert len(proctitles) == 1
     assert len(plugins_loaded) == 1
-    assert clean_envs == [{'FOO': 'BAR'}]
+    assert clean_envs == [clean_snapshot]
     assert len(fake_threads) == 1
     assert fake_threads[0].daemon and fake_threads[0].started
