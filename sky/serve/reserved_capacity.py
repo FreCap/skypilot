@@ -1271,6 +1271,8 @@ def _broker_cycle(
 
     allocation = reserved_capacity_broker.run_round_if_stale(
         service_name, pool_key, _observe_pool, poll_interval_seconds())
+    # Whoever drove the round, adopt its published count.
+    _record_round_observation(placer, zero_cost, pool_key, time.time())
     if allocation is None:
         # No allocation this cycle (claim rejected/expired, round lock
         # timeout, or the fresh round predates our claim): feed zero free
@@ -1289,6 +1291,39 @@ def _broker_cycle(
     logger.info(f'Reserved-fill broker: {service_name!r} feed='
                 f'{allocation.feed} grant={allocation.grant} '
                 f'(round {allocation.round_id}, epoch {allocation.epoch}).')
+
+
+def _record_round_observation(
+    placer: 'spot_placer_lib.SpotPlacer',
+    locations: Sequence['spot_placer_lib.Location'],
+    pool_key: str,
+    now: float,
+) -> None:
+    """Replay the pool's published free-slot count into the placer.
+
+    One poller drives each round; every other service reads the published
+    result. Recording only when we drove the round would leave a service that
+    rarely wins the round without a count, and therefore benched, which is the
+    common case once several services share a pool. This runs every cycle off
+    the same row `_pool_capacity_hint` already trusts.
+    """
+    round_row = serve_state.get_reserved_fill_round(pool_key)
+    if round_row is None:
+        return
+    free = round_row.get('last_observed_free')
+    observed_at = round_row.get('last_observed_free_ts')
+    if free is None or observed_at is None:
+        return
+    try:
+        observed_at = float(observed_at)
+        free = int(free)
+    except (TypeError, ValueError):
+        return
+    if now - observed_at > (poll_interval_seconds() *
+                            constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS):
+        return
+    placer.observe_zero_cost_capacity(
+        {location: free for location in locations}, observed_at)
 
 
 def _pool_capacity_hint(spec: FillPoolSpec, holdings: int, launchable: bool,
@@ -1509,6 +1544,9 @@ def _broker_cycle_v2(
                            f'{service_name!r}/{spec.pool_key}: '
                            f'{common_utils.format_exception(error)}')
             allocation = None
+        # Whoever drove this pool's round, adopt its published count.
+        _record_round_observation(placer, spec.locations, spec.pool_key,
+                                  time.time())
         # A lock timeout or other transient round miss must not cull existing
         # fill from this one pool.  Carry only the last real exact-generation
         # grant as scale-down shelter.  Live launch authority still fails
