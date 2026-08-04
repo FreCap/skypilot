@@ -16,6 +16,6 @@ on:
 
 jobs:
   python-test:
-    runs-on: namespace-profile-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-1x2
     steps:
       - run: 'echo "No tests to run"'

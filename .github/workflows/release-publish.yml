@@ -8,7 +8,7 @@ on:
 
 jobs:
   extract-version:
-    runs-on: namespace-profile-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-1x2
     if: startsWith(github.head_ref, 'test_releases/')
     outputs:
       version: ${{ steps.extract_version.outputs.version }}
@@ -29,7 +29,7 @@ jobs:
   build-package:
     needs: extract-version
     if: github.event.pull_request.merged == true && startsWith(github.head_ref, 'test_releases/')
-    runs-on: namespace-profile-ci-2x4
+    runs-on: namespace-profile-skypilot-ci-2x4
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -113,7 +113,7 @@ jobs:
 
   create-release:
     needs: [extract-version, publish-and-validate-pypi]
-    runs-on: namespace-profile-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-1x2
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -223,7 +223,7 @@ jobs:
   cleanup-branches:
     needs: extract-version
     if: github.event.pull_request.merged == false && startsWith(github.head_ref, 'test_releases/')
-    runs-on: namespace-profile-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-1x2
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

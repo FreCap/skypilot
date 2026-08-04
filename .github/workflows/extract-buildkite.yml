@@ -14,7 +14,7 @@ on:
 
 jobs:
   extract:
-    runs-on: namespace-profile-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-1x2
     outputs:
       build_number: ${{ steps.extract.outputs.build_number }}
     steps:
