@@ -154,11 +154,17 @@ and performs no physical-identity read. The tuple is copied into the immutable
 PostgreSQL request body and must survive request/executor restart without
 consulting controller memory. API ingress independently validates and
 atomically commits the carried tuple to that immutable request body without
-relying on the earlier controller authority, and the executor reacquires phase
-and physical fence for each provider attempt. The tuple is bound to the same
-service incarnation as the normal owner fence. Round epoch is intentionally
-absent: the epoch is consumed by the atomic `persist_fill_replica` transaction,
-after which that durable pending row is the reservation carried into launch.
+relying on the earlier controller authority. Each API execution attempt
+acquires a fresh phase and physical fence around registration, provisioning,
+runtime bootstrap, file sync, setup, and job submission. Exact-equivalent
+lower-level Kubernetes provisioning retries remain inside that one immutable
+capture; the provisioner still revalidates the carried context and shape
+immediately before every provider mutation. A scheduler-level retry unwinds
+the complete execution scope before waiting and acquires a fresh phase and
+capture on its next invocation. The tuple is bound to the same service
+incarnation as the normal owner fence. Round epoch is intentionally absent:
+the epoch is consumed by the atomic `persist_fill_replica` transaction, after
+which that durable pending row is the reservation carried into launch.
 
 After request recovery, admin policy, and optimization, the executor requires
 the final selected resources to retain the exact Kubernetes context and shape.
