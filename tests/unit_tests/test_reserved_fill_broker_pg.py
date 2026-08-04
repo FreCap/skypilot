@@ -5365,11 +5365,12 @@ def test_killed_persist_lock_session_is_fenced_by_replacement_round(
                                 physical_cluster_uid=physical_cluster_uid)
     with engine.begin() as connection:
         connection.execute(
-            sqlalchemy.insert(
-                serve_state.services_table).values(name=service_name,
-                                                   hash=service_hash,
-                                                   current_version=1,
-                                                   pool=0))
+            sqlalchemy.insert(serve_state.services_table).values(
+                name=service_name,
+                hash=service_hash,
+                resource_scope=service_hash,
+                current_version=1,
+                pool=0))
     assert serve_state.set_reserved_fill_protocol_version(
         broker.PROTOCOL_V2,
         expected_protocol_version=broker.PROTOCOL_V1,

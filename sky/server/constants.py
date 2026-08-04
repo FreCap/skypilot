@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 69  # Action-fenced internal cluster teardown
+API_VERSION = 70  # Durable request execution-quiescence acknowledgement
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -132,6 +132,11 @@ MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67
 # controller-originated down requests. Older servers ignore unknown payload
 # fields, which would silently discard the teardown fence.
 MIN_RESOURCE_ACTION_EXPECTED_CLUSTER_UUID_API_VERSION = 69
+
+# Minimum server API version whose request status payload exposes exact-
+# generation ``execution_quiesced_*`` evidence. The legacy
+# ``cancel_acknowledged_at`` field continues to mean signal delivery only.
+MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION = 70
 
 # Minimum server API version that exposes the admin-only, low-cardinality
 # operator notification inbox used by the dashboard.

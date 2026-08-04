@@ -53,6 +53,7 @@ def _owner_reference(kind, name, uid):
 def _deployment(*,
                 kind='api',
                 server_role=None,
+                request_backend='postgres',
                 generation=42,
                 observed_generation=42,
                 resource_version='deployment-rv-1',
@@ -61,12 +62,23 @@ def _deployment(*,
                 ready_replicas=2,
                 available_replicas=2,
                 unavailable_replicas=None):
-    is_api = kind == 'api'
-    assert is_api or kind == 'controller'
-    name = 'skypilot-api-server' if is_api else 'skypilot-controller'
-    uid = 'deployment-uid' if is_api else 'controller-deployment-uid'
-    container_name = 'skypilot-api' if is_api else 'skypilot-controller'
-    resolved_server_role = server_role or ('all' if is_api else 'controller')
+    assert kind in ('api', 'controller', 'executor')
+    name = {
+        'api': 'skypilot-api-server',
+        'controller': 'skypilot-controller',
+        'executor': 'skypilot-executor',
+    }[kind]
+    uid = {
+        'api': 'deployment-uid',
+        'controller': 'controller-deployment-uid',
+        'executor': 'executor-deployment-uid',
+    }[kind]
+    container_name = {
+        'api': 'skypilot-api',
+        'controller': 'skypilot-controller',
+        'executor': 'skypilot-executor',
+    }[kind]
+    resolved_server_role = server_role or ('all' if kind == 'api' else kind)
     selector_labels = {
         'component': kind,
         'app': 'skypilot',
@@ -96,6 +108,8 @@ def _deployment(*,
                                              'skypilot'),
                                         _env('SKYPILOT_API_SERVER_ROLE',
                                              resolved_server_role),
+                                        _env('SKYPILOT_API_REQUEST_BACKEND',
+                                             request_backend),
                                     ]),
                     SimpleNamespace(name='metrics-sidecar', env=[]),
                 ]))),
@@ -111,16 +125,19 @@ def _pod(index: int,
          *,
          kind: str = 'api',
          server_role: str | None = None,
+         request_backend: str = 'postgres',
          digest: str = _DIGEST_A,
          resource_version: str | None = None):
-    is_api = kind == 'api'
-    assert is_api or kind == 'controller'
-    prefix = 'api' if is_api else 'controller'
-    container_name = 'skypilot-api' if is_api else 'skypilot-controller'
-    resolved_server_role = server_role or ('all' if is_api else 'controller')
-    replica_set_name = ('skypilot-api-rs'
-                        if is_api else 'skypilot-controller-rs')
-    replica_set_uid = ('api-rs-uid' if is_api else 'controller-rs-uid')
+    assert kind in ('api', 'controller', 'executor')
+    prefix = kind
+    container_name = {
+        'api': 'skypilot-api',
+        'controller': 'skypilot-controller',
+        'executor': 'skypilot-executor',
+    }[kind]
+    resolved_server_role = server_role or ('all' if kind == 'api' else kind)
+    replica_set_name = f'skypilot-{kind}-rs'
+    replica_set_uid = f'{kind}-rs-uid'
     return SimpleNamespace(
         metadata=SimpleNamespace(name=f'{prefix}-{index}',
                                  namespace='skypilot',
@@ -139,12 +156,13 @@ def _pod(index: int,
                                                       replica_set_uid)
                                  ]),
         spec=SimpleNamespace(containers=[
-            SimpleNamespace(name=container_name,
-                            env=[
-                                _env('SKYPILOT_RELEASE_NAME', 'skypilot'),
-                                _env('SKYPILOT_API_SERVER_ROLE',
-                                     resolved_server_role),
-                            ]),
+            SimpleNamespace(
+                name=container_name,
+                env=[
+                    _env('SKYPILOT_RELEASE_NAME', 'skypilot'),
+                    _env('SKYPILOT_API_SERVER_ROLE', resolved_server_role),
+                    _env('SKYPILOT_API_REQUEST_BACKEND', request_backend),
+                ]),
             SimpleNamespace(name='metrics-sidecar', env=[]),
         ]),
         status=SimpleNamespace(
@@ -253,8 +271,16 @@ def _install_clients(monkeypatch,
     monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
     monkeypatch.setattr(serve_state, 'get_database_engine',
                         lambda: _assert_locked_and_return(lock, object()))
+
+    def current_revision(_engine, section):
+        assert lock.held
+        return {
+            broker.migration_utils.SERVE_DB_NAME: '035',
+            broker.migration_utils.API_REQUESTS_DB_NAME: '008',
+        }[section]
+
     monkeypatch.setattr(broker.migration_utils, 'get_current_alembic_revision',
-                        lambda *_args: _assert_locked_and_return(lock, '035'))
+                        current_revision)
     monkeypatch.setattr(
         serve_state, 'get_reserved_fill_protocol_state',
         lambda: _assert_locked_and_return(lock, {'protocol_version': 1}))
@@ -275,7 +301,7 @@ def _writer_instances(pod_list):
                 if entry.name == 'SKYPILOT_API_SERVER_ROLE'
             ]
             if len(role_entries) != 1 or role_entries[0].value not in (
-                    'all', 'controller'):
+                    'all', 'controller', 'executor'):
                 continue
             instances.append(
                 serve_state.ReservedFillWriterInstance(
@@ -473,17 +499,20 @@ def test_activation_derives_stable_rollout_proof_under_global_lock(monkeypatch):
     ]
 
 
-def test_activation_attests_ha_api_and_controller_writer_rollout(monkeypatch):
+def test_activation_attests_ha_api_controller_and_executor_rollout(monkeypatch):
     lock = _TrackedLock()
     api_deployment = _deployment(server_role='api')
     controller_deployment = _deployment(kind='controller')
+    executor_deployment = _deployment(kind='executor')
     pods = _pod_list(_pod(0, server_role='api'), _pod(1, server_role='api'),
-                     _pod(0, kind='controller'), _pod(1, kind='controller'))
-    _install_clients(monkeypatch,
-                     lock, [[api_deployment, controller_deployment],
-                            [api_deployment, controller_deployment]],
-                     [pods, pods],
-                     bound_pod=pods.items[0])
+                     _pod(0, kind='controller'), _pod(1, kind='controller'),
+                     _pod(0, kind='executor'), _pod(1, kind='executor'))
+    _install_clients(
+        monkeypatch,
+        lock, [[api_deployment, controller_deployment, executor_deployment],
+               [api_deployment, controller_deployment, executor_deployment]],
+        [pods, pods],
+        bound_pod=pods.items[0])
     persisted = {}
 
     def persist_protocol(*args, **kwargs):
@@ -500,13 +529,38 @@ def test_activation_attests_ha_api_and_controller_writer_rollout(monkeypatch):
     assert json.loads(persisted['deployment_generation']) == [
         ['api', 'skypilot-api-server', '42'],
         ['controller', 'skypilot-controller', '42'],
+        ['executor', 'skypilot-executor', '42'],
     ]
     assert json.loads(persisted['deployment_uid']) == [
         ['api', 'skypilot-api-server', 'deployment-uid'],
         ['controller', 'skypilot-controller', 'controller-deployment-uid'],
+        ['executor', 'skypilot-executor', 'executor-deployment-uid'],
     ]
-    assert persisted['pod_inventory_count'] == 4
+    assert persisted['pod_inventory_count'] == 6
     assert len(persisted['pod_inventory_sha256']) == 64
+
+
+def test_activation_rejects_missing_recent_executor_lease(monkeypatch):
+    lock = _TrackedLock()
+    deployments = [
+        _deployment(server_role='api'),
+        _deployment(kind='controller'),
+        _deployment(kind='executor'),
+    ]
+    pods = _pod_list(_pod(0, server_role='api'), _pod(1, server_role='api'),
+                     _pod(0, kind='controller'), _pod(1, kind='controller'),
+                     _pod(0, kind='executor'), _pod(1, kind='executor'))
+    instances_without_executor = tuple(
+        instance for instance in _writer_instances(pods)
+        if instance.role != 'executor')
+    _install_clients(monkeypatch,
+                     lock, [deployments], [pods],
+                     bound_pod=pods.items[0],
+                     writer_instance_lists=[instances_without_executor])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='database writer-process inventory'):
+        broker.activate_protocol_v2()
 
 
 def test_activation_rejects_ha_release_without_controller_deployment(
@@ -519,15 +573,94 @@ def test_activation_rejects_ha_release_without_controller_deployment(
         broker.activate_protocol_v2()
 
 
-def test_activation_rejects_incomplete_ha_controller_deployment(monkeypatch):
+def test_activation_rejects_ha_release_without_executor_deployment(monkeypatch):
     lock = _TrackedLock()
     api_deployment = _deployment(server_role='api')
-    controller_deployment = _deployment(kind='controller', ready_replicas=1)
+    controller_deployment = _deployment(kind='controller')
     _install_clients(monkeypatch, lock,
                      [[api_deployment, controller_deployment]], [])
 
     with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='does not have exactly its executor'):
+        broker.activate_protocol_v2()
+
+
+def test_activation_rejects_incomplete_ha_controller_deployment(monkeypatch):
+    lock = _TrackedLock()
+    api_deployment = _deployment(server_role='api')
+    controller_deployment = _deployment(kind='controller', ready_replicas=1)
+    executor_deployment = _deployment(kind='executor')
+    _install_clients(
+        monkeypatch, lock,
+        [[api_deployment, controller_deployment, executor_deployment]], [])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
                        match='controller writer Deployment rollout'):
+        broker.activate_protocol_v2()
+
+
+def test_activation_rejects_incomplete_ha_executor_deployment(monkeypatch):
+    lock = _TrackedLock()
+    api_deployment = _deployment(server_role='api')
+    controller_deployment = _deployment(kind='controller')
+    executor_deployment = _deployment(kind='executor', ready_replicas=1)
+    _install_clients(
+        monkeypatch, lock,
+        [[api_deployment, controller_deployment, executor_deployment]], [])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='executor writer Deployment rollout'):
+        broker.activate_protocol_v2()
+
+
+@pytest.mark.parametrize('non_postgres_role', ['api', 'controller', 'executor'])
+def test_activation_rejects_non_postgres_writer_deployment(
+        monkeypatch, non_postgres_role):
+    lock = _TrackedLock()
+    deployments = [
+        _deployment(server_role='api',
+                    request_backend=('sqlite' if non_postgres_role == 'api' else
+                                     'postgres')),
+        _deployment(kind='controller',
+                    request_backend=('sqlite' if non_postgres_role
+                                     == 'controller' else 'postgres')),
+        _deployment(kind='executor',
+                    request_backend=('sqlite' if non_postgres_role == 'executor'
+                                     else 'postgres')),
+    ]
+    _install_clients(monkeypatch, lock, [deployments], [])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='does not use the PostgreSQL API request backend'):
+        broker.activate_protocol_v2()
+
+
+@pytest.mark.parametrize('non_postgres_role', ['api', 'controller', 'executor'])
+def test_activation_rejects_non_postgres_writer_pod(monkeypatch,
+                                                    non_postgres_role):
+    lock = _TrackedLock()
+    deployments = [
+        _deployment(server_role='api'),
+        _deployment(kind='controller'),
+        _deployment(kind='executor'),
+    ]
+
+    def backend(role):
+        return 'sqlite' if non_postgres_role == role else 'postgres'
+
+    pods = _pod_list(
+        _pod(0, server_role='api', request_backend=backend('api')),
+        _pod(1, server_role='api'),
+        _pod(0, kind='controller', request_backend=backend('controller')),
+        _pod(1, kind='controller'),
+        _pod(0, kind='executor', request_backend=backend('executor')),
+        _pod(1, kind='executor'))
+    _install_clients(monkeypatch,
+                     lock, [deployments], [pods],
+                     bound_pod=pods.items[0])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='does not use the PostgreSQL API request backend'):
         broker.activate_protocol_v2()
 
 
@@ -536,12 +669,37 @@ def test_activation_rejects_independently_overridden_controller_image(
     lock = _TrackedLock()
     api_deployment = _deployment(server_role='api')
     controller_deployment = _deployment(kind='controller')
+    executor_deployment = _deployment(kind='executor')
     pods = _pod_list(_pod(0, server_role='api'), _pod(1, server_role='api'),
                      _pod(0, kind='controller', digest=_DIGEST_B),
-                     _pod(1, kind='controller', digest=_DIGEST_B))
-    _install_clients(monkeypatch,
-                     lock, [[api_deployment, controller_deployment]], [pods],
-                     bound_pod=pods.items[0])
+                     _pod(1, kind='controller', digest=_DIGEST_B),
+                     _pod(0, kind='executor'), _pod(1, kind='executor'))
+    _install_clients(
+        monkeypatch,
+        lock, [[api_deployment, controller_deployment, executor_deployment]],
+        [pods],
+        bound_pod=pods.items[0])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='writer fleet has mixed'):
+        broker.activate_protocol_v2()
+
+
+def test_activation_rejects_independently_overridden_executor_image(
+        monkeypatch):
+    lock = _TrackedLock()
+    api_deployment = _deployment(server_role='api')
+    controller_deployment = _deployment(kind='controller')
+    executor_deployment = _deployment(kind='executor')
+    pods = _pod_list(_pod(0, server_role='api'), _pod(1, server_role='api'),
+                     _pod(0, kind='controller'), _pod(1, kind='controller'),
+                     _pod(0, kind='executor', digest=_DIGEST_B),
+                     _pod(1, kind='executor', digest=_DIGEST_B))
+    _install_clients(
+        monkeypatch,
+        lock, [[api_deployment, controller_deployment, executor_deployment]],
+        [pods],
+        bound_pod=pods.items[0])
 
     with pytest.raises(broker.ProtocolV2ActivationError,
                        match='writer fleet has mixed'):
@@ -732,7 +890,8 @@ def test_activation_rejects_unstable_double_read(monkeypatch, changed_object):
 
 @pytest.mark.parametrize(
     'changed_object',
-    ('controller-deployment', 'controller-pod', 'controller-process'))
+    ('controller-deployment', 'controller-pod', 'controller-process',
+     'executor-deployment', 'executor-pod', 'executor-process'))
 def test_activation_rejects_unstable_ha_writer_double_read(
         monkeypatch, changed_object):
     lock = _TrackedLock()
@@ -742,33 +901,50 @@ def test_activation_rejects_unstable_ha_writer_double_read(
         kind='controller',
         resource_version=('controller-deployment-rv-2' if changed_object
                           == 'controller-deployment' else 'deployment-rv-1'))
+    first_executor = _deployment(kind='executor')
+    second_executor = _deployment(
+        kind='executor',
+        resource_version=('executor-deployment-rv-2' if changed_object
+                          == 'executor-deployment' else 'deployment-rv-1'))
     first_pods = _pod_list(_pod(0, server_role='api'), _pod(1,
                                                             server_role='api'),
                            _pod(0, kind='controller'), _pod(1,
-                                                            kind='controller'))
+                                                            kind='controller'),
+                           _pod(0, kind='executor'), _pod(1, kind='executor'))
     second_pods = _pod_list(
         _pod(0, server_role='api'), _pod(1, server_role='api'),
         _pod(0,
              kind='controller',
              resource_version=('controller-pod-rv-changed' if changed_object
                                == 'controller-pod' else 'controller-pod-rv-0')),
-        _pod(1, kind='controller'))
+        _pod(1, kind='controller'),
+        _pod(0,
+             kind='executor',
+             resource_version=('executor-pod-rv-changed' if changed_object
+                               == 'executor-pod' else 'executor-pod-rv-0')),
+        _pod(1, kind='executor'))
     first_instances = _writer_instances(first_pods)
     second_instances = list(_writer_instances(second_pods))
-    if changed_object == 'controller-process':
-        original = second_instances[0]
-        second_instances[0] = serve_state.ReservedFillWriterInstance(
-            role=original.role,
-            instance_id=original.instance_id,
-            pod_name=original.pod_name,
-            pod_uid=original.pod_uid,
-            version='changed-version',
-            ready=original.ready,
-            draining=original.draining)
+    if changed_object in ('controller-process', 'executor-process'):
+        changed_role = changed_object.removesuffix('-process')
+        changed_index = next(
+            index for index, instance in enumerate(second_instances)
+            if instance.role == changed_role)
+        original = second_instances[changed_index]
+        second_instances[
+            changed_index] = serve_state.ReservedFillWriterInstance(
+                role=original.role,
+                instance_id=original.instance_id,
+                pod_name=original.pod_name,
+                pod_uid=original.pod_uid,
+                version='changed-version',
+                ready=original.ready,
+                draining=original.draining)
     _install_clients(
         monkeypatch,
-        lock, [[api_deployment, first_controller],
-               [api_deployment, second_controller]], [first_pods, second_pods],
+        lock, [[api_deployment, first_controller, first_executor],
+               [api_deployment, second_controller, second_executor]],
+        [first_pods, second_pods],
         bound_pod=first_pods.items[0],
         writer_instance_lists=[first_instances,
                                tuple(second_instances)])
@@ -846,14 +1022,50 @@ def test_activation_rejects_schema_other_than_exact_035(monkeypatch):
     setter.assert_not_called()
 
 
+def test_activation_rejects_api_request_schema_other_than_exact_008(
+        monkeypatch):
+    lock = _TrackedLock()
+    engine = object()
+    monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
+    monkeypatch.setattr(serve_state, 'get_database_engine',
+                        mock.Mock(return_value=engine))
+
+    def current_revision(observed_engine, section):
+        assert lock.held
+        assert observed_engine is engine
+        return {
+            broker.migration_utils.SERVE_DB_NAME: '035',
+            broker.migration_utils.API_REQUESTS_DB_NAME: '007',
+        }[section]
+
+    monkeypatch.setattr(broker.migration_utils, 'get_current_alembic_revision',
+                        current_revision)
+    token_reader = mock.Mock()
+    monkeypatch.setattr(broker, '_read_token_bound_pod_identity', token_reader)
+    setter = mock.Mock()
+    monkeypatch.setattr(serve_state, 'set_reserved_fill_protocol_version',
+                        setter)
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='exact API-request schema revision 008'):
+        broker.activate_protocol_v2()
+    token_reader.assert_not_called()
+    setter.assert_not_called()
+
+
 def test_activation_rejects_already_active_protocol_before_observing_rollout(
         monkeypatch):
     lock = _TrackedLock()
     monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
     monkeypatch.setattr(serve_state, 'get_database_engine',
                         mock.Mock(return_value=object()))
-    monkeypatch.setattr(broker.migration_utils, 'get_current_alembic_revision',
-                        mock.Mock(return_value='035'))
+    monkeypatch.setattr(
+        broker.migration_utils, 'get_current_alembic_revision',
+        mock.Mock(
+            side_effect=lambda _engine, section: {
+                broker.migration_utils.SERVE_DB_NAME: '035',
+                broker.migration_utils.API_REQUESTS_DB_NAME: '008',
+            }[section]))
     monkeypatch.setattr(serve_state, 'get_reserved_fill_protocol_state',
                         mock.Mock(return_value={'protocol_version': 2}))
     token_reader = mock.Mock()

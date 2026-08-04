@@ -34,6 +34,10 @@ def _request(*, status=requests.RequestStatus.WAITING):
         should_retry=True,
         finished_at=None,
         file_mounts_blob_id='blob-1',
+        execution_generation=7,
+        execution_quiescence_required=True,
+        execution_quiesced_generation=7,
+        execution_quiesced_at=124.5,
     )
 
 
@@ -88,6 +92,10 @@ def test_wire_projection_round_trip_and_late_bound_seams(monkeypatch):
     assert display_payload.error == 'null'
     assert display_payload.pid is None
     assert display_payload.file_mounts_blob_id == 'blob-1'
+    assert display_payload.execution_generation == 7
+    assert display_payload.execution_quiescence_required is True
+    assert display_payload.execution_quiesced_generation == 7
+    assert display_payload.execution_quiesced_at == 124.5
     assert full_payload.status == requests.RequestStatus.RUNNING.value
     assert decoded.request_id == request.request_id
     assert decoded.entrypoint is _entrypoint
@@ -95,6 +103,12 @@ def test_wire_projection_round_trip_and_late_bound_seams(monkeypatch):
     assert decoded.schedule_type is requests.ScheduleType.LONG
     assert decoded.request_body == request.request_body
     assert decoded.file_mounts_blob_id == request.file_mounts_blob_id
+    assert decoded.execution_generation == request.execution_generation
+    assert (decoded.execution_quiescence_required ==
+            request.execution_quiescence_required)
+    assert (decoded.execution_quiesced_generation ==
+            request.execution_quiesced_generation)
+    assert decoded.execution_quiesced_at == request.execution_quiesced_at
     user_lookup.assert_called_once_with()
     assert version_lookup.call_count == 2
 

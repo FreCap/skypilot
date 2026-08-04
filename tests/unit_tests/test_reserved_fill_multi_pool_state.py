@@ -58,6 +58,7 @@ def state_engine(postgres_engine, monkeypatch):
         connection.execute(serve_state.services_table.insert().values(
             name='svc',
             hash='service-hash',
+            resource_scope='service-hash',
             controller_pid=17,
             controller_ip='10.0.0.17',
             status='READY'))
@@ -105,11 +106,13 @@ def test_recent_reserved_fill_writer_instances_are_database_wide(state_engine):
 
     live_all = instance('all', 0)
     live_draining_controller = instance('controller', 1, draining=True)
-    excluded_api = instance('api', 2)
-    stale_controller = instance('controller', 3, age_seconds=60)
+    live_executor = instance('executor', 2)
+    excluded_api = instance('api', 3)
+    stale_controller = instance('controller', 4, age_seconds=60)
     with state_engine.begin() as connection:
         connection.execute(request_postgres_schema.SERVER_INSTANCES.insert(), [
-            live_all, live_draining_controller, excluded_api, stale_controller
+            live_all, live_draining_controller, live_executor, excluded_api,
+            stale_controller
         ])
 
     observed = serve_state.get_recent_reserved_fill_writer_instances(20)
@@ -132,6 +135,14 @@ def test_recent_reserved_fill_writer_instances_are_database_wide(state_engine):
                 version=str(live_draining_controller['version']),
                 ready=False,
                 draining=True),
+            serve_state.ReservedFillWriterInstance(
+                instance_id=str(live_executor['instance_id']),
+                role='executor',
+                pod_name=str(live_executor['pod_name']),
+                pod_uid=str(live_executor['pod_uid']),
+                version=str(live_executor['version']),
+                ready=True,
+                draining=False),
         ),
                key=lambda item:
                (item.role, item.pod_uid or '', item.instance_id)))
@@ -469,6 +480,59 @@ def test_owner_loss_rejects_complete_set_without_mutation(state_engine):
     assert serve_state.get_reserved_fill_service_claim_set('svc') is None
 
 
+@pytest.mark.parametrize('resource_scope', [None, '', 'different-incarnation'])
+def test_protocol_v2_unscoped_owner_withdraws_stale_claim_set(
+        state_engine, resource_scope):
+    assert _activate_v2()
+    assert _replace([_edge('east', 0)]) == 1
+    before_protocol = serve_state.get_reserved_fill_protocol_state()
+    with state_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.services_table).where(
+                serve_state.services_table.c.name == 'svc').values(
+                    resource_scope=resource_scope))
+
+    assert _replace([_edge('east', 0)], heartbeat=101.0) is None
+
+    assert serve_state.get_reserved_fill_service_claim_set('svc') is None
+    assert serve_state.get_authoritative_reserved_fill_claims() == []
+    after_protocol = serve_state.get_reserved_fill_protocol_state()
+    assert after_protocol['protocol_version'] == 2
+    assert (after_protocol['claim_generation'] ==
+            before_protocol['claim_generation'])
+    with state_engine.connect() as connection:
+        # pylint: disable=not-callable
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state.reserved_fill_claims_table).where(
+                    serve_state.reserved_fill_claims_table.c.service_name ==
+                    'svc')).scalar_one() == 0
+
+
+def test_protocol_v1_owner_fence_accepts_legacy_null_scope(state_engine):
+    with state_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.services_table).where(
+                serve_state.services_table.c.name == 'svc').values(
+                    resource_scope=None))
+
+    assert serve_state.upsert_reserved_fill_claim(
+        'svc',
+        pool_key='["legacy-context","h200"]',
+        weight=1.0,
+        floor_replicas=0,
+        gpus_per_replica=8,
+        holdings_fill=0,
+        effective_cap=1,
+        launchable=True,
+        heartbeat_ts=100.0,
+        expected_service_hash='service-hash',
+        expected_controller_owner=(17, '10.0.0.17'))
+    assert [
+        row['service_name'] for row in serve_state.get_reserved_fill_claims()
+    ] == ['svc']
+
+
 def test_claim_set_and_legacy_projection_failure_roll_back_atomically(
         state_engine):
     """A projection SQL failure cannot expose a half-replaced v2 set."""
@@ -571,6 +635,7 @@ def test_service_name_reuse_fences_old_round_and_decision_generation(
         connection.execute(serve_state.services_table.insert().values(
             name='svc',
             hash='successor-hash',
+            resource_scope='successor-hash',
             controller_pid=23,
             controller_ip='10.0.0.23',
             status='READY'))

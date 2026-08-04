@@ -1,7 +1,8 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: feature implementation complete after adversarial review; final CI,
-production rollout, and the compatibility-cleanup merge gates remain open
+Status: feature implementation and final adversarial review complete; final
+required CI, production rollout, and the compatibility-cleanup merge gates
+remain open
 
 Last updated: 2026-08-04
 
@@ -199,6 +200,14 @@ controller Deployment. HA mode requires the same API Deployment with role
 The controller image may be independently configured, but its live immutable
 digest must equal the API digest before activation.
 
+Every discovered Deployment and Pod container must also carry the literal
+`SKYPILOT_API_REQUEST_BACKEND=postgres`. Schema 008 existing in the shared
+PostgreSQL catalog is not by itself proof that request execution uses it: a
+release inheriting the chart's SQLite request-store default must fail
+activation and demotion attestation. Protocol v2 therefore cannot activate
+until the one-way request-store cutover has completed for the entire writer
+fleet.
+
 The action reads every discovered Deployment, every Pod in the release
 namespace, and every recent `all`/`controller` server-instance lease in the
 shared PostgreSQL database twice. Each Deployment must retain the same
@@ -239,7 +248,12 @@ shadow. Under the exact existing global broker lock, and only after acquiring
 that lock (never while holding a database transaction), one owner-fenced
 transaction:
 
-1. locks the service owner and service claim-set row;
+1. locks the service owner, including `resource_scope`, and the service
+   claim-set row; protocol v2 requires the scope to be nonempty and equal the
+   expected service hash before publishing any edge. An owner-valid unscoped
+   or mismatched service atomically withdraws its prior normalized edges,
+   claim-set row, and legacy projection so it cannot absorb pool grants it is
+   unable to launch, and its in-process grant cache is cleared;
 2. retains the existing generation for an identical semantic heartbeat, or
    allocates a new globally monotonic generation from the protocol singleton
    for every semantic change (including edge removal and disable/re-enable);
@@ -441,12 +455,149 @@ every `sdk.launch` attempt, after any launch-pool queue delay, that guard again
 requires the exact pinned Kubernetes context/card/count and force-refreshes
 the context's physical UID; a mismatch fails closed before the cloud mutation.
 This closes context retargeting between row persistence and provider launch.
-An interrupted `PENDING` or `PROVISIONING` fill row is never recovery-re-driven:
-the new controller first cancels and awaits every active API launch request
-for that exact replica cluster. Any cancellation/status uncertainty retains
-the durable row and retries the recovery pass. Only after the request barrier
-proves terminal does recovery recheck provider inventory, schedule immediate
-teardown, and let the broker refill the opportunistic slot under fresh
+Protocol-v2 fill is admitted only when the service's nonempty durable
+`resource_scope` equals its service-incarnation hash; its replica cluster name
+must be the deterministic name for that exact service scope and replica ID.
+This makes the cluster name an incarnation identity rather than the reusable
+legacy `{service}-{replica}` name. Because protocol selection is global, an
+existing pre-scope service has reserved fill inactive after protocol-v2
+activation until it is recreated with an incarnation scope; it cannot keep
+emitting protocol-v1 fill independently.
+An interrupted `PENDING` or `PROVISIONING` fill row is never recovery-re-driven.
+The new controller classifies every interrupted row from its durable pool key,
+service generation, and physical-cluster UID. A complete, internally
+consistent protocol-v2 tuple uses the strong PostgreSQL history barrier; a
+genuine protocol-v1 tuple with no physical UID and its historical null/zero
+service generation uses the compatibility active-request barrier; any partial
+or contradictory tuple fails recovery
+closed. Mixed waves run both barriers before any row is torn down. The
+controller batches each partition, snapshots every relevant API launch request
+for those exact replica clusters, and retains the exact request IDs through
+cancellation. A terminal request status alone is not
+quiescence: PostgreSQL cancellation publishes `CANCELLED` before the remote
+executor necessarily observes its heartbeat and stops the handler. Revision
+008 therefore adds `execution_quiescence_required` plus nullable
+`execution_quiesced_generation` and `execution_quiesced_at` request columns.
+Old rows default to not required; every version-70 queue claim sets required
+and clears the prior receipt. This avoids treating legacy signal delivery as
+proof without retaining all pre-version-70 request history forever. The
+generation field is the durable proof that one exact request execution has
+stopped running effect-bearing handler code; the existing legacy
+`cancel_acknowledged_at` signal-delivery timestamp is explicitly insufficient.
+Cancellation may publish quiescence
+atomically only while its locked row is still `PENDING` and has the matching
+durable delivery, because the terminal transition then prevents
+`try_mark_running` from winning. `WAITING` is not sufficient: a broken shared
+process pool can publish and requeue `WAITING`, clearing its claim/worker,
+before every surviving handler is known stopped. `WAITING` therefore requires
+an existing exact wrapper receipt. A `RUNNING` row is never inferred quiescent
+from a null PID. Otherwise the owning executor publishes the proof, fenced by
+request ID, execution generation, claim token, and worker instance. The
+executing worker publishes it
+only at the end of its own effect-bearing cleanup, for any terminal outcome.
+The monitor may retry that write after `Future.result()` returns normally or
+after it receives the wrapper's explicitly serialized `ExecutionRetryableError`;
+the latter fallback runs before the monitor changes the row to `WAITING` or
+requeues it. Both outcomes prove that exact wrapper invocation returned. The
+monitor must not acknowledge `BrokenProcessPool` or another ambiguous Future
+exception: CPython can break unrelated pending futures before every process in
+the shared pool has exited, and this pool deliberately has no safe task-to-PID
+map. A claimed version-70 request is never automatically requeued after
+`BrokenProcessPool`, regardless of its ordinary retry flag. Requeueing would
+create a second execution generation whose later receipt could mask the still-
+running first generation. The request instead becomes terminal-but-unproven,
+and recovery retains the replica until the exact old invocation is reconciled.
+Ordinary capacity retries raised by a live wrapper remain unchanged.
+
+The receipt proves completion of the exact wrapper/handler invocation, not
+exit of its reusable ProcessPool PID. Durable handlers must not detach
+effect-bearing Python threads; cancellation runs the wrapper's child-process
+cleanup before it publishes the receipt. The worker's SIGTERM interruption
+gate is one-shot and exact-claim-addressed. Before signalling, the owning
+executor creates a mode-0600 cancellation marker whose path includes a digest
+of the PID, request ID, execution generation, and claim token. The active
+wrapper independently derives and holds that path. Its signal handler raises
+`KeyboardInterrupt` only when the marker for its current invocation exists,
+atomically consumes that marker, and disarms the gate first. The sender first
+verifies through the local process table that the PID is a titled ProcessPool
+executor direct child of the current server process and refuses a PID already
+observed as unrelated. This matches production, where the short and long
+RequestWorker dispatchers are threads rather than OS processes. It then holds
+the exact request row lock across
+marker creation, `os.kill`, and the signal-delivery write, and does not signal
+an invocation that already has its exact receipt. A successful wrapper receipt
+takes that same lock before its
+Future can return and its ProcessPool PID can be reused. Thus a wrapper-first
+race normally observes the receipt and sends no signal, while a sender-first
+race keeps generation A in its wrapper until signal delivery commits. If the
+receipt write fails or the worker crashes, the exact marker remains the fence:
+a generation-A marker is ignored by a replacement worker running generation B.
+A non-SkyPilot process could theoretically acquire the PID between the process-
+table check and `os.kill`; closing that operating-system TOCTOU completely
+would require persisting a process birth identity or using a Linux pidfd. That
+pre-existing, same-container race is outside this rollout's exact SkyPilot-
+worker reuse guarantee.
+A duplicate signal during A's cleanup is ignored. The next invocation installs
+its distinct path immediately before handler execution, and wrapper exit clears
+only its own marker. Marker removal is best effort: an unlink error cannot turn
+an otherwise completed wrapper Future into an ambiguous failure and suppress
+its receipt; claim-addressed paths make a residual marker inert and bounded-age
+pruning removes it later. Receipt publication is additionally guarded by an
+explicit wrapper-local completion flag. Cancellation sets that flag only after
+child-process cleanup returns successfully; cleanup failure leaves it false
+and the exceptional Future cannot publish the monitor fallback. Tests cover delayed
+PID reuse, locked sender/wrapper ordering, a duplicate while cleanup is blocked,
+and cleanup failure. Literal retirement of every reusable worker process is
+neither required nor claimed.
+
+Before cancellation the controller captures each retained exact request ID and
+`execution_generation`. It polls those IDs including terminal rows, and
+requires every terminal target to report
+`execution_quiesced_generation == captured_generation`. This also covers a
+handler that wins the terminal race with `SUCCEEDED` or `FAILED`; status alone
+never proves quiescence. The generation proof is a mixed-rollout capability
+fence: an old executor may still write the legacy cancellation timestamp, but
+cannot populate the new column. A missing row, null/mismatched generation, an
+old server response without the fields, an unexpected identity/status,
+timeout, transport error, or ownership change is uncertainty: the durable
+replica rows remain and the recovery pass retries.
+
+An active-only discovery is insufficient because another controller or caller
+can already have published `CANCELLED` while the remote handler still runs.
+Interrupted-fill recovery therefore uses an additive API-version-70,
+POST/body-backed status filter that reads all request statuses for the whole
+set of validated incarnation-scoped replica cluster names in one PostgreSQL
+query. The server itself applies the exact `sky.launch` request-name allowlist;
+callers cannot supply arbitrary internal request names. This internal mode is
+accepted only from the current PostgreSQL controller generation proven by the
+server's existing origin middleware (or a loopback compatibility caller), is
+absent from the legacy GET endpoint, and uses a scalar PostgreSQL projection.
+Unrelated request history and large launch payloads are therefore neither
+transferred nor decoded.
+There is deliberately no request-age cutoff: wall-clock age is not execution
+or identity proof, and every retained required/unproved request for the exact
+incarnation-scoped cluster name remains relevant. The body transport also
+carries the retained exact request IDs during polling, so
+large waves cannot overflow ingress URL/header limits or degrade into one
+database query per ID; exact polling uses one primary-key `IN` query. Revision
+008 adds a partial `(cluster_name, status)` index only for receipt-required
+rows whose exact generation is still unproved; the query combines those rows
+with the existing active-status index instead of scanning either unrelated
+terminal history or the growing set of successfully proved requests. It
+captures every matching launch generation,
+cancels the active subset, and requires the generation proof from both that
+subset and matching requests that were already terminal.
+The API request retention predicate keeps any required terminal generation
+whose quiescence proof is null or mismatched, so request GC cannot erase the
+only evidence while its handler may still mutate; pre-version-70 rows remain
+subject to the existing retention policy. Comprehensive discovery ignores
+non-required terminal legacy history but requires the bit and exact receipt for
+every active protocol-v2 target. This history mode is required for
+protocol-v2 interrupted fill; compatibility teardown retains active-only
+discovery for local/SQLite and pre-version-70 deployments.
+Only after this barrier completes and a fresh active-request scan remains empty
+does recovery recheck provider inventory, schedule immediate teardown for the
+whole batch, and let the broker refill opportunistic slots under fresh
 authority. Ordinary demand recovery is unchanged.
 
 The selected replica persists `reserved_fill_pool_key`,
@@ -507,16 +658,19 @@ shelter them.
 1. Merge revision 035, normalized claims, pool-aware runtime, and tests while
    the durable protocol gate remains v1. Protocol-v1 one-pool behavior is
    unchanged and multi-context fill remains mechanically inactive.
-2. Run the migration Job, wait for its Pod to become terminal, then replace
-   every API/controller process. Resource
+2. Complete the supported one-way API request-store cutover to PostgreSQL, run
+   the migration Job, wait for its Pod to become terminal, then replace every
+   API/controller/executor process. Resource
    action authority remains explicitly disabled during the 034-to-035 mixed
    rollout: old code recognizes only 034 evidence, new code recognizes only
    freshly produced 035 evidence, and neither may promote from evidence
    produced for the other schema head.
 3. Verify healthy legacy rounds, then run the zero-argument explicit activation
    action inside an API pod. The action takes the global broker lock,
-   mechanically verifies exact schema head 035 plus stable all-ready API and,
-   in HA mode, controller Deployment/pod cohorts at one immutable digest. It
+   mechanically verifies exact Serve schema head 035, exact API-request schema
+   head 008, plus stable all-ready API and, in HA mode, controller and executor
+   Deployment/pod cohorts at one immutable digest with a literal PostgreSQL
+   request backend. It
    also requires the database-wide recent writer leases to equal those Pods;
    wait at least the server-instance stale horizon after retiring an old or
    draining release before retrying. The action derives its proof and performs
@@ -535,9 +689,10 @@ Normal rollback must happen while the v2 image still runs: disable fill (or
 remove every secondary context), wait for pending v2 launches to be fenced and
 for secondary normalized claims to disappear, then run the zero-argument
 `python -m sky.serve.reserved_capacity_demotion` action inside an API pod. The
-action takes the same global broker lock, requires exact schema head 035, and
-uses its mounted pod-bound token to double-read and attest the complete stable
-API/controller writer rollout. It accepts no operator-supplied rollout identity.
+action takes the same global broker lock, requires exact schema head 035 and
+API-request schema head 008, and uses its mounted pod-bound token to double-read
+and attest the complete stable API/controller/executor writer rollout. It
+accepts no operator-supplied rollout identity.
 
 Under that lock, demotion takes PostgreSQL table locks that also exclude an old
 v1 writer unaware of the protocol singleton. In one transaction it inventories
@@ -566,7 +721,7 @@ because the old validator cannot recognize current evidence.
 
 The cleanup PR may merge only after:
 
-- all production API and controller processes have run the new image for the
+- all production API, controller, and executor processes have run the new image for the
   documented rollback window;
 - every live legacy claim has an equivalent normalized edge;
 - east-only and east-plus-PHX services have completed update and restart
@@ -588,9 +743,10 @@ Automated coverage must include:
 - same-service claims in two pools without overwrite;
 - migration-shadow versus legacy-heartbeat races, legacy move/delete versus
   v2 adoption, owner rotation, and atomic set-plus-projection failure;
-- protocol-v2 activation rejection for schema mismatch, an incomplete or
-  mixed-image API/controller rollout, a missing or independently overridden
-  controller, a changing double-read cohort, an active migration Pod, an
+- protocol-v2 activation rejection for either schema mismatch, any non-
+  PostgreSQL writer request backend, an incomplete or mixed-image
+  API/controller/executor rollout, a missing or independently
+  overridden controller or executor, a changing double-read cohort, an active migration Pod, an
   unattested same-release writer Pod, an extra/unready/draining database
   writer lease, an invalid Pod -> ReplicaSet -> Deployment UID chain,
   malformed/unbound or swapped in-cluster tokens, spoofed caller/environment
@@ -620,10 +776,16 @@ Automated coverage must include:
   rows retain the legacy placement fallback;
 - context retargeting both before persistence and after launch-pool queuing,
   with the latter rejected by the per-attempt pre-cloud UID/shape guard;
-- recovery of interrupted fill rows schedules teardown without a second launch,
-  including an already-accepted launch whose cluster record is initially
-  absent: teardown waits for request quiescence, while uncertainty retains the
-  row and ordinary demand recovery remains unchanged;
+- recovery of interrupted fill rows schedules batched teardown without a
+  second launch, including an already-accepted launch whose cluster record is
+  initially absent: terminal cancellation without executor acknowledgement is
+  insufficient, the exact request-generation barrier waits for durable handler
+  quiescence, arbitrarily old required history is still included, mixed v1/v2
+  waves run separate compatibility/strong barriers before any teardown, and
+  malformed scope/protocol, missing, old-server, timeout, or ownership
+  uncertainty retains every row while ordinary demand recovery remains
+  unchanged, plus delayed same-PID delivery cannot cancel the next invocation
+  and a broken pool cannot create a masking execution generation;
 - no row/thread on malformed, removed, benched, or superseded pool launches;
 - pool-local demand saturation and scale-down shelter;
 - legacy dynamic-state load and new per-pool dump/load; and
@@ -645,15 +807,28 @@ Local pre-PR evidence on 2026-08-04: the feature-focused suite completed with
 1,547 passed, 54 environment-dependent skips (including PostgreSQL/Docker),
 and 28 passing subtests using the supported Kubernetes client 35.0.0; all 133
 affected Helm unit tests passed;
-repository mypy completed with no issues across 881 files; pylint scored
+repository mypy completed with no issues across 883 files; pylint scored
 10.00/10; dashboard lint completed with no warnings; and `git diff --check`
 passed.
+
+Final pre-push safety validation on 2026-08-04 reran the complete affected
+activation, demotion, broker, multi-pool state, replica-manager, request
+executor, request wire/storage, server route, and SDK transport suite
+successfully. Focused real-process regressions prove the production thread-
+dispatcher ProcessPool ownership topology and prove marker-cleanup I/O errors
+cannot suppress a quiescence receipt. The changed production Python passes
+mypy across 883 files and pylint at 10.00/10; the affected executor Helm suite
+passes 12/12. The full local Helm run passes 306 tests and has only the four
+known metrics tests unavailable without the Prometheus dependency chart.
+Docker is unavailable locally, so real-PostgreSQL execution remains a required
+CI gate rather than being reported as local evidence.
 
 Required feature CI on the preceding code-bearing head `1357dec79` completed
 all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
 xfailed, 197 warnings, and 103 subtests passed. The final pre-cloud launch
-guard head must retain the same green required checks before merge.
+guard and execution-quiescence head must retain the same green required checks
+before merge.
 
 Production acceptance requires two live pool claims for `boltz-l4-fleet`, a
 successful PHX H200 replica canary whose persisted location is PHX, unchanged
@@ -664,7 +839,8 @@ fleet no larger than the configured `max_replicas`.
 
 - Revision 035 migration, concurrency, demotion, and killed-session suites have
   passed against real PostgreSQL in required CI. The production database
-  migration and token-bound activation remain to be executed during rollout.
+  migration, request-store PostgreSQL cutover, and token-bound activation
+  remain to be executed during rollout.
 - The SkyPilot image has not yet been built or deployed.
 - The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
 - Draft compatibility cleanup PR #1263 is authored in stack #1264 and must

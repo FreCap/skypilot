@@ -8,7 +8,9 @@ from collections.abc import Generator
 import contextlib
 import contextvars
 import dataclasses
+import hashlib
 import os
+import pathlib
 import time
 from typing import Any, TYPE_CHECKING
 
@@ -29,6 +31,73 @@ class ExecutionClaim:
     request_id: str
     execution_generation: int
     claim_token: str
+
+
+_EXECUTION_CANCELLATION_DIRECTORY = pathlib.Path(
+    '/tmp/skypilot-execution-cancellation')
+_EXECUTION_CANCELLATION_MARKER_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def execution_cancellation_marker_path(pid: int,
+                                       claim: ExecutionClaim) -> pathlib.Path:
+    """Return the unguessable-enough local marker for one exact invocation."""
+    if pid <= 0:
+        raise ValueError('Execution cancellation PID must be positive.')
+    identity = (f'{pid}\0{claim.request_id}\0{claim.execution_generation}\0'
+                f'{claim.claim_token}').encode('utf-8')
+    digest = hashlib.sha256(identity).hexdigest()
+    return _EXECUTION_CANCELLATION_DIRECTORY / f'{pid}-{digest}'
+
+
+def arm_execution_cancellation(pid: int, claim: ExecutionClaim) -> pathlib.Path:
+    """Create an exact-claim marker before signalling a reusable worker PID."""
+    marker = execution_cancellation_marker_path(pid, claim)
+    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cutoff = time.time() - _EXECUTION_CANCELLATION_MARKER_MAX_AGE_SECONDS
+    # A worker normally consumes the marker. If it died just before delivery,
+    # no handshake is possible; bounded-age pruning prevents those markers from
+    # leaking inodes forever without weakening delayed-signal protection.
+    try:
+        for candidate in marker.parent.iterdir():
+            try:
+                if candidate.stat().st_mtime < cutoff:
+                    candidate.unlink()
+            except (FileNotFoundError, OSError):
+                continue
+    except OSError:
+        pass
+    # O_NOFOLLOW prevents replacing the final marker with a symlink in the
+    # shared container filesystem.  The claim token makes paths invocation-
+    # unique, so truncation is safe for duplicate cancellation delivery.
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(marker, flags, 0o600)
+    os.close(fd)
+    return marker
+
+
+def consume_execution_cancellation(marker: pathlib.Path) -> bool:
+    """Atomically consume an exact-claim marker, if it is armed."""
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def clear_execution_cancellation(marker: pathlib.Path | None) -> None:
+    """Best-effort removal of this invocation's marker."""
+    if marker is None:
+        return
+    try:
+        marker.unlink()
+    except OSError:
+        # Cleanup must never turn an otherwise completed wrapper Future into
+        # an ambiguous failure: that would suppress the exact-generation
+        # quiescence receipt forever.  A leftover marker is harmless because
+        # the path is claim-token and generation addressed and is pruned after
+        # a bounded age.
+        pass
 
 
 _EXECUTION_CLAIM: contextvars.ContextVar[ExecutionClaim |
@@ -235,9 +304,25 @@ class RequestBackend(abc.ABC):
         """Signal a cancelled claim owned by this backend instance.
 
         Distributed backends override this so an API process can record
-        cancellation intent and the remote owning executor can acknowledge
-        and deliver it. Returns True only when a matching local generation was
-        signalled or its process had already exited.
+        cancellation intent and the remote owning executor can deliver it.
+        Returning True means only that the matching local generation was
+        signalled or its process had already exited; it does not prove that
+        effect-bearing handler code has quiesced.
+        """
+        del claim
+        return False
+
+    def acknowledge_execution_quiescence(self, claim: ExecutionClaim) -> bool:
+        """Publish execution quiescence for one exact completed invocation.
+
+        This must be called only after the execution Future has completed (or
+        by the execution wrapper after its effect-bearing cleanup). Durable
+        backends override it with request-generation, claim-token, and worker-
+        instance fencing. The default keeps local/plugin backends compatible.
+
+        Returns:
+            True iff the exact claim is already recorded as quiescent or this
+            call recorded it.
         """
         del claim
         return False

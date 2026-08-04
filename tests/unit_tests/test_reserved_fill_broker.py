@@ -785,6 +785,21 @@ def test_replace_claim_set_overlap_withdraws_previous_generation(monkeypatch):
                                      edges=[_v2_edge(pool)],
                                      expected_service_hash=None) is None)
     assert replace.call_count == 1
+    assert all(service != 'svc-a' for service, _pool in broker._GRANT_CACHE)
+    assert ('peer', removed_pool) in broker._GRANT_CACHE
+
+    broker._GRANT_CACHE[('svc-a', pool)] = broker._GrantCacheEntry(
+        3, 1000.0, 'phx-context', ('h200',), 'phx-cluster', 7)
+    replace.return_value = None
+    assert broker.replace_claim_set('svc-a',
+                                    semantic_hash='semantic-v1',
+                                    global_headroom=3,
+                                    utilization_ceiling=3,
+                                    utilization_state={},
+                                    edges=[_v2_edge(pool)],
+                                    expected_service_hash='owner-hash') is None
+    assert all(service != 'svc-a' for service, _pool in broker._GRANT_CACHE)
+    assert ('peer', removed_pool) in broker._GRANT_CACHE
     broker.clear_caches()
 
 

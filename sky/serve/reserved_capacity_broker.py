@@ -81,10 +81,13 @@ _SUPPORTED_PROTOCOLS = frozenset((PROTOCOL_V1, PROTOCOL_V2))
 # itself is still rolling out.
 _API_SERVER_CONTAINER_NAME = 'skypilot-api'
 _CONTROLLER_CONTAINER_NAME = 'skypilot-controller'
+_EXECUTOR_CONTAINER_NAME = 'skypilot-executor'
 _SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
 _RELEASE_NAME_ENV_VAR = 'SKYPILOT_RELEASE_NAME'
+_REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
 _IMAGE_ID_DIGEST_PATTERN = re.compile(r'(?:@|//)(sha256:[0-9a-fA-F]{64})$')
 _PROTOCOL_V2_SCHEMA_REVISION = '035'
+_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION = '008'
 _MAX_SERVICE_ACCOUNT_TOKEN_BYTES = 64 * 1024
 # Keep this equal to the API request server-instance lease's stale horizon.
 # Recently draining/unready rows remain relevant: their controller children may
@@ -132,7 +135,7 @@ class _WriterDeploymentTarget:
 
 @dataclasses.dataclass(frozen=True)
 class _WriterDeploymentSnapshot:
-    """One fully validated API or controller Deployment rollout."""
+    """One fully validated API, controller, or executor rollout."""
 
     role: str
     deployment_name: str
@@ -172,8 +175,8 @@ class _WriterRolloutSnapshot:
         digests = {deployment.image_digest for deployment in self.deployments}
         if len(digests) != 1:
             raise ProtocolV2ActivationError(
-                'The API/controller writer fleet has mixed immutable image '
-                'digests.')
+                'The API/controller/executor writer fleet has mixed immutable '
+                'image digests.')
         return digests.pop()
 
     @property
@@ -989,12 +992,18 @@ def _discover_writer_targets(
     helm_instance = _required_label(bound_pod, _HELM_INSTANCE_LABEL,
                                     'authenticated API Pod')
 
-    matching: dict[str, list[str]] = {'api': [], 'controller': []}
+    matching: dict[str, list[str]] = {
+        'api': [],
+        'controller': [],
+        'executor': [],
+    }
     container_names = {
         'api': _API_SERVER_CONTAINER_NAME,
         'controller': _CONTROLLER_CONTAINER_NAME,
+        'executor': _EXECUTOR_CONTAINER_NAME,
     }
     expected_controller_name = f'{release_name}-controller'
+    expected_executor_name = f'{release_name}-executor'
     for name, deployment in deployments.items():
         for role, container_name in container_names.items():
             container = _deployment_container(deployment,
@@ -1007,7 +1016,8 @@ def _discover_writer_targets(
                     container, _RELEASE_NAME_ENV_VAR,
                     f'{role} writer Deployment candidate')
             except ProtocolV2ActivationError:
-                if name in (api_owner.name, expected_controller_name):
+                if name in (api_owner.name, expected_controller_name,
+                            expected_executor_name):
                     raise
                 continue
             if observed_release != release_name:
@@ -1017,10 +1027,18 @@ def _discover_writer_targets(
                 f'{role} writer Deployment candidate')
             if ((role == 'api' and observed_server_role not in ('all', 'api'))
                     or (role == 'controller' and
-                        observed_server_role != 'controller')):
+                        observed_server_role != 'controller') or
+                (role == 'executor' and observed_server_role != 'executor')):
                 raise ProtocolV2ActivationError(
                     f'The {role} writer Deployment candidate has an invalid '
                     'server role.')
+            request_backend = _literal_env_value(
+                container, _REQUEST_BACKEND_ENV_VAR,
+                f'{role} writer Deployment candidate')
+            if request_backend != 'postgres':
+                raise ProtocolV2ActivationError(
+                    f'The {role} writer Deployment candidate does not use '
+                    'the PostgreSQL API request backend.')
             observed_helm_instance = _required_label(
                 deployment, _HELM_INSTANCE_LABEL,
                 f'{role} writer Deployment candidate')
@@ -1040,21 +1058,31 @@ def _discover_writer_targets(
         container_name=_API_SERVER_CONTAINER_NAME,
         server_role=api_server_role)
     if api_server_role == 'all':
-        if matching['controller'] or expected_controller_name in deployments:
+        if (matching['controller'] or matching['executor'] or
+                expected_controller_name in deployments or
+                expected_executor_name in deployments):
             raise ProtocolV2ActivationError(
-                'A compatibility API release has a separate controller '
-                'Deployment.')
+                'A compatibility API release has a separate controller or '
+                'executor Deployment.')
         return release_name, helm_instance, (api_target,)
     if matching['controller'] != [expected_controller_name]:
         raise ProtocolV2ActivationError(
             'The HA API release does not have exactly its controller writer '
+            'Deployment.')
+    if matching['executor'] != [expected_executor_name]:
+        raise ProtocolV2ActivationError(
+            'The HA API release does not have exactly its executor writer '
             'Deployment.')
     return release_name, helm_instance, (
         api_target,
         _WriterDeploymentTarget(role='controller',
                                 name=expected_controller_name,
                                 container_name=_CONTROLLER_CONTAINER_NAME,
-                                server_role='controller'))
+                                server_role='controller'),
+        _WriterDeploymentTarget(role='executor',
+                                name=expected_executor_name,
+                                container_name=_EXECUTOR_CONTAINER_NAME,
+                                server_role='executor'))
 
 
 def _pod_identity(pod: Any, namespace: str) -> tuple[str, str, str]:
@@ -1077,7 +1105,7 @@ def _is_terminal_pod(pod: Any) -> bool:
 
 
 def _read_recent_writer_instances() -> tuple[_WriterProcessInstance, ...]:
-    """Read every recent all/controller lease from the shared PostgreSQL DB."""
+    """Read every recent all/controller/executor lease from PostgreSQL."""
     try:
         rows = serve_state.get_recent_reserved_fill_writer_instances(
             _WRITER_INSTANCE_STALE_AFTER_SECONDS)
@@ -1090,7 +1118,7 @@ def _read_recent_writer_instances() -> tuple[_WriterProcessInstance, ...]:
         pod_name = row.pod_name
         pod_uid = row.pod_uid
         version = row.version
-        if (role not in ('all', 'controller') or
+        if (role not in ('all', 'controller', 'executor') or
                 any(not isinstance(value, str) or not value
                     for value in (pod_name, pod_uid, version))):
             raise ProtocolV2ActivationError(
@@ -1134,7 +1162,7 @@ def _validate_live_writer_pod_inventory(
     for deployment in deployments:
         if deployment.role == 'api' and len(deployments) > 1:
             continue
-        server_role = 'all' if deployment.role == 'api' else 'controller'
+        server_role = ('all' if deployment.role == 'api' else deployment.role)
         for pod_name, pod_uid, _ in deployment.pod_cohort:
             if pod_uid in attested:
                 raise ProtocolV2ActivationError(
@@ -1155,8 +1183,8 @@ def _validate_live_writer_pod_inventory(
             continue
         matched: list[tuple[str, str]] = []
         for role, container_name in (('api', _API_SERVER_CONTAINER_NAME),
-                                     ('controller',
-                                      _CONTROLLER_CONTAINER_NAME)):
+                                     ('controller', _CONTROLLER_CONTAINER_NAME),
+                                     ('executor', _EXECUTOR_CONTAINER_NAME)):
             container = _pod_container(pod, container_name, required=False)
             if container is None:
                 continue
@@ -1171,11 +1199,20 @@ def _validate_live_writer_pod_inventory(
             server_role = _literal_env_value(container, _SERVER_ROLE_ENV_VAR,
                                              f'{role} writer Pod candidate')
             if ((role == 'api' and server_role not in ('all', 'api')) or
-                (role == 'controller' and server_role != 'controller')):
+                (role == 'controller' and server_role != 'controller') or
+                (role == 'executor' and server_role != 'executor')):
                 raise ProtocolV2ActivationError(
                     'A Helm-scoped writer Pod has an invalid server role.')
+            request_backend = _literal_env_value(
+                container, _REQUEST_BACKEND_ENV_VAR,
+                f'{role} writer Pod candidate')
+            if request_backend != 'postgres':
+                raise ProtocolV2ActivationError(
+                    'A Helm-scoped writer Pod does not use the PostgreSQL API '
+                    'request backend.')
             # HA API-only processes cannot mutate reserved-fill state; the
-            # separately attested controller cohort is the writer population.
+            # separately attested controller and executor cohorts are the
+            # writer population.
             if not (role == 'api' and server_role == 'api'):
                 matched.append((server_role, role))
         if not matched:
@@ -1200,7 +1237,7 @@ def _validate_writer_process_instances(
     for deployment in deployments:
         if deployment.role == 'api' and len(deployments) > 1:
             continue
-        role = 'all' if deployment.role == 'api' else 'controller'
+        role = 'all' if deployment.role == 'api' else deployment.role
         for pod_name, pod_uid, _ in deployment.pod_cohort:
             expected[pod_uid] = (role, pod_name)
     observed: dict[str, tuple[str, str]] = {}
@@ -1325,8 +1362,8 @@ def _read_stable_writer_rollout() -> _WriterRolloutSnapshot:
                                                    api_owner=api_owner)
             if second != first:
                 raise ProtocolV2ActivationError(
-                    'The API/controller writer topology changed between '
-                    'rollout proof reads.')
+                    'The API/controller/executor writer topology changed '
+                    'between rollout proof reads.')
             token_pod = (identity.name, identity.uid)
             for snapshot in (first, second):
                 api_deployments = [
@@ -1364,6 +1401,16 @@ def activate_protocol_v2() -> bool:
                 'Reserved-fill protocol v2 requires exact Serve schema '
                 f'revision {_PROTOCOL_V2_SCHEMA_REVISION}; observed '
                 f'{observed_revision}.')
+        api_request_schema_revision = (
+            migration_utils.get_current_alembic_revision(
+                engine, migration_utils.API_REQUESTS_DB_NAME))
+        if (api_request_schema_revision
+                != _PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION):
+            observed_revision = api_request_schema_revision or 'uninitialized'
+            raise ProtocolV2ActivationError(
+                'Reserved-fill protocol v2 requires exact API-request schema '
+                f'revision {_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION}; '
+                f'observed {observed_revision}.')
         protocol_state = serve_state.get_reserved_fill_protocol_state()
         try:
             current_protocol = int(protocol_state['protocol_version'])
@@ -1405,6 +1452,17 @@ def demote_protocol_v1() -> bool:
             raise ProtocolV1DemotionError(
                 'Reserved-fill protocol v1 demotion requires exact Serve '
                 f'schema revision {_PROTOCOL_V2_SCHEMA_REVISION}; observed '
+                f'{observed_revision}.')
+        api_request_schema_revision = (
+            migration_utils.get_current_alembic_revision(
+                engine, migration_utils.API_REQUESTS_DB_NAME))
+        if (api_request_schema_revision
+                != _PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION):
+            observed_revision = api_request_schema_revision or 'uninitialized'
+            raise ProtocolV1DemotionError(
+                'Reserved-fill protocol v1 demotion requires exact '
+                'API-request schema revision '
+                f'{_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION}; observed '
                 f'{observed_revision}.')
         protocol_state = serve_state.get_reserved_fill_protocol_state()
         try:
@@ -1679,6 +1737,7 @@ def replace_claim_set(
     edge absent from that set or produced by an earlier generation.
     """
     if expected_service_hash is None:
+        _clear_service_cache(service_name)
         logger.error('Protocol-v2 claim-set replacement requires an exact '
                      f'service owner hash for {service_name!r}.')
         return None
@@ -1779,6 +1838,7 @@ def replace_claim_set(
             expected_service_hash=expected_service_hash,
             expected_controller_owner=expected_controller_owner)
         if generation is None:
+            _clear_service_cache(service_name)
             return None
         generation = int(generation)
         edge_by_pool = {

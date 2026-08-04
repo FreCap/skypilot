@@ -2336,6 +2336,36 @@ def _replica_from_state(
     return replica_managers.ReplicaInfo.from_storage_dict(replica_state)
 
 
+def _lock_service_owner_row_in_session(
+    session: orm.Session,
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+    *,
+    require_launch_allowed: bool,
+) -> sqlalchemy.engine.Row | None:
+    """Lock and return one valid service controller owner row."""
+    _lifecycle_epoch_matches_in_session(session, service_name, None)
+    owner = session.execute(
+        sqlalchemy.select(services_table.c.hash,
+                          services_table.c.controller_pid,
+                          services_table.c.controller_ip,
+                          services_table.c.status,
+                          services_table.c.resource_scope).where(
+                              services_table.c.name ==
+                              service_name).with_for_update()).fetchone()
+    if (owner is None or owner[0] != expected_service_hash or
+        (expected_controller_owner is not None and
+         (owner[1], owner[2]) != expected_controller_owner)):
+        return None
+    if require_launch_allowed and owner[3] in {
+            status.value
+            for status in ServiceStatus.replica_launch_blocking_statuses()
+    }:
+        return None
+    return owner
+
+
 def _lock_service_owner_in_session(
     session: orm.Session,
     service_name: str,
@@ -2345,22 +2375,12 @@ def _lock_service_owner_in_session(
     require_launch_allowed: bool,
 ) -> bool:
     """Lock and validate one service controller owner."""
-    _lifecycle_epoch_matches_in_session(session, service_name, None)
-    owner = session.execute(
-        sqlalchemy.select(services_table.c.hash,
-                          services_table.c.controller_pid,
-                          services_table.c.controller_ip,
-                          services_table.c.status).where(
-                              services_table.c.name ==
-                              service_name).with_for_update()).fetchone()
-    if (owner is None or owner[0] != expected_service_hash or
-        (expected_controller_owner is not None and
-         (owner[1], owner[2]) != expected_controller_owner)):
-        return False
-    return (not require_launch_allowed or owner[3] not in {
-        status.value
-        for status in ServiceStatus.replica_launch_blocking_statuses()
-    })
+    return _lock_service_owner_row_in_session(
+        session,
+        service_name,
+        expected_service_hash,
+        expected_controller_owner,
+        require_launch_allowed=require_launch_allowed) is not None
 
 
 def _lock_system_recovery_service_owner_in_session(
@@ -5239,7 +5259,7 @@ def get_recent_reserved_fill_writer_instances(
         request_postgres_schema.SERVER_INSTANCES.c.draining_at,
     ).where(
         request_postgres_schema.SERVER_INSTANCES.c.role.in_(
-            ('all', 'controller')),
+            ('all', 'controller', 'executor')),
         request_postgres_schema.SERVER_INSTANCES.c.heartbeat_at >= cutoff)
     try:
         with engine.connect() as connection:
@@ -5766,12 +5786,33 @@ def replace_reserved_fill_claim_set(
         if int(protocol.protocol_version) != RESERVED_FILL_PROTOCOL_V2:
             session.rollback()
             return None
-        if not _lock_service_owner_in_session(session,
-                                              service_name,
-                                              expected_service_hash,
-                                              expected_controller_owner,
-                                              require_launch_allowed=False):
+        owner = _lock_service_owner_row_in_session(session,
+                                                   service_name,
+                                                   expected_service_hash,
+                                                   expected_controller_owner,
+                                                   require_launch_allowed=False)
+        if owner is None:
             session.rollback()
+            return None
+        resource_scope = owner.resource_scope
+        if (not isinstance(resource_scope, str) or not resource_scope or
+                resource_scope != expected_service_hash):
+            # Protocol selection is global: a legacy/pre-scope service cannot
+            # remain on v1 after activation. Withdraw any prior v2 authority in
+            # this owner-locked transaction so it cannot absorb grants it can
+            # never launch.
+            session.execute(
+                sqlalchemy.delete(reserved_fill_pool_claims_table).where(
+                    reserved_fill_pool_claims_table.c.service_name ==
+                    service_name))
+            session.execute(
+                sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
+                    reserved_fill_service_claim_sets_table.c.service_name ==
+                    service_name))
+            session.execute(
+                sqlalchemy.delete(reserved_fill_claims_table).where(
+                    reserved_fill_claims_table.c.service_name == service_name))
+            session.commit()
             return None
         previous = session.execute(
             sqlalchemy.select(reserved_fill_service_claim_sets_table).where(

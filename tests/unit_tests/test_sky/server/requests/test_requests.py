@@ -1125,6 +1125,16 @@ async def test_get_request_tasks_async(isolated_database):
     assert len(pending_requests) == 1
     assert pending_requests[0].request_id == 'async-req-1'
 
+    # Exact request IDs do not use the legacy prefix semantics.
+    exact_requests = await requests.get_request_tasks_async(
+        requests.RequestTaskFilter(request_ids=['async-req-1', 'async-req-3'],
+                                   sort=True))
+    assert [request.request_id for request in exact_requests
+           ] == ['async-req-3', 'async-req-1']
+    no_prefix_matches = await requests.get_request_tasks_async(
+        requests.RequestTaskFilter(request_ids=['async-req'], sort=True))
+    assert no_prefix_matches == []
+
     # Test 3: Filter by user_id - async
     user1_requests = await requests.get_request_tasks_async(
         requests.RequestTaskFilter(user_id='async-user1', sort=True))
@@ -1314,25 +1324,42 @@ def test_requests_filter():
     assert sql == expected_sql
     assert params == []
 
+    # Test exact request-ID filter (uses parameterized query).
+    filter_request_ids = requests.RequestTaskFilter(
+        request_ids=['request-1', 'request-2'], sort=True)
+    sql, params = filter_request_ids.build_query()
+    expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
+                    'WHERE request_id IN (?,?) ORDER BY created_at DESC')
+    assert sql == expected_sql
+    assert params == ['request-1', 'request-2']
+
+    # An empty exact-ID list matches nothing without emitting invalid IN ().
+    empty_request_ids = requests.RequestTaskFilter(request_ids=[], sort=True)
+    sql, params = empty_request_ids.build_query()
+    expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
+                    'WHERE 1=0 ORDER BY created_at DESC')
+    assert sql == expected_sql
+    assert params == []
+
     # Test status filter
     filter_status = requests.RequestTaskFilter(
         status=[RequestStatus.PENDING, RequestStatus.RUNNING], sort=True)
     sql, params = filter_status.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE status IN (\'PENDING\',\'RUNNING\') '
+                    'WHERE status IN (?,?) '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == ['PENDING', 'RUNNING']
 
     # Test cluster_names filter
     filter_clusters = requests.RequestTaskFilter(
         cluster_names=['cluster1', 'cluster2'], sort=True)
     sql, params = filter_clusters.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE cluster_name IN (\'cluster1\',\'cluster2\') '
+                    'WHERE cluster_name IN (?,?) '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == ['cluster1', 'cluster2']
 
     # Test user_id filter (uses parameterized query)
     filter_user = requests.RequestTaskFilter(user_id='test-user-123', sort=True)
@@ -1347,20 +1374,20 @@ def test_requests_filter():
         exclude_request_names=['request1', 'request2'], sort=True)
     sql, params = filter_exclude.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE name NOT IN (\'request1\',\'request2\') '
+                    'WHERE name NOT IN (?,?) '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == ['request1', 'request2']
 
     # Test include_request_names filter
     filter_include = requests.RequestTaskFilter(
         include_request_names=['request3', 'request4'], sort=True)
     sql, params = filter_include.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE name IN (\'request3\',\'request4\') '
+                    'WHERE name IN (?,?) '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == ['request3', 'request4']
 
     # Test finished_before filter (uses parameterized query)
     timestamp = 1234567890.0
@@ -1382,13 +1409,16 @@ def test_requests_filter():
         sort=True)
     sql, params = filter_combined.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE status IN (\'SUCCEEDED\',\'FAILED\') AND '
-                    'name NOT IN (\'internal-task\') AND '
-                    'cluster_name IN (\'prod-cluster\') AND '
+                    'WHERE status IN (?,?) AND '
+                    'name NOT IN (?) AND '
+                    'cluster_name IN (?) AND '
                     'user_id = ? AND finished_at < ? '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == ['admin-user', 9876543210.0]
+    assert params == [
+        'SUCCEEDED', 'FAILED', 'internal-task', 'prod-cluster', 'admin-user',
+        9876543210.0
+    ]
 
     # Test mutually exclusive filters raise ValueError
     with pytest.raises(ValueError, match='Only one of exclude_request_names'):
@@ -1396,17 +1426,22 @@ def test_requests_filter():
                                    include_request_names=['req2'],
                                    sort=True)
 
-    # Test special characters in names are properly escaped with repr()
-    filter_special_chars = requests.RequestTaskFilter(
-        cluster_names=['cluster\'with\'quotes', 'cluster\"with\"double'],
-        sort=True)
+    with pytest.raises(ValueError, match='Unsupported request status fields'):
+        requests.RequestTaskFilter(fields=['request_id FROM requests; --'])
+
+    # Special characters remain data and cannot alter the SQL expression.
+    filter_special_chars = requests.RequestTaskFilter(cluster_names=[
+        'cluster\'with\'quotes', 'cluster\"with\"double', "x') OR 1=1 --"
+    ],
+                                                      sort=True)
     sql, params = filter_special_chars.build_query()
-    # repr() should properly escape the quotes
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE cluster_name IN (\"cluster\'with\'quotes\",'
-                    '\'cluster\"with\"double\') ORDER BY created_at DESC')
+                    'WHERE cluster_name IN (?,?,?) '
+                    'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == [
+        'cluster\'with\'quotes', 'cluster\"with\"double', "x') OR 1=1 --"
+    ]
 
 
 def test_encode_requests_empty_list():

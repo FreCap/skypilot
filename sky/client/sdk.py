@@ -2719,6 +2719,11 @@ def api_status(
     limit: int | None = None,
     fields: list[str] | None = None,
     cluster_name: str | None = None,
+    cluster_names: list[str] | None = None,
+    _include_request_names: list[str] | None = None,
+    _execution_quiescence_candidates_only: bool = False,
+    _exact_request_ids: bool = False,
+    _use_body: bool = False,
 ) -> list[payloads.RequestPayload]:
     """Lists all requests.
 
@@ -2731,6 +2736,15 @@ def api_status(
         fields: The fields to get. If None, get all fields.
         cluster_name: Filter requests by cluster name.
             If None, show all requests.
+        cluster_names: Filter requests by any of these cluster names in one
+            server-side query. Mutually exclusive with ``cluster_name``.
+        _include_request_names: Internal exact request-name allowlist.
+        _execution_quiescence_candidates_only: Internal PostgreSQL filter for
+            active or receipt-required request generations.
+        _exact_request_ids: Treat ``request_ids`` as full primary keys and
+            query them in one server-side batch instead of as prefixes.
+        _use_body: Use the v70 body-backed endpoint for a potentially large
+            filter set.
 
     Returns:
         A list of request payloads.
@@ -2739,11 +2753,23 @@ def api_status(
         logger.info('SkyPilot API server is not running.')
         return []
 
+    if cluster_name is not None and cluster_names is not None:
+        raise ValueError('cluster_name and cluster_names are mutually '
+                         'exclusive.')
+
     # Backward compatibility check for the new flag cluster_name
     version = versions.get_remote_api_version()
     if (cluster_name is not None) and (version is None or version < 38):
         logger.warning(
             'The flag is ignored because the server does not support it yet.')
+    if (cluster_names is not None and version is not None and version
+            < server_constants.MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.APINotSupportedError(
+                'Filtering API requests by multiple cluster names requires '
+                'API server version '
+                f'{server_constants.MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION}'
+                ' or newer. Please upgrade the remote server.')
 
     body = payloads.RequestStatusBody(
         request_ids=request_ids,
@@ -2751,11 +2777,26 @@ def api_status(
         limit=limit,
         fields=fields,
         cluster_name=cluster_name,
+        cluster_names=cluster_names,
+        include_request_names=_include_request_names,
+        execution_quiescence_candidates_only=(
+            _execution_quiescence_candidates_only),
+        exact_request_ids=_exact_request_ids,
     )
+    use_body = (_use_body or cluster_names is not None or
+                _include_request_names is not None or
+                _execution_quiescence_candidates_only or _exact_request_ids)
+    request_kwargs: dict[str, Any]
+    if use_body:
+        request_kwargs = {'json': json.loads(body.model_dump_json())}
+    else:
+        request_kwargs = {
+            'params': server_common.request_body_to_params(body),
+        }
     response = server_common.make_authenticated_request(
-        'GET',
-        '/api/status',
-        params=server_common.request_body_to_params(body),
+        'POST' if use_body else 'GET',
+        '/api/status/query' if use_body else '/api/status',
+        **request_kwargs,
         timeout=(client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS,
                  None))
     server_common.handle_request_error(response)

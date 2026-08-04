@@ -34,8 +34,13 @@ def _install_demotion_preconditions(monkeypatch, lock: _TrackedLock) -> None:
     monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
     monkeypatch.setattr(serve_state, 'get_database_engine',
                         mock.Mock(return_value=object()))
-    monkeypatch.setattr(broker.migration_utils, 'get_current_alembic_revision',
-                        mock.Mock(return_value='035'))
+    monkeypatch.setattr(
+        broker.migration_utils, 'get_current_alembic_revision',
+        mock.Mock(
+            side_effect=lambda _engine, section: {
+                broker.migration_utils.SERVE_DB_NAME: '035',
+                broker.migration_utils.API_REQUESTS_DB_NAME: '008',
+            }[section]))
     monkeypatch.setattr(serve_state, 'get_reserved_fill_protocol_state',
                         mock.Mock(return_value={'protocol_version': 2}))
 
@@ -106,6 +111,27 @@ def test_demotion_rejects_schema_other_than_exact_035(monkeypatch):
         broker.demote_protocol_v1()
     attester.assert_not_called()
     setter.assert_not_called()
+
+
+def test_demotion_rejects_api_request_schema_other_than_exact_008(monkeypatch):
+    lock = _TrackedLock()
+    monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
+    monkeypatch.setattr(serve_state, 'get_database_engine',
+                        mock.Mock(return_value=object()))
+    monkeypatch.setattr(
+        broker.migration_utils, 'get_current_alembic_revision',
+        mock.Mock(
+            side_effect=lambda _engine, section: {
+                broker.migration_utils.SERVE_DB_NAME: '035',
+                broker.migration_utils.API_REQUESTS_DB_NAME: '007',
+            }[section]))
+    attester = mock.Mock()
+    monkeypatch.setattr(broker, '_read_stable_writer_rollout', attester)
+
+    with pytest.raises(broker.ProtocolV1DemotionError,
+                       match='exact API-request schema revision 008'):
+        broker.demote_protocol_v1()
+    attester.assert_not_called()
 
 
 def test_demotion_rejects_inactive_protocol_before_rollout_read(monkeypatch):

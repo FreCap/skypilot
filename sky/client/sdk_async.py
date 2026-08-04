@@ -824,10 +824,12 @@ async def api_status(
         all_status: bool = False,
         limit: int | None = None,
         fields: list[str] | None = None,
-        cluster_name: str | None = None) -> list[payloads.RequestPayload]:
+        cluster_name: str | None = None,
+        cluster_names: list[str] | None = None
+) -> list[payloads.RequestPayload]:
     """Async version of api_status() that lists all requests."""
     return await asyncio.to_thread(sdk.api_status, request_ids, all_status,
-                                   limit, fields, cluster_name)
+                                   limit, fields, cluster_name, cluster_names)
 
 
 @usage_lib.entrypoint

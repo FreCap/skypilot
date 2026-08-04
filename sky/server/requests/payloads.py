@@ -1185,10 +1185,15 @@ class RequestCancelBody(RequestBody):
 class RequestStatusBody(pydantic.BaseModel):
     """The request body for the API request status endpoint."""
     request_ids: list[str] | None = None
+    # Treat request_ids as exact primary keys instead of legacy prefixes.
+    exact_request_ids: bool = False
     all_status: bool = False
     limit: int | None = None
     fields: list[str] | None = None
     cluster_name: str | None = None
+    cluster_names: list[str] | None = None
+    include_request_names: list[str] | None = None
+    execution_quiescence_candidates_only: bool = False
 
 
 class OperatorNotificationReadBody(pydantic.BaseModel):
@@ -1581,6 +1586,14 @@ class RequestPayload(BasePayload):
     should_retry: bool = False
     finished_at: float | None = None
     file_mounts_blob_id: str | None = None
+    # Servers at MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION or newer expose
+    # these together. Equality between the observed execution generation and
+    # quiesced generation proves that exact invocation has stopped running
+    # effect-bearing handler code.
+    execution_generation: int | None = None
+    execution_quiescence_required: bool | None = None
+    execution_quiesced_generation: int | None = None
+    execution_quiesced_at: float | None = None
 
 
 class SlurmGpuAvailabilityRequestBody(RequestBody):

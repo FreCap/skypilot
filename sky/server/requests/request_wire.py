@@ -63,6 +63,12 @@ def encode_request(
             should_retry=request.should_retry,
             finished_at=request.finished_at,
             file_mounts_blob_id=request.file_mounts_blob_id,
+            execution_generation=request.execution_generation,
+            execution_quiescence_required=(
+                request.execution_quiescence_required),
+            execution_quiesced_generation=(
+                request.execution_quiesced_generation),
+            execution_quiesced_at=request.execution_quiesced_at,
         )
     except (TypeError, ValueError) as e:
         # The error is unexpected, so we don't suppress the stack trace.
@@ -124,6 +130,14 @@ def decode_request(
             should_retry=payload.should_retry,
             finished_at=payload.finished_at,
             file_mounts_blob_id=payload.file_mounts_blob_id,
+            execution_generation=(payload.execution_generation
+                                  if payload.execution_generation is not None
+                                  else 0),
+            execution_quiescence_required=bool(
+                payload.execution_quiescence_required),
+            execution_quiesced_generation=(
+                payload.execution_quiesced_generation),
+            execution_quiesced_at=payload.execution_quiesced_at,
         )
     except (TypeError, ValueError) as e:
         logger.error(
@@ -175,6 +189,12 @@ def encode_requests(
             should_retry=request.should_retry,
             finished_at=request.finished_at,
             file_mounts_blob_id=request.file_mounts_blob_id,
+            execution_generation=request.execution_generation,
+            execution_quiescence_required=(
+                request.execution_quiescence_required),
+            execution_quiesced_generation=(
+                request.execution_quiesced_generation),
+            execution_quiesced_at=request.execution_quiesced_at,
         )
         encoded_requests.append(payload)
     return encoded_requests

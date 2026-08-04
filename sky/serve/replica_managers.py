@@ -1341,6 +1341,38 @@ def _protocol_v2_fill_cloud_launch_guard(
     return True, 'authorized'
 
 
+def _interrupted_reserved_fill_protocol(info: 'ReplicaInfo') -> int:
+    """Classify a durable interrupted fill row without guessing corruption."""
+    persisted = vars(info)
+    pool_key = persisted.get('reserved_fill_pool_key')
+    service_generation = persisted.get('reserved_fill_service_generation')
+    physical_cluster_uid = persisted.get('reserved_fill_physical_cluster_uid')
+    identity = None
+    if pool_key is not None:
+        if not isinstance(pool_key, str) or not pool_key:
+            raise ValueError('invalid reserved-fill pool key')
+        try:
+            identity = reserved_capacity_broker.parse_pool_identity(pool_key)
+        except (TypeError, ValueError) as e:
+            raise ValueError('invalid reserved-fill pool key') from e
+
+    legacy_generation = (service_generation is None or
+                         type(service_generation) is int and
+                         service_generation == 0)
+    if ((identity is None or
+         identity.protocol_version == reserved_capacity_broker.PROTOCOL_V1) and
+            legacy_generation and physical_cluster_uid is None):
+        return reserved_capacity_broker.PROTOCOL_V1
+    if (identity is not None and identity.protocol_version
+            == reserved_capacity_broker.PROTOCOL_V2 and
+            not isinstance(service_generation, bool) and
+            isinstance(service_generation, int) and service_generation > 0 and
+            isinstance(physical_cluster_uid, str) and physical_cluster_uid and
+            identity.physical_cluster_uid == physical_cluster_uid):
+        return reserved_capacity_broker.PROTOCOL_V2
+    raise ValueError('partial or contradictory protocol-v2 fill identity')
+
+
 def _zero_cost_pool_key(
         location: spot_placer.Location) -> tuple[str, str] | None:
     """Return the shared demand pool identity for one exact GPU shape."""
@@ -3352,21 +3384,57 @@ class SkyPilotReplicaManager(ReplicaManager):
             info for info in to_up_replicas
             if getattr(info, 'reserved_fill', False) is True
         ]
-        for info in interrupted_fill_replicas:
+        if interrupted_fill_replicas:
             # The old controller may have submitted sdk.launch before it died
             # without receiving the durable request ID or before the cluster
             # table row appeared.  This recovery pass holds the new manager's
-            # lock, so no current producer can enqueue the same replica; first
-            # cancel and await every API request for its incarnation-scoped
-            # cluster name.  On uncertainty, retain the row and retry the
-            # whole recovery pass instead of creating an unowned cluster.
-            if not serve_utils.quiesce_service_replica_launch_requests(
-                    self._service_name, [info],
-                    continue_guard=self._service_is_launch_authorized):
+            # lock, so no current producer can enqueue these replicas. Cancel
+            # and prove execution-level quiescence for the whole wave in one
+            # API barrier. On uncertainty, retain every row and retry the
+            # recovery pass instead of creating an unowned cluster.
+            legacy_fill_replicas = []
+            protocol_v2_fill_replicas = []
+            resource_scope = getattr(self, '_resource_scope', None)
+            service_hash = getattr(self, '_service_hash', None)
+            try:
+                for info in interrupted_fill_replicas:
+                    protocol = _interrupted_reserved_fill_protocol(info)
+                    if protocol == reserved_capacity_broker.PROTOCOL_V1:
+                        legacy_fill_replicas.append(info)
+                        continue
+                    if (not isinstance(resource_scope, str) or
+                            not resource_scope or
+                            resource_scope != service_hash):
+                        raise ValueError(
+                            'protocol-v2 row has no service incarnation scope')
+                    expected_cluster_name = (
+                        serve_utils.generate_replica_cluster_name(
+                            self._service_name, info.replica_id,
+                            resource_scope))
+                    if info.cluster_name != expected_cluster_name:
+                        raise ValueError(
+                            'protocol-v2 row has a non-incarnation-scoped '
+                            'cluster name')
+                    protocol_v2_fill_replicas.append(info)
+            except ValueError as e:
                 raise RuntimeError(
-                    'Could not quiesce an interrupted reserved-fill launch '
-                    f'for replica {info.replica_id}; retaining its durable '
-                    'row for recovery retry.')
+                    'Could not validate interrupted reserved-fill identity; '
+                    'retaining every durable row for recovery retry.') from e
+
+            barrier_partitions = ((protocol_v2_fill_replicas, True),
+                                  (legacy_fill_replicas, False))
+            for replicas, include_terminal_history in barrier_partitions:
+                if not replicas:
+                    continue
+                if not serve_utils.quiesce_service_replica_launch_requests(
+                        self._service_name,
+                        replicas,
+                        continue_guard=self._service_is_launch_authorized,
+                        include_terminal_history=include_terminal_history):
+                    raise RuntimeError(
+                        'Could not quiesce interrupted reserved-fill launches; '
+                        'retaining their durable rows for recovery retry.')
+        for info in interrupted_fill_replicas:
             logger.warning(
                 f'Replica {info.replica_id} is an interrupted reserved-fill '
                 'launch; scheduling immediate teardown instead of recovery '
@@ -4077,6 +4145,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             'fence')
                         return False
                 if fill_protocol_version == 2:
+                    resource_scope = getattr(self, '_resource_scope', None)
+                    service_hash = getattr(self, '_service_hash', None)
+                    if (not isinstance(resource_scope, str) or
+                            not resource_scope or
+                            resource_scope != service_hash):
+                        self._log_fill_skip(
+                            'protocol-v2 fill requires a durable service '
+                            'incarnation scope')
+                        return False
                     if (isinstance(fill_service_generation, bool) or
                             not isinstance(fill_service_generation, int) or
                             fill_service_generation < 1 or

@@ -1676,6 +1676,7 @@ def test_promotion_recomputes_match_and_counts_only_success(
         actions.ResourceActionMode.AUTHORITATIVE,
         gate_evidence=_gate_evidence(
             candidate_since=old_window,
+            api_revision='008',
             coverage_inventory_sha256=report.coverage_inventory_sha256),
         expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
     assert promoted.record.mode is actions.ResourceActionMode.AUTHORITATIVE

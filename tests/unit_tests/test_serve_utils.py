@@ -183,19 +183,68 @@ def test_resolve_service_workspace_rejects_stored_workspace_mismatch():
 
 def test_launch_quiesce_awaits_cancel_request_before_reporting_success():
     replicas = [
-        mock.Mock(cluster_name='svc-a-r1'),
-        mock.Mock(cluster_name='svc-a-r2'),
+        mock.Mock(cluster_name='svc-a-r1', created_at=100.0),
+        mock.Mock(cluster_name='svc-a-r2', created_at=100.0),
     ]
-    launch_request = mock.Mock(request_id='launch-request')
-    launch_request.name = 'sky.launch'
-    launch_request.cluster_name = 'svc-a-r1'
     cancellation_completed = False
+    quiescence_polls = 0
     events = []
 
-    def _status(*, all_status, fields):
-        assert all_status is False
-        assert fields == ['request_id', 'name', 'cluster_name']
-        return [] if cancellation_completed else [launch_request]
+    def _status(**kwargs):
+        nonlocal quiescence_polls
+        if 'request_ids' not in kwargs:
+            assert kwargs == {
+                'all_status': True,
+                'cluster_names': ['svc-a-r1', 'svc-a-r2'],
+                '_include_request_names': ['sky.launch'],
+                '_execution_quiescence_candidates_only': True,
+                'fields': [
+                    'request_id', 'name', 'cluster_name',
+                    'execution_generation', 'status',
+                    'execution_quiescence_required',
+                    'execution_quiesced_generation', 'execution_quiesced_at'
+                ],
+            }
+            events.append('discovery-status')
+            return [
+                types.SimpleNamespace(
+                    request_id='launch-request',
+                    name='sky.launch',
+                    cluster_name='svc-a-r1',
+                    created_at=101.0,
+                    execution_generation=7,
+                    status=('CANCELLED'
+                            if cancellation_completed else 'RUNNING'),
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=(7 if cancellation_completed
+                                                   else None),
+                    execution_quiesced_at=(1.0
+                                           if cancellation_completed else None))
+            ]
+        assert kwargs == {
+            'request_ids': ['launch-request'],
+            'fields': [
+                'request_id', 'name', 'cluster_name', 'status',
+                'execution_generation', 'execution_quiescence_required',
+                'execution_quiesced_generation', 'execution_quiesced_at'
+            ],
+            '_exact_request_ids': True,
+            '_use_body': True,
+        }
+        events.append('quiescence-status')
+        quiescence_polls += 1
+        return [
+            types.SimpleNamespace(
+                request_id='launch-request',
+                name='sky.launch',
+                cluster_name='svc-a-r1',
+                status='CANCELLED',
+                execution_generation=7,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=(None
+                                               if quiescence_polls == 1 else 7),
+                execution_quiesced_at=(None if quiescence_polls == 1 else 1.0))
+        ]
 
     def _cancel(request_ids, *, all_users, silent):
         assert request_ids == ['launch-request']
@@ -214,13 +263,177 @@ def test_launch_quiesce_awaits_cancel_request_before_reporting_success():
          mock.patch.object(serve_utils.sdk,
                            'api_cancel', side_effect=_cancel), \
          mock.patch.object(serve_utils.sdk,
-                           'stream_and_get', side_effect=_await):
+                           'stream_and_get', side_effect=_await), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION), \
+         mock.patch.object(serve_utils, '_LAUNCH_QUIESCE_POLL_SECONDS', 0):
         quiesced = serve_utils.quiesce_service_replica_launch_requests(
-            'svc', replicas, continue_guard=lambda: True)
+            'svc',
+            replicas,
+            continue_guard=lambda: True,
+            include_terminal_history=True)
 
     assert quiesced
-    assert events == ['cancel-enqueued', 'cancel-awaited']
-    assert status.call_count == 2
+    assert events == [
+        'discovery-status', 'cancel-enqueued', 'cancel-awaited',
+        'quiescence-status', 'quiescence-status', 'discovery-status'
+    ]
+    assert status.call_count == 4
+
+
+@pytest.mark.parametrize('terminal_status', ['SUCCEEDED', 'FAILED'])
+def test_launch_quiesce_accepts_handler_terminal_race(terminal_status):
+    replica = mock.Mock(cluster_name='svc-a-r1', created_at=100.0)
+    active_request = types.SimpleNamespace(request_id='launch-request',
+                                           name='sky.launch',
+                                           cluster_name='svc-a-r1',
+                                           created_at=101.0,
+                                           execution_generation=7,
+                                           status='RUNNING',
+                                           execution_quiescence_required=True,
+                                           execution_quiesced_generation=None,
+                                           execution_quiesced_at=None)
+    terminal_request = types.SimpleNamespace(request_id='launch-request',
+                                             name='sky.launch',
+                                             cluster_name='svc-a-r1',
+                                             created_at=101.0,
+                                             status=terminal_status,
+                                             execution_generation=7,
+                                             execution_quiescence_required=True,
+                                             execution_quiesced_generation=7,
+                                             execution_quiesced_at=1.0)
+    status_results = [[active_request], [terminal_request], []]
+    with mock.patch.object(serve_utils.sdk,
+                           'api_status', side_effect=status_results), \
+         mock.patch.object(serve_utils.sdk,
+                           'api_cancel', return_value='cancel-request'), \
+         mock.patch.object(serve_utils.sdk, 'stream_and_get'), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+        assert serve_utils.quiesce_service_replica_launch_requests(
+            'svc', [replica],
+            continue_guard=lambda: True,
+            include_terminal_history=True)
+
+
+def test_launch_quiesce_missing_terminal_request_fails_closed():
+    replica = mock.Mock(cluster_name='svc-a-r1', created_at=100.0)
+    active_request = types.SimpleNamespace(request_id='launch-request',
+                                           name='sky.launch',
+                                           cluster_name='svc-a-r1',
+                                           created_at=101.0,
+                                           execution_generation=7,
+                                           status='RUNNING',
+                                           execution_quiescence_required=True,
+                                           execution_quiesced_generation=None,
+                                           execution_quiesced_at=None)
+    with mock.patch.object(serve_utils.sdk,
+                           'api_status', side_effect=[[active_request], []]), \
+         mock.patch.object(serve_utils.sdk,
+                           'api_cancel', return_value='cancel-request'), \
+         mock.patch.object(serve_utils.sdk, 'stream_and_get'), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+        assert not serve_utils.quiesce_service_replica_launch_requests(
+            'svc', [replica],
+            continue_guard=lambda: True,
+            include_terminal_history=True)
+
+
+def test_launch_quiesce_old_server_fails_closed():
+    replica = mock.Mock(cluster_name='svc-a-r1', created_at=100.0)
+    active_request = types.SimpleNamespace(request_id='launch-request',
+                                           name='sky.launch',
+                                           cluster_name='svc-a-r1',
+                                           created_at=101.0,
+                                           execution_generation=7,
+                                           status='RUNNING',
+                                           execution_quiescence_required=False,
+                                           execution_quiesced_generation=None,
+                                           execution_quiesced_at=None)
+    cancelled_request = types.SimpleNamespace(
+        request_id='launch-request',
+        name='sky.launch',
+        cluster_name='svc-a-r1',
+        created_at=101.0,
+        status='CANCELLED',
+        execution_generation=7,
+        execution_quiescence_required=False,
+        execution_quiesced_generation=None,
+        execution_quiesced_at=None)
+    with mock.patch.object(
+            serve_utils.sdk,
+            'api_status',
+            side_effect=[[active_request], [cancelled_request]]), \
+         mock.patch.object(serve_utils.sdk,
+                           'api_cancel', return_value='cancel-request'), \
+         mock.patch.object(serve_utils.sdk, 'stream_and_get'), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=(serve_utils.server_constants.
+                           MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION - 1)):
+        assert not serve_utils.quiesce_service_replica_launch_requests(
+            'svc', [replica],
+            continue_guard=lambda: True,
+            include_terminal_history=True)
+
+
+def test_launch_quiesce_history_catches_arbitrarily_old_cancelled_handler():
+    replica = mock.Mock(cluster_name='svc-a-r1', created_at=100.0)
+    unproven = types.SimpleNamespace(request_id='launch-request',
+                                     name='sky.launch',
+                                     cluster_name='svc-a-r1',
+                                     created_at=-1_000_000.0,
+                                     status='CANCELLED',
+                                     execution_generation=7,
+                                     execution_quiescence_required=True,
+                                     execution_quiesced_generation=None,
+                                     execution_quiesced_at=None)
+    proven = types.SimpleNamespace(request_id='launch-request',
+                                   name='sky.launch',
+                                   cluster_name='svc-a-r1',
+                                   created_at=-1_000_000.0,
+                                   status='CANCELLED',
+                                   execution_generation=7,
+                                   execution_quiescence_required=True,
+                                   execution_quiesced_generation=7,
+                                   execution_quiesced_at=1.0)
+    with mock.patch.object(
+            serve_utils.sdk,
+            'api_status',
+            side_effect=[[unproven], [proven], [proven]]) as status, \
+         mock.patch.object(serve_utils.sdk, 'api_cancel') as cancel, \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+        assert serve_utils.quiesce_service_replica_launch_requests(
+            'svc', [replica],
+            continue_guard=lambda: True,
+            include_terminal_history=True)
+
+    assert status.call_args_list[0] == mock.call(
+        all_status=True,
+        cluster_names=['svc-a-r1'],
+        _include_request_names=['sky.launch'],
+        _execution_quiescence_candidates_only=True,
+        fields=[
+            'request_id', 'name', 'cluster_name', 'execution_generation',
+            'status', 'execution_quiescence_required',
+            'execution_quiesced_generation', 'execution_quiesced_at'
+        ])
+    cancel.assert_not_called()
 
 
 def test_launch_quiesce_large_inventory_uses_one_active_request_snapshot():
@@ -233,7 +446,12 @@ def test_launch_quiesce_large_inventory_uses_one_active_request_snapshot():
                           cluster_name='another-service-r1')
     with mock.patch.object(serve_utils.sdk,
                            'api_status', return_value=[unrelated]) as status, \
-         mock.patch.object(serve_utils.sdk, 'api_cancel') as cancel:
+         mock.patch.object(serve_utils.sdk, 'api_cancel') as cancel, \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
         quiesced = serve_utils.quiesce_service_replica_launch_requests(
             'svc', replicas, continue_guard=lambda: True)
 
@@ -248,13 +466,19 @@ def test_launch_quiesce_failure_retains_cleanup_inventory():
     launch_request = mock.Mock(request_id='launch-request')
     launch_request.name = 'sky.launch'
     launch_request.cluster_name = 'svc-a-r1'
+    launch_request.execution_generation = 7
     with mock.patch.object(serve_utils.sdk,
                            'api_status', return_value=[launch_request]), \
          mock.patch.object(serve_utils.sdk,
                            'api_cancel', return_value='cancel-request'), \
          mock.patch.object(serve_utils.sdk,
                            'stream_and_get',
-                           side_effect=RuntimeError('cancel worker down')):
+                           side_effect=RuntimeError('cancel worker down')), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
         assert not serve_utils.quiesce_service_replica_launch_requests(
             'svc', [replica], continue_guard=lambda: True)
 

@@ -43,6 +43,12 @@ tests:
           path: metadata.name
           value: RELEASE-NAME-executor
       - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+      - equal:
           path: spec.replicas
           value: 2
       - equal:

@@ -16,6 +16,7 @@ import time
 from typing import Any
 import uuid
 
+import psutil
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext import asyncio as sqlalchemy_async
@@ -28,6 +29,7 @@ from sky.server import daemons
 from sky.server.events import emission as event_emission
 from sky.server.events import models as event_models
 from sky.server.requests import authority_worker
+from sky.server.requests import payloads
 from sky.server.requests import postgres_schema
 from sky.server.requests import preconditions
 from sky.server.requests import registry as request_registry
@@ -62,6 +64,30 @@ _CONTROLLER_LEADER_LOCK_ID = 'skypilot:api-controller-leader:v1'
 _CONTROLLER_GENERATION_LOCK_PREFIX = ('skypilot:api-controller-generation:v1:')
 
 
+def _is_owned_executor_process(pid: int) -> bool:
+    """Whether PID is an executor child owned by this server process tree."""
+
+    def _has_title(process: psutil.Process, prefix: str) -> bool:
+        command = process.cmdline()
+        return bool(command) and command[0].startswith(prefix)
+
+    try:
+        target = psutil.Process(pid)
+        if not _has_title(target, 'SkyPilot:executor:'):
+            return False
+        # RequestWorker dispatchers are threads in production, so both the
+        # short and long ProcessPool children have the executor server process
+        # itself as their OS parent.  Requiring a synthetic worker *process*
+        # title rejects the real topology and makes cancellation hang.  A
+        # direct-child check is also stronger than accepting any descendant:
+        # only this server instance can own and signal the claimed PID.
+        caller = psutil.Process()
+        return target.ppid() == caller.pid
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError,
+            PermissionError):
+        return False
+
+
 def role_is_draining() -> bool:
     """Return whether Kubernetes has started the pod drain interval."""
     return os.path.exists(ROLE_DRAIN_MARKER_PATH)
@@ -86,6 +112,7 @@ _DATETIME_FIELDS = frozenset({
     'heartbeat_at',
     'cancel_requested_at',
     'cancel_acknowledged_at',
+    'execution_quiesced_at',
 })
 
 
@@ -389,6 +416,63 @@ def _request_from_mapping(
     for field in _DATETIME_FIELDS:
         values[field] = _timestamp(values.get(field))
     return requests_lib.Request.from_durable_values(values)
+
+
+_SCALAR_REQUEST_PROJECTION_FIELDS = frozenset({
+    'request_id',
+    'name',
+    'status',
+    'pid',
+    'created_at',
+    'cluster_name',
+    'schedule_type',
+    'user_id',
+    'status_msg',
+    'should_retry',
+    'finished_at',
+    'file_mounts_blob_id',
+    'execution_generation',
+    'execution_quiescence_required',
+    'execution_quiesced_generation',
+    'execution_quiesced_at',
+})
+
+
+def _scalar_projection_entrypoint() -> None:
+    """Placeholder callable for a display-only scalar projection."""
+
+
+def _request_from_scalar_mapping(
+        mapping: sqlalchemy.engine.RowMapping) -> requests_lib.Request:
+    """Build a display-only request without decoding its durable payload."""
+    values = dict(mapping)
+    status = requests_lib.RequestStatus(
+        values.get('status', requests_lib.RequestStatus.PENDING.value))
+    schedule_type = requests_lib.ScheduleType(
+        values.get('schedule_type', requests_lib.ScheduleType.SHORT.value))
+    return requests_lib.Request(
+        request_id=str(values.get('request_id', '')),
+        name=str(values.get('name', '')),
+        entrypoint=_scalar_projection_entrypoint,
+        request_body=payloads.RequestBody(),
+        status=status,
+        created_at=float(_timestamp(values.get('created_at')) or 0),
+        user_id=str(values.get('user_id', '')),
+        pid=values.get('pid'),
+        schedule_type=schedule_type,
+        cluster_name=values.get('cluster_name'),
+        status_msg=values.get('status_msg'),
+        should_retry=bool(values.get('should_retry', False)),
+        finished_at=_timestamp(values.get('finished_at')),
+        file_mounts_blob_id=values.get('file_mounts_blob_id'),
+        execution_generation=int(values.get('execution_generation', 0)),
+        execution_quiescence_required=bool(
+            values.get('execution_quiescence_required', False)),
+        execution_quiesced_generation=(
+            int(values['execution_quiesced_generation']) if
+            values.get('execution_quiesced_generation') is not None else None),
+        execution_quiesced_at=_timestamp(values.get('execution_quiesced_at')),
+    )
 
 
 def _initialize_schema(engine: sqlalchemy.engine.Engine) -> None:
@@ -960,24 +1044,55 @@ def _insert_request_and_queue(
 
 
 def _request_is_retention_safe() -> sqlalchemy.ColumnElement[bool]:
-    """Require correlated request evidence to be durably snapshotted."""
+    """Require action and execution evidence to be durably settled."""
     settled_attempt = sqlalchemy.exists().where(
         RESOURCE_ACTION_ATTEMPTS.c.action_id == REQUESTS.c.resource_action_id,
         RESOURCE_ACTION_ATTEMPTS.c.attempt ==
         REQUESTS.c.resource_action_attempt,
         RESOURCE_ACTION_ATTEMPTS.c.request_id == REQUESTS.c.request_id,
         RESOURCE_ACTION_ATTEMPTS.c.mutation_boundary == 'SETTLED')
-    return sqlalchemy.or_(REQUESTS.c.resource_action_id.is_(None),
-                          settled_attempt)
+    action_is_safe = sqlalchemy.or_(REQUESTS.c.resource_action_id.is_(None),
+                                    settled_attempt)
+    execution_is_safe = sqlalchemy.or_(
+        ~REQUESTS.c.execution_quiescence_required,
+        sqlalchemy.and_(
+            REQUESTS.c.execution_quiesced_generation ==
+            REQUESTS.c.execution_generation,
+            REQUESTS.c.execution_quiesced_at.is_not(None)))
+    return sqlalchemy.and_(action_is_safe, execution_is_safe)
 
 
 def _request_filter_statement(
     req_filter: requests_lib.RequestTaskFilter,) -> sqlalchemy.sql.Select:
-    statement = sqlalchemy.select(REQUESTS)
+    scalar_projection = bool(
+        req_filter.fields and
+        set(req_filter.fields).issubset(_SCALAR_REQUEST_PROJECTION_FIELDS))
+    if scalar_projection:
+        assert req_filter.fields is not None
+        statement = sqlalchemy.select(
+            *(REQUESTS.c[field] for field in req_filter.fields))
+    else:
+        statement = sqlalchemy.select(REQUESTS)
     if req_filter.status is not None:
         statement = statement.where(
             REQUESTS.c.status.in_(
                 [status.value for status in req_filter.status]))
+    if req_filter.request_ids is not None:
+        statement = statement.where(
+            REQUESTS.c.request_id.in_(req_filter.request_ids))
+    if req_filter.execution_quiescence_candidates_only:
+        execution_unproved = sqlalchemy.and_(
+            REQUESTS.c.execution_quiescence_required,
+            sqlalchemy.or_(
+                REQUESTS.c.execution_quiesced_generation.is_distinct_from(
+                    REQUESTS.c.execution_generation),
+                REQUESTS.c.execution_quiesced_at.is_(None)))
+        statement = statement.where(
+            sqlalchemy.or_(
+                REQUESTS.c.status.in_([
+                    status.value
+                    for status in requests_lib.RequestStatus.active_statuses()
+                ]), execution_unproved))
     if req_filter.cluster_names is not None:
         statement = statement.where(
             REQUESTS.c.cluster_name.in_(req_filter.cluster_names))
@@ -1446,6 +1561,12 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                     'heartbeat_at': None,
                     'cancel_requested_at': None,
                     'cancel_acknowledged_at': None,
+                    # Re-enqueue is not execution admission. A v70 claim (or
+                    # cancellation) opts the revived generation into the
+                    # exact-quiescence contract.
+                    'execution_quiescence_required': False,
+                    'execution_quiesced_generation': None,
+                    'execution_quiesced_at': None,
                     'interrupted_reason': None,
                 })
             await connection.execute(
@@ -1482,7 +1603,10 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         with engine.connect() as connection:
             rows = connection.execute(
                 _request_filter_statement(req_filter)).mappings().all()
-        return [_request_from_mapping(row) for row in rows]
+        decoder = (_request_from_scalar_mapping if req_filter.fields and set(
+            req_filter.fields).issubset(_SCALAR_REQUEST_PROJECTION_FIELDS) else
+                   _request_from_mapping)
+        return [decoder(row) for row in rows]
 
     async def query_requests_async(
         self, req_filter: requests_lib.RequestTaskFilter
@@ -1492,7 +1616,10 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             result = await connection.execute(
                 _request_filter_statement(req_filter))
             rows = result.mappings().all()
-        return [_request_from_mapping(row) for row in rows]
+        decoder = (_request_from_scalar_mapping if req_filter.fields and set(
+            req_filter.fields).issubset(_SCALAR_REQUEST_PROJECTION_FIELDS) else
+                   _request_from_mapping)
+        return [decoder(row) for row in rows]
 
     async def delete_requests(self, request_ids: list[str]) -> None:
         if not request_ids:
@@ -1588,33 +1715,51 @@ class PostgresRequestBackend(request_storage.RequestBackend):
 
     def interrupt_cancelled_claim(
             self, claim: request_storage.ExecutionClaim) -> bool:
-        """Deliver durable cancellation intent to this owning executor."""
+        """Deliver durable cancellation intent to this owning executor.
+
+        ``cancel_acknowledged_at`` retains its legacy signal-delivery meaning.
+        Only ``acknowledge_execution_quiescence`` can publish proof that the
+        handler has stopped running effect-bearing code.
+        """
         engine = initialize_and_get_db()
         claim_token = uuid.UUID(claim.claim_token)
         with engine.begin() as connection:
             row = connection.execute(
-                sqlalchemy.select(REQUESTS.c.pid).where(
-                    REQUESTS.c.request_id == claim.request_id,
-                    *self._claim_predicates(claim.execution_generation,
-                                            claim_token), REQUESTS.c.status ==
-                    requests_lib.RequestStatus.CANCELLED.value,
-                    REQUESTS.c.cancel_requested_at.is_not(None),
-                    REQUESTS.c.cancel_acknowledged_at.is_(
-                        None)).with_for_update()).first()
+                sqlalchemy.select(
+                    REQUESTS.c.pid, REQUESTS.c.execution_quiesced_generation,
+                    REQUESTS.c.execution_quiesced_at).where(
+                        REQUESTS.c.request_id == claim.request_id,
+                        *self._claim_predicates(claim.execution_generation,
+                                                claim_token), REQUESTS.c.status
+                        == requests_lib.RequestStatus.CANCELLED.value,
+                        REQUESTS.c.cancel_requested_at.is_not(None),
+                        REQUESTS.c.cancel_acknowledged_at.is_(
+                            None)).with_for_update()).first()
             if row is None or row.pid is None:
                 return False
+            if (row.execution_quiesced_generation == claim.execution_generation
+                    and row.execution_quiesced_at is not None):
+                return True
             pid = int(row.pid)
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            # The process already observed an equivalent termination event.
-            pass
-        except OSError as e:
-            logger.warning(
-                f'Failed to interrupt cancelled request {claim.request_id} '
-                f'owned by {self._instance_id}: {e}')
-            return False
-        with engine.begin() as connection:
+            if not _is_owned_executor_process(pid):
+                logger.warning(
+                    f'Refusing to signal request {claim.request_id}: PID '
+                    f'{pid} is not this dispatcher\'s executor child.')
+                return False
+            marker = request_storage.arm_execution_cancellation(pid, claim)
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                # The process already observed an equivalent termination
+                # event. This remains only signal-delivery acknowledgement;
+                # it is not execution-quiescence proof.
+                request_storage.clear_execution_cancellation(marker)
+            except OSError as e:
+                request_storage.clear_execution_cancellation(marker)
+                logger.warning(
+                    f'Failed to interrupt cancelled request '
+                    f'{claim.request_id} owned by {self._instance_id}: {e}')
+                return False
             result = connection.execute(
                 sqlalchemy.update(REQUESTS).where(
                     REQUESTS.c.request_id == claim.request_id,
@@ -1625,6 +1770,54 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                             sqlalchemy.func.clock_timestamp()),
                         updated_at=sqlalchemy.func.clock_timestamp()))
         return result.rowcount == 1
+
+    def acknowledge_execution_quiescence(
+            self, claim: request_storage.ExecutionClaim) -> bool:
+        """Record quiescence for one exact completed execution generation."""
+        engine = initialize_and_get_db()
+        claim_token = uuid.UUID(claim.claim_token)
+        with engine.begin() as connection:
+            row = connection.execute(
+                sqlalchemy.select(
+                    REQUESTS.c.execution_quiesced_generation,
+                    REQUESTS.c.execution_quiesced_at).where(
+                        REQUESTS.c.request_id == claim.request_id,
+                        REQUESTS.c.execution_generation ==
+                        claim.execution_generation,
+                        REQUESTS.c.claim_token == claim_token,
+                        REQUESTS.c.worker_instance_id == uuid.UUID(
+                            self._instance_id),
+                        REQUESTS.c.execution_quiescence_required,
+                        sqlalchemy.or_(
+                            REQUESTS.c.status ==
+                            requests_lib.RequestStatus.RUNNING.value,
+                            REQUESTS.c.status.in_([
+                                status.value for status in
+                                requests_lib.RequestStatus.finished_status()
+                            ]))).with_for_update()).first()
+            if row is None:
+                return False
+            if (row.execution_quiesced_generation is not None or
+                    row.execution_quiesced_at is not None):
+                return (row.execution_quiesced_generation
+                        == claim.execution_generation and
+                        row.execution_quiesced_at is not None)
+            result = connection.execute(
+                sqlalchemy.update(REQUESTS).where(
+                    REQUESTS.c.request_id == claim.request_id,
+                    REQUESTS.c.execution_generation ==
+                    claim.execution_generation,
+                    REQUESTS.c.claim_token == claim_token,
+                    REQUESTS.c.worker_instance_id == uuid.UUID(
+                        self._instance_id),
+                    REQUESTS.c.execution_quiesced_generation.is_(None),
+                    REQUESTS.c.execution_quiesced_at.is_(None)).values(
+                        execution_quiesced_generation=(
+                            claim.execution_generation),
+                        execution_quiesced_at=(
+                            sqlalchemy.func.clock_timestamp()),
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            return result.rowcount == 1
 
     def set_request_finished(self,
                              request_id: str,
@@ -1735,26 +1928,56 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         if user_id is not None:
             statement = statement.where(REQUESTS.c.user_id == user_id)
         cancelled: list[str] = []
-        local_pids: list[tuple[str, int, uuid.UUID | None]] = []
         now = sqlalchemy.func.clock_timestamp()
         with engine.begin() as connection:
             rows = connection.execute(
                 statement.with_for_update()).mappings().all()
+            delivery_rows = connection.execute(
+                sqlalchemy.select(QUEUE.c.request_id, QUEUE.c.delivery_state,
+                                  QUEUE.c.claim_generation).where(
+                                      QUEUE.c.request_id.in_([
+                                          row['request_id'] for row in rows
+                                      ]))).mappings().all()
+            deliveries = {row['request_id']: row for row in delivery_rows}
             database_now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
             for row in rows:
                 if daemons.is_daemon_request_id(row['request_id']):
                     continue
+                delivery = deliveries.get(row['request_id'])
+                matching_delivery = (delivery is not None and (
+                    (delivery['delivery_state'] == 'queued' and
+                     delivery['claim_generation'] is None) or
+                    (delivery['delivery_state'] == 'claimed' and
+                     delivery['claim_generation']
+                     == row['execution_generation'])))
+                has_quiescence_contract = bool(
+                    row['execution_quiescence_required'] or matching_delivery or
+                    row['claim_token'] is not None)
+                execution_is_quiescent = bool(
+                    (row['status'] == requests_lib.RequestStatus.PENDING.value
+                     and matching_delivery) or
+                    (row['execution_quiesced_generation']
+                     == row['execution_generation'] and
+                     row['execution_quiesced_at'] is not None))
+                terminal_values: dict[str, Any] = {
+                    'cancel_requested_at': now,
+                    'execution_quiescence_required': has_quiescence_contract,
+                    'finished_at': now,
+                }
+                if execution_is_quiescent:
+                    terminal_values.update({
+                        'execution_quiesced_generation': int(
+                            row['execution_generation']),
+                        'execution_quiesced_at': now,
+                    })
                 transitioned = _terminalize_locked_request(
                     connection,
                     row,
                     status=requests_lib.RequestStatus.CANCELLED,
                     cause=event_api_models.EventCause.EXPLICIT_CANCEL,
-                    values={
-                        'cancel_requested_at': now,
-                        'finished_at': now,
-                    })
+                    values=terminal_values)
                 if not transitioned:
                     continue
                 cancelled.append(row['request_id'])
@@ -1767,26 +1990,38 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                              'running'])).values(state='ambiguous',
                                                  reconciliation_at=now,
                                                  updated_at=now))
-                if (row['pid'] is not None and
+                if (not execution_is_quiescent and row['pid'] is not None and
                         row['claim_token'] is not None and
                         str(row['worker_instance_id']) == self._instance_id and
                         row['lease_expires_at'] is not None and
-                        row['lease_expires_at'] > database_now):
-                    local_pids.append((row['request_id'], int(row['pid']),
-                                       row['claim_token']))
-        for request_id, pid, claim_token in local_pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                continue
-            with engine.begin() as connection:
-                connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id == request_id,
-                        REQUESTS.c.claim_token == claim_token).values(
-                            cancel_acknowledged_at=(
-                                sqlalchemy.func.clock_timestamp()),
-                            updated_at=sqlalchemy.func.clock_timestamp()))
+                        row['lease_expires_at'] > database_now and
+                        _is_owned_executor_process(int(row['pid']))):
+                    claim = request_storage.ExecutionClaim(
+                        row['request_id'], int(row['execution_generation']),
+                        str(row['claim_token']))
+                    marker = request_storage.arm_execution_cancellation(
+                        int(row['pid']), claim)
+                    try:
+                        os.kill(int(row['pid']), signal.SIGTERM)
+                    except ProcessLookupError:
+                        request_storage.clear_execution_cancellation(marker)
+                    except OSError as error:
+                        request_storage.clear_execution_cancellation(marker)
+                        logger.warning(f'Failed to interrupt cancelled request '
+                                       f'{row["request_id"]} owned by '
+                                       f'{self._instance_id}: {error}')
+                        continue
+                    connection.execute(
+                        sqlalchemy.update(REQUESTS).where(
+                            REQUESTS.c.request_id == row['request_id'],
+                            REQUESTS.c.execution_generation ==
+                            row['execution_generation'],
+                            REQUESTS.c.claim_token == row['claim_token'],
+                            REQUESTS.c.worker_instance_id ==
+                            row['worker_instance_id']).values(
+                                cancel_acknowledged_at=(
+                                    sqlalchemy.func.clock_timestamp()),
+                                updated_at=sqlalchemy.func.clock_timestamp()))
         return cancelled
 
     async def kill_request_async(self, request_id: str) -> bool:
@@ -2206,6 +2441,13 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 request.set_error(precondition_error)
                 values = _request_values_for_db(request)
                 values.pop('request_id')
+                # No executor was admitted: this queued generation is
+                # effect-quiescent at the same atomic terminal transition.
+                values['execution_quiesced_generation'] = int(
+                    locked['execution_generation'])
+                values['execution_quiesced_at'] = (
+                    sqlalchemy.func.clock_timestamp())
+                values['execution_quiescence_required'] = True
                 _terminalize_locked_request(
                     connection,
                     locked,
@@ -2261,6 +2503,9 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                         sqlalchemy.func.clock_timestamp() +
                         datetime.timedelta(seconds=_CLAIM_LEASE_SECONDS)),
                     heartbeat_at=sqlalchemy.func.clock_timestamp(),
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=None,
+                    execution_quiesced_at=None,
                     updated_at=sqlalchemy.func.clock_timestamp()))
             if result.rowcount != 1:
                 return None
@@ -2288,6 +2533,8 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                         'worker_instance_id': None,
                         'lease_expires_at': None,
                         'heartbeat_at': None,
+                        'execution_quiesced_generation': generation,
+                        'execution_quiesced_at': now,
                         'should_retry': True,
                         'finished_at': now,
                         'interrupted_reason':

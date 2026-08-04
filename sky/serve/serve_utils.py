@@ -46,6 +46,7 @@ from sky.serve import serve_state
 from sky.serve import serve_status_formatter
 from sky.serve import spot_placer
 from sky.server import constants as server_constants
+from sky.server import versions
 from sky.server.requests import request_names
 from sky.skylet import constants as skylet_constants
 from sky.skylet import job_lib
@@ -155,6 +156,8 @@ for _auth_token_symbol in (
 del _auth_token_symbol
 
 _LAUNCH_QUIESCE_MAX_CANCEL_ROUNDS = 3
+_LAUNCH_QUIESCE_TIMEOUT_SECONDS = 60
+_LAUNCH_QUIESCE_POLL_SECONDS = 0.5
 
 # Bound on the per-call thread pool used by `get_service_status_pickled` to
 # fan out across services/pools. The per-service work is dominated by I/O
@@ -2399,18 +2402,25 @@ def quiesce_service_replica_launch_requests(
     service_name: str,
     replica_infos: list['replica_managers.ReplicaInfo'],
     continue_guard: Callable[[], bool] | None = None,
+    *,
+    include_terminal_history: bool = False,
 ) -> bool:
-    """Cancel and await every active launch backed by replica inventory.
+    """Cancel and execution-quiesce launches backed by replica inventory.
 
-    ``sdk.api_cancel`` only schedules a cancellation request.  Teardown may
-    remove replica/service rows only after that cancellation request itself
-    has completed and a fresh status query proves that no launch request for
-    any incarnation-scoped replica cluster remains active.  The caller must
-    first stop the controller child (or receive its teardown acknowledgement),
-    so no producer can enqueue a new launch after this barrier begins.
+    ``sdk.api_cancel`` publishes ``CANCELLED`` before a remote executor has
+    necessarily stopped its handler. Teardown may remove replica/service rows
+    only after every retained target request proves that its exact execution
+    generation is quiescent. The caller must first stop the controller child
+    (or receive its teardown acknowledgement), so no producer can enqueue a
+    new launch after this barrier begins.
 
-    Returns False on any transport/status/ownership uncertainty.  Callers then
-    retain the durable service and replica rows for a later retry.
+    ``include_terminal_history`` uses one server-side cluster-name batch to
+    discover already-terminal but unproven requests. Protocol-v2 interrupted
+    fill recovery requires it; compatibility teardown leaves it disabled while
+    pre-v70 request history ages out.
+
+    Returns False on any transport/status/identity/ownership uncertainty.
+    Callers then retain all durable service and replica rows for a later retry.
     """
 
     def _guard_allows() -> bool:
@@ -2428,47 +2438,172 @@ def quiesce_service_replica_launch_requests(
                            request_names.RequestName.CLUSTER_LAUNCH.value)
     cluster_names = {info.cluster_name for info in replica_infos}
 
-    def _active_launch_request_ids() -> set[str]:
+    def _discover_launch_requests() -> tuple[dict[str, int], dict[str, int]]:
         if not cluster_names:
-            return set()
-        # The service is already durably terminal, so the controller cannot
-        # schedule more launches. A launch request racing this snapshot is
-        # caught by the next cancellation round. Return only the three small
-        # fields needed for that convergence proof. This is bounded by the
-        # API's active queue rather than by retained replica history (2,159
-        # stale rows previously meant 2,159 HTTP requests per round).
-        active_requests = sdk.api_status(
-            all_status=False, fields=['request_id', 'name', 'cluster_name'])
-        return {
-            request.request_id
-            for request in active_requests
-            if request.name == launch_request_name and
-            request.cluster_name in cluster_names
-        }
+            return {}, {}
+        # The caller has stopped the launch producer (and generic teardown has
+        # already durably terminalized the service). A launch request racing
+        # this snapshot is caught by the next cancellation round. The
+        # protocol-v2 recovery path asks PostgreSQL for all statuses of the
+        # whole incarnation-scoped cluster-name set in one bounded query;
+        # compatibility teardown scans only the active queue.
+        fields = ['request_id', 'name', 'cluster_name']
+        if include_terminal_history:
+            fields.extend([
+                'execution_generation', 'status',
+                'execution_quiescence_required',
+                'execution_quiesced_generation', 'execution_quiesced_at'
+            ])
+            requests = sdk.api_status(
+                all_status=True,
+                cluster_names=sorted(cluster_names),
+                _include_request_names=[launch_request_name],
+                fields=fields,
+                _execution_quiescence_candidates_only=(True))
+        else:
+            requests = sdk.api_status(all_status=False, fields=fields)
+
+        if include_terminal_history:
+            remote_api_version = versions.get_remote_api_version()
+            if (remote_api_version is None or
+                    remote_api_version < server_constants.
+                    MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+                raise RuntimeError(
+                    'API server cannot expose exact request execution '
+                    'quiescence; finish the server rollout first.')
+
+        active: dict[str, int] = {}
+        terminal_unproven: dict[str, int] = {}
+        for request in requests:
+            if (request.name != launch_request_name or
+                    request.cluster_name not in cluster_names):
+                continue
+            if not include_terminal_history:
+                active[request.request_id] = 0
+                continue
+            execution_generation = request.execution_generation
+            if (not isinstance(execution_generation, int) or
+                    execution_generation < 0):
+                raise RuntimeError(
+                    'API server did not return an execution generation for '
+                    f'launch request {request.request_id}.')
+            if request.status in ('CANCELLED', 'SUCCEEDED', 'FAILED'):
+                if request.execution_quiescence_required is not True:
+                    # Pre-v70 terminal history has no completion-receipt
+                    # contract. Protocol v2 cannot create those rows, and
+                    # replica creation time excludes reused cluster names.
+                    continue
+                if (request.execution_quiesced_generation
+                        != execution_generation or
+                        request.execution_quiesced_at is None):
+                    terminal_unproven[request.request_id] = (
+                        execution_generation)
+                continue
+            active[request.request_id] = execution_generation
+        return active, terminal_unproven
+
+    def _await_execution_quiescence(
+            request_generations: dict[str, int]) -> bool:
+        """Wait for exact target generations, not just terminal status."""
+        request_ids = set(request_generations)
+        deadline = time.monotonic() + _LAUNCH_QUIESCE_TIMEOUT_SECONDS
+        while True:
+            if not _guard_allows():
+                return False
+            requests = sdk.api_status(request_ids=sorted(request_ids),
+                                      fields=[
+                                          'request_id', 'name', 'cluster_name',
+                                          'status', 'execution_generation',
+                                          'execution_quiescence_required',
+                                          'execution_quiesced_generation',
+                                          'execution_quiesced_at'
+                                      ],
+                                      _exact_request_ids=True,
+                                      _use_body=True)
+            exact_requests = {
+                request.request_id: request
+                for request in requests
+                if request.request_id in request_ids
+            }
+            missing = request_ids - exact_requests.keys()
+            if missing:
+                logger.error('Launch requests disappeared before execution '
+                             f'quiescence was proven for {service_name!r}: '
+                             f'{sorted(missing)}')
+                return False
+
+            waiting: list[str] = []
+            for request_id, request in exact_requests.items():
+                if (request.name != launch_request_name or
+                        request.cluster_name not in cluster_names):
+                    logger.error(
+                        'Launch request identity changed while quiescing '
+                        f'{service_name!r}: {request_id}')
+                    return False
+                expected_generation = request_generations[request_id]
+                if request.execution_generation != expected_generation:
+                    logger.error(
+                        'Launch request execution generation changed while '
+                        f'quiescing {service_name!r}: {request_id} '
+                        f'({request.execution_generation} != '
+                        f'{expected_generation})')
+                    return False
+                if request.status not in ('CANCELLED', 'SUCCEEDED', 'FAILED'):
+                    logger.error(
+                        'Launch request did not reach a terminal state while '
+                        f'quiescing {service_name!r}: {request_id} '
+                        f'({request.status})')
+                    return False
+                if (request.execution_quiescence_required is not True or
+                        request.execution_quiesced_generation
+                        != expected_generation or
+                        request.execution_quiesced_at is None):
+                    waiting.append(request_id)
+
+            if not waiting:
+                return True
+            if time.monotonic() >= deadline:
+                logger.error(
+                    'Timed out waiting for cancelled launch handlers to '
+                    f'quiesce for {service_name!r}: {sorted(waiting)}')
+                return False
+            time.sleep(_LAUNCH_QUIESCE_POLL_SECONDS)
 
     try:
-        # A completed cancellation request makes the target terminal before it
-        # returns. The caller has already published SHUTTING_DOWN, and both the
-        # scheduler precondition and persisted execution entrypoint reject any
-        # launch row that appears after this scan.
+        # The caller has already stopped the producer (and generic service
+        # teardown has published SHUTTING_DOWN). Both the scheduler
+        # precondition and persisted execution entrypoint reject a launch row
+        # that appears after the final empty scan.
         cancel_rounds = 0
         while True:
             if not _guard_allows():
                 return False
-            active_request_ids = _active_launch_request_ids()
-            if not active_request_ids:
-                return True
+            active_requests, terminal_unproven = (_discover_launch_requests())
 
-            if cancel_rounds >= _LAUNCH_QUIESCE_MAX_CANCEL_ROUNDS:
-                logger.error('Replica launch requests remained active after '
-                             f'cancellation for {service_name!r}: '
-                             f'{sorted(active_request_ids)}')
+            if active_requests:
+                if cancel_rounds >= _LAUNCH_QUIESCE_MAX_CANCEL_ROUNDS:
+                    logger.error(
+                        'Replica launch requests remained active after '
+                        f'cancellation for {service_name!r}: '
+                        f'{sorted(active_requests)}')
+                    return False
+                cancel_request_id = sdk.api_cancel(sorted(active_requests),
+                                                   all_users=True,
+                                                   silent=True)
+                sdk.stream_and_get(cancel_request_id)
+                cancel_rounds += 1
+                if not include_terminal_history:
+                    # Compatibility path for local/SQLite and pre-v70
+                    # deployments. Protocol-v2 fill recovery always enables
+                    # the generation-stamped PostgreSQL history barrier.
+                    continue
+
+            targets = dict(terminal_unproven)
+            targets.update(active_requests)
+            if not targets:
+                return True
+            if not _await_execution_quiescence(targets):
                 return False
-            cancel_request_id = sdk.api_cancel(sorted(active_request_ids),
-                                               all_users=True,
-                                               silent=True)
-            sdk.stream_and_get(cancel_request_id)
-            cancel_rounds += 1
     except Exception as e:  # pylint: disable=broad-except
         logger.error('Failed to quiesce replica launch requests for '
                      f'{service_name!r}: '

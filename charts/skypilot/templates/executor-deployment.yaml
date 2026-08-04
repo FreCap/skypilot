@@ -140,6 +140,8 @@ kind: Deployment
 metadata:
   name: {{ $fullName }}-executor
   namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ $executorReplicas }}
   strategy:
@@ -166,6 +168,7 @@ spec:
         {{- end }}
       labels:
         app: {{ $fullName }}-executor
+        app.kubernetes.io/instance: {{ .Release.Name }}
         skypilot.co/role: executor
     spec:
       automountServiceAccountToken: {{ or .Values.kubernetesCredentials.useApiServerCluster $externalLBEnabled }}

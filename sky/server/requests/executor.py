@@ -25,6 +25,7 @@ import concurrent.futures
 import contextlib
 import multiprocessing
 import os
+import pathlib
 import signal
 import sys
 import threading
@@ -125,6 +126,22 @@ def get_request_thread_executor() -> threads.OnDemandThreadExecutor:
                 name='request_thread_executor',
                 max_workers=_REQUEST_THREADS_LIMIT)
         return _REQUEST_THREAD_EXECUTOR
+
+
+def _acknowledge_execution_quiescence(
+        claim: request_storage.ExecutionClaim) -> None:
+    """Best-effort publish that one exact invocation is quiescent."""
+    try:
+        request_storage.get_request_backend().acknowledge_execution_quiescence(
+            claim)
+    except Exception as e:  # pylint: disable=broad-except
+        # The execution itself is already quiescent. Keep its result intact;
+        # the wrapper and its normal-Future monitor each attempt this durable
+        # acknowledgement so a transient failure has an independent fallback.
+        logger.warning(
+            f'Failed to record execution quiescence for {claim.request_id} '
+            f'generation {claim.execution_generation}: '
+            f'{common_utils.format_exception(e)}')
 
 
 class RequestQueue:
@@ -349,11 +366,17 @@ class RequestWorker:
             if request_element is not None else None)
         try:
             api_requests.set_exception_stacktrace(e)
-            request_storage.get_request_backend().transition_request_terminal(
-                request_id,
-                api_requests.RequestStatus.FAILED,
-                'dispatcher_submit_failed',
-                error=e)
+            transitioned = (request_storage.get_request_backend(
+            ).transition_request_terminal(request_id,
+                                          api_requests.RequestStatus.FAILED,
+                                          'dispatcher_submit_failed',
+                                          error=e))
+            if (transitioned and request_element is not None and
+                    request_element.claim_token is not None):
+                _acknowledge_execution_quiescence(
+                    request_storage.ExecutionClaim(
+                        request_id, request_element.execution_generation,
+                        request_element.claim_token))
         except (Exception, SystemExit) as recovery_e:  # pylint: disable=broad-except
             # Never let the recovery itself crash the dispatcher thread.
             logger.error(
@@ -400,9 +423,10 @@ class RequestWorker:
                     try:
                         if not backend.heartbeat_claim(claim):
                             if backend.interrupt_cancelled_claim(claim):
-                                logger.info(f'Acknowledged cancellation for '
+                                logger.info(f'Signalled cancellation for '
                                             f'{claim.request_id} generation '
-                                            f'{claim.execution_generation}.')
+                                            f'{claim.execution_generation}; '
+                                            'waiting for execution quiescence.')
                                 return
                             logger.warning(
                                 f'Execution claim for {claim.request_id} '
@@ -439,6 +463,17 @@ class RequestWorker:
         try:
             try:
                 fut.result()
+                # A normal ProcessPool Future completion proves that this
+                # exact wrapper returned. BrokenProcessPool and all other
+                # exceptional Future outcomes remain ambiguous: another pool
+                # child can break the Future while this request's child is
+                # still running effect-bearing code.
+                if request_element.claim_token is not None:
+                    _acknowledge_execution_quiescence(
+                        request_storage.ExecutionClaim(
+                            request_element.request_id,
+                            request_element.execution_generation,
+                            request_element.claim_token))
             finally:
                 # The worker process is released the instant the future
                 # completes, before any retry/pause wait below. Account for it
@@ -454,7 +489,10 @@ class RequestWorker:
             logger.error(
                 f'Request {request_id} failed to get processed '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
-            if not retryable:
+            if request_element.claim_token is not None or not retryable:
+                # A durable claimed invocation cannot be proven stopped from a
+                # BrokenProcessPool Future. Requeueing it would create a new
+                # generation whose receipt could mask the old invocation.
                 api_requests.set_request_failed(request_id, e)
                 return
             # A retry must remain in an executable state. Marking it FAILED
@@ -481,6 +519,15 @@ class RequestWorker:
             queue.put(requeue_element)
         except exceptions.ExecutionRetryableError as e:
             request_id = request_element.request_id
+            # Unlike BrokenProcessPool, this exception was explicitly
+            # serialized only after the wrapper's finally block completed. A
+            # parent-side retry closes a transient child DB-write failure
+            # before this generation becomes WAITING and loses its live PID.
+            if request_element.claim_token is not None:
+                _acknowledge_execution_quiescence(
+                    request_storage.ExecutionClaim(
+                        request_id, request_element.execution_generation,
+                        request_element.claim_token))
             # Clamp to avoid ValueError from time.sleep() on a negative wait.
             retry_wait_seconds = max(0, e.retry_wait_seconds)
             # A pause (ExecutionPausedError) may carry a continue condition that
@@ -862,6 +909,7 @@ def _sigterm_handler(signum: int, frame: Optional['types.FrameType']) -> None:
 
 # Set by _request_execution_wrapper; read by _gated_sigterm_handler.
 _in_request_execution: bool = False
+_execution_cancellation_marker: pathlib.Path | None = None
 
 
 def _gated_sigterm_handler(signum: int,
@@ -875,7 +923,30 @@ def _gated_sigterm_handler(signum: int,
     on an idle worker just means we lost the race with the request finishing.
     """
     del signum, frame
+    global _in_request_execution  # pylint: disable=global-statement
     if _in_request_execution:
+        marker = _execution_cancellation_marker
+        if marker is not None:
+            try:
+                armed = request_storage.consume_execution_cancellation(marker)
+            except OSError:
+                # Marker I/O uncertainty cannot fall through the wrapper's
+                # ordinary Exception path: that would skip child cleanup and
+                # could publish a false receipt. Treat it as cancellation and
+                # run the same mandatory cleanup path.
+                armed = True
+            if not armed:
+                # This PID has already moved to a different exact invocation,
+                # or the signal arrived without its token-addressed marker. It
+                # must not interrupt the current request.
+                return
+        # One cancellation interrupt per invocation. A duplicate SIGTERM can
+        # arrive from the API kill path and the executor heartbeat; allowing it
+        # to raise while the first interrupt is synchronously cleaning child
+        # processes would skip that cleanup and publish a false quiescence
+        # receipt from the wrapper's finally block. The next invocation rearms
+        # this gate immediately before executing its handler.
+        _in_request_execution = False
         raise KeyboardInterrupt
     # logger isn't async-signal-safe (re-entrant lock); use os.write.
     try:
@@ -936,7 +1007,7 @@ def _request_execution_wrapper(request_id: str,
     4. Handle the SIGTERM signal to abort the request gracefully.
     5. Maintain the lifecycle of the temp dir used by the request.
     """
-    pid = multiprocessing.current_process().pid
+    pid = os.getpid()
     proc = psutil.Process(pid)
     rss_begin = proc.memory_info().rss
     db_utils.set_max_connections(num_db_connections_per_worker)
@@ -979,12 +1050,21 @@ def _request_execution_wrapper(request_id: str,
 
     request_name = None
     request_body: payloads.RequestBody | None = None
+    execution_quiescent = False
     # Set _in_request_execution inside the try so `finally` always clears it,
     # even if a SIGTERM lands before any wrapper code runs.
     global _in_request_execution  # pylint: disable=global-statement
+    global _execution_cancellation_marker  # pylint: disable=global-statement
+    cancellation_marker = None
+    if claim_token is not None:
+        cancellation_marker = request_storage.execution_cancellation_marker_path(
+            pid,
+            request_storage.ExecutionClaim(request_id, execution_generation,
+                                           claim_token))
     execution_claim_token = request_storage.activate_execution_claim(
         request_id, execution_generation, claim_token)
     try:
+        _execution_cancellation_marker = cancellation_marker
         _in_request_execution = True
         placement_history.reset_request_buffer()
         # As soon as the request is updated with the executor PID, we can
@@ -1001,6 +1081,7 @@ def _request_execution_wrapper(request_id: str,
                                              execution_generation, claim_token):
             logger.warning(f'Request {request_id} is already finished or '
                            'cancelled, skipping execution')
+            execution_quiescent = True
             return
         request_task = api_requests.get_request(request_id)
         assert request_task is not None, request_id
@@ -1059,8 +1140,10 @@ def _request_execution_wrapper(request_id: str,
         # This is required as python does not pass the KeyboardInterrupt to the
         # threads that are not main thread.
         subprocess_utils.kill_children_processes()
+        execution_quiescent = True
         return
     except exceptions.ExecutionRetryableError as e:
+        execution_quiescent = True
         safe_retry_error = api_requests.sanitize_request_error(
             request_name, e, request_body)
         logger.error(safe_retry_error)
@@ -1082,6 +1165,7 @@ def _request_execution_wrapper(request_id: str,
                     'or no longer running')
         return
     except (Exception, SystemExit) as e:  # pylint: disable=broad-except
+        execution_quiescent = True
         safe_failure_error = api_requests.sanitize_request_error(
             request_name, e, request_body)
         api_requests.set_request_failed(request_id, e)
@@ -1093,6 +1177,7 @@ def _request_execution_wrapper(request_id: str,
                      f'{common_utils.format_exception(safe_failure_error)}')
         return
     else:
+        execution_quiescent = True
         api_requests.set_request_succeeded(
             request_id, return_value if not ignore_return_value else None)
         # Manually reset the original stdout and stderr file descriptors early
@@ -1102,6 +1187,8 @@ def _request_execution_wrapper(request_id: str,
         logger.info(f'Request {request_id} finished')
     finally:
         _in_request_execution = False
+        _execution_cancellation_marker = None
+        request_storage.clear_execution_cancellation(cancellation_marker)
         request_storage.deactivate_execution_claim(execution_claim_token)
         _restore_output()
         try:
@@ -1124,6 +1211,15 @@ def _request_execution_wrapper(request_id: str,
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Failed to record memory metrics: '
                          f'{common_utils.format_exception(e)}')
+        if execution_quiescent and claim_token is not None:
+            # This is deliberately last: the receipt means this exact
+            # generation has stopped effect-bearing handler code and completed
+            # the wrapper's cleanup. The monitor repeats the write only after
+            # a normal Future completion as a DB-failure fallback; ambiguous
+            # exceptional Futures must never publish a receipt.
+            _acknowledge_execution_quiescence(
+                request_storage.ExecutionClaim(request_id, execution_generation,
+                                               claim_token))
 
 
 _first_request = True

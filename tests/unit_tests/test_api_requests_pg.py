@@ -295,10 +295,14 @@ def test_api005_upgrade_preserves_ordinary_api004_rows(postgres_engine):
                                          mode='upgrade')
 
     request = _request('pre-api005')
+    request_values = request_postgres._request_values_for_db(request)
+    request_values.pop('execution_quiescence_required')
+    request_values.pop('execution_quiesced_generation')
+    request_values.pop('execution_quiesced_at')
     with postgres_engine.begin() as connection:
         connection.execute(
-            sqlalchemy.insert(request_postgres.REQUESTS).values(
-                **request_postgres._request_values_for_db(request)))
+            sqlalchemy.insert(
+                request_postgres.REQUESTS).values(**request_values))
         connection.execute(
             sqlalchemy.insert(request_postgres.QUEUE).values(
                 **request_postgres._queue_values(request)))
@@ -309,9 +313,12 @@ def test_api005_upgrade_preserves_ordinary_api004_rows(postgres_engine):
                                          mode='upgrade')
     with postgres_engine.connect() as connection:
         stored = connection.execute(
-            sqlalchemy.select(request_postgres.REQUESTS).where(
-                request_postgres.REQUESTS.c.request_id ==
-                request.request_id)).mappings().one()
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.status,
+                request_postgres.REQUESTS.c.resource_action_id,
+                request_postgres.REQUESTS.c.resource_action_attempt).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request.request_id)).mappings().one()
         queue_count = connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
                              ).select_from(request_postgres.QUEUE).where(
@@ -423,6 +430,52 @@ def test_api007_upgrade_preserves_instances_and_widens_only_role_check(
     for role in ('all', 'api', 'executor', 'controller', 'authority-worker'):
         assert f"'{role}'" in role_check
     assert role_check.count("'") == 10
+
+
+def test_api008_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '007',
+                                         mode='upgrade')
+    request = _request('pre-api008')
+    request_values = request_postgres._request_values_for_db(request)
+    request_values.pop('execution_quiescence_required')
+    request_values.pop('execution_quiesced_generation')
+    request_values.pop('execution_quiesced_at')
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                request_postgres.REQUESTS).values(**request_values))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.QUEUE).values(
+                **request_postgres._queue_values(request)))
+
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '008',
+                                         mode='upgrade')
+
+    with postgres_engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id)).mappings().one()
+    assert row['execution_quiescence_required'] is False
+    assert row['execution_quiesced_generation'] is None
+    assert row['execution_quiesced_at'] is None
+    indexes = {
+        index['name']: index for index in sqlalchemy.inspect(
+            postgres_engine).get_indexes('api_requests')
+    }
+    quiescence_index = indexes['ix_api_requests_quiescence_cluster_status']
+    assert quiescence_index['column_names'] == ['cluster_name', 'status']
+    assert _normalized_index_predicate(quiescence_index) == (
+        'execution_quiescence_requiredAND'
+        'execution_quiesced_generationISDISTINCTFROMexecution_generationOR'
+        'execution_quiesced_atISNULL')
 
 
 def test_authority_claim_query_requires_current_queued_action_cohort_and_reference(
@@ -725,6 +778,7 @@ def test_ordinary_request_lifecycle_does_not_create_actions(request_database):
                                      result=[])
     finally:
         storage.deactivate_execution_claim(context)
+    assert backend.acknowledge_execution_quiescence(claim)
     asyncio.run(backend.delete_requests([request_id]))
 
     with engine.connect() as connection:
@@ -739,10 +793,62 @@ def test_ordinary_request_lifecycle_does_not_create_actions(request_database):
                 request_postgres.RESOURCE_ACTION_ATTEMPTS)).scalar_one() == 0
 
 
+def test_retention_waits_for_required_execution_quiescence(request_database):
+    engine, backend = request_database
+    request_id = 'retention-unproven'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token)
+    context = storage.activate_execution_claim(claim.request_id,
+                                               claim.execution_generation,
+                                               claim.claim_token)
+    try:
+        assert backend.set_request_finished(request_id,
+                                            requests.RequestStatus.SUCCEEDED,
+                                            result=[])
+    finally:
+        storage.deactivate_execution_claim(context)
+
+    asyncio.run(backend.delete_requests([request_id]))
+    assert backend.get_request(request_id) is not None
+
+    assert backend.acknowledge_execution_quiescence(claim)
+    asyncio.run(backend.delete_requests([request_id]))
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.REQUESTS).where(
+                                 request_postgres.REQUESTS.c.request_id ==
+                                 request_id)).scalar_one() == 0
+
+
+def test_retention_allows_pre_api008_unrequired_terminal_row(request_database):
+    engine, backend = request_database
+    request_id = 'retention-legacy'
+    request = _request(request_id, should_enqueue=False)
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    assert backend.set_request_finished(request_id,
+                                        requests.RequestStatus.SUCCEEDED,
+                                        result=[])
+    restored = backend.get_request(request_id)
+    assert not restored.execution_quiescence_required
+
+    asyncio.run(backend.delete_requests([request_id]))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.REQUESTS).where(
+                                 request_postgres.REQUESTS.c.request_id ==
+                                 request_id)).scalar_one() == 0
+
+
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '007'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '008'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
@@ -757,6 +863,10 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     assert 'event_context' in request_columns
     assert {'resource_action_id',
             'resource_action_attempt'}.issubset(request_columns)
+    assert {
+        'execution_quiescence_required', 'execution_quiesced_generation',
+        'execution_quiesced_at'
+    }.issubset(request_columns)
     attempt_columns = {
         column['name']
         for column in inspector.get_columns('api_resource_action_attempts')
@@ -1003,6 +1113,7 @@ def test_correlated_request_gc_waits_for_settled_attempt(
                                      result=[])
     finally:
         storage.deactivate_execution_claim(context)
+    assert backend.acknowledge_execution_quiescence(claim)
     assert backend.get_request(
         request_id).status is requests.RequestStatus.SUCCEEDED
     with engine.begin() as connection:
@@ -1090,7 +1201,7 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api006_downgrade_guard_retains_api007_head(request_database):
+def test_api006_downgrade_guard_retains_api008_head(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
@@ -1098,7 +1209,7 @@ def test_api006_downgrade_guard_retains_api007_head(request_database):
         alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '007'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '008'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()
@@ -1597,6 +1708,8 @@ def test_cancelling_running_controller_action_marks_outcome_ambiguous(
                                         item.claim_token)
         kill = mock.Mock()
         monkeypatch.setattr(request_postgres.os, 'kill', kill)
+        monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
+                            lambda _pid: True)
 
         assert backend.kill_requests([item.request_id]) == [item.request_id]
 
@@ -2022,6 +2135,9 @@ def test_terminal_internal_daemon_is_revived_with_fresh_delivery(
     restored = backend.get_request(request.request_id)
     assert restored.status is requests.RequestStatus.PENDING
     assert restored.error is None
+    assert not restored.execution_quiescence_required
+    assert restored.execution_quiesced_generation is None
+    assert restored.execution_quiesced_at is None
     assert queue.qsize() == 1
 
 
@@ -2046,7 +2162,213 @@ def test_cancel_never_signals_a_different_instance(request_database,
     assert item.claim_token is not None
 
 
-def test_remote_cancel_is_acknowledged_by_owning_executor(
+def test_pending_durable_cancel_records_immediate_quiescence(request_database):
+    _, backend = request_database
+    assert asyncio.run(
+        backend.create_if_not_exists_async(_request('pending-cancel')))
+    inserted = backend.get_request('pending-cancel')
+    assert not inserted.execution_quiescence_required
+    assert inserted.execution_quiesced_generation is None
+    assert inserted.execution_quiesced_at is None
+
+    assert backend.kill_requests(['pending-cancel']) == ['pending-cancel']
+
+    restored = backend.get_request('pending-cancel')
+    assert restored.status is requests.RequestStatus.CANCELLED
+    assert restored.execution_quiescence_required
+    assert restored.execution_generation == 0
+    assert restored.execution_quiesced_generation == 0
+    assert restored.execution_quiesced_at is not None
+
+
+def test_unclaimed_insert_opts_into_quiescence_only_when_claimed(
+        request_database):
+    _, backend = request_database
+    request_id = 'quiescence-opt-in-on-claim'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+
+    inserted = backend.get_request(request_id)
+    assert not inserted.execution_quiescence_required
+    assert inserted.execution_quiesced_generation is None
+    assert inserted.execution_quiesced_at is None
+
+    item = _claim(backend, request_id)
+
+    claimed = backend.get_request(request_id)
+    assert claimed.execution_quiescence_required
+    assert claimed.execution_generation == item.execution_generation
+    assert claimed.execution_quiesced_generation is None
+    assert claimed.execution_quiesced_at is None
+
+
+def test_execution_quiescence_candidates_use_cluster_and_required_predicate(
+        request_database):
+    engine, backend = request_database
+    active = _request('candidate-active')
+    active.cluster_name = 'target-cluster'
+    required_terminal = _request('candidate-required-terminal',
+                                 should_enqueue=False)
+    required_terminal.cluster_name = 'target-cluster'
+    legacy_terminal = _request('candidate-legacy-terminal',
+                               should_enqueue=False)
+    legacy_terminal.cluster_name = 'target-cluster'
+    other = _request('candidate-other')
+    other.cluster_name = 'other-cluster'
+    for request in (active, required_terminal, legacy_terminal, other):
+        assert asyncio.run(backend.create_if_not_exists_async(request))
+    assert backend.kill_requests([required_terminal.request_id
+                                 ]) == [required_terminal.request_id]
+    assert backend.set_request_finished(legacy_terminal.request_id,
+                                        requests.RequestStatus.SUCCEEDED,
+                                        result=[])
+
+    candidates = backend.query_requests(
+        requests.RequestTaskFilter(cluster_names=['target-cluster'],
+                                   execution_quiescence_candidates_only=True,
+                                   sort=False))
+
+    assert {request.request_id for request in candidates
+           } == {active.request_id, required_terminal.request_id}
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                required_terminal.request_id).values(
+                    execution_quiesced_generation=(
+                        request_postgres.REQUESTS.c.execution_generation),
+                    execution_quiesced_at=sqlalchemy.func.clock_timestamp()))
+    candidates = backend.query_requests(
+        requests.RequestTaskFilter(cluster_names=['target-cluster'],
+                                   execution_quiescence_candidates_only=True,
+                                   sort=False))
+    assert {request.request_id for request in candidates} == {active.request_id}
+
+
+def test_exact_request_id_filter_does_not_match_prefixes(request_database):
+    _, backend = request_database
+    for request_id in ('exact-filter', 'exact-filter-sibling', 'other'):
+        assert asyncio.run(
+            backend.create_if_not_exists_async(_request(request_id)))
+
+    matched = backend.query_requests(
+        requests.RequestTaskFilter(request_ids=['exact-filter'], sort=False))
+    empty = backend.query_requests(
+        requests.RequestTaskFilter(request_ids=[], sort=False))
+
+    assert [request.request_id for request in matched] == ['exact-filter']
+    assert empty == []
+
+
+def test_scalar_status_projection_does_not_decode_large_payload(
+        request_database, monkeypatch):
+    """Quiescence polling must not deserialize or transfer launch payloads."""
+    _, backend = request_database
+    request_id = 'scalar-status-projection'
+    request = requests.Request(
+        request_id=request_id,
+        name='sky.launch',
+        entrypoint=core.launch,
+        request_body=payloads.LaunchBody(task='resources:\n  cpus: 2\n' +
+                                         '# large-payload\n' * 10000,
+                                         cluster_name='projection-cluster'),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='user',
+        cluster_name='projection-cluster',
+        schedule_type=requests.ScheduleType.LONG,
+        should_enqueue=True)
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    monkeypatch.setattr(
+        registry, 'decode_payload',
+        mock.Mock(side_effect=AssertionError('payload must not be decoded')))
+
+    [projected] = backend.query_requests(
+        requests.RequestTaskFilter(request_ids=[request_id],
+                                   fields=[
+                                       'request_id', 'name', 'cluster_name',
+                                       'status', 'execution_generation',
+                                       'execution_quiescence_required',
+                                       'execution_quiesced_generation',
+                                       'execution_quiesced_at'
+                                   ],
+                                   sort=False))
+
+    assert projected.request_id == request_id
+    assert projected.cluster_name == 'projection-cluster'
+    assert projected.request_body == payloads.RequestBody()
+
+
+def test_pending_direct_cancel_does_not_invent_quiescence(request_database):
+    _, backend = request_database
+    assert asyncio.run(
+        backend.create_if_not_exists_async(
+            _request('direct-pending-cancel', should_enqueue=False)))
+
+    assert backend.kill_requests(['direct-pending-cancel'
+                                 ]) == ['direct-pending-cancel']
+
+    restored = backend.get_request('direct-pending-cancel')
+    assert restored.status is requests.RequestStatus.CANCELLED
+    # Direct coroutines never carry a durable execution claim. Cancellation
+    # must not opt them into an acknowledgement they cannot publish.
+    assert not restored.execution_quiescence_required
+    assert restored.execution_quiesced_generation is None
+    assert restored.execution_quiesced_at is None
+
+
+def test_waiting_cancel_without_receipt_does_not_invent_quiescence(
+        request_database):
+    engine, backend = request_database
+    assert asyncio.run(
+        backend.create_if_not_exists_async(_request('waiting-cancel')))
+    item = _claim(backend, 'waiting-cancel')
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                'waiting-cancel').values(
+                    status=requests.RequestStatus.WAITING.value,
+                    pid=None,
+                    claim_token=None,
+                    worker_instance_id=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None))
+        connection.execute(
+            sqlalchemy.update(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == 'waiting-cancel').values(
+                    delivery_state='queued', claim_generation=None))
+
+    assert backend.kill_requests(['waiting-cancel']) == ['waiting-cancel']
+
+    restored = backend.get_request('waiting-cancel')
+    assert restored.execution_generation == item.execution_generation
+    assert restored.execution_quiescence_required
+    assert restored.execution_quiesced_generation is None
+    assert restored.execution_quiesced_at is None
+
+
+def test_running_pidless_cancel_does_not_invent_quiescence(request_database):
+    engine, backend = request_database
+    assert asyncio.run(
+        backend.create_if_not_exists_async(_request('running-pidless')))
+    item = _claim(backend, 'running-pidless')
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                'running-pidless').values(pid=None))
+
+    assert backend.kill_requests(['running-pidless']) == ['running-pidless']
+
+    restored = backend.get_request('running-pidless')
+    assert restored.execution_generation == item.execution_generation
+    assert restored.execution_quiescence_required
+    assert restored.execution_quiesced_generation is None
+    assert restored.execution_quiesced_at is None
+
+
+def test_remote_cancel_signal_is_not_execution_quiescence(
         request_database, monkeypatch):
     engine, executor_backend = request_database
     executor_instance_id = executor_backend.instance_id
@@ -2062,9 +2384,14 @@ def test_remote_cancel_is_acknowledged_by_owning_executor(
     monkeypatch.setattr(request_postgres.os, 'kill', kill)
     assert api_backend.kill_requests(['remote-cancel']) == ['remote-cancel']
     kill.assert_not_called()
+    assert not api_backend.acknowledge_execution_quiescence(
+        storage.ExecutionClaim(item.request_id, item.execution_generation,
+                               item.claim_token))
 
     monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
                        executor_instance_id)
+    monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
+                        lambda _pid: True)
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
                                    item.claim_token)
     assert executor_backend.interrupt_cancelled_claim(claim)
@@ -2072,10 +2399,134 @@ def test_remote_cancel_is_acknowledged_by_owning_executor(
     with engine.connect() as connection:
         row = connection.execute(
             sqlalchemy.select(
-                request_postgres.REQUESTS.c.cancel_acknowledged_at).where(
+                request_postgres.REQUESTS.c.cancel_acknowledged_at,
+                request_postgres.REQUESTS.c.execution_quiesced_generation,
+                request_postgres.REQUESTS.c.execution_quiesced_at).where(
                     request_postgres.REQUESTS.c.request_id ==
                     'remote-cancel')).one()
     assert row.cancel_acknowledged_at is not None
+    assert row.execution_quiesced_generation is None
+    assert row.execution_quiesced_at is None
+
+    stale_claim = storage.ExecutionClaim(item.request_id,
+                                         item.execution_generation,
+                                         str(uuid.uuid4()))
+    assert not executor_backend.acknowledge_execution_quiescence(stale_claim)
+    stale_generation = storage.ExecutionClaim(item.request_id,
+                                              item.execution_generation - 1,
+                                              item.claim_token)
+    assert not executor_backend.acknowledge_execution_quiescence(
+        stale_generation)
+    assert executor_backend.acknowledge_execution_quiescence(claim)
+    assert executor_backend.acknowledge_execution_quiescence(claim)
+    restored = executor_backend.get_request('remote-cancel')
+    assert (restored.execution_quiesced_generation == item.execution_generation)
+    assert restored.execution_quiesced_at is not None
+
+
+def test_cancel_signal_and_receipt_are_serialized_by_request_lock(
+        request_database, monkeypatch):
+    """A wrapper cannot return/reuse its PID while cancellation signals it."""
+    _, backend = request_database
+    request_id = 'cancel-row-lock-ordering'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token)
+    signal_entered = threading.Event()
+    signal_release = threading.Event()
+    receipt_returned = threading.Event()
+    receipt_result: list[bool] = []
+
+    def blocking_kill(_pid, _signal):
+        signal_entered.set()
+        assert signal_release.wait(timeout=5)
+
+    monkeypatch.setattr(request_postgres.os, 'kill', blocking_kill)
+    monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
+                        lambda _pid: True)
+
+    cancel_thread = threading.Thread(target=backend.kill_requests,
+                                     args=([request_id],))
+    cancel_thread.start()
+    assert signal_entered.wait(timeout=5)
+
+    def publish_receipt():
+        receipt_result.append(backend.acknowledge_execution_quiescence(claim))
+        receipt_returned.set()
+
+    receipt_thread = threading.Thread(target=publish_receipt)
+    receipt_thread.start()
+    assert not receipt_returned.wait(timeout=0.2)
+
+    signal_release.set()
+    cancel_thread.join(timeout=5)
+    receipt_thread.join(timeout=5)
+    assert not cancel_thread.is_alive()
+    assert not receipt_thread.is_alive()
+    assert receipt_result == [True]
+    storage.clear_execution_cancellation(
+        storage.execution_cancellation_marker_path(1234, claim))
+
+
+@pytest.mark.parametrize('terminal_status', [
+    requests.RequestStatus.SUCCEEDED,
+    requests.RequestStatus.FAILED,
+])
+def test_exact_worker_records_terminal_execution_quiescence(
+        request_database, terminal_status):
+    _, backend = request_database
+    request_id = f'quiesced-{terminal_status.value.lower()}'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token)
+    context = storage.activate_execution_claim(claim.request_id,
+                                               claim.execution_generation,
+                                               claim.claim_token)
+    try:
+        if terminal_status is requests.RequestStatus.SUCCEEDED:
+            assert backend.set_request_finished(request_id,
+                                                terminal_status,
+                                                result=[])
+        else:
+            assert backend.set_request_finished(request_id,
+                                                terminal_status,
+                                                error=RuntimeError('failed'))
+    finally:
+        storage.deactivate_execution_claim(context)
+
+    assert backend.acknowledge_execution_quiescence(claim)
+    restored = backend.get_request(request_id)
+    assert restored.execution_quiescence_required
+    assert (restored.execution_quiesced_generation == item.execution_generation)
+    assert restored.execution_quiesced_at is not None
+
+
+def test_new_claim_resets_prior_generation_quiescence(request_database):
+    _, backend = request_database
+    request_id = 'quiescence-reset-on-claim'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    first = _claim(backend, request_id)
+    assert first.claim_token is not None
+    first_claim = storage.ExecutionClaim(first.request_id,
+                                         first.execution_generation,
+                                         first.claim_token)
+    assert backend.acknowledge_execution_quiescence(first_claim)
+    request_postgres.PostgresQueueBackend('short').put(first)
+    waiting = backend.get_request(request_id)
+    assert waiting.execution_quiesced_generation == first.execution_generation
+
+    second = request_postgres.PostgresQueueBackend('short').get()
+
+    assert second is not None
+    assert second.execution_generation == first.execution_generation + 1
+    restored = backend.get_request(request_id)
+    assert restored.execution_quiescence_required
+    assert restored.execution_quiesced_generation is None
+    assert restored.execution_quiesced_at is None
 
 
 def test_cancel_never_signals_an_expired_local_claim(request_database,
@@ -2096,6 +2547,27 @@ def test_cancel_never_signals_an_expired_local_claim(request_database,
     kill.assert_not_called()
     restored = backend.get_request('cancel-expired')
     assert restored.status is requests.RequestStatus.CANCELLED
+    assert item.claim_token is not None
+
+
+def test_cancel_never_signals_a_reused_unowned_pid(request_database,
+                                                   monkeypatch):
+    _, backend = request_database
+    request_id = 'cancel-reused-unowned-pid'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    kill = mock.Mock()
+    monkeypatch.setattr(request_postgres.os, 'kill', kill)
+    monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
+                        lambda _pid: False)
+
+    assert backend.kill_requests([request_id]) == [request_id]
+
+    kill.assert_not_called()
+    restored = backend.get_request(request_id)
+    assert restored.status is requests.RequestStatus.CANCELLED
+    assert restored.execution_quiescence_required
+    assert restored.execution_quiesced_generation is None
     assert item.claim_token is not None
 
 

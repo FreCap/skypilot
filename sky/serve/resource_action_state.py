@@ -436,9 +436,9 @@ class ActivationGateEvidenceV1:
                     for character in digest[7:])):
             raise ValueError('approved_image_digest must be sha256:<64 hex>.')
         object.__setattr__(self, 'approved_image_digest', digest)
-        if self.api_schema_revision not in ('005', '007'):
+        if self.api_schema_revision not in ('005', '007', '008'):
             raise ValueError('activation requires API schema revision 005 or '
-                             '007.')
+                             'a 007-compatible revision (007 or 008).')
         if self.serve_schema_revision != '035':
             raise ValueError('activation requires Serve schema revision 035.')
         if self.global_user_state_schema_revision != '028':
@@ -463,7 +463,8 @@ class ActivationGateEvidenceV1:
     @property
     def private_handler_dispatch_ready(self) -> bool:
         """Whether private shadow/provider dispatch has its API007 fence."""
-        return self.api_schema_revision == '007' and self.shadow_ready
+        return (self.api_schema_revision in ('007', '008') and
+                self.shadow_ready)
 
     @property
     def authority_ready(self) -> bool:
@@ -5610,10 +5611,10 @@ class PostgresServeResourceActionStateStore:
                     'Legacy-to-shadow evidence must not bind a candidate '
                     'window.')
         else:
-            if gate_evidence.api_schema_revision != '007':
+            if gate_evidence.api_schema_revision not in ('007', '008'):
                 raise kernel_actions.ActionConflict(
-                    'Shadow-to-authority activation requires API revision '
-                    '007.')
+                    'Shadow-to-authority activation requires a '
+                    '007-compatible API revision (007 or 008).')
             if (current.mode is old_mode and
                 (current.changed_at is None or
                  gate_evidence.candidate_since != current.changed_at)):

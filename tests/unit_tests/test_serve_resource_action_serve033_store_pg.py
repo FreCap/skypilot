@@ -531,12 +531,18 @@ def test_store_and_activation_contract_fail_closed_on_old_dialects() -> None:
                                             authority_ready=True)
     assert private_dispatch.private_handler_dispatch_ready
     assert private_dispatch.authority_ready
+    api008_dispatch = _activation_evidence(api_revision='008',
+                                           serve_revision='035',
+                                           authority_ready=True)
+    assert api008_dispatch.private_handler_dispatch_ready
+    assert api008_dispatch.authority_ready
     with pytest.raises(ValueError, match='Serve schema revision 035'):
         _activation_evidence(api_revision='007', serve_revision='034')
 
 
 def test_api006_cannot_authorize_m4() -> None:
-    with pytest.raises(ValueError, match='API schema revision 005 or 007'):
+    with pytest.raises(ValueError,
+                       match='API schema revision 005 or a 007-compatible'):
         _activation_evidence(api_revision='006',
                              serve_revision='035',
                              authority_ready=True)

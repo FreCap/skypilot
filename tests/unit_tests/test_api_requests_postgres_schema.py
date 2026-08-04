@@ -17,8 +17,9 @@ def test_postgres_record_schema_topology() -> None:
              'execution_generation', 'claim_token', 'worker_instance_id',
              'controller_generation', 'lease_expires_at', 'heartbeat_at',
              'cancel_requested_at', 'cancel_acknowledged_at',
-             'interrupted_reason', 'event_context', 'resource_action_id',
-             'resource_action_attempt', 'updated_at'),
+             'execution_quiescence_required', 'execution_quiesced_generation',
+             'execution_quiesced_at', 'interrupted_reason', 'event_context',
+             'resource_action_id', 'resource_action_attempt', 'updated_at'),
         'api_resource_actions':
             ('action_id', 'domain', 'resource_type', 'resource_identity',
              'desired_generation', 'action_type', 'immutable_spec',
