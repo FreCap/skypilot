@@ -2321,6 +2321,52 @@ class TestServiceStatusEndpointSnapshot:
         assert 'hourly_cost' not in replica
         endpoint.assert_not_called()
 
+    def test_malformed_v2_status_is_unknown_without_provider_admission(self):
+        info, handle = self._v2_replica('r-1')
+        info.reserved_fill_kubernetes_context = 'contradictory-context'
+        cluster_record = {
+            'name': info.cluster_name,
+            'launched_at': 9,
+            'handle': handle,
+        }
+        record = {'name': 'svc-a', 'pool': False, 'version': 1}
+
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(
+                 serve_utils.global_user_state,
+                 'get_clusters_from_names',
+                 return_value={info.cluster_name: cluster_record}), \
+             mock.patch.object(serve_utils.provider_phase,
+                               'provider_phase') as phase, \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence') as uid, \
+             mock.patch('sky.backends.backend_utils.get_endpoints') as endpoint:
+            status = serve_utils._get_service_status(
+                'svc-a',
+                pool=False,
+                with_yaml=False,
+                with_target_num_replicas=False)
+
+        assert status is not None
+        replica = status['replica_info'][0]
+        assert replica['status'] is serve_state.ReplicaStatus.UNKNOWN
+        assert replica['provider_identity_uncertain'] is True
+        assert replica['endpoint'] is None
+        assert replica['handle'] is None
+        assert replica['launched_at'] is None
+        # Durable placement remains useful and is not replacement-provider
+        # evidence; live endpoint/handle/cost metadata stays absent.
+        assert replica['cloud'] == 'Kubernetes'
+        assert 'hourly_cost' not in replica
+        phase.assert_not_called()
+        uid.assert_not_called()
+        endpoint.assert_not_called()
+
 
 class TestTerminalStatuses:
     """`terminal_statuses` includes SHUTTING_DOWN so that callers like
@@ -2538,7 +2584,9 @@ class TestStreamReplicaLogsPhysicalIdentityFence:
                                             tail=1,
                                             pool=True)
 
-        provider_fence.assert_called_once_with(info, handle)
+        provider_fence.assert_called_once_with(info,
+                                               handle,
+                                               include_provider_phase=False)
         phase.assert_called_once_with(
             serve_utils.provider_phase.ProviderPhaseMode.V2_FENCED)
         backend.tail_logs.assert_called_once_with(handle,

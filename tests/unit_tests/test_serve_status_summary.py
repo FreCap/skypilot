@@ -4,7 +4,7 @@ The dashboard splits the service page into a fast summary query
 (`summary_only=True` -> per-status replica counts, no replica_info) and a
 slower full query. These tests pin the server-side contract.
 """
-# pylint: disable=redefined-outer-name,unused-argument
+# pylint: disable=redefined-outer-name,unused-argument,protected-access
 from unittest import mock
 
 import pytest
@@ -521,11 +521,15 @@ class TestGetServiceStatusPickledSummary:
         def _fake_status(name, *, pool, **kwargs):
             del kwargs
             scanned.append(name)
-            return {'name': name, 'status': 'READY', 'pool': pool}
+            return serve_utils._PreparedServiceStatus(
+                record={'name': name, 'status': 'READY', 'pool': pool},
+                pool=pool,
+                include_replica_info=False)
 
         monkeypatch.setattr(serve_state, 'get_glob_service_names',
                             _get_glob_service_names)
-        monkeypatch.setattr(serve_utils, '_get_service_status', _fake_status)
+        monkeypatch.setattr(serve_utils, '_prepare_service_status',
+                            _fake_status)
 
         statuses = serve_utils.get_service_status_pickled(None,
                                                           pool=False,
