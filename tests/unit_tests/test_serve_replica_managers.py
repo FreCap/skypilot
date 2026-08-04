@@ -4944,7 +4944,8 @@ class TestInfrastructureInterruptionRecovery:
                                return_value={}):
             manager._probe_all_replicas()
 
-        manager._cloud_instance_looks_alive.assert_called_once_with(info)
+        manager._cloud_instance_looks_alive.assert_called_once_with(
+            info, phase_admission=mock.ANY)
         manager._handle_preemption.assert_called_once_with(info)
         if changed_only:
             manager._persist_replicas.assert_not_called()

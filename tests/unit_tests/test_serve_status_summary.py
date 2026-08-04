@@ -522,7 +522,11 @@ class TestGetServiceStatusPickledSummary:
             del kwargs
             scanned.append(name)
             return serve_utils._PreparedServiceStatus(
-                record={'name': name, 'status': 'READY', 'pool': pool},
+                record={
+                    'name': name,
+                    'status': 'READY',
+                    'pool': pool
+                },
                 pool=pool,
                 include_replica_info=False)
 
