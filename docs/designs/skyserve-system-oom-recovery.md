@@ -1,42 +1,33 @@
 # SkyServe System OOM Recovery
 
-_Status: #1182 is merged; exact release 1.1.1061 was dark-deployed and then
-superseded by observed descendant releases 1.1.1064 and 1.1.1067, the latter
-from exact release source `7deb033019c322c844f205c1e26d0d6f703df9df`.
-Repository-wide required CI, including the real-PostgreSQL suites and exact
-paid-capacity retry, passed. Production Helm revision 318 now runs that exact
-1.1.1067 image with `Recreate` strategy and the metrics listener on port 9090.
-The revision-318 audit found recovery authorization absent, the central Serve
-database PostgreSQL-backed and at head when the server-selection marker is set,
-the separate API-request backend still SQLite, all 5,195 persisted replica rows
-across seven services `ORDINARY` with zero quarantine, and `boltz-l4-fleet`
-version 50 `READY`. The exact Datadog scrape is healthy; zero recovery-counter
-samples are expected until the first counter label is instantiated.
-Platform #7732 reconciled the Git/Terraform desired-state pin, but it ran no
-Helm/Terragrunt apply and did not complete the live workload audit. Its
-post-merge test-fleet update passed the exact client-pin and authenticated
-healthy-server guard plus dry-run, then observed no committed successor version
-because configured `aws/eu-central-2` was rejected during placement validation.
-Platform #7779 merged the narrow placement-matrix correction. Its post-merge
-workflow then committed and elected test-service version 43 in an intentional
-zero-demand state without changing the endpoint. Platform #7788 subsequently
-merged as `5b46ef6`; it does not close an OOM-recovery rollout or removal gate.
-Revision 318 incurred a separately explained approximately 106-second API gap:
-about 60 seconds waiting for the logrotate shutdown hold plus about 40 seconds
-of API startup. It is not retroactively grouped with the five earlier rollout-
-correlated HTTP-503 windows. Authorization-v3 activation is limited to
-dedicated canonical AWS-only canaries; the unchanged mixed production task is
-structurally ineligible and requires a future authorization-v4 migration.
-Published releases 1.1.1068 through 1.1.1078 have not been qualified for this
-rollout. #1246 fixes the observed logrotate-sidecar shutdown hold, and #1247
-adds complete split-role metrics serving; both are present in published exact
-release 1.1.1078 but have not yet been deployed. The restacked #1183 steady-
-state removal remains draft and blocked on all seven removal gates._
+_Status: #1182 is merged. The 2026-08-04 production audit found exact release
+1.1.1084 from source `5b301925560f2c8923d29ac50c1a7011794893f3`
+running as one `Recreate` API pod with the metrics listener enabled. PostgreSQL
+is authoritative for central Serve state while the separate API-request store
+remains SQLite. The final repeatable-read snapshot contained 5,294 replica
+rows: 77 `READY`, 379 `FAILED`, 119 `FAILED_INITIAL_DELAY`, 340
+`FAILED_PROBING`, and 4,379 `FAILED_PROVISION`. All 366 v13 rows have complete
+additive fields and disposition `ORDINARY`, but `cf-repro/1` is an old READY
+orphan with no parent service and there are no post-activation candidate or
+capable associations. This keeps the exhaustive replica gate open.
 
-_Last updated: 2026-08-03_
+The instantaneous load-balancer inventory is clean: all 12 a/b Deployments for
+the six persisted services are Ready on the exact 1.1.1084 digest, and each
+persisted active slot matches its live Service selector. The two-pass marker
+audit is invalid because the eligible inventory changed between snapshots; no
+remote marker scans were performed. Datadog and the live endpoint expose no
+recovery-counter family because labeled Prometheus counters are lazy until a
+child label tuple is instantiated. Current source preinitializes only the four
+deprecated compatibility events at the placement-neutral
+`provider="unknown",market="unknown"` tuple with value zero. That correction is
+not deployed, the seven-day clock has not started, and no missing-series
+interval earns removal-gate credit. The restacked #1183 steady-state removal
+remains draft with all seven global gates open._
+
+_Last updated: 2026-08-04_
 
 _Design baseline: `origin/improvements` at
-`d5b1ea56cff198604ef2f89479bd9b6d6b11e8a8`_
+`6498c6594d3f13019bcfbbd3d368ff8cff88116d`_
 
 ## Context and decision
 
@@ -2091,6 +2082,16 @@ monitoring must retain this series for at least eight days before the removal
 clock starts. Each of the seven UTC 24-hour gate queries requires both zero
 `increase()` for all four deprecated compatibility events and gap-free scrape-
 health evidence; counter reset, missing target, or scrape gap resets the clock.
+While those transition readers exist, the module preinitializes exactly one
+zero-valued child for each deprecated event at
+`provider="unknown",market="unknown"`. This tuple is a process-level
+visibility sentinel, not evidence that a compatibility event occurred or that
+an unknown placement was observed. It deliberately does not instantiate the
+provider/market Cartesian product: actual events create their own child with
+the persisted replica placement. A cold eligible controller metrics endpoint
+must therefore expose all four deprecated event children at zero before the
+observation window can start. #1183 removes both the transition events and
+their visibility sentinels after the gates pass.
 The timestamped query result and eligible-image inventory are retained with
 both PRs. Exact per-replica associations remain in current `ReplicaInfo`;
 bounded structured logs supply diagnostic correlation but are not lifecycle
@@ -2173,13 +2174,40 @@ authority.
   separate SQLite API-request backend, 5,195/5,195 `ORDINARY` replica rows
   across seven services, zero quarantine, and fleet version 50 `READY`.
   Datadog's exact scrape is healthy and has zero recovery-counter samples only
-  because no label has yet been instantiated. Its separately recorded
+  because no label has yet been instantiated. A missing family cannot prove a
+  zero increase, so this interval earns no gate-4 credit; the seven-day clock
+  may start only after the zero-series correction is deployed on the complete
+  eligible controller inventory and the canary-cohort rollout prerequisite is
+  satisfied. Its separately recorded
   approximately 106-second replacement gap consists of the 60-second logrotate
   hold plus roughly 40 seconds of startup and is not grouped with the five
   earlier rollout-correlated windows. No real AWS OOM injection or provider-
   termination race has been performed. LB runtime inventory, both 16-GB cloud
   smoke sequences, rollback/re-upgrade, and seven continuous UTC days of
   compatibility telemetry remain blocking evidence below.
+- The 2026-08-04 audit supersedes revision 318 as the removal-gate baseline.
+  Exact PostgreSQL repeatable-read snapshots at 04:14:33, 04:16:32, and
+  04:31:29 UTC ended with 5,294 rows and exposed the unresolved `cf-repro/1`
+  orphan. The first and final eligible inventories differed: fleet replicas
+  37564 and 37565 appeared, `b25fi-v4/9113` became `FAILED_PROVISION`, and
+  attempts 9114 and 9115 appeared. The marker contract therefore invalidates
+  both passes; neither an empty scan nor deleted-history inference is evidence.
+  A concurrent inventory found all 12 load-balancer slot Deployments Ready and
+  selector-consistent on the exact 1.1.1084 digest, but did not provide the
+  required remote controller, Skylet, job-detail, or marker inventory.
+  Datadog returned no recovery-counter series over July 27 through the audit,
+  while bounded logs contained zero deprecated-event labels. Missing counter
+  telemetry cannot prove zero increase. The eligible image also changed
+  1.1.1082 to 1.1.1083 to 1.1.1084 that day, so all seven cleanup gates remain
+  open and the seven-day clock has not started.
+- The two historical `boltz-l4-fleet` version-spec quarantines are not
+  recovery-state quarantine. Version 39 produced 24 terminal never-ready
+  replicas (18 `FAILED_INITIAL_DELAY`, six `FAILED`) and zero Ready replicas;
+  sampled AWS and Kubernetes setup logs identify invalid base64 input for the
+  R2 SSE-C key path. Version 38 has no replica rows and was excluded only so
+  fail-open chose proven version 37 after the v39 incident. Preserve both
+  records as operational history; neither is evidence for or against the OOM
+  authorization cleanup gates.
 
 ## PR 3 removal gates
 
