@@ -147,7 +147,7 @@ def _read_node_cluster_config() -> dict[str, Any] | None:
 
 def _read_namespace() -> str | None:
     try:
-        with open(_NAMESPACE_FILE, 'r', encoding='utf-8') as f:
+        with open(_NAMESPACE_FILE, encoding='utf-8') as f:
             namespace = f.read().strip()
     except OSError as e:
         logger.debug(f'[autodown-preflight] cannot read {_NAMESPACE_FILE}: '
