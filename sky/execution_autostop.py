@@ -1,7 +1,10 @@
 """Launch-time autostop policy for the execution layer."""
 
+import logging
 import typing
 from typing import Any
+
+import colorama
 
 from sky import clouds
 from sky import exceptions
@@ -11,6 +14,8 @@ from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
     import sky
+    from sky import backends
+    from sky.skylet import autostop_lib
 
 
 def _compute_set_autostop_args_for_hooks_only_relaunch(
@@ -54,6 +59,64 @@ def _compute_set_autostop_args_for_hooks_only_relaunch(
         down=prior_to_down,
         hooks=hooks_payload,
     )
+
+
+def apply_launch_autostop(
+    backend: 'backends.CloudVmRayBackend',
+    handle: 'backends.CloudVmRayResourceHandle',
+    idle_minutes_to_autostop: int,
+    wait_for: 'autostop_lib.AutostopWaitFor | None',
+    down: bool,
+    *,
+    hook: str | None,
+    hook_timeout: int | None,
+    hooks: list[dict[str, Any]] | None,
+    refusal_is_fatal: bool,
+    job_logger: logging.Logger,
+) -> None:
+    """Arms the launch's autostop config, handling a node that refuses it.
+
+    A node refuses (``NotSupportedError``) when it provably cannot execute
+    the requested teardown -- see ``sky/skylet/autostop_preflight.py``. The
+    node reports capability; deciding whether that is fatal is this layer's
+    job, because only the launch knows *who asked* for the autodown:
+
+    - The user did (``sky launch -i N --down``): the promise cannot be
+      kept, so fail rather than hand back a cluster that will sit there
+      billing with a serene ``AUTOSTOP  Nm (down)`` in ``sky status``.
+    - SkyPilot did: managed-job clusters and controllers get an autodown
+      nobody asked for, purely as a leak backstop in case their controller
+      dies (see ``jobs/recovery_strategy.py``, and the Kubernetes SkyServe
+      controller force-convert in ``CloudVmRayBackend.set_autostop``).
+      Failing those launches would trade a backstop that was never going to
+      fire for an outage. They proceed with autostop explicitly cleared, so
+      nothing advertises a teardown that cannot happen.
+    """
+    try:
+        backend.set_autostop(handle,
+                             idle_minutes_to_autostop,
+                             wait_for,
+                             down,
+                             hook=hook,
+                             hook_timeout=hook_timeout,
+                             hooks=hooks)
+        return
+    except exceptions.NotSupportedError:
+        if refusal_is_fatal:
+            raise
+    job_logger.warning(
+        f'{colorama.Fore.YELLOW}Cluster {handle.cluster_name!r} cannot tear '
+        'itself down, so the idle-teardown backstop is disabled for it. It '
+        'will be torn down as usual when its work finishes; if the '
+        'controller dies first, the cluster must be removed manually.'
+        f'{colorama.Style.RESET_ALL}')
+    # -1 cancels autostop. The hooks list rides along so it still lands on
+    # the node -- hooks fire on preemption/down independently of autostop.
+    # The deprecated single-hook fields deliberately do not: they were
+    # picked for the `down` event, and only a pre-v7 skylet reads them --
+    # which is also a skylet with no preflight, so it never refuses and
+    # never reaches here.
+    backend.set_autostop(handle, -1, wait_for, down=False, hooks=hooks)
 
 
 def autostop_requested_features(

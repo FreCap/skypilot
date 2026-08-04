@@ -17,3 +17,11 @@ output "role_name" {
   description = "Name shared by the namespaced role and its binding."
   value       = kubernetes_role_v1.pool.metadata[0].name
 }
+
+output "self_teardown_role_name" {
+  description = <<-EOT
+    Name shared by the pod ServiceAccount's self-teardown role and its binding,
+    or null when allow_self_teardown is false (autodown unavailable in the pool).
+  EOT
+  value       = one(kubernetes_role_v1.pool_sa_self_teardown[*].metadata[0].name)
+}

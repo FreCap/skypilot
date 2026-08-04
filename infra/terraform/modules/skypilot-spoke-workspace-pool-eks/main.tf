@@ -63,6 +63,7 @@ module "rbac" {
   manage_namespace     = each.value.manage_namespace
   service_account_name = each.value.pod_identity_service_account
   allow_pvc_read       = length(each.value.fsx_volumes) > 0
+  allow_self_teardown  = each.value.allow_self_teardown
 
   subjects = [{
     kind = "Group"

@@ -487,7 +487,7 @@ def test_two_local_wheels_replace_v40_or_v42_offline_on_v43_baseline(
     assert completed.returncode == 0, completed.stderr
     baseline_probe = (
         'from sky.skylet import constants;'
-        "assert constants.SKYLET_VERSION == '43';"
+        "assert constants.SKYLET_VERSION == '44';"
         'assert constants.SKYLET_LIB_VERSION == 9;'
         'import importlib.util;'
         f"assert importlib.util.find_spec('sky.v{prior_version}_only') is None;"

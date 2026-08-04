@@ -232,7 +232,7 @@ class TestRestartSkylet:
 
 def test_running_v42_skylet_restarts_for_capability_contract(
         skylet_env, monkeypatch):  # pylint: disable=redefined-outer-name
-    assert constants.SKYLET_VERSION == '43'
+    assert constants.SKYLET_VERSION == '44'
     skylet_env['version_file'].write_text('42')
     monkeypatch.setattr(attempt_skylet, '_find_running_skylet_pids',
                         lambda: [12345])
