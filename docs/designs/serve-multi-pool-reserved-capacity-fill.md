@@ -699,6 +699,46 @@ malformed present split is a measurement blackout; malformed persisted shaped
 feed authorizes zero launches. Rounds written before the nullable field exists
 retain their aggregate compatibility behavior.
 
+Measured capacity may override a zero-cost placement bench only after the
+measurement belongs to a successfully published broker round. Query callbacks
+never update a controller-local placer: a writer that loses the lease-token
+publish race, or whose observation is rejected as malformed, phantom, or
+blackout, supplies no placement evidence. Both the writer and every peer that
+reads the fresh shared round reconstruct the same optional observation through
+the ordinary `Allocation` reader and apply it only to that poller's locations
+for the exact pool. Protocol v1 retains its one-context invariant; protocol v2
+uses the exact `FillPoolSpec.locations` for the returned `pool_key`. Capacity
+from one physical pool or accelerator card therefore cannot release a bench in
+another.
+
+This committed-round dissemination uses no schema change. The existing
+`feed_by_accelerator` outer JSON object carries an additional reserved key,
+`$skypilot-observed-free-v1`, whose value is the validated, normalized raw
+per-card observation. The `$` prefix cannot collide with a valid service name.
+Normal per-service shaped-feed entries remain present, including for protocol
+v1 rounds, so an older reader ignores the extra key while continuing to find
+its own entry. The aggregate value and observation time remain in
+`last_observed_free` and `last_observed_free_ts`; the latter is the conservative
+pre-query snapshot time, not a post-query timestamp. A bench at or after that
+time therefore still wins.
+
+The service shaped-feed entry and reserved observation entry are parsed and
+validated independently. A malformed service entry retains the existing
+protocol-v2 fail-closed zero-launch behavior. A missing or malformed reserved
+entry suppresses only measured bench release; it cannot invalidate a valid
+service allocation. The reserved map accepts only canonical cards from the
+pool identity, nonnegative integer counts (never booleans), no case-folded
+duplicates, and a sum equal to the persisted aggregate. Old rounds without the
+reserved entry provide no measured bench override and recover on the next
+successfully published round.
+
+The reserved observation is metadata, not additional launch allocation. It is
+removed before comparing shaped service feeds for epoch advancement. A raw
+measurement change above an unchanged service cap therefore does not churn the
+pool epoch or fence queued launches. Any change to a service feed, its exact
+card allocation, protocol/generation metadata, lease state, or blackout of
+positive authority retains the existing epoch fence.
+
 A failed, stale, benched, or phantom pool feeds zero only for that pool. It
 does not erase another healthy edge of the same service. A pool epoch change
 fences only launches stamped for that pool.
@@ -1169,6 +1209,19 @@ Automated coverage must include:
   authority without edge deletion, generation churn, or sibling invalidation;
 - per-pool grant, feed, damping, staleness, phantom, bench, epoch, cache, and
   removal isolation;
+- committed measured-capacity dissemination to two independent pollers sharing
+  one fresh round, with one provider query and identical exact-pool/card bench
+  release for both controllers;
+- no measured bench release from a lease-CAS-lost writer, invalid exact-card
+  split, phantom, or blackout, and conservative pre-query observation-time
+  ordering against a concurrent or newer bench;
+- protocol-v1 one-context and protocol-v2 multi-pool/card observation
+  isolation through the actual broker-cycle paths, including a fresh-round
+  reader that never invokes its query callback;
+- old rounds without the reserved observation entry, old readers presented
+  with the additive reserved key, independently malformed service and
+  observation entries, and raw-observation-only changes that do not advance
+  the pool epoch while real service feed/card changes still do;
 - service-global floor/cap conservation and deterministic over-cap drain;
 - global utilization-cap conservation, including need=1 across two pools;
 - headroom shrink during a pool blackout and a stale-round cap-repartition
