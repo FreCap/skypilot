@@ -445,6 +445,7 @@ def test_api008_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
     request_values.pop('execution_quiescence_required')
     request_values.pop('execution_quiesced_generation')
     request_values.pop('execution_quiesced_at')
+    legacy_instance_id = uuid.uuid4()
     with postgres_engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(
@@ -452,6 +453,15 @@ def test_api008_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
         connection.execute(
             sqlalchemy.insert(request_postgres.QUEUE).values(
                 **request_postgres._queue_values(request)))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=legacy_instance_id,
+                role='api',
+                version='api007',
+                ready=True,
+                health_detail={},
+                supported_handlers=[],
+                supported_payload_versions={}))
 
     migration_utils.safe_alembic_upgrade(postgres_engine,
                                          migration_utils.API_REQUESTS_DB_NAME,
@@ -463,9 +473,16 @@ def test_api008_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
             sqlalchemy.select(request_postgres.REQUESTS).where(
                 request_postgres.REQUESTS.c.request_id ==
                 request.request_id)).mappings().one()
+        legacy_instance = connection.execute(
+            sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id ==
+                legacy_instance_id)).mappings().one()
     assert row['execution_quiescence_required'] is False
     assert row['execution_quiesced_generation'] is None
     assert row['execution_quiesced_at'] is None
+    assert legacy_instance['request_storage_backend'] == 'unknown'
+    assert legacy_instance['request_queue_backend'] == 'unknown'
+    assert legacy_instance['execution_quiescence_capable'] is False
     indexes = {
         index['name']: index for index in sqlalchemy.inspect(
             postgres_engine).get_indexes('api_requests')
@@ -1215,9 +1232,45 @@ def test_api006_downgrade_guard_retains_api008_head(request_database):
     assert 'api_resource_action_attempts' in inspector.get_table_names()
 
 
+def test_api008_downgrade_guard_retains_quiescence_evidence(request_database):
+    engine, _ = request_database
+    columns_before = {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('api_requests')
+    }
+    instance_columns_before = {
+        column['name'] for column in sqlalchemy.inspect(engine).get_columns(
+            'api_server_instances')
+    }
+    config = migration_utils.get_alembic_config(
+        engine, migration_utils.API_REQUESTS_DB_NAME)
+
+    with pytest.raises(RuntimeError, match='008 is additive'):
+        alembic_command.downgrade(config, '007')
+
+    assert migration_utils.get_current_alembic_revision(
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '008'
+    assert {
+        'execution_quiescence_required', 'execution_quiesced_generation',
+        'execution_quiesced_at'
+    } <= columns_before
+    assert columns_before == {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('api_requests')
+    }
+    assert {
+        'request_storage_backend', 'request_queue_backend',
+        'execution_quiescence_capable'
+    } <= instance_columns_before
+    assert instance_columns_before == {
+        column['name'] for column in sqlalchemy.inspect(engine).get_columns(
+            'api_server_instances')
+    }
+
+
 def test_server_instance_lease_publishes_ready_and_draining(
         request_database, monkeypatch, tmp_path):
-    engine, _ = request_database
+    engine, backend = request_database
     instance_id = str(uuid.uuid4())
     drain_marker = tmp_path / 'draining'
     monkeypatch.setattr(request_postgres, 'ROLE_DRAIN_MARKER_PATH',
@@ -1226,6 +1279,11 @@ def test_server_instance_lease_publishes_ready_and_draining(
     monkeypatch.setenv('HOSTNAME', 'executor-pod')
     monkeypatch.setenv('SKYPILOT_POD_UID', 'pod-uid')
     monkeypatch.setenv('POD_IP', '10.0.0.1')
+    monkeypatch.setenv(request_postgres.REQUEST_BACKEND_ENV_VAR,
+                       request_postgres.POSTGRES_REQUEST_BACKEND)
+    monkeypatch.setattr(storage, '_storage_backend', backend)
+    monkeypatch.setattr(queue_base, '_queue_backend_factory',
+                        request_postgres.PostgresQueueFactory())
     lease = request_postgres.ServerInstanceLease('executor',
                                                  heartbeat_interval_seconds=60)
     lease.start()
@@ -1244,6 +1302,11 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert row['draining_at'] is None
     assert row['health_detail'] == {'phase': 'claiming'}
     assert row['supported_handlers']
+    assert row['request_storage_backend'] == (
+        request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE)
+    assert row['request_queue_backend'] == (
+        request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE)
+    assert row['execution_quiescence_capable'] is True
     drain_marker.touch()
     assert not lease.is_locally_ready()
     assert not request_postgres.current_instance_is_ready()
@@ -1265,6 +1328,39 @@ def test_server_instance_lease_publishes_ready_and_draining(
                     instance_id))).mappings().one()
     assert not row['ready']
     assert row['draining_at'] is not None
+
+
+def test_server_instance_lease_rejects_plugin_backend_subclasses(
+        request_database, monkeypatch):
+    engine, _ = request_database
+
+    class PluginRequestBackend(request_postgres.PostgresRequestBackend):
+        pass
+
+    class PluginQueueFactory(request_postgres.PostgresQueueFactory):
+        pass
+
+    instance_id = str(uuid.uuid4())
+    monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR, instance_id)
+    monkeypatch.setenv(request_postgres.REQUEST_BACKEND_ENV_VAR,
+                       request_postgres.POSTGRES_REQUEST_BACKEND)
+    monkeypatch.setattr(storage, '_storage_backend', PluginRequestBackend())
+    monkeypatch.setattr(queue_base, '_queue_backend_factory',
+                        PluginQueueFactory())
+    lease = request_postgres.ServerInstanceLease('api',
+                                                 heartbeat_interval_seconds=60)
+    lease.start()
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
+                    request_postgres.SERVER_INSTANCES.c.instance_id ==
+                    uuid.UUID(instance_id))).mappings().one()
+        assert row['request_storage_backend'].endswith('.PluginRequestBackend')
+        assert row['request_queue_backend'].endswith('.PluginQueueFactory')
+        assert row['execution_quiescence_capable'] is False
+    finally:
+        lease.stop()
 
 
 def test_controller_cutover_waits_for_recent_m2_executor_heartbeat(

@@ -3,6 +3,7 @@
 
 import base64
 import contextlib
+import dataclasses
 import hashlib
 import json
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import pytest
 from sky.serve import reserved_capacity_activation
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
+from sky.server.requests import postgres as request_postgres
 from sky.skylet import constants as skylet_constants
 
 _DIGEST_A = 'sha256:' + 'a' * 64
@@ -54,6 +56,7 @@ def _deployment(*,
                 kind='api',
                 server_role=None,
                 request_backend='postgres',
+                quiescence_backend_guard='true',
                 generation=42,
                 observed_generation=42,
                 resource_version='deployment-rv-1',
@@ -102,15 +105,18 @@ def _deployment(*,
                     'app.kubernetes.io/instance': 'release',
                 }),
                 spec=SimpleNamespace(containers=[
-                    SimpleNamespace(name=container_name,
-                                    env=[
-                                        _env('SKYPILOT_RELEASE_NAME',
-                                             'skypilot'),
-                                        _env('SKYPILOT_API_SERVER_ROLE',
-                                             resolved_server_role),
-                                        _env('SKYPILOT_API_REQUEST_BACKEND',
-                                             request_backend),
-                                    ]),
+                    SimpleNamespace(
+                        name=container_name,
+                        env=[
+                            _env('SKYPILOT_RELEASE_NAME', 'skypilot'),
+                            _env('SKYPILOT_API_SERVER_ROLE',
+                                 resolved_server_role),
+                            _env('SKYPILOT_API_REQUEST_BACKEND',
+                                 request_backend),
+                            _env(
+                                'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS',
+                                quiescence_backend_guard),
+                        ]),
                     SimpleNamespace(name='metrics-sidecar', env=[]),
                 ]))),
         status=SimpleNamespace(observed_generation=observed_generation,
@@ -126,6 +132,7 @@ def _pod(index: int,
          kind: str = 'api',
          server_role: str | None = None,
          request_backend: str = 'postgres',
+         quiescence_backend_guard: str = 'true',
          digest: str = _DIGEST_A,
          resource_version: str | None = None):
     assert kind in ('api', 'controller', 'executor')
@@ -162,6 +169,8 @@ def _pod(index: int,
                     _env('SKYPILOT_RELEASE_NAME', 'skypilot'),
                     _env('SKYPILOT_API_SERVER_ROLE', resolved_server_role),
                     _env('SKYPILOT_API_REQUEST_BACKEND', request_backend),
+                    _env('SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS',
+                         quiescence_backend_guard),
                 ]),
             SimpleNamespace(name='metrics-sidecar', env=[]),
         ]),
@@ -301,7 +310,7 @@ def _writer_instances(pod_list):
                 if entry.name == 'SKYPILOT_API_SERVER_ROLE'
             ]
             if len(role_entries) != 1 or role_entries[0].value not in (
-                    'all', 'controller', 'executor'):
+                    'all', 'api', 'controller', 'executor'):
                 continue
             instances.append(
                 serve_state.ReservedFillWriterInstance(
@@ -311,7 +320,12 @@ def _writer_instances(pod_list):
                     pod_uid=pod.metadata.uid,
                     version='test-version',
                     ready=True,
-                    draining=False))
+                    draining=False,
+                    request_storage_backend=(
+                        request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE),
+                    request_queue_backend=(
+                        request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE),
+                    execution_quiescence_capable=True))
     return tuple(
         sorted(instances,
                key=lambda item: (item.role, item.pod_uid, item.instance_id)))
@@ -444,9 +458,13 @@ def test_activation_derives_stable_rollout_proof_under_global_lock(monkeypatch):
         )
         expected_processes = [
             ('all', 'api-pod-uid-0', 'api-0', 'api-pod-uid-0', 'test-version',
-             True, False),
+             True, False,
+             request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+             request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True),
             ('all', 'api-pod-uid-1', 'api-1', 'api-pod-uid-1', 'test-version',
-             True, False),
+             True, False,
+             request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE,
+             request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE, True),
         ]
         inventory_hash = hashlib.sha256(
             json.dumps(
@@ -563,6 +581,29 @@ def test_activation_rejects_missing_recent_executor_lease(monkeypatch):
         broker.activate_protocol_v2()
 
 
+def test_activation_rejects_missing_recent_ha_api_lease(monkeypatch):
+    lock = _TrackedLock()
+    deployments = [
+        _deployment(server_role='api'),
+        _deployment(kind='controller'),
+        _deployment(kind='executor'),
+    ]
+    pods = _pod_list(_pod(0, server_role='api'), _pod(1, server_role='api'),
+                     _pod(0, kind='controller'), _pod(1, kind='controller'),
+                     _pod(0, kind='executor'), _pod(1, kind='executor'))
+    instances_without_api = tuple(
+        instance for instance in _writer_instances(pods)
+        if instance.role != 'api')
+    _install_clients(monkeypatch,
+                     lock, [deployments], [pods],
+                     bound_pod=pods.items[0],
+                     writer_instance_lists=[instances_without_api])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='database writer-process inventory'):
+        broker.activate_protocol_v2()
+
+
 def test_activation_rejects_ha_release_without_controller_deployment(
         monkeypatch):
     lock = _TrackedLock()
@@ -664,6 +705,77 @@ def test_activation_rejects_non_postgres_writer_pod(monkeypatch,
         broker.activate_protocol_v2()
 
 
+@pytest.mark.parametrize('unguarded_role', ['api', 'controller', 'executor'])
+def test_activation_rejects_unguarded_writer_deployment(monkeypatch,
+                                                        unguarded_role):
+    lock = _TrackedLock()
+    deployments = [
+        _deployment(server_role='api',
+                    quiescence_backend_guard=('false' if unguarded_role == 'api'
+                                              else 'true')),
+        _deployment(kind='controller',
+                    quiescence_backend_guard=('false' if unguarded_role
+                                              == 'controller' else 'true')),
+        _deployment(kind='executor',
+                    quiescence_backend_guard=('false' if unguarded_role
+                                              == 'executor' else 'true')),
+    ]
+    _install_clients(monkeypatch, lock, [deployments], [])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='does not enforce built-in'):
+        broker.activate_protocol_v2()
+
+
+@pytest.mark.parametrize('unguarded_role', ['api', 'controller', 'executor'])
+def test_activation_rejects_unguarded_writer_pod(monkeypatch, unguarded_role):
+    lock = _TrackedLock()
+    deployments = [
+        _deployment(server_role='api'),
+        _deployment(kind='controller'),
+        _deployment(kind='executor'),
+    ]
+
+    def guard(role):
+        return 'false' if unguarded_role == role else 'true'
+
+    pods = _pod_list(
+        _pod(0, server_role='api', quiescence_backend_guard=guard('api')),
+        _pod(1, server_role='api'),
+        _pod(0, kind='controller',
+             quiescence_backend_guard=guard('controller')),
+        _pod(1, kind='controller'),
+        _pod(0, kind='executor', quiescence_backend_guard=guard('executor')),
+        _pod(1, kind='executor'))
+    _install_clients(monkeypatch,
+                     lock, [deployments], [pods],
+                     bound_pod=pods.items[0])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='does not enforce built-in'):
+        broker.activate_protocol_v2()
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    (('request_storage_backend', 'test_plugin.backends.CustomRequestBackend'),
+     ('request_queue_backend', 'test_plugin.queues.CustomQueueFactory'),
+     ('execution_quiescence_capable', False)))
+def test_activation_rejects_plugin_overridden_runtime_backend(
+        monkeypatch, field, value):
+    lock = _TrackedLock()
+    pods = _pod_list(_pod(0), _pod(1))
+    instances = list(_writer_instances(pods))
+    instances[0] = dataclasses.replace(instances[0], **{field: value})
+    _install_clients(monkeypatch,
+                     lock, [_deployment()], [pods],
+                     writer_instance_lists=[tuple(instances)])
+
+    with pytest.raises(broker.ProtocolV2ActivationError,
+                       match='does not attest the built-in PostgreSQL'):
+        broker.activate_protocol_v2()
+
+
 def test_activation_rejects_independently_overridden_controller_image(
         monkeypatch):
     lock = _TrackedLock()
@@ -744,13 +856,19 @@ def test_activation_rejects_recent_database_writer_outside_rollout(monkeypatch):
     pods = _pod_list(_pod(0), _pod(1))
     instances = list(_writer_instances(pods))
     instances.append(
-        serve_state.ReservedFillWriterInstance(role='controller',
-                                               instance_id='old-pod-uid',
-                                               pod_name='old-controller',
-                                               pod_uid='old-pod-uid',
-                                               version='old-version',
-                                               ready=True,
-                                               draining=False))
+        serve_state.ReservedFillWriterInstance(
+            role='controller',
+            instance_id='old-pod-uid',
+            pod_name='old-controller',
+            pod_uid='old-pod-uid',
+            version='old-version',
+            ready=True,
+            draining=False,
+            request_storage_backend=(
+                request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE),
+            request_queue_backend=(
+                request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE),
+            execution_quiescence_capable=(True)))
     _install_clients(monkeypatch,
                      lock, [_deployment()], [pods],
                      writer_instance_lists=[tuple(instances)])
@@ -774,7 +892,10 @@ def test_activation_rejects_unhealthy_recent_database_writer(
         pod_uid=original.pod_uid,
         version=original.version,
         ready=ready,
-        draining=draining)
+        draining=draining,
+        request_storage_backend=original.request_storage_backend,
+        request_queue_backend=original.request_queue_backend,
+        execution_quiescence_capable=original.execution_quiescence_capable)
     _install_clients(monkeypatch,
                      lock, [_deployment()], [pods],
                      writer_instance_lists=[tuple(instances)])
@@ -939,7 +1060,11 @@ def test_activation_rejects_unstable_ha_writer_double_read(
                 pod_uid=original.pod_uid,
                 version='changed-version',
                 ready=original.ready,
-                draining=original.draining)
+                draining=original.draining,
+                request_storage_backend=original.request_storage_backend,
+                request_queue_backend=original.request_queue_backend,
+                execution_quiescence_capable=(
+                    original.execution_quiescence_capable))
     _install_clients(
         monkeypatch,
         lock, [[api_deployment, first_controller, first_executor],

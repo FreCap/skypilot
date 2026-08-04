@@ -45,6 +45,12 @@ logger = sky_logging.init_logger(__name__)
 
 REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
 POSTGRES_REQUEST_BACKEND = 'postgres'
+POSTGRES_REQUEST_STORAGE_BACKEND_TYPE = (
+    'sky.server.requests.postgres.PostgresRequestBackend')
+POSTGRES_REQUEST_QUEUE_BACKEND_TYPE = (
+    'sky.server.requests.postgres.PostgresQueueFactory')
+EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR = (
+    'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS')
 SERVER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_API_SERVER_INSTANCE_ID'
 SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
 CONTROLLER_GENERATION_ENV_VAR = (server_constants.CONTROLLER_GENERATION_ENV_VAR)
@@ -178,6 +184,44 @@ def _supported_payload_versions() -> dict[str, dict[str, int]]:
     }
 
 
+def _qualified_type_name(value: Any) -> str:
+    value_type = type(value)
+    return f'{value_type.__module__}.{value_type.__qualname__}'
+
+
+def _resolved_request_backend_capability() -> tuple[str, str, bool]:
+    """Return the actual storage/queue types and strong-cancellation support."""
+    storage_backend = request_storage.get_request_backend()
+    queue_factory = queue_base.get_queue_backend_factory()
+    storage_type = _qualified_type_name(storage_backend)
+    queue_type = _qualified_type_name(queue_factory)
+    capable = (type(storage_backend) is PostgresRequestBackend and
+               type(queue_factory) is PostgresQueueFactory)
+    return storage_type, queue_type, capable
+
+
+def execution_quiescence_backend_guard_enabled() -> bool:
+    return os.environ.get(EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR) == 'true'
+
+
+def require_builtin_execution_quiescence_backends(*,
+                                                  required: bool = False
+                                                 ) -> None:
+    """Require exact durable backends in every PostgreSQL process context."""
+    if not required and not execution_quiescence_backend_guard_enabled():
+        return
+    if os.environ.get(REQUEST_BACKEND_ENV_VAR) != POSTGRES_REQUEST_BACKEND:
+        raise RuntimeError(
+            'Execution-quiescence backend enforcement requires '
+            f'{REQUEST_BACKEND_ENV_VAR}={POSTGRES_REQUEST_BACKEND}.')
+    storage_type, queue_type, capable = _resolved_request_backend_capability()
+    if not capable:
+        raise RuntimeError(
+            'PostgreSQL API request execution requires the built-in request '
+            'storage and queue backends for exact-generation quiescence; '
+            f'resolved storage={storage_type!r}, queue={queue_type!r}.')
+
+
 class ServerInstanceLease:
     """PostgreSQL-backed liveness and readiness for one role supervisor."""
 
@@ -204,6 +248,8 @@ class ServerInstanceLease:
 
     def _values(self, *, include_started_at: bool) -> dict[str, Any]:
         now = sqlalchemy.func.clock_timestamp()
+        storage_type, queue_type, quiescence_capable = (
+            _resolved_request_backend_capability())
         with self._state_lock:
             ready = self._ready
             draining = self._draining
@@ -225,6 +271,9 @@ class ServerInstanceLease:
             'health_detail': health_detail,
             'supported_handlers': _supported_handlers(self.role),
             'supported_payload_versions': _supported_payload_versions(),
+            'request_storage_backend': storage_type,
+            'request_queue_backend': queue_type,
+            'execution_quiescence_capable': quiescence_capable,
         }
         if include_started_at:
             values['started_at'] = now

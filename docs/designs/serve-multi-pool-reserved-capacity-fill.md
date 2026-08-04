@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: feature implementation and final adversarial review complete; final
+Status: feature implementation and final adversarial review are complete;
 required CI, production rollout, and the compatibility-cleanup merge gates
 remain open
 
@@ -194,40 +194,68 @@ Pod -> ReplicaSet -> Deployment, checking every name and UID. From that
 authenticated API Deployment's chart-owned literal `SKYPILOT_RELEASE_NAME`,
 literal `SKYPILOT_API_SERVER_ROLE`, fixed name, and Helm instance label it
 mechanically discovers the complete writer topology. Compatibility mode
-requires exactly the API Deployment with role `all` and rejects a separate
-controller Deployment. HA mode requires the same API Deployment with role
-`api` plus the exact sibling controller Deployment with role `controller`.
-The controller image may be independently configured, but its live immutable
-digest must equal the API digest before activation.
+requires exactly the API Deployment with role `all` and rejects separate
+controller or executor Deployments. HA mode requires the same API Deployment
+with role `api` plus the exact sibling controller and executor Deployments with
+roles `controller` and `executor`. Their images may be independently
+configured, but every live immutable digest must equal the API digest before
+activation.
 
 Every discovered Deployment and Pod container must also carry the literal
-`SKYPILOT_API_REQUEST_BACKEND=postgres`. Schema 008 existing in the shared
+`SKYPILOT_API_REQUEST_BACKEND=postgres` and literal
+`SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS=true`. The latter is an
+explicit protocol-v2 preparation mode; its chart value defaults false so
+existing PostgreSQL plugins retain their compatibility contract unless an
+operator prepares this feature. Schema 008 existing in the shared
 PostgreSQL catalog is not by itself proof that request execution uses it: a
 release inheriting the chart's SQLite request-store default must fail
 activation and demotion attestation. Protocol v2 therefore cannot activate
 until the one-way request-store cutover has completed for the entire writer
-fleet.
+fleet. The literal environment value is necessary but not sufficient because
+a server plugin can replace the request storage or queue factory after process
+startup. Every server-instance lease therefore also records the fully qualified
+runtime types of the resolved storage backend and queue factory, plus an
+`execution_quiescence_capable` bit that is true only for the exact built-in
+PostgreSQL storage and queue implementations. Activation and demotion require
+the expected type identities and true capability from every API, controller,
+and executor lease. A plugin override remains available to protocol-v1
+deployments while preparation mode is false. Preparation mode and an already
+active protocol-v2 gate both require the built-ins. Plugins load independently in MAIN, UVICORN,
+and EXECUTOR process contexts, so every one of those contexts also validates
+the exact built-in PostgreSQL storage and queue immediately after plugin
+installation and exits before accepting or executing work on any mismatch.
+The MAIN lease is rollout evidence; it is not treated as evidence about a
+different process context. An executor child adopts the main process's clean
+server-environment snapshot into both its process snapshot and its fresh-child
+`os.environ` before loading or validating plugins, so a request-scoped
+environment mutation at lazy worker spawn cannot suppress the PostgreSQL check
+and then leave a custom backend installed.
 
 The action reads every discovered Deployment, every Pod in the release
-namespace, and every recent `all`/`controller` server-instance lease in the
-shared PostgreSQL database twice. Each Deployment must retain the same
+namespace, and every recent `all`/`api`/`controller`/`executor`
+server-instance lease in the shared PostgreSQL database twice. Each Deployment
+must retain the same
 generation/resourceVersion/UID and exact pod UID/resourceVersion cohort. Every
 Deployment controller must have observed its generation; desired replicas
 must be positive; current, updated, ready, and available counts must all equal
 desired; and unavailable must be zero. Every selected Pod must be
 non-terminating, Running, Ready, carry the same chart/release/role identity,
-and have its fixed `skypilot-api` or `skypilot-controller` container ready at
-one common immutable imageID digest. A nonterminal same-release database
-migration Pod or an unattested same-release writer Pod blocks activation.
+and have its fixed `skypilot-api`, `skypilot-controller`, or
+`skypilot-executor` container ready at one common immutable imageID digest. A
+nonterminal same-release database migration Pod or an unattested same-release
+request-serving or writer Pod blocks activation.
 
 The database inventory closes the independently deployed and cross-namespace
-writer hole: every recent `all` or `controller` lease, including unready or
-draining leases until the request backend's full stale horizon expires, must
-map one-to-one by role, Pod name, and Pod UID to the attested writer Pods. The
-server instance ID must itself equal that Downward-API Pod UID. Thus an old
-writer in another release or namespace blocks activation even though the
-token-bound Kubernetes Role cannot enumerate it. Both complete reads include
-the Deployment, Pod, and database-process identities and must be identical.
+process hole: every recent `all`, `api`, `controller`, or `executor` lease,
+including unready or draining leases until the request backend's full stale
+horizon expires, must map one-to-one by role, Pod name, and Pod UID to the
+attested Pods. The server instance ID must itself equal that Downward-API Pod
+UID, and the runtime backend capability fields must retain their expected
+values. Thus an old process in another release or namespace, or a process whose
+plugin replaced a request backend, blocks activation even though the
+token-bound Kubernetes Role cannot enumerate or inspect it. Both complete
+reads include the Deployment, Pod, database-process, and resolved-backend
+identities and must be identical.
 All Kubernetes reads use the bounded timeout and the one no-refresh client.
 The exact token-bound Pod name and UID must be present in both verified API
 cohorts; caller arguments, Downward API environment, and generic `HOSTNAME`
@@ -236,7 +264,7 @@ never supply activation identity.
 The singleton has dialect-portable database checks requiring proof fields to
 be all-null or all-present and requiring every v2 row to carry a structurally
 valid complete proof. The action records the common digest, canonical
-API/controller Deployment generation/UID inventories, and deterministic
+API/controller/executor Deployment generation/UID inventories, and deterministic
 combined pod/process inventory count/SHA-256 while atomically advancing
 `reserved_fill_protocol_state`. Until that durable gate is v2, a multi-context
 poller withdraws normalized claims, feeds zero fill, and reports the exact
@@ -665,13 +693,39 @@ shelter them.
    rollout: old code recognizes only 034 evidence, new code recognizes only
    freshly produced 035 evidence, and neither may promote from evidence
    produced for the other schema head.
+   The `blocked` cutover phase admits only the configured and resolved legacy
+   SQLite runtime so it can drain; it rejects a normal PostgreSQL runtime until
+   the importer atomically commits `cutover-complete`. The import Job invokes
+   the importer directly and therefore does not need to start a server runtime.
+   Once the shared cutover gate records `cutover-complete`, every server role
+   resolves its actual request storage backend before database recovery and
+   refuses startup unless it is the exact built-in PostgreSQL backend. This
+   turns a later declarative or plugin-driven regression to SQLite into an
+   explicit rollout outage instead of allowing stale-source reads or recovery
+   against the frozen one-way source. This runtime fence does not make an
+   out-of-band Helm value declarative; operators must still prevent a later
+   configuration apply from reverting `requestStore.backend`.
+   Enable the chart's built-in execution-quiescence backend guard as part of
+   the PostgreSQL runtime rollout. The chart value is deliberately optional
+   in the generated schema and renders as `false` when absent so an existing
+   release upgraded with Helm `--reuse-values` remains backward compatible;
+   the PostgreSQL cutover must nevertheless set it explicitly to `true`.
+   Once the durable broker gate is v2, MAIN
+   startup for the `all`, `api`, `controller`, and `executor` roles
+   independently requires that preparation flag and exact built-ins, so a
+   later new-code rollout cannot silently disable the guard. The separately
+   attested resource-action authority-worker role is outside reserved-fill
+   launch execution and is not coupled to this protocol gate.
 3. Verify healthy legacy rounds, then run the zero-argument explicit activation
    action inside an API pod. The action takes the global broker lock,
    mechanically verifies exact Serve schema head 035, exact API-request schema
    head 008, plus stable all-ready API and, in HA mode, controller and executor
    Deployment/pod cohorts at one immutable digest with a literal PostgreSQL
-   request backend. It
-   also requires the database-wide recent writer leases to equal those Pods;
+   request backend and literal execution-quiescence preparation flag. It also
+   requires every database-wide recent process lease
+   to resolve to the exact built-in PostgreSQL request storage and queue
+   implementations, advertise execution-quiescence capability, and equal
+   those Pods;
    wait at least the server-instance stale horizon after retiring an old or
    draining release before retrying. The action derives its proof and performs
    the one-row gate transaction. Verify the durable protocol gate reads v2 and
@@ -719,6 +773,14 @@ is re-enabled only from fresh 035 evidence. Rolling back the image while the
 database remains at 035 likewise requires authority to remain disabled,
 because the old validator cannot recognize current evidence.
 
+API request revision 008 is retained-additive and intentionally has no schema
+downgrade. Removing its required/proven quiescence fields could erase the fact
+that a terminal request still has executing code, while removing its runtime
+capability fields could invalidate the proof used to activate protocol v2.
+Application rollback therefore leaves the API request schema at 008, as the
+existing retained-additive migration policy does for earlier durable request
+kernel revisions.
+
 The cleanup PR may merge only after:
 
 - all production API, controller, and executor processes have run the new image for the
@@ -744,7 +806,8 @@ Automated coverage must include:
 - migration-shadow versus legacy-heartbeat races, legacy move/delete versus
   v2 adoption, owner rotation, and atomic set-plus-projection failure;
 - protocol-v2 activation rejection for either schema mismatch, any non-
-  PostgreSQL writer request backend, an incomplete or mixed-image
+  PostgreSQL writer request backend, a plugin-overridden storage backend or
+  queue factory, an incomplete or mixed-image
   API/controller/executor rollout, a missing or independently
   overridden controller or executor, a changing double-read cohort, an active migration Pod, an
   unattested same-release writer Pod, an extra/unready/draining database
@@ -752,6 +815,15 @@ Automated coverage must include:
   malformed/unbound or swapped in-cluster tokens, spoofed caller/environment
   identity, or an already-active gate, plus successful compatibility and HA
   persisted derived evidence;
+- a completed one-way cutover marker rejects process startup when the resolved
+  request storage is SQLite or plugin-overridden, while the pre-cutover
+  `blocked` phase permits only the configured/resolved legacy process to drain
+  and rejects an early PostgreSQL server start;
+- MAIN-, UVICORN-, and EXECUTOR-only plugin backend overrides each fail their
+  process context before work begins when preparation mode is enabled; v1 with
+  preparation disabled retains plugin compatibility; active v2 rejects a new
+  MAIN process with preparation disabled; and direct API008-to-007 downgrade
+  is rejected without dropping columns or changing the schema head;
 - zero-argument v2-to-v1 demotion with token-bound stable-writer attestation,
   exact projection rebuild, multi-edge/malformed/legacy-only rejection, and
   atomic projection-failure rollback;
@@ -817,9 +889,13 @@ executor, request wire/storage, server route, and SDK transport suite
 successfully. Focused real-process regressions prove the production thread-
 dispatcher ProcessPool ownership topology and prove marker-cleanup I/O errors
 cannot suppress a quiescence receipt. The changed production Python passes
-mypy across 883 files and pylint at 10.00/10; the affected executor Helm suite
-passes 12/12. The full local Helm run passes 306 tests and has only the four
-known metrics tests unavailable without the Prometheus dependency chart.
+mypy across 883 files and pylint at 10.00/10. Follow-up adversarial regressions
+prove exact backend enforcement independently in MAIN, UVICORN, and EXECUTOR
+plugin contexts, active-v2 startup enforcement, clean child-environment
+restoration, exact SQLite/blocked and PostgreSQL/completed cutover ordering,
+and retained API008 downgrade rejection. The generated chart schema matches
+the values contract and the full local Helm run passes all 313 tests across 20
+suites.
 Docker is unavailable locally, so real-PostgreSQL execution remains a required
 CI gate rather than being reported as local evidence.
 

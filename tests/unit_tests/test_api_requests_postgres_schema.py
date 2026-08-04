@@ -44,8 +44,9 @@ def test_postgres_record_schema_topology() -> None:
         'api_server_instances':
             ('instance_id', 'role', 'pod_name', 'pod_uid', 'pod_ip', 'version',
              'started_at', 'heartbeat_at', 'draining_at', 'ready',
-             'health_detail', 'supported_handlers', 'supported_payload_versions'
-            ),
+             'health_detail', 'supported_handlers',
+             'supported_payload_versions', 'request_storage_backend',
+             'request_queue_backend', 'execution_quiescence_capable'),
         'api_controller_leadership':
             ('leadership_key', 'generation', 'instance_id', 'lock_backend_pid',
              'generation_lock_key', 'acquired_at', 'heartbeat_at', 'released_at'

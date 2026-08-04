@@ -206,19 +206,21 @@ def executor_initializer(proc_group: str,
     # the request CANCELLED for retry), leading to double execution.
     if watchdog.running_in_child_process():
         watchdog.start_parent_death_watchdog()
-    # Load plugins for executor process.
-    plugins.load_plugins(
-        plugins.ExtensionContext(context=plugins.PluginContext.EXECUTOR))
-    # Same rationale as in sky.server.uvicorn.Server.run: reap this
-    # executor's prometheus multiproc files when it exits.
-    metrics_lib.register_multiproc_cleanup_atexit()
     # The main API server process captures its env at startup and forwards
     # it via initargs (see RequestWorker.run). Adopt that snapshot directly
     # so the worker doesn't depend on its own spawn-time os.environ, which
     # for a lazy-spawned burst worker could reflect a coroutine-path
     # request mid-pollution in the main process.
     if clean_env is not None:
-        clean_env_module.set_clean_server_env(clean_env)
+        clean_env_module.restore_clean_server_env(clean_env)
+    # Load plugins only after adopting the clean environment. PostgreSQL
+    # request-backend validation runs at the end of plugin loading, before this
+    # process can execute request code.
+    plugins.load_plugins(
+        plugins.ExtensionContext(context=plugins.PluginContext.EXECUTOR))
+    # Same rationale as in sky.server.uvicorn.Server.run: reap this
+    # executor's prometheus multiproc files when it exits.
+    metrics_lib.register_multiproc_cleanup_atexit()
     # Executor never stops, unless the whole process is killed.
     threading.Thread(target=metrics_lib.process_monitor,
                      args=(f'worker:{proc_group}', threading.Event()),

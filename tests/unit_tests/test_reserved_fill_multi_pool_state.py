@@ -11,6 +11,7 @@ from test_serve_resource_actions_pg import postgres_engine
 
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.server.requests import postgres as request_postgres
 from sky.server.requests import postgres_schema as request_postgres_schema
 
 
@@ -102,16 +103,21 @@ def test_recent_reserved_fill_writer_instances_are_database_wide(state_engine):
             'health_detail': {},
             'supported_handlers': [],
             'supported_payload_versions': {},
+            'request_storage_backend':
+                (request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE),
+            'request_queue_backend':
+                (request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE),
+            'execution_quiescence_capable': True,
         }
 
     live_all = instance('all', 0)
     live_draining_controller = instance('controller', 1, draining=True)
     live_executor = instance('executor', 2)
-    excluded_api = instance('api', 3)
+    live_api = instance('api', 3)
     stale_controller = instance('controller', 4, age_seconds=60)
     with state_engine.begin() as connection:
         connection.execute(request_postgres_schema.SERVER_INSTANCES.insert(), [
-            live_all, live_draining_controller, live_executor, excluded_api,
+            live_all, live_draining_controller, live_executor, live_api,
             stale_controller
         ])
 
@@ -126,7 +132,23 @@ def test_recent_reserved_fill_writer_instances_are_database_wide(state_engine):
                 pod_uid=str(live_all['pod_uid']),
                 version=str(live_all['version']),
                 ready=True,
-                draining=False),
+                draining=False,
+                request_storage_backend=str(
+                    live_all['request_storage_backend']),
+                request_queue_backend=str(live_all['request_queue_backend']),
+                execution_quiescence_capable=True),
+            serve_state.ReservedFillWriterInstance(
+                instance_id=str(live_api['instance_id']),
+                role='api',
+                pod_name=str(live_api['pod_name']),
+                pod_uid=str(live_api['pod_uid']),
+                version=str(live_api['version']),
+                ready=True,
+                draining=False,
+                request_storage_backend=str(
+                    live_api['request_storage_backend']),
+                request_queue_backend=str(live_api['request_queue_backend']),
+                execution_quiescence_capable=True),
             serve_state.ReservedFillWriterInstance(
                 instance_id=str(live_draining_controller['instance_id']),
                 role='controller',
@@ -134,7 +156,12 @@ def test_recent_reserved_fill_writer_instances_are_database_wide(state_engine):
                 pod_uid=str(live_draining_controller['pod_uid']),
                 version=str(live_draining_controller['version']),
                 ready=False,
-                draining=True),
+                draining=True,
+                request_storage_backend=str(
+                    live_draining_controller['request_storage_backend']),
+                request_queue_backend=str(
+                    live_draining_controller['request_queue_backend']),
+                execution_quiescence_capable=True),
             serve_state.ReservedFillWriterInstance(
                 instance_id=str(live_executor['instance_id']),
                 role='executor',
@@ -142,7 +169,12 @@ def test_recent_reserved_fill_writer_instances_are_database_wide(state_engine):
                 pod_uid=str(live_executor['pod_uid']),
                 version=str(live_executor['version']),
                 ready=True,
-                draining=False),
+                draining=False,
+                request_storage_backend=str(
+                    live_executor['request_storage_backend']),
+                request_queue_backend=str(
+                    live_executor['request_queue_backend']),
+                execution_quiescence_capable=True),
         ),
                key=lambda item:
                (item.role, item.pod_uid or '', item.instance_id)))

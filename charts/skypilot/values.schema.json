@@ -1335,6 +1335,9 @@
                 "cutoverGatePath": {
                     "type": "string",
                     "minLength": 1
+                },
+                "enforceBuiltinExecutionQuiescenceBackends": {
+                    "type": "boolean"
                 }
             }
         },

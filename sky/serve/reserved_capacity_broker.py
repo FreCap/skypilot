@@ -54,6 +54,7 @@ from sky.adaptors import kubernetes
 from sky.serve import constants
 from sky.serve import reserved_capacity_allocation
 from sky.serve import serve_state
+from sky.server.requests import postgres as request_postgres
 from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils.db import migration_utils
@@ -85,6 +86,8 @@ _EXECUTOR_CONTAINER_NAME = 'skypilot-executor'
 _SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
 _RELEASE_NAME_ENV_VAR = 'SKYPILOT_RELEASE_NAME'
 _REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
+_QUIESCENCE_BACKEND_GUARD_ENV_VAR = (
+    'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS')
 _IMAGE_ID_DIGEST_PATTERN = re.compile(r'(?:@|//)(sha256:[0-9a-fA-F]{64})$')
 _PROTOCOL_V2_SCHEMA_REVISION = '035'
 _PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION = '008'
@@ -151,7 +154,7 @@ class _WriterDeploymentSnapshot:
 
 @dataclasses.dataclass(frozen=True)
 class _WriterProcessInstance:
-    """One recent database lease held by a writer-capable server process."""
+    """One recent database lease held by a request-serving process."""
 
     role: str
     instance_id: str
@@ -160,6 +163,9 @@ class _WriterProcessInstance:
     version: str
     ready: bool
     draining: bool
+    request_storage_backend: str
+    request_queue_backend: str
+    execution_quiescence_capable: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1039,6 +1045,12 @@ def _discover_writer_targets(
                 raise ProtocolV2ActivationError(
                     f'The {role} writer Deployment candidate does not use '
                     'the PostgreSQL API request backend.')
+            if _literal_env_value(
+                    container, _QUIESCENCE_BACKEND_GUARD_ENV_VAR,
+                    f'{role} writer Deployment candidate') != 'true':
+                raise ProtocolV2ActivationError(
+                    f'The {role} writer Deployment candidate does not '
+                    'enforce built-in execution-quiescence backends.')
             observed_helm_instance = _required_label(
                 deployment, _HELM_INSTANCE_LABEL,
                 f'{role} writer Deployment candidate')
@@ -1105,7 +1117,7 @@ def _is_terminal_pod(pod: Any) -> bool:
 
 
 def _read_recent_writer_instances() -> tuple[_WriterProcessInstance, ...]:
-    """Read every recent all/controller/executor lease from PostgreSQL."""
+    """Read every recent all/api/controller/executor lease from PostgreSQL."""
     try:
         rows = serve_state.get_recent_reserved_fill_writer_instances(
             _WRITER_INSTANCE_STALE_AFTER_SECONDS)
@@ -1118,23 +1130,35 @@ def _read_recent_writer_instances() -> tuple[_WriterProcessInstance, ...]:
         pod_name = row.pod_name
         pod_uid = row.pod_uid
         version = row.version
-        if (role not in ('all', 'controller', 'executor') or
+        request_storage_backend = row.request_storage_backend
+        request_queue_backend = row.request_queue_backend
+        execution_quiescence_capable = row.execution_quiescence_capable
+        if (role not in ('all', 'api', 'controller', 'executor') or
                 any(not isinstance(value, str) or not value
-                    for value in (pod_name, pod_uid, version))):
+                    for value in (pod_name, pod_uid, version,
+                                  request_storage_backend,
+                                  request_queue_backend)) or
+                not isinstance(execution_quiescence_capable, bool)):
             raise ProtocolV2ActivationError(
                 'A recent writer-process lease has malformed Pod identity.')
         assert isinstance(role, str)
         assert isinstance(pod_name, str)
         assert isinstance(pod_uid, str)
         assert isinstance(version, str)
+        assert isinstance(request_storage_backend, str)
+        assert isinstance(request_queue_backend, str)
         result.append(
-            _WriterProcessInstance(role=role,
-                                   instance_id=row.instance_id,
-                                   pod_name=pod_name,
-                                   pod_uid=pod_uid,
-                                   version=version,
-                                   ready=row.ready,
-                                   draining=row.draining))
+            _WriterProcessInstance(
+                role=role,
+                instance_id=row.instance_id,
+                pod_name=pod_name,
+                pod_uid=pod_uid,
+                version=version,
+                ready=row.ready,
+                draining=row.draining,
+                request_storage_backend=(request_storage_backend),
+                request_queue_backend=request_queue_backend,
+                execution_quiescence_capable=(execution_quiescence_capable)))
     return tuple(
         sorted(result,
                key=lambda item: (item.role, item.pod_uid, item.instance_id)))
@@ -1160,9 +1184,8 @@ def _validate_live_writer_pod_inventory(
         *, namespace: str, release_name: str, helm_instance: str) -> None:
     attested: dict[str, tuple[str, str]] = {}
     for deployment in deployments:
-        if deployment.role == 'api' and len(deployments) > 1:
-            continue
-        server_role = ('all' if deployment.role == 'api' else deployment.role)
+        server_role = ('all' if deployment.role == 'api' and
+                       len(deployments) == 1 else deployment.role)
         for pod_name, pod_uid, _ in deployment.pod_cohort:
             if pod_uid in attested:
                 raise ProtocolV2ActivationError(
@@ -1210,11 +1233,12 @@ def _validate_live_writer_pod_inventory(
                 raise ProtocolV2ActivationError(
                     'A Helm-scoped writer Pod does not use the PostgreSQL API '
                     'request backend.')
-            # HA API-only processes cannot mutate reserved-fill state; the
-            # separately attested controller and executor cohorts are the
-            # writer population.
-            if not (role == 'api' and server_role == 'api'):
-                matched.append((server_role, role))
+            if _literal_env_value(container, _QUIESCENCE_BACKEND_GUARD_ENV_VAR,
+                                  f'{role} writer Pod candidate') != 'true':
+                raise ProtocolV2ActivationError(
+                    'A Helm-scoped writer Pod does not enforce built-in '
+                    'execution-quiescence backends.')
+            matched.append((server_role, role))
         if not matched:
             continue
         if len(matched) != 1:
@@ -1235,9 +1259,8 @@ def _validate_writer_process_instances(
         deployments: Sequence[_WriterDeploymentSnapshot]) -> None:
     expected: dict[str, tuple[str, str]] = {}
     for deployment in deployments:
-        if deployment.role == 'api' and len(deployments) > 1:
-            continue
-        role = 'all' if deployment.role == 'api' else deployment.role
+        role = ('all' if deployment.role == 'api' and len(deployments) == 1 else
+                deployment.role)
         for pod_name, pod_uid, _ in deployment.pod_cohort:
             expected[pod_uid] = (role, pod_name)
     observed: dict[str, tuple[str, str]] = {}
@@ -1248,6 +1271,15 @@ def _validate_writer_process_instances(
             raise ProtocolV2ActivationError(
                 'A recent writer-process lease is not one healthy '
                 'Pod-bound instance.')
+        if (instance.request_storage_backend
+                != request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE or
+                instance.request_queue_backend
+                != request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE or
+                not instance.execution_quiescence_capable):
+            raise ProtocolV2ActivationError(
+                'A recent writer-process lease does not attest the built-in '
+                'PostgreSQL request storage and queue with execution '
+                'quiescence support.')
         observed[instance.pod_uid] = (instance.role, instance.pod_name)
     if observed != expected:
         raise ProtocolV2ActivationError(

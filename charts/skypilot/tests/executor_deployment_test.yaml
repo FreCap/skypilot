@@ -10,6 +10,7 @@ tests:
       apiService.replicas: 2
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
       storage.enabled: true
       storage.accessMode: ReadWriteMany
       storage.existingClaim: production-rwx-state
@@ -35,6 +36,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       apiService.dbConnectionSecretName: external-db
       requestStore.backend: postgres
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
       storage.enabled: true
       storage.accessMode: ReadWriteMany
       executorService.replicas: 2
@@ -62,6 +64,11 @@ tests:
           content:
             name: SKYPILOT_API_SERVER_ROLE
             value: executor
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "true"
       - contains:
           path: spec.template.spec.containers[0].env
           content:

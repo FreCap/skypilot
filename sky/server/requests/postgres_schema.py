@@ -194,6 +194,18 @@ SERVER_INSTANCES = sqlalchemy.Table(
     sqlalchemy.Column('supported_payload_versions',
                       postgresql.JSONB(none_as_null=True),
                       nullable=False),
+    sqlalchemy.Column('request_storage_backend',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default=sqlalchemy.text("'unknown'")),
+    sqlalchemy.Column('request_queue_backend',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default=sqlalchemy.text("'unknown'")),
+    sqlalchemy.Column('execution_quiescence_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
 )
 CONTROLLER_LEADERSHIP = sqlalchemy.Table(
     'api_controller_leadership',

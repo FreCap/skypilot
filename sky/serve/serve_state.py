@@ -92,7 +92,7 @@ RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 = 'authoritative_v2'
 
 @dataclasses.dataclass(frozen=True)
 class ReservedFillWriterInstance:
-    """One recent API request-server lease relevant to fill writes."""
+    """One recent API request-server lease relevant to fill execution."""
 
     instance_id: str
     role: str
@@ -101,6 +101,9 @@ class ReservedFillWriterInstance:
     version: str
     ready: bool
     draining: bool
+    request_storage_backend: str
+    request_queue_backend: str
+    execution_quiescence_capable: bool
 
 
 def claim_service_lifecycle_epoch(service_name: str,
@@ -5240,7 +5243,7 @@ def _require_reserved_fill_v2_postgresql(
 
 def get_recent_reserved_fill_writer_instances(
         stale_after_seconds: int) -> tuple[ReservedFillWriterInstance, ...]:
-    """Return database-wide live leases for fill-writer server roles."""
+    """Return database-wide live leases for fill request-server roles."""
     if (isinstance(stale_after_seconds, bool) or
             not isinstance(stale_after_seconds, int) or
             stale_after_seconds <= 0):
@@ -5257,9 +5260,12 @@ def get_recent_reserved_fill_writer_instances(
         request_postgres_schema.SERVER_INSTANCES.c.version,
         request_postgres_schema.SERVER_INSTANCES.c.ready,
         request_postgres_schema.SERVER_INSTANCES.c.draining_at,
+        request_postgres_schema.SERVER_INSTANCES.c.request_storage_backend,
+        request_postgres_schema.SERVER_INSTANCES.c.request_queue_backend,
+        request_postgres_schema.SERVER_INSTANCES.c.execution_quiescence_capable,
     ).where(
         request_postgres_schema.SERVER_INSTANCES.c.role.in_(
-            ('all', 'controller', 'executor')),
+            ('all', 'api', 'controller', 'executor')),
         request_postgres_schema.SERVER_INSTANCES.c.heartbeat_at >= cutoff)
     try:
         with engine.connect() as connection:
@@ -5273,19 +5279,31 @@ def get_recent_reserved_fill_writer_instances(
         role = row['role']
         version = row['version']
         ready = row['ready']
+        request_storage_backend = row['request_storage_backend']
+        request_queue_backend = row['request_queue_backend']
+        execution_quiescence_capable = row['execution_quiescence_capable']
         if (not instance_id or not isinstance(role, str) or not role or
                 not isinstance(version, str) or not version or
-                not isinstance(ready, bool)):
+                not isinstance(ready, bool) or
+                not isinstance(request_storage_backend, str) or
+                not request_storage_backend or
+                not isinstance(request_queue_backend, str) or
+                not request_queue_backend or
+                not isinstance(execution_quiescence_capable, bool)):
             raise RuntimeError(
                 'A live writer-process inventory row is malformed.')
         result.append(
-            ReservedFillWriterInstance(instance_id=instance_id,
-                                       role=role,
-                                       pod_name=row['pod_name'],
-                                       pod_uid=row['pod_uid'],
-                                       version=version,
-                                       ready=ready,
-                                       draining=row['draining_at'] is not None))
+            ReservedFillWriterInstance(
+                instance_id=instance_id,
+                role=role,
+                pod_name=row['pod_name'],
+                pod_uid=row['pod_uid'],
+                version=version,
+                ready=ready,
+                draining=row['draining_at'] is not None,
+                request_storage_backend=(request_storage_backend),
+                request_queue_backend=(request_queue_backend),
+                execution_quiescence_capable=(execution_quiescence_capable)))
     return tuple(
         sorted(result,
                key=lambda item:
