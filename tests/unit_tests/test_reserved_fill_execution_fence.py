@@ -292,6 +292,8 @@ def test_execute_dag_ordinary_launch_does_not_install_provider_fence():
         return handle, False
 
     backend.provision.side_effect = provision
+    phase = mock.MagicMock()
+    phase.__enter__.return_value = mock.sentinel.phase_admission
     with mock.patch.object(
             execution.global_user_state,
             'cluster_with_name_exists',
@@ -301,7 +303,10 @@ def test_execute_dag_ordinary_launch_does_not_install_provider_fence():
                            return_value=mock.sentinel.image_consumer), \
          mock.patch.object(
              reserved_capacity,
-             'get_kubernetes_physical_cluster_uid') as get_uid:
+             'get_kubernetes_physical_cluster_uid') as get_uid, \
+         mock.patch.object(execution.provider_phase,
+                           'provider_phase',
+                           return_value=phase) as enter_phase:
         _, result_handle = execution._execute_dag(
             dag,
             dryrun=False,
@@ -322,8 +327,67 @@ def test_execute_dag_ordinary_launch_does_not_install_provider_fence():
             _extra_launch_context={})
 
     assert result_handle is handle
+    enter_phase.assert_called_once_with(
+        execution.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
+    phase.__enter__.assert_called_once()
+    phase.__exit__.assert_called_once()
     backend.provision.assert_called_once()
     get_uid.assert_not_called()
+
+
+def test_execute_dag_enters_v2_phase_before_physical_capture():
+    task = _task()
+    dag = _Dag(task)
+    backend = mock.MagicMock()
+    backend.provision.return_value = (mock.sentinel.handle, False)
+    events = []
+
+    class RecordingContext:
+
+        def __init__(self, name):
+            self._name = name
+
+        def __enter__(self):
+            events.append(f'{self._name}-enter')
+
+        def __exit__(self, *_args):
+            events.append(f'{self._name}-exit')
+
+    with mock.patch.object(execution.global_user_state,
+                           'cluster_with_name_exists',
+                           return_value=False), \
+         mock.patch.object(execution.container_image_consumers,
+                           'derive',
+                           return_value=mock.sentinel.image_consumer), \
+         mock.patch.object(execution.provider_phase,
+                           'provider_phase',
+                           side_effect=lambda _mode: RecordingContext('phase')), \
+         mock.patch.object(kubernetes,
+                           'physical_cluster_uid_fence',
+                           return_value=RecordingContext('physical')):
+        _, result_handle = execution._execute_dag(
+            dag,
+            dryrun=False,
+            stream_logs=False,
+            handle=None,
+            backend=backend,
+            retry_until_up=False,
+            optimize_target=common.OptimizeTarget.COST,
+            stages=[execution.Stage.PROVISION],
+            cluster_name='svc-replica',
+            detach_setup=False,
+            no_setup=False,
+            clone_disk_from=None,
+            skip_unnecessary_provisioning=False,
+            _quiet_optimizer=False,
+            _is_launched_by_jobs_controller=False,
+            _is_launched_by_sky_serve_controller=True,
+            _extra_launch_context=_fill_context())
+
+    assert result_handle is mock.sentinel.handle
+    assert events == [
+        'phase-enter', 'physical-enter', 'physical-exit', 'phase-exit'
+    ]
 
 
 def test_outer_executor_defers_fence_to_inner_planning(monkeypatch):
