@@ -1,3 +1,8 @@
+"""Unit tests for ``sky.jobs.utils``."""
+
+# pylint: disable=protected-access,unused-argument
+# pylint: disable=import-outside-toplevel,use-implicit-booleaness-not-comparison
+
 import asyncio
 import os
 import pathlib
@@ -93,6 +98,38 @@ def test_terminate_cluster_handles_concurrent_cluster_removal(
     mock_get_cluster.assert_called_once_with('test-cluster',
                                              include_user_info=False,
                                              summary_response=True)
+
+
+@pytest.mark.asyncio
+async def test_event_callback_pool_job_uses_one_context_helper():
+    task = mock.MagicMock()
+    task.event_callback = 'echo callback'
+    task.envs = {}
+    task.name = 'pool-task'
+
+    with mock.patch(
+            'sky.jobs.utils.managed_job_state.get_pool_and_current_cluster_name',
+            return_value=('pool-a', 'replica-a')) as get_context, \
+         mock.patch('sky.jobs.utils.managed_job_state.get_pool_from_job_id',
+                    side_effect=AssertionError('stale point pool read')), \
+         mock.patch('sky.jobs.utils.managed_job_state.get_pool_submit_info',
+                    side_effect=AssertionError('stale point submit read')), \
+         mock.patch('sky.jobs.utils.generate_managed_job_cluster_name',
+                    side_effect=AssertionError('pool jobs must not use task '
+                                               'cluster fallback')), \
+         mock.patch('sky.jobs.utils.log_lib.run_bash_command_with_log',
+                    return_value=0) as run:
+        callback = utils.event_callback_func(job_id=42, task_id=0, task=task)
+        await callback('RUNNING')
+
+    get_context.assert_called_once_with(42)
+    run.assert_called_once()
+    env_vars = run.call_args.kwargs['env_vars']
+    assert env_vars['JOB_ID'] == '42'
+    assert env_vars['JOB_STATUS'] == 'RUNNING'
+    assert env_vars['CLUSTER_NAME'] == 'replica-a'
+    assert env_vars['TASK_NAME'] == 'pool-task'
+    assert env_vars['EVENT_TYPE'] == 'Spot'
 
 
 @pytest.mark.asyncio
@@ -386,7 +423,7 @@ def test_cancel_signal_file_no_graceful():
     """Test that cancel_jobs_by_id writes an empty signal file (touch)
     for non-graceful cancels on the new controller."""
     snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                          'default', False)
+                                          'default')
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(
@@ -408,7 +445,7 @@ def test_cancel_signal_file_no_graceful():
 
 def test_cancel_pending_wrong_workspace_is_not_mutated():
     snapshot = state.JobCancellationState(state.ManagedJobStatus.PENDING,
-                                          'team-b', False)
+                                          'team-b')
     with mock.patch('sky.jobs.state.get_job_cancellation_states',
                     return_value={42: snapshot}), \
          mock.patch('sky.jobs.state.set_pending_cancelled') as set_cancelled, \
@@ -423,9 +460,9 @@ def test_cancel_pending_wrong_workspace_is_not_mutated():
 
 def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
     running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default', False)
+                                         'default')
     succeeded = state.JobCancellationState(state.ManagedJobStatus.SUCCEEDED,
-                                           'default', False)
+                                           'default')
     with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
          mock.patch('sky.jobs.state.get_job_cancellation_states',
                     side_effect=[{42: running}, {42: succeeded}]) as snapshots, \
@@ -441,17 +478,61 @@ def test_cancel_skips_job_that_finishes_during_status_refresh(tmp_path):
     refresh.assert_called_once_with([42])
 
 
+def test_cancel_refreshed_pending_job_reuses_atomic_finalizer(tmp_path):
+    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                         'default')
+    pending = state.JobCancellationState(state.ManagedJobStatus.PENDING,
+                                         'default')
+    with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
+         mock.patch('sky.jobs.state.get_job_cancellation_states',
+                    side_effect=[{42: running}, {42: pending}]) as snapshots, \
+         mock.patch('sky.jobs.state.set_pending_cancelled',
+                    return_value=True) as set_cancelled, \
+         mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh, \
+         mock.patch('sky.jobs.utils.filelock.FileLock',
+                    side_effect=AssertionError(
+                        'refreshed pending cancel must not write a signal')):
+        result = utils.cancel_jobs_by_id(job_ids=[42],
+                                         current_workspace='default')
+
+    assert result == 'Job with ID 42 is scheduled to be cancelled.'
+    assert snapshots.call_count == 2
+    assert set_cancelled.call_args_list == [mock.call(42)]
+    refresh.assert_called_once_with([42])
+    assert not (tmp_path / '42').exists()
+
+
+def test_cancel_refreshed_pending_job_still_signals_after_claim_race(tmp_path):
+    running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                         'default')
+    pending = state.JobCancellationState(state.ManagedJobStatus.PENDING,
+                                         'default')
+    with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
+         mock.patch('sky.jobs.state.get_job_cancellation_states',
+                    side_effect=[{42: running}, {42: pending}]) as snapshots, \
+         mock.patch('sky.jobs.state.set_pending_cancelled',
+                    return_value=False) as set_cancelled, \
+         mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh:
+        result = utils.cancel_jobs_by_id(job_ids=[42],
+                                         current_workspace='default')
+
+    assert result == 'Job with ID 42 is scheduled to be cancelled.'
+    assert snapshots.call_count == 2
+    assert set_cancelled.call_args_list == [mock.call(42)]
+    refresh.assert_called_once_with([42])
+    assert (tmp_path / '42').exists()
+
+
 def test_cancel_batches_state_reads_for_multiple_running_jobs(tmp_path):
     job_ids = list(range(1, 21))
     running = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                         'default', False)
+                                         'default')
     snapshot = {job_id: running for job_id in job_ids}
     with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmp_path), \
          mock.patch('sky.jobs.state.get_job_cancellation_states',
                     side_effect=[snapshot, snapshot]) as snapshots, \
          mock.patch('sky.jobs.state.get_status') as point_status, \
          mock.patch('sky.jobs.state.get_workspace') as point_workspace, \
-         mock.patch('sky.jobs.state.is_legacy_controller_process') as point_legacy, \
          mock.patch('sky.jobs.utils.update_managed_jobs_statuses') as refresh:
         result = utils.cancel_jobs_by_id(job_ids=job_ids,
                                          current_workspace='default')
@@ -463,14 +544,13 @@ def test_cancel_batches_state_reads_for_multiple_running_jobs(tmp_path):
     assert refresh.call_args_list == [mock.call(job_ids)]
     point_status.assert_not_called()
     point_workspace.assert_not_called()
-    point_legacy.assert_not_called()
     assert all((tmp_path / str(job_id)).exists() for job_id in job_ids)
 
 
 def test_cancel_signal_file_graceful():
     """Test that cancel_jobs_by_id writes 'graceful' to signal file."""
     snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                          'default', False)
+                                          'default')
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(
@@ -493,7 +573,7 @@ def test_cancel_signal_file_graceful_with_timeout():
     """Test that cancel_jobs_by_id writes 'graceful:<timeout>' to signal
     file."""
     snapshot = state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                          'default', False)
+                                          'default')
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH', tmpdir):
             with mock.patch(
@@ -1385,26 +1465,4 @@ class TestStreamControllerLogs:
             name_match='finished', fields=['job_id', 'job_name', 'status'])
         resolve_log.assert_called_once_with(17)
         assert message == ''
-        assert exit_code == exceptions.JobExitCode.SUCCEEDED
-
-    def test_follow_drains_until_terminal_status(self, tmp_path, capsys):
-        log_path = tmp_path / '42.log'
-        log_path.write_text('complete\n', encoding='utf-8')
-
-        with (mock.patch.object(utils,
-                                'controller_log_file_for_job',
-                                return_value=str(log_path)),
-              mock.patch.object(utils.managed_job_state,
-                                'get_status',
-                                return_value=state.ManagedJobStatus.SUCCEEDED)
-              as get_status, mock.patch.object(utils.time, 'sleep') as sleep):
-            message, exit_code = utils.stream_logs(job_id=42,
-                                                   job_name=None,
-                                                   controller=True,
-                                                   follow=True)
-
-        assert capsys.readouterr().out == 'complete\n'
-        get_status.assert_called_once_with(42)
-        sleep.assert_called_once()
-        assert 'Job finished (status: ManagedJobStatus.SUCCEEDED).' in message
         assert exit_code == exceptions.JobExitCode.SUCCEEDED

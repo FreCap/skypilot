@@ -44,6 +44,26 @@ def _get_git_commit():
         return _SKYPILOT_COMMIT_SHA
 
 
+# Replaced with the exact commit's committer timestamp when building wheels.
+_SKYPILOT_COMMIT_TIMESTAMP = '{{SKYPILOT_COMMIT_TIMESTAMP}}'
+
+
+def _get_git_commit_timestamp() -> str | None:
+    if 'SKYPILOT_COMMIT_TIMESTAMP' not in _SKYPILOT_COMMIT_TIMESTAMP:
+        return _SKYPILOT_COMMIT_TIMESTAMP or None
+
+    try:
+        cwd = os.path.dirname(__file__)
+        timestamp = subprocess.check_output(
+            ['git', 'show', '-s', '--format=%cI', 'HEAD'],
+            cwd=cwd,
+            universal_newlines=True,
+            stderr=subprocess.DEVNULL).strip()
+        return timestamp or None
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 # Replaced with the commit count when building the wheels, producing a build
 # number that auto-increments with every commit.
 _SKYPILOT_COMMIT_COUNT = '{{SKYPILOT_COMMIT_COUNT}}'
@@ -67,6 +87,7 @@ def _get_commit_count() -> str | None:
 
 
 __commit__ = _get_git_commit()
+__commit_timestamp__ = _get_git_commit_timestamp()
 # Canonical SkyPilot version used by the package, CLI, API, dashboard, wheels,
 # image, and Helm chart.
 __version__ = '1.1.0'
@@ -176,6 +197,7 @@ from sky.utils.registry import JOBS_RECOVERY_STRATEGY_REGISTRY
 from sky.utils.status_lib import ClusterStatus
 
 image = adaptors_common.LazyImport('sky.container_images.client')
+events = adaptors_common.LazyImport('sky.events')
 
 # Aliases.
 IBM = clouds.IBM
@@ -298,6 +320,7 @@ __all__ = [
     'JOBS_RECOVERY_STRATEGY_REGISTRY',
     # Batch processing
     'batch',
+    'events',
 ]
 
 # --------------------- Client SDK namespace --------------------- #

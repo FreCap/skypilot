@@ -11003,7 +11003,7 @@ finally:
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
             ).scalar_one()
-        assert revision == '027'
+        assert revision == migration_utils.GLOBAL_USER_STATE_VERSION
     finally:
         for process in processes:
             if process.poll() is None:
@@ -11146,11 +11146,121 @@ def test_bootstrap_mode_allows_genuinely_empty_isolated_schema(
             assert connection.execute(
                 sqlalchemy.text(
                     'SELECT version_num FROM alembic_version_state_db')
-            ).scalar_one() == '027'
+            ).scalar_one() == migration_utils.GLOBAL_USER_STATE_VERSION
         assert sqlalchemy.inspect(fresh_engine).has_table(
             'container_image_catalog')
     finally:
         fresh_engine.dispose()
+        with postgres_engine.begin() as connection:
+            connection.exec_driver_sql(
+                f'DROP SCHEMA IF EXISTS {fresh_schema} CASCADE')
+
+
+def test_database_migration_process_bootstraps_before_config_overlay(
+        postgres_engine, tmp_path: Path) -> None:
+    """Proves import-time config loading cannot preempt fresh DB bootstrap."""
+    fresh_schema = f'migration_process_fresh_{uuid.uuid4().hex}'
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA {fresh_schema}')
+    fresh_url = postgres_engine.url.update_query_dict(
+        {'options': f'-csearch_path={fresh_schema}'})
+    empty_config = tmp_path / 'config.yaml'
+    empty_config.write_text('', encoding='utf-8')
+    environment = os.environ.copy()
+    environment.update({
+        constants.ENV_VAR_IS_SKYPILOT_SERVER: 'true',
+        constants.ENV_VAR_DB_CONNECTION_URI:
+            fresh_url.render_as_string(hide_password=False),
+        constants.ENV_VAR_STATE_DB_MIGRATION_MODE: 'bootstrap',
+        'SKYPILOT_API_REQUEST_BACKEND': 'postgres',
+        'SKYPILOT_GLOBAL_CONFIG': str(empty_config),
+    })
+    repository_root = Path(__file__).resolve().parents[2]
+    existing_pythonpath = environment.get('PYTHONPATH')
+    environment['PYTHONPATH'] = (
+        str(repository_root) if not existing_pythonpath else
+        f'{repository_root}{os.pathsep}{existing_pythonpath}')
+    try:
+        result = subprocess.run(
+            [sys.executable, '-m', 'sky.server.database_migrations'],
+            cwd=repository_root,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120)
+        assert result.returncode == 0, (f'migration stderr:\n{result.stderr}\n'
+                                        f'migration stdout:\n{result.stdout}')
+
+        with sqlalchemy.create_engine(fresh_url).connect() as connection:
+            revisions = {
+                table: connection.execute(
+                    sqlalchemy.text(f'SELECT version_num FROM {table}')
+                ).scalar_one() for table in (
+                    'alembic_version_state_db',
+                    'alembic_version_sky_config_db',
+                    'alembic_version_serve_state_db',
+                    'alembic_version_spot_jobs_db',
+                    'alembic_version_api_requests_db',
+                    'alembic_version_lifecycle_actions_db',
+                    'alembic_version_capacity_state_db',
+                )
+            }
+            store_row = connection.execute(
+                sqlalchemy.text("""
+                    SELECT store_key, store_uuid, schema_version,
+                           writer_authority_digest, created_at,
+                           isfinite(created_at) AS created_at_is_finite
+                    FROM lifecycle_store_identity
+                """)).one()
+            scope_row = connection.execute(
+                sqlalchemy.text("""
+                    SELECT domain, operation_subset, store_mode, routing_mode,
+                           minimum_lifecycle_version, ownership_epoch,
+                           authority_generation,
+                           writer_implementation_digest,
+                           reconciler_implementation_digest, updated_at,
+                           isfinite(updated_at) AS updated_at_is_finite
+                    FROM lifecycle_ownership_scopes
+                """)).one()
+        assert revisions == {
+            'alembic_version_state_db':
+                migration_utils.GLOBAL_USER_STATE_VERSION,
+            'alembic_version_sky_config_db':
+                migration_utils.SKYPILOT_CONFIG_VERSION,
+            'alembic_version_serve_state_db': migration_utils.SERVE_VERSION,
+            'alembic_version_spot_jobs_db': migration_utils.SPOT_JOBS_VERSION,
+            'alembic_version_api_requests_db':
+                migration_utils.API_REQUESTS_VERSION,
+            'alembic_version_lifecycle_actions_db':
+                migration_utils.LIFECYCLE_ACTIONS_VERSION,
+            'alembic_version_capacity_state_db':
+                migration_utils.CAPACITY_STATE_VERSION,
+        }
+        store_uuid = uuid.UUID(str(store_row.store_uuid))
+        assert store_row.store_key == 'global'
+        assert store_uuid.version == 4
+        assert store_uuid.variant == uuid.RFC_4122
+        assert store_row.schema_version == 1
+        assert store_row.writer_authority_digest is None
+        assert store_row.created_at.tzinfo is not None
+        assert store_row.created_at.utcoffset() is not None
+        assert store_row.created_at_is_finite is True
+        assert tuple(scope_row[:9]) == (
+            'VOLUME',
+            'KUBERNETES_PVC_OWNED_LIFECYCLE_V1',
+            'CENTRAL_POSTGRESQL',
+            'DARK',
+            0,
+            1,
+            0,
+            None,
+            None,
+        )
+        assert scope_row.updated_at.tzinfo is not None
+        assert scope_row.updated_at.utcoffset() is not None
+        assert scope_row.updated_at_is_finite is True
+    finally:
         with postgres_engine.begin() as connection:
             connection.exec_driver_sql(
                 f'DROP SCHEMA IF EXISTS {fresh_schema} CASCADE')

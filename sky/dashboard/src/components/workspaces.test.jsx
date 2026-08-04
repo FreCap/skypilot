@@ -86,6 +86,13 @@ function callsFor(fetcher) {
   });
 }
 
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
+
 function installSuccessfulFetches() {
   dashboardCache.get.mockImplementation((fetcher) => {
     if (fetcher === getWorkspaces) return Promise.resolve({ alpha: {} });
@@ -492,6 +499,216 @@ describe('Workspaces request lifecycle', () => {
       await Promise.resolve();
     });
     await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(1));
+  });
+
+  it('refreshes immediately on visibility restore and skips the adjacent timer boundary', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    installSuccessfulFetches();
+    setDocumentVisibility('hidden');
+
+    const { unmount } = render(<Workspaces />);
+    let mounted = true;
+
+    try {
+      await screen.findByText('alpha');
+      dashboardCache.get.mockClear();
+
+      await act(async () => {
+        jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL - 1);
+        await Promise.resolve();
+      });
+      expect(callsFor(getWorkspaces)).toHaveLength(0);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(1));
+
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await Promise.resolve();
+      });
+      expect(callsFor(getWorkspaces)).toHaveLength(1);
+
+      unmount();
+      mounted = false;
+      dashboardCache.get.mockClear();
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => {
+        jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+        await Promise.resolve();
+      });
+      expect(callsFor(getWorkspaces)).toHaveLength(0);
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('fences a pre-hide automatic sweep when visibility restore starts a fresh read', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const staleRefresh = deferred();
+    const visibleRefresh = deferred();
+    let workspaceCall = 0;
+    dashboardCache.get.mockImplementation((fetcher, args) => {
+      if (fetcher === getWorkspaces) {
+        workspaceCall += 1;
+        if (workspaceCall === 1) return Promise.resolve({ alpha: {} });
+        if (workspaceCall === 2) return staleRefresh.promise;
+        if (workspaceCall === 3) return visibleRefresh.promise;
+      }
+      if (fetcher === getEnabledCloudsBatch) {
+        const names = args[0];
+        return Promise.resolve(
+          Object.fromEntries(names.map((name) => [name, ['aws']]))
+        );
+      }
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      throw new Error('Unexpected cache fetcher');
+    });
+    setDocumentVisibility('visible');
+
+    const { unmount } = render(<Workspaces />);
+    let mounted = true;
+
+    try {
+      await screen.findByText('alpha');
+
+      await act(async () => {
+        jest.advanceTimersByTime(REFRESH_INTERVALS.REFRESH_INTERVAL);
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(2));
+
+      setDocumentVisibility('hidden');
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(3));
+
+      await act(async () => {
+        staleRefresh.resolve({ beta: {} });
+        await staleRefresh.promise;
+      });
+      expect(screen.getByText('alpha')).toBeInTheDocument();
+      expect(screen.queryByText('beta')).not.toBeInTheDocument();
+
+      await act(async () => {
+        visibleRefresh.resolve({ gamma: {} });
+        await visibleRefresh.promise;
+      });
+      await screen.findByText('gamma');
+      expect(screen.queryByText('beta')).not.toBeInTheDocument();
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('keeps manual refresh ownership when visibility returns', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const healthCheck = deferred();
+    const manualRefresh = deferred();
+    let workspaceCall = 0;
+    dashboardCache.get.mockImplementation((fetcher, args) => {
+      if (fetcher === getWorkspaces) {
+        workspaceCall += 1;
+        if (workspaceCall === 1) return Promise.resolve({ alpha: {} });
+        if (workspaceCall >= 2) return manualRefresh.promise;
+      }
+      if (fetcher === getEnabledCloudsBatch) {
+        const names = args[0];
+        return Promise.resolve(
+          Object.fromEntries(names.map((name) => [name, ['aws']]))
+        );
+      }
+      if (fetcher === getClusters) return Promise.resolve([]);
+      if (fetcher === getManagedJobs) return Promise.resolve({ jobs: [] });
+      throw new Error('Unexpected cache fetcher');
+    });
+    apiClient.fetch.mockReturnValue(healthCheck.promise);
+    setDocumentVisibility('hidden');
+
+    const { unmount } = render(<Workspaces />);
+    let mounted = true;
+
+    try {
+      await screen.findByText('alpha');
+      fireEvent.keyDown(window, { key: 'r', ctrlKey: true });
+      await waitFor(() => expect(apiClient.fetch).toHaveBeenCalledTimes(1));
+      expect(screen.getByText('Refresh').closest('button')).toBeDisabled();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(callsFor(getWorkspaces)).toHaveLength(1);
+
+      await act(async () => {
+        healthCheck.resolve({});
+        await healthCheck.promise;
+      });
+      await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(2));
+
+      await act(async () => {
+        manualRefresh.resolve({ alpha: {} });
+        await manualRefresh.promise;
+      });
+      await waitFor(() =>
+        expect(screen.getByText('Refresh').closest('button')).toBeEnabled()
+      );
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
   });
 
   it('clears loading state when the current manual refresh fails', async () => {

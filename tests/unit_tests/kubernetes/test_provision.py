@@ -136,6 +136,70 @@ def test_create_pods_is_idempotent_when_all_pods_exist(monkeypatch):
     assert record.head_instance_id == head_name
 
 
+def test_create_pods_resolves_placement_once_before_finalizing_each_pod(
+        monkeypatch):
+    """Provider/config reads are outside the per-Pod pure owner."""
+    cluster_on_cloud = 'test-cluster-placement-owner'
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+
+    resolution_calls = []
+    apply_calls = []
+    finalizer_calls = []
+    created_specs = []
+    allowed_nodes_config = {'label_selector': {'pool': 'research'}}
+    original_inject = kubernetes_utils.inject_allowed_nodes_affinity
+    original_finalize = instance.pod_spec_lib.finalize_pod_spec
+
+    def get_allowed_nodes_config(_context):
+        resolution_calls.append(_context)
+        return allowed_nodes_config
+
+    def inject_allowed_nodes_affinity(spec, config, *, context):
+        apply_calls.append((config, context))
+        return original_inject(spec, config, context=context)
+
+    def finalize_pod_spec(*args, **kwargs):
+        finalizer_calls.append(kwargs['pod_name'])
+        return original_finalize(*args, **kwargs)
+
+    def create_pod(_namespace, pod_spec, _context):
+        created_specs.append(pod_spec)
+        pod = types.SimpleNamespace()
+        pod.metadata = types.SimpleNamespace(
+            name=pod_spec['metadata']['name'],
+            labels=pod_spec['metadata']['labels'],
+        )
+        pod.status = types.SimpleNamespace(phase='Pending')
+        return pod
+
+    monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
+                        get_allowed_nodes_config)
+    monkeypatch.setattr(kubernetes_utils, 'inject_allowed_nodes_affinity',
+                        inject_allowed_nodes_affinity)
+    monkeypatch.setattr(instance.pod_spec_lib, 'finalize_pod_spec',
+                        finalize_pod_spec)
+    monkeypatch.setattr(instance.volume, 'check_pvc_usage_for_pod',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
+                        create_pod)
+    monkeypatch.setattr(subprocess_utils, 'run_in_parallel',
+                        lambda fn, items, *_args: [fn(i) for i in items])
+
+    config = _make_provision_config(count=2)
+    record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
+                                   config)
+
+    assert resolution_calls == ['ctx']
+    assert apply_calls == [(allowed_nodes_config, 'ctx')]
+    assert finalizer_calls == [
+        f'{cluster_on_cloud}-head',
+        f'{cluster_on_cloud}-worker1',
+    ]
+    assert [spec['metadata']['name'] for spec in created_specs
+           ] == finalizer_calls
+    assert record.created_instance_ids == finalizer_calls
+
+
 def test_create_pods_raises_on_more_pods_than_requested(monkeypatch):
     """More running+pending pods than requested trips the leak guard."""
     cluster_on_cloud = 'test-cluster-xyz'

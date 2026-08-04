@@ -1094,6 +1094,67 @@ def test_terminal_rejection_feeds_exact_history(monkeypatch):
     }]
 
 
+def test_terminal_classification_requires_eligibility_and_is_exact_once(
+        monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    pre_admission = fastapi.Request(_scope('/predict'))
+    eligible = fastapi.Request(_scope('/predict'))
+
+    # Body-budget and drain/role rejection paths never open the eligibility
+    # fence, so their legacy rejection telemetry cannot enter the denominator.
+    lb._record_rejection(pre_admission)
+    assert not lb._request_aggregator.request_classification_history_snapshot(
+    )['buckets']
+
+    lb._mark_request_classification_eligible(eligible)
+    lb._record_rejection(eligible)
+    lb._record_rejection(eligible)
+    assert lb._request_aggregator.request_classification_history_snapshot(
+    )['buckets'] == [{
+        'bucket_start': 120,
+        'classified_request_count': 1,
+        'counted_rejected_count': 1,
+    }]
+
+
+@pytest.mark.parametrize('terminal', ['response', 'error', 'cancellation'])
+def test_admitted_request_final_guard_classifies_non_rejected_once(
+        monkeypatch, terminal):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    request = fastapi.Request(_scope('/predict'))
+
+    if terminal == 'response':
+        lb._proxy_with_retries_inner = mock.AsyncMock(
+            return_value=fastapi.responses.Response(status_code=500))
+    elif terminal == 'error':
+        lb._proxy_with_retries_inner = mock.AsyncMock(
+            side_effect=fastapi.HTTPException(status_code=502))
+    else:
+        lb._proxy_with_retries_inner = mock.AsyncMock(
+            side_effect=asyncio.CancelledError())
+
+    async def _run_terminal():
+        if terminal == 'response':
+            response = await lb._proxy_with_retries(request)
+            assert response.status_code == 500
+        else:
+            expected = (asyncio.CancelledError if terminal == 'cancellation'
+                        else fastapi.HTTPException)
+            with pytest.raises(expected):
+                await lb._proxy_with_retries(request)
+
+    asyncio.run(_run_terminal())
+
+    assert lb._request_aggregator.request_classification_history_snapshot(
+    )['buckets'] == [{
+        'bucket_start': 120,
+        'classified_request_count': 1,
+        'counted_rejected_count': 0,
+    }]
+
+
 def test_request_history_is_bounded_to_recent_hour(monkeypatch):
     now = [0.0]
     monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
@@ -1191,6 +1252,43 @@ def test_prediction_time_history_requires_new_controller_ack(monkeypatch):
     assert lb._request_aggregator.prediction_time_history_snapshot() is None
 
 
+def test_classification_history_requires_independent_controller_ack(
+        monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    request = fastapi.Request(_scope('/predict'))
+    lb._mark_request_classification_eligible(request)
+    lb._record_request_classification_once(request, rejected=True)
+    captured = {
+        'response_json': {
+            'replica_info': {},
+            'routing_spec': None,
+            # A legacy request-history acknowledgement must not clear the new
+            # independently durable terminal counters.
+            'request_history_accepted': True,
+        }
+    }
+
+    _sync_once(monkeypatch, lb, 200, captured)
+
+    classification = captured['json']['request_classification_history']
+    assert classification['classification_version'] == 1
+    assert classification['buckets'][0]['classified_request_count'] == 1
+    assert lb._request_aggregator.request_classification_history_snapshot(
+    )['buckets']
+
+    captured = {
+        'response_json': {
+            'replica_info': {},
+            'routing_spec': None,
+            'request_classification_history_accepted': True,
+        }
+    }
+    _sync_once(monkeypatch, lb, 200, captured)
+    assert not lb._request_aggregator.request_classification_history_snapshot(
+    )['buckets']
+
+
 def test_request_history_ack_does_not_erase_arrival_during_sync(monkeypatch):
     now = [120.0]
     monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
@@ -1229,6 +1327,7 @@ def test_drain_flush_uses_history_only_endpoint_and_acknowledges(monkeypatch):
         '/controller/load_balancer_request_history_sync')
     assert set(captured['json']) == {
         'request_history',
+        'request_classification_history',
         'prediction_time_history',
         'request_history_session_id',
         'lb_session_id',
@@ -1255,6 +1354,32 @@ def test_failed_drain_flush_is_bounded_and_retains_history(monkeypatch):
     _run(lb._flush_request_history_on_drain())
 
     assert lb._request_aggregator.request_history_snapshot() is not None
+
+
+def test_drain_flush_acknowledges_classification_independently(monkeypatch):
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: 120.0)
+    lb = _make_lb()
+    lb._request_aggregator.add_request_classification(rejected=True)
+    captured = {
+        'response_json': {
+            # The legacy ack deliberately proves it cannot clear classification.
+            'request_history_accepted': True,
+            'request_classification_history_accepted': True,
+        }
+    }
+    monkeypatch.setattr(load_balancer.aiohttp, 'ClientSession',
+                        lambda *a, **k: _FakeSession(200, captured))
+
+    _run(lb._flush_request_history_on_drain())
+
+    assert captured['json']['request_history'] is None
+    assert captured['json']['request_classification_history']['buckets'] == [{
+        'bucket_start': 120,
+        'classified_request_count': 1,
+        'counted_rejected_count': 1,
+    }]
+    assert not lb._request_aggregator.request_classification_history_snapshot(
+    )['buckets']
 
 
 def test_aggregator_keeps_arrivals_during_successful_sync(monkeypatch):

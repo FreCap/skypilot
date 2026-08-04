@@ -18,6 +18,7 @@ import {
 } from 'chart.js';
 import { Bar } from 'react-chartjs-2';
 import {
+  Activity,
   AlertTriangle,
   Clock3,
   DollarSign,
@@ -41,8 +42,10 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { SpendAttributionTable } from '@/components/spend-attribution-table';
 import { getEstimatedSpend } from '@/data/connectors/estimated_spend';
 import { getCurrentUserRole } from '@/data/connectors/client';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
 
@@ -87,6 +90,17 @@ export function formatCurrency(value) {
   return `$${number.toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
+  })}`;
+}
+
+export function formatCostPerRequest(value) {
+  if (value === null || value === undefined) return 'N/A';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 'N/A';
+  if (number > 0 && number < 0.0001) return '<$0.0001';
+  return `$${number.toLocaleString(undefined, {
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
   })}`;
 }
 
@@ -161,6 +175,12 @@ export function formatHours(seconds) {
   })} h`;
 }
 
+export function formatRequestCount(value) {
+  return Number(value || 0).toLocaleString(undefined, {
+    maximumFractionDigits: 0,
+  });
+}
+
 export function workloadLabel(workload) {
   const type = workload.workload_type || 'cluster';
   const id = workload.workload_id || 'unattributed';
@@ -168,7 +188,9 @@ export function workloadLabel(workload) {
   if (type === 'service') return `Service · ${id}`;
   if (type === 'pool') return `Pool · ${id}`;
   if (type === 'controller') return `Platform · ${id}`;
-  if (type === 'managed') return `Managed workload · ${id}`;
+  if (type === 'managed' || type === 'managed_unattributed') {
+    return 'Legacy managed, parent unknown';
+  }
   return `Cluster · ${id}`;
 }
 
@@ -243,6 +265,301 @@ function EmptyEstimate() {
   );
 }
 
+function ServiceRequestsCard({
+  serviceRequests,
+  days,
+  startDate,
+  endDate,
+  todayUtc,
+}) {
+  const totalRequestCount = Number(serviceRequests?.total_request_count || 0);
+  const requestCoverage = serviceRequests?.coverage || 'unavailable';
+  const coveragePartial =
+    serviceRequests?.coverage_start_utc &&
+    serviceRequests.coverage_start_utc >
+      Date.parse(`${startDate}T00:00:00Z`) / 1000;
+  const hasIncompleteDays = (serviceRequests?.complete_by_day || []).some(
+    (complete) => !complete
+  );
+  const chartData = useMemo(() => {
+    const series = serviceRequests?.series || [];
+    return {
+      labels: days.map((day) =>
+        new Date(`${day.date}T00:00:00Z`).toLocaleDateString(undefined, {
+          month: 'short',
+          day: 'numeric',
+          timeZone: 'UTC',
+        })
+      ),
+      datasets: series.map((service, index) => {
+        const [backgroundColor, borderColor] = service.is_other
+          ? OTHER_COLOR
+          : SERIES_COLORS[index % SERIES_COLORS.length];
+        return {
+          label: service.is_other ? 'Other' : service.service_name,
+          data: service.request_count_by_day || [],
+          isOther: Boolean(service.is_other),
+          estimatedCostByDay: service.estimated_cost_by_day || [],
+          estimatedCostPerRequestByDay:
+            service.estimated_cost_per_request_by_day || [],
+          backgroundColor,
+          borderColor,
+          borderWidth: 1,
+          borderRadius: 3,
+          maxBarThickness: 36,
+          stack: 'service-requests',
+        };
+      }),
+    };
+  }, [days, serviceRequests]);
+  const chartOptions = useMemo(
+    () => ({
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: {
+          display: chartData.datasets.length > 1,
+          position: 'bottom',
+        },
+        tooltip: {
+          filter: (context) => Number(context.parsed.y) > 0,
+          callbacks: {
+            label: (context) => {
+              const labels = [
+                `${context.dataset.label}: ${formatRequestCount(
+                  context.parsed.y
+                )} non-rejected requests`,
+              ];
+              if (context.dataset.isOther) return labels;
+              const estimatedCost =
+                context.dataset.estimatedCostByDay?.[context.dataIndex];
+              const costPerRequest =
+                context.dataset.estimatedCostPerRequestByDay?.[
+                  context.dataIndex
+                ];
+              labels.push(
+                `Est. compute: ${
+                  costPerRequest !== null && costPerRequest !== undefined
+                    ? formatCurrency(estimatedCost)
+                    : 'N/A'
+                }`
+              );
+              labels.push(
+                `Est. compute cost / non-rejected request: ${formatCostPerRequest(
+                  costPerRequest
+                )}`
+              );
+              return labels;
+            },
+          },
+        },
+      },
+      scales: {
+        x: { grid: { display: false }, stacked: true },
+        y: {
+          beginAtZero: true,
+          stacked: true,
+          ticks: {
+            precision: 0,
+            callback: (value) => formatRequestCount(value),
+          },
+        },
+      },
+    }),
+    [chartData.datasets.length]
+  );
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle className="flex items-center gap-2 text-lg">
+              <Activity className="h-5 w-5 text-blue-600" />
+              Daily non-rejected requests by service
+            </CardTitle>
+            <CardDescription className="mt-1">
+              Requests rejected by the load balancer are excluded. This is not a
+              success count: replica errors and post-admission transport or
+              client errors still count once. Internal replica retries do not
+              add requests; client retries are separate requests. Cost/request
+              is estimated replica compute, with reserved Kubernetes capacity
+              valued at zero; genuinely unknown pricing remains unavailable.{' '}
+              {endDate === todayUtc && 'The current UTC day is partial.'}
+            </CardDescription>
+          </div>
+          {serviceRequests.available && (
+            <div className="sm:text-right">
+              <p className="text-2xl font-semibold tracking-tight">
+                {formatRequestCount(totalRequestCount)}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {requestCoverage === 'partial'
+                  ? 'Known non-rejected requests in selected range'
+                  : 'Non-rejected requests in selected range'}
+              </p>
+            </div>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        {!serviceRequests.available ? (
+          <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
+            Exact non-rejected request history is unavailable on this server or
+            for this range. Rejected attempts are never used as a fallback.
+          </div>
+        ) : (
+          <>
+            {coveragePartial && (
+              <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
+                Request history begins{' '}
+                {new Date(
+                  serviceRequests.coverage_start_utc * 1000
+                ).toLocaleString(undefined, {
+                  timeZone: 'UTC',
+                  timeZoneName: 'short',
+                })}
+                . The earlier portion of this range has no exact non-rejected
+                request data.
+              </div>
+            )}
+            {hasIncompleteDays && (
+              <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
+                Days with legacy or mixed load balancers are omitted. Their
+                rejected attempts are not treated as completed requests.
+              </div>
+            )}
+            {totalRequestCount === 0 ? (
+              <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
+                No non-rejected service requests recorded in the covered days.
+              </div>
+            ) : (
+              <div className="h-80">
+                <Bar data={chartData} options={chartOptions} />
+              </div>
+            )}
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Service</TableHead>
+                    <TableHead className="text-right">
+                      Non-rejected requests
+                    </TableHead>
+                    <TableHead className="text-right">
+                      Est. compute cost / non-rejected request
+                    </TableHead>
+                    <TableHead className="text-right">Share</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(serviceRequests.services || []).length === 0 ? (
+                    <TableRow>
+                      <TableCell
+                        colSpan={4}
+                        className="py-8 text-center text-muted-foreground"
+                      >
+                        No services with non-rejected request activity in the
+                        covered days.
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    serviceRequests.services.map((service) => {
+                      const count = Number(service.request_count || 0);
+                      const coverageUnavailable =
+                        service.coverage === 'unavailable';
+                      const ratioCoveragePartial =
+                        service.ratio_coverage_start_utc &&
+                        service.ratio_coverage_start_utc >
+                          Date.parse(`${startDate}T00:00:00Z`) / 1000;
+                      const share =
+                        totalRequestCount > 0
+                          ? (count / totalRequestCount) * 100
+                          : 0;
+                      return (
+                        <TableRow key={service.service_name}>
+                          <TableCell className="font-medium">
+                            {service.service_name}
+                          </TableCell>
+                          <TableCell className="text-right font-medium">
+                            <div>
+                              {coverageUnavailable
+                                ? 'N/A'
+                                : formatRequestCount(count)}
+                            </div>
+                            {coverageUnavailable ? (
+                              <div className="text-xs font-normal text-muted-foreground">
+                                request history unavailable
+                              </div>
+                            ) : (
+                              service.coverage === 'partial' && (
+                                <div className="text-xs font-normal text-muted-foreground">
+                                  partial coverage
+                                </div>
+                              )
+                            )}
+                          </TableCell>
+                          <TableCell className="text-right font-medium">
+                            <div>
+                              {formatCostPerRequest(
+                                service.estimated_cost_per_request
+                              )}
+                            </div>
+                            {service.cost_coverage === 'partial' && (
+                              <div className="text-xs font-normal text-muted-foreground">
+                                unpriced capacity
+                              </div>
+                            )}
+                            {Number(service.ratio_request_count) > 0 &&
+                              Number(service.ratio_request_count) !== count && (
+                                <div className="text-xs font-normal text-muted-foreground">
+                                  based on{' '}
+                                  {formatRequestCount(
+                                    service.ratio_request_count
+                                  )}{' '}
+                                  requests
+                                </div>
+                              )}
+                            {ratioCoveragePartial && (
+                              <div className="text-xs font-normal text-muted-foreground">
+                                request denominator since{' '}
+                                {utcDateString(
+                                  new Date(
+                                    service.ratio_coverage_start_utc * 1000
+                                  )
+                                )}{' '}
+                                UTC
+                              </div>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-right text-muted-foreground">
+                            {requestCoverage === 'complete'
+                              ? `${share.toFixed(1)}%`
+                              : 'N/A'}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+ServiceRequestsCard.propTypes = {
+  serviceRequests: PropTypes.object.isRequired,
+  days: PropTypes.arrayOf(PropTypes.object).isRequired,
+  startDate: PropTypes.string.isRequired,
+  endDate: PropTypes.string.isRequired,
+  todayUtc: PropTypes.string.isRequired,
+};
+
 export function EstimatedSpend() {
   const [dateRange, setDateRange] = useState(() =>
     rangeForPreset(RANGE_OPTIONS.find((option) => option.key === '30d'))
@@ -254,7 +571,7 @@ export function EstimatedSpend() {
     () => rangeForPreset(RANGE_OPTIONS[3]).endDate
   );
   const [dateRangeError, setDateRangeError] = useState(null);
-  const [groupBy, setGroupBy] = useState('job');
+  const [groupBy, setGroupBy] = useState('user');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -262,59 +579,85 @@ export function EstimatedSpend() {
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
   const requestState = useRef({ generation: 0, active: null });
 
-  const fetchData = useCallback(async () => {
-    const requestKey = JSON.stringify([
-      dateRange.startDate,
-      dateRange.endDate,
-      dateRange.days,
-      groupBy,
-    ]);
-    if (requestState.current.active?.key === requestKey) return;
+  const fetchData = useCallback(
+    (options = {}) => {
+      const { kind = 'automatic', showLoading = false } = options;
+      const requestKey = JSON.stringify([
+        dateRange.startDate,
+        dateRange.endDate,
+        dateRange.days,
+        groupBy,
+      ]);
 
-    const generation = ++requestState.current.generation;
-    requestState.current.active = { key: requestKey, generation };
-    setLoading(true);
-    setError(null);
-    try {
-      const role = await getCurrentUserRole();
-      if (generation !== requestState.current.generation) return;
-      if (role.roleFetchFailed) {
-        // A failed role lookup is an error, not a permission denial: keep
-        // the error UI so the next refresh cycle retries.
-        throw new Error('Failed to fetch current role');
+      const activeRequest = requestState.current.active;
+      if (activeRequest?.key === requestKey) {
+        const shouldReuse =
+          kind === 'automatic' ||
+          activeRequest.kind === kind ||
+          (kind === 'visibility' && activeRequest.kind === 'manual');
+        if (shouldReuse) {
+          return activeRequest.promise;
+        }
       }
-      if (role.role !== 'admin') {
-        setForbidden(true);
-        setData(null);
-        return;
+
+      const generation = ++requestState.current.generation;
+      const owner = {
+        key: requestKey,
+        generation,
+        kind,
+        promise: null,
+      };
+      requestState.current.active = owner;
+      if (showLoading) {
+        setLoading(true);
       }
-      setForbidden(false);
-      const estimate = await getEstimatedSpend(dateRange.days, groupBy, {
-        startDate: dateRange.startDate,
-        endDate: dateRange.endDate,
-      });
-      if (generation !== requestState.current.generation) return;
-      if (!estimate.group_by && groupBy !== 'job') {
-        setGroupBy('job');
-      }
-      setData(estimate);
-      setLastFetchedAt(new Date());
-    } catch (fetchError) {
-      if (generation !== requestState.current.generation) return;
-      if (fetchError.status === 403) {
-        setForbidden(true);
-      } else {
-        setError(fetchError);
-      }
-    } finally {
-      if (generation === requestState.current.generation) {
-        setLoading(false);
-      }
-      if (requestState.current.active?.generation === generation) {
-        requestState.current.active = null;
-      }
-    }
-  }, [dateRange.days, dateRange.endDate, dateRange.startDate, groupBy]);
+      setError(null);
+
+      owner.promise = (async () => {
+        try {
+          const role = await getCurrentUserRole();
+          if (generation !== requestState.current.generation) return;
+          if (role.roleFetchFailed) {
+            setForbidden(false);
+            // A failed role lookup is an error, not a permission denial: keep
+            // the error UI so the next refresh cycle retries.
+            throw new Error('Failed to fetch current role');
+          }
+          if (role.role !== 'admin') {
+            setForbidden(true);
+            setData(null);
+            return;
+          }
+          setForbidden(false);
+          const estimate = await getEstimatedSpend(dateRange.days, groupBy, {
+            startDate: dateRange.startDate,
+            endDate: dateRange.endDate,
+          });
+          if (generation !== requestState.current.generation) return;
+          setData(estimate);
+          setLastFetchedAt(new Date());
+        } catch (fetchError) {
+          if (generation !== requestState.current.generation) return;
+          if (fetchError.status === 403) {
+            setForbidden(true);
+          } else {
+            setForbidden(false);
+            setError(fetchError);
+          }
+        } finally {
+          if (generation === requestState.current.generation && showLoading) {
+            setLoading(false);
+          }
+          if (requestState.current.active === owner) {
+            requestState.current.active = null;
+          }
+        }
+      })();
+
+      return owner.promise;
+    },
+    [dateRange.days, dateRange.endDate, dateRange.startDate, groupBy]
+  );
 
   const selectPreset = useCallback((option) => {
     const nextRange = rangeForPreset(option);
@@ -344,15 +687,29 @@ export function EstimatedSpend() {
   );
 
   useEffect(() => {
-    fetchData();
-    const timer = setInterval(fetchData, AUTO_REFRESH_MS);
+    void fetchData({ kind: 'initial', showLoading: true });
     const state = requestState.current;
     return () => {
-      clearInterval(timer);
       state.generation += 1;
       state.active = null;
     };
   }, [fetchData]);
+
+  const refreshWhenVisible = useCallback(
+    (source) => {
+      void fetchData({
+        kind: source === 'visibilitychange' ? 'visibility' : 'automatic',
+        showLoading: false,
+      });
+    },
+    [fetchData]
+  );
+
+  const handleManualRefresh = useCallback(() => {
+    void fetchData({ kind: 'manual', showLoading: true });
+  }, [fetchData]);
+
+  useVisibleRefreshInterval(true, AUTO_REFRESH_MS, refreshWhenVisible);
 
   const chartData = useMemo(() => {
     const days = data?.days || [];
@@ -465,6 +822,18 @@ export function EstimatedSpend() {
     supportsBreakdowns && displayedGroupBy !== 'purchase_option';
   const clouds = data?.clouds || [];
   const totalCost = Number(totals.estimated_cost || 0);
+  const serviceRequestEnvelope = data?.service_requests;
+  const serviceRequests = serviceRequestEnvelope
+    ? serviceRequestEnvelope.non_rejected || {
+        available: false,
+        coverage_start_utc: null,
+        complete_by_day: [],
+        total_request_count: 0,
+        services: [],
+        series: [],
+      }
+    : null;
+  const hasOtherSeries = (data?.series || []).some((series) => series.is_other);
   const todayUtc = utcDateString();
   const earliestDate = shiftUtcDate(todayUtc, -(MAX_RANGE_DAYS - 1));
   const selectedRangeDetail = `${formatUtcDate(dateRange.startDate, {
@@ -567,7 +936,11 @@ export function EstimatedSpend() {
               Apply
             </Button>
           </form>
-          <Button variant="outline" onClick={fetchData} disabled={loading}>
+          <Button
+            variant="outline"
+            onClick={handleManualRefresh}
+            disabled={loading}
+          >
             <RefreshCw
               className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`}
             />
@@ -583,9 +956,10 @@ export function EstimatedSpend() {
       )}
 
       <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-        Kubernetes usage and reservation, Savings Plan, or committed-use
-        adjustments are not included. Storage, network, credits, and taxes are
-        also outside this estimate.
+        Kubernetes usage is not included in spend totals. Service cost/request
+        separately values reserved Kubernetes capacity at zero. Other
+        reservation, Savings Plan, or committed-use adjustments, plus storage,
+        network, credits, and taxes, are outside this estimate.
       </div>
 
       {error && (
@@ -638,15 +1012,43 @@ export function EstimatedSpend() {
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-lg">
-                Daily estimate by {groupOption?.label.toLowerCase() || 'group'}
-              </CardTitle>
-              <CardDescription>
-                Stacked catalog-priced cost split at UTC midnight.{' '}
-                {dateRange.endDate === todayUtc &&
-                  'The current day is partial; '}
-                lower-cost groups are combined as Other.
-              </CardDescription>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <CardTitle className="text-lg">
+                    Daily estimate by{' '}
+                    {groupOption?.label.toLowerCase() || 'group'}
+                  </CardTitle>
+                  <CardDescription className="mt-1">
+                    Stacked catalog-priced cost split at UTC midnight.{' '}
+                    {dateRange.endDate === todayUtc &&
+                      'The current day is partial; '}
+                    {hasOtherSeries
+                      ? `the top 8 groups are charted individually. Other is the chart-only remainder; ${
+                          displayedGroupBy === 'user'
+                            ? 'use the owner hierarchy below to inspect every paginated workload and attempt.'
+                            : 'switch to User to inspect every paginated workload and attempt.'
+                        }`
+                      : 'all groups in this range fit in the chart.'}
+                  </CardDescription>
+                </div>
+                {hasOtherSeries && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setGroupBy('user');
+                      setTimeout(() => {
+                        document
+                          .getElementById('spend-ownership')
+                          ?.scrollIntoView?.({ behavior: 'smooth' });
+                      }, 0);
+                    }}
+                  >
+                    Inspect Other
+                  </Button>
+                )}
+              </div>
             </CardHeader>
             <CardContent>
               <div className="h-80">
@@ -656,111 +1058,125 @@ export function EstimatedSpend() {
           </Card>
 
           <div className="grid gap-6 xl:grid-cols-[2fr_1fr]">
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-lg">
-                  {displayedGroupBy === 'purchase_option'
-                    ? 'Spend'
-                    : 'Top spend'}{' '}
-                  by {groupOption?.label.toLowerCase() || 'group'}
-                </CardTitle>
-                <CardDescription>
-                  {displayedGroupBy === 'job'
-                    ? 'Up to 50 workloads. Managed jobs include provisioning and recovery uptime; shared machines remain attributed to their pool.'
-                    : displayedGroupBy === 'user'
-                      ? 'Up to 50 users. Ownership follows the user recorded when each cluster was launched.'
-                      : 'Catalog-priced compute split between spot and on-demand capacity.'}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>
-                          {displayedGroupBy === 'job'
-                            ? 'Job / workload'
-                            : displayedGroupBy === 'user'
-                              ? 'User'
-                              : 'Purchase option'}
-                        </TableHead>
-                        <TableHead className="text-right">
-                          Machine time
-                        </TableHead>
-                        <TableHead className="text-right">Total</TableHead>
-                        {showPurchaseColumns && (
-                          <>
-                            <TableHead className="text-right">Spot</TableHead>
-                            <TableHead className="text-right">
-                              On-demand
-                            </TableHead>
-                          </>
-                        )}
-                        <TableHead className="text-right">Share</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {groups.length === 0 ? (
+            {displayedGroupBy === 'user' && supportsBreakdowns ? (
+              <SpendAttributionTable
+                dateRange={dateRange}
+                snapshotAt={Number(data?.as_of || 0)}
+                totalCost={totalCost}
+                fallbackGroups={groups}
+                formatCurrency={formatCurrency}
+                formatHours={formatHours}
+                workloadLabel={workloadLabel}
+              />
+            ) : (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-lg">
+                    {displayedGroupBy === 'purchase_option'
+                      ? 'Spend'
+                      : 'Top spend'}{' '}
+                    by {groupOption?.label.toLowerCase() || 'group'}
+                  </CardTitle>
+                  <CardDescription>
+                    {displayedGroupBy === 'job'
+                      ? 'Up to 50 workloads. Managed jobs include provisioning and recovery uptime; shared machines remain attributed to their pool.'
+                      : displayedGroupBy === 'user'
+                        ? 'Up to 50 users. Ownership follows the user recorded when each cluster was launched.'
+                        : 'Catalog-priced compute split between spot and on-demand capacity.'}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="overflow-x-auto">
+                    <Table>
+                      <TableHeader>
                         <TableRow>
-                          <TableCell
-                            colSpan={showPurchaseColumns ? 6 : 4}
-                            className="py-8 text-center text-muted-foreground"
-                          >
-                            No priced groups in this range.
-                          </TableCell>
+                          <TableHead>
+                            {displayedGroupBy === 'job'
+                              ? 'Job / workload'
+                              : displayedGroupBy === 'user'
+                                ? 'User'
+                                : 'Purchase option'}
+                          </TableHead>
+                          <TableHead className="text-right">
+                            Machine time
+                          </TableHead>
+                          <TableHead className="text-right">Total</TableHead>
+                          {showPurchaseColumns && (
+                            <>
+                              <TableHead className="text-right">Spot</TableHead>
+                              <TableHead className="text-right">
+                                On-demand
+                              </TableHead>
+                            </>
+                          )}
+                          <TableHead className="text-right">Share</TableHead>
                         </TableRow>
-                      ) : (
-                        groups.map((group) => {
-                          const cost = Number(group.estimated_cost || 0);
-                          const share =
-                            totalCost > 0 ? (cost / totalCost) * 100 : 0;
-                          return (
-                            <TableRow
-                              key={breakdownKey(displayedGroupBy, group)}
+                      </TableHeader>
+                      <TableBody>
+                        {groups.length === 0 ? (
+                          <TableRow>
+                            <TableCell
+                              colSpan={showPurchaseColumns ? 6 : 4}
+                              className="py-8 text-center text-muted-foreground"
                             >
-                              <TableCell className="max-w-md truncate font-medium">
-                                {breakdownLabel(displayedGroupBy, group)}
-                              </TableCell>
-                              <TableCell className="text-right text-muted-foreground">
-                                <div>
-                                  {formatHours(group.priced_machine_seconds)}
-                                </div>
-                                {group.excluded_machine_seconds > 0 && (
-                                  <div className="text-xs">
-                                    {formatHours(
-                                      group.excluded_machine_seconds
-                                    )}{' '}
-                                    excluded
+                              No priced groups in this range.
+                            </TableCell>
+                          </TableRow>
+                        ) : (
+                          groups.map((group) => {
+                            const cost = Number(group.estimated_cost || 0);
+                            const share =
+                              totalCost > 0 ? (cost / totalCost) * 100 : 0;
+                            return (
+                              <TableRow
+                                key={breakdownKey(displayedGroupBy, group)}
+                              >
+                                <TableCell className="max-w-md truncate font-medium">
+                                  {breakdownLabel(displayedGroupBy, group)}
+                                </TableCell>
+                                <TableCell className="text-right text-muted-foreground">
+                                  <div>
+                                    {formatHours(group.priced_machine_seconds)}
                                   </div>
+                                  {group.excluded_machine_seconds > 0 && (
+                                    <div className="text-xs">
+                                      {formatHours(
+                                        group.excluded_machine_seconds
+                                      )}{' '}
+                                      excluded
+                                    </div>
+                                  )}
+                                </TableCell>
+                                <TableCell className="text-right font-medium">
+                                  {formatCurrency(cost)}
+                                </TableCell>
+                                {showPurchaseColumns && (
+                                  <>
+                                    <TableCell className="text-right text-emerald-700 dark:text-emerald-300">
+                                      {formatCurrency(
+                                        group.spot_estimated_cost
+                                      )}
+                                    </TableCell>
+                                    <TableCell className="text-right text-sky-700 dark:text-sky-300">
+                                      {formatCurrency(
+                                        group.on_demand_estimated_cost
+                                      )}
+                                    </TableCell>
+                                  </>
                                 )}
-                              </TableCell>
-                              <TableCell className="text-right font-medium">
-                                {formatCurrency(cost)}
-                              </TableCell>
-                              {showPurchaseColumns && (
-                                <>
-                                  <TableCell className="text-right text-emerald-700 dark:text-emerald-300">
-                                    {formatCurrency(group.spot_estimated_cost)}
-                                  </TableCell>
-                                  <TableCell className="text-right text-sky-700 dark:text-sky-300">
-                                    {formatCurrency(
-                                      group.on_demand_estimated_cost
-                                    )}
-                                  </TableCell>
-                                </>
-                              )}
-                              <TableCell className="text-right text-muted-foreground">
-                                {share.toFixed(1)}%
-                              </TableCell>
-                            </TableRow>
-                          );
-                        })
-                      )}
-                    </TableBody>
-                  </Table>
-                </div>
-              </CardContent>
-            </Card>
+                                <TableCell className="text-right text-muted-foreground">
+                                  {share.toFixed(1)}%
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
             <Card>
               <CardHeader>
@@ -808,6 +1224,16 @@ export function EstimatedSpend() {
             </Card>
           </div>
         </>
+      )}
+
+      {serviceRequests && (
+        <ServiceRequestsCard
+          serviceRequests={serviceRequests}
+          days={data?.days || []}
+          startDate={dateRange.startDate}
+          endDate={dateRange.endDate}
+          todayUtc={todayUtc}
+        />
       )}
 
       <div className="flex flex-col gap-1 border-t pt-4 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">

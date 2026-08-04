@@ -699,6 +699,40 @@ def test_get_job_controller_processes_empty_input_uses_no_query(
     assert counts['n'] == 0, counts
 
 
+def test_scheduler_set_waiting_empty_input_uses_no_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        state.scheduler_set_waiting([], '/tmp/dag.yaml', '/tmp/user.yaml',
+                                    '/tmp/env', None, 100)
+
+    assert counts['n'] == 0, counts
+
+
+def test_scheduler_set_waiting_deduplicates_repeated_job_ids(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = state.set_job_info_without_job_id(
+        name='waiting',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+
+    with _count_sql_statements(engine) as counts:
+        state.scheduler_set_waiting([job_id, job_id], '/tmp/dag.yaml',
+                                    '/tmp/user.yaml', '/tmp/env', None, 100)
+
+    assert state.get_job_schedule_state(job_id) is (
+        state.ManagedJobScheduleState.WAITING)
+    assert (state.get_job_file_contents(job_id)['dag_yaml_content'] ==
+            '/tmp/dag.yaml')
+    assert counts['n'] == 1, counts
+
+
 def test_get_job_controller_process_reuses_bulk_reader(monkeypatch):
     record = state.ControllerPidRecord(pid=101, started_at=1001.5)
     calls = []
@@ -767,6 +801,237 @@ def test_get_log_stream_context_keeps_task_without_job_info(
     assert counts['n'] == 1, counts
 
 
+def test_get_latest_log_stream_snapshot_reads_one_recovery_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 2, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, job_id, 3, status=ManagedJobStatus.RUNNING)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    pool='pool-a',
+                    current_cluster_name='replica-a',
+                    job_id_on_pool_cluster=41,
+                ))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        snapshot = state.get_latest_log_stream_snapshot(job_id)
+
+    assert snapshot == state.JobLogStreamSnapshot(3, ManagedJobStatus.RUNNING,
+                                                  'pool-a', 'replica-a', 41,
+                                                  'task-3')
+    assert counts['n'] == 1, counts
+
+    state.set_current_cluster_name(job_id, 'replica-b')
+    with _count_sql_statements(engine) as counts:
+        recovered_snapshot = state.get_latest_log_stream_snapshot(job_id)
+
+    assert recovered_snapshot == state.JobLogStreamSnapshot(
+        3, ManagedJobStatus.RUNNING, 'pool-a', 'replica-b', 41, 'task-3')
+    assert counts['n'] == 1, counts
+
+
+def test_get_latest_log_stream_snapshot_missing_job_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        snapshot = state.get_latest_log_stream_snapshot(999)
+
+    assert snapshot == state.JobLogStreamSnapshot(None, None, None, None, None,
+                                                  None)
+    assert counts['n'] == 1, counts
+
+
+def test_get_latest_log_stream_snapshot_keeps_task_without_job_info(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 999, 3, status=ManagedJobStatus.RUNNING)
+
+    with _count_sql_statements(engine) as counts:
+        snapshot = state.get_latest_log_stream_snapshot(999)
+
+    assert snapshot == state.JobLogStreamSnapshot(3, ManagedJobStatus.RUNNING,
+                                                  None, None, None, 'task-3')
+    assert counts['n'] == 1, counts
+
+
+def test_get_controller_log_follow_state_reads_one_lifecycle_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 0, status=ManagedJobStatus.SUCCEEDED)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        follow_state = state.get_controller_log_follow_state(job_id)
+
+    assert follow_state == state.ControllerLogFollowState(
+        ManagedJobStatus.SUCCEEDED, state.ManagedJobScheduleState.ALIVE)
+    assert counts['n'] == 1, counts
+
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.DONE.value))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        finalized_state = state.get_controller_log_follow_state(job_id)
+
+    assert finalized_state == state.ControllerLogFollowState(
+        ManagedJobStatus.SUCCEEDED, state.ManagedJobScheduleState.DONE)
+    assert counts['n'] == 1, counts
+
+
+def test_get_controller_log_follow_state_missing_job_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        follow_state = state.get_controller_log_follow_state(999)
+
+    assert follow_state == state.ControllerLogFollowState(None, None)
+    assert counts['n'] == 1, counts
+
+
+def test_get_controller_log_follow_state_keeps_legacy_task_in_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    _insert_task(engine, 999, 0, status=ManagedJobStatus.SUCCEEDED)
+
+    with _count_sql_statements(engine) as counts:
+        follow_state = state.get_controller_log_follow_state(999)
+
+    assert follow_state == state.ControllerLogFollowState(
+        ManagedJobStatus.SUCCEEDED, None)
+    assert follow_state.__class__.__module__ == 'sky.jobs.state'
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_log_stream_snapshot_reads_one_task_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 2, status=ManagedJobStatus.RUNNING)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    pool='pool-a',
+                    current_cluster_name='replica-a',
+                    job_id_on_pool_cluster=41,
+                ))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        snapshot = state.get_task_log_stream_snapshot(job_id, 2)
+
+    assert snapshot == state.JobLogStreamSnapshot(2, ManagedJobStatus.RUNNING,
+                                                  'pool-a', 'replica-a', 41,
+                                                  'task-2')
+    assert counts['n'] == 1, counts
+
+    state.set_current_cluster_name(job_id, 'replica-b')
+    with _count_sql_statements(engine) as counts:
+        recovered_snapshot = state.get_task_log_stream_snapshot(job_id, 2)
+
+    assert recovered_snapshot == state.JobLogStreamSnapshot(
+        2, ManagedJobStatus.RUNNING, 'pool-a', 'replica-b', 41, 'task-2')
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_log_stream_snapshot_missing_task_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+
+    with _count_sql_statements(engine) as counts:
+        snapshot = state.get_task_log_stream_snapshot(job_id, 999)
+
+    assert snapshot == state.JobLogStreamSnapshot(None, None, None, None, None,
+                                                  None)
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_id_name_status_log_reads_one_task_row(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine,
+                 job_id,
+                 2,
+                 status=ManagedJobStatus.SUCCEEDED,
+                 local_log_file='/tmp/task-2.log',
+                 logs_cleaned_at=123.0)
+
+    with _count_sql_statements(engine) as counts:
+        row = state.get_task_id_name_status_log(job_id, 2)
+
+    assert row == (2, 'task-2', ManagedJobStatus.SUCCEEDED, '/tmp/task-2.log',
+                   123.0)
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_id_name_status_log_missing_task_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+
+    with _count_sql_statements(engine) as counts:
+        row = state.get_task_id_name_status_log(job_id, 999)
+
+    assert row is None
+    assert counts['n'] == 1, counts
+
+
+def test_get_pool_and_current_cluster_name_reads_one_row(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    pool='pool-a',
+                    current_cluster_name='replica-a',
+                ))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        context = state.get_pool_and_current_cluster_name(job_id)
+
+    assert context == ('pool-a', 'replica-a')
+    assert counts['n'] == 1, counts
+
+    state.set_current_cluster_name(job_id, 'replica-b')
+    with _count_sql_statements(engine) as counts:
+        refreshed_context = state.get_pool_and_current_cluster_name(job_id)
+
+    assert refreshed_context == ('pool-a', 'replica-b')
+    assert counts['n'] == 1, counts
+
+
+def test_get_pool_and_current_cluster_name_missing_job_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        context = state.get_pool_and_current_cluster_name(999999)
+
+    assert context == (None, None)
+    assert counts['n'] == 1, counts
+
+
 def test_get_job_cancellation_states_batches_lifecycle_snapshot(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
@@ -806,11 +1071,9 @@ def test_get_job_cancellation_states_batches_lifecycle_snapshot(
 
     assert snapshots == {
         active_job: state.JobCancellationState(state.ManagedJobStatus.RUNNING,
-                                               'team-a', False),
+                                               'team-a'),
         completed_job: state.JobCancellationState(state.ManagedJobStatus.FAILED,
-                                                  'team-b', False),
-        legacy_job: state.JobCancellationState(state.ManagedJobStatus.STARTING,
-                                               'default', True),
+                                                  'team-b'),
     }
     assert counts['n'] == 1, counts
 
@@ -862,12 +1125,8 @@ def test_get_job_cancellation_state_rows_use_latest_task_only(
             [active_job, completed_job, legacy_job, 999999, active_job])
 
     assert rows == [
-        (active_job, 1, state.ManagedJobStatus.RUNNING.value, 'team-a', 101,
-         1001.5),
-        (completed_job, 29, state.ManagedJobStatus.FAILED.value, 'team-b', -202,
-         None),
-        (legacy_job, 0, state.ManagedJobStatus.STARTING.value, None, None,
-         None),
+        (active_job, 1, state.ManagedJobStatus.RUNNING.value, 'team-a'),
+        (completed_job, 29, state.ManagedJobStatus.FAILED.value, 'team-b'),
     ]
     assert counts['n'] == 1, counts
 

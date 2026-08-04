@@ -1,5 +1,6 @@
 """PostgreSQL-backed aggregate history for SkyServe status and requests."""
 
+from collections.abc import Collection
 import datetime
 from typing import Any
 
@@ -7,15 +8,21 @@ import sqlalchemy
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 
+from sky import sky_logging
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.utils import common_utils
 from sky.utils.db import db_utils
 
+logger = sky_logging.init_logger(__name__)
+
 DEFAULT_HISTORY_HOURS = 12
 RETENTION_HOURS = 72
 BUCKET_SECONDS = 60
+REQUEST_CLASSIFICATION_PROTOCOL_VERSION = 1
 ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION = 2
+STATUS_HISTORY_SECTIONS = frozenset(
+    {'requests', 'replicas', 'prediction', 'autoscaler'})
 
 metadata = sqlalchemy.MetaData()
 
@@ -125,12 +132,26 @@ serve_request_activity_history_table = sqlalchemy.Table(
                       sqlalchemy.Boolean,
                       nullable=False,
                       server_default=sqlalchemy.false()),
+    sqlalchemy.Column('classified_request_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
+    sqlalchemy.Column('counted_rejected_count',
+                      sqlalchemy.Integer,
+                      nullable=True),
     sqlalchemy.CheckConstraint(
         'request_count >= 0',
         name='serve_request_activity_history_nonnegative'),
     sqlalchemy.CheckConstraint(
         'rejected_count >= 0',
         name='serve_request_activity_history_rejected_nonnegative'),
+    sqlalchemy.CheckConstraint(
+        '(classified_request_count IS NULL AND '
+        'counted_rejected_count IS NULL) OR '
+        '(classified_request_count IS NOT NULL AND '
+        'counted_rejected_count IS NOT NULL AND '
+        'classified_request_count >= 0 AND counted_rejected_count >= 0 AND '
+        'counted_rejected_count <= classified_request_count)',
+        name='serve_request_activity_history_classified_pair'),
 )
 sqlalchemy.Index('serve_request_activity_history_lookup_idx',
                  serve_request_activity_history_table.c.service_name,
@@ -138,6 +159,62 @@ sqlalchemy.Index('serve_request_activity_history_lookup_idx',
                  serve_request_activity_history_table.c.bucket_start.desc())
 sqlalchemy.Index('serve_request_activity_history_bucket_idx',
                  serve_request_activity_history_table.c.bucket_start)
+
+serve_request_activity_daily_table = sqlalchemy.Table(
+    'serve_request_activity_daily',
+    metadata,
+    sqlalchemy.Column('day_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      primary_key=True),
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('first_bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('last_bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('request_count', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('classified_request_count',
+                      sqlalchemy.BigInteger,
+                      nullable=True),
+    sqlalchemy.Column('counted_rejected_count',
+                      sqlalchemy.BigInteger,
+                      nullable=True),
+    sqlalchemy.Column('classified_first_bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=True),
+    sqlalchemy.Column('classified_last_bucket_start',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=True),
+    sqlalchemy.Column('classification_incomplete',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('observed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.CheckConstraint('request_count >= 0',
+                               name='serve_request_activity_daily_nonnegative'),
+    sqlalchemy.CheckConstraint(
+        '(classified_request_count IS NULL AND '
+        'counted_rejected_count IS NULL AND '
+        'classified_first_bucket_start IS NULL AND '
+        'classified_last_bucket_start IS NULL) OR '
+        '(classified_request_count IS NOT NULL AND '
+        'counted_rejected_count IS NOT NULL AND '
+        'classified_request_count >= 0 AND counted_rejected_count >= 0 AND '
+        'counted_rejected_count <= classified_request_count AND '
+        'classified_first_bucket_start IS NOT NULL AND '
+        'classified_last_bucket_start IS NOT NULL AND '
+        'classified_first_bucket_start <= classified_last_bucket_start)',
+        name='serve_request_activity_daily_classified_pair'),
+)
+sqlalchemy.Index('serve_request_activity_daily_day_idx',
+                 serve_request_activity_daily_table.c.day_start)
+sqlalchemy.Index('serve_request_activity_daily_service_day_idx',
+                 serve_request_activity_daily_table.c.service_name,
+                 serve_request_activity_daily_table.c.day_start)
 
 _RESPONSE_TIME_ARRAY_COLUMNS = tuple(
     sqlalchemy.Column(f'status_{status_class}_counts',
@@ -474,6 +551,464 @@ def record_status_snapshot(timestamp: float | None = None) -> int:
     return len(history_rows)
 
 
+def rollup_request_activity_daily(timestamp: float | None = None) -> int:
+    """Monotonically materialize available minute counters into UTC days.
+
+    The caller intentionally runs this before hourly raw-history pruning and
+    isolates failures from status snapshots. Recomputing all retained raw rows
+    provides a bounded initial backfill and incorporates late counter updates.
+    """
+    engine = _postgres_engine()
+    if engine is None:
+        return 0
+    observed_at = _utc_datetime(timestamp)
+    request_history = serve_request_activity_history_table
+    daily = serve_request_activity_daily_table
+    utc_bucket_start = sqlalchemy.func.timezone('UTC',
+                                                request_history.c.bucket_start)
+    day_start = sqlalchemy.func.timezone(
+        'UTC', sqlalchemy.func.date_trunc('day',
+                                          utc_bucket_start)).label('day_start')
+    classification_supported = sqlalchemy.and_(
+        request_history.c.classified_request_count.is_not(None),
+        request_history.c.counted_rejected_count.is_not(None))
+    classified_request_count = sqlalchemy.func.sum(
+        sqlalchemy.cast(
+            request_history.c.classified_request_count,
+            sqlalchemy.BigInteger)).filter(classification_supported).label(
+                'classified_request_count')
+    counted_rejected_count = sqlalchemy.func.sum(
+        sqlalchemy.cast(
+            request_history.c.counted_rejected_count,
+            sqlalchemy.BigInteger)).filter(classification_supported).label(
+                'counted_rejected_count')
+    classified_first_bucket_start = sqlalchemy.func.min(
+        request_history.c.bucket_start).filter(classification_supported).label(
+            'classified_first_bucket_start')
+    classified_last_bucket_start = sqlalchemy.func.max(
+        request_history.c.bucket_start).filter(classification_supported).label(
+            'classified_last_bucket_start')
+    classification_incomplete = sqlalchemy.func.bool_or(
+        sqlalchemy.and_(request_history.c.request_count > 0,
+                        sqlalchemy.not_(classification_supported))).label(
+                            'classification_incomplete')
+    query = (sqlalchemy.select(
+        day_start,
+        request_history.c.service_name,
+        request_history.c.service_hash,
+        sqlalchemy.func.min(
+            request_history.c.bucket_start).label('first_bucket_start'),
+        sqlalchemy.func.max(
+            request_history.c.bucket_start).label('last_bucket_start'),
+        sqlalchemy.func.sum(
+            sqlalchemy.cast(request_history.c.request_count,
+                            sqlalchemy.BigInteger)).label('request_count'),
+        classified_request_count,
+        counted_rejected_count,
+        classified_first_bucket_start,
+        classified_last_bucket_start,
+        classification_incomplete,
+    ).group_by(day_start, request_history.c.service_name,
+               request_history.c.service_hash))
+
+    with engine.begin() as connection:
+        has_daily_rows = connection.execute(
+            sqlalchemy.select(sqlalchemy.literal(1)).select_from(daily).limit(
+                1)).first() is not None
+        # The first run backfills all retained raw data. Hourly full passes run
+        # before raw pruning. Between them, only the current day needs
+        # recomputation, except during UTC midnight's one-hour late-report
+        # window when the complete previous day is still mutable.
+        if has_daily_rows and observed_at.minute != 0:
+            current_day = observed_at.replace(hour=0,
+                                              minute=0,
+                                              second=0,
+                                              microsecond=0)
+            cutoff = (current_day - datetime.timedelta(days=1)
+                      if observed_at.hour == 0 else current_day)
+            query = query.where(request_history.c.bucket_start >= cutoff)
+        rows = connection.execute(query).mappings().all()
+        if not rows:
+            return 0
+        values = [{
+            **dict(row),
+            'request_count': int(row['request_count']),
+            'classified_request_count':
+                (int(row['classified_request_count'])
+                 if row['classified_request_count'] is not None else None),
+            'counted_rejected_count':
+                (int(row['counted_rejected_count'])
+                 if row['counted_rejected_count'] is not None else None),
+            'classification_incomplete': bool(row['classification_incomplete']),
+            'observed_at': observed_at,
+        } for row in rows]
+        insert = postgresql.insert(serve_request_activity_daily_table).values(
+            values)
+        excluded = insert.excluded
+        connection.execute(
+            insert.on_conflict_do_update(
+                index_elements=[
+                    daily.c.day_start,
+                    daily.c.service_name,
+                    daily.c.service_hash,
+                ],
+                set_={
+                    'first_bucket_start': sqlalchemy.func.least(
+                        daily.c.first_bucket_start,
+                        excluded.first_bucket_start),
+                    'last_bucket_start': sqlalchemy.func.greatest(
+                        daily.c.last_bucket_start, excluded.last_bucket_start),
+                    'request_count': sqlalchemy.func.greatest(
+                        daily.c.request_count, excluded.request_count),
+                    'classified_request_count': _greatest_nullable(
+                        daily.c.classified_request_count,
+                        excluded.classified_request_count),
+                    'counted_rejected_count': _greatest_nullable(
+                        daily.c.counted_rejected_count,
+                        excluded.counted_rejected_count),
+                    'classified_first_bucket_start': _least_nullable(
+                        daily.c.classified_first_bucket_start,
+                        excluded.classified_first_bucket_start),
+                    'classified_last_bucket_start': _greatest_nullable(
+                        daily.c.classified_last_bucket_start,
+                        excluded.classified_last_bucket_start),
+                    'classification_incomplete': sqlalchemy.or_(
+                        daily.c.classification_incomplete,
+                        excluded.classification_incomplete),
+                    'observed_at': sqlalchemy.func.greatest(
+                        daily.c.observed_at, excluded.observed_at),
+                }))
+    return len(values)
+
+
+def get_daily_request_summary(
+    engine: sqlalchemy.engine.Engine,
+    first_day_start: int,
+    last_day_start: int,
+    days: list[dict[str, Any]],
+    table_limit: int,
+    chart_limit: int,
+) -> dict[str, Any]:
+    """Return bounded daily service request aggregates for a UTC range."""
+    non_rejected_empty = {
+        'available': False,
+        'definition': 'non_rejected_inbound_requests',
+        'coverage_start_utc': None,
+        'coverage': 'unavailable',
+        'complete_by_day': [False for _ in days],
+        'total_request_count': 0,
+        'services': [],
+        'series': [],
+    }
+    empty = {
+        'available': False,
+        'definition': 'admitted_inbound_requests',
+        'coverage_start_utc': None,
+        'total_request_count': 0,
+        'services': [],
+        'series': [],
+        'non_rejected': non_rejected_empty,
+    }
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return empty
+
+    daily = serve_request_activity_daily_table
+    first_day = datetime.datetime.fromtimestamp(first_day_start,
+                                                datetime.timezone.utc)
+    end_exclusive = datetime.datetime.fromtimestamp(
+        last_day_start + 24 * 60 * 60, datetime.timezone.utc)
+    base_filter = sqlalchemy.and_(daily.c.day_start >= first_day,
+                                  daily.c.day_start < end_exclusive)
+    count_sum = sqlalchemy.func.sum(daily.c.request_count)
+    classification_supported = sqlalchemy.and_(
+        daily.c.classified_request_count.is_not(None),
+        daily.c.counted_rejected_count.is_not(None))
+    classified_sum = sqlalchemy.func.sum(
+        daily.c.classified_request_count).filter(classification_supported)
+    counted_rejected_sum = sqlalchemy.func.sum(
+        daily.c.counted_rejected_count).filter(classification_supported)
+    service_day_incomplete = sqlalchemy.func.bool_or(
+        sqlalchemy.or_(
+            daily.c.classification_incomplete,
+            sqlalchemy.and_(daily.c.request_count > 0,
+                            sqlalchemy.not_(classification_supported))))
+    try:
+        with engine.connect() as connection:
+            earliest_day = sqlalchemy.select(
+                sqlalchemy.func.min(daily.c.day_start)).scalar_subquery()
+            coverage_start = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.min(daily.c.first_bucket_start)).
+                where(daily.c.day_start == earliest_day)).scalar_one_or_none()
+            service_rows = connection.execute(
+                sqlalchemy.select(
+                    daily.c.service_name,
+                    count_sum.label('request_count'),
+                ).where(base_filter).group_by(daily.c.service_name).order_by(
+                    sqlalchemy.desc('request_count'),
+                    daily.c.service_name.asc()).limit(table_limit)).fetchall()
+            top_service_names = [
+                row.service_name for row in service_rows[:chart_limit]
+            ]
+            total_rows = connection.execute(
+                sqlalchemy.select(
+                    daily.c.day_start,
+                    count_sum.label('request_count'),
+                ).where(base_filter).group_by(daily.c.day_start)).fetchall()
+            daily_service_rows = []
+            if top_service_names:
+                daily_service_rows = connection.execute(
+                    sqlalchemy.select(
+                        daily.c.day_start,
+                        daily.c.service_name,
+                        count_sum.label('request_count'),
+                    ).where(
+                        sqlalchemy.and_(
+                            base_filter,
+                            daily.c.service_name.in_(
+                                top_service_names))).group_by(
+                                    daily.c.day_start,
+                                    daily.c.service_name)).fetchall()
+            classified_earliest_day = sqlalchemy.select(
+                sqlalchemy.func.min(daily.c.day_start)).where(
+                    daily.c.classified_first_bucket_start.is_not(
+                        None)).scalar_subquery()
+            classified_coverage_start = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.min(
+                        daily.c.classified_first_bucket_start)).where(
+                            daily.c.day_start ==
+                            classified_earliest_day)).scalar_one_or_none()
+            service_day_rows = connection.execute(
+                sqlalchemy.select(
+                    daily.c.day_start,
+                    daily.c.service_name,
+                    count_sum.label('request_count'),
+                    classified_sum.label('classified_request_count'),
+                    counted_rejected_sum.label('counted_rejected_count'),
+                    sqlalchemy.func.min(
+                        daily.c.classified_first_bucket_start).filter(
+                            classification_supported).label(
+                                'classified_first_bucket_start'),
+                    service_day_incomplete.label('classification_incomplete'),
+                ).where(base_filter).group_by(daily.c.day_start,
+                                              daily.c.service_name)).fetchall()
+            observed_service_names = sorted(
+                {str(row.service_name) for row in service_day_rows})
+            service_coverage_rows = []
+            if observed_service_names:
+                service_coverage_rows = connection.execute(
+                    sqlalchemy.select(
+                        daily.c.service_name,
+                        sqlalchemy.func.min(
+                            daily.c.classified_first_bucket_start).label(
+                                'coverage_start'),
+                    ).where(
+                        sqlalchemy.and_(
+                            daily.c.service_name.in_(observed_service_names),
+                            daily.c.classified_first_bucket_start.is_not(None),
+                        )).group_by(daily.c.service_name)).fetchall()
+    except sqlalchemy.exc.SQLAlchemyError:
+        # During a rolling API-server upgrade the reader may briefly run
+        # before the Serve migration has created the optional table.
+        logger.exception('Failed to read daily Serve request history.')
+        return empty
+
+    day_starts = [int(day['day_start_utc']) for day in days]
+    totals_by_day = {
+        int(row.day_start.timestamp()): int(row.request_count or 0)
+        for row in total_rows
+    }
+    counts_by_service_day = {
+        (row.service_name, int(row.day_start.timestamp())): int(
+            row.request_count or 0) for row in daily_service_rows
+    }
+    displayed_by_day = dict.fromkeys(day_starts, 0)
+    series = []
+    for service_name in top_service_names:
+        request_count_by_day = []
+        for day_start_epoch in day_starts:
+            count = counts_by_service_day.get((service_name, day_start_epoch),
+                                              0)
+            request_count_by_day.append(count)
+            displayed_by_day[day_start_epoch] += count
+        series.append({
+            'service_name': service_name,
+            'request_count_by_day': request_count_by_day,
+        })
+    other_by_day = [
+        max(
+            0,
+            totals_by_day.get(day_start_epoch, 0) -
+            displayed_by_day[day_start_epoch]) for day_start_epoch in day_starts
+    ]
+    if any(other_by_day):
+        series.append({
+            'is_other': True,
+            'request_count_by_day': other_by_day,
+        })
+
+    classified_coverage_start_utc = (int(classified_coverage_start.timestamp())
+                                     if classified_coverage_start is not None
+                                     else None)
+    service_coverage_starts = {
+        str(row.service_name): int(row.coverage_start.timestamp())
+        for row in service_coverage_rows
+        if row.coverage_start is not None
+    }
+    observed_by_service_day = {
+        (str(row.service_name), int(row.day_start.timestamp())): row
+        for row in service_day_rows
+    }
+
+    seconds_per_day = 24 * 60 * 60
+
+    def first_complete_day(coverage_start_utc: int | None) -> int | None:
+        if coverage_start_utc is None:
+            return None
+        coverage_day = coverage_start_utc // seconds_per_day * seconds_per_day
+        if coverage_start_utc > coverage_day:
+            coverage_day += seconds_per_day
+        return coverage_day
+
+    complete_by_service: dict[str, list[bool]] = {}
+    counts_by_service: dict[str, list[int | None]] = {}
+    observed_days_by_service: dict[str, set[int]] = {}
+    for service_name in observed_service_names:
+        coverage_day = first_complete_day(
+            service_coverage_starts.get(service_name))
+        complete_cells = []
+        count_cells: list[int | None] = []
+        observed_days = set()
+        for day_start_epoch in day_starts:
+            row = observed_by_service_day.get((service_name, day_start_epoch))
+            if row is not None:
+                observed_days.add(day_start_epoch)
+            complete = coverage_day is not None and day_start_epoch >= coverage_day
+            if row is not None:
+                pair_available = (row.classified_request_count is not None and
+                                  row.counted_rejected_count is not None)
+                pair_required = int(row.request_count or 0) > 0
+                complete = (complete and
+                            not bool(row.classification_incomplete) and
+                            (not pair_required or pair_available))
+            complete_cells.append(complete)
+            if not complete:
+                count_cells.append(None)
+            elif row is None:
+                count_cells.append(0)
+            elif row.classified_request_count is None:
+                count_cells.append(0)
+            else:
+                count_cells.append(
+                    max(
+                        0,
+                        int(row.classified_request_count) -
+                        int(row.counted_rejected_count)))
+        complete_by_service[service_name] = complete_cells
+        counts_by_service[service_name] = count_cells
+        observed_days_by_service[service_name] = observed_days
+
+    service_records: list[dict[str, Any]] = []
+    for service_name in observed_service_names:
+        complete_cells = complete_by_service[service_name]
+        count_cells = counts_by_service[service_name]
+        complete_count = sum(1 for complete in complete_cells if complete)
+        if complete_count == 0:
+            service_coverage = 'unavailable'
+        elif complete_count == len(complete_cells):
+            service_coverage = 'complete'
+        else:
+            service_coverage = 'partial'
+        service_records.append({
+            'service_name': service_name,
+            'request_count': sum(count or 0 for count in count_cells),
+            'coverage': service_coverage,
+            'complete_by_day': complete_cells,
+        })
+    service_records.sort(key=lambda service: (-int(service['request_count']),
+                                              str(service['service_name'])))
+
+    global_first_complete_day = first_complete_day(
+        classified_coverage_start_utc)
+    classified_complete_by_day = []
+    for index, day_start_epoch in enumerate(day_starts):
+        complete = (global_first_complete_day is not None and
+                    day_start_epoch >= global_first_complete_day)
+        if complete:
+            complete = all(
+                complete_by_service[service_name][index]
+                for service_name in observed_service_names
+                if day_start_epoch in observed_days_by_service[service_name])
+        classified_complete_by_day.append(complete)
+
+    has_complete_cell = (any(classified_complete_by_day) or any(
+        any(complete_cells) for complete_cells in complete_by_service.values()))
+    if not has_complete_cell:
+        classified_coverage = 'unavailable'
+    elif all(classified_complete_by_day):
+        classified_coverage = 'complete'
+    else:
+        classified_coverage = 'partial'
+
+    classified_top_services = service_records[:table_limit]
+    classified_top_names = [
+        str(service['service_name'])
+        for service in service_records[:chart_limit]
+    ]
+    classified_series: list[dict[str, Any]] = [{
+        'service_name': service_name,
+        'request_count_by_day': counts_by_service[service_name],
+    } for service_name in classified_top_names]
+    remainder_names = [
+        service_name for service_name in observed_service_names
+        if service_name not in set(classified_top_names)
+    ]
+    other_counts: list[int | None] = []
+    for index, day_start_epoch in enumerate(day_starts):
+        incomplete_remainder = any(
+            day_start_epoch in observed_days_by_service[service_name] and
+            not complete_by_service[service_name][index]
+            for service_name in remainder_names)
+        if incomplete_remainder:
+            other_counts.append(None)
+        else:
+            other_counts.append(
+                sum((counts_by_service[service_name][index] or 0)
+                    for service_name in remainder_names))
+    if any(count is None or count > 0 for count in other_counts):
+        classified_series.append({
+            'is_other': True,
+            'request_count_by_day': other_counts,
+        })
+
+    non_rejected = {
+        'available': has_complete_cell,
+        'definition': 'non_rejected_inbound_requests',
+        'coverage_start_utc': classified_coverage_start_utc,
+        'coverage': classified_coverage,
+        'complete_by_day': classified_complete_by_day,
+        'total_request_count': sum(
+            int(service['request_count']) for service in service_records),
+        'services': classified_top_services,
+        'series': classified_series,
+    }
+
+    return {
+        'available': True,
+        'definition': 'admitted_inbound_requests',
+        'coverage_start_utc': int(coverage_start.timestamp())
+                              if coverage_start else None,
+        'total_request_count': sum(totals_by_day.values()),
+        'services': [{
+            'service_name': row.service_name,
+            'request_count': int(row.request_count or 0),
+        } for row in service_rows],
+        'series': series,
+        'non_rejected': non_rejected,
+    }
+
+
 def _request_history_rows(
     service_name: str,
     service_hash: str,
@@ -596,6 +1131,198 @@ def record_request_activity(
                     'rejection_count_available': sqlalchemy.or_(
                         rejection_available,
                         excluded.rejection_count_available),
+                }))
+    return len(rows)
+
+
+def _greatest_nullable(left: Any, right: Any) -> Any:
+    """Return a SQL expression that preserves null only when both are null."""
+    return sqlalchemy.case((left.is_(None), right), (right.is_(None), left),
+                           else_=sqlalchemy.func.greatest(left, right))
+
+
+def _least_nullable(left: Any, right: Any) -> Any:
+    """Return a SQL expression that preserves null only when both are null."""
+    return sqlalchemy.case((left.is_(None), right), (right.is_(None), left),
+                           else_=sqlalchemy.func.least(left, right))
+
+
+def _request_classification_rows(
+    service_name: str,
+    service_hash: str,
+    reporter_session_id: str,
+    request_classification_history: dict[str, Any],
+    observed_at: datetime.datetime,
+) -> list[dict[str, Any]]:
+    """Validate one independent terminal-classification minute snapshot."""
+    if not isinstance(request_classification_history, dict):
+        raise ValueError('request_classification_history must be an object.')
+    classification_version = request_classification_history.get(
+        'classification_version')
+    if (not isinstance(classification_version, int) or
+            isinstance(classification_version, bool) or
+            classification_version != REQUEST_CLASSIFICATION_PROTOCOL_VERSION):
+        raise ValueError(
+            'request_classification_history classification_version '
+            'is unsupported.')
+    if request_classification_history.get('bucket_seconds') != BUCKET_SECONDS:
+        raise ValueError(
+            'request_classification_history bucket_seconds must be '
+            f'{BUCKET_SECONDS}.')
+    buckets = request_classification_history.get('buckets')
+    if not isinstance(buckets, list):
+        raise ValueError('request_classification_history buckets must be a '
+                         'list.')
+    max_buckets = constants.LB_REQUEST_HISTORY_MAX_BUCKETS
+    if len(buckets) > max_buckets:
+        raise ValueError('request_classification_history may contain at most '
+                         f'{max_buckets} buckets.')
+
+    current_bucket = observed_at.replace(second=0, microsecond=0)
+    oldest_bucket = current_bucket - datetime.timedelta(
+        seconds=constants.LB_REQUEST_HISTORY_WINDOW_SECONDS +
+        2 * BUCKET_SECONDS)
+    newest_bucket = current_bucket + datetime.timedelta(seconds=2 *
+                                                        BUCKET_SECONDS)
+    seen_bucket_starts: set[int] = set()
+    rows = []
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            raise ValueError('request_classification_history bucket must be an '
+                             'object.')
+        bucket_start = bucket.get('bucket_start')
+        classified_request_count = bucket.get('classified_request_count')
+        counted_rejected_count = bucket.get('counted_rejected_count')
+        if (not isinstance(bucket_start, int) or
+                isinstance(bucket_start, bool) or
+                bucket_start % BUCKET_SECONDS != 0):
+            raise ValueError('request_classification_history bucket_start must '
+                             'be an aligned integer epoch timestamp.')
+        if bucket_start in seen_bucket_starts:
+            raise ValueError('request_classification_history bucket_start must '
+                             'be unique.')
+        seen_bucket_starts.add(bucket_start)
+        if (not isinstance(classified_request_count, int) or
+                isinstance(classified_request_count, bool) or
+                classified_request_count < 0):
+            raise ValueError(
+                'request_classification_history classified_request_count must '
+                'be a nonnegative integer.')
+        if (not isinstance(counted_rejected_count, int) or
+                isinstance(counted_rejected_count, bool) or
+                counted_rejected_count < 0):
+            raise ValueError(
+                'request_classification_history counted_rejected_count must '
+                'be a nonnegative integer.')
+        if counted_rejected_count > classified_request_count:
+            raise ValueError('request_classification_history '
+                             'counted_rejected_count cannot exceed '
+                             'classified_request_count.')
+        if classified_request_count == 0:
+            raise ValueError('request_classification_history bucket must '
+                             'contain a classified request.')
+        bucket_datetime = _utc_datetime(bucket_start)
+        if not oldest_bucket <= bucket_datetime <= newest_bucket:
+            raise ValueError('request_classification_history bucket_start is '
+                             'outside the accepted recent window.')
+        rows.append({
+            'service_name': service_name,
+            'service_hash': service_hash,
+            'reporter_session_id': reporter_session_id,
+            'bucket_start': bucket_datetime,
+            'observed_at': observed_at,
+            'request_count': 0,
+            'rejected_count': 0,
+            'rejection_count_available': True,
+            'classified_request_count': classified_request_count,
+            'counted_rejected_count': counted_rejected_count,
+        })
+    return rows
+
+
+def validate_request_classification_history(
+    request_classification_history: dict[str, Any],
+    timestamp: float | None = None,
+) -> None:
+    """Validate a classification envelope without reading or writing state."""
+    _request_classification_rows('', '', '', request_classification_history,
+                                 _utc_datetime(timestamp))
+
+
+def record_request_classification(
+    service_name: str,
+    service_hash: str,
+    reporter_session_id: str,
+    request_classification_history: dict[str, Any] | None,
+    timestamp: float | None = None,
+    request_history: dict[str, Any] | None = None,
+) -> int:
+    """Atomically persist support evidence and terminal classifications."""
+    if request_classification_history is None:
+        return 0
+    observed_at = _utc_datetime(timestamp)
+    classification_rows = _request_classification_rows(
+        service_name, service_hash, reporter_session_id,
+        request_classification_history, observed_at)
+    support_rows = []
+    if request_history is not None:
+        support_rows = _request_history_rows(service_name, service_hash,
+                                             reporter_session_id,
+                                             request_history, observed_at)
+        for support_row in support_rows:
+            support_row['request_count'] = 0
+            support_row['rejected_count'] = 0
+            support_row['rejection_count_available'] = True
+            support_row['classified_request_count'] = 0
+            support_row['counted_rejected_count'] = 0
+
+    # A bucket can exist in both snapshots. Merge before INSERT because one
+    # PostgreSQL ON CONFLICT statement cannot affect the same key twice.
+    rows_by_bucket = {row['bucket_start']: row for row in support_rows}
+    for classification_row in classification_rows:
+        bucket_start = classification_row['bucket_start']
+        existing_row = rows_by_bucket.get(bucket_start)
+        if existing_row is None:
+            rows_by_bucket[bucket_start] = classification_row
+            continue
+        existing_row['classified_request_count'] = max(
+            int(existing_row['classified_request_count']),
+            int(classification_row['classified_request_count']))
+        existing_row['counted_rejected_count'] = max(
+            int(existing_row['counted_rejected_count']),
+            int(classification_row['counted_rejected_count']))
+    rows = list(rows_by_bucket.values())
+    engine = _postgres_engine()
+    if engine is None or not rows:
+        return 0
+    history = serve_request_activity_history_table
+    with engine.begin() as connection:
+        insert = postgresql.insert(history).values(rows)
+        excluded = insert.excluded
+        connection.execute(
+            insert.on_conflict_do_update(
+                index_elements=[
+                    history.c.service_name,
+                    history.c.service_hash,
+                    history.c.reporter_session_id,
+                    history.c.bucket_start,
+                ],
+                set_={
+                    'observed_at': sqlalchemy.func.greatest(
+                        history.c.observed_at, excluded.observed_at),
+                    'request_count': sqlalchemy.func.greatest(
+                        history.c.request_count, excluded.request_count),
+                    'rejected_count': sqlalchemy.func.greatest(
+                        history.c.rejected_count, excluded.rejected_count),
+                    'rejection_count_available': sqlalchemy.or_(
+                        history.c.rejection_count_available,
+                        excluded.rejection_count_available),
+                    'classified_request_count': _greatest_nullable(
+                        history.c.classified_request_count,
+                        excluded.classified_request_count),
+                    'counted_rejected_count': _greatest_nullable(
+                        history.c.counted_rejected_count,
+                        excluded.counted_rejected_count),
                 }))
     return len(rows)
 
@@ -1104,12 +1831,68 @@ def record_autoscaler_snapshot(
     return 1
 
 
+def _normalize_status_history_sections(
+    sections: Collection[str] | None,) -> frozenset[str]:
+    if sections is None:
+        return STATUS_HISTORY_SECTIONS
+    if isinstance(sections, str):
+        raise ValueError('sections must be a collection of section names, not '
+                         'a string.')
+    try:
+        requested_sections = frozenset(sections)
+    except TypeError as e:
+        raise ValueError('sections must contain only section names.') from e
+    if any(not isinstance(section, str) for section in requested_sections):
+        raise ValueError('sections must contain only string section names.')
+    invalid_sections = requested_sections - STATUS_HISTORY_SECTIONS
+    if not requested_sections or invalid_sections:
+        expected = ', '.join(sorted(STATUS_HISTORY_SECTIONS))
+        raise ValueError('sections must contain at least one of '
+                         f'{expected}; got {sorted(invalid_sections)!r}.')
+    return requested_sections
+
+
+def unavailable_status_history(reason: str,
+                               sections: Collection[str] | None = None
+                              ) -> dict[str, Any]:
+    """Build a stable unavailable response for selected history sections."""
+    requested_sections = _normalize_status_history_sections(sections)
+    response: dict[str, Any] = {
+        'available': False,
+        'reason': reason,
+        'bucket_seconds': BUCKET_SECONDS,
+        'retention_hours': RETENTION_HOURS,
+    }
+    if 'replicas' in requested_sections:
+        response['samples'] = []
+    if 'requests' in requested_sections:
+        response.update({
+            'request_samples': [],
+            'rejection_history_available': False,
+            'request_window_seconds':
+                constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
+            'requests_last_hour': 0,
+        })
+    if 'prediction' in requested_sections:
+        response.update({
+            'prediction_time_samples': [],
+            'prediction_time_histogram_version':
+                constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+            'prediction_time_bucket_upper_bounds_seconds': list(
+                constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
+        })
+    if 'autoscaler' in requested_sections:
+        response['autoscaler_samples'] = []
+    return response
+
+
 def get_status_history(
         service_name: str,
         hours: int = DEFAULT_HISTORY_HOURS,
         version: int | None = None,
         timestamp: float | None = None,
-        expected_service_hash: str | None = None) -> dict[str, Any]:
+        expected_service_hash: str | None = None,
+        sections: Collection[str] | None = None) -> dict[str, Any]:
     """Return ordered aggregate history for the current service incarnation."""
     if (not isinstance(hours, int) or isinstance(hours, bool) or hours < 1 or
             hours > RETENTION_HOURS):
@@ -1123,107 +1906,87 @@ def get_status_history(
             expected_service_hash, str) or not expected_service_hash):
         raise ValueError('expected_service_hash must be a non-empty string, '
                          f'got {expected_service_hash!r}.')
+    requested_sections = _normalize_status_history_sections(sections)
 
     engine = _postgres_engine()
     if engine is None:
-        return {
-            'available': False,
-            'bucket_seconds': BUCKET_SECONDS,
-            'retention_hours': RETENTION_HOURS,
-            'samples': [],
-            'request_samples': [],
-            'prediction_time_samples': [],
-            'autoscaler_samples': [],
-            'prediction_time_histogram_version':
-                constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
-            'prediction_time_bucket_upper_bounds_seconds': list(
-                constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
-            'rejection_history_available': False,
-            'request_window_seconds':
-                constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
-            'requests_last_hour': 0,
-        }
+        return unavailable_status_history('postgres_required',
+                                          requested_sections)
 
     observed_at = _utc_datetime(timestamp)
     window_start = observed_at - datetime.timedelta(hours=hours)
     services = serve_state.services_table
     history = serve_replica_status_history_table
     with orm.Session(engine) as session:
-        service_predicates = [
-            services.c.name == service_name,
-            services.c.pool == 0,
-        ]
-        if expected_service_hash is not None:
-            service_predicates.append(services.c.hash == expected_service_hash)
         service_hash = session.execute(
             sqlalchemy.select(services.c.hash).where(
-                *service_predicates)).scalar_one_or_none()
+                services.c.name == service_name,
+                services.c.pool == 0)).scalar_one_or_none()
         if service_hash is None:
-            return {
-                'available': False,
-                'bucket_seconds': BUCKET_SECONDS,
-                'retention_hours': RETENTION_HOURS,
-                'samples': [],
-                'request_samples': [],
-                'prediction_time_samples': [],
-                'autoscaler_samples': [],
-                'prediction_time_histogram_version':
-                    constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
-                'prediction_time_bucket_upper_bounds_seconds': list(
-                    constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
-                'rejection_history_available': False,
-                'request_window_seconds':
-                    constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
-                'requests_last_hour': 0,
-            }
-        predicates = [
-            history.c.service_name == service_name,
-            history.c.service_hash == service_hash,
-            history.c.bucket_start >= window_start,
-            history.c.bucket_start <= observed_at,
-        ]
-        if version is not None:
-            predicates.append(history.c.version == version)
-        rows = session.execute(
-            sqlalchemy.select(history).where(*predicates).order_by(
-                history.c.bucket_start, history.c.version)).mappings().all()
-        request_history = serve_request_activity_history_table
-        request_rows = session.execute(
-            sqlalchemy.select(
-                request_history.c.bucket_start,
-                sqlalchemy.func.sum(  # pylint: disable=not-callable
-                    request_history.c.request_count).label('request_count'),
-                sqlalchemy.func.sum(  # pylint: disable=not-callable
-                    request_history.c.rejected_count).label('rejected_count'),
-                sqlalchemy.func.bool_and(  # pylint: disable=not-callable
-                    request_history.c.rejection_count_available).label(
-                        'rejection_count_available'),
-                sqlalchemy.func.bool_or(  # pylint: disable=not-callable
-                    request_history.c.rejection_count_available).label(
-                        'rejection_count_supported'),
-            ).where(
-                request_history.c.service_name == service_name,
-                request_history.c.service_hash == service_hash,
-                request_history.c.bucket_start >= window_start,
-                request_history.c.bucket_start <= observed_at,
-            ).group_by(request_history.c.bucket_start).order_by(
-                request_history.c.bucket_start)).all()
-        prediction_history = serve_prediction_time_history_table
-        prediction_rows = session.execute(
-            sqlalchemy.select(prediction_history).where(
-                prediction_history.c.service_name == service_name,
-                prediction_history.c.service_hash == service_hash,
-                prediction_history.c.bucket_start >= window_start,
-                prediction_history.c.bucket_start <= observed_at,
-            ).order_by(prediction_history.c.bucket_start)).mappings().all()
-        autoscaler_history = serve_autoscaler_history_table
-        autoscaler_rows = session.execute(
-            sqlalchemy.select(autoscaler_history).where(
-                autoscaler_history.c.service_name == service_name,
-                autoscaler_history.c.service_hash == service_hash,
-                autoscaler_history.c.bucket_start >= window_start,
-                autoscaler_history.c.bucket_start <= observed_at,
-            ).order_by(autoscaler_history.c.bucket_start)).mappings().all()
+            return unavailable_status_history('service_not_found',
+                                              requested_sections)
+        if (expected_service_hash is not None and
+                service_hash != expected_service_hash):
+            return unavailable_status_history('service_hash_mismatch',
+                                              requested_sections)
+        rows = []
+        request_rows = []
+        prediction_rows = []
+        autoscaler_rows = []
+        if 'replicas' in requested_sections:
+            predicates = [
+                history.c.service_name == service_name,
+                history.c.service_hash == service_hash,
+                history.c.bucket_start >= window_start,
+                history.c.bucket_start <= observed_at,
+            ]
+            if version is not None:
+                predicates.append(history.c.version == version)
+            rows = session.execute(
+                sqlalchemy.select(history).where(*predicates).order_by(
+                    history.c.bucket_start,
+                    history.c.version)).mappings().all()
+        if 'requests' in requested_sections:
+            request_history = serve_request_activity_history_table
+            request_rows = session.execute(
+                sqlalchemy.select(
+                    request_history.c.bucket_start,
+                    sqlalchemy.func.sum(  # pylint: disable=not-callable
+                        request_history.c.request_count).label('request_count'),
+                    sqlalchemy.func.sum(  # pylint: disable=not-callable
+                        request_history.c.rejected_count).label(
+                            'rejected_count'),
+                    sqlalchemy.func.bool_and(  # pylint: disable=not-callable
+                        request_history.c.rejection_count_available).label(
+                            'rejection_count_available'),
+                    sqlalchemy.func.bool_or(  # pylint: disable=not-callable
+                        request_history.c.rejection_count_available).label(
+                            'rejection_count_supported'),
+                ).where(
+                    request_history.c.service_name == service_name,
+                    request_history.c.service_hash == service_hash,
+                    request_history.c.bucket_start >= window_start,
+                    request_history.c.bucket_start <= observed_at,
+                ).group_by(request_history.c.bucket_start).order_by(
+                    request_history.c.bucket_start)).all()
+        if 'prediction' in requested_sections:
+            prediction_history = serve_prediction_time_history_table
+            prediction_rows = session.execute(
+                sqlalchemy.select(prediction_history).where(
+                    prediction_history.c.service_name == service_name,
+                    prediction_history.c.service_hash == service_hash,
+                    prediction_history.c.bucket_start >= window_start,
+                    prediction_history.c.bucket_start <= observed_at,
+                ).order_by(prediction_history.c.bucket_start)).mappings().all()
+        if 'autoscaler' in requested_sections:
+            autoscaler_history = serve_autoscaler_history_table
+            autoscaler_rows = session.execute(
+                sqlalchemy.select(autoscaler_history).where(
+                    autoscaler_history.c.service_name == service_name,
+                    autoscaler_history.c.service_hash == service_hash,
+                    autoscaler_history.c.bucket_start >= window_start,
+                    autoscaler_history.c.bucket_start <= observed_at,
+                ).order_by(autoscaler_history.c.bucket_start)).mappings().all()
 
     samples = []
     for row in rows:
@@ -1317,23 +2080,33 @@ def get_status_history(
         sample['request_count']
         for sample in request_samples
         if sample['timestamp'] >= request_window_start.timestamp())
-    return {
+    response: dict[str, Any] = {
         'available': True,
         'service_hash': service_hash,
         'bucket_seconds': BUCKET_SECONDS,
         'retention_hours': RETENTION_HOURS,
         'window_start': window_start.timestamp(),
         'window_end': observed_at.timestamp(),
-        'samples': samples,
-        'request_samples': request_samples,
-        'prediction_time_samples': prediction_time_samples,
-        'autoscaler_samples': autoscaler_samples,
-        'prediction_time_histogram_version':
-            constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
-        'prediction_time_bucket_upper_bounds_seconds': list(
-            constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
-        'rejection_history_available': any(
-            row.rejection_count_supported for row in request_rows),
-        'request_window_seconds': constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
-        'requests_last_hour': requests_last_hour,
     }
+    if 'replicas' in requested_sections:
+        response['samples'] = samples
+    if 'requests' in requested_sections:
+        response.update({
+            'request_samples': request_samples,
+            'rejection_history_available': any(
+                row.rejection_count_supported for row in request_rows),
+            'request_window_seconds':
+                constants.LB_REQUEST_HISTORY_WINDOW_SECONDS,
+            'requests_last_hour': requests_last_hour,
+        })
+    if 'prediction' in requested_sections:
+        response.update({
+            'prediction_time_samples': prediction_time_samples,
+            'prediction_time_histogram_version':
+                constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
+            'prediction_time_bucket_upper_bounds_seconds': list(
+                constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS),
+        })
+    if 'autoscaler' in requested_sections:
+        response['autoscaler_samples'] = autoscaler_samples
+    return response

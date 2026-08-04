@@ -30,6 +30,7 @@ jobs:
           src/components/recipe-hub.test.jsx \
           src/components/recipe-detail.test.jsx \
           src/components/clusters.test.jsx \
+          src/components/utils.test.jsx \
           src/components/volumes.test.jsx \
           src/components/estimated-spend.test.jsx \
           src/components/infra.test.jsx \
@@ -37,6 +38,7 @@ jobs:
           src/components/infra-page.test.jsx \
           src/components/image-action-dialogs.test.jsx \
           src/components/image-detail.test.jsx \
+          src/components/image-readiness.test.jsx \
           src/data/connectors/infra-kubernetes.test.jsx \
           src/data/connectors/infra-slurm.test.jsx \
           src/components/serve-replica-history.test.jsx \
@@ -57,10 +59,12 @@ jobs:
           src/data/connectors/services.test.jsx \
           src/data/connectors/jobs.test.jsx \
           src/data/connectors/jobs-stream-timeout.test.jsx \
+          src/data/connectors/ssh-node-pools-stream-timeout.test.jsx \
           src/data/connectors/jobs-download-logs.test.jsx \
           src/data/connectors/operator-notifications.test.js \
           src/data/connectors/stream-decoders.test.jsx \
           src/data/connectors/volumes.test.js \
+          src/tests/managed-job-details.test.jsx \
           src/tests/service-details.test.jsx \
           src/tests/cluster-history-details.test.jsx \
           src/tests/volume-details.test.jsx \
@@ -69,6 +73,7 @@ jobs:
           src/lib/jobs-cache-manager.test.js \
           src/lib/request-activity.test.js \
           src/lib/request-activity.persistence.test.js \
+          src/hooks/useVisibleRefreshInterval.test.js \
           src/hooks/useLogStreamer.test.js \
           src/hooks/useTour.test.jsx \
           src/plugins/PluginProvider.test.jsx \

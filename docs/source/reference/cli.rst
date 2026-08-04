@@ -36,6 +36,11 @@ Cluster CLI
    :prog: sky autostop
    :nested: full
 
+.. _sky-dev:
+.. click:: sky.client.cli.command:dev
+   :prog: sky dev
+   :nested: full
+
 
 Jobs CLI
 --------

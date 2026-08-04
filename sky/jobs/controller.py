@@ -7,6 +7,7 @@ import os
 import pathlib
 import resource
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -53,6 +54,7 @@ from sky.utils import controller_utils
 from sky.utils import dag_utils
 from sky.utils import status_lib
 from sky.utils import ux_utils
+from sky.utils.db import db_utils
 from sky.utils.plugin_extensions import ExternalClusterFailure
 from sky.utils.plugin_extensions import ExternalFailureSource
 
@@ -79,6 +81,40 @@ _background_tasks: set[asyncio.Task] = set()
 # failures without prior healthy evidence recover immediately.
 _NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY = 3
 _FILE_MOUNTS_BLOB_ID_UNSET = object()
+_OUTER_CONTROLLER_PROBE_SECONDS = 2
+
+
+def _fail_stop_outer_controller_process_group(reason: str) -> typing.NoReturn:
+    """Exit a fenced scheduler without running managed-job finalizers."""
+    logger.error(reason)
+    try:
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    except OSError:
+        logger.exception(
+            'Failed to SIGKILL the fenced scheduler process group.')
+    # killpg() does not return on success.  This fallback preserves fail-stop
+    # semantics if the process group disappeared or could not be signaled.
+    os._exit(1)  # pylint: disable=protected-access
+
+
+async def _watch_outer_controller_generation(owner: tuple[str, int]) -> None:
+    """Exit the detached scheduler when its outer generation is fenced."""
+    instance_id, generation = owner
+    while True:
+        await asyncio.sleep(_OUTER_CONTROLLER_PROBE_SECONDS)
+        try:
+            is_current = await asyncio.to_thread(
+                managed_job_state.controller_owner_is_current, owner)
+        except Exception as e:  # pylint: disable=broad-except
+            _fail_stop_outer_controller_process_group(
+                'Could not prove managed-job outer controller generation '
+                f'{generation} for instance {instance_id}: '
+                f'{common_utils.format_exception(e)}')
+        if not is_current:
+            _fail_stop_outer_controller_process_group(
+                'Managed-job outer controller generation '
+                f'{generation} for instance {instance_id} is no longer '
+                'current.')
 
 
 class _ClusterNotUpDebouncer:
@@ -748,6 +784,14 @@ class JobController:
                     raise asyncio.CancelledError()
             if prev_status != managed_job_state.ManagedJobStatus.RUNNING:
                 force_transit_to_recovering = True
+            elif (last_task_prev_status
+                  == managed_job_state.ManagedJobStatus.RUNNING and
+                  not launched_task):
+                # A resumed RUNNING task skips StrategyExecutor.launch(), whose
+                # scheduled_launch context normally restores ALIVE. Complete
+                # that generation-fenced transition before monitoring so the
+                # replacement controller does not remain LAUNCHING forever.
+                await scheduler.job_resumed(self._job_id)
 
             await self._strategy_executor.on_resume(cluster_name)
 
@@ -1633,6 +1677,7 @@ class JobController:
         tasks_to_launch = [
             tid for tid in range(len(tasks)) if needs_launch(tid)
         ]
+        launch_failure: Exception | None = None
 
         try:
             # Prepare all tasks (create executors and set STARTING state)
@@ -1675,10 +1720,17 @@ class JobController:
                 logger.info('Phase 1: Skipping launch - resuming from '
                             'previous execution')
 
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f'Failed to launch clusters: {e}')
-            await self._cleanup_job_group_clusters(cluster_names)
-            raise
+            launch_failure = e
+
+        if launch_failure is not None:
+            try:
+                await self._finish_failure_cleanup(
+                    self._cleanup_job_group_clusters(cluster_names))
+            except asyncio.CancelledError:  # noqa: ASYNC103
+                pass
+            raise launch_failure.with_traceback(launch_failure.__traceback__)
 
         # Phase 2: Barrier sync - collect handles and set RUNNING state
         logger.info('Phase 2: Waiting for all clusters to be ready...')
@@ -1798,6 +1850,7 @@ class JobController:
         async_task_to_id: dict[asyncio.Task, int] = {
             at: tid for tid, at in monitor_async_tasks.items()
         }
+        monitor_failure: Exception | None = None
 
         async def cancel_remaining_monitors() -> None:
             """Cancel and join monitors without interrupting their cleanup."""
@@ -1893,11 +1946,18 @@ class JobController:
             # a child can keep polling or recover while cleanup is in progress.
             await cancel_remaining_monitors()
             raise
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f'Monitoring failed: {e}')
-            await cancel_remaining_monitors()
-            await self._cleanup_job_group_clusters(cluster_names)
-            raise
+            monitor_failure = e
+
+        if monitor_failure is not None:
+            try:
+                await self._finish_failure_cleanup(
+                    cancel_remaining_monitors(),
+                    self._cleanup_job_group_clusters(cluster_names))
+            except asyncio.CancelledError:  # noqa: ASYNC103
+                pass
+            raise monitor_failure.with_traceback(monitor_failure.__traceback__)
 
         # Check results (include terminal tasks)
         all_succeeded = True
@@ -2012,6 +2072,26 @@ class JobController:
         await asyncio.gather(*(cleanup_cluster(cluster_name)
                                for cluster_name in cluster_names
                                if cluster_name is not None))
+
+    async def _finish_failure_cleanup(
+            self, *cleanup_coros: typing.Coroutine[typing.Any, typing.Any,
+                                                   None]) -> None:
+        """Finish failure cleanup before surfacing the original error."""
+        cancelled = False
+        for cleanup_coro in cleanup_coros:
+            cleanup_task: asyncio.Task[None] = asyncio.create_task(cleanup_coro)
+            try:
+                await asyncio.shield(cleanup_task)
+                continue
+            except asyncio.CancelledError:  # noqa: ASYNC103
+                cancelled = True
+            while not cleanup_task.done():
+                try:
+                    await cleanup_task
+                except asyncio.CancelledError:  # noqa: ASYNC103
+                    cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def run(self):
         """Run controller logic and handle exceptions."""
@@ -2421,8 +2501,31 @@ class ControllerManager:
                            log_file: str,
                            pool: str | None = None):
         """Run one job while owning its controller-manager bookkeeping."""
+        job_loop_task = asyncio.create_task(
+            self._run_job_loop(job_id, log_file, pool))
+        owner_cancelled = False
+        cancellation_delivered = False
         try:
-            await self._run_job_loop(job_id, log_file, pool)
+            while True:
+                try:
+                    await asyncio.shield(job_loop_task)
+                    break
+                except asyncio.CancelledError:  # noqa: ASYNC103
+                    owner_cancelled = True
+                    if job_loop_task.done():
+                        break  # noqa: ASYNC104
+                    if not cancellation_delivered:
+                        # The first request starts inner cancellation
+                        # finalization. Later requests must not interrupt it.
+                        cancellation_delivered = True
+                        job_loop_task.cancel()
+
+            # Preserve an inner failure over owner cancellation. If the inner
+            # task suppressed cancellation, the owner still reports its
+            # cancellation after finalization completes.
+            job_loop_task.result()
+            if owner_cancelled:
+                raise asyncio.CancelledError()
         finally:
             # Own launch admission at the outermost scope. Initialization can
             # fail before _run_job_loop reaches its durable-cleanup try/finally;
@@ -2731,17 +2834,37 @@ class ControllerManager:
             job_id for job_id in cancel_job_ids if job_id not in owned_job_ids
         ]
 
-        for job_id, task in owned_tasks:
-            logger.info(f'Cancelling job {job_id}')
-            await self._consume_and_cancel_task(job_id, task)
+        await asyncio.gather(*(self._deliver_owned_cancel(job_id, task)
+                               for job_id, task in owned_tasks))
 
         if not orphan_job_ids:
             return
         orphan_statuses = await managed_job_state.get_statuses_async(
             orphan_job_ids)
-        for job_id in orphan_job_ids:
-            await self._reap_orphan_cancel_signal(job_id,
-                                                  orphan_statuses[job_id])
+        reap_job_ids = [
+            job_id for job_id in orphan_job_ids
+            if orphan_statuses[job_id] is None or
+            orphan_statuses[job_id].is_terminal()
+        ]
+        reap_job_ids_iter = iter(reap_job_ids)
+
+        async def reap_signals() -> None:
+            for job_id in reap_job_ids_iter:
+                await self._reap_orphan_cancel_signal(job_id)
+
+        worker_count = min(len(reap_job_ids),
+                           controller_utils.LAUNCHES_PER_WORKER)
+        await asyncio.gather(*(reap_signals() for _ in range(worker_count)))
+
+    async def _deliver_owned_cancel(self, job_id: int,
+                                    task: asyncio.Task) -> None:
+        """Deliver one owned cancellation without aborting sibling work."""
+        logger.info(f'Cancelling job {job_id}')
+        try:
+            await self._consume_and_cancel_task(job_id, task)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'Failed to cancel job {job_id}: '
+                         f'{common_utils.format_exception(e)}')
 
     @asyncio_utils.shield
     async def _consume_and_cancel_task(self, job_id: int,
@@ -2798,25 +2921,24 @@ class ControllerManager:
         """Consume a job's cancel signal file, tolerating a lost race."""
         await ControllerManager._consume_signal_file(job_id)
 
-    async def _reap_orphan_cancel_signal(
-            self, job_id: int,
-            status: managed_job_state.ManagedJobStatus | None) -> None:
-        """Remove a cancel signal that no consumer will ever pick up.
+    @asyncio_utils.shield
+    async def _reap_orphan_cancel_signal(self, job_id: int) -> None:
+        """Remove one eligible orphan signal and its local bookkeeping.
 
         A signal file is normally consumed either by the owning job task
         in this process, or at claim time while the job is still PENDING.
         If the job reaches a terminal state in between (e.g. it finished
         right as the cancellation landed), neither consumer ever runs
         again for it, and the file would be re-listed by every scan of
-        every controller process forever. Only reap when the DB says the
-        job is terminal (or gone): a non-terminal job is either owned by
-        another controller process or will be handled at claim time.
+        every controller process forever. The caller only schedules jobs
+        whose batched status snapshot is terminal or absent.
+
+        Shield removal together with cancel-info cleanup so scan cancellation
+        cannot consume the durable signal but leave stale local bookkeeping.
         """
-        if status is not None and not status.is_terminal():
-            return
         try:
             await self._remove_signal_file(job_id)
-        except OSError as e:
+        except Exception as e:  # pylint: disable=broad-except
             logger.debug(f'Failed to reap cancel signal for job {job_id}: '
                          f'{common_utils.format_exception(e)}')
             return
@@ -2942,6 +3064,8 @@ async def _finish_superseded_cleanup(
 
 
 async def main(controller_uuid: str):
+    db_utils.set_postgres_connection_metrics_process_role(
+        'managed-job-controller')
     logger.info(f'Starting controller {controller_uuid}')
 
     context_utils.hijack_sys_attrs()
@@ -2969,12 +3093,18 @@ async def main(controller_uuid: str):
     # Will loop forever, do it in the background
     cancel_job_task = asyncio.create_task(controller.cancel_job())
     monitor_loop_task = asyncio.create_task(controller.monitor_loop())
+    controller_tasks = [cancel_job_task, monitor_loop_task]
+    outer_owner = managed_job_state.get_current_controller_owner()
+    if outer_owner is not None:
+        controller_tasks.append(
+            asyncio.create_task(
+                _watch_outer_controller_generation(outer_owner)))
     # Run the garbage collector in a dedicated daemon thread to avoid affecting
     # the main event loop.
     gc_thread = threading.Thread(target=log_gc.elect_for_log_gc, daemon=True)
     gc_thread.start()
     try:
-        await asyncio.gather(cancel_job_task, monitor_loop_task)
+        await asyncio.gather(*controller_tasks)
     except Exception as e:  # pylint: disable=broad-except
         logger.error(f'Controller server crashed: {e}')
         sys.exit(1)

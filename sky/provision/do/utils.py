@@ -4,7 +4,6 @@ Example usage of `pydo` client library was mostly taken from here:
 https://github.com/digitalocean/pydo/blob/main/examples/poc_droplets_volumes_sshkeys.py
 """
 
-import copy
 import os
 from typing import Any
 import urllib
@@ -15,6 +14,7 @@ from sky.adaptors import do
 from sky.provision import common
 from sky.provision import constants as provision_constants
 from sky.provision.do import constants
+from sky.provision.do import incarnation_tags
 from sky.utils import annotations
 from sky.utils import common_utils
 from sky.utils import yaml_utils
@@ -170,15 +170,11 @@ def create_instance(region: str, cluster_name_on_cloud: str, instance_type: str,
     Returns:
         Dict[str, Any]: instance metadata
     """
-    # sort tags by key to support deterministic unit test stubbing
-    tags = dict(sorted(copy.deepcopy(config.tags).items()))
-    tags = {
-        'Name': cluster_name_on_cloud,
-        provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name_on_cloud,
-        provision_constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name_on_cloud,
-        **tags
-    }
-    tags = [f'{key}:{value}' for key, value in tags.items()]
+    tags = incarnation_tags.project_instance_tags(
+        cluster_name_on_cloud,
+        config.tags,
+        getattr(config, 'cluster_incarnation', None),
+    )
     default_image = constants.GPU_IMAGES.get(
         config.node_config['InstanceType'],
         'gpu-h100x1-base',

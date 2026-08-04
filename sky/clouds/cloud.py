@@ -27,6 +27,7 @@ from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
+    from sky.placement import offer as placement_offer
     from sky.utils import status_lib
     from sky.utils import volume as volume_lib
 
@@ -163,6 +164,10 @@ class Cloud:
     PROVISIONER_VERSION = ProvisionerVersion.RAY_AUTOSCALER
     STATUS_VERSION = StatusVersion.CLOUD_CLI
     OPEN_PORTS_VERSION = OpenPortsVersion.UPDATABLE
+
+    def get_offer_source(self) -> 'placement_offer.OfferSourceV1 | None':
+        """Return this provider's optional V1 placement offer source."""
+        return None
 
     @classmethod
     def max_cluster_name_length(cls) -> int | None:

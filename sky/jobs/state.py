@@ -17,6 +17,7 @@ from sqlalchemy.ext import asyncio as sql_async
 from sky import exceptions
 from sky import resources as resources_lib
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.jobs import batch_state
 from sky.jobs import state_events
 from sky.jobs import state_queries
@@ -26,8 +27,10 @@ from sky.jobs.state_schema import api_access_token_table
 from sky.jobs.state_schema import ha_recovery_script_table
 from sky.jobs.state_schema import job_info_table
 from sky.jobs.state_schema import spot_table
+from sky.jobs.status_types import ControllerLogFollowState
 from sky.jobs.status_types import ControllerPidRecord
 from sky.jobs.status_types import JobCancellationState
+from sky.jobs.status_types import JobLogStreamSnapshot
 from sky.jobs.status_types import ManagedJobScheduleState
 from sky.jobs.status_types import ManagedJobStatus
 from sky.skylet import constants
@@ -43,11 +46,76 @@ CallbackType = SyncCallbackType | AsyncCallbackType
 
 logger = sky_logging.init_logger(__name__)
 
+# Importing the PostgreSQL request backend eagerly re-enters SkyServe payload
+# registration while ``sky.jobs.state`` is still initializing. Defer it until
+# a split-role controller actually evaluates an ownership fence.
+request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+
 _DB_RETRY_TIMES = 30
 
 # Bound parameters per token upsert while keeping all chunks in one transaction.
 _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE = 1000
 _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
+
+
+class ControllerLeadershipLostError(RuntimeError):
+    """Raised when a split-role managed-job write has lost its outer fence."""
+
+
+def get_current_controller_owner() -> tuple[str, int] | None:
+    """Return the active outer controller instance and generation, if any."""
+    return request_postgres.controller_owner_from_environment()
+
+
+def controller_owner_is_current(owner: tuple[str, int]) -> bool:
+    """Return whether PostgreSQL still proves this exact outer generation."""
+    return request_postgres.controller_leadership_is_current(*owner)
+
+
+def _controller_owner_values(
+    owner: tuple[str, int] | None,) -> dict[sqlalchemy.Column, Any]:
+    if owner is None:
+        return {
+            job_info_table.c.controller_instance_id: None,
+            job_info_table.c.controller_generation: None,
+        }
+    instance_id, generation = owner
+    return {
+        job_info_table.c.controller_instance_id: instance_id,
+        job_info_table.c.controller_generation: generation,
+    }
+
+
+def _controller_owner_matches_columns(
+    owner: tuple[str, int],) -> sqlalchemy.ColumnElement[bool]:
+    instance_id, generation = owner
+    return sqlalchemy.and_(
+        job_info_table.c.controller_instance_id == instance_id,
+        job_info_table.c.controller_generation == generation,
+    )
+
+
+async def _lock_current_controller_owner_async(session: sql_async.AsyncSession,
+                                               owner: tuple[str, int]) -> None:
+    result = await session.execute(
+        request_postgres.current_controller_leadership_statement(*owner,
+                                                                 lock=True))
+    if result.scalar_one_or_none() is None:
+        raise ControllerLeadershipLostError(
+            'Managed-job controller leadership changed before the durable '
+            'scheduler write.')
+
+
+def _lock_current_controller_owner(session: orm.Session,
+                                   owner: tuple[str, int]) -> None:
+    result = session.execute(
+        request_postgres.current_controller_leadership_statement(*owner,
+                                                                 lock=True))
+    if result.scalar_one_or_none() is None:
+        raise ControllerLeadershipLostError(
+            'Managed-job controller leadership changed before the durable '
+            'recovery write.')
+
 
 # Keep the historical schema facade for migrations and external callers.
 Base = state_schema.Base
@@ -652,8 +720,38 @@ def get_all_task_ids_names_statuses_logs(
                 for row in id_names]
 
 
+@db_retries.retry
+def get_task_id_name_status_log(
+    job_id: int, task_id: int
+) -> tuple[int, str, ManagedJobStatus, str | None, float | None] | None:
+    """Return one task row used by the terminal log-follow path."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                spot_table.c.task_id,
+                spot_table.c.task_name,
+                spot_table.c.status,
+                spot_table.c.local_log_file,
+                spot_table.c.logs_cleaned_at,
+            ).where(
+                sqlalchemy.and_(
+                    spot_table.c.spot_job_id == job_id,
+                    spot_table.c.task_id == task_id,
+                ))).fetchone()
+    if row is None:
+        return None
+    return row[0], row[1], ManagedJobStatus(row[2]), row[3], row[4]
+
+
 def get_num_tasks(job_id: int) -> int:
-    return len(_get_all_task_ids_statuses(job_id))
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        task_count = session.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count(),  # pylint: disable=not-callable
+            ).where(spot_table.c.spot_job_id == job_id)).scalar_one()
+        return int(task_count)
 
 
 def get_latest_task_id_from_statuses(
@@ -725,41 +823,6 @@ def get_job_controller_processes(
 
 def get_job_controller_process(job_id: int) -> ControllerPidRecord | None:
     return get_job_controller_processes([job_id]).get(job_id)
-
-
-def _is_legacy_controller_record(pid: int | None,
-                                 started_at: float | None) -> bool:
-    if pid is None:
-        # Job is from before #4485, so controller_pid is not set.
-        return True
-    if started_at is not None:
-        # controller_pid_started_at is only set after #7847.
-        return False
-    # Between #7051 and #7847, a negative pid identified the consolidated
-    # controller. Positive pids without a start time belong to legacy
-    # single-job controllers.
-    return pid >= 0
-
-
-def is_legacy_controller_process(job_id: int) -> bool:
-    """Check if the controller process is a legacy single-job controller process
-
-    After #7051, the controller process pid is negative to indicate a new
-    multi-job controller process.
-    After #7847, the controller process pid is changed back to positive, but
-    controller_pid_started_at will also be set.
-    """
-    # TODO(cooperc): Remove this function for 0.13.0
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(
-            sqlalchemy.select(
-                job_info_table.c.controller_pid,
-                job_info_table.c.controller_pid_started_at).where(
-                    job_info_table.c.spot_job_id == job_id)).fetchone()
-        if row is None:
-            raise ValueError(f'Job {job_id} not found')
-        return _is_legacy_controller_record(row[0], row[1])
 
 
 def get_status(job_id: int) -> ManagedJobStatus | None:
@@ -888,10 +951,9 @@ def _get_jobs_to_check_status_condition(job_ids: list[int] | None = None):
     #    inconsistent state).
     #
     # Legacy single-job controllers have NULL schedule_state. They are not
-    # manageable through the consolidated refresh sweep, which only knows how
-    # to reason about modern schedule-state rows. Fence them out here so
-    # cancellation and refresh can fall through to the dedicated legacy signal
-    # path instead of crashing while decoding a NULL enum.
+    # manageable through the consolidated refresh sweep or cancellation path,
+    # which only know how to reason about modern schedule-state rows. Fence
+    # them out here instead of crashing while decoding a NULL enum.
     condition1 = sqlalchemy.and_(
         job_info_table.c.schedule_state.is_not(None),
         job_info_table.c.schedule_state != ManagedJobScheduleState.DONE.value)
@@ -907,16 +969,21 @@ def _get_jobs_to_check_status_condition(job_ids: list[int] | None = None):
 
 
 def _status_check_select(from_clause) -> 'sqlalchemy.Select':
-    """The slim 9-column projection shared by the status-check snapshots."""
+    """The slim projection shared by the status-check snapshots."""
     return sqlalchemy.select(
         spot_table.c.spot_job_id,
         spot_table.c.task_id,
         spot_table.c.status,
         spot_table.c.task_name,
+        spot_table.c.submitted_at,
+        spot_table.c.start_at,
+        spot_table.c.last_recovered_at,
         job_info_table.c.name.label('job_info_name'),
         job_info_table.c.schedule_state,
         job_info_table.c.controller_pid,
         job_info_table.c.controller_pid_started_at,
+        job_info_table.c.controller_instance_id,
+        job_info_table.c.controller_generation,
         job_info_table.c.pool,
     ).select_from(from_clause)
 
@@ -931,13 +998,20 @@ def _collect_status_check_snapshot(
     job_ids: list[int] | None, fetch_chunk: Callable[[list[int] | None],
                                                      list[Any]]
 ) -> dict[int, dict[str, Any]]:
-    """Chunk ``job_ids`` and merge the fetched rows into one snapshot."""
+    """Chunk ``job_ids`` and merge the fetched rows into one snapshot.
+
+    Explicit job-id callers may repeat the same job across retry, cancel, or
+    refresh selection paths. Deduping before chunking keeps the snapshot
+    stable and avoids re-fetching/re-merging the same task rows when a repeated
+    id would otherwise spill into a later chunk.
+    """
     result: dict[int, dict[str, Any]] = {}
     if job_ids is None:
         _merge_jobs_status_check_rows(result, fetch_chunk(None))
         return result
-    for start in range(0, len(job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
-        chunk = job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+        chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
         _merge_jobs_status_check_rows(result, fetch_chunk(chunk))
     return result
 
@@ -958,6 +1032,8 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
                 'controller_pid': mapping['controller_pid'],
                 'controller_pid_started_at':
                     mapping['controller_pid_started_at'],
+                'controller_instance_id': mapping['controller_instance_id'],
+                'controller_generation': mapping['controller_generation'],
                 'pool': mapping['pool'],
                 'tasks': [],
             }
@@ -970,6 +1046,9 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
             'status': ManagedJobStatus(mapping['status']),
             'job_name': job_name,
             'task_name': mapping['task_name'],
+            'submitted_at': mapping['submitted_at'],
+            'start_at': mapping['start_at'],
+            'last_recovered_at': mapping['last_recovered_at'],
         })
 
 
@@ -1022,13 +1101,16 @@ def get_jobs_status_check_info(job_ids: list[int]) -> dict[int, dict[str, Any]]:
 
     Returns a mapping ``job_id -> {schedule_state, controller_pid,
     controller_pid_started_at, pool, tasks: [{task_id, status, job_name,
-    task_name}]}``
+    task_name, submitted_at, start_at, last_recovered_at}]}``
     with ``tasks`` ordered by ``task_id``. Job ids with no task rows are absent
     from the result.
 
     ``job_name`` mirrors ``get_managed_job_tasks`` (public display name with a
     fallback to ``task_name``); ``task_name`` preserves the controller launch
-    identity for teardown/recovery logic.
+    identity for teardown/recovery logic. The launch-attempt timestamps keep
+    cleanup on the slim snapshot path while distinguishing untouched backlog
+    tasks from tasks that already started launching and later fell back to
+    ``PENDING`` during recovery.
     """
     if not job_ids:
         return {}
@@ -1066,6 +1148,8 @@ def get_job_status_check_state(job_id: int) -> dict[str, Any] | None:
                 job_info_table.c.schedule_state,
                 job_info_table.c.controller_pid,
                 job_info_table.c.controller_pid_started_at,
+                job_info_table.c.controller_instance_id,
+                job_info_table.c.controller_generation,
                 sqlalchemy.func.count(  # pylint: disable=not-callable
                     spot_table.c.task_id).label('task_count'),
                 sqlalchemy.func.sum(
@@ -1074,22 +1158,167 @@ def get_job_status_check_state(job_id: int) -> dict[str, Any] | None:
                         else_=0)).label('nonterminal_task_count'),
             ).select_from(
                 job_info_table.outerjoin(
-                    spot_table,
-                    spot_table.c.spot_job_id == job_info_table.c.spot_job_id)).
-            where(job_info_table.c.spot_job_id == job_id).group_by(
-                job_info_table.c.schedule_state,
-                job_info_table.c.controller_pid,
-                job_info_table.c.controller_pid_started_at)).fetchone()
+                    spot_table, spot_table.c.spot_job_id ==
+                    job_info_table.c.spot_job_id)).where(
+                        job_info_table.c.spot_job_id == job_id).group_by(
+                            job_info_table.c.schedule_state,
+                            job_info_table.c.controller_pid,
+                            job_info_table.c.controller_pid_started_at,
+                            job_info_table.c.controller_instance_id,
+                            job_info_table.c.controller_generation)).fetchone()
     if row is None or row[0] is None:
         return None
-    task_count = int(row[3] or 0)
-    nonterminal_task_count = int(row[4] or 0)
+    task_count = int(row[5] or 0)
+    nonterminal_task_count = int(row[6] or 0)
     return {
         'schedule_state': ManagedJobScheduleState(row[0]),
         'controller_pid': row[1],
         'controller_pid_started_at': row[2],
+        'controller_instance_id': row[3],
+        'controller_generation': row[4],
         'all_tasks_terminal': task_count > 0 and nonterminal_task_count == 0,
     }
+
+
+def _controller_snapshot_conditions(
+    job_id: int,
+    schedule_state: ManagedJobScheduleState,
+    controller_pid: int | None,
+    controller_pid_started_at: float | None,
+    controller_instance_id: str | None,
+    controller_generation: int | None,
+) -> list[sqlalchemy.ColumnElement[bool]]:
+    """Build the exact job-info snapshot used by destructive refresh writes."""
+    return [
+        job_info_table.c.spot_job_id == job_id,
+        job_info_table.c.schedule_state == schedule_state.value,
+        job_info_table.c.controller_pid == controller_pid,
+        job_info_table.c.controller_pid_started_at == controller_pid_started_at,
+        job_info_table.c.controller_instance_id == controller_instance_id,
+        job_info_table.c.controller_generation == controller_generation,
+    ]
+
+
+def set_failed_controller_if_current_snapshot(
+    job_id: int,
+    *,
+    schedule_state: ManagedJobScheduleState,
+    controller_pid: int | None,
+    controller_pid_started_at: float | None,
+    controller_instance_id: str | None,
+    controller_generation: int | None,
+    failure_reason: str,
+) -> bool:
+    """Terminalize an exact dead-controller snapshot before provider cleanup.
+
+    The job's schedule state intentionally remains non-DONE. If this process
+    exits during cleanup, a replacement leader sees terminal tasks, retries the
+    idempotent teardown, and completes the schedule state instead of recovering
+    the workload.
+    """
+    owner = get_current_controller_owner()
+    recorded_owner = (controller_instance_id, controller_generation)
+    if owner is not None and recorded_owner != owner:
+        return False
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if owner is not None:
+            _lock_current_controller_owner(session, owner)
+        conditions = _controller_snapshot_conditions(job_id, schedule_state,
+                                                     controller_pid,
+                                                     controller_pid_started_at,
+                                                     controller_instance_id,
+                                                     controller_generation)
+        job_row = session.execute(
+            sqlalchemy.select(job_info_table.c.spot_job_id).where(
+                sqlalchemy.and_(*conditions)).with_for_update()).first()
+        if job_row is None:
+            session.rollback()
+            return False
+
+        task_rows = session.execute(
+            sqlalchemy.select(spot_table.c.status, spot_table.c.failure_reason).
+            where(spot_table.c.spot_job_id == job_id).with_for_update()).all()
+        if not task_rows or all(
+                ManagedJobStatus(row.status).is_terminal()
+                for row in task_rows):
+            session.rollback()
+            return False
+
+        existing_reason = next(
+            (row.failure_reason for row in task_rows if row.failure_reason),
+            None)
+        persisted_reason = failure_reason
+        if existing_reason:
+            persisted_reason += f'. Previously: {existing_reason}'
+        end_time = time.time()
+        result = session.execute(
+            sqlalchemy.update(spot_table).where(
+                spot_table.c.spot_job_id == job_id).values({
+                    spot_table.c.status:
+                        ManagedJobStatus.FAILED_CONTROLLER.value,
+                    spot_table.c.failure_reason: persisted_reason,
+                    spot_table.c.last_recovered_at: sqlalchemy.case(
+                        (spot_table.c.status
+                         == ManagedJobStatus.RECOVERING.value, end_time),
+                        else_=spot_table.c.last_recovered_at),
+                    spot_table.c.end_at: sqlalchemy.func.coalesce(
+                        spot_table.c.end_at, end_time),
+                }))
+        session.commit()
+        return result.rowcount > 0
+
+
+def finish_controller_cleanup_if_current_snapshot(
+    job_id: int,
+    *,
+    schedule_state: ManagedJobScheduleState,
+    controller_pid: int | None,
+    controller_pid_started_at: float | None,
+    controller_instance_id: str | None,
+    controller_generation: int | None,
+) -> bool:
+    """Mark an exactly rechecked terminal job DONE after provider cleanup.
+
+    A current leader may finish terminal cleanup left by a stale generation.
+    It proves its own outer fence, compare-and-swaps the recorded snapshot, and
+    stamps the completing generation on the durable row.
+    """
+    owner = get_current_controller_owner()
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        if owner is not None:
+            _lock_current_controller_owner(session, owner)
+        conditions = _controller_snapshot_conditions(job_id, schedule_state,
+                                                     controller_pid,
+                                                     controller_pid_started_at,
+                                                     controller_instance_id,
+                                                     controller_generation)
+        job_row = session.execute(
+            sqlalchemy.select(job_info_table.c.spot_job_id).where(
+                sqlalchemy.and_(*conditions)).with_for_update()).first()
+        if job_row is None:
+            session.rollback()
+            return False
+        task_statuses = session.execute(
+            sqlalchemy.select(spot_table.c.status).where(
+                spot_table.c.spot_job_id ==
+                job_id).with_for_update()).scalars().all()
+        if (not task_statuses or any(not ManagedJobStatus(status).is_terminal()
+                                     for status in task_statuses)):
+            session.rollback()
+            return False
+
+        values: dict[sqlalchemy.Column, Any] = {
+            job_info_table.c.schedule_state: ManagedJobScheduleState.DONE.value,
+        }
+        values.update(_controller_owner_values(owner))
+        result = session.execute(
+            sqlalchemy.update(job_info_table).where(
+                sqlalchemy.and_(*conditions)).values(values))
+        session.commit()
+        return result.rowcount == 1
 
 
 def get_job_cancellation_states(
@@ -1097,23 +1326,27 @@ def get_job_cancellation_states(
     """Return slim, batched snapshots for managed-job cancellation.
 
     Cancellation needs the currently executable task's status together with
-    workspace authorization and the controller generation used to choose the
-    signal path. Reading those fields together avoids three point queries per
-    job and prevents decisions assembled from different lifecycle snapshots.
-    Only the latest task row per job matters for cancellation, so the query
-    keeps the row volume bounded by job count instead of total task count.
+    workspace authorization. Reading those fields together avoids separate
+    point queries and prevents decisions assembled from different lifecycle
+    snapshots. Only the latest task row per job matters for cancellation, so
+    the query keeps the row volume bounded by job count instead of total task
+    count.
+
+    Only jobs with durable modern lifecycle fields (workspace and
+    schedule_state) participate in this snapshot. Legacy single-job
+    controllers used a separate signal transport; without backward-compatibility
+    support, modern cancellation excludes those rows instead of carrying a
+    second delivery path.
     """
     if not job_ids:
         return {}
 
     snapshots: dict[int, JobCancellationState] = {}
-    for job_id, _, status, workspace, pid, started_at in (
-            _fetch_job_cancellation_state_rows(job_ids)):
+    for job_id, _, status, workspace in _fetch_job_cancellation_state_rows(
+            job_ids):
         snapshots[job_id] = JobCancellationState(
             status=ManagedJobStatus(status),
-            workspace=(constants.SKYPILOT_DEFAULT_WORKSPACE
-                       if workspace is None else workspace),
-            is_legacy_controller=_is_legacy_controller_record(pid, started_at),
+            workspace=workspace,
         )
     return snapshots
 
@@ -1172,7 +1405,9 @@ def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
 
     Cancellation follows ``get_latest_task_id_from_statuses`` semantics:
     pick the first non-terminal task if one exists, otherwise the last
-    terminal task.
+    terminal task. Only jobs with durable modern ``job_info`` fields are
+    cancellable through the consolidated signal path, so legacy rows are
+    excluded here.
     """
     unique_job_ids = list(dict.fromkeys(job_ids))
     if not unique_job_ids:
@@ -1192,18 +1427,18 @@ def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
             latest_task_ids.c.task_id,
             spot_table.c.status,
             job_info_table.c.workspace,
-            job_info_table.c.controller_pid,
-            job_info_table.c.controller_pid_started_at,
         ).select_from(
             latest_task_ids.join(
                 spot_table,
                 sqlalchemy.and_(
                     spot_table.c.spot_job_id == latest_task_ids.c.spot_job_id,
-                    spot_table.c.task_id ==
-                    latest_task_ids.c.task_id)).outerjoin(
+                    spot_table.c.task_id == latest_task_ids.c.task_id)).join(
                         job_info_table, latest_task_ids.c.spot_job_id ==
-                        job_info_table.c.spot_job_id)).order_by(
-                            latest_task_ids.c.spot_job_id.asc())
+                        job_info_table.c.spot_job_id)).where(
+                            job_info_table.c.workspace.is_not(None),
+                            job_info_table.c.schedule_state.is_not(
+                                None)).order_by(
+                                    latest_task_ids.c.spot_job_id.asc())
         with orm.Session(engine) as session:
             rows.extend(session.execute(query).fetchall())
     return rows
@@ -1212,29 +1447,18 @@ def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
 def has_jobs_requiring_recovery_grace_wait() -> bool:
     """Whether HA leader handoff should pause before managed-job recovery.
 
-    The post-acquire grace wait only matters when a prior leader may still have
-    detached controllers alive long enough to race recovery. That requires a
-    job which is already claimed by a controller (``controller_pid`` set) or is
-    otherwise beyond the pure backlog states (``INACTIVE``/``WAITING``).
-
-    Empty, terminal, or pending-only backlogs can recover immediately without
-    paying the fixed sleep.
+    Any nonterminal scheduler row can race a detached controller from the prior
+    image during a mixed-version handoff. In particular, an old scheduler can
+    claim a WAITING row after this query if that image predates durable
+    generation ownership. Keep the bounded drain for every nonterminal job
+    until the compatibility image is outside the rollback window.
     """
     engine = _db_manager.get_engine()
-    pending_only_states = [
-        ManagedJobScheduleState.INACTIVE.value,
-        ManagedJobScheduleState.WAITING.value,
-    ]
     query = sqlalchemy.select(sqlalchemy.literal(True)).where(
         sqlalchemy.and_(
             job_info_table.c.schedule_state.is_not(None),
             job_info_table.c.schedule_state
             != ManagedJobScheduleState.DONE.value,
-            sqlalchemy.or_(
-                job_info_table.c.controller_pid.is_not(None),
-                sqlalchemy.not_(
-                    job_info_table.c.schedule_state.in_(pending_only_states)),
-            ),
         )).limit(1)
     with orm.Session(engine) as session:
         return session.execute(query).first() is not None
@@ -1266,7 +1490,7 @@ def get_active_file_mounts_blob_ids() -> set[str]:
                     spot_table.c.status.in_(terminal_status_values)),
             )).distinct())
     query = sqlalchemy.select(
-        job_info_table.c.file_mounts_blob_id.distinct()).where(
+        job_info_table.c.file_mounts_blob_id).distinct().where(
             sqlalchemy.and_(
                 job_info_table.c.file_mounts_blob_id.is_not(None),
                 job_info_table.c.spot_job_id.in_(non_terminal_job_ids_subquery),
@@ -1353,6 +1577,115 @@ def get_log_stream_context(
     return context[0], context[1], context[2], context[3]
 
 
+@db_retries.retry
+def get_task_log_stream_snapshot(job_id: int,
+                                 task_id: int) -> JobLogStreamSnapshot:
+    """Return one task-specific status and routing snapshot for log following.
+
+    When callers follow a specific task in a JobGroup, the task status and its
+    routing context must come from the same database snapshot. Otherwise a
+    later task can advance the job-level latest-task status between the two
+    reads and make the follower wait on the wrong lifecycle.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                spot_table.c.task_id,
+                spot_table.c.status,
+                job_info_table.c.pool,
+                job_info_table.c.current_cluster_name,
+                job_info_table.c.job_id_on_pool_cluster,
+                spot_table.c.task_name,
+            ).select_from(
+                spot_table.outerjoin(
+                    job_info_table, job_info_table.c.spot_job_id ==
+                    spot_table.c.spot_job_id)).where(
+                        sqlalchemy.and_(
+                            spot_table.c.spot_job_id == job_id,
+                            spot_table.c.task_id == task_id,
+                        ))).fetchone()
+    if row is None:
+        return JobLogStreamSnapshot(None, None, None, None, None, None)
+    return JobLogStreamSnapshot(
+        row.task_id,
+        ManagedJobStatus(row.status),
+        row.pool,
+        row.current_cluster_name,
+        row.job_id_on_pool_cluster,
+        row.task_name,
+    )
+
+
+@db_retries.retry
+def get_latest_log_stream_snapshot(job_id: int) -> JobLogStreamSnapshot:
+    """Return one latest-task status and routing snapshot for log following."""
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    latest_task = _latest_task_status_query([job_id],
+                                            terminal_status_values).subquery()
+    query = sqlalchemy.select(
+        latest_task.c.task_id,
+        latest_task.c.status,
+        job_info_table.c.pool,
+        job_info_table.c.current_cluster_name,
+        job_info_table.c.job_id_on_pool_cluster,
+        spot_table.c.task_name,
+    ).select_from(
+        latest_task.join(
+            spot_table,
+            sqlalchemy.and_(
+                spot_table.c.spot_job_id == latest_task.c.spot_job_id,
+                spot_table.c.task_id == latest_task.c.task_id,
+            )).outerjoin(
+                job_info_table,
+                job_info_table.c.spot_job_id == latest_task.c.spot_job_id))
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(query).fetchone()
+    if row is None:
+        return JobLogStreamSnapshot(None, None, None, None, None, None)
+    return JobLogStreamSnapshot(
+        row.task_id,
+        ManagedJobStatus(row.status),
+        row.pool,
+        row.current_cluster_name,
+        row.job_id_on_pool_cluster,
+        row.task_name,
+    )
+
+
+@db_retries.retry
+def get_controller_log_follow_state(job_id: int) -> ControllerLogFollowState:
+    """Return the lifecycle snapshot that drives controller-log following."""
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    latest_task = _latest_task_status_query([job_id],
+                                            terminal_status_values).subquery()
+    query = sqlalchemy.select(
+        latest_task.c.status,
+        job_info_table.c.schedule_state,
+    ).select_from(
+        latest_task.outerjoin(
+            job_info_table,
+            job_info_table.c.spot_job_id == latest_task.c.spot_job_id))
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(query).fetchone()
+    if row is None:
+        return ControllerLogFollowState(None, None)
+    schedule_state = (None if row.schedule_state is None else
+                      ManagedJobScheduleState(row.schedule_state))
+    return ControllerLogFollowState(
+        ManagedJobStatus(row.status),
+        schedule_state,
+    )
+
+
 def get_latest_job_id() -> int | None:
     """Get the latest job id."""
     engine = _db_manager.get_engine()
@@ -1383,8 +1716,15 @@ def scheduler_set_waiting(job_ids: list[int],
                           config_file_content: str | None,
                           priority: int,
                           priority_class: str | None = None) -> None:
+    unique_job_ids = list(dict.fromkeys(job_ids))
+    if not unique_job_ids:
+        return
+
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        owner = get_current_controller_owner()
+        if owner is not None:
+            _lock_current_controller_owner(session, owner)
         updates = {
             job_info_table.c.schedule_state:
                 ManagedJobScheduleState.WAITING.value,
@@ -1398,11 +1738,11 @@ def scheduler_set_waiting(job_ids: list[int],
         if priority_class is not None:
             updates[job_info_table.c.priority_class] = priority_class
         updated_count = session.query(job_info_table).filter(
-            sqlalchemy.and_(
-                job_info_table.c.spot_job_id.in_(job_ids),)).update(updates)
+            sqlalchemy.and_(job_info_table.c.spot_job_id.in_(unique_job_ids),
+                           )).update(updates)
         session.commit()
-        if updated_count != len(job_ids):
-            raise AssertionError((job_ids, updated_count))
+        if updated_count != len(unique_job_ids):
+            raise AssertionError((unique_job_ids, updated_count))
 
 
 @db_retries.retry
@@ -1471,6 +1811,22 @@ def get_pool_from_job_id(job_id: int) -> str | None:
             sqlalchemy.select(job_info_table.c.pool).where(
                 job_info_table.c.spot_job_id == job_id)).fetchone()
         return pool[0] if pool else None
+
+
+@db_retries.retry
+def get_pool_and_current_cluster_name(
+        job_id: int) -> tuple[str | None, str | None]:
+    """Read the pool binding and current pool worker from one job row."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        info = session.execute(
+            sqlalchemy.select(
+                job_info_table.c.pool,
+                job_info_table.c.current_cluster_name).where(
+                    job_info_table.c.spot_job_id == job_id)).fetchone()
+        if info is None:
+            return None, None
+        return info[0], info[1]
 
 
 @db_retries.retry_async
@@ -1672,29 +2028,44 @@ def get_releasable_api_access_token_id(job_id: int) -> str | None:
 
 @db_retries.retry_async
 async def scheduler_set_launching_async(job_id: int):
+    owner = get_current_controller_owner()
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
-        await session.execute(
+        if owner is not None:
+            await _lock_current_controller_owner_async(session, owner)
+        conditions = [job_info_table.c.spot_job_id == job_id]
+        if owner is not None:
+            conditions.append(_controller_owner_matches_columns(owner))
+        result = await session.execute(
             sqlalchemy.update(job_info_table).where(
-                sqlalchemy.and_(job_info_table.c.spot_job_id == job_id)).values(
-                    {
-                        job_info_table.c.schedule_state:
-                            ManagedJobScheduleState.LAUNCHING.value
-                    }))
+                sqlalchemy.and_(*conditions)).values({
+                    job_info_table.c.schedule_state:
+                        ManagedJobScheduleState.LAUNCHING.value
+                }))
         await session.commit()
+        if result.rowcount != 1:
+            raise ControllerLeadershipLostError(
+                f'Managed job {job_id} is no longer owned by this controller '
+                'generation.')
 
 
 async def scheduler_set_backoff_async(job_id: int) -> None:
     """Transition a launching job to resource backoff."""
 
     async def _op(session: sql_async.AsyncSession) -> int:
+        owner = get_current_controller_owner()
+        if owner is not None:
+            await _lock_current_controller_owner_async(session, owner)
+        conditions = [
+            job_info_table.c.spot_job_id == job_id,
+            job_info_table.c.schedule_state ==
+            ManagedJobScheduleState.LAUNCHING.value,
+        ]
+        if owner is not None:
+            conditions.append(_controller_owner_matches_columns(owner))
         result = await session.execute(
             sqlalchemy.update(job_info_table).where(
-                sqlalchemy.and_(
-                    job_info_table.c.spot_job_id == job_id,
-                    job_info_table.c.schedule_state ==
-                    ManagedJobScheduleState.LAUNCHING.value,
-                )).values({
+                sqlalchemy.and_(*conditions)).values({
                     job_info_table.c.schedule_state:
                         ManagedJobScheduleState.ALIVE_BACKOFF.value
                 }))
@@ -1709,13 +2080,19 @@ async def scheduler_set_alive_async(job_id: int) -> None:
     """Do not call without holding the scheduler lock."""
 
     async def _op(session: sql_async.AsyncSession) -> int:
+        owner = get_current_controller_owner()
+        if owner is not None:
+            await _lock_current_controller_owner_async(session, owner)
+        conditions = [
+            job_info_table.c.spot_job_id == job_id,
+            job_info_table.c.schedule_state ==
+            ManagedJobScheduleState.LAUNCHING.value,
+        ]
+        if owner is not None:
+            conditions.append(_controller_owner_matches_columns(owner))
         result = await session.execute(
             sqlalchemy.update(job_info_table).where(
-                sqlalchemy.and_(
-                    job_info_table.c.spot_job_id == job_id,
-                    job_info_table.c.schedule_state ==
-                    ManagedJobScheduleState.LAUNCHING.value,
-                )).values({
+                sqlalchemy.and_(*conditions)).values({
                     job_info_table.c.schedule_state:
                         ManagedJobScheduleState.ALIVE.value
                 }))
@@ -1729,12 +2106,18 @@ def scheduler_set_done(job_id: int, idempotent: bool = False) -> None:
     """Do not call without holding the scheduler lock."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        owner = get_current_controller_owner()
+        if owner is not None:
+            _lock_current_controller_owner(session, owner)
+        conditions = [
+            job_info_table.c.spot_job_id == job_id,
+            job_info_table.c.schedule_state
+            != ManagedJobScheduleState.DONE.value,
+        ]
+        if owner is not None:
+            conditions.append(_controller_owner_matches_columns(owner))
         updated_count = session.query(job_info_table).filter(
-            sqlalchemy.and_(
-                job_info_table.c.spot_job_id == job_id,
-                job_info_table.c.schedule_state
-                != ManagedJobScheduleState.DONE.value,
-            )).update({
+            sqlalchemy.and_(*conditions)).update({
                 job_info_table.c.schedule_state:
                     ManagedJobScheduleState.DONE.value
             })
@@ -1830,7 +2213,7 @@ def get_nonterminal_job_ids_by_pool(pool: str,
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         query = sqlalchemy.select(
-            spot_table.c.spot_job_id.distinct()).select_from(
+            spot_table.c.spot_job_id).distinct().select_from(
                 spot_table.outerjoin(
                     job_info_table,
                     spot_table.c.spot_job_id == job_info_table.c.spot_job_id))
@@ -2122,8 +2505,16 @@ async def get_waiting_job_async(pid: int,
     Backwards compatibility note: jobs submitted before #4485 will have no
     schedule_state and will be ignored by this SQL query.
     """
+    owner = get_current_controller_owner()
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
+        if owner is not None:
+            # Serialize this claim with outer-controller generation
+            # advancement. The leadership row and managed-job tables share the
+            # central PostgreSQL database even though they use separate
+            # SQLAlchemy engine namespaces.
+            await _lock_current_controller_owner_async(session, owner)
+
         # Subquery: pools that already have an active *batch* job.
         # Batch coordinator jobs (ds.map()) are serialized one-at-a-time
         # per pool, so we skip WAITING batch jobs whose pool already has
@@ -2177,17 +2568,19 @@ async def get_waiting_job_async(pid: int,
         pool = waiting_job_row[2]
 
         # Update the job state to LAUNCHING
+        update_values = {
+            job_info_table.c.schedule_state:
+                ManagedJobScheduleState.LAUNCHING.value,
+            job_info_table.c.controller_pid: pid,
+            job_info_table.c.controller_pid_started_at: pid_started_at,
+        }
+        update_values.update(_controller_owner_values(owner))
         update_result = await session.execute(
             sqlalchemy.update(job_info_table).where(
                 sqlalchemy.and_(
                     job_info_table.c.spot_job_id == job_id,
                     job_info_table.c.schedule_state == current_state.value,
-                )).values({
-                    job_info_table.c.schedule_state:
-                        ManagedJobScheduleState.LAUNCHING.value,
-                    job_info_table.c.controller_pid: pid,
-                    job_info_table.c.controller_pid_started_at: pid_started_at,
-                }))
+                )).values(update_values))
 
         if update_result.rowcount != 1:
             # Update failed, rollback and return None
@@ -2770,13 +3163,19 @@ async def scheduler_set_done_async(job_id: int,
     """Do not call without holding the scheduler lock."""
 
     async def _op(session: sql_async.AsyncSession) -> int:
+        owner = get_current_controller_owner()
+        if owner is not None:
+            await _lock_current_controller_owner_async(session, owner)
+        conditions = [
+            job_info_table.c.spot_job_id == job_id,
+            job_info_table.c.schedule_state
+            != ManagedJobScheduleState.DONE.value,
+        ]
+        if owner is not None:
+            conditions.append(_controller_owner_matches_columns(owner))
         result = await session.execute(
             sqlalchemy.update(job_info_table).where(
-                sqlalchemy.and_(
-                    job_info_table.c.spot_job_id == job_id,
-                    job_info_table.c.schedule_state
-                    != ManagedJobScheduleState.DONE.value,
-                )).values({
+                sqlalchemy.and_(*conditions)).values({
                     job_info_table.c.schedule_state:
                         ManagedJobScheduleState.DONE.value
                 }))
@@ -2827,6 +3226,13 @@ def set_job_info(job_id: int,
 def reset_jobs_for_recovery() -> None:
     """Remove controller PIDs for live jobs, allowing them to be recovered."""
     engine = _db_manager.get_engine()
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    has_nonterminal_task = sqlalchemy.exists(
+        sqlalchemy.select(spot_table.c.task_id).where(
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
+            spot_table.c.status.not_in(terminal_status_values)))
     with orm.Session(engine) as session:
         session.query(job_info_table).filter(
             # PID should be set.
@@ -2837,13 +3243,105 @@ def reset_jobs_for_recovery() -> None:
              != ManagedJobScheduleState.WAITING.value),
             (job_info_table.c.schedule_state
              != ManagedJobScheduleState.DONE.value),
+            has_nonterminal_task,
         ).update({
             job_info_table.c.controller_pid: None,
             job_info_table.c.controller_pid_started_at: None,
+            job_info_table.c.controller_instance_id: None,
+            job_info_table.c.controller_generation: None,
             job_info_table.c.schedule_state:
                 (ManagedJobScheduleState.WAITING.value)
         })
         session.commit()
+
+
+def reset_stale_jobs_for_current_controller() -> int:
+    """Reset jobs owned by another outer controller generation.
+
+    The leadership-row lock serializes this recovery write with generation
+    advancement. INACTIVE jobs are excluded because request submission may
+    still be populating their durable inputs; DONE jobs need no scheduler.
+    """
+    owner = get_current_controller_owner()
+    if owner is None:
+        return 0
+
+    engine = _db_manager.get_engine()
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    has_nonterminal_task = sqlalchemy.exists(
+        sqlalchemy.select(spot_table.c.task_id).where(
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
+            spot_table.c.status.not_in(terminal_status_values)))
+    with orm.Session(engine) as session:
+        _lock_current_controller_owner(session, owner)
+        stale_owner = sqlalchemy.or_(
+            job_info_table.c.controller_instance_id.is_(None),
+            job_info_table.c.controller_generation.is_(None),
+            sqlalchemy.not_(_controller_owner_matches_columns(owner)),
+        )
+        result = session.execute(
+            sqlalchemy.update(job_info_table).where(
+                sqlalchemy.and_(
+                    job_info_table.c.schedule_state.is_not(None),
+                    job_info_table.c.schedule_state.not_in([
+                        ManagedJobScheduleState.INACTIVE.value,
+                        ManagedJobScheduleState.DONE.value,
+                    ]),
+                    has_nonterminal_task,
+                    stale_owner,
+                )).values({
+                    job_info_table.c.controller_pid: None,
+                    job_info_table.c.controller_pid_started_at: None,
+                    job_info_table.c.controller_instance_id: None,
+                    job_info_table.c.controller_generation: None,
+                    job_info_table.c.schedule_state:
+                        ManagedJobScheduleState.WAITING.value,
+                }))
+        session.commit()
+        return result.rowcount
+
+
+def reset_job_for_recovery_if_stale(job_id: int, owner: tuple[str,
+                                                              int]) -> bool:
+    """Reset one stale-generation job without clobbering a fresh reclaim."""
+    engine = _db_manager.get_engine()
+    terminal_status_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    has_nonterminal_task = sqlalchemy.exists(
+        sqlalchemy.select(spot_table.c.task_id).where(
+            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
+            spot_table.c.status.not_in(terminal_status_values)))
+    with orm.Session(engine) as session:
+        _lock_current_controller_owner(session, owner)
+        stale_owner = sqlalchemy.or_(
+            job_info_table.c.controller_instance_id.is_(None),
+            job_info_table.c.controller_generation.is_(None),
+            sqlalchemy.not_(_controller_owner_matches_columns(owner)),
+        )
+        result = session.execute(
+            sqlalchemy.update(job_info_table).where(
+                sqlalchemy.and_(
+                    job_info_table.c.spot_job_id == job_id,
+                    job_info_table.c.schedule_state.is_not(None),
+                    job_info_table.c.schedule_state.not_in([
+                        ManagedJobScheduleState.INACTIVE.value,
+                        ManagedJobScheduleState.DONE.value,
+                    ]),
+                    has_nonterminal_task,
+                    stale_owner,
+                )).values({
+                    job_info_table.c.controller_pid: None,
+                    job_info_table.c.controller_pid_started_at: None,
+                    job_info_table.c.controller_instance_id: None,
+                    job_info_table.c.controller_generation: None,
+                    job_info_table.c.schedule_state:
+                        ManagedJobScheduleState.WAITING.value,
+                }))
+        session.commit()
+        return result.rowcount == 1
 
 
 def reset_job_for_recovery(job_id: int) -> None:
@@ -2854,6 +3352,8 @@ def reset_job_for_recovery(job_id: int) -> None:
             job_info_table.c.spot_job_id == job_id).update({
                 job_info_table.c.controller_pid: None,
                 job_info_table.c.controller_pid_started_at: None,
+                job_info_table.c.controller_instance_id: None,
+                job_info_table.c.controller_generation: None,
                 job_info_table.c.schedule_state:
                     ManagedJobScheduleState.WAITING.value,
             })
@@ -2902,8 +3402,8 @@ def get_task_logs_to_clean(
     with orm.Session(engine) as session:
         now = time.time()
         conditions = [
-            job_info_table.c.schedule_state.is_(
-                ManagedJobScheduleState.DONE.value),
+            job_info_table.c.schedule_state ==
+            ManagedJobScheduleState.DONE.value,
             spot_table.c.end_at.isnot(None),
             spot_table.c.end_at < (now - retention_seconds),
             spot_table.c.logs_cleaned_at.is_(None),
@@ -2952,8 +3452,8 @@ def get_controller_logs_to_clean(
     with orm.Session(engine) as session:
         now = time.time()
         conditions = [
-            job_info_table.c.schedule_state.is_(
-                ManagedJobScheduleState.DONE.value),
+            job_info_table.c.schedule_state ==
+            ManagedJobScheduleState.DONE.value,
             spot_table.c.local_log_file.isnot(None),
             job_info_table.c.controller_logs_cleaned_at.is_(None),
         ]

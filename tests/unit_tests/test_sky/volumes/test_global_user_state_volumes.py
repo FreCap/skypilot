@@ -22,8 +22,9 @@ class TestVolumeDatabaseOperations:
     @pytest.fixture
     def mock_engine(self):
         """Mock SQLAlchemy engine."""
-        with mock.patch.object(global_user_state._db_manager,
-                               '_engine') as engine:
+        with mock.patch.object(
+                global_user_state._db_manager,  # pylint: disable=protected-access
+                '_engine') as engine:
             engine.dialect.name = 'sqlite'
             yield engine
 
@@ -302,3 +303,105 @@ class TestVolumeDatabaseOperations:
                                 'status'] == expected_status.value
                             # Verify last_attached_at is set
                             assert call_kwargs['last_attached_at'] == 1234567890
+
+    def test_volume_mutators_open_and_commit_independent_sessions(
+            self, mock_engine, mock_volume_config):
+        """Each volume mutation owns and commits a separate ORM session."""
+        sessions = [mock.Mock(name=f'session-{index}') for index in range(3)]
+        session_contexts = []
+        for index, session in enumerate(sessions):
+            context = mock.MagicMock(name=f'session-{index}-context')
+            context.__enter__.return_value = session
+            session_contexts.append(context)
+
+        with mock.patch.object(
+                global_user_state.orm,
+                'Session',
+                side_effect=session_contexts) as session_factory, \
+             mock.patch('time.time', return_value=1234567890), \
+             mock.patch.object(
+                 global_user_state.common_utils,
+                 'get_current_command',
+                 return_value='sky volumes apply'), \
+             mock.patch.object(
+                 global_user_state.common_utils,
+                 'get_current_user',
+                 return_value=mock.Mock(id='user123')), \
+             mock.patch.object(
+                 global_user_state.skypilot_config,
+                 'get_active_workspace',
+                 return_value='default'):
+            global_user_state.add_volume(
+                name='test-volume',
+                config=mock_volume_config,
+                status=status_lib.VolumeStatus.READY,
+            )
+            global_user_state.update_volume(
+                name='test-volume',
+                last_attached_at=1234567891,
+                status=status_lib.VolumeStatus.IN_USE,
+            )
+            global_user_state.delete_volume('test-volume')
+
+        assert session_factory.call_args_list == [
+            mock.call(mock_engine),
+            mock.call(mock_engine),
+            mock.call(mock_engine),
+        ]
+        for session, context in zip(sessions, session_contexts):
+            session.commit.assert_called_once_with()
+            context.__exit__.assert_called_once()
+
+        add_session, update_session, delete_session = sessions
+        add_session.execute.assert_called_once()
+        add_session.query.assert_not_called()
+        update_session.query.assert_called_once_with(
+            global_user_state.volume_table)
+        update_session.execute.assert_not_called()
+        delete_session.query.assert_called_once_with(
+            global_user_state.volume_table)
+        delete_session.execute.assert_not_called()
+
+    def test_add_volume_ignores_conflict_result_rowcount(
+            self, mock_engine, mock_session, mock_volume_config):
+        """The conflict-ignore insert does not inspect its execute result."""
+
+        class ExecuteResult:
+
+            def __init__(self):
+                self.rowcount_accessed = False
+
+            @property
+            def rowcount(self):
+                self.rowcount_accessed = True
+                raise AssertionError('add_volume must not inspect rowcount')
+
+        execute_result = ExecuteResult()
+        mock_engine.dialect.name = 'postgresql'
+        mock_session.execute.return_value = execute_result
+
+        with mock.patch('time.time', return_value=1234567890), \
+             mock.patch.object(
+                 global_user_state.common_utils,
+                 'get_current_command',
+                 return_value='sky volumes apply'), \
+             mock.patch.object(
+                 global_user_state.common_utils,
+                 'get_current_user',
+                 return_value=mock.Mock(id='user123')), \
+             mock.patch.object(
+                 global_user_state.skypilot_config,
+                 'get_active_workspace',
+                 return_value='default'):
+            global_user_state.add_volume(
+                name='test-volume',
+                config=mock_volume_config,
+                status=status_lib.VolumeStatus.READY,
+            )
+
+        statement = mock_session.execute.call_args.args[0]
+        compiled = str(
+            statement.compile(dialect=global_user_state.postgresql.dialect()))
+        assert 'ON CONFLICT DO NOTHING' in compiled
+        assert not execute_result.rowcount_accessed
+        mock_session.commit.assert_called_once_with()

@@ -27,12 +27,19 @@ from sky import sky_logging
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
+from sky.serve import load_balancer_request_metadata
 from sky.serve import load_balancing_policies as lb_policies
 from sky.serve import replica_tls
 from sky.serve import serve_utils
+from sky.serve import system_recovery_route_lease
 from sky.serve.load_balancer_http import _DrainableServer
 from sky.serve.load_balancer_http import _InboundAuthMiddleware
 from sky.serve.load_balancer_http import _ReleasingStreamingResponse
+from sky.serve.load_balancer_retry import _can_retry_proxy_failure
+from sky.serve.load_balancer_retry import _is_dead_connection_error
+from sky.serve.load_balancer_retry import _is_definitely_not_dispatched
+from sky.serve.load_balancer_retry import _PreDispatchError
+from sky.serve.load_balancer_retry import _RetriableStatusError
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -42,6 +49,11 @@ logger = sky_logging.init_logger(__name__)
 _DrainableServer.__module__ = __name__
 _InboundAuthMiddleware.__module__ = __name__
 _ReleasingStreamingResponse.__module__ = __name__
+_RetriableStatusError.__module__ = __name__
+_PreDispatchError.__module__ = __name__
+_is_dead_connection_error.__module__ = __name__
+_is_definitely_not_dispatched.__module__ = __name__
+_can_retry_proxy_failure.__module__ = __name__
 
 # Per-client in-flight request counter attribute. Attached to the
 # httpx.AsyncClient OBJECT (not keyed by URL): a URL pruned and re-added
@@ -64,7 +76,16 @@ _REQUEST_PRIORITY_ATTR = '_skyserve_request_priority'
 _REQUEST_ACCELERATORS_ATTR = '_skyserve_compatible_accelerators'
 _REQUEST_GRANTED_ACCELERATOR_ATTR = '_skyserve_granted_accelerator'
 _REQUEST_DEMAND_RECORDED_ATTR = '_skyserve_request_demand_recorded'
+_REQUEST_CLASSIFICATION_ELIGIBLE_ATTR = (
+    '_skyserve_request_classification_eligible')
+_REQUEST_CLASSIFICATION_RECORDED_ATTR = (
+    '_skyserve_request_classification_recorded')
 _REQUEST_ACTION_ATTR = '_skyserve_request_action'
+# Exact client/marker generation selected by one retry attempt.  Keeping this
+# on the request preserves the historical ``_proxy_request_to(url, request)``
+# facade used by tests and extensions while still carrying an object-identity
+# checkout across the body-buffering awaits inside that method.
+_SELECTED_REPLICA_ATTR = '_skyserve_selected_replica'
 
 _ASYNC_ACTION_PREDICT = 'async_predict'
 _ASYNC_ACTION_STATUS = 'async_status'
@@ -78,38 +99,11 @@ _ASYNC_TERMINAL_OUTCOMES = {
     'CANCELLED': 'failed',
 }
 
-# HTTP semantics define these methods as idempotent: replay after an ambiguous
-# transport failure cannot create a second logical operation. POST/PATCH are
-# deliberately absent. A configured retriable response status remains an
-# explicit per-service opt-in even for those methods.
-_IDEMPOTENT_METHODS = frozenset(
-    {'GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE'})
-
 # A queued ASGI request does not receive a task cancellation when its client
 # disconnects. Poll the receive channel while waiting so an abandoned request
 # cannot later consume a replica slot. Request bodies are bounded and cached
 # before admission, so this poll cannot consume an unread body message.
 _REQUEST_QUEUE_DISCONNECT_POLL_SECONDS = 1.0
-
-
-class _RetriableStatusError(Exception):
-    """A replica answered with a status the service marked retriable.
-
-    Returned from _proxy_request_to like transport errors so
-    _proxy_with_retries re-routes the request to another replica. Only
-    statuses listed in the service's
-    load_balancer.retriable_status_codes take this path — everything
-    else streams to the client verbatim.
-    """
-
-    def __init__(self, status_code: int, url: str) -> None:
-        super().__init__(
-            f'replica {url} answered retriable status {status_code}')
-        self.status_code = status_code
-
-
-class _PreDispatchError(RuntimeError):
-    """A proxy attempt failed before an upstream request could be sent."""
 
 
 @dataclasses.dataclass
@@ -126,40 +120,16 @@ class _RequestQueueWaiter:
     terminal_error: fastapi.HTTPException | None = None
 
 
-def _is_dead_connection_error(exc: Exception) -> bool:
-    """Whether a proxy failure indicates a DEAD replica vs a saturated one.
+@dataclasses.dataclass(frozen=True)
+class _SelectedReplica:
+    """Exact route/client generation captured by one retry selection."""
 
-    A healthy replica overloaded at high RPS trips the connect/read timeout
-    (httpx.TimeoutException), so timeouts must NOT count toward eviction --
-    evicting a merely-saturated replica shrinks capacity under load and
-    cascades. Only genuine connection failures (refused/reset: NetworkError,
-    ProtocolError) indicate a dead replica worth evicting.
-    """
-    if isinstance(exc, httpx.TimeoutException):
-        return False
-    return isinstance(exc, (httpx.NetworkError, httpx.ProtocolError))
-
-
-def _is_definitely_not_dispatched(exc: Exception) -> bool:
-    """Whether a proxy failure proves the request never reached a replica."""
-    return isinstance(exc, (_PreDispatchError, httpx.ConnectError,
-                            httpx.ConnectTimeout, httpx.PoolTimeout))
-
-
-def _can_retry_proxy_failure(method: str, exc: Exception) -> bool:
-    """Whether replaying a failed proxy attempt preserves request semantics.
-
-    A configured retriable status is an explicit service-level opt-in. An
-    idempotent method is inherently replay-safe. For non-idempotent methods,
-    only failures that prove no connection/request dispatch occurred are safe;
-    read, write, protocol, and generic timeout failures have an ambiguous
-    outcome and must be returned without replaying the operation.
-    """
-    if isinstance(exc, _RetriableStatusError):
-        return True
-    if method.upper() in _IDEMPOTENT_METHODS:
-        return True
-    return _is_definitely_not_dispatched(exc)
+    url: str
+    client: httpx.AsyncClient | None
+    client_generation: int | None
+    route_marker: system_recovery_route_lease.RouteMarker | None
+    route_marker_generation: int | None
+    require_current_route: bool
 
 
 class SkyServeLoadBalancer:
@@ -266,6 +236,25 @@ class SkyServeLoadBalancer:
     # pauses between admission and selection.
     _occupancy_unassigned_reservations: int = 0
     _ha_runtime_stats: lb_ha_obs.LbHaRuntimeStats | None = None
+    _drain_history_flush_task: asyncio.Task | None = None
+    _drain_history_flush_generation: int = 0
+    # Recovery-route lease state is immutable-by-default at class scope so
+    # lightweight ``object.__new__`` tests fail closed instead of sharing
+    # mutable state between instances.
+    _system_recovery_route_markers: dict[
+        str, system_recovery_route_lease.RouteMarker] | None = None
+    _system_recovery_invalid_route_marker_urls: set[str] | None = None
+    _system_recovery_route_fenced_urls: set[str] | None = None
+    _system_recovery_route_marker_generations: dict[str, int] | None = None
+    _system_recovery_route_lease_deadlines: dict[str, float] | None = None
+    _system_recovery_route_lease_last_applied_sequences: dict[str,
+                                                              int] | None = None
+    _system_recovery_route_marker_generation: int = 0
+    _system_recovery_route_lease_heartbeat_sequence: int = 0
+    _system_recovery_route_lease_heartbeat_lock: asyncio.Lock | None = None
+    _client_pool_generations: dict[str, tuple[httpx.AsyncClient,
+                                              int]] | None = None
+    _client_pool_generation: int = 0
 
     def __init__(
         self,
@@ -304,9 +293,15 @@ class SkyServeLoadBalancer:
         self._ha_runtime_stats = lb_ha_obs.LbHaRuntimeStats()
         self._armed_generation: int | None = None
         self._routing_version: int | None = None
-        # Strong references to fire-and-forget startup tasks (the event loop
-        # only holds weak references to tasks).
-        self._background_tasks: list[asyncio.Task] = []
+        # Strong references to owned background tasks (the event loop only
+        # holds weak references to tasks).
+        self._background_tasks: set[asyncio.Task] = set()
+        # Drain-history sends are coalesced behind one task. The generation
+        # closes both races: a terminal classification arriving while a send
+        # is in flight forces another pass, while one arriving after task
+        # completion starts a fresh task.
+        self._drain_history_flush_task = None
+        self._drain_history_flush_generation = 0
         # Use the registry to create the load balancing policy. Track the
         # resolved policy name so a sync only rebuilds the policy object when
         # the name actually changes (a policy swap is rare -- only on an
@@ -375,6 +370,17 @@ class SkyServeLoadBalancer:
         # We need this lock to avoid getting from the client pool while
         # updating it from _sync_with_controller.
         self._client_pool_lock: threading.Lock = threading.Lock()
+        self._client_pool_generations = {}
+        self._client_pool_generation = 0
+        self._system_recovery_route_markers = {}
+        self._system_recovery_invalid_route_marker_urls = set()
+        self._system_recovery_route_fenced_urls = set()
+        self._system_recovery_route_marker_generations = {}
+        self._system_recovery_route_lease_deadlines = {}
+        self._system_recovery_route_lease_last_applied_sequences = {}
+        self._system_recovery_route_marker_generation = 0
+        self._system_recovery_route_lease_heartbeat_sequence = 0
+        self._system_recovery_route_lease_heartbeat_lock = asyncio.Lock()
         # Passive replica eviction state, guarded by _client_pool_lock (the
         # same lock that guards the policy's ready set). _replica_dead_failures
         # counts consecutive dead-connection failures per replica;
@@ -465,6 +471,262 @@ class SkyServeLoadBalancer:
             self._ha_runtime_stats = stats
         return stats
 
+    def _replace_system_recovery_route_markers_locked(
+            self, replica_info: dict[str, dict[str, Any]]) -> set[str]:
+        """Install one coherent heavyweight-sync marker snapshot.
+
+        Must be called while holding ``_client_pool_lock``.  A URL with any
+        marker field but without one complete valid v1 marker is retained in
+        the invalid set and can never fall through to ordinary routing.
+        Deadlines and response-order fences survive only an exact unchanged
+        URL/marker generation.
+        """
+        old_markers = dict(
+            getattr(self, '_system_recovery_route_markers', None) or {})
+        old_generations = dict(
+            getattr(self, '_system_recovery_route_marker_generations', None) or
+            {})
+        old_deadlines = dict(
+            getattr(self, '_system_recovery_route_lease_deadlines', None) or {})
+        old_sequences = dict(
+            getattr(self, '_system_recovery_route_lease_last_applied_sequences',
+                    None) or {})
+        markers: dict[str, system_recovery_route_lease.RouteMarker] = {}
+        invalid_urls: set[str] = set()
+        fenced_urls = set(
+            getattr(self, '_system_recovery_route_fenced_urls', None) or ())
+        for url, info in replica_info.items():
+            fields_present, marker = (
+                system_recovery_route_lease.parse_route_marker(info))
+            if not fields_present:
+                # A coherent current unmarked projection is ordinary again.
+                fenced_urls.discard(url)
+                continue
+            fenced_urls.add(url)
+            if marker is None:
+                invalid_urls.add(url)
+                continue
+            markers[url] = marker
+        # A removed capable URL may remain in the off-ready occupancy/draining
+        # overlay.  Retain only those bounded live references so that overlay
+        # cannot probe a same-address replacement after marker removal.
+        relevant_urls = (set(replica_info) |
+                         set(getattr(self, '_client_pool', None) or {}) |
+                         set(getattr(self, '_draining_clients', None) or {}) |
+                         set(getattr(self, '_occupancy_capable', None) or ()))
+        fenced_urls &= relevant_urls
+
+        marker_generation = int(
+            getattr(self, '_system_recovery_route_marker_generation', 0))
+        generations: dict[str, int] = {}
+        deadlines: dict[str, float] = {}
+        sequences: dict[str, int] = {}
+        for url, marker in markers.items():
+            if old_markers.get(url) == marker and url in old_generations:
+                generation = old_generations[url]
+                if url in old_deadlines:
+                    deadlines[url] = old_deadlines[url]
+                if url in old_sequences:
+                    sequences[url] = old_sequences[url]
+            else:
+                marker_generation += 1
+                generation = marker_generation
+            generations[url] = generation
+
+        self._system_recovery_route_markers = markers
+        self._system_recovery_invalid_route_marker_urls = invalid_urls
+        self._system_recovery_route_fenced_urls = fenced_urls
+        self._system_recovery_route_marker_generations = generations
+        self._system_recovery_route_lease_deadlines = deadlines
+        self._system_recovery_route_lease_last_applied_sequences = sequences
+        self._system_recovery_route_marker_generation = marker_generation
+        return invalid_urls
+
+    def _system_recovery_route_is_available_locked(self,
+                                                   url: str,
+                                                   *,
+                                                   now: float | None = None
+                                                  ) -> bool:
+        """Whether the current exact URL marker permits data-plane use."""
+        if url in set(
+                getattr(self, '_system_recovery_invalid_route_marker_urls',
+                        None) or ()):
+            return False
+        markers = (getattr(self, '_system_recovery_route_markers', None) or {})
+        if (url in set(
+                getattr(self, '_system_recovery_route_fenced_urls', None) or
+            ()) and url not in markers):
+            return False
+        if url not in markers:
+            return True
+        deadlines = (getattr(self, '_system_recovery_route_lease_deadlines',
+                             None) or {})
+        deadline = deadlines.get(url)
+        if (not isinstance(deadline, (int, float)) or
+                isinstance(deadline, bool) or not math.isfinite(deadline)):
+            return False
+        if now is None:
+            now = time.monotonic()
+        if deadline <= now:
+            # Preserve the per-generation applied sequence: an older delayed
+            # positive response must not reinstall this expired lease.
+            deadlines.pop(url, None)
+            self._system_recovery_route_lease_deadlines = deadlines
+            return False
+        return True
+
+    def _routable_ready_urls_locked(self) -> set[str]:
+        """Ready URLs that also pass the narrow recovery-route fence."""
+        return {
+            url for url in self._load_balancing_policy.ready_replicas
+            if self._system_recovery_route_is_available_locked(url)
+        }
+
+    def _client_generation_locked(self, url: str,
+                                  client: httpx.AsyncClient) -> int:
+        """Return the object-identity generation for one pooled client."""
+        generations = (getattr(self, '_client_pool_generations', None) or {})
+        existing = generations.get(url)
+        if existing is not None and existing[0] is client:
+            return existing[1]
+        generation = int(getattr(self, '_client_pool_generation', 0)) + 1
+        generations[url] = (client, generation)
+        self._client_pool_generations = generations
+        self._client_pool_generation = generation
+        return generation
+
+    def _capture_selected_replica_locked(
+            self, url: str, *, require_current_route: bool) -> _SelectedReplica:
+        """Capture the exact client and marker generation chosen under lock."""
+        client = (getattr(self, '_client_pool', None) or {}).get(url)
+        client_generation = (None if client is None else
+                             self._client_generation_locked(url, client))
+        marker = (getattr(self, '_system_recovery_route_markers', None) or
+                  {}).get(url)
+        marker_generation = (getattr(
+            self, '_system_recovery_route_marker_generations', None) or
+                             {}).get(url)
+        return _SelectedReplica(url=url,
+                                client=client,
+                                client_generation=client_generation,
+                                route_marker=marker,
+                                route_marker_generation=marker_generation,
+                                require_current_route=require_current_route)
+
+    def _checkout_selected_replica_locked(
+            self, selected: _SelectedReplica) -> httpx.AsyncClient | None:
+        """Atomically revalidate and reference the exact selected client.
+
+        This is the final pre-transport fence after all request-body awaits.
+        It never substitutes a newly looked-up client for the selected object.
+        """
+        if getattr(self, '_draining',
+                   False) or not self._accepts_new_requests():
+            return None
+        if (selected.require_current_route and
+                selected.url not in self._load_balancing_policy.ready_replicas):
+            return None
+        if not self._system_recovery_route_is_available_locked(selected.url):
+            return None
+        markers = (getattr(self, '_system_recovery_route_markers', None) or {})
+        generations = (getattr(
+            self, '_system_recovery_route_marker_generations', None) or {})
+        if (markers.get(selected.url) != selected.route_marker or
+                generations.get(
+                    selected.url) != selected.route_marker_generation):
+            return None
+        client = selected.client
+        if client is None:
+            return None
+        current_client = (getattr(self, '_client_pool', None) or
+                          {}).get(selected.url)
+        if current_client is not client:
+            return None
+        current_generation = self._client_generation_locked(
+            selected.url, current_client)
+        if current_generation != selected.client_generation:
+            return None
+        inflight = getattr(client, _INFLIGHT_ATTR, 0)
+        if type(inflight) is not int:
+            # Tolerate partially initialized clients during rolling upgrades
+            # and lightweight test doubles.
+            inflight = 0
+        setattr(client, _INFLIGHT_ATTR, inflight + 1)
+        return client
+
+    def _begin_system_recovery_route_lease_heartbeat_locked(
+        self,
+    ) -> tuple[int, float, dict[str, tuple[
+            system_recovery_route_lease.RouteMarker, int]]]:
+        """Capture one ordered heartbeat request against the current snapshot."""
+        sequence = int(
+            getattr(self, '_system_recovery_route_lease_heartbeat_sequence',
+                    0)) + 1
+        self._system_recovery_route_lease_heartbeat_sequence = sequence
+        started_at = time.monotonic()
+        markers = (getattr(self, '_system_recovery_route_markers', None) or {})
+        generations = (getattr(
+            self, '_system_recovery_route_marker_generations', None) or {})
+        snapshot = {
+            url: (marker, generations[url])
+            for url, marker in markers.items()
+            if url in generations
+        }
+        return sequence, started_at, snapshot
+
+    def _apply_system_recovery_route_lease_heartbeat(
+        self,
+        payload: object,
+        *,
+        sequence: int,
+        request_started_at: float,
+        marker_snapshot: dict[str,
+                              tuple[system_recovery_route_lease.RouteMarker,
+                                    int]],
+    ) -> bool:
+        """Atomically apply one newer well-formed heartbeat response."""
+        leases = system_recovery_route_lease.validate_heartbeat_payload(payload)
+        if (not isinstance(request_started_at, (int, float)) or
+                isinstance(request_started_at, bool) or
+                not math.isfinite(request_started_at)):
+            raise system_recovery_route_lease.RouteLeaseError(
+                'heartbeat request start must be finite')
+        now = time.monotonic()
+        changed = False
+        with self._client_pool_lock:
+            current_markers = (getattr(self, '_system_recovery_route_markers',
+                                       None) or {})
+            current_generations = (getattr(
+                self, '_system_recovery_route_marker_generations', None) or {})
+            deadlines = dict(
+                getattr(self, '_system_recovery_route_lease_deadlines', None) or
+                {})
+            applied_sequences = dict(
+                getattr(self,
+                        '_system_recovery_route_lease_last_applied_sequences',
+                        None) or {})
+            for url, (marker, generation) in marker_snapshot.items():
+                if (current_markers.get(url) != marker or
+                        current_generations.get(url) != generation or
+                        sequence <= applied_sequences.get(url, -1)):
+                    continue
+                applied_sequences[url] = sequence
+                remaining = leases.get(marker)
+                proposed_deadline = (None if remaining is None else
+                                     float(request_started_at) + remaining)
+                if proposed_deadline is None or proposed_deadline <= now:
+                    if url in deadlines:
+                        deadlines.pop(url, None)
+                        changed = True
+                    continue
+                if deadlines.get(url) != proposed_deadline:
+                    deadlines[url] = proposed_deadline
+                    changed = True
+            self._system_recovery_route_lease_deadlines = deadlines
+            self._system_recovery_route_lease_last_applied_sequences = (
+                applied_sequences)
+        return changed
+
     def _quarantined_replicas(self) -> set[str]:
         """Replica URLs currently quarantined (TTL not yet expired).
 
@@ -501,6 +763,9 @@ class SkyServeLoadBalancer:
         client_pool = getattr(self, '_client_pool', None)
         client = client_pool.pop(url, None) if client_pool else None
         if client is not None:
+            generations = getattr(self, '_client_pool_generations', None)
+            if generations is not None:
+                generations.pop(url, None)
             if self._draining_clients is None:
                 self._draining_clients = {}
             self._draining_clients.setdefault(url, []).append(client)
@@ -678,6 +943,8 @@ class SkyServeLoadBalancer:
 
     def _occupancy_sample_is_locally_usable_locked(self, url: str) -> bool:
         """Whether one sample is valid for bounded LB-local admission."""
+        if not self._system_recovery_route_is_available_locked(url):
+            return False
         free_slots = getattr(self, '_replica_free_slots', None) or {}
         if url not in free_slots:
             return False
@@ -850,7 +1117,7 @@ class SkyServeLoadBalancer:
         config = self._request_queue_config
         assert config is not None
         with self._client_pool_lock:
-            ready_urls = set(self._load_balancing_policy.ready_replicas)
+            ready_urls = self._routable_ready_urls_locked()
             ready_replicas = len(ready_urls)
             free_slots = None
             queue_capacity_units = ready_replicas
@@ -928,175 +1195,20 @@ class SkyServeLoadBalancer:
         # awaits, and returned streams exactly once.
         return self._active_request_count
 
-    @staticmethod
-    def _priority_header_error(detail: str) -> fastapi.HTTPException:
-        return fastapi.HTTPException(
-            status_code=400,
-            detail=f'{constants.LB_REQUEST_PRIORITY_HEADER} {detail}')
+    # Preserve the historical private facade without adding wrapper frames.
+    # pylint: disable=protected-access
+    _priority_header_error = staticmethod(
+        load_balancer_request_metadata._priority_header_error)
+    _parse_request_priority: Any = classmethod(
+        load_balancer_request_metadata._parse_request_priority)
+    _accelerator_header_error = staticmethod(
+        load_balancer_request_metadata._accelerator_header_error)
+    _parse_request_accelerators = (
+        load_balancer_request_metadata._parse_request_accelerators)
+    _headers_without_request_priority = staticmethod(
+        load_balancer_request_metadata._headers_without_request_priority)
 
-    @classmethod
-    def _parse_request_priority(cls, request: fastapi.Request) -> int:
-        """Parse the scheduling priority without coalescing duplicate headers."""
-        headers = request.headers
-        raw_headers = getattr(headers, 'raw', None)
-        values: list[bytes | str] = []
-        if isinstance(raw_headers, (list, tuple)):
-            for name, value in raw_headers:
-                normalized_name = (name.lower() if isinstance(name, bytes) else
-                                   str(name).lower().encode('ascii'))
-                if normalized_name == constants.LB_REQUEST_PRIORITY_HEADER_BYTES:
-                    values.append(value)
-        else:
-            # Starlette always exposes raw headers. This fallback keeps direct
-            # unit-test requests and compatible ASGI request implementations
-            # working without weakening duplicate detection on the real path.
-            for name, value in headers.items():
-                if str(name).lower() == (
-                        constants.LB_REQUEST_PRIORITY_HEADER.lower()):
-                    values.append(value)
-        if not values:
-            return constants.LB_REQUEST_PRIORITY_MIN
-        if len(values) != 1:
-            raise cls._priority_header_error('must appear at most once.')
-        value = values[0]
-        try:
-            text = (value.decode('ascii')
-                    if isinstance(value, bytes) else str(value))
-        except UnicodeDecodeError:
-            raise cls._priority_header_error(
-                'must be an integer from 0 to 100.') from None
-        if not text or any(
-                character < '0' or character > '9' for character in text):
-            raise cls._priority_header_error(
-                'must be an integer from 0 to 100.')
-        # Strip leading zeroes before bounding the conversion. This preserves
-        # the public integer contract while preventing Python's decimal-string
-        # conversion limit from escaping as HTTP 500 on a very long header.
-        normalized_text = text.lstrip('0') or '0'
-        if len(normalized_text) > len(str(constants.LB_REQUEST_PRIORITY_MAX)):
-            raise cls._priority_header_error(
-                'must be an integer from 0 to 100.')
-        priority = int(normalized_text)
-        if not (constants.LB_REQUEST_PRIORITY_MIN <= priority <=
-                constants.LB_REQUEST_PRIORITY_MAX):
-            raise cls._priority_header_error(
-                'must be an integer from 0 to 100.')
-        return priority
-
-    @staticmethod
-    def _accelerator_header_error(detail: str,
-                                  status_code: int = 400
-                                 ) -> fastapi.HTTPException:
-        headers = ({
-            'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
-        } if status_code == 503 else None)
-        return fastapi.HTTPException(
-            status_code=status_code,
-            detail=(f'{constants.LB_REQUEST_ACCELERATORS_HEADER} {detail}'),
-            headers=headers)
-
-    def _parse_request_accelerators(
-            self, request: fastapi.Request) -> tuple[str, ...] | None:
-        """Parse and canonicalize the optional ordered exact-card set.
-
-        None is returned only for a legacy controller/LB pair and an omitted
-        header. An explicit header never widens when the catalog is unknown.
-        """
-        headers = request.headers
-        raw_headers = getattr(headers, 'raw', None)
-        values: list[bytes | str] = []
-        if isinstance(raw_headers, (list, tuple)):
-            for name, value in raw_headers:
-                normalized_name = (name.lower() if isinstance(name, bytes) else
-                                   str(name).lower().encode('ascii'))
-                if (normalized_name ==
-                        constants.LB_REQUEST_ACCELERATORS_HEADER_BYTES):
-                    values.append(value)
-        else:
-            for name, value in headers.items():
-                if str(name).lower() == (
-                        constants.LB_REQUEST_ACCELERATORS_HEADER.lower()):
-                    values.append(value)
-
-        configured = self._configured_accelerators
-        if not values:
-            return configured
-        if len(values) != 1:
-            raise self._accelerator_header_error('must appear at most once.')
-        if (self._request_accelerator_compatibility_version
-                != constants.LB_REQUEST_ACCELERATORS_VERSION or
-                configured is None):
-            raise self._accelerator_header_error(
-                'cannot be honored until the controller publishes the exact '
-                'accelerator catalog; retry after synchronization.',
-                status_code=503)
-        value = values[0]
-        if isinstance(value, bytes):
-            if len(value) > constants.LB_REQUEST_ACCELERATORS_MAX_BYTES:
-                raise self._accelerator_header_error('is too large.')
-            try:
-                text = value.decode('ascii')
-            except UnicodeDecodeError:
-                raise self._accelerator_header_error(
-                    'must contain ASCII exact accelerator identifiers.'
-                ) from None
-        else:
-            text = str(value)
-            if len(text.encode('utf-8')) > (
-                    constants.LB_REQUEST_ACCELERATORS_MAX_BYTES):
-                raise self._accelerator_header_error('is too large.')
-            if not text.isascii():
-                raise self._accelerator_header_error(
-                    'must contain ASCII exact accelerator identifiers.')
-        raw_items = text.split(',')
-        if (not raw_items or
-                len(raw_items) > constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS):
-            raise self._accelerator_header_error(
-                f'must contain 1-{constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS} '
-                'exact accelerator identifiers.')
-        configured_by_name = {
-            accelerator.casefold(): accelerator for accelerator in configured
-        }
-        result: list[str] = []
-        seen: set[str] = set()
-        for raw_item in raw_items:
-            item = raw_item.strip(' \t')
-            normalized = item.casefold()
-            if not item:
-                raise self._accelerator_header_error(
-                    'must not contain empty accelerator identifiers.')
-            if normalized in seen:
-                raise self._accelerator_header_error(
-                    f'contains duplicate accelerator {item!r}.')
-            seen.add(normalized)
-            canonical = configured_by_name.get(normalized)
-            if canonical is None:
-                raise self._accelerator_header_error(
-                    f'contains unknown exact accelerator {item!r}.')
-            result.append(canonical)
-        return tuple(result)
-
-    @staticmethod
-    def _headers_without_request_priority(request: fastapi.Request) -> Any:
-        """Return upstream headers with every scheduling header removed."""
-        headers = request.headers
-        raw_headers = getattr(headers, 'raw', None)
-        if isinstance(raw_headers, (list, tuple)):
-            scheduling_headers = {
-                constants.LB_REQUEST_PRIORITY_HEADER_BYTES,
-                constants.LB_REQUEST_ACCELERATORS_HEADER_BYTES,
-            }
-            return [(name, value)
-                    for name, value in raw_headers
-                    if (name.lower() if isinstance(name, bytes) else str(name).
-                        lower().encode('ascii')) not in scheduling_headers]
-        scheduling_headers_text = {
-            constants.LB_REQUEST_PRIORITY_HEADER.lower(),
-            constants.LB_REQUEST_ACCELERATORS_HEADER.lower(),
-        }
-        return [(name, value)
-                for name, value in headers.items()
-                if str(name).lower() not in scheduling_headers_text]
+    # pylint: enable=protected-access
 
     def _request_queue_waiters_for_instance(
             self) -> dict[int, dict[int, _RequestQueueWaiter]]:
@@ -1361,7 +1473,7 @@ class SkyServeLoadBalancer:
         # to aggregate admission. This fails closed during partial syncs.
         replica_info = self._replica_info_by_url or {}
         with self._client_pool_lock:
-            ready_urls = set(self._load_balancing_policy.ready_replicas)
+            ready_urls = self._routable_ready_urls_locked()
             if self._queue_uses_async_occupancy():
                 free_by_url = self._effective_replica_free_slots_locked()
             else:
@@ -1447,6 +1559,24 @@ class SkyServeLoadBalancer:
             return
         self._request_aggregator.add(request)
         setattr(request, _REQUEST_DEMAND_RECORDED_ATTR, True)
+
+    @staticmethod
+    def _mark_request_classification_eligible(request: fastapi.Request) -> None:
+        """Open the terminal classification fence for one inbound request."""
+        setattr(request, _REQUEST_CLASSIFICATION_ELIGIBLE_ATTR, True)
+
+    def _record_request_classification_once(self, request: fastapi.Request, *,
+                                            rejected: bool) -> None:
+        """Commit exactly one terminal outcome after the eligibility fence."""
+        request_state = vars(request)
+        if (not request_state.get(_REQUEST_CLASSIFICATION_ELIGIBLE_ATTR, False)
+                or request_state.get(_REQUEST_CLASSIFICATION_RECORDED_ATTR,
+                                     False)):
+            return
+        self._request_aggregator.add_request_classification(rejected=rejected)
+        setattr(request, _REQUEST_CLASSIFICATION_RECORDED_ATTR, True)
+        if self._draining:
+            self._schedule_drain_history_flush()
 
     def _set_queued_compatibility_demand_support(self, supported: bool) -> None:
         """Apply controller queue-gauge capability and rollback fallback."""
@@ -1595,16 +1725,33 @@ class SkyServeLoadBalancer:
                     'request queue.'))
 
     def _retain_background_task(self, task: asyncio.Task) -> None:
-        """Keep a fire-and-forget task alive and consume its final result."""
-        self._background_tasks.append(task)
+        """Own a background task until completion and report failures."""
+        self._background_tasks.add(task)
 
         def _forget(done: asyncio.Task) -> None:
-            with contextlib.suppress(ValueError):
-                self._background_tasks.remove(done)
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                done.result()
+            self._background_tasks.discard(done)
+            if done.cancelled():
+                return
+            exception = done.exception()
+            if exception is not None:
+                done.get_loop().call_exception_handler({
+                    'message': 'SkyServe load balancer background task failed',
+                    'exception': exception,
+                    'task': done,
+                })
 
         task.add_done_callback(_forget)
+
+    def _start_background_loops(self) -> None:
+        """Start and own the load balancer's process-lifetime loops."""
+        background_loops = (
+            self._sync_with_controller,
+            self._sync_role_with_controller,
+            self._probe_occupancy_loop,
+            self._sync_system_recovery_route_lease,
+        )
+        for background_loop in background_loops:
+            self._retain_background_task(asyncio.create_task(background_loop()))
 
     async def _cleanup_request_queue_waiter(
             self, waiter: _RequestQueueWaiter) -> None:
@@ -1665,6 +1812,7 @@ class SkyServeLoadBalancer:
                     # rejections, recording them helps the controller grow the
                     # exact compatible fleet instead of hiding overload.
                     self._record_request_demand_once(request)
+                    self._mark_request_classification_eligible(request)
                     self._record_rejection(request)
                     raise fastapi.HTTPException(
                         status_code=503,
@@ -1724,6 +1872,7 @@ class SkyServeLoadBalancer:
                         self._remove_request_queue_waiter_locked(waiter)
                         self._resolve_request_queue_waiter_locked(waiter)
                         self._record_request_demand_once(request)
+                        self._mark_request_classification_eligible(request)
                         self._record_rejection(request)
                         self._dispatch_request_queue_locked()
                         raise self._queue_timeout_error()
@@ -1894,11 +2043,39 @@ class SkyServeLoadBalancer:
             return
         self._retain_background_task(
             loop.create_task(self._notify_request_queue()))
-        if (self._request_aggregator.request_history_snapshot() is not None or
-                self._request_aggregator.prediction_time_history_snapshot()
-                is not None):
-            self._retain_background_task(
-                loop.create_task(self._flush_request_history_on_drain()))
+        self._schedule_drain_history_flush()
+
+    def _schedule_drain_history_flush(self) -> None:
+        """Coalesce drain-time history flushes without stranding late data."""
+        if not self._draining:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._drain_history_flush_generation += 1
+        existing = self._drain_history_flush_task
+        if existing is not None and not existing.done():
+            return
+        task = loop.create_task(self._flush_drain_history_until_quiet())
+        self._drain_history_flush_task = task
+
+        def _clear(done: asyncio.Task) -> None:
+            # A late classification may have observed ``done()`` and already
+            # installed the successor before this callback runs.
+            if self._drain_history_flush_task is done:
+                self._drain_history_flush_task = None
+
+        task.add_done_callback(_clear)
+        self._retain_background_task(task)
+
+    async def _flush_drain_history_until_quiet(self) -> None:
+        """Repeat until no classification arrived during the last send."""
+        while True:
+            generation = self._drain_history_flush_generation
+            await self._flush_request_history_on_drain()
+            if generation == self._drain_history_flush_generation:
+                return
 
     def _get_lb_session_id(self) -> str:
         """Return the durable external LB identity, failing closed if absent."""
@@ -1969,7 +2146,7 @@ class SkyServeLoadBalancer:
             # replica (the gauge is sampled BEFORE this sync's response
             # re-applies the ready set, so the gauge alone cannot prove
             # it).
-            routing_urls = list(self._load_balancing_policy.ready_replicas)
+            routing_urls = sorted(self._routable_ready_urls_locked())
         # An occupancy sample taken while the url was still routed cannot
         # prove post-retirement idleness (work may have arrived after the
         # sample but before the url left routing): for off-ready urls,
@@ -2153,6 +2330,7 @@ class SkyServeLoadBalancer:
             profiles.pop(key, None)
         request_aggregator = getattr(self, '_request_aggregator', None)
         if request_aggregator is not None:
+            self._record_request_classification_once(request, rejected=True)
             request_aggregator.add_rejection()
 
     def _clear_rejection(self, request: fastapi.Request) -> None:
@@ -2656,7 +2834,7 @@ class SkyServeLoadBalancer:
         """
         del request  # Unused.
         with self._client_pool_lock:
-            ready_set = set(self._load_balancing_policy.ready_replicas)
+            ready_set = self._routable_ready_urls_locked()
             ready_replicas = len(ready_set)
             hint = self._capacity_hint or {}
             replica_unit = hint.get('replica_unit', 'physical_backend')
@@ -3059,9 +3237,12 @@ class SkyServeLoadBalancer:
         round_started_at = time.monotonic()
         connections_created = 0
         with self._client_pool_lock:
-            ready_urls = list(self._load_balancing_policy.ready_replicas)
+            ready_urls = list(self._routable_ready_urls_locked())
             probe_urls = list(
-                set(ready_urls) | (self._occupancy_capable or set()))
+                set(ready_urls) | {
+                    url for url in (self._occupancy_capable or set())
+                    if self._system_recovery_route_is_available_locked(url)
+                })
             probe_generation = {
                 url: (self._occupancy_dispatch_generation or {}).get(url, 0)
                 for url in probe_urls
@@ -3192,7 +3373,7 @@ class SkyServeLoadBalancer:
             # url re-added mid-round may have accepted work invisible to
             # its pre-re-add sample, so that sample cannot prove
             # post-retirement idleness if the url is retired again.
-            current_ready = set(self._load_balancing_policy.ready_replicas)
+            current_ready = self._routable_ready_urls_locked()
             self._occupancy_sampled_off_ready = {
                 url for url in valid_sample_urls
                 if url not in ready_set and url not in current_ready
@@ -3415,6 +3596,9 @@ class SkyServeLoadBalancer:
             request_batch = self._request_aggregator.drain()
             request_history = (
                 self._request_aggregator.request_history_snapshot())
+            request_classification_history = (
+                self._request_aggregator.
+                request_classification_history_snapshot())
             prediction_time_history = (
                 self._request_aggregator.prediction_time_history_snapshot())
             request_batch_accepted = False
@@ -3425,6 +3609,7 @@ class SkyServeLoadBalancer:
                 'routing_version': self._routing_version,
                 'request_aggregator': request_batch,
                 'request_history': request_history,
+                'request_classification_history': request_classification_history,
                 'prediction_time_history': prediction_time_history,
                 'request_history_session_id': self._request_history_session_id,
                 'in_flight': in_flight,
@@ -3497,6 +3682,12 @@ class SkyServeLoadBalancer:
                                 'request_history_accepted') is True:
                             self._request_aggregator.mark_request_history_accepted(
                                 request_history)
+                        classification_accepted = response_json.get(
+                            'request_classification_history_accepted')
+                        if classification_accepted is True:
+                            (self._request_aggregator.
+                             mark_request_classification_history_accepted(
+                                 request_classification_history))
                         if response_json.get(
                                 'prediction_time_history_accepted') is True:
                             self._request_aggregator.mark_prediction_time_history_accepted(
@@ -3568,18 +3759,23 @@ class SkyServeLoadBalancer:
                     # from this same sync.
                     if routing_spec:
                         self._apply_routing_spec(routing_spec)
+                    invalid_marker_urls = (
+                        self._replace_system_recovery_route_markers_locked(
+                            replica_info))
                     # Declared capability is per replica/version. Seed it before
                     # the first probe so a failed/never-run probe is unknown,
                     # never an explicit idle zero. Retain prior declarations for
                     # off-ready bounded drains; the probe retention logic prunes
                     # them once no longer relevant.
                     declared_async_urls = {
-                        url for url, info in replica_info.items() if str(
-                            info.get('async_occupancy', '')).lower() == 'true'
+                        url for url, info in replica_info.items()
+                        if str(info.get('async_occupancy', '')).lower() ==
+                        'true' and url not in invalid_marker_urls
                     }
                     explicitly_sync_urls = {
-                        url for url, info in replica_info.items() if str(
-                            info.get('async_occupancy', '')).lower() == 'false'
+                        url for url, info in replica_info.items()
+                        if str(info.get('async_occupancy', '')).lower() ==
+                        'false' and url not in invalid_marker_urls
                     }
                     self._occupancy_declared_urls = (
                         set(self._occupancy_declared_urls or
@@ -3618,7 +3814,8 @@ class SkyServeLoadBalancer:
                     quarantined = self._quarantined_replicas()
                     routable = [
                         url for url in ready_replica_urls
-                        if url not in quarantined
+                        if url not in quarantined and
+                        url not in invalid_marker_urls
                     ]
                     self._replica_info_by_url = dict(replica_info)
                     self._load_balancing_policy.set_ready_replicas(routable)
@@ -3656,17 +3853,21 @@ class SkyServeLoadBalancer:
                         self._replica_quarantine_until.items()
                         if url in ready_set and until > now
                     }
-                    for replica_url in ready_replica_urls:
+                    client_urls = set(ready_replica_urls) - invalid_marker_urls
+                    for replica_url in client_urls:
                         if replica_url not in self._client_pool:
                             self._client_pool[replica_url] = httpx.AsyncClient(
                                 base_url=replica_url,
                                 verify=self._replica_ssl_context())
-                    urls_to_close = set(
-                        self._client_pool.keys()) - set(ready_replica_urls)
+                        self._client_generation_locked(
+                            replica_url, self._client_pool[replica_url])
+                    urls_to_close = set(self._client_pool.keys()) - client_urls
                     client_to_close = []
                     for replica_url in urls_to_close:
                         client_to_close.append(
                             (replica_url, self._client_pool.pop(replica_url)))
+                        if self._client_pool_generations is not None:
+                            self._client_pool_generations.pop(replica_url, None)
                 for replica_url, client in client_to_close:
                     # Fire-and-forget: a drain can legitimately take as long
                     # as the longest in-flight prediction; the sync loop must
@@ -3846,6 +4047,96 @@ class SkyServeLoadBalancer:
                 # Without a delay, a bad token, unavailable proxy, or failed
                 # controller creates a CPU/network/log hot loop.
                 await asyncio.sleep(retry_delay)
+
+    async def _sync_system_recovery_route_lease_once(self) -> bool:
+        """Fetch and apply one authenticated bounded route-lease heartbeat."""
+        heartbeat_lock = getattr(self,
+                                 '_system_recovery_route_lease_heartbeat_lock',
+                                 None)
+        if heartbeat_lock is None:
+            heartbeat_lock = asyncio.Lock()
+            self._system_recovery_route_lease_heartbeat_lock = heartbeat_lock
+        async with heartbeat_lock:
+            with self._client_pool_lock:
+                sequence, request_started_at, marker_snapshot = (
+                    self._begin_system_recovery_route_lease_heartbeat_locked())
+
+            async def _request() -> object:
+                sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
+                token_attempts: tuple[str | None,
+                                      ...] = (sync_tokens if sync_tokens else
+                                              (None,))
+                absolute_timeout = (
+                    request_started_at +
+                    constants.LB_SYSTEM_RECOVERY_LEASE_HEARTBEAT_TIMEOUT_SECONDS
+                )
+                async with aiohttp.ClientSession() as session:
+                    for token_index, controller_token in enumerate(
+                            token_attempts):
+                        remaining = absolute_timeout - time.monotonic()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError
+                        headers = {}
+                        if controller_token is not None:
+                            headers['Authorization'] = (
+                                f'Bearer {controller_token}')
+                        if self._service_hash is not None:
+                            headers[constants.SERVICE_HASH_HEADER] = (
+                                self._service_hash)
+                        request_timeout = min(
+                            remaining, constants.
+                            LB_SYSTEM_RECOVERY_LEASE_PROXY_TIMEOUT_SECONDS)
+                        async with session.post(
+                                self._controller_url + constants.
+                                LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH,
+                                headers=headers or None,
+                                timeout=aiohttp.ClientTimeout(
+                                    total=request_timeout)) as response:
+                            if (getattr(response, 'status', None) == 401 and
+                                    token_index + 1 < len(token_attempts)):
+                                continue
+                            response.raise_for_status()
+                            return await response.json()
+                raise RuntimeError('No route-lease credential attempt ran.')
+
+            remaining_total = (
+                request_started_at +
+                constants.LB_SYSTEM_RECOVERY_LEASE_HEARTBEAT_TIMEOUT_SECONDS -
+                time.monotonic())
+            if remaining_total <= 0:
+                raise asyncio.TimeoutError
+            payload = await asyncio.wait_for(_request(),
+                                             timeout=remaining_total)
+            changed = self._apply_system_recovery_route_lease_heartbeat(
+                payload,
+                sequence=sequence,
+                request_started_at=request_started_at,
+                marker_snapshot=marker_snapshot)
+            # A first positive heartbeat may unblock an occupancy-aware queue.
+            # Omission/expiry also needs a fresh dispatch-plan calculation.
+            await self._notify_request_queue()
+            return changed
+
+    async def _sync_system_recovery_route_lease(self) -> None:
+        """Nonoverlapping fixed-start two-second lease-heartbeat loop."""
+        while not self._draining:
+            round_started_at = time.monotonic()
+            try:
+                await self._sync_system_recovery_route_lease_once()
+            except Exception as e:  # pylint: disable=broad-except
+                # The last accepted deadlines remain authoritative and expire
+                # locally.  A malformed response, auth failure, or timeout can
+                # never refresh them, but must not kill future heartbeat rounds.
+                logger.warning(
+                    'System-recovery route-lease heartbeat failed: %s',
+                    common_utils.format_exception(e))
+            next_start = (
+                round_started_at +
+                constants.LB_SYSTEM_RECOVERY_LEASE_HEARTBEAT_INTERVAL_SECONDS)
+            delay = max(0.0, next_start - time.monotonic())
+            if self._draining:
+                return
+            await asyncio.sleep(delay)
 
     def _ha_role_payload(self) -> dict[str, Any]:
         """Build a non-additive occupancy and additive HTTP role report."""
@@ -4091,15 +4382,20 @@ class SkyServeLoadBalancer:
     async def _flush_request_history_on_drain(self) -> None:
         """Best-effort bounded history flush that cannot report demand."""
         request_history = self._request_aggregator.request_history_snapshot()
+        request_classification_history = (
+            self._request_aggregator.request_classification_history_snapshot())
         prediction_time_history = (
             self._request_aggregator.prediction_time_history_snapshot())
-        if request_history is None and prediction_time_history is None:
+        if (request_history is None and
+                not request_classification_history.get('buckets') and
+                prediction_time_history is None):
             return
         try:
             sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
             session_id = self._get_lb_session_id()
             payload = {
                 'request_history': request_history,
+                'request_classification_history': request_classification_history,
                 'prediction_time_history': prediction_time_history,
                 'request_history_session_id': self._request_history_session_id,
                 'lb_session_id': session_id,
@@ -4134,6 +4430,12 @@ class SkyServeLoadBalancer:
                                 'request_history_accepted') is True:
                             self._request_aggregator.mark_request_history_accepted(
                                 request_history)
+                        classification_accepted = response_json.get(
+                            'request_classification_history_accepted')
+                        if classification_accepted is True:
+                            (self._request_aggregator.
+                             mark_request_classification_history_accepted(
+                                 request_classification_history))
                         if response_json.get(
                                 'prediction_time_history_accepted') is True:
                             self._request_aggregator.mark_prediction_time_history_accepted(
@@ -4154,6 +4456,15 @@ class SkyServeLoadBalancer:
             The response from the endpoint replica. Return the exception
             encountered if anything goes wrong.
         """
+        selected = vars(request).pop(_SELECTED_REPLICA_ATTR, None)
+        if not isinstance(selected, _SelectedReplica) or selected.url != url:
+            # Direct callers retain the historical facade.  Production retry
+            # selection installs this snapshot in the same lock section as
+            # policy selection; the fallback still captures before any body
+            # await, but skips the selection-only ready-membership assertion.
+            with self._client_pool_lock:
+                selected = self._capture_selected_replica_locked(
+                    url, require_current_route=False)
         # The token ties this request's release to the exact accounting
         # generation it incremented (see LoadBalancingPolicy hooks). Keep the
         # policy OBJECT too: a live routing-spec update may replace
@@ -4177,26 +4488,6 @@ class SkyServeLoadBalancer:
             self._release_client_refcount(client)
 
         try:
-            # We defer the get of the client here on purpose, for case when the
-            # replica is ready in `_proxy_with_retries` but refreshed before
-            # entering this function. In that case we will return an error here
-            # and retry to find next ready replica. We also need to wait for the
-            # update of the client pool to finish before getting the client.
-            with self._client_pool_lock:
-                client = self._client_pool.get(url, None)
-            if client is None:
-                return _PreDispatchError(f'Client for {url} not found.')
-            # Counted on the CLIENT object so a pruned client is closed
-            # only after its in-flight work drains (a re-added URL gets a
-            # fresh client with its own counter). Decremented exactly once
-            # per request alongside the slot release below.
-            inflight = getattr(client, _INFLIGHT_ATTR, 0)
-            if type(inflight) is not int:
-                # Tolerate partially initialized clients during rolling
-                # upgrades and lightweight test doubles. Real clients only
-                # ever carry the integer written below.
-                inflight = 0
-            setattr(client, _INFLIGHT_ATTR, inflight + 1)
             worker_url = httpx.URL(path=request.url.path,
                                    query=request.url.query.encode('utf-8'))
             request_body = await self._request_body(request)
@@ -4207,6 +4498,23 @@ class SkyServeLoadBalancer:
                 request_action = await self._request_action(
                     request, request_body)
                 is_async_request = request_action in _ASYNC_ACTIONS
+            # Body buffering/action decoding above may yield long enough for a
+            # heavy sync, lease expiry, drain, or URL remove/re-add.  Recheck
+            # every identity and increment the exact selected client in one
+            # final critical section.  Transport below uses this object
+            # directly and never substitutes a later URL lookup.
+            with self._client_pool_lock:
+                client = self._checkout_selected_replica_locked(selected)
+            if client is None:
+                return _PreDispatchError(
+                    f'Client generation or route lease for {url} is no '
+                    'longer available.')
+            timeout_kwargs = {
+                'connect': constants.LB_CONNECT_TIMEOUT_SECONDS,
+            }
+            if selected.route_marker is not None:
+                timeout_kwargs['pool'] = (
+                    constants.LB_SYSTEM_RECOVERY_POOL_TIMEOUT_SECONDS)
             proxy_request = client.build_request(
                 request.method,
                 worker_url,
@@ -4218,9 +4526,8 @@ class SkyServeLoadBalancer:
                 # prediction), a dead-but-still-routed replica would hang
                 # requests for the full value during the un-route window
                 # instead of failing fast into the retry loop.
-                timeout=httpx.Timeout(
-                    self._stream_timeout_seconds,
-                    connect=constants.LB_CONNECT_TIMEOUT_SECONDS))
+                timeout=httpx.Timeout(self._stream_timeout_seconds,
+                                      **timeout_kwargs))
             prediction_started_at = (None
                                      if is_async_request else time.monotonic())
             proxy_response = await client.send(proxy_request, stream=True)
@@ -4391,7 +4698,15 @@ class SkyServeLoadBalancer:
             # so an empty compatible fleet can still launch without leaving a
             # phantom arrival behind when this LB drains during admission.
             self._record_request_demand_once(request)
-            response = await self._proxy_with_retries_inner(request)
+            self._mark_request_classification_eligible(request)
+            try:
+                response = await self._proxy_with_retries_inner(request)
+            finally:
+                # A terminal rejection classifies itself before raising. Every
+                # other return, exception, or cancellation after the final
+                # admission fence is part of the non-rejected subset.
+                self._record_request_classification_once(request,
+                                                         rejected=False)
             if (acquired_slot and
                     isinstance(response, _ReleasingStreamingResponse)):
                 response.hold_cleanup_until_complete(
@@ -4474,12 +4789,16 @@ class SkyServeLoadBalancer:
             track_async_attempt = False
             if async_occupancy_request is None:
                 with self._client_pool_lock:
+                    if getattr(self, '_draining', False):
+                        raise self._draining_request_error()
+                    if not self._accepts_new_requests():
+                        raise self._inactive_role_request_error()
                     queue_tracks_occupancy = self._queue_uses_async_occupancy()
                     declared_urls = set(self._occupancy_declared_urls or ())
+                    routable_urls = self._routable_ready_urls_locked()
                     needs_async_inference = bool(
                         not queue_tracks_occupancy and
-                        any(url not in declared_urls for url in
-                            self._load_balancing_policy.ready_replicas))
+                        any(url not in declared_urls for url in routable_urls))
                 if needs_async_inference:
                     # Parsing can await the request body. Do it before policy
                     # selection so stateful policies such as round-robin
@@ -4488,10 +4807,20 @@ class SkyServeLoadBalancer:
                     async_occupancy_request = (
                         await self._request_uses_async_occupancy(request))
             with self._client_pool_lock:
+                # Every attempt owns a fresh role/drain fence.  An admitted
+                # handler cannot select a replacement replica after this LB
+                # begins draining or loses its serving role during backoff.
+                if getattr(self, '_draining', False):
+                    raise self._draining_request_error()
+                if not self._accepts_new_requests():
+                    raise self._inactive_role_request_error()
                 queue_tracks_occupancy = self._queue_uses_async_occupancy()
-                eligible_urls: set[str] | None = None
+                all_ready_urls = set(self._load_balancing_policy.ready_replicas)
+                routable_urls = self._routable_ready_urls_locked()
+                eligible_urls: set[str] | None = (
+                    None if routable_urls == all_ready_urls else routable_urls)
                 if queue_tracks_occupancy:
-                    ready_urls = set(self._load_balancing_policy.ready_replicas)
+                    ready_urls = routable_urls
                     eligible_urls = {
                         url for url, slots in
                         self._effective_replica_free_slots_locked().items()
@@ -4501,7 +4830,7 @@ class SkyServeLoadBalancer:
                                                   _REQUEST_ACCELERATORS_ATTR,
                                                   None)
                 if compatible_accelerators is not None:
-                    ready_urls = set(self._load_balancing_policy.ready_replicas)
+                    ready_urls = routable_urls
                     granted_accelerator = getattr(
                         request, _REQUEST_GRANTED_ACCELERATOR_ATTR, None)
                     requested_cards = ({granted_accelerator}
@@ -4540,6 +4869,9 @@ class SkyServeLoadBalancer:
                            None) is not None:
                     setattr(request, _REQUEST_GRANTED_ACCELERATOR_ATTR, None)
                 if ready_replica_url is not None:
+                    selected = self._capture_selected_replica_locked(
+                        ready_replica_url, require_current_route=True)
+                    vars(request)[_SELECTED_REPLICA_ATTR] = selected
                     occupancy_declared = ready_replica_url in set(
                         self._occupancy_declared_urls or ())
                     track_async_attempt = bool(queue_tracks_occupancy or
@@ -4575,6 +4907,10 @@ class SkyServeLoadBalancer:
                 attempt_error = error
                 raise
             finally:
+                # Real proxy calls consume the snapshot at entry; monkeypatched
+                # test/extension facades may not, so never let one attempt's
+                # selection leak into the next retry.
+                vars(request).pop(_SELECTED_REPLICA_ATTR, None)
                 self._change_queue_depth(priority, 1)
                 if track_async_attempt:
                     capacity_released = self._finish_async_occupancy_attempt(
@@ -4598,7 +4934,7 @@ class SkyServeLoadBalancer:
             failed_urls.add(ready_replica_url)
             with self._client_pool_lock:
                 all_ready_tried = failed_urls.issuperset(
-                    self._load_balancing_policy.ready_replicas)
+                    self._routable_ready_urls_locked())
             # When the user aborts the request during streaming, the request
             # will be disconnected. We do not need to retry for this case.
             if await request.is_disconnected():
@@ -4707,18 +5043,7 @@ class SkyServeLoadBalancer:
             for handler in uvicorn_access_logger.handlers:
                 handler.setFormatter(sky_logging.FORMATTER)
 
-            # Keep strong references: the loop only holds weak refs to
-            # tasks, so an unreferenced background task can be GC'd
-            # mid-flight.
-            # Register controller synchronization task
-            self._background_tasks.append(
-                asyncio.create_task(self._sync_with_controller()))
-            self._background_tasks.append(
-                asyncio.create_task(self._sync_role_with_controller()))
-            # [boltz fork] Register the async-occupancy prober (no-op task
-            # when disabled via env).
-            self._background_tasks.append(
-                asyncio.create_task(self._probe_occupancy_loop()))
+            self._start_background_loops()
 
         logger.info('SkyServe Load Balancer started on '
                     f'http://0.0.0.0:{self._load_balancer_port}. '

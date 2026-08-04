@@ -3,6 +3,46 @@ suite: server_deployment_test
 templates:
   - templates/api-deployment.yaml
 tests:
+  - it: should keep mounting the release-owned state claim by default
+    set:
+      storage.existingClaim: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: RELEASE-NAME-state
+
+  - it: should mount a pre-existing state claim
+    set:
+      storage.existingClaim: production-rwx-state
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: production-rwx-state
+
+  - it: should reject an existing claim when persistence is disabled
+    set:
+      storage.enabled: false
+      storage.existingClaim: production-rwx-state
+    asserts:
+      - failedTemplate:
+          errorMessage: "storage.existingClaim requires storage.enabled=true"
+
+  - it: should run as the externally managed API service account
+    set:
+      rbac.create: false
+      rbac.bindExistingServiceAccount: true
+      rbac.serviceAccountName: external-api
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: external-api
+
   - it: should mount kubeconfig correctly when useKubeconfig is enabled
     set:
       kubernetesCredentials.useKubeconfig: true
@@ -158,6 +198,256 @@ tests:
       - equal:
           path: spec.strategy.type
           value: Recreate
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: sqlite
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
+            value: /root/.sky/api-request-cutover.json
+
+  - it: should enable the PostgreSQL request store for one compatibility pod
+    set:
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: postgres
+
+  - it: should render stateless API replicas for role-split HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      executorService.replicas: 2
+      # Simulate an upgrade whose reused values still contain the pre-HA
+      # readiness endpoint. HA must force the role-specific readiness gate.
+      apiService.readinessProbe.httpGet.path: /api/health
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_ROLE
+            value: api
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_INSTANCE_ID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.uid
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /api/health/ready
+      - equal:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command
+          value:
+            - /bin/sh
+            - -c
+            - touch /var/run/skypilot/draining && sleep 20
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-role-runtime
+            mountPath: /var/run/skypilot
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-role-runtime
+            emptyDir: {}
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].topologyKey
+          value: kubernetes.io/hostname
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: state-volume
+            mountPath: /root/.sky
+            subPath: .sky
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: sky-ephemeral
+            emptyDir: {}
+
+  - it: should allow an explicit HA topology-spread opt-out
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      apiService.topologySpreadTopologyKey: ""
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - notExists:
+          path: spec.template.spec.topologySpreadConstraints
+
+  - it: should reject a chart-managed database secret in HA mode
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionString: postgresql://user:pass@host:5432/db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook"
+
+  - it: should reject an HA drain shorter than readiness detection
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.highAvailability.readinessDrainSeconds: 15
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.readinessDrainSeconds must be at least the API readiness failure-detection window (16 seconds)"
+
+  - it: should reserve enough termination time after the HA drain
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.highAvailability.readinessDrainSeconds: 51
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (61 seconds) in HA mode"
+
+  - it: should reject HA without the PostgreSQL request store
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires requestStore.backend=postgres"
+
+  - it: should reject HA with fewer than two API replicas
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 1
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.replicas>=2"
+
+  - it: should reject HA with fewer than two executor replicas
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      executorService.replicas: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires executorService.replicas>=2"
+
+  - it: should reject HA with fewer than two controller replicas
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      controllerService.replicas: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires controllerService.replicas>=2"
+
+  - it: should reject HA without shared RWX storage
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteOnce
+      storage.existingClaim: production-rwx-state
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires storage.accessMode=ReadWriteMany"
+
+  - it: should reject the PostgreSQL request store without an external database
+    set:
+      requestStore.backend: postgres
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres requires external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString"
+
+  - it: should reject the PostgreSQL request store without migration ownership
+    set:
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      databaseMigration.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres requires databaseMigration.enabled=true"
+
+  - it: should reject multiple all-role pods with the PostgreSQL request store
+    set:
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      apiService.replicas: 2
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres supports exactly one all-role API pod until role-split HA is enabled"
+
+  - it: should reject all-role rolling overlap with the PostgreSQL request store
+    set:
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      apiService.upgradeStrategy: RollingUpdate
+      storage.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres requires apiService.upgradeStrategy=Recreate until role-split HA is enabled"
+
+  - it: should reject an environment override of the request store selector
+    set:
+      apiService.extraEnvs:
+        - name: SKYPILOT_API_REQUEST_BACKEND
+          value: postgres
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_REQUEST_BACKEND" is duplicated or reserved by the chart'
 
   - it: should use RollingUpdate strategy when configured with external database via secret
     set:
@@ -1049,6 +1339,15 @@ tests:
           content:
             name: slurm-config
 
+  - it: should pass the configured metrics port to the API runtime
+    set:
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9191
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "sky api start --deploy --metrics --metrics-port 9191 --foreground"
+
   # Test cases for apiService.serveServerLog configuration
   - it: should tee server logs to file by default
     asserts:
@@ -1144,6 +1443,33 @@ tests:
           path: spec.template.spec.containers[1].args[0]
           pattern: '/root/\.sky/serve/\*/replica'
 
+  - it: should stop the logrotate sidecar child promptly on TERM or INT
+    set:
+      apiService.serveServerLog: true
+      apiService.logs.retention.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'shutdown\(\) \{[\s\S]*trap - TERM INT[\s\S]*kill "\$\{child_pid\}"[\s\S]*exit 0[\s\S]*\}'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'run_interruptibly\(\) \{[\s\S]*"\$@" &[\s\S]*child_pid=\$![\s\S]*wait "\$\{child_pid\}"[\s\S]*\}'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'trap shutdown TERM INT'
+
+  - it: should make both logrotate sidecar loops interruptible
+    set:
+      apiService.serveServerLog: true
+      apiService.logs.retention.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'if ! command -v logrotate[\s\S]*run_interruptibly sleep 3600[\s\S]*fi'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'EOF\s+while true; do\s+run_interruptibly logrotate -s /var/lib/logrotate/status /etc/logrotate\.conf\s+run_interruptibly sleep 60\s+done'
+
   - it: should not include logrotate sidecar when serveServerLog is false
     set:
       apiService.serveServerLog: false
@@ -1167,7 +1493,7 @@ tests:
             name: logrotate
 
   # Tests for the apiService.livenessProbe / readinessProbe / startupProbe values
-  - it: should render the default probe specs that match the historical chart output
+  - it: should render the default liveness, readiness, and startup probes
     asserts:
       # Liveness — historical defaults: httpGet only, periodSeconds 30,
       # timeoutSeconds 1. failureThreshold and initialDelaySeconds were
@@ -1188,11 +1514,10 @@ tests:
           path: spec.template.spec.containers[0].livenessProbe.failureThreshold
       - notExists:
           path: spec.template.spec.containers[0].livenessProbe.initialDelaySeconds
-      # Readiness — historical defaults plus successThreshold injected
-      # based on upgradeStrategy (RollingUpdate=3 by default; Recreate=1).
+      # Readiness additionally verifies that a durable executor is available.
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.httpGet.path
-          value: /api/health
+          value: /api/health/ready
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.httpGet.port
           value: 46580
@@ -1399,12 +1724,11 @@ tests:
           content:
             name: SOME_OTHER_ENV
             value: "x"
-      # Total env count = baseline (11, including POD_NAMESPACE and the
-      # explicit external-LB capability flag, with chart POD_IP suppressed:
-      # 10) + 2 user-provided = 12. A duplicate would push it to 13.
+      # The four HA role and identity variables extend the prior baseline.
+      # A duplicate POD_IP would push the count to 19.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 12
+          count: 18
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -1414,11 +1738,11 @@ tests:
             fieldRef:
               fieldPath: status.podIP
     asserts:
-      # Baseline (11, including POD_NAMESPACE and the external-LB capability)
-      # - chart POD_IP (10) + user POD_IP (1) = 11.
+      # The four HA role and identity variables extend the prior baseline.
+      # A duplicate POD_IP would push the count to 18.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 11
+          count: 17
 
   - it: should allow custom GCP workload identity env when native credentials are disabled
     set:

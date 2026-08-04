@@ -15,6 +15,7 @@ from unittest import mock
 
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import system_recovery_state
 from sky.utils import common_utils
 
 
@@ -29,6 +30,13 @@ def _replica_info(replica_id):
     info.status_property.first_ready_time = 1.0
     info.first_consecutive_failure_time = None
     info.first_not_ready_time = None
+    # This fixture models an ordinary replica.  Leaving newly added recovery
+    # fields as implicit Mock children makes ``quarantine is not None`` true and
+    # correctly drives the production probe loop into fail-closed teardown.
+    info.system_recovery_quarantine = None
+    info.system_recovery_disposition = (
+        system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+    info.system_recovery = None
     return info
 
 

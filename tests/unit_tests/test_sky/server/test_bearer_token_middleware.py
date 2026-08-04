@@ -6,6 +6,7 @@ import unittest.mock as mock
 import fastapi
 import pytest
 
+from sky.server.server import BasicAuthMiddleware
 from sky.server.server import BearerTokenMiddleware
 from sky.skylet import constants
 
@@ -31,7 +32,7 @@ class TestBearerTokenMiddleware:
     def mock_call_next(self):
         """Create a mock call_next function."""
 
-        async def call_next(request):
+        async def call_next(_request):
             return fastapi.responses.JSONResponse({"message": "success"})
 
         return call_next
@@ -233,6 +234,7 @@ class TestBearerTokenMiddleware:
 
         mock_user_info = mock.Mock()
         mock_user_info.name = 'test-service-account'
+        mock_user_info.user_type = 'sa'
 
         with mock.patch.dict(
                 os.environ,
@@ -253,6 +255,7 @@ class TestBearerTokenMiddleware:
             # Verify user was set in request state
             assert base_mock_request.state.auth_user.id == 'sa-123456'
             assert base_mock_request.state.auth_user.name == 'test-service-account'
+            assert base_mock_request.state.auth_user.user_type == 'sa'
             # last_used must be updated with the DB row's token_id, not
             # the JWT's.
             mock_update_last_used.assert_called_once_with('token_db_id_456')
@@ -357,6 +360,7 @@ class TestBearerTokenMiddleware:
 
         mock_user_info = mock.Mock()
         mock_user_info.name = 'test-service-account'
+        mock_user_info.user_type = 'sa'
 
         with mock.patch.dict(
                 os.environ,
@@ -420,6 +424,7 @@ class TestBearerTokenMiddleware:
 
         mock_user_info = mock.Mock()
         mock_user_info.name = 'test-service-account'
+        mock_user_info.user_type = 'sa'
 
         with mock.patch.dict(
                 os.environ,
@@ -498,9 +503,9 @@ class TestBearerTokenMiddleware:
         mock_user_info = mock.Mock()
         mock_user_info.id = 'sa-123456'
         mock_user_info.name = 'test-service-account'
+        mock_user_info.user_type = 'sa'
 
         # Mock BasicAuthMiddleware
-        from sky.server.server import BasicAuthMiddleware
         basic_auth_middleware = BasicAuthMiddleware(app=mock.Mock())
 
         # Create a call_next that simulates BasicAuthMiddleware being next in chain

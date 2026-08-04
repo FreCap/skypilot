@@ -172,6 +172,29 @@ jobs:
           # Contracts are static (grimp parses imports); no dep install needed.
           lint-imports
 
+  lifecycle-removal-manifest:
+    runs-on: namespace-profile-skypilot-ci-2x4
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+        with:
+          fetch-depth: 0
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+          python-version: "3.14"
+      - name: Check lifecycle removal obligations
+        run: |
+          uv venv --seed "${RUNNER_TEMP}/lifecycle-removals-env"
+          uv pip install \
+            --python "${RUNNER_TEMP}/lifecycle-removals-env/bin/python" \
+            pyyaml==6.0.3
+          "${RUNNER_TEMP}/lifecycle-removals-env/bin/python" \
+            tools/check_lifecycle_removals.py \
+            --manifest \
+            docs/designs/provider-lifecycle-actuation-removals.yaml \
+            --phase current
+
   # NOT a legacy-Python lane: our deployment is 3.14-only, but SkyPilot
   # bootstraps cluster workers with a Python 3.10 env (ray 2.9.3 has no
   # newer wheels; see requires_python in setup.py) and pip-installs this
@@ -192,7 +215,55 @@ jobs:
           uv venv --seed ~/worker-env
           source ~/worker-env/bin/activate
           uv pip install -e .
-          python -c "import sky, sky.skylet.constants, sky.jobs.state, sky.data.storage; print(sky.__version__)"
+          python - <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import unicodedata
+
+          import sky
+          import sky.batch.coordinator
+          import sky.provision.ray_commands
+          import sky.skylet.constants
+          import sky.jobs.state
+          import sky.data.storage
+          import sky.placement.offer
+          import sky.utils.json_types
+
+          frozen = sky.utils.json_types.freeze_json({
+              'z': [],
+              'a': {
+                  'value': True,
+              },
+          })
+          assert isinstance(frozen, sky.utils.json_types.FrozenJSONDict)
+          assert tuple(frozen) == ('a', 'z')
+
+          probe_b64 = sky.provision.ray_commands.host_network_probe_b64()
+          assert probe_b64.isascii()
+          compressed_probe = base64.b64decode(probe_b64, validate=True)
+          assert compressed_probe[:10].hex() == '1f8b08000000000002ff'
+          assert hashlib.sha256(compressed_probe).hexdigest() == (
+              '75aa9fefe49fe72bd89bcf70158467754871fa19c9541fd5fcbe5181ae285895')
+          probe_source = gzip.decompress(compressed_probe).decode('utf-8')
+          compile(probe_source, '<host-network-probe>', 'exec')
+
+          for suffix in ('\U00016ff0', '\U00016ff1'):
+              source = f'\u0301{suffix}'
+              expected = f'{suffix}\u0301'
+              assert unicodedata.ucd_3_2_0.normalize('NFC',
+                                                    source) == expected
+              try:
+                  sky.placement.offer.OfferAcceleratorV1(name=source, count=1)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(
+                      'Non-NFC placement text must be rejected.')
+              sky.placement.offer.OfferAcceleratorV1(name=expected, count=1)
+
+          print(sky.__version__)
+          PY
       - name: Compile the whole package on the cluster-worker Python
         # The imports above only reach modules on those four import paths; a
         # 3.11+ syntax construct anywhere else in the package would still
@@ -201,6 +272,57 @@ jobs:
         run: |
           source ~/worker-env/bin/activate
           python -m compileall -q -x 'schemas/generated' sky
+
+  host-network-probe-portability:
+    name: "Host-network probe payload (Python ${{ matrix.python-version }})"
+    runs-on: namespace-profile-skypilot-ci-2x4
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "latest"
+          python-version: ${{ matrix.python-version }}
+      - name: Verify deterministic probe packaging
+        run: |
+          uv venv --seed "$RUNNER_TEMP/probe-env"
+          source "$RUNNER_TEMP/probe-env/bin/activate"
+          uv pip install -e .
+          python - <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import subprocess
+          import sys
+
+          script = (
+              'from sky.provision import ray_commands; '
+              'print(ray_commands.host_network_probe_b64())'
+          )
+          outputs = []
+          for _ in range(2):
+              result = subprocess.run(
+                  [sys.executable, '-c', script],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              outputs.append(result.stdout.splitlines()[-1])
+
+          assert outputs[0] == outputs[1]
+          assert outputs[0].isascii()
+          compressed = base64.b64decode(outputs[0], validate=True)
+          assert compressed[:10].hex() == '1f8b08000000000002ff'
+          assert hashlib.sha256(compressed).hexdigest() == (
+              '75aa9fefe49fe72bd89bcf70158467754871fa19c9541fd5fcbe5181ae285895'
+          )
+          source = gzip.decompress(compressed).decode('utf-8')
+          compile(source, '<host-network-probe>', 'exec')
+          PY
 
   actionlint:
     runs-on: namespace-profile-skypilot-ci-1x2

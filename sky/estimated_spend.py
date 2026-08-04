@@ -16,6 +16,7 @@ from sqlalchemy.dialects import sqlite
 from sky import estimated_spend_cost
 from sky import global_user_state
 from sky import sky_logging
+from sky.serve import serve_history
 from sky.utils import locks
 from sky.utils.db import db_utils
 
@@ -38,6 +39,12 @@ _STATE_ID = 1
 _HASH_END_SENTINEL = '\uffff'
 GROUP_TABLE_LIMIT = 50
 GROUP_CHART_LIMIT = 8
+DRILLDOWN_DEFAULT_LIMIT = 50
+DRILLDOWN_MAX_LIMIT = 100
+# Serve's placement catalog values Kubernetes locations as reserved or
+# already-paid capacity. Keep this exception scoped to the service ratio:
+# global spend continues to report Kubernetes time as excluded.
+_SERVICE_ZERO_COST_EXCLUSION_REASONS = ('kubernetes',)
 
 
 class GroupBy(str, enum.Enum):
@@ -48,8 +55,21 @@ class GroupBy(str, enum.Enum):
     PURCHASE_OPTION = 'purchase_option'
 
 
+class SpendDrilldownLevel(str, enum.Enum):
+    """Supported levels in the spend-attribution hierarchy."""
+
+    OWNER = 'owner'
+    WORKLOAD = 'workload'
+    TASK = 'task'
+    CLUSTER = 'cluster'
+
+
 class InvalidDateRangeError(ValueError):
     """The requested estimated-spend UTC date range is invalid."""
+
+
+class InvalidDrilldownScopeError(ValueError):
+    """The requested spend-attribution hierarchy scope is invalid."""
 
 
 def _utc_day_start(timestamp: int) -> int:
@@ -433,14 +453,29 @@ def _sum_expression(column: Any) -> Any:
     return sqlalchemy.func.coalesce(sqlalchemy.func.sum(column), 0)
 
 
-def _aggregate_columns(daily: Any) -> list[Any]:
-    priced_seconds = sqlalchemy.case((sqlalchemy.and_(
-        daily.c.exclusion_reason.is_(None),
-        daily.c.estimated_cost.is_not(None)), daily.c.machine_seconds),
-                                     else_=0)
+def _count_expression(column: Any | None = None) -> Any:
+    if column is None:
+        return sqlalchemy.func.count()  # pylint: disable=not-callable
+    return sqlalchemy.func.count(column)  # pylint: disable=not-callable
+
+
+def _aggregate_columns(
+        daily: Any,
+        zero_cost_exclusion_reasons: tuple[str, ...] = (),
+) -> list[Any]:
+    covered_condition = sqlalchemy.and_(daily.c.exclusion_reason.is_(None),
+                                        daily.c.estimated_cost.is_not(None))
+    excluded_condition = daily.c.exclusion_reason.is_not(None)
+    if zero_cost_exclusion_reasons:
+        known_zero_cost = daily.c.exclusion_reason.in_(
+            zero_cost_exclusion_reasons)
+        covered_condition = sqlalchemy.or_(covered_condition, known_zero_cost)
+        excluded_condition = sqlalchemy.and_(excluded_condition,
+                                             sqlalchemy.not_(known_zero_cost))
+    priced_seconds = sqlalchemy.case(
+        (covered_condition, daily.c.machine_seconds), else_=0)
     excluded_seconds = sqlalchemy.case(
-        (daily.c.exclusion_reason.is_not(None), daily.c.machine_seconds),
-        else_=0)
+        (excluded_condition, daily.c.machine_seconds), else_=0)
     spot_cost = sqlalchemy.case(
         (daily.c.use_spot.is_(True), daily.c.estimated_cost), else_=0)
     on_demand_cost = sqlalchemy.case(
@@ -470,6 +505,276 @@ def _row_to_breakdown(row: Any, key_names: tuple[str, ...]) -> dict[str, Any]:
         'excluded_machine_seconds': int(row.excluded_machine_seconds or 0),
     })
     return result
+
+
+def _workload_type_expression(daily: Any) -> Any:
+    """Return the evidenced logical workload type for dashboard grouping."""
+    return sqlalchemy.case(
+        (daily.c.workload_type == 'managed', 'managed_unattributed'),
+        else_=daily.c.workload_type)
+
+
+def _workload_id_expression(daily: Any) -> Any:
+    """Hide cluster-derived IDs when a legacy managed parent is unproven."""
+    return sqlalchemy.case((daily.c.workload_type == 'managed', None),
+                           else_=daily.c.workload_id)
+
+
+def _workload_key_expression(daily: Any) -> Any:
+    workload_type = sqlalchemy.func.coalesce(_workload_type_expression(daily),
+                                             'cluster')
+    workload_id = sqlalchemy.func.coalesce(_workload_id_expression(daily), '')
+    return workload_type + '\x1f' + workload_id
+
+
+def _owner_scope_condition(daily: Any, owner_user_hash: str | None,
+                           owner_unknown: bool) -> Any:
+    if owner_unknown:
+        return daily.c.user_hash.is_(None)
+    assert owner_user_hash is not None
+    return daily.c.user_hash == owner_user_hash
+
+
+def _workload_scope_condition(daily: Any, workload_type: str,
+                              workload_id: str | None) -> Any:
+    if workload_type == 'managed_unattributed':
+        if workload_id is not None:
+            raise InvalidDrilldownScopeError(
+                'managed_unattributed must not include workload_id')
+        return daily.c.workload_type == 'managed'
+    workload_id_condition = (daily.c.workload_id.is_(None) if workload_id
+                             is None else daily.c.workload_id == workload_id)
+    return sqlalchemy.and_(daily.c.workload_type == workload_type,
+                           workload_id_condition)
+
+
+def _validate_drilldown_scope(
+    level: SpendDrilldownLevel,
+    owner_user_hash: str | None,
+    owner_unknown: bool,
+    workload_type: str | None,
+    workload_id: str | None,
+    workload_task_id: int | None,
+    offset: int,
+    limit: int,
+) -> None:
+    if offset < 0:
+        raise InvalidDrilldownScopeError('offset must be non-negative')
+    if limit < 1 or limit > DRILLDOWN_MAX_LIMIT:
+        raise InvalidDrilldownScopeError(
+            f'limit must be between 1 and {DRILLDOWN_MAX_LIMIT}')
+
+    has_owner_scope = owner_user_hash is not None or owner_unknown
+    if owner_user_hash is not None and owner_unknown:
+        raise InvalidDrilldownScopeError(
+            'provide owner_user_hash or owner_unknown, not both')
+    if level == SpendDrilldownLevel.OWNER:
+        if (has_owner_scope or workload_type is not None or
+                workload_id is not None or workload_task_id is not None):
+            raise InvalidDrilldownScopeError(
+                'owner level does not accept a parent scope')
+        return
+
+    if not has_owner_scope:
+        raise InvalidDrilldownScopeError(
+            'descendant levels require owner_user_hash or owner_unknown')
+    if level == SpendDrilldownLevel.WORKLOAD:
+        if (workload_type is not None or workload_id is not None or
+                workload_task_id is not None):
+            raise InvalidDrilldownScopeError(
+                'workload level accepts only an owner scope')
+        return
+
+    if workload_type is None:
+        raise InvalidDrilldownScopeError(
+            'task and cluster levels require workload_type')
+    if (workload_type != 'managed_unattributed' and workload_id is None):
+        raise InvalidDrilldownScopeError(
+            'task and cluster levels require workload_id')
+    if level == SpendDrilldownLevel.TASK:
+        if workload_task_id is not None:
+            raise InvalidDrilldownScopeError(
+                'task level does not accept workload_task_id')
+        if workload_type == 'managed_unattributed':
+            raise InvalidDrilldownScopeError(
+                'legacy managed workloads do not have evidenced task parents')
+
+
+def _paginated_group_rows(session: orm.Session, query: Any, offset: int,
+                          limit: int) -> tuple[list[Any], int]:
+    count_query = sqlalchemy.select(_count_expression()).select_from(
+        query.order_by(None).subquery())
+    total = int(session.scalar(count_query) or 0)
+    rows = session.execute(query.offset(offset).limit(limit)).fetchall()
+    return rows, total
+
+
+def _drilldown_row(row: Any, key_names: tuple[str, ...],
+                   extra_names: tuple[str, ...]) -> dict[str, Any]:
+    result = _row_to_breakdown(row, key_names)
+    for name in extra_names:
+        value = getattr(row, name)
+        if name.endswith('_count'):
+            value = int(value or 0)
+        result[name] = value
+    return result
+
+
+def get_estimated_spend_drilldown(
+    level: str | SpendDrilldownLevel,
+    days: int = DEFAULT_LOOKBACK_DAYS,
+    start_date: datetime.date | None = None,
+    end_date: datetime.date | None = None,
+    owner_user_hash: str | None = None,
+    owner_unknown: bool = False,
+    workload_type: str | None = None,
+    workload_id: str | None = None,
+    workload_task_id: int | None = None,
+    offset: int = 0,
+    limit: int = DRILLDOWN_DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Read one bounded page of the spend-attribution hierarchy."""
+    try:
+        normalized_level = SpendDrilldownLevel(level)
+    except ValueError as e:
+        options = ', '.join(option.value for option in SpendDrilldownLevel)
+        raise InvalidDrilldownScopeError(
+            f'level must be one of: {options}') from e
+    _validate_drilldown_scope(normalized_level, owner_user_hash, owner_unknown,
+                              workload_type, workload_id, workload_task_id,
+                              offset, limit)
+
+    now = int(time.time())
+    first_day, last_day, requested_days = _resolve_query_range(
+        days, start_date, end_date, now)
+    daily = global_user_state.estimated_spend_daily_table
+    base_filter = sqlalchemy.and_(
+        daily.c.day_start_utc >= first_day, daily.c.day_start_utc
+        < last_day + SECONDS_PER_DAY)
+    engine = global_user_state.initialize_and_get_db()
+
+    with orm.Session(engine) as session:
+        if normalized_level == SpendDrilldownLevel.OWNER:
+            users = global_user_state.user_table
+            workload_count = _count_expression(
+                sqlalchemy.distinct(
+                    _workload_key_expression(daily))).label('workload_count')
+            cluster_count = _count_expression(
+                sqlalchemy.distinct(
+                    daily.c.cluster_hash)).label('cluster_count')
+            query = (sqlalchemy.select(
+                daily.c.user_hash.label('user_hash'),
+                users.c.name.label('user_name'),
+                workload_count,
+                cluster_count,
+                *_aggregate_columns(daily),
+            ).select_from(
+                daily.outerjoin(users, daily.c.user_hash == users.c.id)).where(
+                    base_filter).group_by(
+                        daily.c.user_hash, users.c.name).order_by(
+                            sqlalchemy.desc('estimated_cost'),
+                            sqlalchemy.func.coalesce(users.c.name, ''),
+                            sqlalchemy.func.coalesce(daily.c.user_hash, '')))
+            rows, total = _paginated_group_rows(session, query, offset, limit)
+            response_rows = []
+            for row in rows:
+                result = _drilldown_row(row, ('user_hash', 'user_name'),
+                                        ('workload_count', 'cluster_count'))
+                result['owner_unknown'] = row.user_hash is None
+                response_rows.append(result)
+        else:
+            assert owner_user_hash is not None or owner_unknown
+            scoped_filter = sqlalchemy.and_(
+                base_filter,
+                _owner_scope_condition(daily, owner_user_hash, owner_unknown))
+            if normalized_level == SpendDrilldownLevel.WORKLOAD:
+                displayed_type = _workload_type_expression(daily)
+                displayed_id = _workload_id_expression(daily)
+                unknown_task_cluster = sqlalchemy.case(
+                    (daily.c.workload_task_id.is_(None), daily.c.cluster_hash),
+                    else_=None)
+                query = (sqlalchemy.select(
+                    displayed_type.label('workload_type'),
+                    displayed_id.label('workload_id'),
+                    _count_expression(
+                        sqlalchemy.distinct(
+                            daily.c.workload_task_id)).label('task_count'),
+                    _count_expression(
+                        sqlalchemy.distinct(unknown_task_cluster)).label(
+                            'unknown_task_cluster_count'),
+                    _count_expression(sqlalchemy.distinct(
+                        daily.c.cluster_hash)).label('cluster_count'),
+                    *_aggregate_columns(daily),
+                ).where(scoped_filter).group_by(
+                    displayed_type, displayed_id).order_by(
+                        sqlalchemy.desc('estimated_cost'), displayed_type,
+                        sqlalchemy.func.coalesce(displayed_id, '')))
+                rows, total = _paginated_group_rows(session, query, offset,
+                                                    limit)
+                response_rows = [
+                    _drilldown_row(row, ('workload_type', 'workload_id'),
+                                   ('task_count', 'unknown_task_cluster_count',
+                                    'cluster_count')) for row in rows
+                ]
+            else:
+                assert workload_type is not None
+                scoped_filter = sqlalchemy.and_(
+                    scoped_filter,
+                    _workload_scope_condition(daily, workload_type,
+                                              workload_id))
+                if normalized_level == SpendDrilldownLevel.TASK:
+                    scoped_filter = sqlalchemy.and_(
+                        scoped_filter, daily.c.workload_task_id.is_not(None))
+                    query = (sqlalchemy.select(
+                        daily.c.workload_task_id.label('workload_task_id'),
+                        _count_expression(
+                            sqlalchemy.distinct(
+                                daily.c.cluster_hash)).label('cluster_count'),
+                        *_aggregate_columns(daily),
+                    ).where(scoped_filter).group_by(
+                        daily.c.workload_task_id).order_by(
+                            daily.c.workload_task_id.asc()))
+                    rows, total = _paginated_group_rows(session, query, offset,
+                                                        limit)
+                    response_rows = [
+                        _drilldown_row(row, ('workload_task_id',),
+                                       ('cluster_count',)) for row in rows
+                    ]
+                else:
+                    if workload_task_id is not None:
+                        scoped_filter = sqlalchemy.and_(
+                            scoped_filter,
+                            daily.c.workload_task_id == workload_task_id)
+                    query = (sqlalchemy.select(
+                        daily.c.cluster_hash.label('cluster_hash'),
+                        daily.c.cluster_name.label('cluster_name'),
+                        daily.c.workspace.label('workspace'),
+                        *_aggregate_columns(daily),
+                    ).where(scoped_filter).group_by(
+                        daily.c.cluster_hash, daily.c.cluster_name,
+                        daily.c.workspace).order_by(
+                            sqlalchemy.desc('estimated_cost'),
+                            daily.c.cluster_name.asc(),
+                            daily.c.cluster_hash.asc()))
+                    rows, total = _paginated_group_rows(session, query, offset,
+                                                        limit)
+                    response_rows = [
+                        _drilldown_row(
+                            row, ('cluster_hash', 'cluster_name', 'workspace'),
+                            ()) for row in rows
+                    ]
+
+    return {
+        'level': normalized_level.value,
+        'start_date': _utc_date_from_day_start(first_day).isoformat(),
+        'end_date': _utc_date_from_day_start(last_day).isoformat(),
+        'requested_days': requested_days,
+        'rows': response_rows,
+        'total': total,
+        'offset': offset,
+        'limit': limit,
+        'has_more': offset + len(response_rows) < total,
+    }
 
 
 def _normalize_group_by(group_by: str | GroupBy) -> GroupBy:
@@ -525,6 +830,8 @@ def _get_group_rows(session: orm.Session, daily: Any, base_filter: Any,
 
 def _group_match_condition(daily: Any, group_by: GroupBy, row: Any) -> Any:
     if group_by == GroupBy.JOB:
+        if row.workload_type == 'managed_unattributed':
+            return daily.c.workload_type == 'managed'
         workload_id = row.workload_id
         workload_id_condition = (daily.c.workload_id.is_(None)
                                  if workload_id is None else daily.c.workload_id
@@ -547,7 +854,12 @@ def _get_daily_group_rows(session: orm.Session, daily: Any, base_filter: Any,
         _group_match_condition(daily, group_by, row) for row in top_group_rows
     ]
     if group_by == GroupBy.JOB:
-        key_columns = [daily.c.workload_type, daily.c.workload_id]
+        displayed_workload_type = _workload_type_expression(daily)
+        displayed_workload_id = _workload_id_expression(daily)
+        key_columns = [
+            displayed_workload_type.label('workload_type'),
+            displayed_workload_id.label('workload_id')
+        ]
         group_columns = key_columns
     elif group_by == GroupBy.USER:
         key_columns = [daily.c.user_hash]
@@ -602,6 +914,203 @@ def _build_series(group_by: GroupBy, top_group_rows: list[Any],
     return series
 
 
+def _get_service_request_and_cost_rows(
+    session: orm.Session,
+    spend_daily: Any,
+    spend_filter: Any,
+    first_day: int,
+    last_day: int,
+    service_names: list[str],
+) -> tuple[list[Any], list[Any]]:
+    """Read bounded daily request and cost rows for displayed services."""
+    if not service_names:
+        return [], []
+
+    request_daily = serve_history.serve_request_activity_daily_table
+    first_day_datetime = datetime.datetime.fromtimestamp(
+        first_day, datetime.timezone.utc)
+    end_exclusive_datetime = datetime.datetime.fromtimestamp(
+        last_day + SECONDS_PER_DAY, datetime.timezone.utc)
+    classification_supported = sqlalchemy.and_(
+        request_daily.c.classified_request_count.is_not(None),
+        request_daily.c.counted_rejected_count.is_not(None))
+    classified_count = sqlalchemy.func.coalesce(
+        sqlalchemy.func.sum(request_daily.c.classified_request_count).filter(
+            classification_supported), 0)
+    counted_rejected_count = sqlalchemy.func.coalesce(
+        sqlalchemy.func.sum(request_daily.c.counted_rejected_count).filter(
+            classification_supported), 0)
+    request_rows = session.execute(
+        sqlalchemy.select(
+            request_daily.c.day_start,
+            request_daily.c.service_name,
+            (classified_count - counted_rejected_count).label('request_count'),
+        ).where(
+            sqlalchemy.and_(
+                request_daily.c.day_start >= first_day_datetime,
+                request_daily.c.day_start < end_exclusive_datetime,
+                request_daily.c.service_name.in_(service_names),
+            )).group_by(request_daily.c.day_start,
+                        request_daily.c.service_name)).fetchall()
+
+    cost_rows = session.execute(
+        sqlalchemy.select(
+            spend_daily.c.day_start_utc,
+            spend_daily.c.workload_id.label('service_name'),
+            *_aggregate_columns(spend_daily,
+                                zero_cost_exclusion_reasons=(
+                                    _SERVICE_ZERO_COST_EXCLUSION_REASONS)),
+        ).where(
+            sqlalchemy.and_(
+                spend_filter,
+                spend_daily.c.workload_type == 'service',
+                spend_daily.c.workload_id.in_(service_names),
+            )).group_by(spend_daily.c.day_start_utc,
+                        spend_daily.c.workload_id)).fetchall()
+    return request_rows, cost_rows
+
+
+def _first_complete_coverage_day(coverage_start_utc: int | None) -> int | None:
+    """Return the first UTC day wholly covered by a history source."""
+    if coverage_start_utc is None:
+        return None
+    day_start = _utc_day_start(coverage_start_utc)
+    if coverage_start_utc > day_start:
+        day_start += SECONDS_PER_DAY
+    return day_start
+
+
+def _enrich_service_requests_with_costs(
+    service_requests: dict[str, Any],
+    days: list[dict[str, Any]],
+    request_rows: list[Any],
+    cost_rows: list[Any],
+    spend_coverage_start_utc: int | None,
+) -> None:
+    """Attach aligned service compute cost and cost-per-request estimates."""
+    if not service_requests.get('available'):
+        return
+
+    day_starts = [int(day['day_start_utc']) for day in days]
+    request_counts = {
+        (str(row.service_name), int(row.day_start.timestamp())): int(
+            row.request_count or 0) for row in request_rows
+    }
+    costs = {
+        (str(row.service_name), int(row.day_start_utc)): {
+            'estimated_cost': float(row.estimated_cost or 0),
+            'priced_machine_seconds': int(row.priced_machine_seconds or 0),
+            'excluded_machine_seconds': int(row.excluded_machine_seconds or 0),
+        } for row in cost_rows
+    }
+    spend_coverage_start = _first_complete_coverage_day(
+        spend_coverage_start_utc)
+
+    services_by_name = {
+        str(service['service_name']): service
+        for service in service_requests.get('services', [])
+    }
+    for service_name, service in services_by_name.items():
+        complete_by_day = service.get('complete_by_day')
+        if (not isinstance(complete_by_day, list) or
+                len(complete_by_day) != len(day_starts)):
+            complete_by_day = [False for _ in day_starts]
+        included_days = [
+            day_start
+            for day_start, complete in zip(day_starts, complete_by_day)
+            if complete and spend_coverage_start is not None and
+            day_start >= spend_coverage_start
+        ]
+        ratio_coverage_start = min(included_days) if included_days else None
+        ratio_request_count = 0
+        estimated_cost = 0.0
+        priced_machine_seconds = 0
+        excluded_machine_seconds = 0
+        for day_start, complete in zip(day_starts, complete_by_day):
+            if (not complete or spend_coverage_start is None or
+                    day_start < spend_coverage_start):
+                continue
+            ratio_request_count += request_counts.get((service_name, day_start),
+                                                      0)
+            day_cost = costs.get((service_name, day_start), {})
+            estimated_cost += float(day_cost.get('estimated_cost', 0))
+            priced_machine_seconds += int(
+                day_cost.get('priced_machine_seconds', 0))
+            excluded_machine_seconds += int(
+                day_cost.get('excluded_machine_seconds', 0))
+
+        if excluded_machine_seconds > 0:
+            cost_coverage = 'partial'
+        elif (ratio_coverage_start is None or ratio_request_count <= 0 or
+              priced_machine_seconds <= 0):
+            cost_coverage = 'unavailable'
+        else:
+            cost_coverage = 'complete'
+        estimated_cost_per_request = None
+        if cost_coverage == 'complete':
+            estimated_cost_per_request = (estimated_cost / ratio_request_count)
+        service.update({
+            'estimated_cost': estimated_cost,
+            'estimated_cost_per_request': estimated_cost_per_request,
+            'ratio_request_count': ratio_request_count,
+            'ratio_coverage_start_utc': ratio_coverage_start,
+            'priced_machine_seconds': priced_machine_seconds,
+            'excluded_machine_seconds': excluded_machine_seconds,
+            'cost_coverage': cost_coverage,
+        })
+
+    for series in service_requests.get('series', []):
+        if series.get('is_other'):
+            continue
+        service_name = str(series['service_name'])
+        service = services_by_name.get(service_name, {})
+        complete_by_day = service.get('complete_by_day')
+        if (not isinstance(complete_by_day, list) or
+                len(complete_by_day) != len(day_starts)):
+            complete_by_day = [False for _ in day_starts]
+        daily_costs = []
+        daily_ratios = []
+        for index, day_start in enumerate(day_starts):
+            request_count = request_counts.get((service_name, day_start), 0)
+            day_cost = costs.get((service_name, day_start), {})
+            estimated_cost = float(day_cost.get('estimated_cost', 0))
+            priced_seconds = int(day_cost.get('priced_machine_seconds', 0))
+            excluded_seconds = int(day_cost.get('excluded_machine_seconds', 0))
+            daily_costs.append(estimated_cost)
+            ratio_available = (bool(complete_by_day[index]) and
+                               spend_coverage_start is not None and
+                               day_start >= spend_coverage_start and
+                               request_count > 0 and priced_seconds > 0 and
+                               excluded_seconds == 0)
+            daily_ratios.append(estimated_cost /
+                                request_count if ratio_available else None)
+        series['estimated_cost_by_day'] = daily_costs
+        series['estimated_cost_per_request_by_day'] = daily_ratios
+
+
+def _mark_legacy_service_request_costs_unavailable(service_requests: dict[str,
+                                                                          Any],
+                                                   day_count: int) -> None:
+    """Keep attempt counts compatible without exposing an invalid ratio."""
+    for service in service_requests.get('services', []):
+        service.update({
+            'estimated_cost': 0.0,
+            'estimated_cost_per_request': None,
+            'ratio_request_count': 0,
+            'ratio_coverage_start_utc': None,
+            'priced_machine_seconds': 0,
+            'excluded_machine_seconds': 0,
+            'cost_coverage': 'unavailable',
+        })
+    for series in service_requests.get('series', []):
+        if series.get('is_other'):
+            continue
+        series['estimated_cost_by_day'] = [0.0 for _ in range(day_count)]
+        series['estimated_cost_per_request_by_day'] = [
+            None for _ in range(day_count)
+        ]
+
+
 def get_estimated_spend(
     days: int = DEFAULT_LOOKBACK_DAYS,
     group_by: str | GroupBy = GroupBy.JOB,
@@ -625,6 +1134,8 @@ def get_estimated_spend(
         base_filter = sqlalchemy.and_(
             daily.c.day_start_utc >= first_day, daily.c.day_start_utc
             < last_day + SECONDS_PER_DAY)
+        displayed_workload_type = _workload_type_expression(daily)
+        displayed_workload_id = _workload_id_expression(daily)
         day_rows = session.execute(
             sqlalchemy.select(
                 daily.c.day_start_utc.label('day_start_utc'),
@@ -634,13 +1145,15 @@ def get_estimated_spend(
 
         workload_rows = session.execute(
             sqlalchemy.select(
-                daily.c.workload_type.label('workload_type'),
-                daily.c.workload_id.label('workload_id'),
+                displayed_workload_type.label('workload_type'),
+                displayed_workload_id.label('workload_id'),
                 *_aggregate_columns(daily),
             ).where(base_filter).group_by(
-                daily.c.workload_type,
-                daily.c.workload_id).order_by(sqlalchemy.desc(
-                    'estimated_cost')).limit(GROUP_TABLE_LIMIT)).fetchall()
+                displayed_workload_type, displayed_workload_id).order_by(
+                    sqlalchemy.desc('estimated_cost'), displayed_workload_type,
+                    sqlalchemy.func.coalesce(
+                        displayed_workload_id,
+                        '')).limit(GROUP_TABLE_LIMIT)).fetchall()
 
         cloud_rows = session.execute(
             sqlalchemy.select(
@@ -697,11 +1210,46 @@ def get_estimated_spend(
 
     last_success = int(state['last_success_at'] or 0) if state else 0
     backfill_complete = bool(state['backfill_complete']) if state else False
+    spend_coverage_start = (int(state['coverage_start_utc']) if state and
+                            state['coverage_start_utc'] is not None else None)
     total_cost = sum(day['estimated_cost'] for day in days_response)
     total_priced_seconds = sum(
         day['priced_machine_seconds'] for day in days_response)
     total_excluded_seconds = sum(
         day['excluded_machine_seconds'] for day in days_response)
+    service_requests = serve_history.get_daily_request_summary(
+        engine=engine,
+        first_day_start=first_day,
+        last_day_start=last_day,
+        days=days_response,
+        table_limit=GROUP_TABLE_LIMIT,
+        chart_limit=GROUP_CHART_LIMIT,
+    )
+    _mark_legacy_service_request_costs_unavailable(service_requests,
+                                                   len(days_response))
+    non_rejected_requests = service_requests.get('non_rejected')
+    if (isinstance(non_rejected_requests, dict) and
+            non_rejected_requests.get('available')):
+        service_names = [
+            str(service['service_name'])
+            for service in non_rejected_requests.get('services', [])
+        ]
+        request_rows: list[Any] = []
+        service_cost_rows: list[Any] = []
+        try:
+            with orm.Session(engine) as session:
+                request_rows, service_cost_rows = (
+                    _get_service_request_and_cost_rows(session, daily,
+                                                       base_filter, first_day,
+                                                       last_day, service_names))
+        except sqlalchemy.exc.SQLAlchemyError:
+            # Keep the independently useful request totals available during a
+            # rolling upgrade or transient best-effort spend read failure.
+            logger.exception('Failed to read daily service request costs.')
+        _enrich_service_requests_with_costs(non_rejected_requests,
+                                            days_response, request_rows,
+                                            service_cost_rows,
+                                            spend_coverage_start)
     return {
         'currency': 'USD',
         'basis': 'skypilot_catalog_payg_equivalent',
@@ -710,9 +1258,7 @@ def get_estimated_spend(
         'stale': (not last_success or
                   now - last_success > REFRESH_INTERVAL_SECONDS * 2),
         'backfill_complete': backfill_complete,
-        'coverage_start_utc':
-            (int(state['coverage_start_utc'])
-             if state and state['coverage_start_utc'] is not None else None),
+        'coverage_start_utc': spend_coverage_start,
         'kubernetes_included': False,
         'reservation_adjustments_applied': False,
         'start_date': _utc_date_from_day_start(first_day).isoformat(),
@@ -736,6 +1282,7 @@ def get_estimated_spend(
         ],
         'series': _build_series(normalized_group_by, top_group_rows,
                                 daily_group_rows, days_response),
+        'service_requests': service_requests,
         'excluded_by_reason': {
             str(row.exclusion_reason): int(row.machine_seconds or 0)
             for row in reason_rows

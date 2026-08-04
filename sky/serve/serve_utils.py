@@ -1,6 +1,5 @@
 """User interface with the SkyServe."""
 import base64
-import bisect
 import collections
 from collections.abc import Callable
 from collections.abc import Iterator
@@ -10,8 +9,8 @@ import dataclasses
 import datetime
 import enum
 import hashlib
-import ipaddress
 import json
+import logging
 import math
 import os
 import pathlib
@@ -41,7 +40,10 @@ from sky.container_images import task_utils as container_image_task_utils
 from sky.jobs import state as managed_job_state
 from sky.serve import auth_tokens
 from sky.serve import constants
+from sky.serve import controller_transport
+from sky.serve import request_aggregator
 from sky.serve import serve_state
+from sky.serve import serve_status_formatter
 from sky.serve import spot_placer
 from sky.server import constants as server_constants
 from sky.server.requests import request_names
@@ -73,10 +75,27 @@ if typing.TYPE_CHECKING:
     WorkerHandle = backends.CloudVmRayResourceHandle | None
 else:
     psutil = adaptors_common.LazyImport('psutil')
-    requests = adaptors_common.LazyImport('requests')
+    requests = controller_transport.requests
     WorkerHandle = Any
 
-logger = sky_logging.init_logger(__name__)
+logger: logging.Logger = sky_logging.init_logger(__name__)
+controller_transport.logger = logger
+
+# Keep the established serve_utils import and pickle identities while the
+# presentation-only implementation lives in its own low-state module.
+# pylint: disable=protected-access
+_REPLICA_TRUNC_NUM = serve_status_formatter._REPLICA_TRUNC_NUM
+_get_replicas = serve_status_formatter._get_replicas
+format_service_table = serve_status_formatter.format_service_table
+_format_replica_table = serve_status_formatter._format_replica_table
+# pylint: enable=protected-access
+for _status_formatter_symbol in (
+        _get_replicas,
+        format_service_table,
+        _format_replica_table,
+):
+    _status_formatter_symbol.__module__ = __name__
+del _status_formatter_symbol
 
 
 def get_provider_configs_for_handles(
@@ -135,28 +154,7 @@ for _auth_token_symbol in (
     _auth_token_symbol.__module__ = __name__
 del _auth_token_symbol
 
-# Retry settings for cross-pod controller HTTP calls. The DB row update of
-# `controller_ip` is atomic w.r.t. controller readiness (sky.serve.service
-# only flips DB after _wait_for_controller_ready), so the only failure modes
-# left are: (1) DB read replica lag right after a recovery; (2) brief network
-# blips between pods.
-# Intermediate retries log at DEBUG to avoid spamming WARN every refresh tick
-# while the controller is intentionally absent (CONTROLLER_INIT /
-# SHUTTING_DOWN / FAILED_CLEANUP); the final-attempt failure logs once at
-# WARN.
-# A single attempt with a tight connect timeout keeps `sky jobs pool status`
-# responsive even when one of N pools' controllers is unreachable.
-_CONTROLLER_HTTP_RETRY_ATTEMPTS = 1
-_CONTROLLER_HTTP_RETRY_BACKOFF_SECONDS = 0.5
 _LAUNCH_QUIESCE_MAX_CANCEL_ROUNDS = 3
-# (connect_timeout, read_timeout). Connect timeout matters most: when the
-# controller pod is dead/unreachable, kernel ECONNREFUSED is instant on
-# loopback but cross-pod TCP can hang for 30s+ if the remote pod silently
-# drops SYN (e.g. NetworkPolicy, pod terminating mid-flight). Without an
-# explicit timeout, `requests` waits forever and `sky jobs pool status`
-# appears to hang. Read timeout is generous because /autoscaler/info on a
-# busy controller can take a moment.
-_CONTROLLER_HTTP_TIMEOUT_SECONDS = (1.0, 10.0)
 
 # Bound on the per-call thread pool used by `get_service_status_pickled` to
 # fan out across services/pools. The per-service work is dominated by I/O
@@ -164,10 +162,6 @@ _CONTROLLER_HTTP_TIMEOUT_SECONDS = (1.0, 10.0)
 # 100-pool deployment doesn't open 100 simultaneous DB connections or
 # trigger memory pressure on big pools.
 _STATUS_FANOUT_MAX_WORKERS = 8
-
-
-class ControllerOwnerError(RuntimeError):
-    """The intended service incarnation has no safe controller target."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,213 +172,44 @@ class _PurgeResult:
     message: str | None = None
 
 
-_ControllerOwner = tuple[str, int, str | None, int]
-
-
-def make_controller_owner_fingerprint(service_hash: object,
-                                      controller_pid: object,
-                                      controller_ip: object,
-                                      controller_port: object) -> str:
-    """Return a stable fingerprint for one exact controller owner tuple."""
-    if not isinstance(service_hash, str) or not service_hash:
-        raise ControllerOwnerError('Controller service hash is missing.')
-    if (not isinstance(controller_pid, int) or
-            isinstance(controller_pid, bool) or controller_pid <= 0):
-        raise ControllerOwnerError(
-            'Controller parent PID is missing or invalid.')
-    if (not isinstance(controller_port, int) or
-            isinstance(controller_port, bool) or
-            not 1 <= controller_port <= 65535):
-        raise ControllerOwnerError('Controller port is missing or invalid.')
-    normalized_ip: str | None = None
-    if controller_ip is not None:
-        if not isinstance(controller_ip, str) or not controller_ip:
-            raise ControllerOwnerError('Controller IP is invalid.')
-        try:
-            normalized_ip = str(ipaddress.ip_address(controller_ip))
-        except ValueError as e:
-            raise ControllerOwnerError('Controller IP is invalid.') from e
-    payload = json.dumps(
-        [service_hash, controller_pid, normalized_ip, controller_port],
-        separators=(',', ':'))
-    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
-
-
-def _get_controller_url(service_name: str,
-                        expected_service_hash: str) -> tuple[str, str]:
-    """Resolve and fence the controller HTTP URL.
-
-    In single-pod (or daemon == controller pod) deployments the IP read from
-    DB either matches our own POD_IP or is None — in both cases we fall back
-    to localhost. In HA where the request handler runs on a different pod
-    than the controller process, we route via the controller's pod IP from DB.
-    The address and owner fingerprint come from one narrow, atomic row read.
-    """
-    record = serve_state.get_service_controller_owner(service_name)
-    if record is None:
-        raise ControllerOwnerError(
-            f'Controller owner for {service_name!r} is missing.')
-    service_hash = record.get('hash')
-    if service_hash != expected_service_hash:
-        raise ControllerOwnerError(
-            f'Service {service_name!r} was replaced while the controller '
-            'request was in flight.')
-    service_status = record.get('status')
-    if (not isinstance(service_status, serve_state.ServiceStatus) or
-            service_status in (serve_state.ServiceStatus.SHUTTING_DOWN,
-                               serve_state.ServiceStatus.FAILED_CLEANUP)):
-        raise ControllerOwnerError(
-            f'Controller owner for {service_name!r} is not routable.')
-    controller_pid = record.get('controller_pid')
-    controller_port = record.get('controller_port')
-    controller_ip = record.get('controller_ip')
-    owner_fingerprint = make_controller_owner_fingerprint(
-        service_hash, typing.cast(int, controller_pid), controller_ip,
-        typing.cast(int, controller_port))
-    self_ip = os.environ.get('POD_IP')
-    normalized_self_ip = None
-    if self_ip is not None:
-        try:
-            normalized_self_ip = str(ipaddress.ip_address(self_ip))
-        except ValueError:
-            pass
-    normalized_controller_ip = None
-    if controller_ip is not None:
-        normalized_controller_ip = str(ipaddress.ip_address(controller_ip))
-    if (normalized_controller_ip is None or
-            normalized_controller_ip == normalized_self_ip):
-        url = f'http://localhost:{controller_port}'
-    else:
-        host = (f'[{normalized_controller_ip}]' if ':'
-                in normalized_controller_ip else normalized_controller_ip)
-        url = f'http://{host}:{controller_port}'
-    logger.debug(f'_get_controller_url for {service_name}: url={url} '
-                 f'self_ip={self_ip} controller_ip={controller_ip}')
-    return url, owner_fingerprint
-
-
-def _get_local_controller_url(owner: _ControllerOwner) -> tuple[str, str]:
-    """Resolve a specifically supervised local child without consulting DB."""
-    service_hash, controller_pid, controller_ip, controller_port = owner
-    owner_fingerprint = make_controller_owner_fingerprint(
-        service_hash, controller_pid, controller_ip, controller_port)
-    return f'http://localhost:{controller_port}', owner_fingerprint
-
-
-def _request_to_controller_with_retry(method: str,
-                                      service_name: str,
-                                      expected_service_hash: str,
-                                      path: str,
-                                      *,
-                                      fixed_controller_owner: _ControllerOwner |
-                                      None = None,
-                                      **kwargs):
-    """HTTP `method` to the controller with bounded retry on ConnectionError.
-    """
-    request_fn = getattr(requests, method)
-    # Force a bounded timeout.
-    if 'timeout' not in kwargs:
-        kwargs['timeout'] = _CONTROLLER_HTTP_TIMEOUT_SECONDS
-    # Controller callers use the admin ring, independent of the credential the
-    # LB uses for sync. During rotation, retry with the next overlap credential
-    # only after a 401: transport failures retry the SAME credential, while a
-    # 403/5xx is an application result and must not replay the request.
-    admin_tokens = get_controller_admin_auth_tokens()
-    owner_header_lower = constants.CONTROLLER_OWNER_HEADER.lower()
-    base_headers = {
-        name: value
-        for name, value in dict(kwargs.pop('headers', {}) or {}).items()
-        if str(name).lower() != owner_header_lower
-    }
-    caller_supplied_auth = any(
-        str(name).lower() == 'authorization' for name in base_headers)
-    token_index = 0
-    for attempt in range(_CONTROLLER_HTTP_RETRY_ATTEMPTS):
-        if fixed_controller_owner is None:
-            controller_url, owner_fingerprint = _get_controller_url(
-                service_name, expected_service_hash)
-        else:
-            if fixed_controller_owner[0] != expected_service_hash:
-                raise ControllerOwnerError(
-                    'Fixed controller owner does not match the intended '
-                    'service incarnation.')
-            controller_url, owner_fingerprint = _get_local_controller_url(
-                fixed_controller_owner)
-        url = controller_url + path
-        try:
-            while True:
-                headers = dict(base_headers)
-                headers[constants.CONTROLLER_OWNER_HEADER] = owner_fingerprint
-                if admin_tokens and not caller_supplied_auth:
-                    headers['Authorization'] = (
-                        f'Bearer {admin_tokens[token_index]}')
-                request_kwargs = dict(kwargs)
-                if headers:
-                    request_kwargs['headers'] = headers
-                response = request_fn(url, **request_kwargs)
-                if (response.status_code == 401 and not caller_supplied_auth and
-                        token_index + 1 < len(admin_tokens)):
-                    token_index += 1
-                    continue
-                return response
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout):
-            if attempt < _CONTROLLER_HTTP_RETRY_ATTEMPTS - 1:
-                logger.debug(
-                    f'Connection to controller {url} failed '
-                    f'(attempt {attempt + 1}/'
-                    f'{_CONTROLLER_HTTP_RETRY_ATTEMPTS}); retrying after '
-                    f'{_CONTROLLER_HTTP_RETRY_BACKOFF_SECONDS}s.')
-                time.sleep(_CONTROLLER_HTTP_RETRY_BACKOFF_SECONDS)
-                continue
-            logger.warning(
-                f'Connection to controller {url} failed after '
-                f'{_CONTROLLER_HTTP_RETRY_ATTEMPTS} attempts. '
-                'Controller may be down, restarting, or mid-HA-flip.')
-            raise
-
-
-def _post_to_controller_with_retry(service_name: str,
-                                   expected_service_hash: str, path: str,
-                                   **kwargs):
-    return _request_to_controller_with_retry('post', service_name,
-                                             expected_service_hash, path,
-                                             **kwargs)
-
-
-def _get_to_controller_with_retry(service_name: str, expected_service_hash: str,
-                                  path: str, **kwargs):
-    return _request_to_controller_with_retry('get', service_name,
-                                             expected_service_hash, path,
-                                             **kwargs)
-
-
-def get_service_placement_state(service_name: str,
-                                expected_service_hash: str) -> dict[str, Any]:
-    """Read one controller's in-memory placer state with bounded I/O."""
-    response = _get_to_controller_with_retry(
-        service_name,
-        expected_service_hash,
-        constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
-        timeout=(1.0, 2.0))
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError('Placement-state response must be an object.')
-    return payload
-
-
-def _get_to_local_controller_with_retry(service_name: str,
-                                        controller_owner: _ControllerOwner,
-                                        path: str, **kwargs):
-    return _request_to_controller_with_retry(
-        'get',
-        service_name,
-        controller_owner[0],
-        path,
-        fixed_controller_owner=controller_owner,
-        **kwargs)
-
+# Keep the established serve_utils import and pickle identities while the
+# controller HTTP implementation lives in its own low-state gateway.
+# pylint: disable=protected-access
+_CONTROLLER_HTTP_RETRY_ATTEMPTS: int = (
+    controller_transport._CONTROLLER_HTTP_RETRY_ATTEMPTS)
+_CONTROLLER_HTTP_RETRY_BACKOFF_SECONDS: float = (
+    controller_transport._CONTROLLER_HTTP_RETRY_BACKOFF_SECONDS)
+_CONTROLLER_HTTP_TIMEOUT_SECONDS: tuple[float, float] = (
+    controller_transport._CONTROLLER_HTTP_TIMEOUT_SECONDS)
+ControllerOwnerError = controller_transport.ControllerOwnerError
+_ControllerOwner = controller_transport._ControllerOwner
+make_controller_owner_fingerprint = (
+    controller_transport.make_controller_owner_fingerprint)
+_get_controller_url = controller_transport._get_controller_url
+_get_local_controller_url = controller_transport._get_local_controller_url
+_request_to_controller_with_retry = (
+    controller_transport._request_to_controller_with_retry)
+_post_to_controller_with_retry = (
+    controller_transport._post_to_controller_with_retry)
+_get_to_controller_with_retry = (
+    controller_transport._get_to_controller_with_retry)
+get_service_placement_state = controller_transport.get_service_placement_state
+_get_to_local_controller_with_retry = (
+    controller_transport._get_to_local_controller_with_retry)
+# pylint: enable=protected-access
+for _controller_transport_symbol in (
+        ControllerOwnerError,
+        make_controller_owner_fingerprint,
+        _get_controller_url,
+        _get_local_controller_url,
+        _request_to_controller_with_retry,
+        _post_to_controller_with_retry,
+        _get_to_controller_with_retry,
+        get_service_placement_state,
+        _get_to_local_controller_with_retry,
+):
+    _controller_transport_symbol.__module__ = __name__
+del _controller_transport_symbol
 
 # NOTE(dev): We assume log are print with the hint 'sky api logs -l'. Be careful
 # when changing UX as this assumption is used to expand some log files while
@@ -401,9 +226,6 @@ _FAILED_TO_FIND_REPLICA_MSG = (
     f'{colorama.Fore.RED}Failed to find replica '
     '{replica_id}. Please use `sky serve status [SERVICE_NAME]`'
     f' to check all valid replica id.{colorama.Style.RESET_ALL}')
-# Max number of replicas to show in `sky serve status` by default.
-# If user wants to see all replicas, use `sky serve status --all`.
-_REPLICA_TRUNC_NUM = 10
 
 
 class ServiceComponent(enum.Enum):
@@ -479,386 +301,11 @@ _SIGNAL_TO_ERROR = {
     UserSignal.TERMINATE: exceptions.ServeUserTerminatedError,
 }
 
-
-class RequestsAggregator:
-    """Base class for request aggregator."""
-
-    def add(self, request: 'fastapi.Request') -> None:
-        """Add a request to the request aggregator."""
-        raise NotImplementedError
-
-    def add_rejection(self) -> None:
-        """Record one terminal load-balancer rejection."""
-        raise NotImplementedError
-
-    def clear(self) -> None:
-        """Clear all current request aggregator."""
-        raise NotImplementedError
-
-    def drain(self) -> dict[str, Any]:
-        """Atomically take the current report batch out of the aggregator.
-
-        New samples added after this method returns belong to the next batch.
-        The caller must restore the returned batch if delivery fails.
-        """
-        raise NotImplementedError
-
-    def restore(self, batch: dict[str, Any]) -> None:
-        """Restore a previously drained batch after failed delivery."""
-        raise NotImplementedError
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert the aggregator to a dict."""
-        raise NotImplementedError
-
-    def request_history_snapshot(self) -> dict[str, Any] | None:
-        """Return request-history counters awaiting acknowledgement."""
-        raise NotImplementedError
-
-    def mark_request_history_accepted(self,
-                                      snapshot: dict[str, Any] | None) -> None:
-        """Mark a request-history snapshot as durably accepted."""
-        raise NotImplementedError
-
-    def add_prediction_time(self, duration_seconds: float,
-                            outcome: str) -> None:
-        """Record one completed prediction."""
-        raise NotImplementedError
-
-    def prediction_time_history_snapshot(self) -> dict[str, Any] | None:
-        """Return prediction-time counters awaiting acknowledgement."""
-        raise NotImplementedError
-
-    def mark_prediction_time_history_accepted(
-            self, snapshot: dict[str, Any] | None) -> None:
-        """Mark a prediction-time snapshot as durably accepted."""
-        raise NotImplementedError
-
-    def __repr__(self) -> str:
-        raise NotImplementedError
-
-
-class RequestTimestamp(RequestsAggregator):
-    """RequestTimestamp: Aggregates request timestamps.
-
-    This is useful for QPS-based autoscaling.
-    """
-
-    def __init__(self) -> None:
-        # Bounded: the batch is retained across a failed controller sync (so
-        # load signal is not dropped), but a persistent failure must not grow it
-        # without limit -- maxlen keeps only the most recent samples (ample for
-        # QPS autoscaling). See constants.LB_REQUEST_TIMESTAMP_CAP.
-        self.timestamps: collections.deque[float] = collections.deque(
-            maxlen=constants.LB_REQUEST_TIMESTAMP_CAP)
-        self.compatibility_profiles: collections.deque[dict[str, Any]] = (
-            collections.deque(maxlen=constants.LB_REQUEST_TIMESTAMP_CAP))
-        # Exact arrival counters are reported independently from the lossy,
-        # bounded raw timestamp batch used by autoscaling. Counts remain in
-        # memory through the current hour so another request in an already
-        # acknowledged minute advances the same cumulative counter.
-        self._request_history: dict[int, int] = {}
-        self._acknowledged_request_history: dict[int, int] = {}
-        self._rejection_history: dict[int, int] = {}
-        self._acknowledged_rejection_history: dict[int, int] = {}
-        self._prediction_time_history: dict[int, dict[str, list[int]]] = {}
-        self._acknowledged_prediction_time_history: dict[int,
-                                                         dict[str,
-                                                              list[int]]] = {}
-        # Pruning rebuilds both bounded history dictionaries. Keep that work on
-        # minute boundaries (and controller snapshots), never on every request.
-        self._last_pruned_request_history_bucket: int | None = None
-
-    def add(self, request: 'fastapi.Request') -> None:
-        """Add a request to the request aggregator."""
-        timestamp = time.time()
-        self.timestamps.append(timestamp)
-        compatible = getattr(request, '_skyserve_compatible_accelerators', None)
-        self.compatibility_profiles.append({
-            'timestamp': timestamp,
-            'priority': int(
-                getattr(request, '_skyserve_request_priority',
-                        constants.LB_REQUEST_PRIORITY_MIN)),
-            # None distinguishes a legacy omitted-catalog request from an
-            # explicit canonical set; an empty list is never valid.
-            'compatible_accelerators':
-                (list(compatible) if compatible is not None else None),
-        })
-        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
-        bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
-        self._request_history[bucket_start] = (
-            self._request_history.get(bucket_start, 0) + 1)
-        if bucket_start != self._last_pruned_request_history_bucket:
-            self._prune_request_history(bucket_start)
-
-    def add_rejection(self) -> None:
-        """Record one terminal 503 in its completion-minute bucket."""
-        timestamp = time.time()
-        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
-        bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
-        self._rejection_history[bucket_start] = (
-            self._rejection_history.get(bucket_start, 0) + 1)
-        if bucket_start != self._last_pruned_request_history_bucket:
-            self._prune_request_history(bucket_start)
-
-    def add_prediction_time(self, duration_seconds: float,
-                            outcome: str) -> None:
-        """Record one completed prediction in its observation minute."""
-        timestamp = time.time()
-        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
-        bucket_start = int(timestamp // bucket_seconds) * bucket_seconds
-        if outcome not in constants.LB_PREDICTION_TIME_OUTCOMES:
-            raise ValueError(f'Unsupported prediction outcome: {outcome!r}.')
-        if (not isinstance(duration_seconds, (int, float)) or
-                isinstance(duration_seconds, bool) or
-                not math.isfinite(duration_seconds)):
-            raise ValueError('Prediction duration must be finite.')
-        duration_seconds = max(0.0, float(duration_seconds))
-        duration_bucket = bisect.bisect_left(
-            constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS,
-            duration_seconds)
-        outcome_counts = self._prediction_time_history.setdefault(
-            bucket_start, {})
-        counts = outcome_counts.setdefault(
-            outcome, [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT)
-        counts[duration_bucket] += 1
-        if bucket_start != self._last_pruned_request_history_bucket:
-            self._prune_request_history(bucket_start)
-
-    def clear(self) -> None:
-        """Clear all current request aggregator."""
-        self.timestamps.clear()
-        self.compatibility_profiles.clear()
-        self._request_history.clear()
-        self._acknowledged_request_history.clear()
-        self._rejection_history.clear()
-        self._acknowledged_rejection_history.clear()
-        self._prediction_time_history.clear()
-        self._acknowledged_prediction_time_history.clear()
-        self._last_pruned_request_history_bucket = None
-
-    def _prune_request_history(self, newest_bucket: int) -> None:
-        oldest_bucket = (newest_bucket -
-                         (constants.LB_REQUEST_HISTORY_MAX_BUCKETS - 1) *
-                         constants.LB_REQUEST_HISTORY_BUCKET_SECONDS)
-        self._request_history = {
-            bucket: count
-            for bucket, count in self._request_history.items()
-            if bucket >= oldest_bucket
-        }
-        self._acknowledged_request_history = {
-            bucket: count
-            for bucket, count in self._acknowledged_request_history.items()
-            if bucket >= oldest_bucket
-        }
-        self._rejection_history = {
-            bucket: count
-            for bucket, count in self._rejection_history.items()
-            if bucket >= oldest_bucket
-        }
-        self._acknowledged_rejection_history = {
-            bucket: count
-            for bucket, count in self._acknowledged_rejection_history.items()
-            if bucket >= oldest_bucket
-        }
-        self._prediction_time_history = {
-            bucket: counts
-            for bucket, counts in self._prediction_time_history.items()
-            if bucket >= oldest_bucket
-        }
-        self._acknowledged_prediction_time_history = {
-            bucket: counts
-            for bucket, counts in
-            self._acknowledged_prediction_time_history.items()
-            if bucket >= oldest_bucket
-        }
-        self._last_pruned_request_history_bucket = newest_bucket
-
-    def request_history_snapshot(self) -> dict[str, Any] | None:
-        """Return counters changed since their last durable acknowledgement."""
-        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
-        newest_bucket = int(time.time() // bucket_seconds) * bucket_seconds
-        self._prune_request_history(newest_bucket)
-        bucket_starts = sorted(
-            set(self._request_history) | set(self._rejection_history))
-        buckets = []
-        for bucket in bucket_starts:
-            request_count = self._request_history.get(bucket, 0)
-            rejected_count = self._rejection_history.get(bucket, 0)
-            if (request_count <= self._acknowledged_request_history.get(
-                    bucket, 0) and
-                    rejected_count <= self._acknowledged_rejection_history.get(
-                        bucket, 0)):
-                continue
-            bucket_payload = {
-                'bucket_start': bucket,
-                'request_count': request_count,
-                'rejected_count': rejected_count,
-            }
-            buckets.append(bucket_payload)
-        if not buckets:
-            return None
-        return {
-            'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
-            'buckets': buckets,
-        }
-
-    def mark_request_history_accepted(self,
-                                      snapshot: dict[str, Any] | None) -> None:
-        """Acknowledge only counts present in an accepted snapshot.
-
-        Requests arriving while the snapshot is in flight increment the live
-        counter beyond the acknowledged value and are therefore sent on the
-        next sync.
-        """
-        if snapshot is None:
-            return
-        for bucket in snapshot.get('buckets', []):
-            bucket_start = bucket.get('bucket_start')
-            request_count = bucket.get('request_count')
-            rejected_count = bucket.get('rejected_count', 0)
-            current_count = self._request_history.get(bucket_start)
-            if current_count is not None:
-                accepted_count = min(current_count, request_count)
-                self._acknowledged_request_history[bucket_start] = max(
-                    accepted_count,
-                    self._acknowledged_request_history.get(bucket_start, 0))
-            current_rejected = self._rejection_history.get(bucket_start)
-            if current_rejected is not None:
-                accepted_rejected = min(current_rejected, rejected_count)
-                self._acknowledged_rejection_history[bucket_start] = max(
-                    accepted_rejected,
-                    self._acknowledged_rejection_history.get(bucket_start, 0))
-
-    @staticmethod
-    def _prediction_counts_advance(
-            current: dict[str, list[int]],
-            acknowledged: dict[str, list[int]] | None) -> bool:
-        if acknowledged is None:
-            return any(sum(counts) for counts in current.values())
-        for outcome, counts in current.items():
-            accepted = acknowledged.get(outcome, [])
-            if any(count > (accepted[index] if index < len(accepted) else 0)
-                   for index, count in enumerate(counts)):
-                return True
-        return False
-
-    def prediction_time_history_snapshot(self) -> dict[str, Any] | None:
-        """Return prediction histograms changed since durable acceptance."""
-        bucket_seconds = constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
-        newest_bucket = int(time.time() // bucket_seconds) * bucket_seconds
-        self._prune_request_history(newest_bucket)
-        buckets = []
-        for bucket_start in sorted(self._prediction_time_history):
-            outcome_counts = self._prediction_time_history[bucket_start]
-            acknowledged = self._acknowledged_prediction_time_history.get(
-                bucket_start)
-            if not self._prediction_counts_advance(outcome_counts,
-                                                   acknowledged):
-                continue
-            buckets.append({
-                'bucket_start': bucket_start,
-                'outcome_counts': {
-                    outcome: list(counts)
-                    for outcome, counts in outcome_counts.items()
-                    if any(counts)
-                },
-            })
-        if not buckets:
-            return None
-        return {
-            'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
-            'histogram_version': constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
-            'buckets': buckets,
-        }
-
-    def mark_prediction_time_history_accepted(
-            self, snapshot: dict[str, Any] | None) -> None:
-        """Acknowledge only histogram counts present in one accepted report."""
-        if snapshot is None:
-            return
-        for bucket in snapshot.get('buckets', []):
-            bucket_start = bucket.get('bucket_start')
-            live = self._prediction_time_history.get(bucket_start)
-            reported = bucket.get('outcome_counts')
-            if live is None or not isinstance(reported, dict):
-                continue
-            acknowledged = self._acknowledged_prediction_time_history.setdefault(
-                bucket_start, {})
-            for outcome, reported_counts in reported.items():
-                live_counts = live.get(outcome)
-                if live_counts is None or not isinstance(reported_counts, list):
-                    continue
-                accepted = acknowledged.setdefault(
-                    outcome, [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT)
-                for index, reported_count in enumerate(reported_counts):
-                    if index >= len(live_counts) or index >= len(accepted):
-                        break
-                    accepted[index] = max(
-                        accepted[index], min(live_counts[index],
-                                             reported_count))
-
-    def drain(self) -> dict[str, Any]:
-        """Take the current timestamps, leaving later arrivals untouched."""
-        batch = self.to_dict()
-        self.timestamps.clear()
-        self.compatibility_profiles.clear()
-        return batch
-
-    def restore(self, batch: dict[str, Any]) -> None:
-        """Merge a failed batch back ahead of any arrivals made in-flight.
-
-        Extending oldest-to-newest also preserves the deque's bounded behavior:
-        if the combined batches exceed the cap, only the newest timestamps are
-        retained.
-        """
-        drained = batch.get('timestamps', [])
-        drained_profiles = batch.get('compatibility_profiles', [])
-        if not drained and not drained_profiles:
-            return
-        current = list(self.timestamps)
-        current_profiles = list(self.compatibility_profiles)
-        self.timestamps.clear()
-        self.compatibility_profiles.clear()
-        self.timestamps.extend(drained)
-        self.timestamps.extend(current)
-        self.compatibility_profiles.extend(drained_profiles)
-        self.compatibility_profiles.extend(current_profiles)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert the aggregator to a dict."""
-        grouped_profiles: dict[tuple[int, frozenset[str]], dict[str, Any]] = {}
-        for profile in self.compatibility_profiles:
-            accelerators = profile.get('compatible_accelerators')
-            priority = profile.get('priority')
-            timestamp = profile.get('timestamp')
-            count = profile.get('count', 1)
-            if (not isinstance(accelerators, list) or not accelerators or
-                    not isinstance(priority, int) or
-                    not isinstance(timestamp, (int, float)) or
-                    not isinstance(count, int) or count < 1):
-                # Legacy omitted-catalog samples remain visible to aggregate
-                # timestamp scaling but cannot be safely assigned to a card.
-                continue
-            key = (priority, frozenset(accelerators))
-            grouped = grouped_profiles.get(key)
-            if grouped is None:
-                grouped_profiles[key] = {
-                    'timestamp': timestamp,
-                    'priority': priority,
-                    'compatible_accelerators': list(accelerators),
-                    'count': count,
-                }
-            else:
-                grouped['timestamp'] = max(grouped['timestamp'], timestamp)
-                grouped['count'] += count
-        return {
-            'timestamps': list(self.timestamps),
-            'compatibility_profiles': list(grouped_profiles.values()),
-        }
-
-    def __repr__(self) -> str:
-        return f'RequestTimestamp(timestamps={list(self.timestamps)})'
+RequestsAggregator = request_aggregator.RequestsAggregator
+RequestTimestamp = request_aggregator.RequestTimestamp
+for _request_aggregator_symbol in (RequestsAggregator, RequestTimestamp):
+    _request_aggregator_symbol.__module__ = __name__
+del _request_aggregator_symbol
 
 
 def get_service_filelock_path(pool: str) -> str:
@@ -1871,12 +1318,36 @@ def generate_replica_cluster_name(service_name: str,
     return f'{prefix}{suffix}'
 
 
+_COMPLETED_REPLICA_FAILURE_STATUSES = frozenset({
+    serve_state.ReplicaStatus.FAILED_PROVISION,
+})
+
+
+def _service_status_from_replica_infos(
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    target_num_replicas: int | None,
+) -> serve_state.ServiceStatus:
+    replica_statuses = [info.status for info in replica_infos]
+    status = serve_state.ServiceStatus.from_replica_statuses(replica_statuses)
+    if (status == serve_state.ServiceStatus.FAILED and
+            target_num_replicas == 0 and
+            all(replica_status in _COMPLETED_REPLICA_FAILURE_STATUSES
+                for replica_status in replica_statuses)):
+        # Completed provisioning failures are retained for operator-visible
+        # history. Once the autoscaler authoritatively wants no replicas, those
+        # rows no longer describe the current fleet. App/readiness failures and
+        # cleanup-uncertain FAILED_CLEANUP/UNKNOWN rows remain visible.
+        return serve_state.ServiceStatus.NO_REPLICA
+    return status
+
+
 def set_service_status_and_active_versions_from_replica(
     service_name: str,
     replica_infos: list['replica_managers.ReplicaInfo'],
     update_mode: UpdateMode,
     expected_service_hash: str | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    target_num_replicas: int | None = None,
 ) -> None:
     record = serve_state.get_service_controller_owner(service_name,
                                                       require_version=True)
@@ -1917,13 +1388,11 @@ def set_service_status_and_active_versions_from_replica(
         chosen_version = get_latest_version_with_min_replicas(
             service_name, replica_infos)
         active_versions = [chosen_version] if chosen_version is not None else []
-    # Compute the service status from ALL replicas, not just the ready ones:
-    # `from_replica_statuses` needs the full set to ever return FAILED (some
-    # replica failed, none ready) or REPLICA_INIT (replicas exist, none ready
-    # or failed). Fed only ready replicas, it can only return READY or
-    # NO_REPLICA, so a service whose replicas all failed would show the
-    # benign-looking NO_REPLICA. `active_versions` above intentionally stays
-    # on the ready replicas (the versions actually serving traffic).
+    # Compute the service status from ALL replicas, not just the ready ones.
+    # The authoritative autoscaler target lets the helper distinguish an idle
+    # scale-to-zero service from an actively desired fleet whose replicas all
+    # failed. `active_versions` above intentionally stays on ready replicas
+    # (the versions actually serving traffic).
     service_hash = (expected_service_hash
                     if expected_service_hash is not None else record_hash)
     if not isinstance(service_hash, str) or not service_hash:
@@ -1936,8 +1405,7 @@ def set_service_status_and_active_versions_from_replica(
                        is not None else record.get('controller_pid')),
         (expected_controller_owner[1] if expected_controller_owner is not None
          else record.get('controller_ip')),
-        serve_state.ServiceStatus.from_replica_statuses(
-            [info.status for info in replica_infos]),
+        _service_status_from_replica_infos(replica_infos, target_num_replicas),
         active_versions=active_versions,
         expected_status=observed_status)
     if not updated:
@@ -2490,18 +1958,22 @@ def resolve_target_qps_for_gpu_shape(
 
 
 def get_service_status_pickled(
-        service_names: list[str] | None,
-        pool: bool,
-        summary_only: bool = False,
-        include_target_num_replicas: bool | None = None
+    service_names: list[str] | None,
+    pool: bool,
+    summary_only: bool = False,
+    include_target_num_replicas: bool | None = None,
+    metadata_only: bool = False,
 ) -> list[dict[str, str]]:
+    if summary_only and metadata_only:
+        raise ValueError(
+            'summary_only and metadata_only are mutually exclusive.')
     if service_names is None:
         # Get all names for the requested mode only.
         service_names = serve_state.get_glob_service_names(None, pool=pool)
     if not service_names:
         return []
     if include_target_num_replicas is None:
-        include_target_num_replicas = not summary_only
+        include_target_num_replicas = not summary_only and not metadata_only
     # Fan out across services. Each `_get_service_status` is dominated by
     # I/O (controller HTTP + DB reads) so threads parallelize well; the
     # cap on max_workers keeps memory and DB-connection pressure bounded.
@@ -2516,17 +1988,22 @@ def get_service_status_pickled(
     def _run_in_context(name: str) -> dict[str, Any] | None:
         kwargs = {
             'pool': pool,
-            'with_replica_info': not summary_only,
+            'with_replica_info': not summary_only and not metadata_only,
             'with_replica_counts': summary_only,
             'with_target_num_replicas': include_target_num_replicas,
         }
+        if metadata_only:
+            kwargs['status_snapshot_only'] = True
         # Service summaries are metadata-only dashboard snapshots. Avoid
         # parsing, redacting, and dumping one YAML document per service on
         # every poll. Pool summaries deliberately keep YAML because pool
         # lifecycle consumers parse it back into a launchable task.
-        if summary_only and not pool:
+        if (summary_only and not pool) or metadata_only:
             kwargs['with_yaml'] = False
-        return parent_ctx.copy().run(_get_service_status, name, **kwargs)
+        status = parent_ctx.copy().run(_get_service_status, name, **kwargs)
+        if status is not None and metadata_only:
+            status['metadata_only'] = True
+        return status
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -2550,11 +2027,11 @@ def get_service_status_pickled(
 
 
 # TODO (kyuds): remove when serve codegen is removed
-def get_service_status_encoded(
-        service_names: list[str] | None,
-        pool: bool,
-        summary_only: bool = False,
-        include_target_num_replicas: bool | None = None) -> str:
+def get_service_status_encoded(service_names: list[str] | None,
+                               pool: bool,
+                               summary_only: bool = False,
+                               include_target_num_replicas: bool | None = None,
+                               metadata_only: bool = False) -> str:
     # We have to use payload_type here to avoid the issue of
     # message_utils.decode_payload() not being able to correctly decode the
     # message with <sky-payload> tags.
@@ -2562,6 +2039,7 @@ def get_service_status_encoded(
         service_names,
         pool,
         summary_only=summary_only,
+        metadata_only=metadata_only,
         include_target_num_replicas=include_target_num_replicas)
     return message_utils.encode_payload(service_statuses,
                                         payload_type='service_status')
@@ -3006,6 +2484,28 @@ def get_existing_replica_cluster_names(
         global_user_state.get_cluster_status_fields(cluster_names).keys())
 
 
+def get_orphaned_service_cluster_status_fields(
+) -> dict[str, tuple[str | None, int | None]]:
+    """Returns managed service clusters without an exact replica owner.
+
+    Only consolidated SkyServe has both inventories in the API server's
+    central database. Non-consolidated services keep replica authority on
+    their remote controller, so an API-server-side absence is not evidence of
+    orphaned ownership there.
+    """
+    if not is_consolidation_mode():
+        return {}
+    candidates = global_user_state.get_managed_cluster_status_fields('service')
+    if not candidates:
+        return {}
+    owned_cluster_names = serve_state.get_replica_cluster_names()
+    return {
+        cluster_name: status_fields
+        for cluster_name, status_fields in candidates.items()
+        if cluster_name not in owned_cluster_names
+    }
+
+
 def _terminate_failed_services(service_name: str,
                                expected_service_hash: str | None,
                                service_status: serve_state.ServiceStatus | None,
@@ -3196,11 +2696,32 @@ def _terminate_failed_services_locked(
     if not _still_owns():
         return _purge_ownership_failure(
             service_name, 'ownership lost after cluster inventory snapshot')
+    # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove this
+    # failed-service purge submission path at M5 for eligible authoritative
+    # services after durable down actions cover purge and rollback.
     to_terminate = [
         info for info in replica_infos
         if info.cluster_name in existing_cluster_names
     ]
     if to_terminate:
+        try:
+            teardown_identities = (
+                serve_state.get_replica_resource_action_identities(
+                    service_name, [info.replica_id for info in to_terminate]))
+            if set(teardown_identities) != {
+                    info.replica_id for info in to_terminate
+            }:
+                raise RuntimeError(
+                    'Replica inventory changed while snapshotting teardown '
+                    'identities.')
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                f'Failed to prove replica teardown identities for service '
+                f'{service_name!r}: {common_utils.format_exception(e)}')
+            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                    'could not be purged because its durable replica teardown '
+                    'identities could not be verified; cleanup inventory was '
+                    f'retained for retry.{colorama.Style.RESET_ALL}')
         # Imported here to break the circular dependency: replica_managers
         # imports serve_utils at module load.
         # pylint: disable=import-outside-toplevel
@@ -3224,10 +2745,14 @@ def _terminate_failed_services_locked(
             log_file_name = generate_replica_log_file_name(
                 service_name, info.replica_id, resource_scope)
             try:
+                identity = teardown_identities[info.replica_id]
                 replica_managers.terminate_cluster(
                     info.cluster_name,
                     log_file_name,
-                    continue_guard=(_worker_still_owns))
+                    continue_guard=(_worker_still_owns),
+                    expected_cluster_record_uuid=(str(
+                        identity.sky_cluster_record_uuid) if identity
+                                                  is not None else None))
                 return None
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate replica cluster '
@@ -3407,10 +2932,29 @@ def _terminate_orphaned_service_children_impl(
             return _purge_ownership_failure(
                 service_name,
                 'ownership lost after orphan cluster inventory snapshot')
+        # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove
+        # this orphan purge submission path at M5 for eligible authoritative
+        # services after durable down actions cover purge and rollback.
         to_terminate = [
             info for info in replica_infos
             if info.cluster_name in existing_cluster_names
         ]
+        try:
+            teardown_identities = (
+                serve_state.get_replica_resource_action_identities(
+                    service_name, [info.replica_id for info in to_terminate]))
+            if set(teardown_identities) != {
+                    info.replica_id for info in to_terminate
+            }:
+                raise RuntimeError(
+                    'Replica inventory changed while snapshotting teardown '
+                    'identities.')
+        except Exception as e:  # pylint: disable=broad-except
+            return (f'{colorama.Fore.YELLOW}orphaned service '
+                    f'{service_name!r} could not be purged because durable '
+                    'replica teardown identities could not be verified: '
+                    f'{common_utils.format_exception(e)}.'
+                    f'{colorama.Style.RESET_ALL}')
         termination_failures = []
         for info in to_terminate:
             if not _still_orphaned():
@@ -3418,11 +2962,15 @@ def _terminate_orphaned_service_children_impl(
                     service_name,
                     'ownership lost before orphan replica cleanup')
             try:
+                identity = teardown_identities[info.replica_id]
                 replica_managers.terminate_cluster(
                     info.cluster_name,
                     generate_replica_log_file_name(service_name,
                                                    info.replica_id),
-                    continue_guard=_still_orphaned)
+                    continue_guard=_still_orphaned,
+                    expected_cluster_record_uuid=(str(
+                        identity.sky_cluster_record_uuid) if identity
+                                                  is not None else None))
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate orphan replica cluster '
                              f'{info.cluster_name!r}: '
@@ -3765,15 +3313,23 @@ def _get_service_log_owner_record(service_name: str,
     return record
 
 
-def _check_service_status_healthy(service_name: str, pool: bool) -> str | None:
+def _get_healthy_service_log_owner_record(
+        service_name: str,
+        pool: bool) -> tuple[dict[str, Any] | None, str | None]:
+    """Return one slim owner snapshot or the user-facing health error."""
     service_record = _get_service_log_owner_record(service_name, pool)
     capnoun = 'Service' if not pool else 'Pool'
     if service_record is None:
-        return f'{capnoun} {service_name!r} does not exist.'
+        return None, f'{capnoun} {service_name!r} does not exist.'
     if service_record['status'] == serve_state.ServiceStatus.CONTROLLER_INIT:
-        return (f'{capnoun} {service_name!r} is still initializing its '
+        return (None, f'{capnoun} {service_name!r} is still initializing its '
                 'controller. Please try again later.')
-    return None
+    return service_record, None
+
+
+def _check_service_status_healthy(service_name: str, pool: bool) -> str | None:
+    _, msg = _get_healthy_service_log_owner_record(service_name, pool)
+    return msg
 
 
 def get_latest_version_with_min_replicas(
@@ -3949,15 +3505,15 @@ def _capped_follow_logs_with_provision_expanding(
 
 def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
                         tail: int | None, pool: bool) -> str:
-    msg = _check_service_status_healthy(service_name, pool=pool)
+    record, msg = _get_healthy_service_log_owner_record(service_name, pool=pool)
     if msg is not None:
         return msg
+    assert record is not None
     repnoun = 'worker' if pool else 'replica'
     caprepnoun = repnoun.capitalize()
     print(f'{colorama.Fore.YELLOW}Start streaming logs for launching process '
           f'of {repnoun} {replica_id}.{colorama.Style.RESET_ALL}')
-    record = _get_service_log_owner_record(service_name, pool)
-    resource_scope = record.get('resource_scope') if record else None
+    resource_scope = record.get('resource_scope')
     log_file_name = generate_replica_log_file_name(service_name, replica_id,
                                                    resource_scope)
     # The replica_<id>.log file is the post-mortem archive: it's only
@@ -4091,9 +3647,10 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
 def stream_serve_process_logs(service_name: str, stream_controller: bool,
                               follow: bool, tail: int | None,
                               pool: bool) -> str:
-    msg = _check_service_status_healthy(service_name, pool)
+    record, msg = _get_healthy_service_log_owner_record(service_name, pool)
     if msg is not None:
         return msg
+    assert record is not None
     if not stream_controller:
         if pool:
             return 'Pools do not have a load balancer.'
@@ -4102,8 +3659,7 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
         # legacy controller-local load_balancer.log file.
         from sky.serve import lb_k8s  # pylint: disable=import-outside-toplevel
         return lb_k8s.stream_lb_logs(service_name, follow, tail)
-    record = _get_service_log_owner_record(service_name, pool)
-    resource_scope = record.get('resource_scope') if record else None
+    resource_scope = record.get('resource_scope')
     log_file = generate_remote_controller_log_file_name(service_name,
                                                         resource_scope)
 
@@ -4132,195 +3688,6 @@ def stream_serve_process_logs(service_name: str, stream_controller: bool,
     return ''
 
 
-# ================== Table Formatter for `sky serve status` ==================
-
-
-def _get_replicas(service_record: dict[str, Any]) -> str:
-    ready = service_record.get('ready_replicas')
-    total = service_record.get('total_replicas')
-    if (isinstance(ready, int) and not isinstance(ready, bool) and
-            ready >= 0 and isinstance(total, int) and
-            not isinstance(total, bool) and total >= 0):
-        return f'{ready}/{total}'
-    ready_replica_num, total_replica_num = 0, 0
-    for info in service_record['replica_info']:
-        if info['status'] == serve_state.ReplicaStatus.READY:
-            ready_replica_num += 1
-        # TODO(MaoZiming): add a column showing failed replicas number.
-        if info['status'] not in serve_state.ReplicaStatus.failed_statuses():
-            total_replica_num += 1
-    return f'{ready_replica_num}/{total_replica_num}'
-
-
-def format_service_table(service_records: list[dict[str, Any]], show_all: bool,
-                         pool: bool) -> str:
-    noun = 'pool' if pool else 'service'
-    if not service_records:
-        return f'No existing {noun}s.'
-
-    service_columns = [
-        'NAME', 'VERSION', 'UPTIME', 'STATUS',
-        'REPLICAS' if not pool else 'WORKERS'
-    ]
-    if not pool:
-        service_columns.append('ENDPOINT')
-    if show_all:
-        service_columns.extend([
-            'AUTOSCALING_POLICY', 'LOAD_BALANCING_POLICY', 'REQUESTED_RESOURCES'
-        ])
-        if pool:
-            # Remove the load balancing policy column for pools.
-            service_columns.pop(-2)
-    service_table = log_utils.create_table(service_columns)
-
-    replica_infos: list[dict[str, Any]] = []
-    for record in service_records:
-        for replica in record['replica_info']:
-            replica['service_name'] = record['name']
-            replica_infos.append(replica)
-
-        service_name = record['name']
-        version = ','.join(
-            str(v) for v in record['active_versions']
-        ) if 'active_versions' in record and record['active_versions'] else '-'
-        uptime = log_utils.readable_time_duration(record['uptime'],
-                                                  absolute=True)
-        service_status = record['status']
-        status_str = service_status.colored_str()
-        replicas = _get_replicas(record)
-        endpoint = record['endpoint']
-        if endpoint is None:
-            endpoint = '-'
-        policy = record['policy']
-        requested_resources_str = record['requested_resources_str']
-        load_balancing_policy = record['load_balancing_policy']
-
-        service_values = [
-            service_name,
-            version,
-            uptime,
-            status_str,
-            replicas,
-        ]
-        if not pool:
-            service_values.append(endpoint)
-        if show_all:
-            service_values.extend(
-                [policy, load_balancing_policy, requested_resources_str])
-            if pool:
-                service_values.pop(-2)
-        service_table.add_row(service_values)
-
-    replica_table = _format_replica_table(replica_infos, show_all, pool)
-    replica_noun = 'Pool Workers' if pool else 'Service Replicas'
-    return (f'{service_table}\n'
-            f'\n{colorama.Fore.CYAN}{colorama.Style.BRIGHT}'
-            f'{replica_noun}{colorama.Style.RESET_ALL}\n'
-            f'{replica_table}')
-
-
-def _format_replica_table(replica_records: list[dict[str, Any]], show_all: bool,
-                          pool: bool) -> str:
-    noun = 'worker' if pool else 'replica'
-    if not replica_records:
-        return f'No existing {noun}s.'
-
-    replica_columns = [
-        'POOL_NAME' if pool else 'SERVICE_NAME', 'ID', 'VERSION', 'ENDPOINT',
-        'LAUNCHED', 'INFRA', 'RESOURCES', 'STATUS'
-    ]
-    if pool:
-        replica_columns.append('USED_BY')
-        # Remove the endpoint column for pool workers.
-        replica_columns.pop(3)
-    replica_table = log_utils.create_table(replica_columns)
-
-    truncate_hint = ''
-    if not show_all:
-        if len(replica_records) > _REPLICA_TRUNC_NUM:
-            truncate_hint = f'\n... (use --all to show all {noun}s)'
-        replica_records = replica_records[:_REPLICA_TRUNC_NUM]
-
-    for record in replica_records:
-        endpoint = record.get('endpoint', '-')
-        service_name = record['service_name']
-        replica_id = record['replica_id']
-        version = (record['version'] if 'version' in record else '-')
-        replica_endpoint = endpoint if endpoint else '-'
-        launched_at = log_utils.readable_time_duration(record['launched_at'])
-        infra = '-'
-        resources_str = '-'
-        replica_status = record['status']
-        status_str = replica_status.colored_str()
-        used_by = record.get('used_by', None)
-        if used_by is None:
-            used_by_str = '-'
-        elif isinstance(used_by, str):
-            used_by_str = used_by
-        else:
-            if len(used_by) > 2:
-                used_by_str = (
-                    f'{used_by[0]}, {used_by[1]}, +{len(used_by) - 2}'
-                    ' more')
-            elif len(used_by) == 2:
-                used_by_str = f'{used_by[0]}, {used_by[1]}'
-            elif len(used_by) == 1:
-                used_by_str = str(used_by[0])
-            else:
-                used_by_str = '-'
-
-        # Prefer pre-computed string fields from the server (new servers
-        # ship these alongside or instead of a pickled handle to keep wire
-        # payload small). Fall back to computing them locally from
-        # ``record['handle']`` for back-compat with old servers.
-        infra_pre = record.get('infra')
-        if infra_pre is not None:
-            infra = infra_pre
-        if show_all:
-            resources_pre = (record.get('resources_str_full') or
-                             record.get('resources_str'))
-        else:
-            resources_pre = record.get('resources_str')
-        if resources_pre is not None:
-            resources_str = resources_pre
-
-        if infra_pre is None or resources_pre is None:
-            replica_handle: backends.CloudVmRayResourceHandle | None = record.get(
-                'handle')
-            if (replica_handle is not None and
-                    replica_handle.launched_resources is not None):
-                if infra_pre is None:
-                    infra = (
-                        replica_handle.launched_resources.infra.formatted_str())
-                if resources_pre is None:
-                    simplified = not show_all
-                    resources_str_simple, resources_str_full = (
-                        resources_utils.get_readable_resources_repr(
-                            replica_handle, simplified_only=simplified))
-                    if simplified:
-                        resources_str = resources_str_simple
-                    else:
-                        assert resources_str_full is not None
-                        resources_str = resources_str_full
-
-        replica_values = [
-            service_name,
-            replica_id,
-            version,
-            replica_endpoint,
-            launched_at,
-            infra,
-            resources_str,
-            status_str,
-        ]
-        if pool:
-            replica_values.append(used_by_str)
-            replica_values.pop(3)
-        replica_table.add_row(replica_values)
-
-    return f'{replica_table}{truncate_hint}'
-
-
 # =========================== CodeGen for Sky Serve ===========================
 # TODO (kyuds): deprecate and remove serve codegen entirely.
 
@@ -4345,16 +3712,43 @@ class ServeCodeGen:
     ]
 
     @classmethod
-    def get_service_status(
-            cls,
-            service_names: list[str] | None,
-            pool: bool,
-            summary_only: bool = False,
-            include_target_num_replicas: bool | None = None) -> str:
+    def get_service_status(cls,
+                           service_names: list[str] | None,
+                           pool: bool,
+                           summary_only: bool = False,
+                           include_target_num_replicas: bool | None = None,
+                           metadata_only: bool = False) -> str:
+        if metadata_only:
+            # Serve v9 controllers already expose the slim lifecycle snapshot
+            # used by control paths, but do not understand the metadata_only
+            # RPC field. Build the projection from that primitive so existing
+            # services benefit immediately after an API-server rollout instead
+            # of silently materializing the full historical replica inventory.
+            metadata_code = [
+                f'names = {service_names!r}',
+                ('names = serve_state.get_glob_service_names('
+                 f'None, pool={pool}) if names is None else names'),
+                ('statuses = [serve_utils._get_service_status('
+                 f'name, pool={pool}, with_replica_info=False, '
+                 'with_yaml=False, with_target_num_replicas=False, '
+                 'status_snapshot_only=True) for name in names]'),
+                ('statuses = [status for status in statuses '
+                 'if status is not None]'),
+                ('_ = [status.update({"metadata_only": True}) '
+                 'for status in statuses]'),
+                'statuses = sorted(statuses, key=lambda status: status["name"])',
+                ('pickled = [{key: serve_utils.base64.b64encode('
+                 'serve_utils.pickle.dumps(value)).decode("utf-8") '
+                 'for key, value in status.items()} for status in statuses]'),
+                ('msg = serve_utils.message_utils.encode_payload('
+                 'pickled, payload_type="service_status")'),
+                'print(msg, end="", flush=True)',
+            ]
+            return cls._build(metadata_code)
         # summary_only is only forwarded to controllers whose lib version
         # understands it (v6+); older controllers just return the full
         # payload — a graceful degradation, never an error.
-        code = [
+        code: list[str | None] = [
             f'kwargs={{}} if serve_version < 3 else {{"pool": {pool}}}',
             ('kwargs.update({"summary_only": '
              f'{summary_only}}}) if serve_version >= 6 else None'),

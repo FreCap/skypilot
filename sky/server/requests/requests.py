@@ -23,6 +23,7 @@ import colorama
 import filelock
 import orjson
 
+import sky
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
@@ -34,8 +35,11 @@ from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server import versions
 from sky.server.blob import blob_storage as bs
+from sky.server.requests import cutover as request_cutover
 from sky.server.requests import payloads
+from sky.server.requests import registry as request_registry
 from sky.server.requests import request_names
+from sky.server.requests import request_wire
 from sky.server.requests import storage as request_storage
 from sky.server.requests.serializers import decoders
 from sky.server.requests.serializers import encoders
@@ -78,6 +82,8 @@ COL_FILE_MOUNTS_BLOB_ID = 'file_mounts_blob_id'
 # never sent to clients.
 COL_IGNORE_RETURN_VALUE = 'ignore_return_value'
 COL_RETRYABLE = 'retryable'
+DURABLE_PAYLOAD_FORMAT = 'pydantic-json'
+DURABLE_PAYLOAD_VERSION = 1
 # Legacy path for backward compatibility - GC will clean up logs from both
 # the new and legacy paths to handle server upgrades gracefully.
 LEGACY_REQUEST_LOG_PATH_PREFIX = '~/sky_logs/api_server/requests'
@@ -217,12 +223,14 @@ def _status_value_for_client(status_value: str) -> str:
     and crash on an unknown value, so downgrade it to the closest status they
     understand on the wire.
     """
-    remote_api_version = versions.get_remote_api_version()
-    if (status_value == RequestStatus.WAITING.value and
-            remote_api_version is not None and remote_api_version
-            < server_constants.MIN_WAITING_STATUS_API_VERSION):
-        return RequestStatus.RUNNING.value
-    return status_value
+    return request_wire.status_value_for_client(
+        status_value,
+        waiting_status_value=RequestStatus.WAITING.value,
+        running_status_value=RequestStatus.RUNNING.value,
+        get_remote_api_version=versions.get_remote_api_version,
+        min_waiting_status_api_version=(
+            server_constants.MIN_WAITING_STATUS_API_VERSION),
+    )
 
 
 def _build_error_dict(error: BaseException) -> dict[str, Any]:
@@ -253,22 +261,16 @@ def sanitize_request_error(
 
 
 def _encoded_return_value(name: str, request_id: str, return_value: Any) -> Any:
-    """Encode a return value, dropping to None on encoder failure.
+    """Encode a return value.
 
-    An exception here would escape the executor wrapper's else-block
-    (outside its try/except) and leave the row stuck in RUNNING with the
-    worker pid populated — enabling the SIGTERM-to-idle-worker pool break.
-    All return-value serializers already guard `if return_value is not
-    None`, so None persists as JSON `null`.
+    Durable terminal-transition implementations catch encoder failures and
+    atomically persist FAILED plus the encoding error.  Keeping this helper
+    strict prevents a malformed private-handler result from becoming a
+    successful JSON null.
     """
     encoder = encoders.get_encoder(name)
-    try:
-        return encoder(return_value)
-    except Exception as e:  # pylint: disable=broad-except
-        logger.warning(f'Encoder for request {request_id} ({name}) '
-                       f'failed; storing None: '
-                       f'{common_utils.format_exception(e)}')
-        return None
+    del request_id
+    return encoder(return_value)
 
 
 REQUEST_COLUMNS = [
@@ -332,6 +334,37 @@ class Request:
     # RequestPayload and never sent to clients.
     ignore_return_value: bool = False
     retryable: bool = False
+    # PostgreSQL-only durable execution metadata. SQLite keeps its historical
+    # pickle representation during the migration window.
+    handler_name: str | None = None
+    payload_type: str | None = None
+    payload_format: str = DURABLE_PAYLOAD_FORMAT
+    payload_version: int = DURABLE_PAYLOAD_VERSION
+    producer_version: str = sky.__version__
+    execution_class: str | None = None
+    execution_generation: int = 0
+    claim_token: str | None = None
+    worker_instance_id: str | None = None
+    controller_generation: int | None = None
+    lease_expires_at: float | None = None
+    heartbeat_at: float | None = None
+    cancel_requested_at: float | None = None
+    cancel_acknowledged_at: float | None = None
+    interrupted_reason: str | None = None
+    # PostgreSQL-only, server-owned context for actor-aware operational
+    # events. It is intentionally absent from the client RequestPayload and
+    # legacy SQLite row shape.
+    event_context: dict[str, Any] | None = None
+    # In-memory cause required when a generic update context performs a
+    # terminal transition. Never persisted or exposed to clients.
+    terminal_cause: str | None = None
+    # Queue intent is set only while creating a newly scheduled request.
+    # Durable backends consume it in the same transaction as request creation;
+    # it is not exposed on the client wire format.
+    should_enqueue: bool = False
+    precondition_type: str | None = None
+    precondition_payload: dict[str, Any] | None = None
+    precondition_deadline: float | None = None
 
     @property
     def log_path(self) -> pathlib.Path:
@@ -362,12 +395,128 @@ class Request:
         }
 
     def set_return_value(self, return_value: Any) -> None:
-        """Set the encoded return value.
-
-        On encoder failure, drop to None (see `_encoded_return_value`).
-        """
+        """Set the encoded return value, raising if validation fails."""
         self.return_value = _encoded_return_value(self.name, self.request_id,
                                                   return_value)
+
+    def durable_values(self) -> dict[str, Any]:
+        """Return the non-pickle PostgreSQL representation of this request."""
+        registration = request_registry.registration_for_handler(
+            self.entrypoint)
+        payload_type, payload_json = request_registry.encode_payload(
+            self.request_body)
+        if self.handler_name is not None and self.handler_name not in (
+                registration.name, *registration.aliases):
+            raise ValueError(f'Request {self.request_id} handler changed from '
+                             f'{self.handler_name!r} to {registration.name!r}.')
+        if self.payload_type is not None and self.payload_type != payload_type:
+            raise ValueError(f'Request {self.request_id} payload changed from '
+                             f'{self.payload_type!r} to {payload_type!r}.')
+        if (self.execution_class is not None and
+                self.execution_class != registration.execution_class.value):
+            raise ValueError(
+                f'Request {self.request_id} execution class '
+                f'{self.execution_class!r} does not match handler-owned class '
+                f'{registration.execution_class.value!r}.')
+        self.handler_name = registration.name
+        self.payload_type = payload_type
+        self.execution_class = registration.execution_class.value
+        return {
+            'request_id': self.request_id,
+            'name': self.name,
+            'handler_name': registration.name,
+            'payload_type': payload_type,
+            'payload_format': self.payload_format,
+            'payload_version': self.payload_version,
+            'producer_version': self.producer_version,
+            'payload_json': payload_json,
+            'execution_class': registration.execution_class.value,
+            'status': self.status.value,
+            'return_value': self.return_value,
+            'error': self.error,
+            'pid': self.pid,
+            'created_at': self.created_at,
+            COL_CLUSTER_NAME: self.cluster_name,
+            'schedule_type': self.schedule_type.value,
+            COL_USER_ID: self.user_id,
+            COL_STATUS_MSG: self.status_msg,
+            COL_SHOULD_RETRY: self.should_retry,
+            COL_FINISHED_AT: self.finished_at,
+            COL_FILE_MOUNTS_BLOB_ID: self.file_mounts_blob_id,
+            COL_IGNORE_RETURN_VALUE: self.ignore_return_value,
+            COL_RETRYABLE: self.retryable,
+            'execution_generation': self.execution_generation,
+            'claim_token': self.claim_token,
+            'worker_instance_id': self.worker_instance_id,
+            'controller_generation': self.controller_generation,
+            'lease_expires_at': self.lease_expires_at,
+            'heartbeat_at': self.heartbeat_at,
+            'cancel_requested_at': self.cancel_requested_at,
+            'cancel_acknowledged_at': self.cancel_acknowledged_at,
+            'interrupted_reason': self.interrupted_reason,
+            'event_context': self.event_context,
+        }
+
+    @classmethod
+    def from_durable_values(cls, values: dict[str, Any]) -> 'Request':
+        """Decode a request row through the closed handler/payload registries."""
+        registration = request_registry.resolve_handler(values['handler_name'])
+        execution_class = values['execution_class']
+        if execution_class != registration.execution_class.value:
+            raise ValueError(
+                f'Durable request {values["request_id"]} has execution class '
+                f'{execution_class!r}, but handler {registration.name!r} owns '
+                f'{registration.execution_class.value!r}.')
+        if values['payload_format'] != DURABLE_PAYLOAD_FORMAT:
+            raise ValueError(f'Unsupported request payload format '
+                             f'{values["payload_format"]!r}.')
+        if int(values['payload_version']) != DURABLE_PAYLOAD_VERSION:
+            raise ValueError(f'Unsupported request payload version '
+                             f'{values["payload_version"]!r}.')
+        request_body = request_registry.decode_payload(values['payload_type'],
+                                                       values['payload_json'])
+        return cls(
+            request_id=values['request_id'],
+            name=values['name'],
+            entrypoint=registration.func,
+            request_body=request_body,
+            status=RequestStatus(values['status']),
+            created_at=float(values['created_at']),
+            user_id=values[COL_USER_ID],
+            return_value=values.get('return_value'),
+            error=values.get('error'),
+            pid=values.get('pid'),
+            schedule_type=ScheduleType(values['schedule_type']),
+            cluster_name=values.get(COL_CLUSTER_NAME),
+            status_msg=values.get(COL_STATUS_MSG),
+            should_retry=bool(values.get(COL_SHOULD_RETRY, False)),
+            finished_at=values.get(COL_FINISHED_AT),
+            file_mounts_blob_id=values.get(COL_FILE_MOUNTS_BLOB_ID),
+            ignore_return_value=bool(values.get(COL_IGNORE_RETURN_VALUE,
+                                                False)),
+            retryable=bool(values.get(COL_RETRYABLE, False)),
+            handler_name=registration.name,
+            payload_type=values['payload_type'],
+            payload_format=values['payload_format'],
+            payload_version=int(values['payload_version']),
+            producer_version=values['producer_version'],
+            execution_class=execution_class,
+            execution_generation=int(values.get('execution_generation', 0)),
+            claim_token=(str(values['claim_token'])
+                         if values.get('claim_token') is not None else None),
+            worker_instance_id=(str(values['worker_instance_id'])
+                                if values.get('worker_instance_id') is not None
+                                else None),
+            controller_generation=(int(values['controller_generation'])
+                                   if values.get('controller_generation')
+                                   is not None else None),
+            lease_expires_at=values.get('lease_expires_at'),
+            heartbeat_at=values.get('heartbeat_at'),
+            cancel_requested_at=values.get('cancel_requested_at'),
+            cancel_acknowledged_at=values.get('cancel_acknowledged_at'),
+            interrupted_reason=values.get('interrupted_reason'),
+            event_context=values.get('event_context'),
+        )
 
     def get_return_value(self) -> Any:
         """Get the return value."""
@@ -422,45 +571,15 @@ class Request:
 
     def encode(self) -> payloads.RequestPayload:
         """Serialize the SkyPilot API request."""
-        assert isinstance(self.request_body,
-                          payloads.RequestBody), (self.name, self.request_body)
-        # Pydantic validates normal request construction, but this final fence
-        # also covers internally constructed or restored bodies before their
-        # task text can enter the durable request row.
-        payloads.validate_task_request_body_for_persistence(self.request_body)
-        try:
-            # Use version-aware serializer to handle backward compatibility
-            # for old clients that don't recognize new fields.
-            serializer = return_value_serializers.get_serializer(self.name)
-            return payloads.RequestPayload(
-                request_id=self.request_id,
-                name=self.name,
-                entrypoint=encoders.pickle_and_encode(self.entrypoint),
-                request_body=encoders.pickle_and_encode(self.request_body),
-                status=_status_value_for_client(self.status.value),
-                return_value=serializer(self.return_value),
-                error=orjson.dumps(self.error).decode('utf-8'),
-                pid=self.pid,
-                created_at=self.created_at,
-                schedule_type=self.schedule_type.value,
-                user_id=self.user_id,
-                cluster_name=self.cluster_name,
-                status_msg=self.status_msg,
-                should_retry=self.should_retry,
-                finished_at=self.finished_at,
-                file_mounts_blob_id=self.file_mounts_blob_id,
-            )
-        except (TypeError, ValueError) as e:
-            # The error is unexpected, so we don't suppress the stack trace.
-            logger.error(
-                f'Error encoding: {e}\n'
-                f'  {self.request_id}\n'
-                f'  {self.name}\n'
-                f'  {self.request_body}\n'
-                f'  {self.return_value}\n'
-                f'  {self.created_at}\n',
-                exc_info=e)
-            raise
+        return request_wire.encode_request(
+            self,
+            validate_request_body=(
+                payloads.validate_task_request_body_for_persistence),
+            get_serializer=return_value_serializers.get_serializer,
+            pickle_and_encode=encoders.pickle_and_encode,
+            project_status=_status_value_for_client,
+            logger=logger,
+        )
 
     @staticmethod
     def _decode_entrypoint(encoded_entrypoint: str) -> Callable:
@@ -474,48 +593,25 @@ class Request:
         /``ImportError``. Since the value is never called on the client, fall
         back to a placeholder instead of failing the whole request.
         """
-        try:
-            return decoders.decode_and_unpickle(encoded_entrypoint)
-        except (AttributeError, ImportError) as e:
-            logger.debug(
-                'Could not resolve the request entrypoint while decoding '
-                f'(likely a client/server version skew): {e}. The entrypoint '
-                'is not used on the client, so falling back to a placeholder.')
-            return _unresolved_entrypoint
+        return request_wire.decode_entrypoint(
+            encoded_entrypoint,
+            decode_and_unpickle=decoders.decode_and_unpickle,
+            unresolved_entrypoint=_unresolved_entrypoint,
+            logger=logger,
+        )
 
     @classmethod
     def decode(cls, payload: payloads.RequestPayload) -> 'Request':
         """Deserialize the SkyPilot API request."""
-        try:
-            return cls(
-                request_id=payload.request_id,
-                name=payload.name,
-                entrypoint=cls._decode_entrypoint(payload.entrypoint),
-                request_body=decoders.decode_and_unpickle(payload.request_body),
-                status=RequestStatus(payload.status),
-                return_value=orjson.loads(payload.return_value),
-                error=orjson.loads(payload.error),
-                pid=payload.pid,
-                created_at=payload.created_at,
-                schedule_type=ScheduleType(payload.schedule_type),
-                user_id=payload.user_id,
-                cluster_name=payload.cluster_name,
-                status_msg=payload.status_msg,
-                should_retry=payload.should_retry,
-                finished_at=payload.finished_at,
-                file_mounts_blob_id=payload.file_mounts_blob_id,
-            )
-        except (TypeError, ValueError) as e:
-            logger.error(
-                f'Error decoding: {e}\n'
-                f'  {payload.request_id}\n'
-                f'  {payload.name}\n'
-                f'  {payload.entrypoint}\n'
-                f'  {payload.request_body}\n'
-                f'  {payload.created_at}\n',
-                exc_info=e)
-            # The error is unexpected, so we don't suppress the stack trace.
-            raise
+        return request_wire.decode_request(
+            payload,
+            request_factory=cls,
+            entrypoint_decoder=cls._decode_entrypoint,
+            decode_and_unpickle=decoders.decode_and_unpickle,
+            status_cls=RequestStatus,
+            schedule_type_cls=ScheduleType,
+            logger=logger,
+        )
 
 
 def get_new_request_id() -> str:
@@ -537,39 +633,11 @@ def encode_requests(requests: list[Request]) -> list[payloads.RequestPayload]:
         sent to the client side, especially for the request table could include
         all the requests.
         """
-    encoded_requests = []
-    all_users = global_user_state.get_all_users()
-    all_users_map = {user.id: user.name for user in all_users}
-    for request in requests:
-        if request.request_body is not None:
-            assert isinstance(request.request_body,
-                              payloads.RequestBody), (request.name,
-                                                      request.request_body)
-        user_name = all_users_map.get(request.user_id)
-        payload = payloads.RequestPayload(
-            request_id=request.request_id,
-            name=request.name,
-            entrypoint=request.entrypoint.__name__
-            if request.entrypoint is not None else '',
-            request_body=request.request_body.model_dump_json()
-            if request.request_body is not None else
-            orjson.dumps(None).decode('utf-8'),
-            status=_status_value_for_client(request.status.value),
-            return_value=orjson.dumps(None).decode('utf-8'),
-            error=orjson.dumps(None).decode('utf-8'),
-            pid=None,
-            created_at=request.created_at,
-            schedule_type=request.schedule_type.value,
-            user_id=request.user_id,
-            user_name=user_name,
-            cluster_name=request.cluster_name,
-            status_msg=request.status_msg,
-            should_retry=request.should_retry,
-            finished_at=request.finished_at,
-            file_mounts_blob_id=request.file_mounts_blob_id,
-        )
-        encoded_requests.append(payload)
-    return encoded_requests
+    return request_wire.encode_requests(
+        requests,
+        get_all_users=global_user_state.get_all_users,
+        project_status=_status_value_for_client,
+    )
 
 
 def _update_request_row_fields(
@@ -1045,11 +1113,22 @@ def recover_db_and_logs() -> bool:
         e.g. rows owned by a plugin backend whose ``reset_on_startup`` is a
         no-op -- were never reconciled and must NOT be re-enqueued.
     """
+    backend = request_storage.get_request_backend()
+    if backend.uses_durable_queue is True:
+        if os.environ.get(RESET_REQUESTS_ON_STARTUP_ENV_VAR) == '1':
+            raise RuntimeError(
+                f'{RESET_REQUESTS_ON_STARTUP_ENV_VAR}=1 cannot wipe the '
+                'durable PostgreSQL request store. Use the explicit migration '
+                'or administrative cleanup workflow.')
+        recover = getattr(backend, 'recover_on_startup', None)
+        if not callable(recover):
+            raise RuntimeError(
+                'A durable request backend must implement recover_on_startup.')
+        return bool(recover())  # pylint: disable=not-callable
     if os.environ.get(RESET_REQUESTS_ON_STARTUP_ENV_VAR) == '1':
         reset_db_and_logs()
         return False
-    if not isinstance(request_storage.get_request_backend(),
-                      SqliteRequestBackend):
+    if not isinstance(backend, SqliteRequestBackend):
         # A plugin request backend owns its own restart semantics via
         # reset_on_startup(); the sqlite-level recovery below would not see
         # its rows (and reenqueue_recovered_requests would then replay rows
@@ -1242,7 +1321,10 @@ def update_request(request_id: str) -> Generator[Request | None, None, None]:
 
 
 @metrics_lib.time_me
-def try_mark_running(request_id: str, pid: int | None) -> bool:
+def try_mark_running(request_id: str,
+                     pid: int | None,
+                     execution_generation: int = 0,
+                     claim_token: str | None = None) -> bool:
     """Atomically flip a request to RUNNING if it is still executable.
 
     Returns:
@@ -1251,7 +1333,7 @@ def try_mark_running(request_id: str, pid: int | None) -> bool:
         status_msg cleared.
     """
     return request_storage.get_request_backend().try_mark_running(
-        request_id, pid)
+        request_id, pid, execution_generation, claim_token)
 
 
 @metrics_lib.time_me
@@ -1268,6 +1350,18 @@ async def update_status_msg_async(request_id: str, status_msg: str) -> None:
     """Update the status message of a request"""
     await request_storage.get_request_backend().update_status_msg_async(
         request_id, status_msg)
+
+
+def set_event_workspace(request_id: str, workspace: str) -> bool:
+    """Persist the authoritative workspace for an opted-in event request."""
+    return request_storage.get_request_backend().set_event_workspace(
+        request_id, workspace)
+
+
+def set_event_target_id(request_id: str, target_id: str) -> bool:
+    """Enrich the primary operational event target identity."""
+    return request_storage.get_request_backend().set_event_target_id(
+        request_id, target_id)
 
 
 def _get_request_no_lock(request_id: str,
@@ -1412,6 +1506,7 @@ def build_internal_daemon_request(
         # Matches the retryable=True used when scheduling daemon requests
         # (executor.schedule_internal_daemon_async).
         retryable=True,
+        should_enqueue=True,
     )
 
 
@@ -1459,6 +1554,9 @@ class RequestTaskFilter:
         finished_after: if provided, only include requests finished at or after
             this timestamp. Requests still in progress (finished_at IS NULL)
             are always included.
+        retention_safe: internal GC guard that excludes correlated requests
+            until their exact resource-action attempt is settled. PostgreSQL
+            enforces this; SQLite has no central resource-action correlation.
         limit: the number of requests to show. If None, show all requests.
 
     Raises:
@@ -1473,6 +1571,7 @@ class RequestTaskFilter:
     finished_before: float | None = None
     include_missing_finished_at: bool = False
     finished_after: float | None = None
+    retention_safe: bool = False
     limit: int | None = None
     fields: list[str] | None = None
     sort: bool = False
@@ -1611,7 +1710,12 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     (update_request / update_request_async).
     """
     serialized_result = None
-    if result is not None:
+    result_encoding_failed = False
+    should_encode_result = result is not None
+    if (name is not None and status == RequestStatus.SUCCEEDED and
+            encoders.requires_strict_return_value(name)):
+        should_encode_result = True
+    if should_encode_result:
         assert name is not None, request_id
         serializer = return_value_serializers.get_serializer(name)
         # A serializer failure must not raise: an exception here escapes the
@@ -1628,6 +1732,7 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
                 f'{request_id} ({name}); marking the request failed.',
                 exc_info=True)
             status = RequestStatus.FAILED
+            result_encoding_failed = True
             if error is None:
                 error = e
     set_clauses = ['status = ?', f'{COL_FINISHED_AT} = ?']
@@ -1635,6 +1740,11 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     if serialized_result is not None:
         set_clauses.append('return_value = ?')
         params.append(serialized_result)
+    elif result_encoding_failed:
+        # Do not retain a result from an earlier delivery when validating the
+        # terminal result for this delivery failed.
+        set_clauses.append('return_value = ?')
+        params.append(return_value_serializers.default_serializer(None))
     if error is not None:
         set_clauses.append('error = ?')
         params.append(orjson.dumps(_build_error_dict(error)).decode('utf-8'))
@@ -1709,9 +1819,14 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
         _set_value_free_exception_stacktrace(e)
     else:
         set_exception_stacktrace(e)
-    request_storage.get_request_backend().set_request_finished(
-        request_id, RequestStatus.FAILED, error=e)
-    _mark_container_image_request_terminal(request_id)
+    transitioned = request_storage.get_request_backend(
+    ).transition_request_terminal(request_id,
+                                  RequestStatus.FAILED,
+                                  'handler_failed',
+                                  error=e)
+    # Older plugin backends may still return None from this internal hook.
+    if transitioned is not False:
+        _mark_container_image_request_terminal(request_id)
 
 
 @metrics_lib.time_me_async
@@ -1727,16 +1842,25 @@ async def set_request_failed_async(request_id: str, e: BaseException) -> None:
         _set_value_free_exception_stacktrace(e)
     else:
         set_exception_stacktrace(e)
-    await request_storage.get_request_backend().set_request_finished_async(
-        request_id, RequestStatus.FAILED, error=e)
-    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
+    transitioned = await request_storage.get_request_backend(
+    ).transition_request_terminal_async(request_id,
+                                        RequestStatus.FAILED,
+                                        'handler_failed',
+                                        error=e)
+    if transitioned is not False:
+        await asyncio.to_thread(_mark_container_image_request_terminal,
+                                request_id)
 
 
 def set_request_succeeded(request_id: str, result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
-    request_storage.get_request_backend().set_request_finished(
-        request_id, RequestStatus.SUCCEEDED, result=result)
-    _mark_container_image_request_terminal(request_id)
+    transitioned = request_storage.get_request_backend(
+    ).transition_request_terminal(request_id,
+                                  RequestStatus.SUCCEEDED,
+                                  'handler_succeeded',
+                                  result=result)
+    if transitioned is not False:
+        _mark_container_image_request_terminal(request_id)
 
 
 @metrics_lib.time_me_async
@@ -1744,9 +1868,14 @@ def set_request_succeeded(request_id: str, result: Any | None) -> None:
 async def set_request_succeeded_async(request_id: str,
                                       result: Any | None) -> None:
     """Set a request to succeeded and populate the result."""
-    await request_storage.get_request_backend().set_request_finished_async(
-        request_id, RequestStatus.SUCCEEDED, result=result)
-    await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
+    transitioned = await request_storage.get_request_backend(
+    ).transition_request_terminal_async(request_id,
+                                        RequestStatus.SUCCEEDED,
+                                        'handler_succeeded',
+                                        result=result)
+    if transitioned is not False:
+        await asyncio.to_thread(_mark_container_image_request_terminal,
+                                request_id)
 
 
 @metrics_lib.time_me_async
@@ -1761,6 +1890,7 @@ async def set_request_cancelled_async(request_id: str) -> None:
             return
         request_task.finished_at = time.time()
         request_task.status = RequestStatus.CANCELLED
+        request_task.terminal_cause = 'coroutine_disconnected'
     await asyncio.to_thread(_mark_container_image_request_terminal, request_id)
 
 
@@ -1839,6 +1969,7 @@ async def clean_finished_requests_with_retention(
                                          finished_before=time.time() -
                                          retention_seconds,
                                          include_missing_finished_at=True,
+                                         retention_safe=True,
                                          limit=batch_size,
                                          fields=['request_id']))
         if len(reqs) == 0:
@@ -2057,6 +2188,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     @asyncio_utils.shield
     @db_utils.retry_on_sqlite_busy_async
     async def create_if_not_exists_async(self, request: Request) -> bool:
+        request_cutover.require_legacy_submissions_allowed()
         assert _DB is not None
         request_columns = ', '.join(REQUEST_COLUMNS)
         values_str = ', '.join(['?'] * len(REQUEST_COLUMNS))
@@ -2198,7 +2330,12 @@ class SqliteRequestBackend(request_storage.RequestBackend):
 
     @init_db
     @db_utils.retry_on_sqlite_busy
-    def try_mark_running(self, request_id: str, pid: int | None) -> bool:
+    def try_mark_running(self,
+                         request_id: str,
+                         pid: int | None,
+                         execution_generation: int = 0,
+                         claim_token: str | None = None) -> bool:
+        del execution_generation, claim_token
         assert _DB is not None
         # The per-request FileLock is required for composition with
         # update_request()'s full-row read-modify-write writers (kill
@@ -2220,10 +2357,10 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                              request_id: str,
                              status: RequestStatus,
                              error: BaseException | None = None,
-                             result: Any | None = None) -> None:
+                             result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
-        if result is not None:
+        if result is not None or status == RequestStatus.SUCCEEDED:
             # The return-value encoder is looked up by request name; a
             # single-column primary-key read is far cheaper than the full
             # row (which would unpickle entrypoint and request_body).
@@ -2234,7 +2371,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                     (request_id,))
                 row = cursor.fetchone()
             if row is None:
-                return
+                return False
             name = row[0]
         sql, params = _finish_request_update_sql(request_id, status, name,
                                                  error, result)
@@ -2248,6 +2385,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
             with _DB.conn:
                 cursor = _DB.conn.cursor()
                 cursor.execute(sql, params)
+                return cursor.rowcount == 1
 
     @init_db_async
     @asyncio_utils.shield
@@ -2256,15 +2394,15 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                                          request_id: str,
                                          status: RequestStatus,
                                          error: BaseException | None = None,
-                                         result: Any | None = None) -> None:
+                                         result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
-        if result is not None:
+        if result is not None or status == RequestStatus.SUCCEEDED:
             async with _DB.execute_fetchall_async(
                     f'SELECT name FROM {REQUEST_TABLE} WHERE request_id = ?',
                 (request_id,)) as rows:
                 if not rows:
-                    return
+                    return False
                 name = rows[0][0]
         sql, params = _finish_request_update_sql(request_id, status, name,
                                                  error, result)
@@ -2273,7 +2411,9 @@ class SqliteRequestBackend(request_storage.RequestBackend):
         # read-modify-write writers; the SQL status guard alone cannot
         # prevent a stale full-row REPLACE from clobbering this write.
         async with filelock.AsyncFileLock(request_lock_path(request_id)):
-            await _DB.execute_and_commit_async(sql, params)
+            row = await _DB.execute_get_returning_value_async(
+                f'{sql} RETURNING request_id', params)
+            return row is not None
 
     @init_db
     def kill_requests(self,

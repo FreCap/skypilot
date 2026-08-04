@@ -1,13 +1,11 @@
 # pyright: reportOptionalMemberAccess=error
 """SkyPilot API Server exposing RESTful APIs."""
 
-import argparse
 import asyncio
 import contextlib
 import datetime
 import html
 import json
-import multiprocessing
 import os
 import pathlib
 import re
@@ -27,7 +25,6 @@ from fastapi import exception_handlers as fastapi_exception_handlers
 from fastapi import exceptions as fastapi_exceptions
 from fastapi.middleware import cors
 import starlette.background
-import uvloop
 
 import sky
 from sky import catalog
@@ -41,8 +38,6 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.container_images import server as container_images_rest
 from sky.data import storage_utils
-from sky.jobs import state as managed_job_state
-from sky.jobs import utils as managed_job_utils
 from sky.jobs.server import server as jobs_rest
 from sky.metrics import utils as metrics_utils
 from sky.provision import metadata_utils
@@ -52,10 +47,11 @@ from sky.recipes import server as recipes_rest
 from sky.schemas.api import responses
 from sky.serve import constants as serve_constants
 from sky.serve import lb_rbac_preflight
+from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.serve.server import controller_proxy as serve_controller_proxy
 from sky.serve.server import server as serve_rest
-from sky.server import clean_env as clean_env_module
 from sky.server import common
 from sky.server import config as server_config
 from sky.server import constants as server_constants
@@ -63,7 +59,6 @@ from sky.server import core_middleware
 from sky.server import csp_utils
 from sky.server import daemons
 from sky.server import dashboard as dashboard_app
-from sky.server import database_migrations
 from sky.server import file_mount_uploads
 from sky.server import metrics
 from sky.server import plugins
@@ -77,7 +72,9 @@ from sky.server.auth import middleware as auth_middleware
 from sky.server.auth import oauth2_proxy
 from sky.server.auth import sessions as auth_sessions
 from sky.server.blob import blob_storage as bs
+from sky.server.events import server as events_rest
 from sky.server.requests import executor
+from sky.server.requests import launch_identity
 from sky.server.requests import log_provider
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
@@ -86,7 +83,6 @@ from sky.server.requests import requests as requests_lib
 from sky.server.requests import role_filter
 from sky.skylet import constants
 from sky.ssh_node_pools import server as ssh_node_pools_rest
-from sky.usage import usage_lib
 from sky.users import permission
 from sky.users import rbac
 from sky.users import server as users_rest
@@ -95,24 +91,25 @@ from sky.utils import asyncio_utils
 from sky.utils import common as common_lib
 from sky.utils import common_utils
 from sky.utils import context
-from sky.utils import controller_utils
 from sky.utils import dag_utils
 from sky.utils import debug_utils
 from sky.utils import env_options
 from sky.utils import interactive_utils
 from sky.utils import perf_utils
-from sky.utils import subprocess_utils
 from sky.utils import ux_utils
-from sky.utils.db import db_utils
 from sky.utils.kubernetes import gpu_labeler
 from sky.volumes.server import server as volumes_rest
 from sky.workspaces import server as workspaces_rest
 
 P = ParamSpec('P')
 
-_SERVER_USER_HASH_KEY = 'server_user_hash'
-
 logger = sky_logging.init_logger(__name__)
+
+# Portable deployment provenance for the code instance serving this process.
+# Capturing this at module initialization avoids adding Helm/Kubernetes calls
+# to the health endpoint and works for local, VM, container, and K8s servers.
+_SERVER_STARTED_AT = datetime.datetime.now(
+    datetime.timezone.utc).isoformat(timespec='seconds')
 
 # TODO(zhwu): Streaming requests, such log tailing after sky launch or sky logs,
 # need to be detached from the main requests queue. Otherwise, the streaming
@@ -181,6 +178,8 @@ for _dashboard_symbol in (
 RequestIDMiddleware = core_middleware.RequestIDMiddleware
 SecurityHeadersMiddleware = core_middleware.SecurityHeadersMiddleware
 GracefulShutdownMiddleware = core_middleware.GracefulShutdownMiddleware
+ControllerGenerationMiddleware = (
+    core_middleware.ControllerGenerationMiddleware)
 APIVersionMiddleware = core_middleware.APIVersionMiddleware
 
 # Preserve historical import and pickle identities for the stable server
@@ -189,6 +188,7 @@ for _core_middleware_symbol in (
         RequestIDMiddleware,
         SecurityHeadersMiddleware,
         GracefulShutdownMiddleware,
+        ControllerGenerationMiddleware,
         APIVersionMiddleware,
 ):
     _core_middleware_symbol.__module__ = __name__
@@ -313,17 +313,6 @@ async def lifespan(app: fastapi.FastAPI):  # pylint: disable=redefined-outer-nam
     # per-service controller child during a large recovery.
     await asyncio.to_thread(lb_rbac_preflight.check_lb_rbac_preflight)
 
-    # Startup: Run background tasks. Delete any persisted daemon rows whose
-    # ids are no longer in INTERNAL_REQUEST_DAEMONS first (daemon renamed /
-    # removed in code), then submit each current daemon.
-    await requests_lib.delete_orphan_internal_daemons_async(
-        daemons.INTERNAL_REQUEST_DAEMONS)
-    for event in daemons.INTERNAL_REQUEST_DAEMONS:
-        if event.should_skip():
-            continue
-        await executor.schedule_internal_daemon_async(event)
-    await schedule_on_boot_check_async()
-    _spawn_lifespan_task(cleanup_upload_ids())
     # Start periodic version check task (runs daily)
     _spawn_lifespan_task(version_check.check_versions_periodically())
     if metrics_utils.METRICS_ENABLED:
@@ -352,6 +341,7 @@ app.add_middleware(APIVersionMiddleware)
 app.add_middleware(RBACMiddleware)
 app.add_middleware(InternalDashboardPrefixMiddleware)
 app.add_middleware(GracefulShutdownMiddleware)
+app.add_middleware(ControllerGenerationMiddleware)
 app.add_middleware(PathCleanMiddleware)
 app.add_middleware(CacheControlStaticMiddleware)
 app.add_middleware(
@@ -419,7 +409,9 @@ app.include_router(ssh_node_pools_rest.router,
                    prefix='/ssh_node_pools',
                    tags=['ssh_node_pools'])
 app.include_router(recipes_rest.router, prefix='/recipes', tags=['recipes'])
+app.include_router(events_rest.router, prefix='/events', tags=['events'])
 app.include_router(file_mount_uploads.router)
+app.include_router(launch_identity.router)
 # increase the resource limit for the server
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
@@ -902,9 +894,38 @@ async def launch(launch_body: payloads.LaunchBody,
     """Launches a cluster or task."""
     request_id = request.state.request_id
     logger.info(f'Launching request: {request_id}')
+    launch_context = launch_body.extra_launch_context
+    has_system_recovery_context = (
+        serve_system_oom_recovery.has_v3_system_oom_recovery_context(
+            launch_context))
+    if has_system_recovery_context:
+        if not launch_body.is_launched_by_sky_serve_controller:
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail='System-recovery launches require a valid durable '
+                'SkyServe launch intent.')
+        try:
+            # Constructing the replacement first proves that the exact closed
+            # context has a valid bound form.  The update-only PostgreSQL
+            # transaction then consumes the nonce under lifecycle, service,
+            # and replica row locks before any request is scheduled.
+            bound_context = serve_system_oom_recovery.bind_launch_context(
+                launch_context, request_id)
+            await asyncio.to_thread(
+                serve_state.bind_replica_system_recovery_launch_request,
+                launch_context, request_id)
+        except (ValueError,
+                serve_state.ReplicaSystemRecoveryStateError) as error:
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail='System-recovery launches require a valid durable '
+                'SkyServe launch intent.') from error
+        # Never mutate the caller-provided dictionary in place.  Downstream
+        # execution sees the server-known request association and no nonce.
+        launch_body.extra_launch_context = bound_context
+        launch_context = bound_context
     launch_precondition = None
     if launch_body.is_launched_by_sky_serve_controller:
-        launch_context = launch_body.extra_launch_context
         has_launch_fence = any(
             key in launch_context
             for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS)
@@ -945,7 +966,8 @@ async def launch(launch_body: payloads.LaunchBody,
         schedule_type=requests_lib.ScheduleType.LONG,
         request_cluster_name=launch_body.cluster_name,
         precondition=launch_precondition,
-        retryable=launch_body.retry_until_up,
+        retryable=(False if has_system_recovery_context else
+                   launch_body.retry_until_up),
         auth_user=request.state.auth_user,
     )
 
@@ -1123,25 +1145,41 @@ async def logs(
     # TODO(zhwu): This should wait for the request on the cluster, e.g., async
     # launch, to finish, so that a user does not need to manually pull the
     # request status.
-    executor.check_request_thread_executor_available()
-    request_task = await executor.prepare_request_async(
-        request_id=request.state.request_id,
-        request_name=request_names.RequestName.CLUSTER_JOB_LOGS,
-        request_body=cluster_job_body,
-        func=core.tail_logs,
-        schedule_type=requests_lib.ScheduleType.SHORT,
-        request_cluster_name=cluster_job_body.cluster_name,
-        auth_user=request.state.auth_user,
-    )
-    task = executor.execute_request_in_coroutine(request_task)
-    background_tasks.add_task(task.cancel)
+    kill_request_on_disconnect = False
+    if executor.api_process_execution_enabled():
+        executor.check_request_thread_executor_available()
+        request_task = await executor.prepare_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.CLUSTER_JOB_LOGS,
+            request_body=cluster_job_body,
+            func=core.tail_logs,
+            schedule_type=requests_lib.ScheduleType.SHORT,
+            request_cluster_name=cluster_job_body.cluster_name,
+            auth_user=request.state.auth_user,
+        )
+        task = executor.execute_request_in_coroutine(request_task)
+        background_tasks.add_task(task.cancel)
+    else:
+        await executor.schedule_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.CLUSTER_JOB_LOGS,
+            request_body=cluster_job_body,
+            func=core.tail_logs,
+            schedule_type=requests_lib.ScheduleType.SHORT,
+            request_cluster_name=cluster_job_body.cluster_name,
+            auth_user=request.state.auth_user,
+        )
+        request_task = await requests_lib.get_request_async(
+            request.state.request_id)
+        assert request_task is not None
+        kill_request_on_disconnect = True
     # TODO(zhwu): This makes viewing logs in browser impossible. We should adopt
     # the same approach as /stream.
     return stream_utils.stream_response_for_long_request(
         request_id=request.state.request_id,
         logs_path=request_task.log_path,
         background_tasks=background_tasks,
-        kill_request_on_disconnect=False,
+        kill_request_on_disconnect=kill_request_on_disconnect,
     )
 
 
@@ -1372,23 +1410,39 @@ async def hook_logs(
 
     If ``event`` is None, auto-selects whichever hook event has fired.
     """
-    executor.check_request_thread_executor_available()
-    request_task = await executor.prepare_request_async(
-        request_id=request.state.request_id,
-        request_name=request_names.RequestName.CLUSTER_HOOK_LOGS,
-        request_body=hook_logs_body,
-        func=core.tail_hook_logs,
-        schedule_type=requests_lib.ScheduleType.SHORT,
-        request_cluster_name=hook_logs_body.cluster_name,
-        auth_user=request.state.auth_user,
-    )
-    task = executor.execute_request_in_coroutine(request_task)
-    background_tasks.add_task(task.cancel)
+    kill_request_on_disconnect = False
+    if executor.api_process_execution_enabled():
+        executor.check_request_thread_executor_available()
+        request_task = await executor.prepare_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.CLUSTER_HOOK_LOGS,
+            request_body=hook_logs_body,
+            func=core.tail_hook_logs,
+            schedule_type=requests_lib.ScheduleType.SHORT,
+            request_cluster_name=hook_logs_body.cluster_name,
+            auth_user=request.state.auth_user,
+        )
+        task = executor.execute_request_in_coroutine(request_task)
+        background_tasks.add_task(task.cancel)
+    else:
+        await executor.schedule_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.CLUSTER_HOOK_LOGS,
+            request_body=hook_logs_body,
+            func=core.tail_hook_logs,
+            schedule_type=requests_lib.ScheduleType.SHORT,
+            request_cluster_name=hook_logs_body.cluster_name,
+            auth_user=request.state.auth_user,
+        )
+        request_task = await requests_lib.get_request_async(
+            request.state.request_id)
+        assert request_task is not None
+        kill_request_on_disconnect = True
     return stream_utils.stream_response_for_long_request(
         request_id=request.state.request_id,
         logs_path=request_task.log_path,
         background_tasks=background_tasks,
-        kill_request_on_disconnect=False,
+        kill_request_on_disconnect=kill_request_on_disconnect,
     )
 
 
@@ -1429,6 +1483,47 @@ def estimated_spend(
             end_date=end_date,
         )
     except estimated_spend_lib.InvalidDateRangeError as e:
+        raise fastapi.HTTPException(status_code=422, detail=str(e)) from e
+
+
+@app.get('/estimated_spend/drilldown')
+def estimated_spend_drilldown(
+    request: fastapi.Request,
+    level: estimated_spend_lib.SpendDrilldownLevel,
+    days: int = estimated_spend_lib.DEFAULT_LOOKBACK_DAYS,
+    start_date: datetime.date | None = None,
+    end_date: datetime.date | None = None,
+    owner_user_hash: str | None = None,
+    owner_unknown: bool = False,
+    workload_type: str | None = None,
+    workload_id: str | None = None,
+    workload_task_id: int | None = None,
+    offset: int = 0,
+    limit: int = estimated_spend_lib.DRILLDOWN_DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Returns one materialized spend-attribution page to admins only."""
+    auth_user = request.state.auth_user
+    if auth_user is not None:
+        roles = permission.permission_service.get_user_roles(auth_user.id)
+        if rbac.RoleName.ADMIN.value not in roles:
+            raise fastapi.HTTPException(
+                status_code=403, detail='Only admins can view estimated spend.')
+    try:
+        return estimated_spend_lib.get_estimated_spend_drilldown(
+            level=level,
+            days=days,
+            start_date=start_date,
+            end_date=end_date,
+            owner_user_hash=owner_user_hash,
+            owner_unknown=owner_unknown,
+            workload_type=workload_type,
+            workload_id=workload_id,
+            workload_task_id=workload_task_id,
+            offset=offset,
+            limit=limit,
+        )
+    except (estimated_spend_lib.InvalidDateRangeError,
+            estimated_spend_lib.InvalidDrilldownScopeError) as e:
         raise fastapi.HTTPException(status_code=422, detail=str(e)) from e
 
 
@@ -1943,6 +2038,24 @@ async def list_plugins() -> dict[str, list[dict[str, Any]]]:
     return {'plugins': plugin_infos}
 
 
+@app.get('/api/health/ready')
+async def readiness() -> dict[str, str]:
+    """Check PostgreSQL-backed role readiness for Kubernetes endpoints."""
+    if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
+        try:
+            # Runtime import keeps the SQLite/local API import path light.
+            # pylint: disable=import-outside-toplevel
+            from sky.server.requests import postgres as request_postgres
+            if not request_postgres.current_instance_is_ready():
+                raise RuntimeError('role heartbeat is not ready')
+        except Exception as e:
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail=f'API role is not ready: '
+                f'{common_utils.format_exception(e)}') from e
+    return {'status': 'ready'}
+
+
 @app.get(
     '/api/health',
     # response_model_exclude_unset omits unset fields
@@ -1955,8 +2068,9 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         responses.APIHealthResponse: The health response.
     """
     user = request.state.auth_user
+    is_anonymous = getattr(request.state, 'anonymous_user', False)
     server_status = common.ApiServerStatus.HEALTHY
-    if getattr(request.state, 'anonymous_user', False):
+    if is_anonymous:
         # API server authentication is enabled, but the request is not
         # authenticated. We still have to serve the request because the
         # /api/health endpoint has two different usage:
@@ -1994,6 +2108,11 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
     # Get latest version from cache (returns None for dev versions
     # or if not available)
     latest_version = version_check.get_latest_version_for_current()
+    release_metadata: dict[str, str] = {}
+    if not is_anonymous:
+        if sky.__commit_timestamp__ is not None:
+            release_metadata['commit_timestamp'] = sky.__commit_timestamp__
+        release_metadata['deployment_timestamp'] = _SERVER_STARTED_AT
 
     return responses.APIHealthResponse(
         status=server_status,
@@ -2021,6 +2140,7 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         # Whether external proxy auth is enabled (from server.yaml config)
         external_proxy_auth_enabled=server_config.load_external_proxy_config().
         enabled,
+        **release_metadata,
         # Latest version info (if available and newer than current)
         latest_version=latest_version,
         # Whether telemetry/usage collection is enabled
@@ -2289,239 +2409,15 @@ app.include_router(dashboard_app.router)
 
 
 def _init_or_restore_server_user_hash():
-    """Restores the server user hash from the global user state db.
-
-    The API server must have a stable user hash across restarts and potential
-    multiple replicas. Thus we persist the user hash in db and restore it on
-    startup. When upgrading from old version, the user hash will be read from
-    the local file (if any) to keep the user hash consistent.
-    """
-
-    def apply_user_hash(user_hash: str) -> None:
-        # For local API server, the user hash in db and local file should be
-        # same so there is no harm to override here.
-        common_utils.set_user_hash_locally(user_hash)
-        # Refresh the server user hash for current process after restore or
-        # initialize the user hash in db, child processes will get the correct
-        # server id from the local cache file.
-        common_lib.refresh_server_id()
-
-    user_hash = global_user_state.get_system_config(_SERVER_USER_HASH_KEY)
-    if user_hash is not None:
-        apply_user_hash(user_hash)
-        return
-
-    # Initial deployment, generate a user hash and save it to the db.
-    user_hash = common_utils.get_user_hash()
-    global_user_state.set_system_config(_SERVER_USER_HASH_KEY, user_hash)
-    apply_user_hash(user_hash)
+    """Compatibility facade for the shared role bootstrap helper."""
+    # pylint: disable=import-outside-toplevel
+    from sky.server import runtime as runtime_lib
+    runtime_lib.init_or_restore_server_user_hash()
 
 
 if __name__ == '__main__':
-    # Raise the websockets library header limits before importing uvicorn.
-    # The env vars are read by websockets.http11 and websockets.legacy.http
-    # at import time. Enterprise SSO cookies from oauth2proxy can exceed the
-    # default 8KB limit, causing WebSocket upgrade to fail with HTTP 400.
-    os.environ.setdefault('WEBSOCKETS_MAX_LINE_LENGTH',
-                          server_constants.WEBSOCKETS_MAX_HEADER_LINE_LENGTH)
-    os.environ.setdefault('WEBSOCKETS_MAX_NUM_HEADERS',
-                          server_constants.WEBSOCKETS_MAX_NUM_HEADERS)
-
-    import uvicorn
-
-    # pylint: disable-next=ungrouped-imports
-    from sky.server import uvicorn as skyuvicorn
-
-    logger.info('Initializing SkyPilot API server')
-    skyuvicorn.add_timestamp_prefix_for_server_logs()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--port', default=46580, type=int)
-    parser.add_argument('--deploy', action='store_true')
-    # Serve metrics on a separate port to isolate it from the application APIs:
-    # metrics port will not be exposed to the public network typically.
-    parser.add_argument('--metrics-port', default=9090, type=int)
-    cmd_args = parser.parse_args()
-    if cmd_args.port == cmd_args.metrics_port:
-        logger.error('port and metrics-port cannot be the same, exiting.')
-        raise ValueError('port and metrics-port cannot be the same')
-
-    # Fail fast if the port is not available to avoid corrupt the state
-    # of potential running server instance.
-    # We might reach here because the running server is currently not
-    # responding, thus the healthz check fails and `sky api start` think
-    # we should start a new server instance.
-    if not common_utils.is_port_available(cmd_args.port):
-        logger.error(f'Port {cmd_args.port} is not available, exiting.')
-        raise RuntimeError(f'Port {cmd_args.port} is not available')
-
-    # Always load plugin in main process, an edge case is that the main process
-    # will also run uvicorn server when num_worker=1 and then the plugins will
-    # be installed twice in main process (second time with the uvicorn app).
-    # This is okay since plugin install is considered idempotent.
-    plugins.load_plugins(
-        plugins.ExtensionContext(context=plugins.PluginContext.MAIN))
-
-    # Show the privacy policy if it is not already shown. We place it here so
-    # that it is shown only when the API server is started.
-    usage_lib.maybe_show_privacy_policy()
-
-    # Initialize and verify every central Alembic schema before serving.
-    db_utils.set_max_connections(1)
-    logger.info('Initializing database engines')
-    database_migrations.initialize_central_databases()
-    logger.info('Database engines initialized')
-    # Initialize request db, recovering request state from the previous
-    # server run (or wiping it if recovery is disabled or fails). Returns
-    # whether the recovery transitions actually ran and completed; only then
-    # is it safe to re-enqueue the surviving queued rows below.
-    requests_recovered = requests_lib.recover_db_and_logs()
-    # Surface clusters wedged in INIT by work that died with the previous
-    # server run (or with the pod's disk on a redeploy) and could not be
-    # requeued: record a cluster event explaining the interruption. Runs in
-    # the background so a large INIT backlog cannot delay readiness, delayed
-    # past the previous replica's shutdown grace so a launch still finishing
-    # on an overlapping old replica is not misread as interrupted. Best
-    # effort; never affects the server.
-    try:
-        scan_delay = float(
-            os.environ.get(constants.GRACE_PERIOD_SECONDS_ENV_VAR, '60'))
-    except ValueError:
-        scan_delay = 60
-    threading.Thread(target=requests_lib.surface_interrupted_cluster_launches,
-                     args=(scan_delay,),
-                     name='surface-interrupted-launches',
-                     daemon=True).start()
-    # Restore the server user hash
-    logger.info('Initializing server user hash')
-    _init_or_restore_server_user_hash()
-    # Set up consolidation mode signal file. Needs global user state DB access
-    # to check for existing controller clusters. Placed after user hash restore
-    # to avoid accidentally using the wrong server hash.
-    managed_job_utils.setup_consolidation_mode_on_startup(cmd_args.deploy)
-    # Pre-load plugin RBAC rules + viewer allowlist before initializing
-    # the permission service. The permission service reads both during
-    # _maybe_initialize_policies (blocklist seeded into Casbin; viewer
-    # allowlist built into an in-memory structure).
-    logger.info('Pre-loading plugin RBAC rules + viewer allowlist')
-    plugins.load_plugin_rbac_rules()
-    plugins.load_plugin_viewer_allowlist()
-    logger.info('Initializing permission service')
-    permission.permission_service.initialize()
-    logger.info('Permission service initialized')
-
-    max_db_connections = global_user_state.get_max_db_connections()
-    logger.info(f'Max db connections: {max_db_connections}')
-
-    # Reserve memory for jobs and serve/pool controller in consolidation mode.
-    reserved_memory_mb = (
-        controller_utils.compute_memory_reserved_for_controllers(
-            reserve_for_controllers=os.environ.get(
-                constants.OVERRIDE_CONSOLIDATION_MODE) is not None,
-            # For jobs controller, we need to reserve for both jobs and
-            # pool controller.
-            reserve_extra_for_pool=not os.environ.get(
-                constants.IS_SKYPILOT_SERVE_CONTROLLER)))
-
-    config = server_config.compute_server_config(
-        cmd_args.deploy,
-        max_db_connections,
-        reserved_memory_mb=reserved_memory_mb)
-    server_config.publish_serve_launch_parallelism(config)
-
-    num_workers = config.num_server_workers
-
-    queue_server: multiprocessing.Process | None = None
-    workers: list[executor.RequestWorker] = []
-    # Global background tasks that will be scheduled in a separate event loop.
-    global_tasks: list[asyncio.Task] = []
-    try:
-        background = uvloop.new_event_loop()
-        if os.environ.get(constants.ENV_VAR_SERVER_METRICS_ENABLED):
-            metrics.maybe_register_managed_jobs_collector()
-            metrics_server = metrics.build_metrics_server(
-                cmd_args.host, cmd_args.metrics_port)
-            global_tasks.append(background.create_task(metrics_server.serve()))
-            # Reap per-pid prometheus multiproc files left behind by
-            # workers that crashed (SIGKILL, OOM, hard crash) and never
-            # called mark_process_dead. Without this, MultiProcessCollector
-            # keeps serving the dead pid's last live-gauge value on every
-            # /metrics scrape.
-            global_tasks.append(
-                background.create_task(metrics.multiproc_reaper_daemon()))
-        global_tasks.append(
-            background.create_task(requests_lib.requests_gc_daemon()))
-        global_tasks.append(
-            background.create_task(
-                global_user_state.cluster_event_retention_daemon()))
-        global_tasks.append(
-            background.create_task(
-                managed_job_state.job_event_retention_daemon()))
-        global_tasks.append(
-            background.create_task(estimated_spend_lib.rollup_daemon()))
-        # Unreferenced file mounts cleanup is based on database so should
-        # be a singleton task.
-        global_tasks.append(
-            background.create_task(cleanup_unreferenced_file_mounts()))
-        global_tasks.append(background.create_task(cleanup_download_tmp()))
-        threading.Thread(target=background.run_forever, daemon=True).start()
-
-        # managed-job-status-refresh runs as a thread inside this
-        # supervisor process so the leader role and the controller
-        # subprocesses it spawns share a single OS lifecycle.  Routing
-        # this daemon through the executor task queue (as other daemons
-        # do) lets it drift between replicas while the controllers stay
-        # behind, which causes cross-replica controller orphans.  See
-        # sky/jobs/managed_job_refresh_thread.py for details.
-        # pylint: disable=import-outside-toplevel
-        from sky.jobs import managed_job_refresh_thread
-        managed_job_refresh_thread.start_managed_job_refresh_daemon()
-
-        # Snapshot a clean copy of os.environ BEFORE spawning workers and
-        # before any per-request env mutation can happen. Used when
-        # spawning consolidation-mode controllers so they don't inherit
-        # the client request's env vars (e.g. SKYPILOT_API_SERVER_ENDPOINT).
-        # The same snapshot is forwarded to workers via initargs (see
-        # executor.start) and to coroutine-path requests running in this
-        # same process.
-        clean_env_module.capture_clean_server_env()
-
-        queue_server, workers = executor.start(config)
-        # Requeue requests that were still queued when the previous server
-        # stopped. Must run after executor.start() (queue backend up) and
-        # before serving traffic, so recovered work resumes ahead of new
-        # requests. Only safe when startup recovery actually reconciled the
-        # request rows; on any legacy wipe path (env-var reset, plugin
-        # request backend, recovery failure) surviving rows were never
-        # reconciled and must not be replayed.
-        if requests_recovered:
-            executor.reenqueue_recovered_requests()
-
-        logger.info(f'Starting SkyPilot API server, workers={num_workers}')
-        # We don't support reload for now, since it may cause leakage of request
-        # workers or interrupt running requests.
-        uvicorn_config = uvicorn.Config('sky.server.server:app',
-                                        host=cmd_args.host,
-                                        port=cmd_args.port,
-                                        workers=num_workers,
-                                        ws_per_message_deflate=False)
-        skyuvicorn.run(uvicorn_config,
-                       max_db_connections=config.num_db_connections_per_worker)
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error(f'Failed to start SkyPilot API server: '
-                     f'{common_utils.format_exception(exc, use_bracket=True)}')
-        raise
-    finally:
-        logger.info('Shutting down SkyPilot API server...')
-
-        for gt in global_tasks:
-            gt.cancel()
-        for plugin in plugins.get_plugins():
-            plugin.shutdown()
-        subprocess_utils.run_in_parallel(lambda worker: worker.cancel(),
-                                         workers,
-                                         num_threads=len(workers))
-        if queue_server is not None:
-            queue_server.kill()
-            queue_server.join()
+    # Imported only for executable entrypoints, preserving this module's
+    # historical FastAPI and pickle facade for ordinary imports.
+    # pylint: disable=import-outside-toplevel
+    from sky.server import runtime as runtime_entrypoint
+    runtime_entrypoint.main()

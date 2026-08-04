@@ -1,7 +1,49 @@
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
 {{- if and $databaseConfigured .Values.databaseMigration.enabled }}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "IS_SKYPILOT_SERVER" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts)) }}
+{{- $haEnabled := .Values.apiService.highAvailability.enabled -}}
+{{- $guardedPostgresHook := and (eq .Values.requestStore.backend "postgres") (not (empty .Values.apiService.dbConnectionSecretName)) -}}
+{{- if and $haEnabled (not .Values.apiService.dbConnectionSecretName) -}}
+{{- fail "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook" -}}
+{{- end -}}
+{{- if and $haEnabled .Values.apiService.dbConnectionString -}}
+{{- fail "apiService.highAvailability.enabled=true does not support chart-managed apiService.dbConnectionString; use apiService.dbConnectionSecretName" -}}
+{{- end -}}
+{{- if and $guardedPostgresHook .Values.databaseMigration.annotations -}}
+{{- range $annotationName := list "helm.sh/hook" "helm.sh/hook-weight" "helm.sh/hook-delete-policy" -}}
+{{- if hasKey $.Values.databaseMigration.annotations $annotationName -}}
+{{- fail (printf "databaseMigration.annotations[%q] is managed by guarded PostgreSQL mode" $annotationName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $authorityWorker := get (.Values.resourceActions | default (dict)) "authorityWorker" | default (dict) -}}
+{{- $authorityEnabled := get $authorityWorker "enabled" | default false -}}
+{{- $authorityInstallationId := get $authorityWorker "installationId" | default "" -}}
+{{- $authorityCohorts := get $authorityWorker "cohorts" | default (list) -}}
+{{- $authorityTombstones := get $authorityWorker "retirementTombstones" | default (list) -}}
+{{- $authorityCohortSuffixes := list -}}
+{{- $authorityTombstoneSuffixes := list -}}
+{{- $authorityLiveManifestFiles := list -}}
+{{- if $authorityEnabled -}}
+{{- range $cohort := $authorityCohorts -}}
+{{- $authorityCohortSuffixes = append $authorityCohortSuffixes (get $cohort "id") -}}
+{{- end -}}
+{{- $authorityCohortSuffixes = sortAlpha $authorityCohortSuffixes -}}
+{{- $authorityTombstoneSuffixes = sortAlpha $authorityTombstones -}}
+{{- range $cohortSuffix := $authorityCohortSuffixes -}}
+{{- $manifestPath := include "skypilot.resourceActionAuthorityPreflightManifestPath" (dict "cohortSuffix" $cohortSuffix) -}}
+{{- $authorityLiveManifestFiles = append $authorityLiveManifestFiles (dict "cohort_suffix" $cohortSuffix "path" $manifestPath) -}}
+{{- end -}}
+{{- end -}}
+{{- $proposedInstallationId := ternary $authorityInstallationId "" $authorityEnabled -}}
+{{- $authorityReleasePreflight := dict "enabled" $authorityEnabled "helm_full_name" $fullName "helm_release_name" .Release.Name "installation_id" $proposedInstallationId "live_manifest_files" $authorityLiveManifestFiles "namespace" .Release.Namespace "tombstone_suffixes" $authorityTombstoneSuffixes "version" 1 -}}
+{{- $reservedVolumeNames := list -}}
+{{- $reservedMountPaths := list -}}
+{{- range $index, $manifestFile := $authorityLiveManifestFiles -}}
+{{- $reservedVolumeNames = append $reservedVolumeNames (printf "authority-preflight-%d" $index) -}}
+{{- $reservedMountPaths = append $reservedMountPaths (get $manifestFile "path") -}}
+{{- end -}}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "IS_SKYPILOT_SERVER" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedVolumeNames" $reservedVolumeNames "reservedMountPaths" $reservedMountPaths) }}
 {{- $migrationSuffix := printf "-db-migration-%d" .Release.Revision -}}
 {{- $migrationBaseLength := sub 63 (len $migrationSuffix) | int -}}
 {{- $migrationName := printf "%s%s" ($fullName | trunc $migrationBaseLength | trimSuffix "-") $migrationSuffix -}}
@@ -12,9 +54,19 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ $migrationName }}
-  {{- with .Values.databaseMigration.annotations }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: database-migration
+    skypilot.co/helm-revision: {{ .Release.Revision | quote }}
+  {{- if or .Values.databaseMigration.annotations $guardedPostgresHook }}
   annotations:
+    {{- with .Values.databaseMigration.annotations }}
     {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if $guardedPostgresHook }}
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- end }}
   {{- end }}
 spec:
   backoffLimit: {{ .Values.databaseMigration.backoffLimit }}
@@ -24,6 +76,9 @@ spec:
     metadata:
       labels:
         app: {{ $migrationName }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: database-migration
+        skypilot.co/helm-revision: {{ .Release.Revision | quote }}
     spec:
       automountServiceAccountToken: false
       restartPolicy: Never
@@ -56,8 +111,14 @@ spec:
         {{- end }}
         - name: IS_SKYPILOT_SERVER
           value: "true"
+        - name: SKYPILOT_API_REQUEST_BACKEND
+          value: {{ .Values.requestStore.backend | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: {{ ternary "bootstrap" "upgrade" .Values.databaseMigration.bootstrapFreshSchema }}
+        {{- if $guardedPostgresHook }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON
+          value: {{ toRawJson $authorityReleasePreflight | quote }}
+        {{- end }}
         {{- if .Values.apiService.dbConnectionSecretName }}
         - name: SKYPILOT_DB_CONNECTION_URI
           valueFrom:
@@ -71,14 +132,29 @@ spec:
               name: {{ $fullName }}-db-connection
               key: connection_string
         {{- end }}
-        {{- if .Values.databaseConnection.extraVolumeMounts }}
+        {{- if or (gt (len $authorityLiveManifestFiles) 0) .Values.databaseConnection.extraVolumeMounts }}
         volumeMounts:
+          {{- range $index, $manifestFile := $authorityLiveManifestFiles }}
+          - name: {{ printf "authority-preflight-%d" $index }}
+            mountPath: {{ get $manifestFile "path" | quote }}
+            subPath: manifest.json
+            readOnly: true
+          {{- end }}
           {{- with .Values.databaseConnection.extraVolumeMounts }}
           {{- toYaml . | nindent 10 }}
           {{- end }}
         {{- end }}
-      {{- if .Values.databaseConnection.extraVolumes }}
+      {{- if or (gt (len $authorityLiveManifestFiles) 0) .Values.databaseConnection.extraVolumes }}
       volumes:
+        {{- range $index, $manifestFile := $authorityLiveManifestFiles }}
+        - name: {{ printf "authority-preflight-%d" $index }}
+          configMap:
+            name: {{ include "skypilot.resourceActionAuthorityPreflightManifestName" (dict "namespace" $.Release.Namespace "helmReleaseName" $.Release.Name "cohortSuffix" (get $manifestFile "cohort_suffix")) }}
+            defaultMode: 0444
+            items:
+            - key: manifest.json
+              path: manifest.json
+        {{- end }}
         {{- with .Values.databaseConnection.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

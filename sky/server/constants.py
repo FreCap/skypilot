@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 62  # Managed container image catalog and preparation API
+API_VERSION = 69  # Action-fenced internal cluster teardown
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -71,6 +71,11 @@ MIN_BATCH_REPLICA_INFO_VERSION = 6
 # depend on per-user preferred workspace when talking to such servers.
 MIN_PREFERRED_WORKSPACE_API_VERSION = 53
 
+# Minimum server API version that supports filtering cluster status by
+# workspace. Servers below this version ignore the request-body field, which
+# would otherwise silently return clusters outside the requested workspaces.
+MIN_STATUS_WORKSPACE_FILTER_API_VERSION = 63
+
 # Minimum server API version that supports filtering the managed jobs queue by
 # submission time (submitted_after / submitted_before, surfaced as the CLI
 # --since / --after / --before flags). Older servers silently ignore these
@@ -95,8 +100,38 @@ MIN_ESTIMATED_SPEND_BREAKDOWNS_API_VERSION = 58
 # estimated-spend endpoint.
 MIN_ESTIMATED_SPEND_DATE_RANGE_API_VERSION = 59
 
+# Minimum server API version that adds durable daily service request volume to
+# the estimated-spend response.
+MIN_ESTIMATED_SPEND_SERVICE_REQUESTS_API_VERSION = 63
+
+# Minimum server API version that adds the exact non-rejected request subset to
+# the estimated-spend service request projection.
+MIN_ESTIMATED_SPEND_NON_REJECTED_REQUESTS_API_VERSION = 68
+
 # Minimum server API version exposing the managed image catalog.
 MIN_CONTAINER_IMAGES_API_VERSION = 62
+
+# Minimum server API version exposing actor-aware operational events.
+MIN_OPERATIONAL_EVENTS_API_VERSION = 64
+
+# Minimum API version with metadata-only SkyServe status projections.
+MIN_SERVE_PROGRESSIVE_STATUS_API_VERSION = 65
+
+# Minimum API version with direct persisted SkyServe dashboard history reads.
+MIN_SERVE_DASHBOARD_HISTORY_API_VERSION = 66
+
+# Backward-compatible name introduced with the history route. It refers only
+# to the v1b history capability; replica reads have their own later gate.
+MIN_SERVE_DASHBOARD_DIRECT_READS_API_VERSION = (
+    MIN_SERVE_DASHBOARD_HISTORY_API_VERSION)
+
+# Minimum API version with batched summaries and paginated replica reads.
+MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67
+
+# Minimum server version accepting the private expected-cluster-record UUID on
+# controller-originated down requests. Older servers ignore unknown payload
+# fields, which would silently discard the teardown fence.
+MIN_RESOURCE_ACTION_EXPECTED_CLUSTER_UUID_API_VERSION = 69
 
 # Minimum server API version that exposes the admin-only, low-cardinality
 # operator notification inbox used by the dashboard.
@@ -140,6 +175,14 @@ AUTH_SESSION_TIMEOUT_SECONDS = 300  # 5 minutes
 
 # Cookie header for stream request id.
 STREAM_REQUEST_HEADER = 'X-SkyPilot-Stream-Request-ID'
+
+# Server-owned controller origin carried by nested SDK requests. These headers
+# do not grant authorization; API middleware uses them only to reject work from
+# a controller generation whose PostgreSQL leadership fence is no longer live.
+CONTROLLER_INSTANCE_ID_HEADER = 'X-SkyPilot-Controller-Instance-ID'
+CONTROLLER_GENERATION_HEADER = 'X-SkyPilot-Controller-Generation'
+CONTROLLER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'
+CONTROLLER_GENERATION_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_GENERATION'
 
 # Valid empty values for pickled fields (base64-encoded pickled None)
 # base64.b64encode(pickle.dumps(None)).decode('utf-8')

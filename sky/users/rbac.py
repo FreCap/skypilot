@@ -109,6 +109,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'POST'
     },
     {
+        'path': '/events',
+        'method': 'GET'
+    },
+    {
         'path': '/queue',
         'method': 'POST'
     },
@@ -181,6 +185,18 @@ _DEFAULT_VIEWER_ALLOWLIST = [
     {
         'path': '/serve/placement',
         'method': 'POST'
+    },
+    {
+        'path': '/serve/:service_name/history',
+        'method': 'GET'
+    },
+    {
+        'path': '/serve/replica-summaries',
+        'method': 'GET'
+    },
+    {
+        'path': '/serve/:service_name/replicas',
+        'method': 'GET'
     },
     {
         'path': '/serve/logs',

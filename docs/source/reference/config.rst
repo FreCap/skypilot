@@ -31,6 +31,7 @@ Below is the configuration syntax and some example values. See detailed explanat
     :ref:`requests_retention_hours <config-yaml-api-server-requests-gc-retention-hours>`: 24
     :ref:`cluster_event_retention_hours <config-yaml-api-server-cluster-event-retention-hours>`: 720
     :ref:`cluster_debug_event_retention_hours <config-yaml-api-server-cluster-debug-event-retention-hours>`: 720
+    :ref:`operational_event_retention_hours <config-yaml-api-server-operational-event-retention-hours>`: 720
     :ref:`daemon_log_max_bytes <config-yaml-api-server-daemon-log-max-bytes>`: 134217728
 
   :ref:`allowed_clouds <config-yaml-allowed-clouds>`:
@@ -352,6 +353,26 @@ Example:
 
   api_server:
     cluster_event_retention_hours: -1 # Disable all cluster event GC
+
+.. _config-yaml-api-server-operational-event-retention-hours:
+
+``api_server.operational_event_retention_hours``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Retention period for actor-aware operational events in hours (optional). Set
+this to a negative value to disable operational event garbage collection.
+
+Operational events power ``sky events`` and the cluster detail history panel.
+They are stored only when the API server uses the PostgreSQL request backend.
+
+Default: ``720.0`` (30 days).
+
+Example:
+
+.. code-block:: yaml
+
+  api_server:
+    operational_event_retention_hours: -1
 
 .. _config-yaml-api-server-cluster-debug-event-retention-hours:
 

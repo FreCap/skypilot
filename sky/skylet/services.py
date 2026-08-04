@@ -3,9 +3,11 @@
 import json
 import os
 import subprocess
+import uuid
 
 import grpc
 
+import sky
 from sky import exceptions
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
@@ -20,6 +22,8 @@ from sky.schemas.generated import managed_jobsv1_pb2
 from sky.schemas.generated import managed_jobsv1_pb2_grpc
 from sky.schemas.generated import servev1_pb2
 from sky.schemas.generated import servev1_pb2_grpc
+from sky.schemas.generated import skyletv1_pb2
+from sky.schemas.generated import skyletv1_pb2_grpc
 from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -34,6 +38,43 @@ logger = sky_logging.init_logger(__name__)
 # In the worst case, flush the log buffer every 50ms,
 # to ensure responsiveness.
 DEFAULT_LOG_CHUNK_FLUSH_INTERVAL = 0.05
+
+
+class CapabilitiesServiceImpl(skyletv1_pb2_grpc.CapabilitiesServiceServicer):
+    """Immutable advertisement of worker-wire contracts for one Skylet."""
+
+    def __init__(self, skylet_boot_id: str):
+        parsed_boot_id = uuid.UUID(skylet_boot_id)
+        if str(parsed_boot_id) != skylet_boot_id:
+            raise ValueError(
+                f'Noncanonical Skylet boot ID: {skylet_boot_id!r}.')
+
+        jobs_service = jobsv1_pb2.DESCRIPTOR.services_by_name['JobsService']
+        get_job_status = jobs_service.methods_by_name['GetJobStatus']
+        methods = [
+            skyletv1_pb2.SkyletMethodCapabilityV1(
+                service=jobs_service.full_name,
+                method=get_job_status.name,
+                contract_versions=(1,),
+            )
+        ]
+        methods.sort(key=lambda method: (method.service, method.method))
+        response = skyletv1_pb2.SkyletCapabilitiesV1(
+            schema_version=1,
+            skylet_boot_id=skylet_boot_id,
+            skylet_version=constants.SKYLET_VERSION,
+            skypilot_version=sky.__version__,
+            skypilot_commit=sky.__commit__,
+            methods=methods)
+        self._serialized_response = response.SerializeToString(
+            deterministic=True)
+
+    def GetCapabilities(
+            self, request: skyletv1_pb2.GetCapabilitiesRequest,
+            context: grpc.ServicerContext) -> skyletv1_pb2.SkyletCapabilitiesV1:
+        del request, context
+        return skyletv1_pb2.SkyletCapabilitiesV1.FromString(
+            self._serialized_response)
 
 
 class AutostopServiceImpl(autostopv1_pb2_grpc.AutostopServiceServicer):
@@ -85,6 +126,14 @@ class AutostopServiceImpl(autostopv1_pb2_grpc.AutostopServiceServicer):
                 autostop_lib.set_hooks(
                     autostop_lib.hooks_from_protobuf(request.hooks))
             return autostopv1_pb2.SetAutostopResponse()
+        except exceptions.NotSupportedError as e:
+            # The node refuses a config it cannot execute (e.g. an
+            # autodown it has no permission to perform). This is a
+            # permanent property of the request, not a transient
+            # failure: FAILED_PRECONDITION keeps the client from
+            # retrying and carries the message through as a
+            # NotSupportedError instead of an internal error.
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
@@ -116,12 +165,13 @@ class ServeServiceImpl(servev1_pb2_grpc.ServeServiceServicer):
         """Gets serve status."""
         try:
             (service_names, pool, summary_only,
-             include_target_num_replicas) = (
+             include_target_num_replicas, metadata_only) = (
                  serve_rpc_utils.GetServiceStatusRequestConverter.from_proto(request))  # pylint: disable=line-too-long
             statuses = serve_utils.get_service_status_pickled(
                 service_names,
                 pool,
                 summary_only=summary_only,
+                metadata_only=metadata_only,
                 include_target_num_replicas=include_target_num_replicas)
             return serve_rpc_utils.GetServiceStatusResponseConverter.to_proto(
                 statuses)
@@ -434,7 +484,35 @@ class JobsServiceImpl(jobsv1_pb2_grpc.JobsServiceServicer):
             for job_id, status in job_statuses.items():
                 job_statuses[job_id] = job_lib.JobStatus(status).to_protobuf(
                 ) if status is not None else jobsv1_pb2.JOB_STATUS_UNSPECIFIED
-            return jobsv1_pb2.GetJobStatusResponse(job_statuses=job_statuses)
+            try:
+                recovery_infos, detail_statuses = (
+                    job_lib.get_job_system_recovery_details(job_ids))
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning('Ignoring optional system recovery details '
+                               f'while serving job statuses: {e}')
+                recovery_infos = {}
+                detail_statuses = {
+                    job_id: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
+                    for job_id in job_ids
+                }
+            recovery_proto_infos: dict[int,
+                                       jobsv1_pb2.JobSystemRecoveryInfo] = {}
+            for job_id, info in recovery_infos.items():
+                try:
+                    recovery_proto_infos[job_id] = info.to_protobuf()
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Ignoring malformed optional system recovery detail '
+                        f'for job {job_id}: {e}')
+                    detail_statuses[job_id] = (
+                        job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+            return jobsv1_pb2.GetJobStatusResponse(
+                job_statuses=job_statuses,
+                system_recovery_infos=recovery_proto_infos,
+                system_recovery_detail_statuses={
+                    job_id: detail_status.to_protobuf()
+                    for job_id, detail_status in detail_statuses.items()
+                })
         except Exception as e:  # pylint: disable=broad-except
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 

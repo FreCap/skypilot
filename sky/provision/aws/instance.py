@@ -163,6 +163,55 @@ def _get_head_instance_id(instances: list) -> str | None:
     return head_instance_id
 
 
+def _capture_fresh_instance_identity(
+        request_session: Any, *, region: str,
+        created_instance_ids: list[str]) -> common.AWSInstanceIdentity | None:
+    """Read one created instance and caller account with the same session."""
+    if request_session is None or len(created_instance_ids) != 1:
+        return None
+    instance_id = created_instance_ids[0]
+    ec2_client = request_session.client('ec2', region_name=region)
+    response = ec2_client.describe_instances(InstanceIds=[instance_id])
+    reservations = response.get('Reservations')
+    if not isinstance(reservations, list):
+        raise ValueError('DescribeInstances returned no reservation list.')
+    instances = [
+        instance for reservation in reservations
+        if isinstance(reservation, dict)
+        for instance in reservation.get('Instances', [])
+        if isinstance(instance, dict)
+    ]
+    if len(instances) != 1 or instances[0].get('InstanceId') != instance_id:
+        raise ValueError('DescribeInstances did not return the exact create.')
+    instance = instances[0]
+    instance_type = instance.get('InstanceType')
+    if not isinstance(instance_type, str) or not instance_type:
+        raise ValueError('DescribeInstances returned no instance type.')
+    placement = instance.get('Placement')
+    availability_zone = (placement.get('AvailabilityZone') if isinstance(
+        placement, dict) else None)
+    if not isinstance(availability_zone, str) or not availability_zone:
+        raise ValueError('DescribeInstances returned no availability zone.')
+    lifecycle = instance.get('InstanceLifecycle')
+    if lifecycle is None:
+        market_type = 'on_demand'
+    elif lifecycle == 'spot':
+        market_type = 'spot'
+    else:
+        raise ValueError(f'Unsupported InstanceLifecycle: {lifecycle!r}.')
+    sts_client = request_session.client('sts', region_name=region)
+    caller_identity = sts_client.get_caller_identity()
+    account_id = caller_identity.get('Account')
+    if not isinstance(account_id, str) or not account_id:
+        raise ValueError('STS returned no AWS account ID.')
+    return common.AWSInstanceIdentity(aws_account_id=account_id,
+                                      region=region,
+                                      availability_zone=availability_zone,
+                                      ec2_instance_id=instance_id,
+                                      instance_type=instance_type,
+                                      market_type=market_type)
+
+
 def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                   config: common.ProvisionConfig) -> common.ProvisionRecord:
     """See sky/provision/__init__.py"""
@@ -170,6 +219,17 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
     is_single_zone_request = _is_single_zone_request(config.provider_config)
 
     ec2 = _default_ec2_resource(region)
+    # aws.resource() above and aws.session() share the same thread-local
+    # workspace-profile session. Fetch it after creating the resource so the
+    # compatibility reload in _default_ec2_resource(), if any, has completed.
+    # This retains the exact provisioning credential scope for the optional
+    # post-create DescribeInstances/STS evidence rather than resolving a new
+    # ambient/default session later in the backend.
+    try:
+        request_session = aws.session(check_credentials=True,
+                                      profile=aws.get_workspace_profile())
+    except Exception:  # pylint: disable=broad-except
+        request_session = None
     # NOTE: We set max_attempts=0 for fast failing when the resource is not
     # available (although the doc says it will only retry for network
     # issues, practically, it retries for capacity errors, etc as well).
@@ -451,13 +511,25 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 _create_node_tag(inst, is_head=False)
 
     assert head_instance_id is not None
+    fresh_identity = None
+    try:
+        fresh_identity = _capture_fresh_instance_identity(
+            request_session,
+            region=region,
+            created_instance_ids=created_instance_ids)
+    except Exception as error:  # pylint: disable=broad-except
+        # Provisioning itself succeeded. Optional system-recovery evidence is
+        # fail-closed and must not make the ordinary launch fail.
+        logger.debug('Fresh AWS identity evidence is unavailable: '
+                     f'{common_utils.format_exception(error)}')
     return common.ProvisionRecord(provider_name='aws',
                                   region=region,
                                   zone=zone,
                                   cluster_name=cluster_name_on_cloud,
                                   head_instance_id=head_instance_id,
                                   resumed_instance_ids=resumed_instance_ids,
-                                  created_instance_ids=created_instance_ids)
+                                  created_instance_ids=created_instance_ids,
+                                  fresh_aws_instance_identity=fresh_identity)
 
 
 def _filter_instances(ec2: 'mypy_boto3_ec2.ServiceResource',

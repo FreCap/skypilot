@@ -483,11 +483,15 @@ def _broker_cycle(
     activity: dict[str, Any] | None = None
     if autoscaler.reserved_fill_utilization_gate:
         sample = autoscaler.fill_demand_sample(replica_infos)
-        if sample is not None:
-            activity = {
-                'demonstrated_need': sample.demonstrated_need(),
-                'boot_hold': sample.boot_hold(),
-            }
+        # A current gated writer publishes activity_ts every round. A missing
+        # detailed sample carries NULL need so the broker can distinguish
+        # armed-but-blind (freeze, then bounded blind-grace decay) from the
+        # all-NULL explicit utilization_gate:false opt-out.
+        activity = {
+            'demonstrated_need':
+                (None if sample is None else sample.demonstrated_need()),
+            'boot_hold': False if sample is None else sample.boot_hold(),
+        }
     claim_persisted = reserved_capacity_broker.upsert_claim(
         service_name,
         pool_key=pool_key,

@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -8,6 +9,7 @@ import {
 
 import JobDetails from '@/pages/jobs/[job]';
 import TaskDetails from '@/pages/jobs/[job]/[task]';
+import ClusterJobDetails from '@/pages/clusters/[cluster]/[job]';
 import {
   computeJobGroupStatus,
   downloadManagedJobLogs,
@@ -15,6 +17,10 @@ import {
   useManagedJobPools,
   useSingleManagedJob,
 } from '@/data/connectors/jobs';
+import {
+  streamClusterJobLogs,
+  useClusterDetails,
+} from '@/data/connectors/clusters';
 import { useLogStreamer } from '@/hooks/useLogStreamer';
 import { PluginSlot } from '@/plugins/PluginSlot';
 import { usePluginComponents } from '@/plugins/PluginProvider';
@@ -40,6 +46,12 @@ jest.mock('@/data/connectors/jobs', () => ({
   useManagedJobPools: jest.fn(() => []),
 }));
 
+jest.mock('@/data/connectors/clusters', () => ({
+  downloadJobLogs: jest.fn(),
+  streamClusterJobLogs: jest.fn(),
+  useClusterDetails: jest.fn(),
+}));
+
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
   default: {
@@ -57,6 +69,10 @@ jest.mock('@/plugins/PluginProvider', () => ({
 
 jest.mock('@/plugins/PluginSlot', () => ({
   PluginSlot: jest.fn(({ fallback = null }) => fallback),
+}));
+
+jest.mock('@/components/elements/UserDisplay', () => ({
+  UserDisplay: () => null,
 }));
 
 jest.mock('@/utils/grafana', () => ({
@@ -120,6 +136,12 @@ function latestEnabledStreamCall(controller) {
     )?.[0];
 }
 
+function latestClusterStreamCall() {
+  return [...useLogStreamer.mock.calls]
+    .reverse()
+    .find(([options]) => options.streamFn === streamClusterJobLogs)?.[0];
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   router.query = { job: '42' };
@@ -136,11 +158,91 @@ beforeEach(() => {
     refreshJobData: jest.fn().mockResolvedValue(undefined),
   });
   useManagedJobPools.mockReturnValue([]);
+  useClusterDetails.mockReturnValue({
+    clusterData: null,
+    clusterJobData: null,
+    loading: true,
+    clusterJobsLoading: true,
+    refreshData: jest.fn().mockResolvedValue(undefined),
+  });
   useLogStreamer.mockImplementation(({ streamArgs }) => ({
     lines: streamArgs.controller ? controllerLines : workerLines,
     isLoading: false,
     hasReceivedFirstChunk: true,
   }));
+});
+
+it('streams one confirmed runnable cluster job but not a pending job', () => {
+  router.query = { cluster: 'cluster-a', job: '7' };
+  const refreshData = jest.fn().mockResolvedValue(undefined);
+  useClusterDetails.mockReturnValue({
+    clusterData: { cluster: 'cluster-a', workspace: 'workspace-a' },
+    clusterJobData: [{ id: 7, status: 'PENDING', job: 'queued' }],
+    loading: false,
+    clusterJobsLoading: false,
+    refreshData,
+  });
+
+  const view = render(<ClusterJobDetails />);
+  expect(latestClusterStreamCall().enabled).toBe(false);
+
+  useClusterDetails.mockReturnValue({
+    clusterData: { cluster: 'cluster-a', workspace: 'workspace-a' },
+    clusterJobData: [{ id: 7, status: 'RUNNING', job: 'training' }],
+    loading: false,
+    clusterJobsLoading: false,
+    refreshData,
+  });
+  view.rerender(<ClusterJobDetails />);
+
+  expect(latestClusterStreamCall()).toMatchObject({
+    streamFn: streamClusterJobLogs,
+    streamArgs: {
+      clusterName: 'cluster-a',
+      jobId: '7',
+      workspace: 'workspace-a',
+    },
+    enabled: true,
+  });
+});
+
+it('does not start a mismatched stream across cluster-job route changes', () => {
+  router.query = { cluster: 'cluster-a', job: '7' };
+  useClusterDetails.mockReturnValue({
+    clusterData: { cluster: 'cluster-a', workspace: 'workspace-a' },
+    clusterJobData: [{ id: 7, status: 'RUNNING', job: 'training' }],
+    loading: false,
+    clusterJobsLoading: false,
+    refreshData: jest.fn().mockResolvedValue(undefined),
+  });
+  const view = render(<ClusterJobDetails />);
+  expect(latestClusterStreamCall().enabled).toBe(true);
+
+  router.query = { cluster: 'cluster-b', job: '8' };
+  useClusterDetails.mockReturnValue({
+    clusterData: { cluster: 'cluster-b', workspace: 'workspace-b' },
+    clusterJobData: [],
+    loading: false,
+    clusterJobsLoading: false,
+    refreshData: jest.fn().mockResolvedValue(undefined),
+  });
+  view.rerender(<ClusterJobDetails />);
+
+  expect(latestClusterStreamCall()).toMatchObject({
+    streamArgs: {
+      clusterName: 'cluster-b',
+      jobId: '8',
+      workspace: 'workspace-b',
+    },
+    enabled: false,
+  });
+  expect(
+    useLogStreamer.mock.calls.some(
+      ([options]) =>
+        options.enabled === true &&
+        options.streamArgs.clusterName === 'cluster-b'
+    )
+  ).toBe(false);
 });
 
 it('uses the current job rows for its pool-link snapshot', async () => {
@@ -205,6 +307,114 @@ it('owns the task-detail refresh button until the data refresh settles', async (
 
   refresh.resolve();
   await waitFor(() => expect(refreshButton).toBeEnabled());
+});
+
+it('keeps the job route in loading instead of not-found while a new route is fetching', async () => {
+  const refresh42 = jest.fn().mockResolvedValue(undefined);
+  const refresh43 = jest.fn().mockResolvedValue(undefined);
+  let job43Loading = true;
+  useSingleManagedJob.mockImplementation((jobId) => {
+    if (String(jobId) === '42') {
+      return {
+        jobData: { jobs: [job] },
+        loading: false,
+        refreshJobData: refresh42,
+      };
+    }
+    return {
+      jobData: null,
+      loading: job43Loading,
+      refreshJobData: refresh43,
+    };
+  });
+
+  const { rerender } = render(<JobDetails />);
+  await screen.findByText('Managed Jobs');
+
+  router.query = { job: '43' };
+  rerender(<JobDetails />);
+
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(2);
+  expect(refresh42).not.toHaveBeenCalled();
+  expect(refresh43).not.toHaveBeenCalled();
+
+  job43Loading = false;
+  rerender(<JobDetails />);
+  await screen.findByText('Job not found');
+});
+
+it('keeps the task route in loading instead of not-found while a new route is fetching', async () => {
+  const refresh42 = jest.fn().mockResolvedValue(undefined);
+  const refresh43 = jest.fn().mockResolvedValue(undefined);
+  let job43Loading = true;
+  useSingleManagedJob.mockImplementation((jobId) => {
+    if (String(jobId) === '42') {
+      return {
+        jobData: { jobs: [job] },
+        loading: false,
+        refreshJobData: refresh42,
+      };
+    }
+    return {
+      jobData: null,
+      loading: job43Loading,
+      refreshJobData: refresh43,
+    };
+  });
+
+  router.query = { job: '42', task: '0' };
+  const { rerender } = render(<TaskDetails />);
+  await screen.findByText('Task 0');
+
+  router.query = { job: '43', task: '0' };
+  rerender(<TaskDetails />);
+
+  expect(screen.queryByText('Task not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(2);
+  expect(refresh42).not.toHaveBeenCalled();
+  expect(refresh43).not.toHaveBeenCalled();
+
+  job43Loading = false;
+  rerender(<TaskDetails />);
+  await screen.findByText('Task not found');
+});
+
+it('keeps matching job detail visible during background loading', async () => {
+  useSingleManagedJob.mockReturnValue({
+    jobData: { jobs: [job] },
+    loading: true,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  });
+
+  render(<JobDetails />);
+
+  expect(await screen.findByText('Job ID (Name)')).toBeInTheDocument();
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+});
+
+it('keeps matching task detail visible during background loading', async () => {
+  router.query = { job: '42', task: '0' };
+  useSingleManagedJob.mockReturnValue({
+    jobData: { jobs: [job] },
+    loading: true,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  });
+
+  render(<TaskDetails />);
+
+  expect(await screen.findByText('Task Details')).toBeInTheDocument();
+  expect(screen.queryByText('Task not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+});
+
+it('settles an invalid task index to not-found', async () => {
+  router.query = { job: '42', task: '1' };
+
+  render(<TaskDetails />);
+
+  expect(await screen.findByText('Task not found')).toBeInTheDocument();
 });
 
 it('advances job telemetry once for an accepted manual refresh', async () => {
@@ -325,6 +535,211 @@ it('preserves controller-log expansion and download behavior', async () => {
       jobStatus: 'RUNNING',
     });
   });
+});
+
+it('owns duplicate controller-log downloads until the request settles', async () => {
+  const firstDownload = deferred();
+  downloadManagedJobLogs
+    .mockImplementationOnce(() => firstDownload.promise)
+    .mockResolvedValueOnce(undefined);
+  render(<JobDetails />);
+
+  const section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+  const [, downloadButton] = within(section).getAllByRole('button');
+
+  act(() => {
+    fireEvent.click(downloadButton);
+    fireEvent.click(downloadButton);
+  });
+  expect(downloadManagedJobLogs).toHaveBeenCalledTimes(1);
+
+  firstDownload.resolve();
+  await waitFor(() => expect(downloadButton).toBeEnabled());
+
+  fireEvent.click(downloadButton);
+  await waitFor(() => expect(downloadManagedJobLogs).toHaveBeenCalledTimes(2));
+});
+
+it('releases controller-log download ownership after failure', async () => {
+  const failedDownload = deferred();
+  downloadManagedJobLogs
+    .mockImplementationOnce(() => failedDownload.promise)
+    .mockResolvedValueOnce(undefined);
+  render(<JobDetails />);
+
+  const section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+  const [, downloadButton] = within(section).getAllByRole('button');
+
+  fireEvent.click(downloadButton);
+  expect(downloadButton).toBeDisabled();
+
+  failedDownload.reject(new Error('archive failed'));
+  await waitFor(() => expect(downloadButton).toBeEnabled());
+
+  fireEvent.click(downloadButton);
+  await waitFor(() => expect(downloadManagedJobLogs).toHaveBeenCalledTimes(2));
+});
+
+it('fences controller-log download cleanup across job routes', async () => {
+  const firstDownload = deferred();
+  const secondDownload = deferred();
+  downloadManagedJobLogs
+    .mockImplementationOnce(() => firstDownload.promise)
+    .mockImplementationOnce(() => secondDownload.promise);
+  useSingleManagedJob.mockImplementation((jobId) => ({
+    jobData: {
+      jobs: [
+        {
+          ...job,
+          id: Number(jobId),
+          name: `training-${jobId}`,
+        },
+      ],
+    },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  }));
+
+  const { rerender } = render(<JobDetails />);
+  let section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+  let [, downloadButton] = within(section).getAllByRole('button');
+  fireEvent.click(downloadButton);
+  expect(downloadButton).toBeDisabled();
+
+  router.query = { job: '43' };
+  rerender(<JobDetails />);
+  section = document.querySelector('#controller-logs-section');
+  [, downloadButton] = within(section).getAllByRole('button');
+  expect(downloadButton).toBeEnabled();
+  fireEvent.click(downloadButton);
+  expect(downloadManagedJobLogs).toHaveBeenNthCalledWith(2, {
+    jobId: 43,
+    controller: true,
+    jobStatus: 'RUNNING',
+  });
+  expect(downloadButton).toBeDisabled();
+
+  firstDownload.resolve();
+  await waitFor(() => expect(downloadButton).toBeDisabled());
+
+  secondDownload.resolve();
+  await waitFor(() => expect(downloadButton).toBeEnabled());
+});
+
+it('retains controller-log ownership across an A-B-A route cycle', async () => {
+  const firstJobDownload = deferred();
+  const secondJobDownload = deferred();
+  downloadManagedJobLogs
+    .mockImplementationOnce(() => firstJobDownload.promise)
+    .mockImplementationOnce(() => secondJobDownload.promise);
+  useSingleManagedJob.mockImplementation((jobId) => ({
+    jobData: {
+      jobs: [
+        {
+          ...job,
+          id: Number(jobId),
+          name: `training-${jobId}`,
+        },
+      ],
+    },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  }));
+
+  const { rerender } = render(<JobDetails />);
+  let section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+  let [, downloadButton] = within(section).getAllByRole('button');
+  fireEvent.click(downloadButton);
+
+  router.query = { job: '43' };
+  rerender(<JobDetails />);
+  section = document.querySelector('#controller-logs-section');
+  [, downloadButton] = within(section).getAllByRole('button');
+  expect(downloadButton).toBeEnabled();
+  fireEvent.click(downloadButton);
+
+  router.query = { job: '42' };
+  rerender(<JobDetails />);
+  section = document.querySelector('#controller-logs-section');
+  [, downloadButton] = within(section).getAllByRole('button');
+  expect(downloadButton).toBeDisabled();
+  fireEvent.click(downloadButton);
+  expect(downloadManagedJobLogs).toHaveBeenCalledTimes(2);
+
+  secondJobDownload.resolve();
+  await act(async () => {});
+  expect(downloadButton).toBeDisabled();
+
+  firstJobDownload.resolve();
+  await waitFor(() => expect(downloadButton).toBeEnabled());
+});
+
+it('retains 100 pending route owners without duplicate downloads', async () => {
+  const routeCount = 100;
+  const firstJobId = 100;
+  const downloads = Array.from({ length: routeCount }, deferred);
+  downloadManagedJobLogs.mockImplementation(({ jobId }) => {
+    return downloads[jobId - firstJobId].promise;
+  });
+  useSingleManagedJob.mockImplementation((jobId) => ({
+    jobData: {
+      jobs: [
+        {
+          ...job,
+          id: Number(jobId),
+          name: `training-${jobId}`,
+        },
+      ],
+    },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  }));
+
+  router.query = { job: String(firstJobId) };
+  const { rerender } = render(<JobDetails />);
+  let section = document.querySelector('#controller-logs-section');
+  fireEvent.click(
+    within(section).getByRole('button', { name: /Controller Logs/ })
+  );
+
+  for (let offset = 0; offset < routeCount; offset += 1) {
+    router.query = { job: String(firstJobId + offset) };
+    rerender(<JobDetails />);
+    section = document.querySelector('#controller-logs-section');
+    const [, downloadButton] = within(section).getAllByRole('button');
+    expect(downloadButton).toBeEnabled();
+    fireEvent.click(downloadButton);
+  }
+  expect(downloadManagedJobLogs).toHaveBeenCalledTimes(routeCount);
+
+  for (let offset = routeCount - 1; offset >= 0; offset -= 1) {
+    router.query = { job: String(firstJobId + offset) };
+    rerender(<JobDetails />);
+    section = document.querySelector('#controller-logs-section');
+    const [, downloadButton] = within(section).getAllByRole('button');
+    expect(downloadButton).toBeDisabled();
+    fireEvent.click(downloadButton);
+  }
+  expect(downloadManagedJobLogs).toHaveBeenCalledTimes(routeCount);
+
+  await act(async () => {
+    downloads.forEach(({ resolve }) => resolve());
+    await Promise.all(downloads.map(({ promise }) => promise));
+  });
+  const [, downloadButton] = within(section).getAllByRole('button');
+  expect(downloadButton).toBeEnabled();
 });
 
 it('leaves streaming and log-line extraction to a logs-slot plugin', async () => {

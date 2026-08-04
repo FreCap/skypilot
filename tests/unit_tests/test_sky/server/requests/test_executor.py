@@ -49,6 +49,7 @@ def _make_server_config(
 
 def test_queue_backend_factory_accessors_distinguish_default(monkeypatch):
     monkeypatch.setattr(executor.queue_base, '_queue_backend_factory', None)
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
 
     assert executor.queue_base.get_registered_queue_backend_factory() is None
     assert isinstance(executor.queue_base.get_queue_backend_factory(),
@@ -61,6 +62,35 @@ def test_queue_backend_factory_accessors_distinguish_default(monkeypatch):
     assert (executor.queue_base.get_registered_queue_backend_factory()
             is registered_factory)
     assert executor.queue_base.get_queue_backend_factory() is registered_factory
+
+
+def test_spawned_process_resolves_postgres_queue_from_environment(monkeypatch):
+    from sky.server.requests import postgres as request_postgres
+
+    monkeypatch.setattr(executor.queue_base, '_queue_backend_factory', None)
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+
+    factory = executor.queue_base.get_queue_backend_factory()
+
+    assert isinstance(factory, request_postgres.PostgresQueueFactory)
+
+
+@pytest.mark.asyncio
+async def test_non_durable_schedule_preserves_legacy_queue_tuple(monkeypatch):
+    backend = mock.Mock(uses_durable_queue=False)
+    queue = mock.Mock()
+    queue.put_async = mock.AsyncMock()
+    request = mock.Mock(request_id='legacy-request',
+                        schedule_type=requests_lib.ScheduleType.SHORT)
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(executor, '_get_queue', lambda _schedule_type: queue)
+
+    await executor.schedule_prepared_request(request,
+                                             ignore_return_value=True,
+                                             retryable=True)
+
+    queue.put_async.assert_awaited_once_with(('legacy-request', True, True))
 
 
 @pytest.mark.parametrize(
@@ -144,6 +174,43 @@ def test_worker_preserves_executor_construction_error(monkeypatch):
         worker.run()
 
 
+def test_task_monitor_heartbeats_durable_claim(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    heartbeat_seen = threading.Event()
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = 0.01
+
+    def heartbeat(claim):
+        heartbeat_seen.set()
+        return True
+
+    backend.heartbeat_claim.side_effect = heartbeat
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(worker, '_handle_task_result',
+                        lambda *_args: heartbeat_seen.wait(timeout=1))
+    future = concurrent.futures.Future()
+    future.set_result(None)
+    item = executor.queue_base.QueueItem('heartbeat-request',
+                                         False,
+                                         False,
+                                         execution_generation=7,
+                                         claim_token='claim-token')
+
+    worker.handle_task_result(future, item)
+
+    backend.heartbeat_claim.assert_called()
+    claim = backend.heartbeat_claim.call_args.args[0]
+    assert claim.request_id == item.request_id
+    assert claim.execution_generation == item.execution_generation
+    assert claim.claim_token == item.claim_token
+    assert executor.request_storage.active_execution_claim() is None
+
+
 @pytest.fixture()
 def isolated_database(tmp_path):
     """Create an isolated DB and logs directory per-test."""
@@ -157,7 +224,8 @@ def isolated_database(tmp_path):
                         str(temp_log_path)):
             requests_lib._DB = None
             yield
-            requests_lib._DB = None
+            if requests_lib._DB is not None:
+                asyncio.run(requests_lib.close_db_async())
 
 
 @pytest.mark.asyncio
@@ -180,6 +248,148 @@ async def test_prepare_request_rejects_non_admin_pod_config(mock_svc):
         )
 
     assert exc_info.value.status_code == 403
+
+
+@pytest.fixture()
+def prepare_request_identity_spies(monkeypatch):
+    prepared_request = mock.Mock()
+    prepared_request.log_path = mock.Mock()
+    request_constructor = mock.Mock(return_value=prepared_request)
+    initial_context = mock.Mock(return_value='event-context')
+    add_or_update_user = mock.Mock(return_value=True)
+    monkeypatch.setattr(executor.api_requests, 'Request', request_constructor)
+    monkeypatch.setattr(executor.api_requests, 'create_if_not_exists_async',
+                        mock.AsyncMock(return_value=True))
+    monkeypatch.setattr(executor.role_filter, 'reject_non_admin_pod_config',
+                        mock.Mock())
+    monkeypatch.setattr(executor.event_models, 'initial_context',
+                        initial_context)
+    monkeypatch.setattr(executor.global_user_state, 'add_or_update_user',
+                        add_or_update_user)
+    monkeypatch.setattr(executor.versions, 'get_remote_api_version',
+                        mock.Mock(return_value=None))
+    return request_constructor, initial_context, add_or_update_user
+
+
+async def _prepare_identity_request(env_vars,
+                                    spies,
+                                    *,
+                                    auth_user=None,
+                                    is_skypilot_system=False):
+    body = payloads.RequestBody(env_vars=env_vars)
+    request_constructor, _, _ = spies
+    await executor.prepare_request_async(
+        request_id='identity-request',
+        request_name=request_names.RequestName.CHECK,
+        request_body=body,
+        func=lambda: None,
+        auth_user=auth_user,
+        is_skypilot_system=is_skypilot_system)
+    return body, request_constructor.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_replaces_submitted_authenticated_identity(
+        prepare_request_identity_spies):
+    auth_user = models.User(id='AUTH-HASH',
+                            name='Authenticated Name',
+                            user_type=models.UserType.SSO.value)
+    body, request_kwargs = await _prepare_identity_request(
+        {
+            constants.USER_ID_ENV_VAR: 'spoofed-hash',
+            constants.USER_ENV_VAR: 'spoofed-name',
+            'UNRELATED': 'preserved',
+        },
+        prepare_request_identity_spies,
+        auth_user=auth_user)
+
+    assert body.env_vars == {
+        constants.USER_ID_ENV_VAR: 'auth-hash',
+        constants.USER_ENV_VAR: 'Authenticated Name',
+        'UNRELATED': 'preserved',
+    }
+    assert request_kwargs['user_id'] == 'auth-hash'
+    _, initial_context, _ = prepare_request_identity_spies
+    initial_context.assert_called_once_with(
+        request_names.RequestName.CHECK,
+        actor_name='Authenticated Name',
+        actor_type=models.UserType.SSO.value,
+        cluster_name=None)
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_authenticated_identity_does_not_require_env_pair(
+        prepare_request_identity_spies):
+    body, request_kwargs = await _prepare_identity_request(
+        {'UNRELATED': 'preserved'},
+        prepare_request_identity_spies,
+        auth_user=models.User(id='authenticated-hash', name='Auth Name'))
+
+    assert body.env_vars == {
+        constants.USER_ID_ENV_VAR: 'authenticated-hash',
+        constants.USER_ENV_VAR: 'Auth Name',
+        'UNRELATED': 'preserved',
+    }
+    assert request_kwargs['user_id'] == 'authenticated-hash'
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_preserves_submitted_no_auth_identity(
+        prepare_request_identity_spies):
+    submitted_env = {
+        constants.USER_ID_ENV_VAR: 'submitted-hash',
+        constants.USER_ENV_VAR: 'submitted-name',
+        'UNRELATED': 'preserved',
+    }
+    body, request_kwargs = await _prepare_identity_request(
+        submitted_env, prepare_request_identity_spies)
+
+    assert body.env_vars == submitted_env
+    assert request_kwargs['user_id'] == 'submitted-hash'
+    _, initial_context, _ = prepare_request_identity_spies
+    initial_context.assert_called_once_with(request_names.RequestName.CHECK,
+                                            actor_name='submitted-name',
+                                            actor_type=None,
+                                            cluster_name=None)
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_no_auth_missing_name_keeps_env_unmodified(
+        prepare_request_identity_spies):
+    body, request_kwargs = await _prepare_identity_request(
+        {constants.USER_ID_ENV_VAR: 'submitted-hash'},
+        prepare_request_identity_spies)
+
+    assert body.env_vars == {constants.USER_ID_ENV_VAR: 'submitted-hash'}
+    assert request_kwargs['user_id'] == 'submitted-hash'
+    _, initial_context, _ = prepare_request_identity_spies
+    assert initial_context.call_args.kwargs['actor_name'] == 'submitted-hash'
+
+
+@pytest.mark.asyncio
+async def test_prepare_system_request_keeps_auth_env_but_uses_system_actor(
+        prepare_request_identity_spies):
+    body, request_kwargs = await _prepare_identity_request(
+        {},
+        prepare_request_identity_spies,
+        auth_user=models.User(id='authenticated-hash', name='Auth Name'),
+        is_skypilot_system=True)
+
+    assert body.env_vars == {
+        constants.USER_ID_ENV_VAR: 'authenticated-hash',
+        constants.USER_ENV_VAR: 'Auth Name',
+    }
+    assert request_kwargs['user_id'] == constants.SKYPILOT_SYSTEM_USER_ID
+    _, initial_context, add_or_update_user = prepare_request_identity_spies
+    initial_context.assert_called_once_with(
+        request_names.RequestName.CHECK,
+        actor_name=constants.SKYPILOT_SYSTEM_USER_ID,
+        actor_type=models.UserType.SYSTEM.value,
+        cluster_name=None)
+    system_user = add_or_update_user.call_args.args[0]
+    assert system_user.id == constants.SKYPILOT_SYSTEM_USER_ID
+    assert system_user.name == constants.SKYPILOT_SYSTEM_USER_ID
+    assert system_user.user_type == models.UserType.SYSTEM.value
 
 
 @pytest.fixture()
@@ -989,6 +1199,36 @@ def _success_entrypoint():
     return 'success'
 
 
+@pytest.mark.parametrize(
+    ('request_name', 'expected_calls'),
+    [
+        ('sky.status', []),
+        ('sky.launch', [mock.call('request-id', 'cluster')]),
+        ('sky.down', [
+            mock.call('request-id', 'cluster'),
+            mock.call('request-id', 'cluster'),
+        ]),
+    ],
+)
+def test_capture_event_target_only_wraps_opted_in_lifecycle_operations(
+        monkeypatch, request_name, expected_calls):
+    enrich = mock.Mock()
+    monkeypatch.setattr(executor, '_enrich_event_target_id', enrich)
+    with executor._capture_event_target('request-id', request_name, 'cluster'):
+        pass
+    assert enrich.call_args_list == expected_calls
+
+
+def test_capture_event_target_after_failed_launch(monkeypatch):
+    enrich = mock.Mock()
+    monkeypatch.setattr(executor, '_enrich_event_target_id', enrich)
+    with pytest.raises(RuntimeError, match='failed'):
+        with executor._capture_event_target('request-id', 'sky.launch',
+                                            'cluster'):
+            raise RuntimeError('failed')
+    enrich.assert_called_once_with('request-id', 'cluster')
+
+
 def _retryable_error_entrypoint():
     from sky import exceptions
     raise exceptions.ExecutionRetryableError('Simulated retryable error',
@@ -1219,7 +1459,7 @@ async def test_request_worker_does_not_requeue_cancelled_broken_pool_request(
 @pytest.mark.asyncio
 async def test_request_worker_retry_execution_retryable_error(
         isolated_database, monkeypatch):
-    """Test that RequestWorker retries requests when ExecutionRetryableError is raised."""
+    """Typed pre-job retries ignore the unknown-stage retryable flag."""
     # Create a request in the database
     request_id = 'test-retry-request'
     request = requests_lib.Request(
@@ -1231,6 +1471,7 @@ async def test_request_worker_retry_execution_retryable_error(
         status=requests_lib.RequestStatus.RUNNING,
         created_at=time.time(),
         user_id='test-user',
+        retryable=False,
     )
     await requests_lib.create_if_not_exists_async(request)
 
@@ -1315,7 +1556,7 @@ async def test_request_worker_retry_execution_retryable_error(
     fut.set_exception(retryable_error)
 
     # Create request_element tuple
-    request_element = (request_id, False, True
+    request_element = (request_id, False, False
                       )  # (request_id, ignore_return_value, retryable)
 
     # Call handle_task_result - this should catch the exception and reschedule
@@ -1674,6 +1915,8 @@ def stub_override_request_env_deps(monkeypatch):
     monkeypatch.setattr(
         'sky.workspaces.core.reject_request_for_unauthorized_workspace',
         mock.Mock())
+    monkeypatch.setattr('sky.server.requests.requests.set_event_workspace',
+                        mock.Mock(return_value=True))
 
     fake_user = mock.Mock()
     fake_user.id = 'client-user-id'
@@ -1738,18 +1981,67 @@ def test_override_env_applied_for_client_request(stub_override_request_env_deps,
                                                                     1024)
 
 
+def test_override_env_blocks_when_event_workspace_loses_execution_fence(
+        stub_override_request_env_deps, monkeypatch):
+    """An opted-in mutation cannot start after its audit fence is lost."""
+    monkeypatch.setattr('sky.server.requests.requests.set_event_workspace',
+                        mock.Mock(return_value=False))
+    body = payloads.RequestBody(
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'client-user-id',
+            constants.USER_ENV_VAR: 'client-user',
+        })
+
+    with pytest.raises(RuntimeError, match='lost its execution fence'):
+        with executor.override_request_env_and_config(
+                body, request_id='not-a-daemon-uuid',
+                request_name='sky.launch'):
+            pytest.fail('The mutation body must not start.')
+
+
+def test_override_env_skips_event_context_write_for_unrelated_request(
+        stub_override_request_env_deps, monkeypatch):
+    set_workspace = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        'sky.server.requests.requests.set_event_workspace',
+        set_workspace,
+    )
+    body = payloads.RequestBody(
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'client-user-id',
+            constants.USER_ENV_VAR: 'client-user',
+        })
+
+    with executor.override_request_env_and_config(
+            body, request_id='not-a-daemon-uuid', request_name='sky.status'):
+        pass
+    set_workspace.assert_not_called()
+
+
 def test_override_env_rejects_server_owned_client_values(
         stub_override_request_env_deps, monkeypatch):
     """A crafted request body cannot replace deployment-owned capabilities."""
     capability = serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR
     server_prefixed = f'{constants.SKYPILOT_SERVER_ENV_VAR_PREFIX}TEST_ONLY'
+    role = 'SKYPILOT_API_SERVER_ROLE'
+    pod_uid = 'SKYPILOT_POD_UID'
+    endpoint = constants.SKY_API_SERVER_URL_ENV_VAR
+    service_account_token = constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR
     monkeypatch.setenv(capability, 'true')
     monkeypatch.setenv(server_prefixed, 'server-value')
+    monkeypatch.setenv(role, 'controller')
+    monkeypatch.setenv(pod_uid, 'current-pod')
+    monkeypatch.setenv(endpoint, 'http://stable-api-service')
+    monkeypatch.setenv(service_account_token, 'sky_server_token')
 
     body = payloads.RequestBody(
         env_vars={
             capability: 'false',
             server_prefixed: 'client-value',
+            role: 'api',
+            pod_uid: 'stale-pod',
+            endpoint: 'http://client-controlled-endpoint',
+            service_account_token: 'sky_client_token',
             constants.USER_ID_ENV_VAR: 'client-user-id',
             constants.USER_ENV_VAR: 'client-user',
         })
@@ -1758,9 +2050,31 @@ def test_override_env_rejects_server_owned_client_values(
             body, request_id='not-a-daemon-uuid', request_name='sky.launch'):
         assert os.environ[capability] == 'true'
         assert os.environ[server_prefixed] == 'server-value'
+        assert os.environ[role] == 'controller'
+        assert os.environ[pod_uid] == 'current-pod'
+        assert os.environ[endpoint] == 'http://stable-api-service'
+        assert os.environ[service_account_token] == 'sky_server_token'
 
     assert capability not in body.env_vars
     assert server_prefixed not in body.env_vars
+    assert role not in body.env_vars
+    assert pod_uid not in body.env_vars
+    assert endpoint not in body.env_vars
+    assert service_account_token not in body.env_vars
+
+
+def test_controller_execution_environment_uses_claim_fence(monkeypatch):
+    """A claimed request sees its own durable controller generation."""
+    monkeypatch.setenv('SKYPILOT_SERVER_CONTROLLER_GENERATION', 'old')
+    monkeypatch.setenv('SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID', 'old-owner')
+
+    with executor._controller_execution_environment(7, 'new-owner'):
+        assert os.environ['SKYPILOT_SERVER_CONTROLLER_GENERATION'] == '7'
+        assert os.environ[
+            'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'] == 'new-owner'
+
+    assert os.environ['SKYPILOT_SERVER_CONTROLLER_GENERATION'] == 'old'
+    assert os.environ['SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'] == 'old-owner'
 
 
 def test_daemon_env_mutations_reverted_on_exit(stub_override_request_env_deps,

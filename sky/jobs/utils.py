@@ -7,14 +7,9 @@ ManagedJobCodeGen.
 import asyncio
 import contextlib
 from datetime import datetime
-import enum
 import os
 import pathlib
 import re
-import select
-import signal
-import sys
-import threading
 import time
 import traceback
 import typing
@@ -34,6 +29,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import controller_log_stream
 from sky.jobs import debug_dump as managed_job_debug_dump
+from sky.jobs import log_streaming as managed_job_log_streaming
 from sky.jobs import managed_job_codegen
 from sky.jobs import queue_utils as managed_job_queue_utils
 from sky.jobs import runtime as managed_job_runtime
@@ -47,10 +43,10 @@ from sky.usage import usage_lib
 from sky.utils import annotations
 from sky.utils import common as common_lib
 from sky.utils import common_utils
+from sky.utils import context_utils
 from sky.utils import controller_utils
 from sky.utils import debug_dump_helpers
 from sky.utils import message_utils
-from sky.utils import rich_utils
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 
@@ -148,14 +144,12 @@ _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS = 120
 _JOBS_GRACEFUL_CANCEL_SIGNAL = 'graceful'
 
 
-class UserSignal(enum.Enum):
-    """The signal to be sent to the user."""
-    CANCEL = 'CANCEL'
-    # NOTE: We can have more communication signals here if needed
-    # in the future.
-
-
 # ====== internal functions ======
+def _sleep_log_follow_wait(seconds: float) -> None:
+    """Sleep between log-follow polls while honoring request cancellation."""
+    context_utils.sleep_with_cancellation(seconds)
+
+
 def terminate_cluster(
     cluster_name: str,
     max_retry: int = 6,
@@ -353,17 +347,26 @@ def ha_recovery_for_consolidation_mode() -> None:
     updates. This also should ensure correct operation during a rolling update.
     """
     # No setup recovery is needed in consolidation mode, as the API server
-    # already has all runtime installed. Directly start jobs recovery here.
+    # already has all runtime installed. Reset stale outer-generation
+    # ownership before any replacement scheduler process can claim work.
     # Refers to sky/templates/kubernetes-ray.yml.j2 for more details.
-    scheduler.maybe_start_controllers()
+    stale_owner_count = (
+        managed_job_state.reset_stale_jobs_for_current_controller())
     with open(constants.HA_PERSISTENT_RECOVERY_LOG_PATH.format('jobs_'),
               'a',
               encoding='utf-8') as f:
         start = time.time()
         f.write(f'Starting HA recovery at {datetime.now()}\n')
+        if stale_owner_count:
+            message = (
+                f'Reset {stale_owner_count} managed job(s) owned by a stale '
+                'outer controller generation.\n')
+            logger.info(message.rstrip())
+            f.write(message)
         jobs, _ = managed_job_state.get_managed_jobs_with_filters(fields=[
             'job_id', 'controller_pid', 'controller_pid_started_at',
-            'schedule_state', 'status'
+            'controller_instance_id', 'controller_generation', 'schedule_state',
+            'status'
         ])
         for job in jobs:
             job_id = job['job_id']
@@ -410,6 +413,11 @@ def ha_recovery_for_consolidation_mode() -> None:
                            f'{datetime.now()}\n')
                 logger.info(message)
                 f.write(message)
+        # Start schedulers only after every stale or dead PID has been reset.
+        # Starting them before the scan lets a replacement claim race the
+        # recovery writes and can stamp a PID that recovery immediately
+        # invalidates.
+        scheduler.maybe_start_controllers()
         f.write(f'HA recovery completed at {datetime.now()}\n')
         f.write(f'Total recovery time: {time.time() - start} seconds\n')
 
@@ -562,6 +570,21 @@ def _controller_is_restarting() -> bool:
         os.path.expanduser(constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE))
 
 
+def _task_has_launch_attempt(task: dict[str, Any]) -> bool:
+    """Whether cleanup must treat this task as having launched.
+
+    A later pipeline stage that never left the backlog still has a durable
+    ``spot`` row, but it never owned a cluster and should not trigger a best-
+    effort teardown. Launch and recovery paths stamp at least one of the
+    lifecycle timestamps below and keep it when the task falls back to
+    ``PENDING`` during retry backoff, so the marker remains correct on the
+    failure path without refetching the full task row.
+    """
+    return any(
+        task.get(field) is not None
+        for field in ('submitted_at', 'start_at', 'last_recovered_at'))
+
+
 def update_managed_jobs_statuses(job_ids: list[int] | None = None):
     """Update managed job status if the controller process failed abnormally.
 
@@ -583,6 +606,8 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
     # restart of last controller process that fully occupied the controller VM.
     if _controller_is_restarting():
         return
+    current_controller_owner = (
+        managed_job_state.get_current_controller_owner())
 
     def _cleanup_job_clusters(job_id: int, tasks: list[dict[str, Any]],
                               pool: str | None) -> str | None:
@@ -600,6 +625,8 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             return None
         cluster_names = []
         for task in tasks:
+            if not _task_has_launch_attempt(task):
+                continue
             cluster_name = generate_managed_job_cluster_name(
                 task['task_name'], job_id)
             if cluster_name is not None:
@@ -628,6 +655,47 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             return None
         return '; '.join(error_msgs)
 
+    def _snapshot_kwargs(snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'schedule_state': snapshot['schedule_state'],
+            'controller_pid': snapshot['controller_pid'],
+            'controller_pid_started_at': snapshot['controller_pid_started_at'],
+            'controller_instance_id': snapshot.get('controller_instance_id'),
+            'controller_generation': snapshot.get('controller_generation'),
+        }
+
+    def _snapshot_is_unchanged(info: dict[str, Any],
+                               fresh_info: dict[str, Any] | None) -> bool:
+        return (fresh_info is not None and
+                fresh_info['schedule_state'] == info['schedule_state'] and
+                fresh_info['controller_pid'] == info['controller_pid'] and
+                fresh_info['controller_pid_started_at']
+                == info['controller_pid_started_at'] and
+                fresh_info.get('controller_instance_id')
+                == info.get('controller_instance_id') and
+                fresh_info.get('controller_generation')
+                == info.get('controller_generation'))
+
+    def _finish_terminal_cleanup(job_id: int, tasks: list[dict[str, Any]],
+                                 pool: str | None, snapshot: dict[str,
+                                                                  Any]) -> None:
+        """Clean a terminal job, then finish its exact durable snapshot."""
+        if _controller_is_restarting():
+            logger.info(f'Controller restart in progress for terminal job '
+                        f'{job_id}; deferring cleanup/finalization to the next '
+                        'status update cycle.')
+            return
+        cleanup_error = _cleanup_job_clusters(job_id, tasks, pool)
+        if cleanup_error:
+            logger.error(cleanup_error)
+            return
+        finished = (
+            managed_job_state.finish_controller_cleanup_if_current_snapshot(
+                job_id, **_snapshot_kwargs(snapshot)))
+        if not finished:
+            logger.info(f'Job {job_id} changed while terminal cleanup was in '
+                        'progress; deferring DONE to the next status update.')
+
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
@@ -648,6 +716,36 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
         # Handle jobs with schedule state (non-legacy jobs):
         pid = info['controller_pid']
         pid_started_at = info['controller_pid_started_at']
+        snapshot_all_tasks_terminal = all(
+            task['status'].is_terminal() for task in tasks)
+        if snapshot_all_tasks_terminal:
+            fresh_info = managed_job_state.get_job_status_check_state(job_id)
+            if not _snapshot_is_unchanged(info, fresh_info):
+                logger.info(f'Job {job_id} changed since the terminal status '
+                            'snapshot; deferring cleanup.')
+                continue
+            assert fresh_info is not None
+            if not fresh_info['all_tasks_terminal']:
+                logger.info(f'Job {job_id} is no longer terminal; deferring '
+                            'cleanup.')
+                continue
+            _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
+            continue
+        if current_controller_owner is not None:
+            recorded_owner = (info.get('controller_instance_id'),
+                              info.get('controller_generation'))
+            pure_backlog = (pid is None and schedule_state in [
+                managed_job_state.ManagedJobScheduleState.INACTIVE,
+                managed_job_state.ManagedJobScheduleState.WAITING,
+            ])
+            if not pure_backlog and recorded_owner != current_controller_owner:
+                reset = managed_job_state.reset_job_for_recovery_if_stale(
+                    job_id, current_controller_owner)
+                recovery_result = ('resetting it for recovery' if reset else
+                                   'its owner changed before recovery')
+                logger.info(f'Job {job_id} belongs to stale outer controller '
+                            f'{recorded_owner}; {recovery_result}.')
+                continue
         if schedule_state == managed_job_state.ManagedJobScheduleState.DONE:
             # There are two cases where we could get a job that is DONE.
             # 1. At snapshot time (get_jobs_to_check_status_info), the job was
@@ -730,14 +828,12 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             # The controller marked the job done and exited between the batched
             # snapshot and the destructive path. This is fine.
             continue
-        if (fresh_info is None or
-                fresh_info['schedule_state'] != schedule_state or
-                fresh_info['controller_pid'] != pid or
-                fresh_info['controller_pid_started_at'] != pid_started_at):
+        if not _snapshot_is_unchanged(info, fresh_info):
             logger.info(f'Job {job_id} schedule state or controller pid '
                         'changed since the status snapshot was taken; '
                         'deferring to the next status update cycle.')
             continue
+        assert fresh_info is not None
 
         # The controller can also die AFTER all tasks are already terminal but
         # BEFORE it flips schedule_state to DONE, e.g. during log streaming or
@@ -748,15 +844,7 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             logger.info(f'Job {job_id} already reached terminal task status; '
                         'finalizing schedule state without rewriting the job '
                         'to FAILED_CONTROLLER.')
-            if _controller_is_restarting():
-                logger.info(f'Controller restart in progress for terminal job '
-                            f'{job_id}; deferring cleanup/finalization to the '
-                            'next status update cycle.')
-                continue
-            cleanup_error = _cleanup_job_clusters(job_id, tasks, info['pool'])
-            if cleanup_error:
-                logger.error(cleanup_error)
-            scheduler.job_done(job_id, idempotent=True)
+            _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
             continue
 
         # The controller process for this managed job is not running: it must
@@ -778,47 +866,24 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
                 f'for job {job_id} (will re-check on the next status update).')
             continue
 
-        # Cleanup clusters and capture any errors.
-        cleanup_error = _cleanup_job_clusters(job_id, tasks, info['pool'])
-        cleanup_error_msg = ''
-        if cleanup_error:
-            cleanup_error_msg = f'Also, cleanup failed: {cleanup_error}. '
-
-        # Cluster teardown can take minutes, so a restart can begin while it
-        # runs. The cluster is gone either way, but the terminal set_failed
-        # below is what makes the job unrecoverable -- defer it so a restarted
-        # controller can resume the job (recovery relaunches the cluster).
-        if _controller_is_restarting():
-            logger.info(
-                f'Controller restart began during cluster cleanup; deferring '
-                f'FAILED_CONTROLLER for job {job_id} (will re-check on the '
-                f'next status update).')
+        failure_message = (
+            f'Controller process has exited abnormally ({failure_reason}). '
+            f'For more details, run: sky jobs logs --controller {job_id}')
+        terminalized = (
+            managed_job_state.set_failed_controller_if_current_snapshot(
+                job_id,
+                **_snapshot_kwargs(fresh_info),
+                failure_reason=failure_message))
+        if not terminalized:
+            logger.info(f'Job {job_id} changed before FAILED_CONTROLLER could '
+                        'be committed; deferring cleanup.')
             continue
 
-        # Set all tasks to FAILED_CONTROLLER, regardless of current status.
-        # This may change a job from SUCCEEDED or another terminal state to
-        # FAILED_CONTROLLER. This is what we want - we are sure that this
-        # controller process crashed, so we want to capture that even if the
-        # underlying job succeeded.
-        # Note: 2+ invocations of update_managed_jobs_statuses could be running
-        # at the same time, so this could override the FAILED_CONTROLLER status
-        # set by another invocation of update_managed_jobs_statuses. That should
-        # be okay. The only difference could be that one process failed to clean
-        # up the cluster while the other succeeds. No matter which
-        # failure_reason ends up in the database, the outcome is acceptable.
-        # We assume that no other code path outside the controller process will
-        # update the job status.
-        managed_job_state.set_failed(
-            job_id,
-            task_id=None,
-            failure_type=managed_job_state.ManagedJobStatus.FAILED_CONTROLLER,
-            failure_reason=
-            f'Controller process has exited abnormally ({failure_reason}). '
-            f'{cleanup_error_msg}'
-            f'For more details, run: sky jobs logs --controller {job_id}',
-            override_terminal=True)
-
-        scheduler.job_done(job_id, idempotent=True)
+        # Terminal task state is the durable no-recovery decision. Provider
+        # cleanup follows it so a handoff can retry teardown but cannot relaunch
+        # the workload underneath an old generation's destructive request.
+        logger.info(failure_message)
+        _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
 
 
 def get_job_timestamp(backend: 'backends.CloudVmRayBackend',
@@ -907,10 +972,9 @@ def event_callback_func(
         if event_callback is None or task is None:
             return
         event_callback = event_callback.strip()
-        pool = managed_job_state.get_pool_from_job_id(job_id)
-        if pool is not None:
-            cluster_name, _ = (managed_job_state.get_pool_submit_info(job_id))
-        else:
+        pool, cluster_name = (
+            managed_job_state.get_pool_and_current_cluster_name(job_id))
+        if pool is None:
             cluster_name = generate_managed_job_cluster_name(
                 task.name, job_id) if task.name else None
         logger.info(f'=== START: event callback for {status!r} ===')
@@ -1073,40 +1137,30 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
         if snapshot.workspace != current_workspace:
             wrong_workspace_job_ids.append(job_id)
             continue
-
-        if snapshot.is_legacy_controller:
-            # The job is running on a legacy single-job controller process.
-            # TODO(cooperc): Remove this handling for 0.13.0
-
-            # Send the signal to the jobs controller.
-            signal_file = (pathlib.Path(
-                managed_job_constants.SIGNAL_FILE_PREFIX.format(job_id)))
-            # Filelock is needed to prevent race condition between signal
-            # check/removal and signal writing.
-            with filelock.FileLock(str(signal_file) + '.lock'):
-                with signal_file.open('w', encoding='utf-8') as f:
-                    f.write(UserSignal.CANCEL.value)
-                    f.flush()
-            if graceful:
-                logger.warning(f'Job {job_id} is on legacy controller, '
-                               'graceful shutdown not supported.')
-        else:
-            # New controller process.
-            try:
-                signal_file = pathlib.Path(
-                    managed_job_constants.CONSOLIDATED_SIGNAL_PATH, f'{job_id}')
-                with filelock.FileLock(str(signal_file) + '.lock'):
-                    if graceful:
-                        content = _JOBS_GRACEFUL_CANCEL_SIGNAL
-                        if graceful_timeout is not None:
-                            content += f':{graceful_timeout}'
-                        signal_file.write_text(content, encoding='utf-8')
-                    else:
-                        signal_file.touch()
-            except OSError as e:
-                logger.error(f'Failed to cancel job {job_id}: {e}')
-                # Don't add it to the to be cancelled job ids
+        if snapshot.status == managed_job_state.ManagedJobStatus.PENDING:
+            # A refresh can move a stale live snapshot back into the
+            # pre-launch backlog. Reuse the same atomic finalizer here before
+            # falling back to controller-signal delivery.
+            cancelled = managed_job_state.set_pending_cancelled(job_id)
+            if cancelled:
+                cancelled_job_ids.append(job_id)
                 continue
+
+        try:
+            signal_file = pathlib.Path(
+                managed_job_constants.CONSOLIDATED_SIGNAL_PATH, f'{job_id}')
+            with filelock.FileLock(str(signal_file) + '.lock'):
+                if graceful:
+                    content = _JOBS_GRACEFUL_CANCEL_SIGNAL
+                    if graceful_timeout is not None:
+                        content += f':{graceful_timeout}'
+                    signal_file.write_text(content, encoding='utf-8')
+                else:
+                    signal_file.touch()
+        except OSError as e:
+            logger.error(f'Failed to cancel job {job_id}: {e}')
+            # Don't add it to the to be cancelled job ids
+            continue
 
         cancelled_job_ids.append(job_id)
 
@@ -1210,160 +1264,51 @@ def cancel_managed_jobs(
     )
 
 
-def controller_log_file_for_job(job_id: int,
-                                create_if_not_exists: bool = False) -> str:
-    log_dir = os.path.expanduser(managed_job_constants.JOBS_CONTROLLER_LOGS_DIR)
-    if create_if_not_exists:
-        os.makedirs(log_dir, exist_ok=True)
-    return os.path.join(log_dir, f'{job_id}.log')
+def _sync_log_streaming_facade() -> None:
+    """Keep historical replaceable bindings effective after extraction."""
+    managed_job_log_streaming.sync_facade(
+        sleep_log_follow_wait=_sleep_log_follow_wait,
+        name_generator=generate_managed_job_cluster_name,
+        provision_status_reader=read_provision_status_from_log,
+        batch_streamer=stream_logs,
+        logger_override=logger,
+        status_gap_seconds=JOB_STATUS_CHECK_GAP_SECONDS,
+        provision_poll_seconds=_PROVISION_LOG_POLL_GAP_SECONDS,
+        final_status_timeout_seconds=_FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS,
+        waiting_status_message=_JOB_WAITING_STATUS_MESSAGE,
+        cancelled_message=_JOB_CANCELLED_MESSAGE,
+    )
 
 
-def read_provision_status_from_log(
-        log_path: str, pos: int,
-        current_msg: str | None) -> tuple[int, str | None]:
-    """Reads rich-status spinner messages relayed into a controller log.
-
-    The jobs controller relays the inner cluster-launch rich-status payloads
-    into its per-job log (see ``recovery_strategy._launch``'s
-    ``relay_rich_status=True``). This decodes any payloads appended since
-    ``pos`` and returns the new read position together with the latest
-    provisioning spinner message, so ``sky jobs launch`` / ``sky jobs logs``
-    can show the same provisioning progress (e.g. "Preparing SkyPilot runtime
-    (1/3)") that ``sky launch`` displays.
-
-    Args:
-        log_path: Path to the jobs controller log for the job.
-        pos: Byte/character offset to resume reading from (0 on first call).
-        current_msg: The previously returned spinner message.
-
-    Returns:
-        A tuple ``(new_pos, latest_msg)``. ``latest_msg`` is ``None`` if
-        provisioning has not emitted a spinner yet, or if it has finished
-        (an EXIT control clears the message).
-    """
-    msg = current_msg
-    try:
-        # If the log was truncated or recreated (e.g. controller recovery or a
-        # job retry), the saved offset can be past the new EOF; restart from the
-        # beginning so following doesn't get stuck reading nothing.
-        if os.path.exists(log_path) and pos > os.path.getsize(log_path):
-            pos = 0
-            msg = None
-        with open(log_path, encoding='utf-8') as f:
-            f.seek(pos)
-            while True:
-                line_start = f.tell()
-                line = f.readline()
-                if line == '':
-                    # EOF.
-                    break
-                if not line.endswith('\n'):
-                    # Partial line still being written; re-read it next time.
-                    f.seek(line_start)
-                    break
-                pos = f.tell()
-                is_payload, decoded = message_utils.decode_payload(
-                    line, raise_for_mismatch=False)
-                if not is_payload:
-                    continue
-                control, encoded_status = rich_utils.Control.decode(decoded)
-                if control in (rich_utils.Control.INIT,
-                               rich_utils.Control.UPDATE):
-                    # INIT/UPDATE carry the live spinner text.
-                    msg = encoded_status
-                elif control == rich_utils.Control.EXIT:
-                    # The spinner is done.
-                    msg = None
-                # START/STOP only toggle the spinner's visibility and carry the
-                # original (possibly stale) init message rather than the live
-                # one: entering a nested status emits UPDATE(nested) then
-                # START(original), so updating `msg` on START would revert the
-                # headline to the stale text. Leave `msg` unchanged for both.
-    except (OSError, ValueError):
-        # Best-effort: the log may not exist yet (FileNotFoundError) or be
-        # mid-write; never let log following break job-log streaming.
-        pass
-    return pos, msg
-
-
-def _is_relayed_status_payload_line(line: str) -> bool:
-    """Whether a controller-log line is a relayed rich-status payload.
-
-    With ``relay_rich_status=True``, the jobs controller writes the inner
-    cluster launch's encoded rich-status payloads into its per-job log to drive
-    the provisioning spinner (see ``read_provision_status_from_log``). These
-    encoded ``<sky-payload>`` lines are control-plane only and must be hidden
-    from the human-readable ``sky jobs logs --controller`` output.
-    """
-    is_payload, _ = message_utils.decode_payload(line, raise_for_mismatch=False)
-    return is_payload
-
-
-def _provision_status_headline(provision_msg: str) -> str | None:
-    """Returns the blue headline of a provisioning spinner message.
-
-    Provisioning messages from the cluster launch are built by
-    ``ux_utils.spinner_message`` and look like
-    ``[bold cyan]Preparing SkyPilot runtime (1/3)[/]  <dim log hint>``, where
-    the trailing hint is colored with raw ANSI (colorama) codes rather than
-    rich markup -- so the message does *not* end at the headline's ``[/]``. We
-    keep only the ``[bold cyan]...[/]`` headline and drop the trailing hint, so
-    the caller can show it as a secondary detail under the "Waiting for task to
-    start" line. Returns ``None`` when the message has no ``[bold cyan]``
-    headline, so the caller can show nothing rather than a raw/unstyled message.
-    """
-    open_tag = '[bold cyan]'
-    start = provision_msg.find(open_tag)
-    if start == -1:
-        return None
-    start += len(open_tag)
-    # Walk the rich-markup tags after the opening tag, tracking nesting depth,
-    # and stop at the ``[/]`` that closes this ``[bold cyan]``. This keeps any
-    # nested markup (e.g. ``[bold]X[/]``) inside the headline intact -- instead
-    # of truncating at the first ``[/]`` -- and ignores the trailing log hint
-    # (which is ANSI-colored and contains no rich tags).
-    depth = 1
-    for match in re.finditer(r'\[[^\]]*\]', provision_msg[start:]):
-        if match.group(0).startswith('[/'):
-            depth -= 1
-            if depth == 0:
-                return provision_msg[start:start + match.start()]
-        else:
-            depth += 1
-    return None
-
-
-def _should_keep_logging(status: managed_job_state.ManagedJobStatus) -> bool:
-    # If we see CANCELLING, just exit - we could miss some job logs but the
-    # job will be terminated momentarily anyway so we don't really care.
-    return (not status.is_terminal() and
-            status != managed_job_state.ManagedJobStatus.CANCELLING)
+controller_log_file_for_job = (
+    managed_job_log_streaming.controller_log_file_for_job)
+read_provision_status_from_log = (
+    managed_job_log_streaming.read_provision_status_from_log)
+_is_relayed_status_payload_line = (
+    managed_job_log_streaming.is_relayed_status_payload_line)
+_provision_status_headline = (
+    managed_job_log_streaming.provision_status_headline)
+_should_keep_logging = managed_job_log_streaming.should_keep_logging
+select = managed_job_log_streaming.select_module
+signal = managed_job_log_streaming.signal_module
+sys = managed_job_log_streaming.sys_module
+threading = managed_job_log_streaming.threading_module
+rich_utils = managed_job_log_streaming.rich_utils_module
 
 
 def _wait_for_next_task(
         job_id: int,
-        current_task_id: int) -> tuple[int, managed_job_state.ManagedJobStatus]:
-    """Wait until the next task starts or the job stops being followable."""
-    while True:
-        latest_task_id, status = (
-            managed_job_state.get_latest_task_id_status(job_id))
-        assert status is not None, (job_id, latest_task_id, status)
-        assert latest_task_id is not None, (job_id, latest_task_id)
-        if (latest_task_id != current_task_id or
-                not _should_keep_logging(status)):
-            return latest_task_id, status
-        time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
+        current_task_id: int) -> managed_job_state.JobLogStreamSnapshot:
+    _sync_log_streaming_facade()
+    return managed_job_log_streaming.wait_for_next_task(job_id, current_task_id)
 
 
-def _wait_for_initial_task_status(
-        job_id: int) -> tuple[int | None, managed_job_state.ManagedJobStatus]:
-    """Wait until the latest-task status is initialized for log following."""
-    while True:
-        latest_task_id, status = (
-            managed_job_state.get_latest_task_id_status(job_id))
-        if status is not None:
-            return latest_task_id, status
-        time.sleep(1)
+def _wait_for_initial_log_stream_snapshot(
+    get_snapshot: typing.Callable[[], managed_job_state.JobLogStreamSnapshot]
+) -> managed_job_state.JobLogStreamSnapshot:
+    _sync_log_streaming_facade()
+    return managed_job_log_streaming.wait_for_initial_log_stream_snapshot(
+        get_snapshot)
 
 
 def stream_logs_by_id(job_id: int,
@@ -1371,531 +1316,10 @@ def stream_logs_by_id(job_id: int,
                       tail: int | None = None,
                       tail_offset: int | None = None,
                       task: str | int | None = None) -> tuple[str, int]:
-    """Stream logs by job id.
-
-    Args:
-        job_id: The job ID to stream logs for.
-        follow: Whether to follow the logs.
-        tail: Number of lines to tail from the end of the log file.
-        tail_offset: Skip the last ``tail_offset`` lines before applying
-            ``tail``. Used by the dashboard live-tail UI to fetch a window
-            of older history without re-reading the whole file.
-        task: Task identifier to view logs for a specific task in a JobGroup.
-            If an int, it is treated as a task ID. If a str, it is treated as
-            a task name. If None, logs for all tasks are shown.
-
-    Returns:
-        A tuple containing the log message and an exit code based on success or
-        failure of the job. 0 if success, 100 if the job failed.
-        See exceptions.JobExitCode for possible exit codes.
-    """
-
-    # Start a background watchdog thread that detects when the kubectl
-    # exec connection has been dropped (client disconnect). On Kubernetes,
-    # kubectl exec -i does not allocate a PTY, so no SIGHUP is sent when
-    # the connection drops. The only signal is that stdin reaches EOF
-    # (the kubelet closes the stdin pipe). This thread monitors stdin and
-    # terminates the process when disconnection is detected, preventing
-    # leaked stream_logs processes on the controller. Changing the exec call to
-    # also include -t does not result in the kubelet sending a SIGHUP to the
-    # remote end of the connection.
-    #
-    # The API server now passes stdin=subprocess.PIPE (instead of
-    # DEVNULL) to kubectl exec -i, so stdin on the controller is a live
-    # pipe that only reaches EOF when the connection actually drops.
-    #
-    # For SSH controllers, stdin is a PTY (from ssh -tt), so SIGHUP
-    # handles cleanup natively. For consolidation mode or other local
-    # invocations, stdin may be /dev/null or already closed (EOF). We
-    # check at startup: if stdin is already at EOF, we skip stdin
-    # monitoring entirely to avoid false positives. Only a live stdin
-    # (not yet at EOF) is worth monitoring this is the case for
-    # kubectl exec -i with stdin=subprocess.PIPE.
-    check_stdin_eof = False
-    try:
-        readable, _, _ = select.select([sys.stdin], [], [], 0)
-        if readable:
-            # stdin is immediately readable check if it's already EOF
-            data = os.read(sys.stdin.fileno(), 1)
-            if data:
-                # Got actual data (unexpected but harmless); stdin is live
-                check_stdin_eof = True
-            # else: EOF at startup, don't monitor
-        else:
-            # stdin is not immediately readable it's a live pipe/TTY
-            # waiting for input, meaning we have a real connection
-            check_stdin_eof = True
-    except (ValueError, OSError):
-        # stdin is already closed or invalid — not useful for monitoring
-        pass
-
-    def _orphan_watchdog() -> None:
-        """Background thread that monitors for connection drop."""
-        initial_parent_pid = os.getppid()
-        while True:
-            time.sleep(5)
-            # Check 1: Parent PID changed (reparented to init/subreaper)
-            if os.getppid() != initial_parent_pid:
-                logger.info('Parent process died, terminating.')
-                os.kill(os.getpid(), signal.SIGTERM)
-                return
-            # Check 2: stdin EOF (kubectl exec -i connection dropped).
-            # Only checked when stdin is a pipe (Kubernetes), not a TTY
-            # (SSH). With SSH -tt, the PTY delivers SIGHUP on disconnect,
-            # so this check is unnecessary and could cause false positives.
-            if not check_stdin_eof:
-                continue
-            try:
-                readable, _, _ = select.select([sys.stdin], [], [], 0)
-                if readable:
-                    data = os.read(sys.stdin.fileno(), 1)
-                    if not data:
-                        logger.info('stdin EOF detected (connection dropped), '
-                                    'terminating.')
-                        os.kill(os.getpid(), signal.SIGTERM)
-                        return
-            except (ValueError, OSError):
-                logger.info('stdin closed, terminating.')
-                os.kill(os.getpid(), signal.SIGTERM)
-                return
-
-    watchdog = threading.Thread(target=_orphan_watchdog, daemon=True)
-    watchdog.start()
-
-    def matches_task_filter(task_id: int, task_name: str,
-                            task_filter: str | int | None) -> bool:
-        """Check if a task matches the task filter.
-
-        If task_filter is an int, it is matched against task_id.
-        If task_filter is a str, it is matched against task_name.
-        """
-        if task_filter is None:
-            return True
-        if isinstance(task_filter, int):
-            return task_id == task_filter
-        # task_filter is a str, match by task name
-        return task_name == task_filter
-
-    msg = _JOB_WAITING_STATUS_MESSAGE.format(status_str='',
-                                             provision_str='',
-                                             job_id=job_id)
-    status_display = rich_utils.safe_status(msg)
-    task_info: list[tuple[int, str, managed_job_state.ManagedJobStatus, str,
-                          float | None]] | None = None
-    if task is not None:
-        task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
-            job_id)
-        num_tasks = len(task_info)
-    else:
-        num_tasks = managed_job_state.get_num_tasks(job_id)
-
-    # Check if job exists - if num_tasks is 0, the job doesn't exist
-    if num_tasks == 0:
-        return (f'Job {job_id} not found.', exceptions.JobExitCode.NOT_FOUND)
-
-    # Resolve task filter to a specific task_id if provided
-    # This is used for running jobs to stream logs from the correct task
-    filtered_task_id: int | None = None
-    if task is not None:
-        assert task_info is not None, task
-        for t_id, t_name, _, _, _ in task_info:
-            if matches_task_filter(t_id, t_name, task):
-                filtered_task_id = t_id
-                break
-        if filtered_task_id is None:
-            valid_range = f'0-{num_tasks - 1}' if num_tasks > 1 else '0'
-            return (f'No task found matching {task!r} in job {job_id}. '
-                    f'Valid task IDs are {valid_range}.',
-                    exceptions.JobExitCode.NOT_FOUND)
-
-    # Follow the jobs controller log during provisioning so the user sees the
-    # same spinner messages that `sky launch` shows. The controller relays the
-    # inner cluster-launch rich-status payloads into its per-job log (see
-    # recovery_strategy._launch's relay_rich_status=True); here we decode them
-    # to drive the single status spinner.
-    controller_log_path = controller_log_file_for_job(job_id)
-    provision_pos = 0
-    provision_msg: str | None = None
-
-    def _latest_provision_status_msg() -> str | None:
-        nonlocal provision_pos, provision_msg
-        provision_pos, provision_msg = read_provision_status_from_log(
-            controller_log_path, provision_pos, provision_msg)
-        return provision_msg
-
-    with status_display:
-        prev_msg = msg
-        latest_task_id, managed_job_status = _wait_for_initial_task_status(
-            job_id)
-        managed_job_status: managed_job_state.ManagedJobStatus | None = (
-            managed_job_status)
-        assert managed_job_status is not None, job_id
-
-        # Show hint about per-task filtering when there are multiple tasks
-        if num_tasks > 1 and task is None:
-            print(f'{colorama.Fore.CYAN}Hint: This job has {num_tasks} tasks. '
-                  f'Use \'sky jobs logs {job_id} TASK\' to view logs for a '
-                  f'specific task (TASK can be task ID or name).'
-                  f'{colorama.Style.RESET_ALL}')
-
-        if not _should_keep_logging(managed_job_status):
-            job_msg = ''
-            if managed_job_status.is_failed():
-                job_msg = ('\nFailure reason: '
-                           f'{managed_job_state.get_failure_reason(job_id)}')
-            log_file_ever_existed = False
-            terminal_task_info = (
-                managed_job_state.get_all_task_ids_names_statuses_logs(job_id))
-            assert terminal_task_info is not None, job_id
-            total_tasks = len(terminal_task_info)
-            # Filter tasks if task filter is specified
-            if task is not None:
-                terminal_task_info = [
-                    t for t in terminal_task_info
-                    if matches_task_filter(t[0], t[1], task)
-                ]
-                if not terminal_task_info:
-                    valid_range = (f'0-{total_tasks - 1}'
-                                   if total_tasks > 1 else '0')
-                    return (f'No task found matching {task!r} in job {job_id}. '
-                            f'Valid task IDs are {valid_range}.',
-                            exceptions.JobExitCode.NOT_FOUND)
-            num_tasks = len(terminal_task_info)
-            for (task_id, task_name, task_status, log_file,
-                 logs_cleaned_at) in terminal_task_info:
-                if log_file:
-                    log_file_ever_existed = True
-                    if logs_cleaned_at is not None:
-                        ts_str = datetime.fromtimestamp(
-                            logs_cleaned_at).strftime('%Y-%m-%d %H:%M:%S')
-                        print(f'Task {task_name}({task_id}) log has been '
-                              f'cleaned at {ts_str}.')
-                        continue
-                    task_str = (f'Task {task_name}({task_id})'
-                                if task_name else f'Task {task_id}')
-                    # Show task header when multiple tasks OR when filtering
-                    if num_tasks > 1 or task is not None:
-                        print(f'=== {task_str} ===')
-                    log_path = os.path.expanduser(log_file)
-                    if tail is not None:
-                        assert tail > 0
-                        # Backward-seek tail: O(tail × line) instead of
-                        # scanning the whole file. The previous
-                        # `collections.deque(f, maxlen=tail)` scanned every
-                        # byte of the cached log, making dashboard log
-                        # loading 10+ s for multi-GB cancelled jobs.
-                        offset = max(tail_offset or 0, 0)
-                        lines, _ = log_lib.tail_lines_from_end(
-                            log_path, tail, offset)
-                        # Apply the same start-stream-marker filter that
-                        # log_lib.tail_logs_iter uses: when the marker
-                        # appears in both the head of the file and the
-                        # tail window (small log fully covered), filter
-                        # so pre-marker boilerplate (Ray INFO lines etc.)
-                        # is hidden.
-                        with open(log_path, encoding='utf-8') as peek_f:
-                            head_lines = log_lib._peek_head_lines(peek_f)  # type: ignore[attr-defined] # pylint: disable=protected-access
-                        start_streaming = (
-                            log_lib._should_stream_the_whole_tail_lines(  # type: ignore[attr-defined] # pylint: disable=protected-access
-                                head_lines, lines,
-                                log_lib.LOG_FILE_START_STREAMING_AT))
-                        for line in lines:
-                            if log_lib.LOG_FILE_START_STREAMING_AT in line:
-                                start_streaming = True
-                            if start_streaming:
-                                print(line, end='', flush=True)
-                    else:
-                        with open(log_path, encoding='utf-8') as f:
-                            start_streaming = False
-                            for line in f:
-                                if (log_lib.LOG_FILE_START_STREAMING_AT
-                                        in line):
-                                    start_streaming = True
-                                if start_streaming:
-                                    print(line, end='', flush=True)
-                    # Show task finished message for multi-task or filtering
-                    if num_tasks > 1 or task is not None:
-                        # Add the "Task finished" message for terminal states
-                        if task_status.is_terminal():
-                            print(ux_utils.finishing_message(
-                                f'{task_str} finished '
-                                f'(status: {task_status.value}).'),
-                                  flush=True)
-            if log_file_ever_existed:
-                # Add the "Job finished" message for terminal states
-                if managed_job_status.is_terminal():
-                    print(ux_utils.finishing_message(
-                        f'Job finished (status: {managed_job_status.value}).'),
-                          flush=True)
-                return '', exceptions.JobExitCode.from_managed_job_status(
-                    managed_job_status)
-            return (f'{colorama.Fore.YELLOW}'
-                    f'Job {job_id} is already in terminal state '
-                    f'{managed_job_status.value}. For more details, run: '
-                    f'sky jobs logs --controller {job_id}'
-                    f'{colorama.Style.RESET_ALL}'
-                    f'{job_msg}',
-                    exceptions.JobExitCode.from_managed_job_status(
-                        managed_job_status))
-        # Batch coordinator jobs run inline on the controller — no
-        # separate cluster is provisioned. Stream controller logs instead
-        # of trying to find a worker cluster handle.
-        if managed_job_state.is_batch_job(job_id):
-            return stream_logs(job_id,
-                               job_name=None,
-                               controller=True,
-                               follow=follow,
-                               tail=tail,
-                               tail_offset=tail_offset)
-
-        backend = backends.CloudVmRayBackend()
-
-        # If a task filter was specified, use the filtered task_id instead of
-        # the latest task_id. This allows viewing logs for a specific task in
-        # a JobGroup with parallel execution.
-        if filtered_task_id is not None:
-            latest_task_id = filtered_task_id
-
-        # We wait for managed_job_status to be not None above. Once we see that
-        # it's not None, we don't expect it to every become None again.
-        assert managed_job_status is not None, (job_id, latest_task_id,
-                                                managed_job_status)
-        assert latest_task_id is not None, (job_id, latest_task_id)
-        task_id = latest_task_id
-
-        while _should_keep_logging(managed_job_status):
-            handle = None
-            cluster_name = None
-            job_id_to_tail = None
-            if task_id is not None:
-                pool, cluster_name, job_id_to_tail, task_name = (
-                    managed_job_state.get_log_stream_context(job_id, task_id))
-                if pool is None and task_name is not None:
-                    cluster_name = generate_managed_job_cluster_name(
-                        task_name, job_id)
-                if cluster_name is not None:
-                    handle = global_user_state.get_handle_from_cluster_name(
-                        cluster_name)
-
-            # Check the handle: The cluster can be preempted and removed from
-            # the table before the managed job state is updated by the
-            # controller. In this case, we should skip the logging, and wait for
-            # the next round of status check.
-            if (handle is None or managed_job_status
-                    != managed_job_state.ManagedJobStatus.RUNNING):
-                status_str = ''
-                if (managed_job_status is not None and managed_job_status
-                        != managed_job_state.ManagedJobStatus.RUNNING):
-                    status_str = f' (status: {managed_job_status.value})'
-                logger.debug(
-                    f'INFO: The log is not ready yet{status_str}. '
-                    f'Waiting for {JOB_STATUS_CHECK_GAP_SECONDS} seconds.')
-                # Poll the controller log frequently for provisioning spinner
-                # updates, but only re-check the (more expensive) managed job
-                # status every JOB_STATUS_CHECK_GAP_SECONDS.
-                waited = 0.0
-                while True:
-                    # Keep the "Waiting for task to start" context and append
-                    # the live cluster-launch status, so it's clear the job is
-                    # waiting on its cluster to be provisioned.
-                    provision_msg = _latest_provision_status_msg()
-                    # Show only the blue headline of the cluster-launch status
-                    # as a secondary detail under the waiting line; show nothing
-                    # when there is no headline to display.
-                    headline = (None if provision_msg is None else
-                                _provision_status_headline(provision_msg))
-                    provision_str = (''
-                                     if headline is None else f'\n  {headline}')
-                    msg = _JOB_WAITING_STATUS_MESSAGE.format(
-                        status_str=status_str,
-                        provision_str=provision_str,
-                        job_id=job_id)
-                    if msg != prev_msg:
-                        status_display.update(msg)
-                        prev_msg = msg
-                    if waited >= JOB_STATUS_CHECK_GAP_SECONDS:
-                        break
-                    time.sleep(_PROVISION_LOG_POLL_GAP_SECONDS)
-                    waited += _PROVISION_LOG_POLL_GAP_SECONDS
-                latest_task_id, managed_job_status = (
-                    managed_job_state.get_latest_task_id_status(job_id))
-                # Preserve filtered task_id if specified
-                if filtered_task_id is not None:
-                    latest_task_id = filtered_task_id
-                assert managed_job_status is not None, (job_id, latest_task_id,
-                                                        managed_job_status)
-                assert latest_task_id is not None, (job_id, latest_task_id)
-                task_id = latest_task_id
-                continue
-            assert (managed_job_status ==
-                    managed_job_state.ManagedJobStatus.RUNNING)
-            assert isinstance(handle, backends.CloudVmRayResourceHandle), handle
-            status_display.stop()
-            returncode = None
-            if managed_job_runtime.is_registered():
-                returncode = managed_job_runtime.tail_logs(
-                    handle,
-                    backend=backend,
-                    job_id=job_id,
-                    task_id=task_id,
-                    job_id_on_cluster=job_id_to_tail,
-                    follow=follow,
-                    tail=tail,
-                    tail_offset=tail_offset)
-            if returncode is None:
-                # OSS default: stream via backend.tail_logs (skylet/SSH/gRPC).
-                # require_outputs defaults to False, so the return is int
-                # (not Tuple[int, str, str]).
-                tail_param = tail if tail is not None else 0
-                returncode = typing.cast(
-                    int,
-                    backend.tail_logs(handle,
-                                      job_id=job_id_to_tail,
-                                      managed_job_id=job_id,
-                                      follow=follow,
-                                      tail=tail_param,
-                                      tail_offset=tail_offset))
-            if returncode in [rc.value for rc in exceptions.JobExitCode]:
-                # If the log tailing exits with a known exit code we can safely
-                # break the loop because it indicates the tailing process
-                # succeeded (even though the real job can be SUCCEEDED or
-                # FAILED). We use the status in job queue to show the
-                # information, as the ManagedJobStatus is not updated yet.
-                job_status: job_lib.JobStatus | None = None
-                # handle being non-None implies cluster_name was set.
-                assert cluster_name is not None, (job_id, task_id)
-                if managed_job_runtime.is_registered():
-                    runtime_result = managed_job_runtime.get_job_status(
-                        handle, cluster_name, returncode=returncode)
-                    if runtime_result is not None:
-                        job_status, _ = runtime_result
-                if job_status is None:
-                    # OSS default: query skylet via backend.
-                    job_statuses = backend.get_job_status(handle,
-                                                          stream_logs=False)
-                    job_status = list(job_statuses.values())[0]
-                assert job_status is not None, 'No job found.'
-                assert task_id is not None, job_id
-
-                if job_status != job_lib.JobStatus.CANCELLED:
-                    if not follow:
-                        break
-
-                    # Logs for retrying failed tasks.
-                    if (job_status
-                            in job_lib.JobStatus.user_code_failure_states()):
-                        task_specs = managed_job_state.get_task_specs(
-                            job_id, task_id)
-                        if task_specs.get('max_restarts_on_errors', 0) == 0:
-                            # We don't need to wait for the managed job status
-                            # update, as the job is guaranteed to be in terminal
-                            # state afterwards.
-                            break
-                        print()
-                        status_display.update(
-                            ux_utils.spinner_message(
-                                'Waiting for next restart for the failed task'))
-                        status_display.start()
-
-                        def is_managed_job_status_updated(
-                            status: managed_job_state.ManagedJobStatus | None
-                        ) -> bool:
-                            """Check if local managed job status reflects remote
-                            job failure.
-
-                            Ensures synchronization between remote cluster
-                            failure detection (JobStatus.FAILED) and controller
-                            retry logic.
-                            """
-                            return (
-                                status
-                                != managed_job_state.ManagedJobStatus.RUNNING)
-
-                        while not is_managed_job_status_updated(
-                                managed_job_status :=
-                                managed_job_state.get_status(job_id)):
-                            time.sleep(JOB_STATUS_CHECK_GAP_SECONDS)
-                        assert managed_job_status is not None, (
-                            job_id, managed_job_status)
-                        continue
-
-                    if task_id == num_tasks - 1:
-                        break
-
-                    # If a task filter was specified, we're done with the
-                    # specific task - don't wait for other tasks.
-                    if filtered_task_id is not None:
-                        break
-
-                    # The log for the current job is finished. We need to
-                    # wait until next job to be started.
-                    logger.debug(
-                        f'INFO: Log for the current task ({task_id}) '
-                        'is finished. Waiting for the next task\'s log '
-                        'to be started.')
-                    # Add a newline to avoid the status display below
-                    # removing the last line of the task output.
-                    print()
-                    status_display.update(
-                        ux_utils.spinner_message(
-                            f'Waiting for the next task: {task_id + 1}'))
-                    status_display.start()
-                    task_id, managed_job_status = _wait_for_next_task(
-                        job_id, task_id)
-                    continue
-
-                # The job can be cancelled by the user or the controller (when
-                # the cluster is partially preempted).
-                logger.debug(
-                    'INFO: Job is cancelled. Waiting for the status update in '
-                    f'{JOB_STATUS_CHECK_GAP_SECONDS} seconds.')
-            else:
-                logger.debug(
-                    f'INFO: (Log streaming) Got return code {returncode}. '
-                    f'Retrying in {JOB_STATUS_CHECK_GAP_SECONDS} seconds.')
-            # Finish early if the managed job status is already in terminal
-            # state.
-            managed_job_status = managed_job_state.get_status(job_id)
-            assert managed_job_status is not None, job_id
-            if not _should_keep_logging(managed_job_status):
-                break
-            logger.info(f'{colorama.Fore.YELLOW}The job cluster is preempted '
-                        f'or failed.{colorama.Style.RESET_ALL}')
-            msg = _JOB_CANCELLED_MESSAGE
-            status_display.update(msg)
-            prev_msg = msg
-            status_display.start()
-            # If the tailing fails, it is likely that the cluster fails, so we
-            # wait a while to make sure the managed job state is updated by the
-            # controller, and check the managed job queue again.
-            # Wait a bit longer than the controller, so as to make sure the
-            # managed job state is updated.
-            time.sleep(3 * JOB_STATUS_CHECK_GAP_SECONDS)
-            managed_job_status = managed_job_state.get_status(job_id)
-            assert managed_job_status is not None, (job_id, managed_job_status)
-
-    # The managed_job_status may not be in terminal status yet, since the
-    # controller has not updated the managed job state yet. We wait for a while,
-    # until the managed job state is updated.
-    wait_seconds = 0
-    managed_job_status = managed_job_state.get_status(job_id)
-    assert managed_job_status is not None, job_id
-    while (_should_keep_logging(managed_job_status) and follow and
-           wait_seconds < _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS):
-        time.sleep(1)
-        wait_seconds += 1
-        managed_job_status = managed_job_state.get_status(job_id)
-        assert managed_job_status is not None, job_id
-
-    if not follow and not managed_job_status.is_terminal():
-        # The job is not in terminal state and we are not following,
-        # just return.
-        return '', exceptions.JobExitCode.SUCCEEDED
-    logger.info(
-        ux_utils.finishing_message(f'Managed job finished: {job_id} '
-                                   f'(status: {managed_job_status.value}).'))
-    return '', exceptions.JobExitCode.from_managed_job_status(
-        managed_job_status)
+    """Stream logs by job id through the focused log lifecycle."""
+    _sync_log_streaming_facade()
+    return managed_job_log_streaming.stream_logs_by_id(job_id, follow, tail,
+                                                       tail_offset, task)
 
 
 def stream_logs(job_id: int | None,

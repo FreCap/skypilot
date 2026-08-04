@@ -1,5 +1,11 @@
 """Tests for AWS capacity classification and cache scoping."""
 # pylint: disable=protected-access
+import importlib
+import inspect
+import os
+import pathlib
+import pickle
+import types
 import unittest.mock as mock
 
 import botocore.exceptions
@@ -10,10 +16,100 @@ from sky import exceptions
 from sky import resources as resources_lib
 from sky.backends import cloud_vm_ray_backend as backend
 from sky.provision import capacity_cache
+from sky.provision import capacity_policy
 from sky.provision import common as provision_common
+from sky.provision import failover_error_policy
 from sky.provision.aws import instance as aws_instance
 from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils as gcp_instance_utils
+
+_CAPACITY_POLICY_SIGNATURES = {
+    '_iter_error_chain': '(error)',
+    '_provider_error_codes': '(error)',
+    '_classify_capacity_error': '(cloud, error)',
+    '_terminal_failover_leaves': '(error)',
+    '_terminal_leaf_cause_nodes': '(failure, *, history_depth, remaining_nodes)',
+    'classify_resources_unavailable_error': '(cloud, error)',
+    '_is_quota_error': '(error)',
+    '_canonical_accelerators': '(to_provision)',
+    '_capacity_cache_cloud_name': '(to_provision)',
+    '_capacity_cache_account': '(cloud, cloud_user_identity)',
+    '_capacity_cache_key': '(to_provision, region, zones, num_nodes, account)',
+    '_quota_cooldown_key': '(to_provision, region, num_nodes, account)',
+    '_fully_created_fresh_demand': '(provision_record, num_nodes, cluster_exists)',
+    '_failure_requested_full_demand': '(error, num_nodes)',
+    '_placement_error_code': '(error)',
+    '_placement_outcome': '(error, capacity_reason=None)',
+}
+
+_FAILOVER_ERROR_POLICY_SIGNATURES = {
+    '_add_to_blocked_resources': '(blocked_resources, resources)',
+    'FailoverCloudErrorHandlerV1._handle_errors': '(stdout, stderr, is_error_str_known)',
+    'FailoverCloudErrorHandlerV1._ibm_handler': '(blocked_resources, launchable_resources, region, zones, stdout, stderr)',
+    'FailoverCloudErrorHandlerV1.update_blocklist_on_error': '(blocked_resources, launchable_resources, region, zones, stdout, stderr)',
+    'FailoverCloudErrorHandlerV2._azure_handler': '(blocked_resources, launchable_resources, region, zones, err)',
+    'FailoverCloudErrorHandlerV2._gcp_handler': '(blocked_resources, launchable_resources, region, zones, err)',
+    'FailoverCloudErrorHandlerV2._lambda_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._aws_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._scp_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2._default_handler': '(blocked_resources, launchable_resources, region, zones, error)',
+    'FailoverCloudErrorHandlerV2.update_blocklist_on_error': '(blocked_resources, launchable_resources, region, zones, error)',
+}
+
+
+def _call_signature(symbol) -> str:
+    """Returns the version-stable callable portion of a signature."""
+    signature = inspect.signature(symbol)
+    parameters = [
+        parameter.replace(annotation=inspect.Parameter.empty)
+        for parameter in signature.parameters.values()
+    ]
+    return str(
+        signature.replace(parameters=parameters,
+                          return_annotation=inspect.Signature.empty))
+
+
+def test_capacity_policy_historical_contract():
+    for name, signature in _CAPACITY_POLICY_SIGNATURES.items():
+        symbol = getattr(backend, name)
+        assert getattr(capacity_policy, name) is symbol
+        assert _call_signature(symbol) == signature
+        assert symbol.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert pickle.loads(pickle.dumps(symbol)) is symbol
+
+
+def _resolve_backend_symbol(path: str):
+    symbol = backend
+    for name in path.split('.'):
+        symbol = getattr(symbol, name)
+    return symbol
+
+
+def _resolve_failover_policy_symbol(path: str):
+    symbol = failover_error_policy
+    for name in path.split('.'):
+        symbol = getattr(symbol, name)
+    return symbol
+
+
+def test_failover_error_policy_historical_contract():
+    assert (backend._RSYNC_NOT_FOUND_MESSAGE
+            is failover_error_policy._RSYNC_NOT_FOUND_MESSAGE)
+    for handler_name in ('FailoverCloudErrorHandlerV1',
+                         'FailoverCloudErrorHandlerV2'):
+        handler = getattr(backend, handler_name)
+        assert getattr(failover_error_policy, handler_name) is handler
+        assert handler.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert handler.__qualname__ == handler_name
+        assert pickle.loads(pickle.dumps(handler)) is handler
+
+    for path, signature in _FAILOVER_ERROR_POLICY_SIGNATURES.items():
+        symbol = _resolve_backend_symbol(path)
+        assert _resolve_failover_policy_symbol(path) is symbol
+        assert _call_signature(symbol) == signature
+        assert symbol.__module__ == 'sky.backends.cloud_vm_ray_backend'
+        assert symbol.__qualname__ == path
+        assert pickle.loads(pickle.dumps(symbol)) is symbol
 
 
 class _FakeClientError(Exception):
@@ -32,6 +128,129 @@ def _aggregate_error(*codes: str) -> provision_common.ProvisionerError:
     if codes:
         error.__cause__ = _FakeClientError(codes[-1])
     return error
+
+
+def _gcp_launchable_resources() -> resources_lib.Resources:
+    return resources_lib.Resources(
+        cloud=clouds.GCP(),
+        instance_type='n1-standard-4',
+        region='us-central1',
+        zone='us-central1-a',
+    )
+
+
+def test_failover_blocklist_skips_already_covered_resources():
+    launchable = _gcp_launchable_resources()
+    blocked = {launchable.copy(region=None, zone=None)}
+
+    backend._add_to_blocked_resources(blocked, launchable)
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region is None
+    assert blocked_resource.zone is None
+
+    blocked.clear()
+    backend._add_to_blocked_resources(blocked, launchable)
+    backend._add_to_blocked_resources(blocked, launchable)
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region == 'us-central1'
+    assert blocked_resource.zone == 'us-central1-a'
+
+
+def test_failover_v1_known_errors_preserve_order_and_stripping():
+    errors = backend.FailoverCloudErrorHandlerV1._handle_errors(
+        '  ERR first  \nignored',
+        'PANIC second\nignored',
+        lambda line: line.startswith(('ERR', 'PANIC')),
+    )
+    assert errors == ['ERR first', 'PANIC second']
+
+
+def test_failover_v1_rsync_error_preserves_detailed_reason():
+    with pytest.raises(RuntimeError,
+                       match='`rsync` command is not found') as exc_info:
+        backend.FailoverCloudErrorHandlerV1._handle_errors(
+            'launch output',
+            'bash: rsync: command not found',
+            lambda _: False,
+        )
+
+    assert exc_info.value.detailed_reason == (
+        'stdout: launch output\n'
+        'stderr: bash: rsync: command not found')
+
+
+def test_failover_v1_gang_failure_blocks_each_zone():
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+    zones = [clouds.Zone('us-central1-a'), clouds.Zone('us-central1-b')]
+
+    definitely_no_nodes_launched = (
+        backend.FailoverCloudErrorHandlerV1.update_blocklist_on_error(
+            blocked,
+            launchable,
+            clouds.Region('us-central1'),
+            zones,
+            None,
+            None,
+        ))
+
+    assert not definitely_no_nodes_launched
+    assert {resource.zone for resource in blocked} == {
+        'us-central1-a',
+        'us-central1-b',
+    }
+
+
+@pytest.mark.parametrize(
+    ('code', 'message', 'expected_region', 'expected_zone'),
+    [
+        ('ZONE_RESOURCE_POOL_EXHAUSTED', 'capacity', 'us-central1',
+         'us-central1-a'),
+        ('QUOTA_EXCEEDED', 'regional quota', 'us-central1', None),
+        ('QUOTA_EXCEEDED', "'GPUS_ALL_REGIONS' exceeded", None, None),
+        ('IAM_PERMISSION_DENIED', 'permission', None, None),
+    ],
+)
+def test_failover_v2_gcp_error_block_width(code, message, expected_region,
+                                           expected_zone):
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+    error = provision_common.ProvisionerError('provision failed')
+    error.errors = [{'code': code, 'message': message}]
+
+    backend.FailoverCloudErrorHandlerV2._gcp_handler(
+        blocked,
+        launchable,
+        clouds.Region('us-central1'),
+        [clouds.Zone('us-central1-a')],
+        error,
+    )
+
+    assert len(blocked) == 1
+    blocked_resource = next(iter(blocked))
+    assert blocked_resource.region == expected_region
+    assert blocked_resource.zone == expected_zone
+
+
+def test_failover_v2_default_handler_blocks_each_zone():
+    launchable = _gcp_launchable_resources()
+    blocked: set[resources_lib.Resources] = set()
+
+    backend.FailoverCloudErrorHandlerV2._default_handler(
+        blocked,
+        launchable,
+        clouds.Region('us-central1'),
+        [clouds.Zone('us-central1-a'),
+         clouds.Zone('us-central1-b')],
+        RuntimeError('unparsed'),
+    )
+
+    assert {resource.zone for resource in blocked} == {
+        'us-central1-a',
+        'us-central1-b',
+    }
 
 
 @pytest.mark.parametrize('code', [
@@ -529,19 +748,23 @@ def test_quota_consult_hit_and_failure(monkeypatch):
     assert not backend._quota_cooldown_is_active(key)
 
 
-def _call_retry_zones(provisioner, to_provision):
+def _call_retry_zones(provisioner,
+                      to_provision,
+                      *,
+                      dryrun=False,
+                      skip_if_config_hash_matches=None):
     return provisioner._retry_zones(
         to_provision=to_provision,
         num_nodes=1,
         requested_resources={to_provision},
-        dryrun=False,
+        dryrun=dryrun,
         stream_logs=False,
         cluster_name='test-cluster',
         cloud_user_identity=['arn:aws:iam::123456789012:role/test', 'acct'],
         prev_cluster_status=None,
         prev_handle=None,
         prev_cluster_ever_up=False,
-        skip_if_config_hash_matches=None,
+        skip_if_config_hash_matches=skip_if_config_hash_matches,
         volume_mounts=None,
         task=None,
     )
@@ -639,8 +862,6 @@ def test_retry_zones_preserves_structured_provider_failure(
                         lambda *_: mock.MagicMock())
     monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
                         lambda resources, **_: resources)
-    monkeypatch.setattr(backend.provision_lib, 'get_registered_provisioner',
-                        lambda *_: None)
     monkeypatch.setattr(backend, '_get_cluster_config_template',
                         lambda *_: '/tmp/template')
     monkeypatch.setattr(
@@ -677,6 +898,575 @@ def test_retry_zones_preserves_structured_provider_failure(
     assert exc_info.value.failover_history == [provider_error]
     assert backend.classify_resources_unavailable_error(
         clouds.AWS(), exc_info.value) == 'capacity'
+
+
+def test_retry_zones_passes_template_override_to_config_writer(
+        tmp_path, monkeypatch):
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._local_wheel_path = None
+    provisioner._wheel_hash = None
+    provisioner._active_cluster_hash = None
+    provisioner._is_managed = False
+    provisioner._workload_type = 'service'
+    provisioner._extra_launch_context = {'source': 'test'}
+    provisioner._is_launched_by_jobs_controller = False
+    to_provision = _to_provision()
+    provider_error = _aggregate_error('InsufficientInstanceCapacity')
+    provider_error.requested_count = 1
+    template_override = mock.Mock(return_value=backend.provision_lib.
+                                  TemplateSpec('/tmp/plugin-template', {
+                                      'plugin_value': 'yes',
+                                  }))
+    write_cluster_config = mock.Mock(return_value={
+        'ray': '/tmp/cluster.yaml',
+        'cluster_name_on_cloud': 'test-cluster',
+    })
+
+    monkeypatch.setattr(backend.provision_lib, '_registered_provisioners', {})
+    monkeypatch.setattr(backend.provision_lib,
+                        '_registered_provisioner_bundles', {})
+    monkeypatch.setattr(backend.provision_lib,
+                        '_legacy_mixed_owner_diagnostics', set())
+    backend.provision_lib.register_provisioner(
+        'aws',
+        mock.Mock(spec=[]),
+        template_override=template_override,
+    )
+    monkeypatch.setattr(clouds.AWS, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(provisioner, '_yield_zones',
+                        lambda *_: iter([[clouds.Zone('us-east-1a')]]))
+    monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
+                        lambda *_: set())
+    monkeypatch.setattr(backend, '_get_image_demand_attribution',
+                        lambda *_: mock.MagicMock())
+    monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
+                        lambda resources, **_: resources)
+    monkeypatch.setattr(
+        backend,
+        '_get_cluster_config_template',
+        mock.Mock(side_effect=AssertionError('unexpected default template')),
+    )
+    monkeypatch.setattr(backend.backend_utils, 'write_cluster_config',
+                        write_cluster_config)
+    monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
+                        (None, None))
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: 'cluster-hash')
+    monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.global_user_state,
+                        'set_owner_identity_for_cluster', lambda *_, **__: None)
+    monkeypatch.setattr(backend.usage_lib.messages.usage,
+                        'update_final_cluster_status', lambda *_: None)
+    monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
+                        lambda *_: None)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        mock.Mock(side_effect=provider_error))
+    monkeypatch.setattr(backend.CloudVmRayBackend, 'post_teardown_cleanup',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.FailoverCloudErrorHandlerV2,
+                        'update_blocklist_on_error', lambda *_, **__: None)
+    monkeypatch.setattr(backend, '_record_service_placement_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.capacity_cache, 'mark_exhausted',
+                        lambda *_, **__: None)
+
+    with pytest.raises(exceptions.ResourcesUnavailableError):
+        _call_retry_zones(provisioner, to_provision)
+
+    template_override.assert_called_once_with(
+        None,
+        to_provision,
+        _extra_launch_context={'source': 'test'},
+        _is_launched_by_jobs_controller=False,
+    )
+    write_cluster_config.assert_called_once()
+    config_args, config_kwargs = write_cluster_config.call_args
+    assert config_args[2] == '/tmp/plugin-template'
+    assert config_kwargs['extra_template_variables'] == {
+        'plugin_value': 'yes',
+    }
+
+
+def _configure_new_provisioner_callback_attempt(tmp_path,
+                                                monkeypatch,
+                                                events,
+                                                provider_outcomes,
+                                                *,
+                                                config_hash='generated-hash',
+                                                bulk_error=None):
+    """Configures one isolated current new-provisioner attempt."""
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._active_cluster_hash = None
+    provisioner._is_managed = False
+    provisioner._workload_type = 'service'
+    provisioner._extra_launch_context = None
+    provisioner._is_launched_by_jobs_controller = False
+    to_provision = resources_lib.Resources(cloud=clouds.DO(),
+                                           region='nyc3',
+                                           instance_type='g-2vcpu-8gb',
+                                           use_spot=False)
+    outcomes = iter(provider_outcomes)
+    provider_call_count = 0
+    writer_results = []
+
+    monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    skypilot_config = backend.backend_utils.skypilot_config
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
+
+    input_dir = tmp_path / 'do-writer-inputs'
+    input_dir.mkdir(exist_ok=True)
+    private_key_path = input_dir / 'test-key'
+    private_key_path.write_text('test-private-key', encoding='utf-8')
+    public_key_path = input_dir / 'test-key.pub'
+    public_key_path.write_text('test-public-key', encoding='utf-8')
+    wheel_path = input_dir / 'sky.whl'
+    wheel_path.write_bytes(b'test-wheel')
+    provisioner._local_wheel_path = wheel_path
+    provisioner._wheel_hash = 'b1bd84059bc0342f7843fcbe04ab563e'
+
+    monkeypatch.setattr(backend.backend_utils.auth_utils,
+                        'get_or_generate_keys', lambda:
+                        (str(private_key_path), str(public_key_path)))
+    monkeypatch.setattr(backend.backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', lambda *_: {})
+    monkeypatch.setattr(backend.backend_utils.logs, 'get_logging_agent',
+                        lambda: None)
+    monkeypatch.setattr(backend.backend_utils.common_utils, 'get_user_hash',
+                        lambda: '00000000')
+    monkeypatch.setattr(skypilot_config, 'get_active_workspace',
+                        lambda: 'default')
+    monkeypatch.setattr(backend.backend_utils.sky, '__version__', '1.0.0')
+    output_path = tmp_path / 'do-callback-attempt' / 'cluster.yaml'
+    monkeypatch.setattr(backend.backend_utils,
+                        '_get_yaml_path_from_cluster_name',
+                        lambda *_args, **_kwargs: str(output_path))
+    monkeypatch.setattr(backend.backend_utils.global_user_state,
+                        'get_cluster_yaml_str', lambda *_: None)
+    monkeypatch.setattr(backend.backend_utils.global_user_state,
+                        'set_cluster_yaml', lambda *_, **__: None)
+    monkeypatch.setattr(backend.backend_utils, '_optimize_file_mounts',
+                        lambda *_: None)
+    monkeypatch.setattr(backend.backend_utils.usage_lib.messages.usage,
+                        'update_ray_yaml', lambda *_: None)
+
+    def make_deploy_resources_variables(self,
+                                        resources,
+                                        cluster_name,
+                                        region,
+                                        zones,
+                                        num_nodes,
+                                        dryrun=False,
+                                        volume_mounts=None):
+        del self, resources, cluster_name, region, zones, num_nodes, dryrun
+        del volume_mounts
+        nonlocal provider_call_count
+        stage = 'writer' if provider_call_count == 0 else 'post_bulk'
+        provider_call_count += 1
+        events.append(f'deploy_vars:{stage}')
+        outcome = next(outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    real_make_deploy_variables = resources_lib.Resources.make_deploy_variables
+
+    def make_deploy_variables(self, *args, **kwargs):
+        events.append('resources_deploy_vars')
+        result = real_make_deploy_variables(self, *args, **kwargs)
+        writer_results.append(result)
+        return result
+
+    real_write_cluster_config = backend.backend_utils.write_cluster_config
+
+    def write_cluster_config(*args, **kwargs):
+        events.append('config_writer')
+        result = real_write_cluster_config(*args, **kwargs)
+        result['config_hash'] = config_hash
+        return result
+
+    provision_record = provision_common.ProvisionRecord(
+        provider_name='do',
+        region='nyc3',
+        zone=None,
+        cluster_name='test-cluster',
+        head_instance_id='head',
+        resumed_instance_ids=['head'],
+        created_instance_ids=[],
+    )
+
+    def bulk_provision(*args, **kwargs):
+        del args, kwargs
+        events.append('bulk_provision')
+        if bulk_error is not None:
+            raise bulk_error
+        return provision_record
+
+    bulk_provision_mock = mock.Mock(side_effect=bulk_provision)
+    cleanup_mock = mock.Mock()
+    monkeypatch.setattr(resources_lib.Resources, 'make_deploy_variables',
+                        make_deploy_variables)
+    monkeypatch.setattr(clouds.DO, 'make_deploy_resources_variables',
+                        make_deploy_resources_variables)
+    monkeypatch.setattr(clouds.DO, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(provisioner, '_yield_zones', lambda *_: iter([None]))
+    monkeypatch.setattr(provisioner, '_insufficient_resources_msg',
+                        lambda *_, **__: 'test resources unavailable')
+    monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
+                        lambda *_: set())
+    monkeypatch.setattr(backend, '_get_image_demand_attribution',
+                        lambda *_: mock.MagicMock())
+    monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
+                        lambda resources, **_: resources)
+    monkeypatch.setattr(backend.provision_lib,
+                        'get_provisioner_template_override', lambda *_: None)
+    monkeypatch.setattr(backend.backend_utils, 'write_cluster_config',
+                        write_cluster_config)
+    monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
+                        (None, None))
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: 'cluster-hash')
+    monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.global_user_state,
+                        'set_owner_identity_for_cluster', lambda *_, **__: None)
+    monkeypatch.setattr(backend.usage_lib.messages.usage,
+                        'update_final_cluster_status', lambda *_: None)
+    monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        bulk_provision_mock)
+    monkeypatch.setattr(backend.CloudVmRayBackend, 'post_teardown_cleanup',
+                        cleanup_mock)
+    monkeypatch.setattr(backend.FailoverCloudErrorHandlerV2,
+                        'update_blocklist_on_error', lambda *_, **__: None)
+    monkeypatch.setattr(backend, '_record_service_placement_event',
+                        lambda *_, **__: None)
+
+    return (provisioner, to_provision, provision_record, bulk_provision_mock,
+            cleanup_mock, writer_results)
+
+
+def test_new_provisioner_post_bulk_callback_is_authoritative(
+        tmp_path, monkeypatch):
+    events = []
+    writer_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'writer-value',
+        'region': 'nyc3',
+    }
+    post_bulk_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'post-bulk-value',
+        'region': 'nyc3',
+    }
+    (provisioner, to_provision, provision_record, bulk_provision, cleanup,
+     writer_results) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [writer_variables, post_bulk_variables],
+     )
+
+    result = _call_retry_zones(provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+        'bulk_provision',
+        'deploy_vars:post_bulk',
+    ]
+    assert {
+        key: writer_results[0][key] for key in writer_variables
+    } == writer_variables
+    assert result['resources_vars'] == post_bulk_variables
+    assert result['provision_record'] is provision_record
+    bulk_provision.assert_called_once()
+    cleanup.assert_not_called()
+
+
+def test_new_provisioner_builtin_bulk_receives_exact_cluster_incarnation(
+        tmp_path, monkeypatch):
+    reloaded = importlib.reload(backend.provisioner)
+    assert reloaded.bulk_provision is reloaded._BUILTIN_BULK_PROVISION
+
+    events = []
+    writer_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'writer-value',
+        'region': 'nyc3',
+    }
+    post_bulk_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'post-bulk-value',
+        'region': 'nyc3',
+    }
+    (retrying_provisioner, to_provision, provision_record, _, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [writer_variables, post_bulk_variables],
+     )
+    cluster_incarnation = ''.join(['exact', '-cluster', '-incarnation'])
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: cluster_incarnation)
+
+    def get_cluster_yaml_str(path):
+        if path is None:
+            return None
+        yaml_path = pathlib.Path(path)
+        debug_path = pathlib.Path(f'{path}.debug')
+        if yaml_path.exists():
+            return yaml_path.read_text(encoding='utf-8')
+        if debug_path.exists():
+            return debug_path.read_text(encoding='utf-8')
+        return None
+
+    monkeypatch.setattr(backend.global_user_state, 'get_cluster_yaml_str',
+                        get_cluster_yaml_str)
+    captured_configs = []
+
+    def fake_bulk_provision(cloud, region, cluster_name, bootstrap_config):
+        del cloud, region, cluster_name
+        events.append('bulk_provision')
+        captured_configs.append(bootstrap_config)
+        return provision_record
+
+    monkeypatch.setattr(backend.provisioner, '_bulk_provision',
+                        fake_bulk_provision)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        backend.provisioner._BUILTIN_BULK_PROVISION)
+
+    result = _call_retry_zones(retrying_provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+        'bulk_provision',
+        'deploy_vars:post_bulk',
+    ]
+    assert len(captured_configs) == 1
+    assert captured_configs[0].cluster_incarnation is cluster_incarnation
+    assert result['cluster_hash'] is cluster_incarnation
+    assert cluster_incarnation not in get_cluster_yaml_str(result['ray'])
+    cleanup.assert_not_called()
+
+
+def test_new_provisioner_old_signature_bulk_replacement_keeps_old_call_shape(
+        tmp_path, monkeypatch):
+    events = []
+    (retrying_provisioner, to_provision, provision_record, _, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'writer-value',
+                 'region': 'nyc3',
+             },
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'post-bulk-value',
+                 'region': 'nyc3',
+             },
+         ],
+     )
+    calls = []
+
+    def old_bulk_provision(cloud,
+                           region,
+                           zones,
+                           cluster_name,
+                           num_nodes,
+                           cluster_yaml,
+                           prev_cluster_ever_up,
+                           log_dir,
+                           ports_to_open_on_launch=None):
+        calls.append(
+            (cloud, region, zones, cluster_name, num_nodes, cluster_yaml,
+             prev_cluster_ever_up, log_dir, ports_to_open_on_launch))
+        events.append('bulk_provision')
+        return provision_record
+
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        old_bulk_provision)
+
+    result = _call_retry_zones(retrying_provisioner, to_provision)
+
+    assert result['provision_record'] is provision_record
+    assert len(calls) == 1
+    assert 'cluster_incarnation' not in inspect.signature(
+        old_bulk_provision).parameters
+    cleanup.assert_not_called()
+
+
+def test_new_provisioner_replacement_module_keeps_old_call_shape(
+        tmp_path, monkeypatch):
+    events = []
+    (retrying_provisioner, to_provision, provision_record, _, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'writer-value',
+                 'region': 'nyc3',
+             },
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'post-bulk-value',
+                 'region': 'nyc3',
+             },
+         ],
+     )
+    calls = []
+
+    def old_bulk_provision(cloud,
+                           region,
+                           zones,
+                           cluster_name,
+                           num_nodes,
+                           cluster_yaml,
+                           prev_cluster_ever_up,
+                           log_dir,
+                           ports_to_open_on_launch=None):
+        calls.append(
+            (cloud, region, zones, cluster_name, num_nodes, cluster_yaml,
+             prev_cluster_ever_up, log_dir, ports_to_open_on_launch))
+        events.append('bulk_provision')
+        return provision_record
+
+    replacement_module = types.SimpleNamespace(
+        bulk_provision=old_bulk_provision)
+    monkeypatch.setattr(backend, 'provisioner', replacement_module)
+
+    result = _call_retry_zones(retrying_provisioner, to_provision)
+
+    assert result['provision_record'] is provision_record
+    assert len(calls) == 1
+    cleanup.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('dryrun', 'config_hash', 'matching_hash', 'provisioning_skipped'),
+    [
+        (True, 'dryrun-hash', None, False),
+        (False, 'same-hash', 'same-hash', True),
+    ],
+    ids=['dryrun', 'matching-config-hash'],
+)
+def test_new_provisioner_short_circuit_skips_bulk_and_post_bulk_callback(
+        tmp_path, monkeypatch, dryrun, config_hash, matching_hash,
+        provisioning_skipped):
+    events = []
+    writer_variables = {
+        'instance_type': 'g-2vcpu-8gb',
+        'custom_resources': 'writer-value',
+        'region': 'nyc3',
+    }
+    (provisioner, to_provision, _, bulk_provision, cleanup,
+     writer_results) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [writer_variables],
+         config_hash=config_hash,
+     )
+
+    result = _call_retry_zones(
+        provisioner,
+        to_provision,
+        dryrun=dryrun,
+        skip_if_config_hash_matches=matching_hash,
+    )
+
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+    ]
+    assert {
+        key: writer_results[0][key] for key in writer_variables
+    } == writer_variables
+    assert result['provisioning_skipped'] is provisioning_skipped
+    bulk_provision.assert_not_called()
+    cleanup.assert_not_called()
+
+
+def test_new_provisioner_bulk_failure_skips_post_bulk_callback_and_cleans_up(
+        tmp_path, monkeypatch):
+    events = []
+    bulk_error = RuntimeError('bulk mutation failed')
+    (provisioner, to_provision, _, bulk_provision, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [{
+             'instance_type': 'g-2vcpu-8gb',
+             'custom_resources': 'writer-value',
+             'region': 'nyc3',
+         }],
+         bulk_error=bulk_error,
+     )
+
+    with pytest.raises(exceptions.ResourcesUnavailableError) as exc_info:
+        _call_retry_zones(provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+        'bulk_provision',
+    ]
+    assert exc_info.value.failover_history == [bulk_error]
+    bulk_provision.assert_called_once()
+    cleanup.assert_called_once()
+
+
+def test_new_provisioner_post_bulk_callback_failure_is_after_mutation_and_cleans_up(
+        tmp_path, monkeypatch):
+    events = []
+    callback_error = RuntimeError('post-bulk callback failed')
+    (provisioner, to_provision, _, bulk_provision, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [
+             {
+                 'instance_type': 'g-2vcpu-8gb',
+                 'custom_resources': 'writer-value',
+                 'region': 'nyc3',
+             },
+             callback_error,
+         ],
+     )
+
+    with pytest.raises(exceptions.ResourcesUnavailableError) as exc_info:
+        _call_retry_zones(provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+        'bulk_provision',
+        'deploy_vars:post_bulk',
+    ]
+    assert exc_info.value.failover_history == [callback_error]
+    bulk_provision.assert_called_once()
+    cleanup.assert_called_once()
 
 
 def test_provision_with_retries_preserves_nested_terminal_failure(

@@ -8,6 +8,9 @@ import time
 import unittest
 from unittest import mock
 
+from google.protobuf import descriptor_pb2
+from google.protobuf import descriptor_pool
+from google.protobuf import message_factory
 import grpc
 
 from sky.exceptions import JobExitCode
@@ -146,6 +149,211 @@ class TestSetJobInfoWithoutJobId(unittest.TestCase):
             'Managed job num_jobs must be positive: 0.')
         set_job_info.assert_not_called()
         set_pending.assert_not_called()
+
+
+class TestGetJobStatus(unittest.TestCase):
+
+    def setUp(self):
+        self.service = services.JobsServiceImpl()
+
+    @staticmethod
+    def _legacy_response_type():
+        """Build the pre-detail response type in an isolated descriptor pool."""
+        file_descriptor = descriptor_pb2.FileDescriptorProto(
+            name='legacy_job_status.proto',
+            package='legacy.jobs.v1',
+            syntax='proto3')
+        status_enum = file_descriptor.enum_type.add(name='JobStatus')
+        for name, number in (('JOB_STATUS_UNSPECIFIED', 0),
+                             ('JOB_STATUS_RUNNING', 4)):
+            status_enum.value.add(name=name, number=number)
+        response = file_descriptor.message_type.add(name='GetJobStatusResponse')
+        map_entry = response.nested_type.add(name='JobStatusesEntry')
+        map_entry.options.map_entry = True
+        key = map_entry.field.add(name='key', number=1)
+        key.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        key.type = descriptor_pb2.FieldDescriptorProto.TYPE_INT64
+        value = map_entry.field.add(name='value', number=2)
+        value.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        value.type = descriptor_pb2.FieldDescriptorProto.TYPE_ENUM
+        value.type_name = '.legacy.jobs.v1.JobStatus'
+        statuses = response.field.add(name='job_statuses', number=1)
+        statuses.label = descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED
+        statuses.type = descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE
+        statuses.type_name = (
+            '.legacy.jobs.v1.GetJobStatusResponse.JobStatusesEntry')
+        pool = descriptor_pool.DescriptorPool()
+        pool.Add(file_descriptor)
+        return message_factory.GetMessageClass(
+            pool.FindMessageTypeByName('legacy.jobs.v1.GetJobStatusResponse'))
+
+    @staticmethod
+    def _recovery_info():
+        return job_lib.JobSystemRecoveryInfo(
+            capability='skyserve-system-oom-recovery-v1',
+            phase=job_lib.JobSystemRecoveryPhase.WAITING_MEMORY,
+            original_attempt_id='attempt-0',
+            replacement_attempt_id=None,
+            task_index=0,
+            node_boot_id='boot-id',
+            occurrence_count=1,
+            armed_at=100.0,
+            updated_at=102.0,
+            event_id='event-id',
+            reason='RAY_NODE_OOM',
+            occurred_at=101.0,
+            deadline_at=221.0,
+            summary='host memory pressure',
+        )
+
+    @mock.patch('sky.skylet.services.job_lib.get_job_system_recovery_details')
+    @mock.patch('sky.skylet.services.job_lib.get_statuses')
+    def test_returns_status_and_structured_recovery(self, get_statuses,
+                                                    get_recovery_infos):
+        info = self._recovery_info()
+        get_statuses.return_value = {7: job_lib.JobStatus.RUNNING.value}
+        get_recovery_infos.return_value = ({
+            7: info
+        }, {
+            7: job_lib.JobSystemRecoveryDetailStatus.PRESENT
+        })
+
+        response = self.service.GetJobStatus(
+            jobsv1_pb2.GetJobStatusRequest(job_ids=[7]), mock.Mock())
+
+        self.assertEqual(response.job_statuses[7],
+                         jobsv1_pb2.JOB_STATUS_RUNNING)
+        self.assertEqual(
+            job_lib.JobSystemRecoveryInfo.from_protobuf(
+                response.system_recovery_infos[7]), info)
+        self.assertEqual(response.system_recovery_detail_statuses[7],
+                         jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_PRESENT)
+        get_recovery_infos.assert_called_once_with([7])
+
+    @mock.patch('sky.skylet.services.job_lib.get_job_system_recovery_details',
+                return_value=({}, {
+                    7: job_lib.JobSystemRecoveryDetailStatus.ABSENT
+                }))
+    @mock.patch('sky.skylet.services.job_lib.get_statuses',
+                return_value={7: job_lib.JobStatus.RUNNING.value})
+    def test_legacy_empty_recovery_map(self, _get_statuses,
+                                       _get_recovery_infos):
+        response = self.service.GetJobStatus(
+            jobsv1_pb2.GetJobStatusRequest(job_ids=[7]), mock.Mock())
+
+        self.assertEqual(dict(response.job_statuses),
+                         {7: jobsv1_pb2.JOB_STATUS_RUNNING})
+        self.assertEqual(dict(response.system_recovery_infos), {})
+        self.assertEqual(response.system_recovery_detail_statuses[7],
+                         jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_ABSENT)
+
+    @mock.patch('sky.skylet.services.job_lib.get_job_system_recovery_details',
+                side_effect=RuntimeError('optional detail query failed'))
+    @mock.patch('sky.skylet.services.job_lib.get_statuses',
+                return_value={7: job_lib.JobStatus.RUNNING.value})
+    def test_recovery_detail_failure_preserves_status(self, _get_statuses,
+                                                      _get_recovery_infos):
+        context = mock.Mock()
+
+        response = self.service.GetJobStatus(
+            jobsv1_pb2.GetJobStatusRequest(job_ids=[7]), context)
+
+        self.assertEqual(dict(response.job_statuses),
+                         {7: jobsv1_pb2.JOB_STATUS_RUNNING})
+        self.assertEqual(dict(response.system_recovery_infos), {})
+        self.assertEqual(response.system_recovery_detail_statuses[7],
+                         jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED)
+        context.abort.assert_not_called()
+
+    @mock.patch('sky.skylet.services.job_lib.get_job_system_recovery_details')
+    @mock.patch('sky.skylet.services.job_lib.get_statuses',
+                return_value={7: job_lib.JobStatus.RUNNING.value})
+    def test_recovery_detail_conversion_failure_preserves_status(
+            self, _get_statuses, get_recovery_infos):
+        malformed_info = mock.Mock()
+        malformed_info.to_protobuf.side_effect = ValueError('bad detail')
+        get_recovery_infos.return_value = ({
+            7: malformed_info
+        }, {
+            7: job_lib.JobSystemRecoveryDetailStatus.PRESENT
+        })
+        context = mock.Mock()
+
+        response = self.service.GetJobStatus(
+            jobsv1_pb2.GetJobStatusRequest(job_ids=[7]), context)
+
+        self.assertEqual(dict(response.job_statuses),
+                         {7: jobsv1_pb2.JOB_STATUS_RUNNING})
+        self.assertEqual(dict(response.system_recovery_infos), {})
+        self.assertEqual(response.system_recovery_detail_statuses[7],
+                         jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED)
+        context.abort.assert_not_called()
+
+    @mock.patch('sky.skylet.services.job_lib.get_job_system_recovery_details',
+                return_value=({}, {
+                    999: job_lib.JobSystemRecoveryDetailStatus.ABSENT
+                }))
+    @mock.patch('sky.skylet.services.job_lib.get_statuses',
+                return_value={999: None})
+    def test_contract_v1_represents_unknown_requested_id(
+            self, get_statuses, get_recovery_infos):
+        response = self.service.GetJobStatus(
+            jobsv1_pb2.GetJobStatusRequest(job_ids=[999]), mock.Mock())
+
+        self.assertEqual(dict(response.job_statuses),
+                         {999: jobsv1_pb2.JOB_STATUS_UNSPECIFIED})
+        get_statuses.assert_called_once_with([999])
+        get_recovery_infos.assert_called_once_with([999])
+
+    @mock.patch('sky.skylet.services.job_lib.get_job_system_recovery_details',
+                return_value=({}, {}))
+    @mock.patch('sky.skylet.services.job_lib.get_statuses', return_value={})
+    @mock.patch('sky.skylet.services.job_lib.get_latest_job_id',
+                return_value=None)
+    def test_contract_v1_empty_request_without_jobs_returns_empty_wire_map(
+            self, get_latest_job_id, get_statuses, get_recovery_infos):
+        response = self.service.GetJobStatus(jobsv1_pb2.GetJobStatusRequest(),
+                                             mock.Mock())
+
+        self.assertEqual(dict(response.job_statuses), {})
+        get_latest_job_id.assert_called_once_with()
+        get_statuses.assert_called_once_with([])
+        get_recovery_infos.assert_called_once_with([])
+
+    def test_proto_fields_are_wire_additive(self):
+        descriptor = jobsv1_pb2.GetJobStatusResponse.DESCRIPTOR
+        self.assertEqual(descriptor.fields_by_name['job_statuses'].number, 1)
+        self.assertEqual(
+            descriptor.fields_by_name['system_recovery_infos'].number, 2)
+        self.assertEqual(
+            descriptor.fields_by_name['system_recovery_detail_statuses'].number,
+            3)
+
+    def test_new_response_is_readable_by_legacy_status_reader(self):
+        legacy_response_type = self._legacy_response_type()
+        response = jobsv1_pb2.GetJobStatusResponse(
+            job_statuses={7: jobsv1_pb2.JOB_STATUS_RUNNING},
+            system_recovery_infos={7: self._recovery_info().to_protobuf()},
+            system_recovery_detail_statuses={
+                7: jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_PRESENT
+            })
+
+        legacy_response = legacy_response_type.FromString(
+            response.SerializeToString())
+
+        self.assertEqual(dict(legacy_response.job_statuses), {7: 4})
+
+    def test_legacy_response_is_readable_by_new_status_reader(self):
+        legacy_response_type = self._legacy_response_type()
+        legacy_response = legacy_response_type(job_statuses={7: 4})
+
+        response = jobsv1_pb2.GetJobStatusResponse.FromString(
+            legacy_response.SerializeToString())
+
+        self.assertEqual(dict(response.job_statuses),
+                         {7: jobsv1_pb2.JOB_STATUS_RUNNING})
+        self.assertEqual(dict(response.system_recovery_infos), {})
+        self.assertEqual(dict(response.system_recovery_detail_statuses), {})
 
 
 class TestTailLogsBuffering(unittest.TestCase):

@@ -14,15 +14,102 @@ This page covers how to keep a remote SkyPilot API server resilient and up to da
 High availability
 -----------------
 
-The SkyPilot API server can be configured for high availability by making it fully stateless — backing it with an external PostgreSQL database decouples API server state from the API server pod, allowing the pod to be restarted, rescheduled, or upgraded (including via :ref:`rolling updates <sky-api-server-upgrade-strategy>`) without losing state.
+The guarded high availability mode runs independent API, request executor, and
+controller Deployments. PostgreSQL owns durable request delivery and controller
+fencing, while a shared ReadWriteMany volume stores request artifacts and logs.
+Any API replica can therefore accept a request or its follow-up operations.
 
-.. note::
+High availability requires:
 
-    Multi-replica API server deployments are not supported in open-source SkyPilot.
+* an external, highly available PostgreSQL database;
+* a PostgreSQL connection Secret that exists before the Helm installation;
+* a ReadWriteMany storage class;
+* at least two API, executor, and controller replicas; and
+* ``RollingUpdate`` with the chart-managed disruption and drain safeguards.
 
-.. tip::
+Create the PostgreSQL Secret before installing the release:
 
-    **Scaling SkyPilot beyond 20 users or 1,000 GPUs, or need multi-replica high availability?** We would love to talk to you. SkyPilot has been supporting teams with 200+ users and 10,000+ GPUs with high availability and up to 10× faster performance — `sign up here <https://forms.gle/d2q9AVYeMA3eaKXW6>`_.
+.. code-block:: bash
+
+    kubectl create secret generic skypilot-db-connection-uri \
+      --namespace $NAMESPACE \
+      --from-literal connection_string=postgresql://<username>:<password>@<host>:<port>/<database>
+
+Create ``ha-values.yaml``:
+
+.. code-block:: yaml
+
+    apiService:
+      highAvailability:
+        enabled: true
+      replicas: 2
+      upgradeStrategy: RollingUpdate
+      dbConnectionSecretName: skypilot-db-connection-uri
+
+    requestStore:
+      backend: postgres
+
+    executorService:
+      replicas: 2
+
+    controllerService:
+      replicas: 2
+
+    storage:
+      enabled: true
+      accessMode: ReadWriteMany
+      storageClassName: <rwx-storage-class>
+
+Install or upgrade with those values:
+
+.. code-block:: bash
+
+    helm upgrade --install $RELEASE_NAME skypilot/skypilot-nightly --devel \
+      --namespace $NAMESPACE \
+      --create-namespace \
+      --values ha-values.yaml \
+      --wait
+
+The migration image runs as a blocking Helm pre-install and pre-upgrade hook.
+New pods are not created if the migration fails, so the previous Deployments
+continue serving. Each role has a PodDisruptionBudget, spreads replicas across
+nodes by default, and publishes an unready drain marker before termination.
+Ingress cookie affinity is disabled in this mode because request state is
+replica-independent.
+
+Verify that every role and disruption budget is healthy:
+
+.. code-block:: bash
+
+    kubectl rollout status deployment/$RELEASE_NAME-api-server -n $NAMESPACE
+    kubectl rollout status deployment/$RELEASE_NAME-executor -n $NAMESPACE
+    kubectl rollout status deployment/$RELEASE_NAME-controller -n $NAMESPACE
+    kubectl get pdb -n $NAMESPACE \
+      $RELEASE_NAME-api $RELEASE_NAME-executor $RELEASE_NAME-controller
+
+``apiService.highAvailability.readinessDrainSeconds`` defaults to 20 seconds.
+The chart rejects values shorter than the configured readiness failure
+detection window and rejects termination grace periods that leave less than
+ten seconds after the drain interval.
+
+Repository operators can run the destructive test-cluster conformance script
+while upgrading from ``IMAGE_A`` to ``IMAGE_B``. It maintains raw and
+authenticated in-cluster traffic, deletes role pods, rolls back, and upgrades
+again:
+
+.. code-block:: bash
+
+    export SKYPILOT_HA_CONTEXT=<test-context>
+    export SKYPILOT_HA_NAMESPACE=<isolated-test-namespace>
+    export SKYPILOT_HA_RELEASE=<isolated-test-release>
+    export SKYPILOT_HA_IMAGE_B=<target-image-or-digest>
+    export SKYPILOT_HA_TOKEN_SECRET=<existing-token-secret>
+    export SKYPILOT_HA_CONFIRM="$SKYPILOT_HA_CONTEXT/$SKYPILOT_HA_NAMESPACE/$SKYPILOT_HA_RELEASE"
+    tests/kubernetes/ha_conformance.sh
+
+Run this only against an isolated test release. The confirmation value is an
+intentional guard because the script deletes every original API, executor, and
+controller pod.
 
 .. _api-server-persistence-db:
 
@@ -37,7 +124,9 @@ If a persistent DB is not specified, the API server uses a Kubernetes persistent
 
   Database configuration must be set in the Helm deployment.
 
-Configure PostgreSQL during the first Helm deployment using one of the two options below.
+Configure PostgreSQL during the first Helm deployment using one of the two
+options below. Guarded high availability must use option 2 because its
+pre-install migration hook runs before chart-managed Secrets are created.
 
 **Option 1: Set the DB connection URI in helm values**
 
@@ -63,7 +152,8 @@ Create a Kubernetes secret that contains the DB connection URI:
       --namespace $NAMESPACE \
       --from-literal connection_string=postgresql://<username>:<password>@<host>:<port>/<database>
 
-When installing or upgrading the Helm chart, set the ``dbConnectionUri`` to the secret name:
+When installing or upgrading the Helm chart, set
+``apiService.dbConnectionSecretName`` to the Secret name:
 
 .. code-block:: bash
 
@@ -268,16 +358,42 @@ By default, the API server is upgraded with the ``Recreate`` strategy, which int
 
 .. note::
 
-    ``RollingUpdate`` is an experimental feature. There is a known limitation that some running commands might fail when the old version of the API server gets removed from the ingress backend. It is recommended to schedule the upgrade during a maintenance window.
+    ``RollingUpdate`` remains experimental for a compatibility deployment that
+    does not enable ``apiService.highAvailability.enabled``. The guarded high
+    availability configuration above uses durable request ownership and is the
+    supported multi-replica rolling-upgrade path.
 
 .. warning::
 
-    **Managed jobs and local file mounts:** Local ``file_mounts`` and ``workdir`` for managed jobs are stored on the pod's ephemeral filesystem and will be lost when the old pod is replaced during a rolling update. To avoid this:
+    **Compatibility RollingUpdate and local file mounts:** Local ``file_mounts``
+    and ``workdir`` can be lost when an unguarded compatibility pod is replaced.
+    Guarded high availability requires shared ReadWriteMany storage. For a
+    compatibility deployment:
 
     - Enable :ref:`persistent storage <helm-values-storage-enabled>` with a ``ReadWriteMany`` (RWX) PVC so both pods can access the files during the transition.
     - Alternatively, use :ref:`cloud buckets <sky-storage>`, :ref:`volumes <volumes-on-kubernetes>`, or :ref:`git <sync-code-and-project-files-git>` instead of local paths; or set :ref:`jobs.bucket <config-yaml-jobs-bucket>` to redirect all local file uploads to a cloud bucket.
 
     This does not apply if you are using a :ref:`remote jobs controller <jobs-controller-remote>`.
+
+For a claim provisioned outside the chart, set
+:ref:`storage.existingClaim <helm-values-storage-existingClaim>` and keep
+``storage.enabled=true``. The claim must exist in the release namespace and be
+populated and qualified before the upgrade. In guarded HA, also declare
+``storage.accessMode=ReadWriteMany`` and verify that the live claim is Bound and
+actually advertises RWX; Helm cannot inspect that capability while rendering.
+
+Migrating an existing chart-owned claim requires separate revisions. First add
+``helm.sh/resource-policy: keep`` through ``storage.annotations`` while
+``storage.existingClaim`` is still empty, and verify that revision changes only
+the old PVC metadata. Then stop every filesystem and SQLite writer, copy and
+verify the data on the new claim, complete the request-store cutover, and only
+then select the external claim. Do not combine the keep annotation and claim
+switch: the old PVC is no longer rendered once ``existingClaim`` is set.
+
+The PostgreSQL request-store marker is a one-way rollback boundary. After it is
+committed, recover by applying a new upgrade revision pinned to a compatible
+image that already uses PostgreSQL and the same RWX claim. Do not use native
+Helm rollback to a stored RWO/SQLite revision.
 
 The following table compares the two upgrade strategies:
 
@@ -304,7 +420,9 @@ The following table compares the two upgrade strategies:
      - Development environments, simple setups
      - Production environments requiring high availability
 
-To use the ``RollingUpdate`` strategy, you need to:
+For guarded high availability, use the complete configuration in
+:ref:`api-server-ha`. For the experimental compatibility ``RollingUpdate``
+path, you need to:
 
 * :ref:`Back the API server with a persistent database <api-server-persistence-db>`;
 * Disable local peristence by setting :ref:`storage.enabled <helm-values-storage-enabled>` to ``false``;
@@ -325,7 +443,14 @@ Here's an example of deploying the API server with the ``RollingUpdate`` strateg
 Ingress config
 --------------
 
-The SkyPilot helm chart automatically configures the ingress resource to achieve higher availability during upgrade. If you are managing the ingress resource outside of the SkyPilot helm chart, refer to the following snippet to improve the availability during upgrades:
+The SkyPilot Helm chart configures retry behavior during rolling upgrades.
+Guarded high availability deliberately disables session affinity because any
+replica can serve uploads, lookups, cancellation, and logs. If you manage the
+Ingress outside the chart, do not add cookie affinity or upstream-hash
+annotations for a guarded HA release.
+
+The following compatibility-only example retains session affinity for an
+unguarded rolling deployment:
 
 .. dropdown:: Example ingress based on nginx-ingress-controller
 
@@ -336,8 +461,7 @@ The SkyPilot helm chart automatically configures the ingress resource to achieve
         metadata:
           name: your-ingress-name
           annotations:
-            # Enable session affinity to route the requests of the same client to the same pod during upgrade.
-            # Without session affinity, the chance that requests fail during upgrade would be higher.
+            # Compatibility mode only. Do not use affinity in guarded HA mode.
             nginx.ingress.kubernetes.io/affinity: "cookie"
             nginx.ingress.kubernetes.io/session-cookie-name: "SKYPILOT_ROUTEID"
             nginx.ingress.kubernetes.io/affinity-mode: "persistent"

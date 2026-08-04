@@ -8,6 +8,7 @@ override for its thread count.
 """
 # pylint: disable=protected-access
 import threading
+from unittest import mock
 
 from sky.backends import backend_utils
 from sky.utils import status_lib
@@ -15,6 +16,11 @@ from sky.utils import status_lib
 
 def _record(status, status_updated_at):
     return {'status': status, 'status_updated_at': status_updated_at}
+
+
+def _fail_request_task_lookup(*args, **kwargs):
+    del args, kwargs
+    raise AssertionError('refresh must not query request tasks')
 
 
 class TestRefreshFaultIsolation:
@@ -60,8 +66,8 @@ class TestRefreshFaultIsolation:
 
         monkeypatch.setattr(backend_utils.global_user_state,
                             'get_cluster_status_fields', _snapshot)
-        monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
-                            lambda req_filter: [])
+        monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
+                            _fail_request_task_lookup)
 
         # Must not raise, and every cluster must have been attempted.
         backend_utils.refresh_cluster_records()
@@ -71,11 +77,8 @@ class TestRefreshFaultIsolation:
             self, monkeypatch):
         """The normal sweep path reads one consistent unmanaged snapshot."""
         attempted = []
+        refresh_kwargs = []
         snapshot_calls = []
-
-        class _Request:
-
-            cluster_name = 'launching'
 
         def _snapshot(cluster_names=None, *, exclude_managed_clusters=False):
             snapshot_calls.append((cluster_names, exclude_managed_clusters))
@@ -90,16 +93,16 @@ class TestRefreshFaultIsolation:
             raise AssertionError('normal path must not reread cluster names')
 
         def _fake_refresh_cluster_record(cluster_name, **kwargs):
-            del kwargs
             attempted.append(cluster_name)
+            refresh_kwargs.append(kwargs)
             return _record(status_lib.ClusterStatus.UP, 1)
 
         monkeypatch.setattr(backend_utils.global_user_state,
                             'get_cluster_status_fields', _snapshot)
         monkeypatch.setattr(backend_utils.global_user_state,
                             'get_cluster_names', _unexpected_names_read)
-        monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
-                            lambda req_filter: [_Request()])
+        monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
+                            _fail_request_task_lookup)
         monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
                             _fake_refresh_cluster_record)
         monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
@@ -108,7 +111,59 @@ class TestRefreshFaultIsolation:
         backend_utils.refresh_cluster_records()
 
         assert snapshot_calls == [(None, True)]
-        assert attempted == ['init-fresh', 'up-stale']
+        assert attempted == ['launching', 'init-fresh', 'up-stale']
+        assert all(kwargs['cluster_status_lock_timeout'] == 0
+                   for kwargs in refresh_kwargs)
+
+    def test_sweep_adds_only_nominated_ownerless_managed_services(
+            self, monkeypatch):
+        attempted = []
+
+        def _fake_refresh_cluster_record(cluster_name, **kwargs):
+            del kwargs
+            attempted.append(cluster_name)
+            return _record(status_lib.ClusterStatus.UP, 1)
+
+        monkeypatch.setattr(
+            backend_utils.global_user_state,
+            'get_cluster_status_fields',
+            lambda names=None, *, exclude_managed_clusters=False:
+            {'user-cluster': (status_lib.ClusterStatus.UP.value, 10)})
+        monkeypatch.setattr(
+            backend_utils.serve_utils,
+            'get_orphaned_service_cluster_status_fields', lambda:
+            {'orphaned-service': (status_lib.ClusterStatus.INIT.value, 1)})
+        monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
+                            _fake_refresh_cluster_record)
+        monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
+                            lambda: 1)
+
+        backend_utils.refresh_cluster_records()
+
+        assert attempted == ['orphaned-service', 'user-cluster']
+
+    def test_owner_discovery_failure_preserves_ordinary_sweep(
+            self, monkeypatch):
+        attempted = []
+
+        monkeypatch.setattr(
+            backend_utils.global_user_state,
+            'get_cluster_status_fields',
+            lambda names=None, *, exclude_managed_clusters=False:
+            {'user-cluster': (status_lib.ClusterStatus.UP.value, 1)})
+        monkeypatch.setattr(
+            backend_utils.serve_utils,
+            'get_orphaned_service_cluster_status_fields',
+            mock.Mock(side_effect=RuntimeError('serve db unavailable')))
+        monkeypatch.setattr(
+            backend_utils, 'refresh_cluster_record',
+            lambda cluster_name, **_kwargs: attempted.append(cluster_name))
+        monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
+                            lambda: 1)
+
+        backend_utils.refresh_cluster_records()
+
+        assert attempted == ['user-cluster']
 
     def test_sweep_covers_all_clusters_when_snapshot_fails(self, monkeypatch):
         """A status-snapshot failure falls back to the names-only sweep."""
@@ -133,23 +188,18 @@ class TestRefreshFaultIsolation:
                             lambda exclude_managed_clusters: cluster_names)
         monkeypatch.setattr(backend_utils.global_user_state,
                             'get_cluster_status_fields', _raise)
-        monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
-                            lambda req_filter: [])
+        monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
+                            _fail_request_task_lookup)
 
         backend_utils.refresh_cluster_records()
         assert sorted(attempted) == sorted(cluster_names)
 
     def test_sweep_preserves_source_order_when_ordering_fails(
             self, monkeypatch):
-        """The fallback path keeps DB/source order after launch filtering."""
+        """The fallback path keeps DB/source order without request-table I/O."""
         cluster_names = ['c-2', 'c-1', 'c-3', 'launching']
         attempted = []
         attempted_lock = threading.Lock()
-
-        class _Request:
-
-            def __init__(self, cluster_name):
-                self.cluster_name = cluster_name
 
         def _fake_refresh_cluster_record(cluster_name, **kwargs):
             del kwargs
@@ -168,8 +218,8 @@ class TestRefreshFaultIsolation:
                             lambda exclude_managed_clusters: cluster_names)
         monkeypatch.setattr(backend_utils.global_user_state,
                             'get_cluster_status_fields', _raise)
-        monkeypatch.setattr(backend_utils.requests_lib, 'get_request_tasks',
-                            lambda req_filter: [_Request('launching')])
+        monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
+                            _fail_request_task_lookup)
         # Pin the sweep to one thread: the ordering contract is about
         # submission order, which is only observable through execution order
         # when the pool is serial.
@@ -177,7 +227,7 @@ class TestRefreshFaultIsolation:
                             lambda: 1)
 
         backend_utils.refresh_cluster_records()
-        assert attempted == ['c-2', 'c-1', 'c-3']
+        assert attempted == cluster_names
 
 
 class TestRefreshParallelismKnob:

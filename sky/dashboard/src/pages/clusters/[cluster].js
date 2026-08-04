@@ -53,6 +53,7 @@ import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
 import { PluginSlot } from '@/plugins/PluginSlot';
 import { TelemetrySection } from '@/components/TelemetrySection';
 import { hasAccelerator } from '@/utils/gpuUtils';
+import { ClusterOperationalEvents } from '@/components/cluster-operational-events';
 import { trackClusterAction } from '@/lib/analytics';
 import { useLogStreamer } from '@/hooks/useLogStreamer';
 import {
@@ -815,7 +816,17 @@ function ActiveTab({
         name="clusters.detail.events"
         context={{
           clusterHash: clusterData.cluster_hash,
+          clusterName: clusterData.cluster,
+          workspace: clusterData.workspace,
+          isHistoricalCluster,
         }}
+        fallback={
+          <ClusterOperationalEvents
+            clusterHash={clusterData.cluster_hash}
+            clusterName={clusterData.cluster}
+            workspace={clusterData.workspace}
+          />
+        }
         wrapperClassName="mb-8"
       />
 

@@ -59,6 +59,13 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
+
 function renderPublish(onOpenChange = jest.fn(), onChanged = jest.fn()) {
   return render(
     <PublishImageDialog
@@ -245,6 +252,132 @@ describe('managed image action dialogs', () => {
     expect(getImageOperation).toHaveBeenCalledTimes(2);
 
     view.unmount();
+  });
+
+  it('pauses hidden operation polls and catches up once when visibility restores after the due boundary', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    publishImage.mockResolvedValue({
+      operation: { id: 'op-hidden', state: 'PENDING', error_code: null },
+    });
+    getImageOperation.mockResolvedValue({
+      id: 'op-hidden',
+      state: 'RUNNING',
+      error_code: null,
+    });
+
+    const view = renderPublish();
+    fillValidPublishForm();
+    fireEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+    try {
+      setDocumentVisibility('hidden');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        jest.advanceTimersByTime(20_000);
+        await Promise.resolve();
+      });
+      expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(getImageOperation).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1999);
+        await Promise.resolve();
+      });
+      expect(getImageOperation).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await Promise.resolve();
+      });
+      expect(getImageOperation).toHaveBeenCalledTimes(3);
+    } finally {
+      view.unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('does not fire an early operation poll when visibility returns before the due boundary', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    publishImage.mockResolvedValue({
+      operation: { id: 'op-visible', state: 'PENDING', error_code: null },
+    });
+    getImageOperation.mockResolvedValue({
+      id: 'op-visible',
+      state: 'RUNNING',
+      error_code: null,
+    });
+
+    const view = renderPublish();
+    fillValidPublishForm();
+    fireEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+    try {
+      setDocumentVisibility('hidden');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        jest.advanceTimersByTime(1999);
+        await Promise.resolve();
+      });
+      expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(getImageOperation).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await Promise.resolve();
+      });
+      expect(getImageOperation).toHaveBeenCalledTimes(2);
+    } finally {
+      view.unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
   });
 
   it('stops after terminal completion and notifies exactly once', async () => {

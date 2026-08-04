@@ -26,13 +26,12 @@ def _fake_replica(status: serve_state.ReplicaStatus,
 @pytest.fixture
 def patched_env(monkeypatch, tmp_path):
     """Route service logs to tmp_path and stub the service-level checks."""
-    monkeypatch.setattr(serve_utils, '_check_service_status_healthy',
-                        lambda name, pool: None)
     monkeypatch.setattr(serve_state,
                         'get_service_controller_owner',
                         lambda name, require_version=False: {
                             'pool': False,
                             'resource_scope': None,
+                            'status': serve_state.ServiceStatus.READY,
                         })
     monkeypatch.setattr(
         serve_state, 'get_service_from_name', lambda name:
@@ -116,10 +115,12 @@ class TestStreamReplicaLogsStatusLookup:
         monkeypatch.setattr(
             serve_utils, '_follow_logs_with_provision_expanding',
             lambda f, cluster_name, should_stop, stop_on_eof: iter(()))
-        owner_lookup = mock.Mock(return_value={
-            'pool': False,
-            'resource_scope': 'team-a',
-        })
+        owner_lookup = mock.Mock(
+            return_value={
+                'pool': False,
+                'resource_scope': 'team-a',
+                'status': serve_state.ServiceStatus.READY,
+            })
         monkeypatch.setattr(serve_state, 'get_service_controller_owner',
                             owner_lookup)
 

@@ -310,8 +310,9 @@ def upsert_claim(
             effective_cap=effective_cap,
             launchable=launchable,
             heartbeat_ts=now,
-            demonstrated_need=(None if activity is None else int(
-                activity['demonstrated_need'])),
+            demonstrated_need=(None if activity is None or
+                               activity.get('demonstrated_need') is None else
+                               int(activity['demonstrated_need'])),
             boot_hold=(None
                        if activity is None else bool(activity['boot_hold'])),
             # Paired with heartbeat_ts from the SAME `now`, in the same
@@ -350,9 +351,12 @@ def utilization_gate_enabled() -> bool:
 class ActivityInput:
     """One claimant's utilization signal, or the absence of one.
 
-    `blind` is the important state: it means the round cannot tell idle
-    from unobservable, and the governor freezes rather than releasing.
+    `armed` distinguishes an explicit/static opt-out from a default-gated
+    claimant whose utilization is temporarily unobservable. `blind` means an
+    armed gate cannot tell idle from active and must follow its bounded blind
+    grace instead of treating the missing sample as confirmed zero.
     """
+    armed: bool
     demonstrated_need: int
     boot_hold: bool
     blind: bool
@@ -360,15 +364,23 @@ class ActivityInput:
 
 def _activity_input(row: dict[str, Any]) -> ActivityInput:
     """Reads a claim's utilization signal, rejecting stale or absent ones."""
-    blind = ActivityInput(demonstrated_need=0, boot_hold=False, blind=True)
+    ungated = ActivityInput(armed=False,
+                            demonstrated_need=0,
+                            boot_hold=False,
+                            blind=True)
     if not utilization_gate_enabled():
-        return blind
-    need = row.get('demonstrated_need')
+        return ungated
     activity_ts = row.get('activity_ts')
-    if need is None or activity_ts is None:
-        # No signal at all: a pre-030 row, a claimant with the gate off, or
-        # an autoscaler class with no occupancy telemetry.
-        return blind
+    if activity_ts is None:
+        # All activity columns NULL is the durable explicit opt-out (and the
+        # shape of a pre-gate writer). It must clear any prior governor state,
+        # not freeze a cap left behind before a service update disabled the
+        # gate.
+        return ungated
+    blind = ActivityInput(armed=True,
+                          demonstrated_need=0,
+                          boot_hold=False,
+                          blind=True)
     try:
         lag = float(row['heartbeat_ts'] or 0.0) - float(activity_ts)
     except (TypeError, ValueError):
@@ -383,7 +395,14 @@ def _activity_input(row: dict[str, Any]) -> ActivityInput:
         # exists; a negative lag is equally untrustworthy (clock surgery or
         # a hand-edited row).
         return blind
-    return ActivityInput(demonstrated_need=max(0, int(need)),
+    need = row.get('demonstrated_need')
+    if need is None:
+        # A current gated writer deliberately pairs a fresh activity_ts with
+        # NULL need when no detailed utilization sample is available. This is
+        # armed-but-blind, not confirmed idle and not an opt-out.
+        return blind
+    return ActivityInput(armed=True,
+                         demonstrated_need=max(0, int(need)),
                          boot_hold=bool(row.get('boot_hold')),
                          blind=False)
 
@@ -396,9 +415,11 @@ def _apply_utilization_gate(
 ) -> tuple[dict[str, ClaimInput], dict[str, dict[str, Any]]]:
     """Advance every claimant's release target and attach it as a cap.
 
-    Returns the claims with utilization_cap set and the new state to
-    persist on the round row. A claimant with no entry in the returned
-    state is ungated, which is the pre-gate behavior.
+    Returns the claims with utilization_cap set and the new state to persist
+    on the round row. A gated claimant decays to zero while idle and recovers
+    a utilization-proportional cap while active; the cap can remain below its
+    declared floor. A claimant with no entry in the returned state is
+    explicitly ungated, which preserves static-reservation behavior.
     """
     if not utilization_gate_enabled():
         # PROCESS-WIDE KILL SWITCH. The behavior contract (requirement 2)
@@ -421,19 +442,19 @@ def _apply_utilization_gate(
     for name, claim in claims.items():
         signal = activity[name]
         prev = prev_state.get(name)
-        if signal.blind and prev is None:
-            # NEVER GATED. No usable signal has ever been recorded for this
-            # claimant: the gate is off for it, its claim predates the
-            # feature, or its autoscaler class has no occupancy telemetry.
-            # It gets no cap and no state, which is exactly the behavior
-            # before this feature existed. Distinguishing this from "gated
-            # but momentarily blind" is what makes the gate opt-in in
-            # practice as well as in the schema.
+        if not signal.armed:
+            # Explicit utilization_gate:false (or a pre-gate all-NULL row).
+            # Omit it from the rebuilt state even when `prev` exists so an
+            # update that opts out restores the static reservation now rather
+            # than freezing the last decayed cap.
             gated[name] = claim
             continue
         entry = advance_release_target(
             prev,
-            floor=claim.attainable_floor(),
+            # A gated reservation is retained only while utilization is
+            # demonstrated. Idle releases all fill capacity and active
+            # entitlement is proportional to demonstrated need.
+            floor=0,
             holdings=claim.holdings_fill,
             need=signal.demonstrated_need,
             boot_hold=signal.boot_hold,
@@ -974,6 +995,16 @@ def _run_round_locked(service_name: str, pool_key: str,
         json.loads(round_row['utilization_state'] or '{}')
         if round_row is not None and 'utilization_state' in round_row.keys()
         else {})
+    # Disarming is immediate even on a measurement blackout, where the
+    # governor itself is intentionally not advanced. Otherwise the blackout
+    # carry path would preserve a decayed cap after an update explicitly set
+    # utilization_gate:false. Current armed-but-blind claimants retain their
+    # state and follow the normal blind grace.
+    prev_utilization = {
+        name: entry
+        for name, entry in prev_utilization.items()
+        if name in activity and activity[name].armed
+    }
     # Rebuilt from the current claimants every round, mirroring the sticky
     # feed state, so entries for departed services cannot accumulate.
     utilization_state: dict[str, dict[str, Any]] = {}

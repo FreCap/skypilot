@@ -6,8 +6,9 @@ not the full daemon loop:
 * ``_lock_still_held`` dispatches correctly between ``PostgresLock``
   (probes the underlying PG session) and any other ``DistributedLock``
   (trusts the local ``is_locked`` flag).
-* ``_suicide_on_lock_loss`` sends ``SIGTERM`` to the API server PID so
-  K8s restarts the pod and the leader is re-elected on another replica.
+* ``_suicide_on_lock_loss`` fail-stops detached schedulers before sending
+  ``SIGTERM`` to the API server PID so K8s restarts the pod and the leader is
+  re-elected on another replica.
 * ``start_managed_job_refresh_daemon`` gates on consolidation mode,
   preserving the historical ``should_skip_managed_job_status_refresh``
   semantics now that the daemon no longer lives in
@@ -74,12 +75,12 @@ class TestSuicideOnLockLoss:
         with mock.patch.object(mjrt.os, 'kill') as kill_mock, \
                 mock.patch.object(mjrt.os, 'getpid', return_value=12345), \
                 mock.patch.object(mjrt.managed_job_scheduler,
-                                  'kill_local_job_controllers'):
+                                  'fail_stop_local_job_controllers'):
             thread._suicide_on_lock_loss()
         kill_mock.assert_called_once_with(12345, signal.SIGTERM)
 
     def test_kills_local_controllers_before_sigterm(self):
-        """Controllers must be SIGTERMed before the API server SIGTERM —
+        """Controllers must be fail-stopped before the API server SIGTERM —
         the lock is already released here, so a new leader can schedule
         within milliseconds. Killing first prevents split-brain."""
         thread = mjrt.ManagedJobRefreshDaemonThread()
@@ -89,7 +90,7 @@ class TestSuicideOnLockLoss:
         call_order = []
         with mock.patch.object(
                 mjrt.managed_job_scheduler,
-                'kill_local_job_controllers',
+                'fail_stop_local_job_controllers',
                 side_effect=lambda: call_order.append('kill_controllers')), \
                 mock.patch.object(
                     mjrt.os, 'kill',
@@ -108,7 +109,7 @@ class TestSuicideOnLockLoss:
                                             spec_set=True)
         with mock.patch.object(
                 mjrt.managed_job_scheduler,
-                'kill_local_job_controllers',
+                'fail_stop_local_job_controllers',
                 side_effect=RuntimeError('boom')), \
                 mock.patch.object(mjrt.os, 'kill') as kill_mock, \
                 mock.patch.object(mjrt.os, 'getpid', return_value=12345):
@@ -132,7 +133,7 @@ class TestSuicideOnLockLoss:
         order = []
         with mock.patch.object(
                 mjrt.managed_job_scheduler,
-                'kill_local_job_controllers',
+                'fail_stop_local_job_controllers',
                 side_effect=lambda: order.append('kill')), \
                 mock.patch.object(
                     mjrt.os, 'kill',
@@ -160,7 +161,7 @@ class TestSuicideOnLockLoss:
                                             spec_set=True)
         with mock.patch.object(mjrt.pathlib.Path, 'touch', boom_touch), \
                 mock.patch.object(mjrt.managed_job_scheduler,
-                                  'kill_local_job_controllers'), \
+                                  'fail_stop_local_job_controllers'), \
                 mock.patch.object(mjrt.os, 'kill') as kill_mock, \
                 mock.patch.object(mjrt.os, 'getpid', return_value=12345):
             thread._suicide_on_lock_loss()
@@ -362,7 +363,7 @@ class TestBecomeLeaderOrdering:
                 thread._become_leader_and_run()
 
         # Recovery runs only after the lock is acquired AND after the wait.
-        assert order == ['acquire', 'sleep', 'recovery']
+        assert order == ['acquire', 'sleep', 'sleep', 'sleep', 'recovery']
         # The finally block removes the gate file even when recovery fails.
         assert not signal_file.exists()
         assert signal_file.parent.exists()
@@ -472,13 +473,17 @@ class TestBecomeLeaderOrdering:
 
         assert not slept
         assert order == ['acquire', 'recovery']
+        lock.is_session_alive.assert_called_once_with()
         assert not signal_file.exists()
 
     def test_waits_for_configured_duration_before_recovery(
             self, tmp_path, monkeypatch):
-        """The wait must use _RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS, and the
-        gate file must still be present while we wait (so controllers stay
-        gated and update_managed_jobs_statuses does not fire)."""
+        """Healthy ownership preserves the full configured grace duration.
+
+        The wait is divided only at the existing lock-probe cadence.  This
+        bounds startup-only session probes without changing the recovery
+        deadline or removing the controller-start gate.
+        """
         signal_file = tmp_path / 'restart_signal'
         monkeypatch.setattr(mjrt.constants,
                             'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
@@ -509,13 +514,17 @@ class TestBecomeLeaderOrdering:
             with pytest.raises(RuntimeError, match='stop before event loop'):
                 thread._become_leader_and_run()
 
-        assert slept == [7]
+        assert slept == [mjrt._LOCK_PROBE_INTERVAL_SECONDS, 2]
+        assert lock.is_session_alive.call_count == 2
 
-    def test_steps_down_if_lock_lost_during_wait(self, tmp_path, monkeypatch):
-        """If the lock session goes stale during the post-acquire wait, we
-        must NOT run recovery — another replica may now hold the lock. Step
-        down via _suicide_on_lock_loss and leave the gate file in place (the
-        suicide path re-touches it to keep controllers gated)."""
+    def test_steps_down_on_first_lock_probe_during_wait(self, tmp_path,
+                                                        monkeypatch):
+        """Lock loss must not leave stale controllers alive for 15 seconds.
+
+        Once another replica can acquire the advisory lock, waiting for the
+        entire recovery grace period before fail-stopping this process creates
+        a split-brain window.  Detect loss at the first normal probe boundary.
+        """
         signal_file = tmp_path / 'restart_signal'
         monkeypatch.setattr(mjrt.constants,
                             'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
@@ -526,11 +535,12 @@ class TestBecomeLeaderOrdering:
                                     instance=True,
                                     spec_set=True)
         lock.is_locked.return_value = False
-        # Session is dead by the time we re-check after the wait.
         lock.is_session_alive.return_value = False
         thread._lock = lock
+        slept = []
 
-        with mock.patch.object(mjrt.time, 'sleep'), \
+        with mock.patch.object(
+                mjrt.time, 'sleep', side_effect=slept.append), \
                 mock.patch.object(
                     mjrt.managed_job_utils,
                     'ha_recovery_for_consolidation_mode') as recovery, \
@@ -539,11 +549,68 @@ class TestBecomeLeaderOrdering:
                     '_suicide_on_lock_loss') as suicide:
             thread._become_leader_and_run()
 
+        assert slept == [mjrt._LOCK_PROBE_INTERVAL_SECONDS]
+        lock.is_session_alive.assert_called_once_with()
+        suicide.assert_called_once_with()
+        recovery.assert_not_called()
+        assert signal_file.exists()
+
+    def test_steps_down_if_lock_lost_during_wait(self, tmp_path, monkeypatch):
+        """Later lock loss also stops at its next probe boundary.
+
+        Recovery must not run after another replica may hold the lock.  The
+        suicide path owns re-touching the gate through the shutdown drain.
+        """
+        signal_file = tmp_path / 'restart_signal'
+        monkeypatch.setattr(mjrt.constants,
+                            'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
+                            str(signal_file))
+
+        thread = mjrt.ManagedJobRefreshDaemonThread()
+        lock = mock.create_autospec(locks.PostgresLock,
+                                    instance=True,
+                                    spec_set=True)
+        lock.is_locked.return_value = False
+        lock.is_session_alive.side_effect = [True, False]
+        thread._lock = lock
+        slept = []
+
+        with mock.patch.object(
+                mjrt.time, 'sleep', side_effect=slept.append), \
+                mock.patch.object(
+                    mjrt.managed_job_utils,
+                    'ha_recovery_for_consolidation_mode') as recovery, \
+                mock.patch.object(
+                    mjrt.ManagedJobRefreshDaemonThread,
+                    '_suicide_on_lock_loss') as suicide:
+            thread._become_leader_and_run()
+
+        assert slept == [mjrt._LOCK_PROBE_INTERVAL_SECONDS] * 2
+        assert lock.is_session_alive.call_count == 2
         suicide.assert_called_once()
         recovery.assert_not_called()
         # The gate file is NOT removed on the step-down path; the suicide
         # routine owns re-touching it for the shutdown drain.
         assert signal_file.exists()
+
+
+def test_recovery_fences_stale_jobs_before_scheduler_start(
+        tmp_path, monkeypatch):
+    """Replacement scheduler startup must be the last recovery operation."""
+    order = []
+    monkeypatch.setattr(mjrt.constants, 'HA_PERSISTENT_RECOVERY_LOG_PATH',
+                        str(tmp_path / '{}recovery.log'))
+    monkeypatch.setattr(mjrt.managed_job_state,
+                        'reset_stale_jobs_for_current_controller',
+                        lambda: order.append('reset-stale') or 1)
+    monkeypatch.setattr(mjrt.managed_job_state, 'get_managed_jobs_with_filters',
+                        lambda fields: ([], None))
+    monkeypatch.setattr(mjrt.managed_job_scheduler, 'maybe_start_controllers',
+                        lambda: order.append('start-scheduler'))
+
+    mjrt.managed_job_utils.ha_recovery_for_consolidation_mode()
+
+    assert order == ['reset-stale', 'start-scheduler']
 
 
 class TestStart:

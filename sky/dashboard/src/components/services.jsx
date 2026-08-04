@@ -18,11 +18,15 @@ import {
   TableBody,
   TableCell,
 } from '@/components/ui/table';
-import { getServices } from '@/data/connectors/services';
+import {
+  getServiceReplicaSummaries,
+  getServices,
+} from '@/data/connectors/services';
 import { REFRESH_INTERVALS } from '@/lib/config';
 import { sortData } from '@/data/utils';
 import { RotateCwIcon, CopyIcon, CheckIcon } from 'lucide-react';
 import { useMobile } from '@/hooks/useMobile';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import { Card } from '@/components/ui/card';
 import Link from 'next/link';
 import {
@@ -30,10 +34,307 @@ import {
   LastUpdatedTimestamp,
   formatDuration,
 } from '@/components/utils';
-import { StatusBadge } from '@/components/elements/StatusBadge';
 import dashboardCache from '@/lib/cache';
 
 const REFRESH_INTERVAL = REFRESH_INTERVALS.REFRESH_INTERVAL;
+const SERVICE_METADATA_ARGS = [{ metadataOnly: true }];
+const SERVICE_SUMMARY_ARGS = [{ summaryOnly: true, includeEndpoints: true }];
+const SERVICE_REPLICA_SUMMARY_ARGS = [{}];
+
+const PAST_ATTEMPT_STATUSES = new Set([
+  'FAILED',
+  'FAILED_INITIAL_DELAY',
+  'FAILED_PROBING',
+  'FAILED_PROVISION',
+]);
+
+const ACTIVE_RECOVERY_STATUSES = new Set([
+  'PENDING',
+  'PROVISIONING',
+  'STARTING',
+  'NOT_READY',
+  'PREEMPTED',
+  'SHUTTING_DOWN',
+]);
+
+const CLEANUP_UNCERTAIN_STATUSES = new Set(['FAILED_CLEANUP']);
+const UNKNOWN_REPLICA_STATUSES = new Set(['UNKNOWN']);
+
+function countStatuses(service, statuses) {
+  if (service.replicaStatusCounts) {
+    return Object.entries(service.replicaStatusCounts)
+      .filter(([status]) => statuses.has(status))
+      .reduce((total, [, count]) => total + Number(count || 0), 0);
+  }
+  return (service.replicas || []).filter((replica) =>
+    statuses.has(replica.status)
+  ).length;
+}
+
+export function getPastAttemptCount(service) {
+  if (Number.isInteger(service.pastAttemptCount)) {
+    return service.pastAttemptCount;
+  }
+  return countStatuses(service, PAST_ATTEMPT_STATUSES);
+}
+
+export function getServiceOperationalState(service) {
+  const cleanupCount = countStatuses(service, CLEANUP_UNCERTAIN_STATUSES);
+  const unknownCount = countStatuses(service, UNKNOWN_REPLICA_STATUSES);
+  const rawStatus = service.status || 'UNKNOWN';
+  if (rawStatus === 'FAILED_CLEANUP' || cleanupCount > 0) {
+    const cleanupSubject =
+      cleanupCount > 0
+        ? `${cleanupCount} replica cleanup ${
+            cleanupCount === 1 ? 'record needs' : 'records need'
+          }`
+        : 'Service cleanup needs';
+    return {
+      label: 'Cleanup needs verification',
+      tone: 'warning',
+      detail: `${cleanupSubject} verification. Cloud resources may require manual cleanup.`,
+    };
+  }
+  if (unknownCount > 0) {
+    return {
+      label: 'Replica state needs verification',
+      tone: 'warning',
+      detail: `${unknownCount} replica ${
+        unknownCount === 1 ? 'has' : 'have'
+      } an unknown current state. Inspect replica and provider state.`,
+    };
+  }
+  if (['CONTROLLER_FAILED', 'FAILED'].includes(rawStatus)) {
+    return {
+      label: 'Needs attention',
+      tone: 'danger',
+      detail:
+        'The service controller is in a terminal failure state. Inspect the service logs and placement details.',
+    };
+  }
+  if (service.replicasReady == null) {
+    const enrichmentUnavailable = service.enrichmentUnavailable === true;
+    if (rawStatus === 'READY') {
+      return {
+        label: 'Serving',
+        tone: 'success',
+        detail: enrichmentUnavailable
+          ? 'The service is serving. Replica health is temporarily unavailable. Refresh to retry.'
+          : 'The service is serving. Target and replica health are still loading.',
+      };
+    }
+    return {
+      label: rawStatus === 'CONTROLLER_INIT' ? 'Starting' : rawStatus,
+      tone: 'neutral',
+      detail: enrichmentUnavailable
+        ? 'Replica health is temporarily unavailable. Refresh to retry.'
+        : 'Replica health is still loading.',
+    };
+  }
+  if (
+    service.targetReplicas != null &&
+    service.replicasReady >= service.targetReplicas
+  ) {
+    const pastAttemptCount = getPastAttemptCount(service);
+    return {
+      label: 'Healthy',
+      tone: 'success',
+      detail: `${service.replicasReady}/${service.targetReplicas} target replicas are ready.${
+        pastAttemptCount > 0
+          ? ` ${pastAttemptCount} past ${
+              pastAttemptCount === 1 ? 'attempt was' : 'attempts were'
+            } replaced automatically.`
+          : ''
+      } No action is required.`,
+    };
+  }
+  const activeRecoveryCount = countStatuses(service, ACTIVE_RECOVERY_STATUSES);
+  if (activeRecoveryCount > 0) {
+    return {
+      label: 'Scaling automatically',
+      tone: 'info',
+      detail: `${activeRecoveryCount} replica ${
+        activeRecoveryCount === 1 ? 'is' : 'are'
+      } pending, starting, or being replaced. No action is normally required.`,
+    };
+  }
+  if (rawStatus === 'READY') {
+    return {
+      label:
+        service.targetReplicas == null ? 'Serving' : 'Recovery not yet visible',
+      tone: service.targetReplicas == null ? 'success' : 'warning',
+      detail:
+        service.targetReplicas == null
+          ? 'The service is serving. No autoscaler target was included in this snapshot.'
+          : 'Ready capacity is below target, but this single snapshot does not prove recovery is stalled. Refresh or inspect placement if it persists.',
+    };
+  }
+  return {
+    label: rawStatus,
+    tone: 'neutral',
+    detail: 'The service is operating in this lifecycle state.',
+  };
+}
+
+export function ServiceHealthBadge({ service }) {
+  const health = getServiceOperationalState(service);
+  const toneClasses = {
+    success: 'bg-green-100 text-green-800',
+    info: 'bg-blue-100 text-blue-800',
+    warning: 'bg-amber-100 text-amber-900',
+    danger: 'bg-red-100 text-red-800',
+    neutral: 'bg-gray-100 text-gray-800',
+  };
+  return (
+    <Tooltip content={`${health.detail} SkyServe state: ${service.status}.`}>
+      <span
+        className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${toneClasses[health.tone]}`}
+      >
+        {health.label}
+      </span>
+    </Tooltip>
+  );
+}
+
+ServiceHealthBadge.propTypes = {
+  service: PropTypes.object.isRequired,
+};
+
+function mergeMetadataWithPrevious(metadataRows, previousRows) {
+  const previousByName = new Map(
+    (previousRows || []).map((service) => [service.name, service])
+  );
+  return (metadataRows || []).map((metadata) => {
+    const previous = previousByName.get(metadata.name);
+    if (
+      previous?.serviceHash &&
+      metadata.serviceHash &&
+      previous.serviceHash !== metadata.serviceHash
+    ) {
+      return metadata;
+    }
+    if (
+      !previous ||
+      (previous.metadataOnly && !previous.replicaSummaryLoaded)
+    ) {
+      return metadata;
+    }
+    return {
+      ...metadata,
+      ...previous,
+      name: metadata.name,
+      status: metadata.status,
+      uptime: metadata.uptime,
+      policy: metadata.policy,
+      loadBalancingPolicy: metadata.loadBalancingPolicy,
+      requestedResources: metadata.requestedResources,
+      activeVersions: metadata.activeVersions,
+      version: metadata.version,
+      electedVersion: metadata.electedVersion,
+      tlsEncrypted: metadata.tlsEncrypted,
+      metadataOnly: previous.controllerSummaryLoaded !== true,
+    };
+  });
+}
+
+function mergeServiceRows(baseRows, enrichedRows) {
+  const merged = new Map((baseRows || []).map((row) => [row.name, row]));
+  (enrichedRows || []).forEach((row) => {
+    const previous = merged.get(row.name);
+    const identityChanged =
+      previous?.serviceHash &&
+      row.serviceHash &&
+      previous.serviceHash !== row.serviceHash;
+    merged.set(row.name, {
+      ...(identityChanged ? {} : previous || {}),
+      ...row,
+      controllerSummaryLoaded: true,
+      enrichmentUnavailable: false,
+    });
+  });
+  return Array.from(merged.values());
+}
+
+function mergeReplicaSummaryRows(baseRows, summaries) {
+  const merged = new Map((baseRows || []).map((row) => [row.name, row]));
+  (summaries || []).forEach((summary) => {
+    const previous = merged.get(summary.name);
+    // A replica-only projection has no lifecycle status. Buffer it until an
+    // identity-bearing metadata/controller row exists so the UI never invents
+    // an UNKNOWN service state during an arrival-order race.
+    if (!previous) return;
+    if (
+      previous?.serviceHash &&
+      summary.serviceHash &&
+      previous.serviceHash !== summary.serviceHash
+    ) {
+      return;
+    }
+    const liveReplicaFields = previous?.controllerSummaryLoaded
+      ? {
+          replicaUnit: previous.replicaUnit,
+          replicaStatusCounts: previous.replicaStatusCounts,
+          replicasReady: previous.replicasReady,
+          replicasTotal: previous.replicasTotal,
+          replicasFailed: previous.replicasFailed,
+          physicalReplicasReady: previous.physicalReplicasReady,
+          physicalReplicasTotal: previous.physicalReplicasTotal,
+          physicalReplicasFailed: previous.physicalReplicasFailed,
+        }
+      : {};
+    merged.set(summary.name, {
+      ...(previous || {}),
+      ...summary,
+      ...liveReplicaFields,
+      name: summary.name,
+      serviceHash: previous?.serviceHash || summary.serviceHash,
+      metadataOnly: previous?.metadataOnly ?? true,
+      replicaSummaryLoaded: true,
+      replicaSummaryUnavailable: false,
+    });
+  });
+  return Array.from(merged.values());
+}
+
+function clearDirectReplicaSummary(rows) {
+  return (rows || []).map((row) => {
+    if (!row.replicaSummaryLoaded) return row;
+    const cleared = {
+      ...row,
+      replicaSummaryLoaded: false,
+      replicaSummaryUnavailable: false,
+    };
+    delete cleared.currentOrUncertainCount;
+    delete cleared.pastAttemptCount;
+    delete cleared.replicaCapacityCounts;
+    delete cleared.observedAt;
+    if (!row.controllerSummaryLoaded) {
+      Object.assign(cleared, {
+        replicaStatusCounts: null,
+        replicasReady: null,
+        replicasTotal: null,
+        replicasFailed: null,
+        physicalReplicasReady: null,
+        physicalReplicasTotal: null,
+        physicalReplicasFailed: null,
+      });
+    }
+    return cleared;
+  });
+}
+
+function LoadingValue({ label, unavailable = false }) {
+  return (
+    <span className="text-gray-400" aria-label={label}>
+      {unavailable ? 'Unavailable' : 'Loading...'}
+    </span>
+  );
+}
+
+LoadingValue.propTypes = {
+  label: PropTypes.string.isRequired,
+  unavailable: PropTypes.bool,
+};
 
 export function formatUptime(uptime) {
   // `uptime` is the epoch timestamp of when the service first became
@@ -102,6 +403,7 @@ export function Services() {
     // The cache is args-keyed; drop every getServices variant
     // (summary and full) so refresh always refetches.
     dashboardCache.invalidateFunction(getServices);
+    dashboardCache.invalidateFunction(getServiceReplicaSummaries);
     if (refreshDataRef.current) {
       refreshDataRef.current();
     }
@@ -173,6 +475,7 @@ export function ServicesTable({
   const [pageSize, setPageSize] = useState(10);
   const requestVersionRef = useRef(0);
   const activeRequestRef = useRef(null);
+  const replicaSummariesRef = useRef([]);
 
   const runFetch = useCallback(
     async (requestVersion) => {
@@ -180,49 +483,125 @@ export function ServicesTable({
         requestVersionRef.current === requestVersion;
 
       setLoading(true);
-      try {
-        // The list view only needs per-service aggregates: use the cheap
-        // summary query (the full one serializes every replica and takes
-        // tens of seconds at fleet scale).
-        const servicesResponse = await dashboardCache.get(getServices, [
-          { summaryOnly: true },
-        ]);
-        if (!isCurrentRequest()) {
-          return;
-        }
-        setData(servicesResponse.services || []);
-        setControllerStopped(servicesResponse.controllerStopped || false);
-        if (onFetched) {
-          onFetched(new Date());
-        }
-      } catch (error) {
-        if (!isCurrentRequest()) {
-          return;
-        }
-        console.error('Failed to fetch services:', error);
-        setData([]);
-      } finally {
-        if (isCurrentRequest()) {
-          setLoading(false);
+      // All projections are independent. Metadata paints identity, the direct
+      // persisted projection paints replica health, and the controller summary
+      // remains authoritative for live targets, request pressure, and endpoints.
+      const metadataPromise = dashboardCache
+        .get(getServices, SERVICE_METADATA_ARGS)
+        .then((metadataResponse) => {
+          if (!isCurrentRequest()) return;
+          setData((previous) => {
+            const metadataRows = mergeMetadataWithPrevious(
+              metadataResponse.services || [],
+              previous
+            );
+            return mergeReplicaSummaryRows(
+              metadataRows,
+              replicaSummariesRef.current
+            );
+          });
+          setControllerStopped(metadataResponse.controllerStopped || false);
           setIsInitialLoad(false);
-        }
+        });
+      const summaryPromise = dashboardCache
+        .get(getServices, SERVICE_SUMMARY_ARGS)
+        .then((servicesResponse) => {
+          if (!isCurrentRequest()) return;
+          setData((previous) => {
+            const liveRows = mergeServiceRows(
+              previous,
+              servicesResponse.services || []
+            );
+            return mergeReplicaSummaryRows(
+              liveRows,
+              replicaSummariesRef.current
+            );
+          });
+          setControllerStopped(servicesResponse.controllerStopped || false);
+          setIsInitialLoad(false);
+          if (onFetched) {
+            onFetched(new Date());
+          }
+        });
+      const replicaSummaryPromise = dashboardCache
+        .get(getServiceReplicaSummaries, SERVICE_REPLICA_SUMMARY_ARGS)
+        .then((response) => {
+          if (!isCurrentRequest()) return;
+          if (response.legacyFallback) {
+            replicaSummariesRef.current = [];
+            setData(clearDirectReplicaSummary);
+            return;
+          }
+          replicaSummariesRef.current = response.summaries || [];
+          setData((previous) =>
+            mergeReplicaSummaryRows(previous, response.summaries || [])
+          );
+        });
+
+      const [metadataResult, summaryResult, replicaSummaryResult] =
+        await Promise.allSettled([
+          metadataPromise,
+          summaryPromise,
+          replicaSummaryPromise,
+        ]);
+      if (!isCurrentRequest()) return;
+      if (metadataResult.status === 'rejected') {
+        console.error(
+          'Failed to fetch service metadata:',
+          metadataResult.reason
+        );
       }
+      if (summaryResult.status === 'rejected') {
+        console.error(
+          'Failed to fetch service summaries:',
+          summaryResult.reason
+        );
+        setData((previous) =>
+          previous.map((service) =>
+            service.metadataOnly
+              ? { ...service, enrichmentUnavailable: true }
+              : service
+          )
+        );
+      }
+      if (replicaSummaryResult.status === 'rejected') {
+        console.error(
+          'Failed to fetch persisted replica summaries:',
+          replicaSummaryResult.reason
+        );
+        setData((previous) =>
+          previous.map((service) => ({
+            ...service,
+            replicaSummaryUnavailable: true,
+          }))
+        );
+      }
+      setLoading(false);
+      setIsInitialLoad(false);
     },
     [setLoading, onFetched]
   );
 
   const fetchData = useCallback(
-    ({ supersede = false } = {}) => {
-      if (activeRequestRef.current !== null && !supersede) {
-        return activeRequestRef.current;
+    ({ kind = 'automatic' } = {}) => {
+      const activeRequest = activeRequestRef.current;
+      if (activeRequest !== null) {
+        const shouldReuse =
+          kind === 'automatic' ||
+          activeRequest.kind === kind ||
+          (kind === 'visibility' && activeRequest.kind === 'manual');
+        if (shouldReuse) {
+          return activeRequest.promise;
+        }
       }
 
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
       const request = runFetch(requestVersion);
-      activeRequestRef.current = request;
+      const owner = { kind, promise: request };
+      activeRequestRef.current = owner;
       return request.finally(() => {
-        if (activeRequestRef.current === request) {
+        if (activeRequestRef.current === owner) {
           activeRequestRef.current = null;
         }
       });
@@ -237,7 +616,7 @@ export function ServicesTable({
   // Expose fetchData to parent component
   useEffect(() => {
     if (refreshDataRef) {
-      const refresh = () => fetchData({ supersede: true });
+      const refresh = () => fetchData({ kind: 'manual' });
       refreshDataRef.current = refresh;
       return () => {
         if (refreshDataRef.current === refresh) {
@@ -248,24 +627,40 @@ export function ServicesTable({
     return undefined;
   }, [refreshDataRef, fetchData]);
 
-  useEffect(() => {
-    let isCurrent = true;
-
-    fetchData();
-
-    const interval = setInterval(() => {
-      if (isCurrent && window.document.visibilityState === 'visible') {
-        fetchData();
+  const refreshWhenVisible = useCallback(
+    (source) => {
+      if (source === 'visibilitychange') {
+        const activeKind = activeRequestRef.current?.kind;
+        if (activeKind === 'manual' || activeKind === 'visibility') {
+          return;
+        }
+        dashboardCache.invalidate(getServices, SERVICE_SUMMARY_ARGS);
+        dashboardCache.invalidate(getServices, SERVICE_METADATA_ARGS);
+        dashboardCache.invalidate(
+          getServiceReplicaSummaries,
+          SERVICE_REPLICA_SUMMARY_ARGS
+        );
+        void fetchData({ kind: 'visibility' });
+        return;
       }
-    }, refreshInterval);
+      void fetchData();
+    },
+    [fetchData]
+  );
 
+  useVisibleRefreshInterval(
+    Boolean(refreshInterval),
+    refreshInterval,
+    refreshWhenVisible
+  );
+
+  useEffect(() => {
+    void fetchData();
     return () => {
-      isCurrent = false;
       requestVersionRef.current += 1;
       activeRequestRef.current = null;
-      clearInterval(interval);
     };
-  }, [refreshInterval, fetchData]);
+  }, [fetchData]);
 
   // Reset to first page when data changes
   useEffect(() => {
@@ -359,23 +754,67 @@ export function ServicesTable({
                       </Link>
                     </TableCell>
                     <TableCell>
-                      <StatusBadge status={service.status} />
+                      <ServiceHealthBadge service={service} />
                     </TableCell>
                     <TableCell>
-                      {service.replicasReady}/{service.replicasTotal}
-                      {service.replicasFailed > 0 && (
-                        <span className="text-red-700">
-                          {' '}
-                          (+{service.replicasFailed} failed)
-                        </span>
+                      {service.replicasReady == null ? (
+                        <LoadingValue
+                          label="Replica summary"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        <>
+                          {service.replicasReady}/{service.replicasTotal}
+                          {getPastAttemptCount(service) > 0 && (
+                            <Tooltip content="Past attempts are retained autoscaling and provisioning history. SkyServe replaced them automatically, so no action is required while the serving target remains met.">
+                              <span className="ml-1 text-gray-500">
+                                {getPastAttemptCount(service)} past attempts
+                              </span>
+                            </Tooltip>
+                          )}
+                        </>
                       )}
                     </TableCell>
                     <TableCell>
-                      <EndpointCell endpoint={service.endpoint} />
+                      {service.metadataOnly ? (
+                        <LoadingValue
+                          label="Endpoint"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        <EndpointCell endpoint={service.endpoint} />
+                      )}
                     </TableCell>
-                    <TableCell>{formatUptime(service.uptime)}</TableCell>
-                    <TableCell>{service.policy || '-'}</TableCell>
-                    <TableCell>{service.requestedResources || '-'}</TableCell>
+                    <TableCell>
+                      {service.metadataOnly && service.uptime == null ? (
+                        <LoadingValue
+                          label="Uptime"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        formatUptime(service.uptime)
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {service.metadataOnly && !service.policy ? (
+                        <LoadingValue
+                          label="Policy"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        service.policy || '-'
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {service.metadataOnly && !service.requestedResources ? (
+                        <LoadingValue
+                          label="Resources"
+                          unavailable={service.enrichmentUnavailable}
+                        />
+                      ) : (
+                        service.requestedResources || '-'
+                      )}
+                    </TableCell>
                   </TableRow>
                 ))
               ) : (

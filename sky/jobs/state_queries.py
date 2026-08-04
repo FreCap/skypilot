@@ -66,6 +66,8 @@ def _get_jobs_dict(r: 'row.RowMapping') -> dict[str, Any]:
         'schedule_state': r.get('schedule_state'),
         'controller_pid': r.get('controller_pid'),
         'controller_pid_started_at': r.get('controller_pid_started_at'),
+        'controller_instance_id': r.get('controller_instance_id'),
+        'controller_generation': r.get('controller_generation'),
         # the _path columns are for backwards compatibility, use the _content
         # columns instead
         'dag_yaml_path': r.get('dag_yaml_path'),

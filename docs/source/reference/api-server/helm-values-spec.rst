@@ -157,6 +157,7 @@ Below is the available helm value keys and the default value of each key:
 
   :ref:`rbac <helm-values-rbac>`:
     :ref:`create <helm-values-rbac-create>`: true
+    :ref:`bindExistingServiceAccount <helm-values-rbac-bindExistingServiceAccount>`: false
     :ref:`serviceAccountName <helm-values-rbac-serviceAccountName>`: ""
     :ref:`namespaceRules <helm-values-rbac-namespaceRules>`:
       - apiGroups: [ "" ]
@@ -445,7 +446,12 @@ Default: ``"Recreate"``
 ``apiService.replicas``
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-Number of replicas to deploy for the API server. Replicas > 1 is not well tested and requires a PVC that supports ReadWriteMany.
+Number of API replicas. In compatibility mode
+(``apiService.highAvailability.enabled=false``), deployments with more than one
+replica remain experimental and require a PVC that supports ReadWriteMany.
+Guarded high availability requires at least two stateless API replicas and
+enforces PostgreSQL, RollingUpdate, ReadWriteMany storage, and separate executor
+and controller replicas. See :ref:`api-server-ha`.
 
 Default: ``1``
 
@@ -749,7 +755,10 @@ Default: see the yaml below.
 ``apiService.metrics.enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Enable (exposing API metrics)[Link to docs/source/reference/api-server/examples/api-server-metrics-setup.rst] from the API server. If this is enabled and the API server image does not support metrics, the deployment will fail.
+Enable metrics collection for the API server. In guarded HA mode, API,
+executor, and controller pods expose independent role-local multiprocess
+registries and scrape targets. If the API server image does not support
+metrics, the deployment will fail.
 
 Default: ``false``
 
@@ -764,7 +773,9 @@ Default: ``false``
 ``apiService.metrics.port``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The port to expose the metrics on.
+The port to expose metrics on in every API-server role pod. The bundled
+Prometheus federation jobs select the API Service's named metrics port, so this
+setting also applies to ``/gpu-metrics`` and ``/endpoints-metrics`` collection.
 
 Default: ``9090``
 
@@ -1261,7 +1272,8 @@ Default: ``'sub'``
 
 Enable persistent storage for the API server, setting this to ``false`` is prone to data loss and should only be used for testing.
 
-When enabled, SkyPilot creates a PersistentVolumeClaim (PVC) to persist:
+When enabled, SkyPilot creates a PersistentVolumeClaim (PVC), or mounts the
+claim selected by ``storage.existingClaim``, to persist:
 
 - **Managed job logs**: Accessible via ``sky jobs logs <job_id>`` and ``sky jobs logs --controller <job_id>``
 - **File mounts**: Local files uploaded during managed job submission
@@ -1280,6 +1292,37 @@ Default: ``true``
 
   storage:
     enabled: true
+
+.. _helm-values-storage-existingClaim:
+
+``storage.existingClaim``
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Name of a PersistentVolumeClaim that already exists in the release namespace.
+When set, the chart mounts this claim and does not create or manage the default
+``<release>-state`` claim. Create and populate the claim before upgrading so a
+pod can never start against an empty volume.
+
+``storage.storageClassName``, ``storage.size``, ``storage.selector``,
+``storage.volumeName``, and ``storage.annotations`` configure only a claim that
+the chart creates; they do not mutate the external claim. Inspect and qualify
+that claim independently.
+
+This setting also supports a safe storage migration: first retain the legacy
+release-owned claim, provision and verify the replacement claim independently,
+copy the state while all legacy writers are stopped, and only then select the
+replacement. ``storage.accessMode`` remains the declared storage capability and
+must be ``ReadWriteMany`` when guarded HA is enabled; Helm cannot inspect an
+existing claim at render time.
+
+Default: ``""``
+
+.. code-block:: yaml
+
+  storage:
+    enabled: true
+    existingClaim: skypilot-state-rwx
+    accessMode: ReadWriteMany
 
 .. _helm-values-storage-storageClassName:
 
@@ -1805,7 +1848,9 @@ Default: see the yaml below.
 ``rbac.create``
 ^^^^^^^^^^^^^^^
 
-Whether to create the service account and RBAC policies for the API server. If false, an external service account is expected.
+Whether to create the service account and RBAC policies for the API server. If
+false, either all permissions must be managed externally or
+``rbac.bindExistingServiceAccount`` must be enabled.
 
 Default: ``true``
 
@@ -1813,6 +1858,25 @@ Default: ``true``
 
   rbac:
     create: true
+
+.. _helm-values-rbac-bindExistingServiceAccount:
+
+``rbac.bindExistingServiceAccount``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Whether to create chart-managed RBAC policies for the external API server
+service account named by ``rbac.serviceAccountName``. The service account must
+already exist in the Helm release namespace and must not be owned by the
+current Helm release. This is mutually exclusive with ``rbac.create`` and does
+not transfer ownership of a chart-created service account.
+
+Default: ``false``
+
+.. code-block:: yaml
+
+  rbac:
+    create: false
+    bindExistingServiceAccount: false
 
 .. _helm-values-rbac-serviceAccountName:
 

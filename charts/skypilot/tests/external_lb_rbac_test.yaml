@@ -12,39 +12,39 @@ tests:
       kubernetesCredentials.inclusterNamespace: workload-namespace
     asserts:
       - hasDocuments:
-          count: 8
+          count: 10
       - isKind:
           of: Role
-        documentIndex: 6
+        documentIndex: 8
       - equal:
           path: metadata.name
           value: test-release-serve-lb-role
-        documentIndex: 6
+        documentIndex: 8
       - equal:
           path: metadata.namespace
           value: test-namespace
-        documentIndex: 6
+        documentIndex: 8
       - contains:
           path: rules
           content:
             apiGroups: ["apps"]
             resources: ["deployments"]
             verbs: ["create", "get", "list", "patch", "delete"]
-        documentIndex: 6
+        documentIndex: 8
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["pods/log"]
             verbs: ["get"]
-        documentIndex: 6
+        documentIndex: 8
       - isKind:
           of: RoleBinding
-        documentIndex: 7
+        documentIndex: 9
       - equal:
           path: roleRef.name
           value: test-release-serve-lb-role
-        documentIndex: 7
+        documentIndex: 9
 
   - it: should isolate LB permissions from reused same-namespace defaults
     release:
@@ -58,22 +58,22 @@ tests:
           verbs: ["get", "list"]
     asserts:
       - hasDocuments:
-          count: 7
+          count: 9
       - equal:
           path: metadata.name
           value: test-release-serve-lb-role
-        documentIndex: 5
+        documentIndex: 7
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["pods/log"]
             verbs: ["get"]
-        documentIndex: 5
+        documentIndex: 7
       - equal:
           path: roleRef.name
           value: test-release-serve-lb-role
-        documentIndex: 6
+        documentIndex: 8
 
   - it: should retain split-namespace cleanup permission when external LB is disabled
     release:
@@ -84,12 +84,12 @@ tests:
       kubernetesCredentials.inclusterNamespace: workload-namespace
     asserts:
       - hasDocuments:
-          count: 8
+          count: 10
       - equal:
           path: metadata.name
           value: test-release-serve-lb-role
-        documentIndex: 6
+        documentIndex: 8
       - equal:
           path: metadata.namespace
           value: test-namespace
-        documentIndex: 6
+        documentIndex: 8

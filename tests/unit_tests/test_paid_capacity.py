@@ -1,5 +1,6 @@
 """Tests for centralized SkyServe paid-capacity policy."""
 # pylint: disable=protected-access
+import json
 from unittest import mock
 
 import pytest
@@ -15,10 +16,14 @@ from sky.utils import common_utils
 @pytest.fixture(autouse=True)
 def _clear_paid_capacity_config_cache():
     paid_capacity._parse_positive_int.cache_clear()
+    paid_capacity._parse_service_limit_profiles.cache_clear()
+    paid_capacity._warn_service_max_below_floor.cache_clear()
     paid_capacity._admission_summary_log_signature = None
     paid_capacity._admission_summary_logged_at = 0
     yield
     paid_capacity._parse_positive_int.cache_clear()
+    paid_capacity._parse_service_limit_profiles.cache_clear()
+    paid_capacity._warn_service_max_below_floor.cache_clear()
     paid_capacity._admission_summary_log_signature = None
     paid_capacity._admission_summary_logged_at = 0
 
@@ -31,6 +36,44 @@ def _pending_info(replica_id, location):
                                         location=location,
                                         version=1,
                                         resources_override=location.to_dict())
+
+
+def _exploration_budget(locations,
+                        *,
+                        owned_locations,
+                        remaining,
+                        claimed_at=900,
+                        max_frontier=3,
+                        delay=30,
+                        service_remaining=16):
+    pool_keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    owned_keys = {pool_keys[location] for location in owned_locations}
+    if isinstance(claimed_at, dict):
+        newest = {
+            pool_keys[location]: timestamp
+            for location, timestamp in claimed_at.items()
+        }
+    else:
+        newest = {key: claimed_at for key in owned_keys}
+    return paid_capacity.LaunchBudget(
+        remaining_by_location=dict(zip(locations, remaining)),
+        pool_key_by_location=pool_keys,
+        states_by_pool_key={},
+        globally_managed=True,
+        service_remaining=service_remaining,
+        frontier_limit=2,
+        max_frontier_limit=max_frontier,
+        frontier_feedback_delay_seconds=delay,
+        frontier_key_by_location={location: ('l4',) for location in locations},
+        failure_domain_by_location={
+            location: paid_capacity.failure_domain(location)
+            for location in locations
+        },
+        owned_pool_keys_by_frontier={('l4',): owned_keys},
+        newest_claimed_at_by_pool_key=newest)
 
 
 def test_pool_key_distinguishes_every_provider_capacity_dimension():
@@ -76,6 +119,44 @@ def test_frontier_key_groups_card_model_across_counts_and_instance_types():
     assert paid_capacity.frontier_key_from_pool_key(wide_pool) == ('l4',)
 
 
+@pytest.mark.parametrize('mutation', [
+    lambda payload: payload.pop('workspace'),
+    lambda payload: payload.update(accelerators=[['l4', 'bogus']]),
+    lambda payload: payload.update(accelerators=[['l4', 1], ['l4', 2]]),
+    lambda payload: payload.update(accelerators=[['', 1]]),
+    lambda payload: payload.update(use_spot=1),
+])
+def test_malformed_pool_identity_fails_closed_for_frontier(mutation):
+    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    payload = json.loads(
+        paid_capacity.pool_key(location, workspace='w', num_nodes=1))
+    mutation(payload)
+    malformed = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+    assert paid_capacity.frontier_key_from_pool_key(malformed) is None
+    assert paid_capacity.failure_domain_from_pool_key(malformed) is None
+
+
+def test_failure_domain_uses_provider_and_region_only():
+    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    location.zone = 'us-east-1a'
+    location.instance_type = 'g6.xlarge'
+    key = paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+
+    assert paid_capacity.failure_domain(location) == ('aws', 'us-east-1')
+    assert paid_capacity.failure_domain_from_pool_key(key) == ('aws',
+                                                               'us-east-1')
+    assert paid_capacity.failure_domain_from_pool_key('opaque') is None
+    payload = json.loads(key)
+    payload['region'] = None
+    assert paid_capacity.failure_domain_from_pool_key(
+        json.dumps(payload)) is None
+    payload = json.loads(key)
+    payload['accelerators'] = 'malformed'
+    assert paid_capacity.failure_domain_from_pool_key(
+        json.dumps(payload)) is None
+
+
 def test_default_limits_and_invalid_failure_cooldown(monkeypatch):
     monkeypatch.delenv(paid_capacity._BASE_LIMIT_ENV_VAR, raising=False)
     monkeypatch.delenv(paid_capacity._MAX_LIMIT_ENV_VAR, raising=False)
@@ -94,6 +175,103 @@ def test_default_limits_and_invalid_failure_cooldown(monkeypatch):
     assert paid_capacity.failure_cooldown_seconds() == 600
 
 
+def test_adaptive_service_limit_profiles_are_exact_and_fail_closed(monkeypatch):
+    monkeypatch.delenv(paid_capacity._SERVICE_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.delenv(paid_capacity._SERVICE_MAX_LIMIT_ENV_VAR, raising=False)
+    monkeypatch.delenv(paid_capacity._SERVICE_LIMIT_PROFILES_ENV_VAR,
+                       raising=False)
+    monkeypatch.setenv(paid_capacity._MAX_EXPLORATION_FRONTIER_ENV_VAR, '2')
+    assert paid_capacity.max_service_limit(workspace='w',
+                                           service_name='svc',
+                                           service_hash='hash') == 16
+
+    monkeypatch.setenv(paid_capacity._SERVICE_MAX_LIMIT_ENV_VAR, '20')
+    profile_document = {
+        'version': 1,
+        'profiles': [{
+            'workspace': 'w',
+            'service_name': 'svc',
+            'service_hash': 'hash',
+            'max_launch_window': 24,
+            'max_exploration_frontier': 3,
+        }],
+    }
+    monkeypatch.setenv(paid_capacity._SERVICE_LIMIT_PROFILES_ENV_VAR,
+                       json.dumps(profile_document))
+    assert paid_capacity.max_service_limit(workspace='w',
+                                           service_name='svc',
+                                           service_hash='hash') == 24
+    assert paid_capacity.max_service_limit(workspace='w',
+                                           service_name='svc',
+                                           service_hash='replacement') == 20
+    assert paid_capacity.max_service_exploration_frontier(
+        workspace='w', service_name='svc', service_hash='hash') == 3
+    assert paid_capacity.max_service_exploration_frontier(
+        workspace='w', service_name='svc', service_hash='replacement') == 2
+
+    monkeypatch.setenv(paid_capacity._SERVICE_LIMIT_PROFILES_ENV_VAR,
+                       '{not-json')
+    assert paid_capacity.max_service_limit(workspace='w',
+                                           service_name='svc',
+                                           service_hash='hash') == 20
+
+    monkeypatch.setenv(paid_capacity._SERVICE_LIMIT_ENV_VAR, '32')
+    monkeypatch.setenv(paid_capacity._SERVICE_MAX_LIMIT_ENV_VAR, '24')
+    with mock.patch.object(paid_capacity.logger, 'warning') as warning:
+        assert paid_capacity.max_service_limit(workspace='w',
+                                               service_name='svc',
+                                               service_hash='replacement') == 32
+        assert paid_capacity.max_service_limit(workspace='w',
+                                               service_name='svc',
+                                               service_hash='replacement') == 32
+    warning.assert_called_once()
+
+
+def test_opaque_and_missing_owned_pools_consume_productive_frontier():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    locations = [first, second]
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    states = {
+        keys[first]: {
+            'admission_state': 'active',
+            'admission_limit': 16,
+            'last_success_at': 100,
+        },
+        keys[second]: {
+            'admission_state': 'active',
+            'admission_limit': 16,
+            'last_success_at': 100,
+        },
+        'opaque-active-pool': {
+            'admission_state': 'active',
+            'admission_limit': 64,
+            'last_success_at': 100,
+        },
+    }
+    frontiers = {
+        location: paid_capacity.frontier_key(location) for location in locations
+    }
+
+    # One opaque owned claim and one known-but-no-longer-catalogued owned pool
+    # consume the two-pool frontier. Neither can provide current eligible-pool
+    # evidence, and the opaque pool must not contribute merely because a stale
+    # state row happens to exist for its key.
+    assert paid_capacity._evidence_aware_service_limit(
+        paid_locations=locations,
+        states_by_pool_key=states,
+        pool_key_by_location=keys,
+        frontier_key_by_location=frontiers,
+        owned_pool_keys_by_frontier={('l4',): {'missing-owned-pool'}},
+        unknown_owned_pool_keys={'opaque-active-pool'},
+        requested_frontier_keys={('l4',)},
+        floor=16,
+        ceiling=24) == 16
+
+
 def test_exploration_frontier_default_override_and_invalid_fallback(
         monkeypatch):
     monkeypatch.delenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR,
@@ -108,6 +286,34 @@ def test_exploration_frontier_default_override_and_invalid_fallback(
 
     monkeypatch.setenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR, 'invalid')
     assert paid_capacity.exploration_frontier() == 2
+
+
+def test_delayed_exploration_defaults_overrides_and_clamps(monkeypatch):
+    monkeypatch.delenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR,
+                       raising=False)
+    monkeypatch.delenv(paid_capacity._MAX_EXPLORATION_FRONTIER_ENV_VAR,
+                       raising=False)
+    monkeypatch.delenv(
+        paid_capacity._EXPLORATION_FEEDBACK_DELAY_SECONDS_ENV_VAR,
+        raising=False)
+    assert paid_capacity.max_exploration_frontier() == 3
+    assert paid_capacity.exploration_feedback_delay_seconds() == 30
+
+    monkeypatch.setenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR, '4')
+    monkeypatch.setenv(paid_capacity._MAX_EXPLORATION_FRONTIER_ENV_VAR, '2')
+    monkeypatch.setenv(
+        paid_capacity._EXPLORATION_FEEDBACK_DELAY_SECONDS_ENV_VAR, '45')
+    paid_capacity._parse_positive_int.cache_clear()
+    assert paid_capacity.max_exploration_frontier() == 4
+    assert paid_capacity.exploration_feedback_delay_seconds() == 45
+
+    monkeypatch.setenv(paid_capacity._EXPLORATION_FRONTIER_ENV_VAR, '2')
+    monkeypatch.setenv(paid_capacity._MAX_EXPLORATION_FRONTIER_ENV_VAR, '0')
+    monkeypatch.setenv(
+        paid_capacity._EXPLORATION_FEEDBACK_DELAY_SECONDS_ENV_VAR, 'invalid')
+    paid_capacity._parse_positive_int.cache_clear()
+    assert paid_capacity.max_exploration_frontier() == 3
+    assert paid_capacity.exploration_feedback_delay_seconds() == 30
 
 
 def test_default_adaptive_limit_ramps_four_to_480():
@@ -354,6 +560,11 @@ def test_admission_snapshot_distinguishes_open_and_cooldown():
         'pool_remaining': 2,
         'service_remaining': 12,
         'cooldown_until': None,
+        'frontier_limit': None,
+        'frontier_max_limit': None,
+        'frontier_owned': False,
+        'frontier_owned_pool_count': 0,
+        'youngest_unresolved_claim_age_seconds': None,
     }
     assert snapshot[cooldown_location]['state'] == 'cooldown'
     assert snapshot[cooldown_location]['cooldown_until'] == 1234.0
@@ -391,8 +602,312 @@ def test_global_snapshot_uses_shared_headroom_by_exact_pool():
 
     assert budget.remaining_by_location == {cheap: 7, expensive: 3}
     assert budget.service_remaining == 16
+    assert budget.service_claim_limit == 16
+    assert budget.frontier_limit == 2
+    assert budget.max_frontier_limit == 3
+    assert budget.frontier_feedback_delay_seconds == 30
+    assert budget.failure_domain_by_location == {
+        cheap: ('aws', 'us-east-1'),
+        expensive: ('aws', 'us-west-2'),
+    }
     assert zero not in budget.pool_key_by_location
     get_states.assert_called_once()
+
+
+def test_global_budget_uses_exact_profile_and_durable_pool_evidence(
+        monkeypatch):
+    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    placer = make_placer({location: 1.0})
+    key = paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+    monkeypatch.setenv(paid_capacity._MAX_EXPLORATION_FRONTIER_ENV_VAR, '2')
+    monkeypatch.setenv(
+        paid_capacity._SERVICE_LIMIT_PROFILES_ENV_VAR,
+        json.dumps({
+            'version': 1,
+            'profiles': [{
+                'workspace': 'w',
+                'service_name': 'svc',
+                'service_hash': 'hash',
+                'max_launch_window': 24,
+                'max_exploration_frontier': 3,
+            }],
+        }))
+    states = {
+        key: {
+            'remaining': 24,
+            'admission_state': 'active',
+            'admission_limit': 32,
+            'last_success_at': 100,
+        }
+    }
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value=states):
+        budget = paid_capacity.build_launch_budget(placer,
+                                                   workspace='w',
+                                                   service_name='svc',
+                                                   service_hash='hash',
+                                                   existing_replica_infos=[],
+                                                   globally_managed=True,
+                                                   requested_frontier_keys={
+                                                       ('l4',)
+                                                   })
+        replacement_budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            service_name='svc',
+            service_hash='replacement',
+            existing_replica_infos=[],
+            globally_managed=True,
+            requested_frontier_keys={('l4',)})
+
+    assert budget.service_claim_limit == 24
+    assert budget.service_remaining == 24
+    assert budget.max_frontier_limit == 3
+    assert replacement_budget.service_claim_limit == 16
+    assert replacement_budget.service_remaining == 16
+    assert replacement_budget.max_frontier_limit == 2
+
+
+def test_productive_frontier_uses_placer_cost_order_not_catalog_order(
+        monkeypatch):
+    expensive = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+    middle = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    cheap = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    # Insertion order is deliberately the reverse of placement cost.
+    placer = make_placer({expensive: 3.0, middle: 2.0, cheap: 1.0})
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in (expensive, middle, cheap)
+    }
+    monkeypatch.setenv(
+        paid_capacity._SERVICE_LIMIT_PROFILES_ENV_VAR,
+        json.dumps({
+            'version': 1,
+            'profiles': [{
+                'workspace': 'w',
+                'service_name': 'svc',
+                'service_hash': 'hash',
+                'max_launch_window': 24,
+            }],
+        }))
+    states = {
+        key: {
+            'remaining': 32,
+            'admission_state': 'active',
+            'admission_limit': 32,
+            # Only the expensive pool has positive evidence. It is outside the
+            # cheapest two-pool frontier and therefore cannot widen service
+            # admission.
+            'last_success_at': 100 if location is expensive else None,
+        } for location, key in keys.items()
+    }
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value=states):
+        budget = paid_capacity.build_launch_budget(placer,
+                                                   workspace='w',
+                                                   service_name='svc',
+                                                   service_hash='hash',
+                                                   existing_replica_infos=[],
+                                                   globally_managed=True,
+                                                   requested_frontier_keys={
+                                                       ('l4',)
+                                                   })
+
+    assert placer.ranked_active_locations() == [cheap, middle, expensive]
+    assert budget.service_claim_limit == 16
+
+
+@pytest.mark.parametrize('admission_state', ['cooldown', 'probe'])
+def test_cooldown_and_probe_pools_do_not_widen_service_limit(admission_state):
+    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    key = paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+
+    assert paid_capacity._evidence_aware_service_limit(
+        paid_locations=[location],
+        states_by_pool_key={
+            key: {
+                'admission_state': admission_state,
+                'admission_limit': 16,
+                'last_success_at': 100,
+            }
+        },
+        pool_key_by_location={location: key},
+        frontier_key_by_location={location: ('l4',)},
+        owned_pool_keys_by_frontier={},
+        unknown_owned_pool_keys=set(),
+        requested_frontier_keys={('l4',)},
+        floor=4,
+        ceiling=24) == 4
+
+
+def test_duplicate_pool_alias_counts_once_and_productive_sum_is_capped():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    alias = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    alias.image_id = {'us-east-1': 'ami-alias'}
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    first_key = paid_capacity.pool_key(first, workspace='w', num_nodes=1)
+    assert paid_capacity.pool_key(alias, workspace='w',
+                                  num_nodes=1) == first_key
+    second_key = paid_capacity.pool_key(second, workspace='w', num_nodes=1)
+    locations = [first, alias, second]
+
+    limit = paid_capacity._evidence_aware_service_limit(
+        paid_locations=locations,
+        states_by_pool_key={
+            first_key: {
+                'admission_state': 'active',
+                'admission_limit': 16,
+                'last_success_at': 100,
+            },
+            second_key: {
+                'admission_state': 'active',
+                'admission_limit': 16,
+                'last_success_at': 100,
+            },
+        },
+        pool_key_by_location={
+            first: first_key,
+            alias: first_key,
+            second: second_key,
+        },
+        frontier_key_by_location={location: ('l4',) for location in locations},
+        owned_pool_keys_by_frontier={},
+        unknown_owned_pool_keys=set(),
+        requested_frontier_keys={('l4',)},
+        floor=4,
+        ceiling=24)
+
+    assert limit == 24
+
+
+def test_dynamic_service_overage_is_preserved_and_blocks_new_claims(
+        monkeypatch):
+    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    placer = make_placer({location: 1.0})
+    key = paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+    infos = [_pending_info(replica_id, location) for replica_id in range(25)]
+    for info in infos:
+        info.paid_capacity_pool_key = key
+    monkeypatch.setenv(
+        paid_capacity._SERVICE_LIMIT_PROFILES_ENV_VAR,
+        json.dumps({
+            'version': 1,
+            'profiles': [{
+                'workspace': 'w',
+                'service_name': 'svc',
+                'service_hash': 'hash',
+                'max_launch_window': 24,
+            }],
+        }))
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value={
+                                   key: {
+                                       'remaining': 7,
+                                       'admission_state': 'active',
+                                       'admission_limit': 32,
+                                       'last_success_at': 100,
+                                   }
+                               }):
+        budget = paid_capacity.build_launch_budget(placer,
+                                                   workspace='w',
+                                                   service_name='svc',
+                                                   service_hash='hash',
+                                                   existing_replica_infos=infos,
+                                                   globally_managed=True,
+                                                   requested_frontier_keys={
+                                                       ('l4',)
+                                                   })
+
+    assert len(infos) == 25
+    assert budget.service_claim_limit == 24
+    assert budget.service_remaining == 0
+
+
+def test_productive_frontier_widens_only_requested_bounded_card():
+    l4_first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    l4_second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    l4_outside_frontier = make_location('eu-west-1', {'L4': 1},
+                                        cloud_name='AWS')
+    a100 = make_location('us-central1', {'A100': 1}, cloud_name='GCP')
+    locations = [l4_first, l4_second, l4_outside_frontier, a100]
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    frontiers = {
+        location: paid_capacity.frontier_key(location) for location in locations
+    }
+    states = {
+        keys[l4_first]: {
+            'admission_state': 'active',
+            'admission_limit': 16,
+            'last_success_at': 100,
+        },
+        keys[l4_second]: {
+            'admission_state': 'active',
+            'admission_limit': 8,
+            'last_success_at': 100,
+        },
+        keys[l4_outside_frontier]: {
+            'admission_state': 'active',
+            'admission_limit': 64,
+            'last_success_at': 100,
+        },
+        keys[a100]: {
+            'admission_state': 'active',
+            'admission_limit': 64,
+            'last_success_at': 100,
+        },
+    }
+
+    assert paid_capacity._evidence_aware_service_limit(
+        paid_locations=locations,
+        states_by_pool_key=states,
+        pool_key_by_location=keys,
+        frontier_key_by_location=frontiers,
+        owned_pool_keys_by_frontier={},
+        unknown_owned_pool_keys=set(),
+        requested_frontier_keys={('l4',)},
+        floor=16,
+        ceiling=24) == 24
+
+    states[keys[l4_first]]['last_success_at'] = None
+    assert paid_capacity._evidence_aware_service_limit(
+        paid_locations=locations,
+        states_by_pool_key=states,
+        pool_key_by_location=keys,
+        frontier_key_by_location=frontiers,
+        owned_pool_keys_by_frontier={},
+        unknown_owned_pool_keys=set(),
+        requested_frontier_keys={('l4',)},
+        floor=16,
+        ceiling=24) == 16
+
+    assert paid_capacity._evidence_aware_service_limit(
+        paid_locations=locations,
+        states_by_pool_key=states,
+        pool_key_by_location=keys,
+        frontier_key_by_location=frontiers,
+        owned_pool_keys_by_frontier={},
+        unknown_owned_pool_keys=set(),
+        requested_frontier_keys={('a100',)},
+        floor=16,
+        ceiling=24) == 24
 
 
 def test_global_budget_caps_paid_selection_across_exact_pools(monkeypatch):
@@ -427,7 +942,12 @@ def test_global_budget_caps_paid_selection_across_exact_pools(monkeypatch):
     assert paid_capacity.select_location(placer, budget) is None
 
 
-def test_global_snapshot_counts_catalog_hidden_and_unknown_owned_pools():
+@pytest.mark.parametrize(
+    'unknown_age',
+    [None, float('nan'),
+     float('inf'), float('-inf'), -1, True])
+def test_global_snapshot_counts_catalog_hidden_and_unknown_owned_pools(
+        unknown_age):
     first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
     third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
@@ -441,6 +961,10 @@ def test_global_snapshot_counts_catalog_hidden_and_unknown_owned_pools():
     hidden_info.paid_capacity_pool_key = paid_capacity.pool_key(hidden,
                                                                 workspace='w',
                                                                 num_nodes=1)
+    unknown_age_sibling = _pending_info(3, hidden)
+    unknown_age_sibling.paid_capacity_pool_key = (
+        hidden_info.paid_capacity_pool_key)
+    unknown_age_sibling.created_at = unknown_age
     unknown_info = _pending_info(2, hidden)
     unknown_info.paid_capacity_pool_key = 'opaque-pre-versioned-pool'
 
@@ -454,16 +978,22 @@ def test_global_snapshot_counts_catalog_hidden_and_unknown_owned_pools():
                                        'remaining': 4
                                    } for key in active_keys.values()
                                }):
-        budget = paid_capacity.build_launch_budget(
-            placer,
-            workspace='w',
-            existing_replica_infos=[hidden_info, unknown_info],
-            globally_managed=True)
+        budget = paid_capacity.build_launch_budget(placer,
+                                                   workspace='w',
+                                                   existing_replica_infos=[
+                                                       hidden_info,
+                                                       unknown_age_sibling,
+                                                       unknown_info
+                                                   ],
+                                                   globally_managed=True)
 
     assert budget.owned_pool_keys_by_frontier == {
         ('l4',): {hidden_info.paid_capacity_pool_key}
     }
     assert budget.unknown_owned_pool_keys == {'opaque-pre-versioned-pool'}
+    assert budget.unknown_claim_age_pool_keys == {
+        hidden_info.paid_capacity_pool_key
+    }
     assert paid_capacity.select_location(placer, budget) is None
     assert budget.feedback_deferred_frontiers == {('l4',)}
 
@@ -564,8 +1094,11 @@ def test_claim_clamps_priority_and_returns_typed_result():
         },
         states_by_pool_key={},
         globally_managed=True,
-        frontier_limit=3,
-        frontier_key_by_location={location: ('l4',)})
+        service_claim_limit=24,
+        frontier_limit=2,
+        max_frontier_limit=3,
+        frontier_key_by_location={location: ('l4',)},
+        frontier_limit_overrides={('l4',): 3})
     info = _pending_info(1, location)
     with mock.patch.object(paid_capacity.serve_state,
                            'try_add_replica_with_paid_capacity_claim',
@@ -583,9 +1116,11 @@ def test_claim_clamps_priority_and_returns_typed_result():
     assert result is paid_capacity.ClaimResult.ACQUIRED
     assert claim.call_args.kwargs['priority'] == (
         constants.LB_REQUEST_PRIORITY_MAX)
-    assert claim.call_args.kwargs['service_limit'] == 16
+    assert claim.call_args.kwargs['service_limit'] == 24
     assert claim.call_args.kwargs['frontier_key'] == ('l4',)
     assert claim.call_args.kwargs['frontier_limit'] == 3
+    assert claim.call_args.kwargs['frontier_default_limit'] == 2
+    assert claim.call_args.kwargs['frontier_limits_by_key'] == {('l4',): 3}
 
 
 def test_saturated_pool_exhaustion_spills_to_next_pool():
@@ -640,6 +1175,265 @@ def test_cold_large_wave_opens_only_two_l4_pools_before_feedback():
         ('l4',): {pool_keys[locations[0]], pool_keys[locations[1]]}
     }
     assert budget.feedback_deferred_frontiers == {('l4',)}
+
+
+def test_normal_second_pool_prefers_a_new_provider_region():
+    primary = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    same_domain = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    different_domain = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    primary.instance_type = 'g6.xlarge'
+    same_domain.instance_type = 'g6.2xlarge'
+    different_domain.instance_type = 'g6.xlarge'
+    locations = [primary, same_domain, different_domain]
+    placer = make_placer({
+        primary: 0.5,
+        same_domain: 1.0,
+        different_domain: 2.0
+    })
+    budget = _exploration_budget(locations,
+                                 owned_locations=[primary],
+                                 remaining=[0, 4, 4])
+
+    assert paid_capacity.select_location(placer, budget) == different_domain
+
+
+def test_normal_second_pool_allows_same_domain_fallback():
+    primary = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    fallback = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    primary.instance_type = 'g6.xlarge'
+    fallback.instance_type = 'g6.2xlarge'
+    locations = [primary, fallback]
+    placer = make_placer({primary: 0.5, fallback: 1.0})
+    budget = _exploration_budget(locations,
+                                 owned_locations=[primary],
+                                 remaining=[0, 4])
+
+    assert paid_capacity.select_location(placer, budget) == fallback
+
+
+def test_delayed_third_pool_waits_for_the_youngest_unresolved_claim():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+    locations = [first, second, third]
+    placer = make_placer({first: 1.0, second: 2.0, third: 3.0})
+    budget = _exploration_budget(locations,
+                                 owned_locations=[first, second],
+                                 remaining=[0, 0, 4],
+                                 claimed_at={
+                                     first: 800,
+                                     second: 980
+                                 },
+                                 delay=30)
+
+    with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
+        assert paid_capacity.select_location(placer, budget) is None
+
+    assert not budget.frontier_limit_overrides
+    assert budget.feedback_deferred_frontiers == {('l4',)}
+
+
+def test_delayed_third_pool_uses_only_a_new_provider_region():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    same_domain = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    third_domain = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+    first.instance_type = 'g6.xlarge'
+    same_domain.instance_type = 'g6.2xlarge'
+    locations = [first, second, same_domain, third_domain]
+    placer = make_placer({
+        first: 1.0,
+        second: 2.0,
+        same_domain: 0.5,
+        third_domain: 3.0,
+    })
+    budget = _exploration_budget(locations,
+                                 owned_locations=[first, second],
+                                 remaining=[0, 0, 4, 4],
+                                 claimed_at=900,
+                                 delay=30)
+
+    with mock.patch.object(paid_capacity.time, 'time',
+                           return_value=1000), mock.patch.object(
+                               paid_capacity.logger, 'info') as info:
+        selected = paid_capacity.select_location(placer, budget)
+        snapshot = paid_capacity.admission_snapshot_by_location(budget)
+
+    assert selected == third_domain
+    assert budget.frontier_limit_overrides == {('l4',): 3}
+    assert budget.feedback_deferred_frontiers == set()
+    message = info.call_args.args[0]
+    assert 'from_limit=2' in message
+    assert 'to_limit=3' in message
+    assert 'youngest_unresolved_claim_age_seconds=100' in message
+    assert 'candidate_cloud=aws' in message
+    assert 'candidate_region=eu-west-1' in message
+    assert budget.pool_key_by_location[first] not in message
+    assert snapshot[third_domain]['frontier_limit'] == 3
+    assert snapshot[third_domain]['frontier_max_limit'] == 3
+    assert snapshot[first]['frontier_owned']
+    assert not snapshot[third_domain]['frontier_owned']
+    assert snapshot[third_domain]['frontier_owned_pool_count'] == 2
+    assert snapshot[third_domain][
+        'youngest_unresolved_claim_age_seconds'] == 100
+
+
+@pytest.mark.parametrize('missing_age,max_frontier', [(True, 3), (False, 2)])
+def test_delayed_third_pool_fails_closed_without_age_or_when_disabled(
+        missing_age, max_frontier):
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+    locations = [first, second, third]
+    placer = make_placer({first: 1.0, second: 2.0, third: 3.0})
+    claimed_at = ({first: 900} if missing_age else 900)
+    budget = _exploration_budget(locations,
+                                 owned_locations=[first, second],
+                                 remaining=[0, 0, 4],
+                                 claimed_at=claimed_at,
+                                 max_frontier=max_frontier,
+                                 delay=30)
+
+    with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
+        assert paid_capacity.select_location(placer, budget) is None
+
+    assert not budget.frontier_limit_overrides
+
+
+def test_delayed_third_pool_requires_a_distinct_failure_domain():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    east_alternate = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    west_alternate = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    first.instance_type = 'g6.xlarge'
+    east_alternate.instance_type = 'g6.2xlarge'
+    second.instance_type = 'g6.xlarge'
+    west_alternate.instance_type = 'g6.2xlarge'
+    locations = [first, second, east_alternate, west_alternate]
+    placer = make_placer({
+        first: 1.0,
+        second: 2.0,
+        east_alternate: 3.0,
+        west_alternate: 4.0,
+    })
+    budget = _exploration_budget(locations,
+                                 owned_locations=[first, second],
+                                 remaining=[0, 0, 4, 4],
+                                 claimed_at=900)
+
+    with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
+        assert paid_capacity.select_location(placer, budget) is None
+
+
+def test_delayed_third_pool_fails_closed_on_malformed_owned_domain():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+    locations = [first, second, third]
+    placer = make_placer({first: 1.0, second: 2.0, third: 3.0})
+    budget = _exploration_budget(locations,
+                                 owned_locations=[first, second],
+                                 remaining=[0, 0, 4],
+                                 claimed_at=900)
+    first_key = budget.pool_key_by_location[first]
+    malformed_payload = json.loads(first_key)
+    malformed_payload['accelerators'] = 'malformed'
+    malformed_key = json.dumps(malformed_payload,
+                               sort_keys=True,
+                               separators=(',', ':'))
+    budget.owned_pool_keys_by_frontier[('l4',)].remove(first_key)
+    budget.owned_pool_keys_by_frontier[('l4',)].add(malformed_key)
+    budget.newest_claimed_at_by_pool_key[malformed_key] = 900
+
+    with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
+        assert paid_capacity.select_location(placer, budget) is None
+    assert not budget.frontier_limit_overrides
+
+
+def test_delayed_third_pool_requires_age_for_every_unresolved_sibling():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
+    locations = [first, second, third]
+    placer = make_placer({first: 1.0, second: 2.0, third: 3.0})
+    budget = _exploration_budget(locations,
+                                 owned_locations=[first, second],
+                                 remaining=[0, 0, 4],
+                                 claimed_at=900)
+    budget.unknown_claim_age_pool_keys.add(budget.pool_key_by_location[first])
+
+    with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
+        assert paid_capacity.select_location(placer, budget) is None
+    assert not budget.frontier_limit_overrides
+
+
+def test_restart_reuses_owned_third_pool_without_opening_a_fourth():
+    locations = [
+        make_location(region, {'L4': 1}, cloud_name='AWS')
+        for region in ('us-east-1', 'us-west-2', 'eu-west-1', 'ap-south-1')
+    ]
+    placer = make_placer({
+        location: float(index)
+        for index, location in enumerate(locations, start=1)
+    })
+    budget = _exploration_budget(locations,
+                                 owned_locations=locations[:3],
+                                 remaining=[0, 0, 2, 4],
+                                 claimed_at=900,
+                                 max_frontier=3)
+
+    with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
+        assert paid_capacity.select_location(placer, budget) == locations[2]
+        paid_capacity.exhaust(budget, locations[2])
+        assert paid_capacity.select_location(placer, budget) is None
+
+    assert paid_capacity._effective_frontier_limit(budget, ('l4',)) == 3
+    assert not budget.frontier_limit_overrides
+
+
+def test_only_one_delayed_frontier_expansion_occurs_per_budget():
+    locations = [
+        make_location(region, {'L4': 1}, cloud_name='AWS')
+        for region in ('us-east-1', 'us-west-2', 'eu-west-1', 'ap-south-1')
+    ]
+    placer = make_placer({
+        location: float(index)
+        for index, location in enumerate(locations, start=1)
+    })
+    budget = _exploration_budget(locations,
+                                 owned_locations=locations[:2],
+                                 remaining=[0, 0, 1, 4],
+                                 claimed_at=900,
+                                 max_frontier=4,
+                                 delay=30)
+
+    with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
+        selected = paid_capacity.select_location(placer, budget)
+        assert selected == locations[2]
+        paid_capacity.debit(budget, selected)
+        assert paid_capacity.select_location(placer, budget) is None
+
+    assert budget.frontier_limit_overrides == {('l4',): 3}
+
+
+def test_delayed_frontier_never_bypasses_service_envelope():
+    locations = [
+        make_location(region, {'L4': 1}, cloud_name='AWS')
+        for region in ('us-east-1', 'us-west-2', 'eu-west-1')
+    ]
+    placer = make_placer({
+        location: float(index)
+        for index, location in enumerate(locations, start=1)
+    })
+    budget = _exploration_budget(locations,
+                                 owned_locations=locations[:2],
+                                 remaining=[0, 0, 4],
+                                 claimed_at=900,
+                                 service_remaining=0)
+
+    with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
+        assert paid_capacity.select_location(placer, budget) is None
+    assert not budget.frontier_limit_overrides
 
 
 def test_full_l4_frontier_does_not_block_independent_a100():

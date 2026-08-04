@@ -261,6 +261,23 @@ class JobLibCodeGen:
         return cls._build(code)
 
     @classmethod
+    def get_job_status_with_system_recovery(cls,
+                                            job_ids: list[int] | None = None
+                                           ) -> str:
+        """Gets statuses plus optional recovery details on new runtimes."""
+        code = [
+            f'job_ids = {job_ids} if {job_ids} is not None '
+            'else [job_lib.get_latest_job_id()]',
+            ('job_statuses = '
+             'job_lib.get_statuses_with_system_recovery_payload(job_ids) '
+             'if (int(constants.SKYLET_VERSION) >= 42 and '
+             'int(constants.SKYLET_LIB_VERSION) >= 9) '
+             'else job_lib.get_statuses_payload(job_ids)'),
+            'print(job_statuses, flush=True)',
+        ]
+        return cls._build(code)
+
+    @classmethod
     def get_job_submitted_or_ended_timestamp_payload(
             cls,
             job_id: int | None = None,

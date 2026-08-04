@@ -17,6 +17,7 @@ from sky import exceptions
 from sky.backends import backend_utils
 from sky.backends import skylet_rpc
 from sky.utils import context
+from sky.utils import context_utils
 
 
 @pytest.fixture(autouse=True)
@@ -286,9 +287,7 @@ def test_streaming_forwards_extra_grpc_options():
     )
 
 
-def test_invoke_skylet_with_retries_bails_on_ctx_cancel_during_backoff():
-    """If ctx is cancelled while we're sleeping between retries, the next
-    iteration must raise instead of starting a new gRPC call."""
+def test_invoke_skylet_with_retries_rejects_pre_cancelled_context():
     ctx = context.initialize()
     call_count = {'n': 0}
 
@@ -309,6 +308,141 @@ def test_invoke_skylet_with_retries_bails_on_ctx_cancel_during_backoff():
             backend_utils.invoke_skylet_with_retries(func)
         # Should never have called func because ctx was already cancelled.
         assert call_count['n'] == 0
+
+
+def test_unary_retry_backoff_wakes_on_context_cancellation(monkeypatch):
+    ctx = context.initialize()
+    attempts = 0
+    waits = []
+    backoff = mock.MagicMock()
+    backoff.current_backoff.return_value = 7.0
+    monkeypatch.setattr(skylet_rpc.common_utils, 'Backoff',
+                        mock.MagicMock(return_value=backoff))
+
+    def func():
+        nonlocal attempts
+        attempts += 1
+        raise _rpc_error(grpc.StatusCode.UNAVAILABLE)
+
+    def cancel_during_wait(seconds):
+        waits.append(seconds)
+        ctx.cancel()
+        raise asyncio.CancelledError('cancelled during retry backoff')
+
+    monkeypatch.setattr(context_utils, 'sleep_with_cancellation',
+                        cancel_during_wait)
+    monkeypatch.setattr(
+        context_utils.time, 'sleep',
+        lambda _: pytest.fail('retry backoff bypassed cancellation bridge'))
+
+    with pytest.raises(asyncio.CancelledError,
+                       match='cancelled during retry backoff'):
+        backend_utils.invoke_skylet_with_retries(func)
+
+    assert attempts == 1
+    assert waits == [7.0]
+
+
+def test_streaming_retry_backoff_wakes_on_context_cancellation(monkeypatch):
+    ctx = context.initialize()
+    attempts = 0
+    waits = []
+    backoff = mock.MagicMock()
+    backoff.current_backoff.return_value = 11.0
+    monkeypatch.setattr(skylet_rpc.common_utils, 'Backoff',
+                        mock.MagicMock(return_value=backoff))
+
+    def stream_func():
+        nonlocal attempts
+        attempts += 1
+        raise _rpc_error(grpc.StatusCode.UNAVAILABLE)
+
+    def cancel_during_wait(seconds):
+        waits.append(seconds)
+        ctx.cancel()
+        raise asyncio.CancelledError('cancelled during stream retry backoff')
+
+    monkeypatch.setattr(context_utils, 'sleep_with_cancellation',
+                        cancel_during_wait)
+    monkeypatch.setattr(
+        context_utils.time, 'sleep',
+        lambda _: pytest.fail('stream backoff bypassed cancellation bridge'))
+
+    with pytest.raises(asyncio.CancelledError,
+                       match='cancelled during stream retry backoff'):
+        list(backend_utils.invoke_skylet_streaming_with_retries(stream_func))
+
+    assert attempts == 1
+    assert waits == [11.0]
+
+
+def test_unary_retry_preserves_backoffs_and_skips_terminal_wait(monkeypatch):
+    attempts = 0
+    waits = []
+    backoff = mock.MagicMock()
+    backoff.current_backoff.side_effect = [0.5, 1.0, 2.0]
+    monkeypatch.setattr(skylet_rpc.common_utils, 'Backoff',
+                        mock.MagicMock(return_value=backoff))
+    monkeypatch.setattr(context_utils, 'sleep_with_cancellation', waits.append)
+    monkeypatch.setattr(context_utils.time, 'sleep', waits.append)
+
+    def func():
+        nonlocal attempts
+        attempts += 1
+        raise _rpc_error(grpc.StatusCode.UNAVAILABLE)
+
+    with pytest.raises(exceptions.SkyletUnavailableError,
+                       match='after 3 attempts'):
+        backend_utils.invoke_skylet_with_retries(func, max_attempts=3)
+
+    assert attempts == 3
+    assert waits == [0.5, 1.0]
+
+
+def test_unary_retry_without_context_preserves_wait_and_attempt_count(
+        monkeypatch):
+    attempts = 0
+    waits = []
+    backoff = mock.MagicMock()
+    backoff.current_backoff.return_value = 0.5
+    monkeypatch.setattr(skylet_rpc.common_utils, 'Backoff',
+                        mock.MagicMock(return_value=backoff))
+    monkeypatch.setattr(context_utils.time, 'sleep', waits.append)
+
+    def func():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _rpc_error(grpc.StatusCode.UNAVAILABLE)
+        return 'recovered'
+
+    assert backend_utils.invoke_skylet_with_retries(func) == 'recovered'
+    assert attempts == 2
+    assert waits == [0.5]
+
+
+def test_streaming_retry_preserves_backoffs_and_skips_terminal_wait(
+        monkeypatch):
+    attempts = 0
+    waits = []
+    backoff = mock.MagicMock()
+    backoff.current_backoff.side_effect = [0.5, 1.0, 2.0]
+    monkeypatch.setattr(skylet_rpc.common_utils, 'Backoff',
+                        mock.MagicMock(return_value=backoff))
+    monkeypatch.setattr(context_utils, 'sleep_with_cancellation', waits.append)
+    monkeypatch.setattr(context_utils.time, 'sleep', waits.append)
+
+    def stream_func():
+        nonlocal attempts
+        attempts += 1
+        raise _rpc_error(grpc.StatusCode.UNAVAILABLE)
+
+    with pytest.raises(exceptions.SkyletUnavailableError,
+                       match='after 3 attempts'):
+        list(backend_utils.invoke_skylet_streaming_with_retries(stream_func))
+
+    assert attempts == 3
+    assert waits == [0.5, 1.0]
 
 
 def test_invoke_skylet_with_retries_raises_unavailable_on_connection_refused():

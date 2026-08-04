@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Tooltip } from '@nextui-org/tooltip';
 import { formatDistance } from 'date-fns';
 import {
@@ -9,6 +9,7 @@ import {
   SelectItem,
 } from '@/components/ui/select';
 import { REFRESH_INTERVALS, UI_CONFIG } from '@/lib/config';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import Link from 'next/link';
 import { getNonce } from '@/utils/csp';
 
@@ -208,16 +209,9 @@ export const NonCapitalizedTooltip = ({ children, ...props }) => {
 export const LastUpdatedTimestamp = ({ timestamp, className = '' }) => {
   const [, setTick] = useState(0);
 
-  // Auto-update every 10 seconds to keep the relative time current
-  useEffect(() => {
-    if (!timestamp) return;
-
-    const interval = setInterval(() => {
-      setTick((t) => t + 1);
-    }, 10000); // Update every 10 seconds
-
-    return () => clearInterval(interval);
-  }, [timestamp]);
+  useVisibleRefreshInterval(Boolean(timestamp), 10000, () => {
+    setTick((t) => t + 1);
+  });
 
   if (!timestamp) {
     return null;

@@ -14,12 +14,13 @@ import {
   EditIcon,
 } from 'lucide-react';
 import { useMobile } from '@/hooks/useMobile';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import { ContextDetails } from '@/components/infra-context-details';
 import {
   InfrastructureSection,
   SkeletonBadge,
 } from '@/components/infra-section';
-import { canonicalizeGpuName } from '@/utils/gpuUtils';
+import { canonicalizeGpuName, summarizeGpusByType } from '@/utils/gpuUtils';
 import {
   getWorkspaceInfrastructure,
   getWorkspaceContexts,
@@ -186,7 +187,6 @@ export function GPUs() {
   const [kubeLoading, setKubeLoading] = useState(true);
   const [cloudLoading, setCloudLoading] = useState(true);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
-  const refreshDataRef = React.useRef(null);
   const isMobile = useMobile();
   const [kubeDataLoaded, setKubeDataLoaded] = useState(false);
   const [cloudDataLoaded, setCloudDataLoaded] = useState(false);
@@ -727,35 +727,9 @@ export function GPUs() {
     }
   };
 
-  // Effect for assigning the latest refresh entrypoint to refreshDataRef.
-  useEffect(() => {
-    refreshDataRef.current = startRefresh;
-    return () => {
-      if (refreshDataRef.current === startRefresh) {
-        refreshDataRef.current = null;
-      }
-    };
-  }, [startRefresh]);
-
   // Compute allGPUs (aggregated totals) whenever perContextGPUs changes
   useEffect(() => {
-    const gpuSummary = {};
-    perContextGPUs.forEach((gpu) => {
-      const gpuName = canonicalizeGpuName(gpu.gpu_name);
-      if (gpuName in gpuSummary) {
-        gpuSummary[gpuName].gpu_total += gpu.gpu_total || 0;
-        gpuSummary[gpuName].gpu_free += gpu.gpu_free || 0;
-        gpuSummary[gpuName].gpu_not_ready += gpu.gpu_not_ready || 0;
-      } else {
-        gpuSummary[gpuName] = {
-          gpu_name: gpuName,
-          gpu_total: gpu.gpu_total || 0,
-          gpu_free: gpu.gpu_free || 0,
-          gpu_not_ready: gpu.gpu_not_ready || 0,
-        };
-      }
-    });
-    setAllGPUs(Object.values(gpuSummary));
+    setAllGPUs(summarizeGpusByType(perContextGPUs));
   }, [perContextGPUs]);
 
   // Effect for initial load.
@@ -773,25 +747,16 @@ export function GPUs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Effect for interval refresh.
-  useEffect(() => {
-    let isCurrent = true;
-    const interval = setInterval(() => {
-      if (
-        isCurrent &&
-        refreshDataRef.current &&
-        window.document.visibilityState === 'visible'
-      ) {
-        // Calls the latest fetchData from the ref, with showLoadingIndicators: false
-        refreshDataRef.current({ showLoadingIndicators: false });
-      }
-    }, REFRESH_INTERVAL);
-
-    return () => {
-      isCurrent = false;
-      clearInterval(interval);
-    };
-  }, []); // Remove REFRESH_INTERVAL as it's a constant
+  useVisibleRefreshInterval(
+    !isInitialLoad,
+    REFRESH_INTERVAL,
+    () => {
+      startRefresh({ showLoadingIndicators: false });
+    },
+    {
+      catchUpOnlyWhenOverdue: true,
+    }
+  );
 
   // Reset states when component unmounts
   useEffect(() => {
@@ -847,15 +812,13 @@ export function GPUs() {
     // — without this, dots stay frozen on stale data until the slower
     // sky-check pass finishes.
     await Promise.all([
-      refreshDataRef.current
-        ? refreshDataRef.current({
-            showLoadingIndicators: true,
-            forceRefresh: true, // Force refresh to run sky check
-          })
-        : Promise.resolve(),
+      startRefresh({
+        showLoadingIndicators: true,
+        forceRefresh: true, // Force refresh to run sky check
+      }),
       refreshExtraInfra(),
     ]);
-  }, [refreshExtraInfra]);
+  }, [refreshExtraInfra, startRefresh]);
 
   // Effect for keyboard shortcut (Cmd+R / Ctrl+R) to force refresh
   useEffect(() => {

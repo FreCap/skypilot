@@ -191,6 +191,8 @@ def status(
     summary_only: bool = False,
     include_target_num_replicas: bool | None = None,
     history_hours: int | None = None,
+    metadata_only: bool = False,
+    include_endpoints: bool = False,
 ) -> list[dict[str, Any]]:
     """Gets service statuses.
 
@@ -296,8 +298,10 @@ def status(
     return impl.status(service_names,
                        pool=False,
                        summary_only=summary_only,
+                       metadata_only=metadata_only,
                        include_target_num_replicas=include_target_num_replicas,
-                       history_hours=history_hours)
+                       history_hours=history_hours,
+                       include_endpoints=include_endpoints)
 
 
 @usage_lib.entrypoint

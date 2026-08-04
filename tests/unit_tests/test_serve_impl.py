@@ -35,25 +35,62 @@ class TestGetServiceRecord:
             'name': 'svc',
             'pool': False,
             'status': serve_state.ServiceStatus.READY,
+            'workspace': 'ws-a',
         }
         with mock.patch.object(impl.serve_utils,
                                'is_consolidation_mode',
                                return_value=True), \
              mock.patch.object(impl.serve_state,
-                               'get_service_from_name',
+                               'get_service_status_snapshot',
                                return_value=record) as get_service, \
              mock.patch.object(
                  impl.serve_rpc_utils.RpcRunner,
                  'get_service_status') as get_status, \
+             mock.patch.object(impl.serve_utils,
+                               'get_yaml_content') as get_yaml_content, \
              mock.patch.object(impl.serve_utils.ServeCodeGen,
                                'get_service_status') as codegen:
             result = impl._get_service_record('svc', False, handle, backend)
 
         assert result is record
-        get_service.assert_called_once_with('svc')
+        get_service.assert_called_once_with('svc', require_version=True)
         get_status.assert_not_called()
+        get_yaml_content.assert_not_called()
         codegen.assert_not_called()
         backend.run_on_head.assert_not_called()
+
+    def test_consolidation_fetches_yaml_only_when_requested(self):
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        backend = _backend_mock()
+        record = {
+            'name': 'pool-a',
+            'pool': True,
+            'status': serve_state.ServiceStatus.READY,
+            'resource_scope': 'scope-a',
+            'version': 7,
+            'workspace': 'ws-a',
+        }
+        with mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=True), \
+             mock.patch.object(impl.serve_state,
+                               'get_service_status_snapshot',
+                               return_value=record.copy()) as get_service, \
+             mock.patch.object(impl.serve_utils,
+                               'get_yaml_content',
+                               return_value='yaml-a') as get_yaml_content:
+            result = impl._get_service_record('pool-a',
+                                              True,
+                                              handle,
+                                              backend,
+                                              include_yaml=True)
+
+        assert result == {
+            **record,
+            'yaml_content': 'yaml-a',
+        }
+        get_service.assert_called_once_with('pool-a', require_version=True)
+        get_yaml_content.assert_called_once_with('pool-a', 7, 'scope-a')
 
     def test_legacy_status_fallback_is_summary_only(self):
         handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)

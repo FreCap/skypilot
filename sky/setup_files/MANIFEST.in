@@ -10,6 +10,7 @@ include sky/skylet/providers/scp/*
 include sky/skylet/providers/*.py
 include sky/skylet/ray_patches/*.patch
 include sky/skylet/ray_patches/*.diff
+recursive-include sky/skylet/runtime_wheels/v1 *.whl manifest.json
 include sky/jobs/dashboard/*
 include sky/jobs/dashboard/templates/*
 include sky/jobs/dashboard/static/*
@@ -23,6 +24,7 @@ include sky/utils/*.sh
 include sky/setup_files/alembic.ini
 recursive-include sky/schemas/db *
 recursive-include sky/recipes/examples *.yaml
+recursive-include sky/serve/resource_action_artifacts/kubernetes_renderer_v1 *.json
 
 # SkyPilot templates package
 recursive-include sky_templates/ray *

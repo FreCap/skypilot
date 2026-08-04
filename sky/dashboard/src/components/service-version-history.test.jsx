@@ -33,6 +33,11 @@ jest.mock('@/data/connectors/services', () => ({
   electServiceVersion: jest.fn(),
   getServiceVersions: jest.fn(),
 }));
+jest.mock('@/components/ui/yaml-code-block', () => ({
+  YamlCodeBlock: ({ value }) => (
+    <pre data-testid="yaml-code-block">{value}</pre>
+  ),
+}));
 const history = {
   service_name: 'svc',
   elected_version: 3,
@@ -85,6 +90,60 @@ it('shows elected state and compares a stored version', async () => {
     screen.getByText('Autoscaling from 0 to 1000 replicas')
   ).toBeInTheDocument();
   expect(screen.getAllByText('Unknown')).toHaveLength(2);
+});
+
+it('shows the submitted and compiled YAML for each version', async () => {
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(
+    screen.getByRole('button', { name: 'View YAML for version 1' })
+  );
+
+  expect(screen.getByText('Version 1 YAML')).toBeInTheDocument();
+  expect(screen.getByTestId('yaml-code-block')).toHaveTextContent(
+    'min_replicas: 1'
+  );
+
+  fireEvent.click(screen.getByRole('button', { name: 'compiled' }));
+  expect(screen.getByTestId('yaml-code-block')).toHaveTextContent(
+    'accelerators: A100'
+  );
+
+  fireEvent.click(
+    screen.getByRole('button', { name: 'View YAML for version 3' })
+  );
+  expect(screen.getByText('Version 3 YAML')).toBeInTheDocument();
+  expect(screen.getByTestId('yaml-code-block')).toHaveTextContent(
+    'min_replicas: 3'
+  );
+});
+
+it('explains when a version does not have retained YAML', async () => {
+  getServiceVersions.mockResolvedValue({
+    ...history,
+    versions: history.versions.map((version) => ({
+      ...version,
+      submitted_yaml_content: null,
+      compiled_yaml_content: null,
+    })),
+  });
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(
+    screen.getByRole('button', { name: 'View YAML for version 1' })
+  );
+
+  expect(
+    screen.getByText('Submitted YAML was not retained for this version.')
+  ).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Copy YAML' })).toBeDisabled();
+
+  fireEvent.click(screen.getByRole('button', { name: 'compiled' }));
+  expect(
+    screen.getByText('Compiled YAML is unavailable for this version.')
+  ).toBeInTheDocument();
 });
 
 it('reports when the selected and elected YAML are identical', async () => {

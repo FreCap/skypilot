@@ -7,6 +7,7 @@ import { ENDPOINT } from '@/data/connectors/constants';
 import dashboardCache from '@/lib/cache';
 import { applyEnhancements } from '@/plugins/dataEnhancement';
 import { trackClusterAction } from '@/lib/analytics';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 
 // ============ Pagination Plugin Integration ============
 
@@ -76,10 +77,14 @@ const clusterStatusMap = {
   null: 'TERMINATED',
 };
 
-export async function getClusters({ clusterNames = null } = {}) {
+export async function getClusters({
+  clusterNames = null,
+  workspaces = null,
+} = {}) {
   try {
     const clusters = await apiClient.fetch('/status', {
       cluster_names: clusterNames,
+      workspaces_filter: workspaces,
       all_users: true,
       include_credentials: false,
       include_handle: false,
@@ -930,16 +935,21 @@ export function useClusterData(options = {}) {
     };
   }, [fetchData, requestContext]);
 
-  // Auto-refresh
-  useEffect(() => {
-    if (!refreshInterval) return;
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        fetchData();
+  const refreshWhenVisible = useCallback(
+    (source) => {
+      if (source === 'visibilitychange') {
+        void refreshData();
+        return;
       }
-    }, refreshInterval);
-    return () => clearInterval(interval);
-  }, [refreshInterval, fetchData]);
+      void fetchData();
+    },
+    [fetchData, refreshData]
+  );
+  useVisibleRefreshInterval(
+    Boolean(refreshInterval),
+    refreshInterval,
+    refreshWhenVisible
+  );
 
   // Handle limit change - reset to page 1
   const handleSetLimit = useCallback((newLimit) => {

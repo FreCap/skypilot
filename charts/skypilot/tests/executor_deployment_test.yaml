@@ -1,0 +1,327 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: executor_deployment_test
+templates:
+  - templates/executor-deployment.yaml
+tests:
+  - it: should mount a pre-existing state claim
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      storage.existingClaim: production-rwx-state
+      executorService.replicas: 2
+      controllerService.replicas: 2
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: production-rwx-state
+
+  - it: should not render an executor deployment in compatibility mode
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render active-active durable executors in HA mode
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      executorService.replicas: 2
+    asserts:
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-executor
+      - equal:
+          path: spec.replicas
+          value: 2
+      - equal:
+          path: spec.strategy.type
+          value: RollingUpdate
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_ROLE
+            value: executor
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_ENDPOINT
+            value: http://RELEASE-NAME-api-service.NAMESPACE.svc
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_INSTANCE_ID
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.uid
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_DB_CONNECTION_URI
+            valueFrom:
+              secretKeyRef:
+                name: external-db
+                key: connection_string
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /livez
+      - equal:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command
+          value:
+            - /bin/sh
+            - -c
+            - touch /var/run/skypilot/draining && sleep 20
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].topologyKey
+          value: kubernetes.io/hostname
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-role-runtime
+            mountPath: /var/run/skypilot
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-role-runtime
+            emptyDir: {}
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: state-volume
+            mountPath: /root/.sky
+            subPath: .sky
+      - notExists:
+          path: spec.template.metadata.annotations["prometheus.io/scrape"]
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKY_API_SERVER_METRICS_ENABLED
+      - notContains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9090
+
+  - it: should expose and annotate executor multiprocess metrics
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9191
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/scrape"]
+          value: "true"
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/path"]
+          value: /metrics
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/port"]
+          value: "9191"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKY_API_SERVER_METRICS_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PROMETHEUS_MULTIPROC_DIR
+            value: /tmp/metrics
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9191
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "export PROMETHEUS_MULTIPROC_DIR=/tmp/metrics\\s+rm -rf /tmp/metrics\\s+mkdir -p /tmp/metrics\\s+exec python[\\s\\S]+--metrics-port 9191"
+
+  - it: should discard stale executor metric files after hooks before exec
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.metrics.enabled: true
+      apiService.preDeployHook: |
+        touch /tmp/metrics/counter_123.db
+        touch /tmp/metrics/histogram_123.db
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "mkdir -p /tmp/metrics[\\s\\S]+touch /tmp/metrics/counter_123.db[\\s\\S]+touch /tmp/metrics/histogram_123.db[\\s\\S]+export PROMETHEUS_MULTIPROC_DIR=/tmp/metrics\\s+rm -rf /tmp/metrics\\s+mkdir -p /tmp/metrics\\s+exec python"
+
+  - it: should reject an executor health and metrics port collision
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9090
+      executorService.healthPort: 9090
+    asserts:
+      - failedTemplate:
+          errorMessage: executorService.healthPort must differ from apiService.metrics.port when metrics are enabled
+
+  - it: should allow an explicit executor topology-spread opt-out
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.topologySpreadTopologyKey: ""
+    asserts:
+      - notExists:
+          path: spec.template.spec.topologySpreadConstraints
+
+  - it: should reject a custom executor API endpoint
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.extraEnvs:
+        - name: SKYPILOT_API_SERVER_ENDPOINT
+          value: http://client-controlled-endpoint
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_SERVER_ENDPOINT" is duplicated or reserved by the chart'
+
+  - it: should share database and explicit executor pod extensions
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      databaseConnection.extraEnvs:
+        - name: PGSSLMODE
+          value: verify-full
+      executorService.extraEnvs:
+        - name: EXECUTOR_SETTING
+          value: enabled
+      executorService.extraVolumes:
+        - name: executor-secret
+          secret:
+            secretName: executor-secret
+      executorService.extraVolumeMounts:
+        - name: executor-secret
+          mountPath: /etc/executor
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLMODE
+            value: verify-full
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: EXECUTOR_SETTING
+            value: enabled
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: executor-secret
+            mountPath: /etc/executor
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: executor-secret
+            secret:
+              secretName: executor-secret
+
+  - it: should project native cloud credentials into executors
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      awsCredentials.enabled: true
+      awsCredentials.useCredentialsFile: true
+      awsCredentials.awsSecretName: aws-credentials
+      gcpCredentials.enabled: true
+      gcpCredentials.gcpSecretName: gcp-credentials
+      gcpCredentials.projectId: test-project
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: aws-config-files
+            mountPath: /root/.aws
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gcp-credentials
+            mountPath: /root/gcp-cred.json
+            subPath: gcp-cred.json
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: aws-config-files
+            secret:
+              secretName: aws-credentials
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gcp-credentials
+            secret:
+              secretName: gcp-credentials
+
+  - it: should allow custom executor GCP credentials when native credentials are disabled
+    set:
+      apiService.highAvailability.enabled: true
+      gcpCredentials.enabled: false
+      executorService.extraEnvs:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/secrets/gcp/custom.json
+      executorService.extraVolumes:
+        - name: gcp-credentials
+          secret:
+            secretName: custom-gcp-credentials
+      executorService.extraVolumeMounts:
+        - name: gcp-credentials
+          mountPath: /var/secrets/gcp
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GOOGLE_APPLICATION_CREDENTIALS
+            value: /var/secrets/gcp/custom.json
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gcp-credentials
+            secret:
+              secretName: custom-gcp-credentials
+
+  - it: should reject custom executor GCP credentials when native credentials are enabled
+    set:
+      apiService.highAvailability.enabled: true
+      gcpCredentials.enabled: true
+      executorService.extraEnvs:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/secrets/gcp/custom.json
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "GOOGLE_APPLICATION_CREDENTIALS" is duplicated or reserved by the chart'

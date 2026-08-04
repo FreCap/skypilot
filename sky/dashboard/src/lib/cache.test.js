@@ -16,6 +16,41 @@ function createMockFetch(returnValue, delay = 10) {
   return fn;
 }
 
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+function createSlowBackgroundFetch(thirdData = 'duplicate') {
+  const background = createDeferred();
+  let call = 0;
+  const fetch = jest.fn(() => {
+    call += 1;
+    if (call === 1) {
+      return Promise.resolve({ data: 'seeded' });
+    }
+    if (call === 2) {
+      return background.promise;
+    }
+    return Promise.resolve({ data: thirdData });
+  });
+  return { background, fetch };
+}
+
+function createSameSourceFetcher(value) {
+  const fetch = async (...args) => {
+    fetch.calls.push(args);
+    return { value };
+  };
+  fetch.calls = [];
+  return fetch;
+}
+
 describe('DashboardCache', () => {
   let cache;
 
@@ -127,6 +162,55 @@ describe('DashboardCache', () => {
   });
 
   describe('invalidateFunction', () => {
+    test('distinguishes same-source closures with different captured values', async () => {
+      const fetchA = createSameSourceFetcher('A');
+      const fetchB = createSameSourceFetcher('B');
+
+      expect(fetchA.toString()).toBe(fetchB.toString());
+
+      await expect(cache.get(fetchA, ['x'])).resolves.toEqual({ value: 'A' });
+      await expect(cache.get(fetchB, ['x'])).resolves.toEqual({ value: 'B' });
+
+      expect(cache.getCached(fetchA, ['x'])).toEqual({ value: 'A' });
+      expect(cache.getCached(fetchB, ['x'])).toEqual({ value: 'B' });
+      expect(fetchA.calls).toHaveLength(1);
+      expect(fetchB.calls).toHaveLength(1);
+    });
+
+    test('invalidateFunction only clears the exact fetch function', async () => {
+      const fetchA = createSameSourceFetcher('A');
+      const fetchB = createSameSourceFetcher('B');
+
+      await cache.get(fetchA, ['x']);
+      await cache.get(fetchB, ['x']);
+
+      cache.invalidateFunction(fetchA);
+
+      expect(cache.getCached(fetchA, ['x'])).toBeNull();
+      expect(cache.getCached(fetchB, ['x'])).toEqual({ value: 'B' });
+
+      await expect(cache.get(fetchA, ['x'])).resolves.toEqual({ value: 'A' });
+      expect(fetchA.calls).toHaveLength(2);
+      expect(fetchB.calls).toHaveLength(1);
+    });
+
+    test('memoizes function identity key generation', async () => {
+      let toStringCalls = 0;
+      const fetch = async () => ({ data: 'seeded' });
+      fetch.toString = () => {
+        toStringCalls += 1;
+        return 'expensive';
+      };
+
+      await cache.get(fetch, ['x']);
+      cache.getCached(fetch, ['x']);
+      cache.getCached(fetch, ['x']);
+      cache.invalidateFunction(fetch);
+      await cache.get(fetch, ['x']);
+
+      expect(toStringCalls).toBe(0);
+    });
+
     test('drops in-flight pending requests, not just cached entries', async () => {
       const mockFetch = createMockFetch({ data: 'v1' }, 100);
 
@@ -247,6 +331,103 @@ describe('DashboardCache', () => {
   });
 
   describe('Cache Behavior', () => {
+    test('stale read reuses an in-flight background refresh', async () => {
+      const { background, fetch } = createSlowBackgroundFetch();
+      const options = { ttl: 100, refreshOnAccess: false };
+
+      await cache.get(fetch, ['x'], options);
+      await cache.get(fetch, ['x'], options);
+      jest.advanceTimersByTime(101);
+
+      const staleReads = [
+        cache.get(fetch, ['x'], options),
+        cache.get(fetch, ['x'], options),
+      ];
+
+      await expect(Promise.all(staleReads)).resolves.toEqual([
+        { data: 'seeded' },
+        { data: 'seeded' },
+      ]);
+      expect(fetch).toHaveBeenCalledTimes(2);
+
+      background.resolve({ data: 'fresh' });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(cache.getCached(fetch, ['x'], options)).toEqual({
+        data: 'fresh',
+      });
+    });
+
+    test('stale read falls back when its background owner fails', async () => {
+      const { background, fetch } = createSlowBackgroundFetch();
+      const consoleWarn = jest
+        .spyOn(console, 'warn')
+        .mockImplementation(() => {});
+      const options = { ttl: 100, refreshOnAccess: false };
+
+      await cache.get(fetch, ['x'], options);
+      await cache.get(fetch, ['x'], options);
+      jest.advanceTimersByTime(101);
+
+      const staleRead = cache.get(fetch, ['x'], options);
+      await expect(staleRead).resolves.toEqual({ data: 'seeded' });
+      expect(fetch).toHaveBeenCalledTimes(2);
+
+      background.reject(new Error('background failed'));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(cache.backgroundJobs.size).toBe(0);
+      await expect(cache.get(fetch, ['x'], options)).resolves.toEqual({
+        data: 'duplicate',
+      });
+      expect(fetch).toHaveBeenCalledTimes(3);
+      consoleWarn.mockRestore();
+    });
+
+    test('stale read falls back when its background owner skips caching', async () => {
+      const { background, fetch } = createSlowBackgroundFetch();
+      const options = { ttl: 100, refreshOnAccess: false };
+
+      await cache.get(fetch, ['x'], options);
+      await cache.get(fetch, ['x'], options);
+      jest.advanceTimersByTime(101);
+
+      const staleRead = cache.get(fetch, ['x'], options);
+      await expect(staleRead).resolves.toEqual({ data: 'seeded' });
+      expect(fetch).toHaveBeenCalledTimes(2);
+
+      background.resolve({ data: 'fallback', __skipCache: true });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(cache.backgroundJobs.size).toBe(0);
+      await expect(cache.get(fetch, ['x'], options)).resolves.toEqual({
+        data: 'duplicate',
+      });
+      expect(fetch).toHaveBeenCalledTimes(3);
+    });
+
+    test('invalidating a background owner starts and preserves a new generation', async () => {
+      const { background, fetch } = createSlowBackgroundFetch('new generation');
+
+      await cache.get(fetch, ['x']);
+      await cache.get(fetch, ['x']);
+      cache.invalidate(fetch, ['x']);
+
+      await expect(cache.get(fetch, ['x'])).resolves.toEqual({
+        data: 'new generation',
+      });
+      background.resolve({ data: 'revoked' });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(cache.getCached(fetch, ['x'])).toEqual({
+        data: 'new generation',
+      });
+    });
+
     test('should return cached data when available and fresh', async () => {
       jest.useRealTimers(); // Use real timers for this test
       const mockFetch = createMockFetch({ data: 'test' }, 10);

@@ -7,10 +7,12 @@ spawned consolidation-mode controller subprocess chain
 (`worker -> bash -> scheduler -> nohup -> sky.jobs.controller`) inherits
 that polluted env for the controller's entire lifetime.
 
-The fix has two layers:
+The compatibility fix has two layers:
   1. recovery_strategy.py clears `SKY_API_SERVER_URL_ENV_VAR` (and
      invalidates the lru_cache on get_server_url/is_api_server_local)
-     before calling api_start, so already-leaked controllers self-heal.
+     before calling api_start in the legacy `all` role, so already-leaked
+     consolidated controllers self-heal. Explicit HA roles keep the
+     deployment-owned API Service endpoint and never start a local server.
   2. `LocalProcessCommandRunner.run` (the only CommandRunner that inherits
      the calling process's env into the child) passes a captured clean
      server env to subprocess.Popen instead of letting it default to
@@ -118,17 +120,15 @@ class TestPopenEnvOverrideMechanism:
 
 
 class TestRecoveryStrategyBeltAndSuspenders:
-    """Layer 1: ENV_VARS_TO_CLEAR includes the endpoint var."""
+    """Layer 1: the compatibility clear list includes the endpoint var."""
 
-    def test_endpoint_env_var_is_cleared_before_api_start(self):
-        assert (
-            constants.SKY_API_SERVER_URL_ENV_VAR
-            in recovery_strategy.ENV_VARS_TO_CLEAR), (
-                'SKY_API_SERVER_URL_ENV_VAR must be in ENV_VARS_TO_CLEAR so '
-                'already-leaked controllers can call sdk.api_start() and have '
-                'get_server_url() resolve to the local default. This is the '
-                'one-line escape hatch for controllers that were spawned with '
-                'a polluted env before the plumbing fix landed.')
+    def test_endpoint_env_var_is_cleared_before_legacy_api_start(self):
+        assert (constants.SKY_API_SERVER_URL_ENV_VAR
+                in recovery_strategy.ENV_VARS_TO_CLEAR
+               ), ('SKY_API_SERVER_URL_ENV_VAR must be in ENV_VARS_TO_CLEAR so '
+                   'already-leaked compatibility controllers can call '
+                   'sdk.api_start() and have get_server_url() resolve to the '
+                   'local default. Explicit HA roles do not use this list.')
 
 
 class TestLocalProcessCommandRunnerUsesCleanEnv:

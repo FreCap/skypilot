@@ -102,6 +102,13 @@ const deferred = () => {
 const countCacheReads = (fetcher) =>
   dashboardCache.get.mock.calls.filter(([fn]) => fn === fetcher).length;
 
+const setDocumentVisibility = (value) => {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+};
+
 describe('managed jobs page initialization', () => {
   afterEach(() => {
     jest.useRealTimers();
@@ -468,6 +475,116 @@ describe('managed jobs page initialization', () => {
     unmount();
     jest.useRealTimers();
   });
+
+  it('refreshes pools immediately when the page becomes visible again', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('hidden');
+    dashboardCache.get
+      .mockResolvedValueOnce({ pools: [{ name: 'initial-pool' }] })
+      .mockResolvedValueOnce({ pools: [{ name: 'visible-pool' }] });
+
+    const { result, unmount } = renderHook(() => useManagedJobsPageData());
+    let mounted = true;
+
+    try {
+      await waitFor(() => {
+        expect(result.current.poolsData).toEqual([{ name: 'initial-pool' }]);
+      });
+      dashboardCache.get.mockClear();
+
+      act(() => {
+        jest.advanceTimersByTime(REFRESH_INTERVAL * 2 - 1);
+      });
+      expect(dashboardCache.get).not.toHaveBeenCalled();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+      await waitFor(() => {
+        expect(result.current.poolsData).toEqual([{ name: 'visible-pool' }]);
+      });
+
+      act(() => {
+        jest.advanceTimersByTime(1);
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      unmount();
+      mounted = false;
+
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      act(() => {
+        jest.advanceTimersByTime(REFRESH_INTERVAL);
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
+
+  it('resumes pool polling after a backward wall-clock adjustment', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-01-01T01:00:00Z'));
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('hidden');
+    dashboardCache.get.mockResolvedValue({ pools: [] });
+
+    const { unmount } = renderHook(() => useManagedJobsPageData());
+
+    try {
+      await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+      dashboardCache.get.mockClear();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      jest.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      act(() => {
+        jest.advanceTimersByTime(REFRESH_INTERVAL * 2);
+      });
+
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    } finally {
+      unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('managed jobs automatic refresh', () => {
@@ -594,7 +711,36 @@ describe('managed jobs automatic refresh', () => {
         }
       });
 
-      jobsCacheManager.getPaginatedJobs.mockClear();
+      const staleRefresh = deferred();
+      jobsCacheManager.getPaginatedJobs.mockReset();
+      jobsCacheManager.getPaginatedJobs
+        .mockImplementationOnce(() => staleRefresh.promise)
+        .mockResolvedValueOnce({
+          jobs: [
+            {
+              id: 12,
+              task_id: 0,
+              task_job_id: '12-0',
+              name: 'fresh-filtered-job',
+              user: 'alice',
+              user_hash: 'alice-id',
+              status: 'SUCCEEDED',
+            },
+          ],
+          total: 1,
+          totalNoFilter: 1,
+          statusCounts: { SUCCEEDED: 1 },
+          controllerStopped: false,
+          hasNext: false,
+        });
+
+      let pendingRefresh;
+      act(() => {
+        pendingRefresh = props.refreshDataRef.current({
+          includeStatus: false,
+        });
+      });
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
 
       rerender(
         <ManagedJobsTable
@@ -604,15 +750,40 @@ describe('managed jobs automatic refresh', () => {
       );
 
       await waitFor(() =>
-        expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalled()
+        expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(2)
       );
-      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
-      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledWith(
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenNthCalledWith(
+        2,
         expect.objectContaining({
           nameMatch: 'alpha',
           page: 1,
         })
       );
+      await screen.findByText('fresh-filtered-job');
+
+      await act(async () => {
+        staleRefresh.resolve({
+          jobs: [
+            {
+              id: 11,
+              task_id: 0,
+              task_job_id: '11-0',
+              name: 'stale-page-job',
+              user: 'alice',
+              user_hash: 'alice-id',
+              status: 'FAILED',
+            },
+          ],
+          total: 1,
+          totalNoFilter: 1,
+          statusCounts: { FAILED: 1 },
+          controllerStopped: false,
+          hasNext: false,
+        });
+        await pendingRefresh;
+      });
+      expect(screen.queryByText('stale-page-job')).not.toBeInTheDocument();
+      expect(screen.getByText('fresh-filtered-job')).toBeInTheDocument();
     } finally {
       window.history.replaceState(null, '', originalUrl);
     }
@@ -837,6 +1008,241 @@ describe('managed jobs automatic refresh', () => {
       jest.advanceTimersByTime(5000);
     });
     expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(3);
+  });
+
+  it('refreshes jobs immediately when the page becomes visible again', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('hidden');
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    jobsCacheManager.getPaginatedJobs
+      .mockResolvedValueOnce({
+        jobs: [
+          {
+            id: 1,
+            task_id: 0,
+            task_job_id: '1-0',
+            name: 'initial-job',
+            user: 'alice',
+            user_hash: 'alice-id',
+            status: 'RUNNING',
+          },
+        ],
+        total: 1,
+        totalNoFilter: 1,
+        statusCounts: { RUNNING: 1 },
+        controllerStopped: false,
+        hasNext: false,
+      })
+      .mockResolvedValueOnce({
+        jobs: [
+          {
+            id: 1,
+            task_id: 0,
+            task_job_id: '1-0',
+            name: 'visible-job',
+            user: 'alice',
+            user_hash: 'alice-id',
+            status: 'SUCCEEDED',
+          },
+        ],
+        total: 1,
+        totalNoFilter: 1,
+        statusCounts: { SUCCEEDED: 1 },
+        controllerStopped: false,
+        hasNext: false,
+      });
+
+    const { unmount } = render(
+      <ManagedJobsTable
+        refreshInterval={5000}
+        setLoading={jest.fn()}
+        refreshDataRef={{ current: null }}
+        filters={[]}
+        onUserFilter={jest.fn()}
+        onRefresh={jest.fn()}
+        poolsData={[]}
+        poolsLoading={false}
+        setValueList={jest.fn()}
+        preloadingComplete={true}
+        lastFetchedTime={null}
+      />
+    );
+    let mounted = true;
+
+    try {
+      await screen.findByText('initial-job');
+      jobsCacheManager.getPaginatedJobs.mockClear();
+
+      act(() => {
+        jest.advanceTimersByTime(10000);
+      });
+      expect(jobsCacheManager.getPaginatedJobs).not.toHaveBeenCalled();
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
+      await screen.findByText('visible-job');
+
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
+
+  it('fences a pre-hide automatic poll when visibility restore starts a fresh read', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const stalePoll = deferred();
+    const visiblePoll = deferred();
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    jobsCacheManager.getPaginatedJobs
+      .mockResolvedValueOnce({
+        jobs: [
+          {
+            id: 1,
+            task_id: 0,
+            task_job_id: '1-0',
+            name: 'initial-job',
+            user: 'alice',
+            user_hash: 'alice-id',
+            status: 'RUNNING',
+          },
+        ],
+        total: 1,
+        totalNoFilter: 1,
+        statusCounts: { RUNNING: 1 },
+        controllerStopped: false,
+        hasNext: false,
+      })
+      .mockImplementationOnce(() => stalePoll.promise)
+      .mockImplementationOnce(() => visiblePoll.promise);
+    setDocumentVisibility('visible');
+
+    const { unmount } = render(
+      <ManagedJobsTable
+        refreshInterval={5000}
+        setLoading={jest.fn()}
+        refreshDataRef={{ current: null }}
+        filters={[]}
+        onUserFilter={jest.fn()}
+        onRefresh={jest.fn()}
+        poolsData={[]}
+        poolsLoading={false}
+        setValueList={jest.fn()}
+        preloadingComplete={true}
+        lastFetchedTime={null}
+      />
+    );
+    let mounted = true;
+
+    try {
+      await screen.findByText('initial-job');
+      jobsCacheManager.getPaginatedJobs.mockClear();
+
+      await act(async () => {
+        jest.advanceTimersByTime(5000);
+        await Promise.resolve();
+      });
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('hidden');
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(2);
+
+      act(() => {
+        jest.advanceTimersByTime(5000);
+      });
+      expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        stalePoll.resolve({
+          jobs: [
+            {
+              id: 1,
+              task_id: 0,
+              task_job_id: '1-0',
+              name: 'stale-job',
+              user: 'alice',
+              user_hash: 'alice-id',
+              status: 'FAILED',
+            },
+          ],
+          total: 1,
+          totalNoFilter: 1,
+          statusCounts: { FAILED: 1 },
+          controllerStopped: false,
+          hasNext: false,
+        });
+        await stalePoll.promise;
+      });
+      expect(screen.queryByText('stale-job')).not.toBeInTheDocument();
+
+      await act(async () => {
+        visiblePoll.resolve({
+          jobs: [
+            {
+              id: 1,
+              task_id: 0,
+              task_job_id: '1-0',
+              name: 'visible-job',
+              user: 'alice',
+              user_hash: 'alice-id',
+              status: 'SUCCEEDED',
+            },
+          ],
+          total: 1,
+          totalNoFilter: 1,
+          statusCounts: { SUCCEEDED: 1 },
+          controllerStopped: false,
+          hasNext: false,
+        });
+        await visiblePoll.promise;
+      });
+      await screen.findByText('visible-job');
+      expect(screen.queryByText('stale-job')).not.toBeInTheDocument();
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
   });
 
   it('reuses the cached filter directory across background polls', async () => {

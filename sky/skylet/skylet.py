@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 
 import grpc
 
@@ -16,6 +17,7 @@ from sky.schemas.generated import healthv1_pb2_grpc
 from sky.schemas.generated import jobsv1_pb2_grpc
 from sky.schemas.generated import managed_jobsv1_pb2_grpc
 from sky.schemas.generated import servev1_pb2_grpc
+from sky.schemas.generated import skyletv1_pb2_grpc
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.skylet import events
@@ -70,6 +72,8 @@ def start_grpc_server(port: int = constants.SKYLET_GRPC_PORT) -> grpc.Server:
         services.ManagedJobsServiceImpl(), server)
     healthv1_pb2_grpc.add_HealthServiceServicer_to_server(
         services.HealthServiceImpl(), server)
+    skyletv1_pb2_grpc.add_CapabilitiesServiceServicer_to_server(
+        services.CapabilitiesServiceImpl(str(uuid.uuid4())), server)
 
     listen_addr = f'0.0.0.0:{port}'
     server.add_insecure_port(listen_addr)

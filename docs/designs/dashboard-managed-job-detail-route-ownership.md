@@ -12,6 +12,13 @@ The stale snapshot feeds job details, actions, pool links, and log controls.
 Consumers should not need to repeat route-ownership checks around every use of
 the hook.
 
+The job and task detail pages also keep an `isInitialLoad` flag that becomes
+false after the first request settles and never resets for later route changes.
+After the connector correctly hides the old snapshot on navigation, those
+pages can still interpret the new route's empty, loading snapshot as a settled
+not-found result. The user briefly sees `Job not found` or `Task not found`
+while the new route is still fetching.
+
 ## Behavior contract
 
 The hook owns a snapshot only while the snapshot's route identifier matches its
@@ -27,6 +34,11 @@ current `jobId`.
   an earlier in-flight refresh for job A.
 - Same-route refreshes remain coalesced and explicit refreshes remain the only
   cache-invalidating path.
+- A page with no matching job or task snapshot renders loading while the
+  current route read is in progress, then renders not-found only after an empty
+  result settles.
+- A background refresh with a matching snapshot keeps the existing detail
+  visible instead of replacing it with a full-page loading state.
 
 ## Solution
 
@@ -42,6 +54,13 @@ invalidation, or scan. The render path adds one constant-time ref comparison.
 The snapshot reset shares the existing route effect and is batched with its
 loading update.
 
+The job and task detail pages derive their full-page loading state directly
+from the connector lifecycle and their matching snapshot. Loading is shown
+only when the connector is loading and the page cannot select its current job
+or task. This removes both page-local `isInitialLoad` state variables and their
+effects. It also preserves visible detail during background refreshes without
+adding a refresh call or another lifecycle owner.
+
 ## Alternatives considered
 
 Clearing state only in the effect is insufficient because effects run after
@@ -54,6 +73,11 @@ connector invariant and leave future consumers exposed.
 Storing `{jobId, data}` in a new state object would make ownership explicit,
 but it expands the state transition surface without improving the render-time
 gate or request fencing.
+
+Resetting `isInitialLoad` from another route effect would add a second page
+lifecycle owner and would still commit the reset after the first render of the
+new route. Deriving loading from the connector snapshot covers that first
+render and removes state instead.
 
 ## Rollout
 
@@ -75,3 +99,10 @@ leave-and-return ownership, same-route refresh coalescing, cache invalidation,
 and loading cleanup. `.github/workflows/dashboard.yml` explicitly runs this
 test file, lint, formatting checks, and a production dashboard build for pull
 requests to `improvements`.
+
+`sky/dashboard/src/components/job-detail-logs.test.jsx` covers both page
+consumers. It loads route A, navigates the same mounted page to a loading route
+B, and requires the page to avoid not-found until B settles empty. It also
+requires passive navigation to call neither refresh callback. Adjacent cases
+keep matching detail visible during background loading and verify that a
+settled empty result and a settled invalid task index reach not-found.

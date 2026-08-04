@@ -454,6 +454,40 @@ class TestGetServiceStatusPickledSummary:
         decoded = serve_utils.unpickle_service_status(statuses)[0]
         assert decoded['target_num_replicas'] == 4
 
+    def test_metadata_only_skips_replica_and_controller_enrichment(
+            self, patched_state, monkeypatch):
+        monkeypatch.setattr(serve_state,
+                            'get_glob_service_names',
+                            lambda names, pool=None: ['svc'])
+        replica_counts = mock.Mock()
+        replicas = mock.Mock()
+        autoscaler = mock.Mock()
+        monkeypatch.setattr(serve_state, 'get_replica_status_counts',
+                            replica_counts)
+        monkeypatch.setattr(serve_state, 'get_replica_infos', replicas)
+        monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
+                            autoscaler)
+
+        statuses = serve_utils.get_service_status_pickled(None,
+                                                          pool=False,
+                                                          metadata_only=True)
+
+        decoded = serve_utils.unpickle_service_status(statuses)[0]
+        assert decoded['metadata_only'] is True
+        assert 'replica_info' not in decoded
+        assert 'replica_status_counts' not in decoded
+        assert 'target_num_replicas' not in decoded
+        replica_counts.assert_not_called()
+        replicas.assert_not_called()
+        autoscaler.assert_not_called()
+
+    def test_metadata_and_summary_projections_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match='mutually exclusive'):
+            serve_utils.get_service_status_pickled(['svc'],
+                                                   pool=False,
+                                                   summary_only=True,
+                                                   metadata_only=True)
+
     def test_default_is_full(self, patched_state, monkeypatch):
         monkeypatch.setattr(serve_state,
                             'get_glob_service_names',
@@ -586,6 +620,16 @@ class TestCodegenVersionGating:
         assert ('kwargs.update({"include_target_num_replicas": False}) '
                 'if serve_version >= 7 else None') in code
 
+    def test_metadata_only_uses_v9_compatible_slim_snapshot(self):
+        code = serve_utils.ServeCodeGen.get_service_status(['svc'],
+                                                           pool=False,
+                                                           metadata_only=True)
+        assert 'status_snapshot_only=True' in code
+        assert 'with_replica_info=False' in code
+        assert 'with_target_num_replicas=False' in code
+        assert 'metadata_only' in code
+        assert 'get_service_status_encoded' not in code
+
     def test_default_summary_only_false(self):
         code = serve_utils.ServeCodeGen.get_service_status(['svc'], pool=False)
         assert 'summary_only": False' in code
@@ -600,4 +644,6 @@ class TestServeStatusBodyDefault:
         # to the full payload.
         body = payloads.ServeStatusBody(service_names=None)
         assert body.summary_only is False
+        assert body.metadata_only is False
         assert body.include_target_num_replicas is None
+        assert body.include_endpoints is False

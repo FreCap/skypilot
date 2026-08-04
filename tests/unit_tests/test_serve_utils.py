@@ -6,6 +6,7 @@ import tempfile
 import threading
 import types
 from unittest import mock
+import uuid
 
 import pytest
 import requests.exceptions as requests_exceptions
@@ -16,6 +17,7 @@ from sqlalchemy import orm
 from sky import clouds
 from sky.resources import Resources
 from sky.serve import constants
+from sky.serve import controller_transport
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -937,8 +939,8 @@ class TestControllerHttpRetry:
             mock.Mock(status_code=200)
         ]
         with self._patch_record(), \
-             mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
-                        3), \
+             mock.patch.object(controller_transport,
+                               '_CONTROLLER_HTTP_RETRY_ATTEMPTS', 3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.post',
                         side_effect=side) as m:
@@ -1003,8 +1005,8 @@ class TestControllerHttpRetry:
         with mock.patch('sky.serve.serve_utils.serve_state.'
                         'get_service_controller_owner',
                         side_effect=records), \
-             mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
-                        3), \
+             mock.patch.object(controller_transport,
+                               '_CONTROLLER_HTTP_RETRY_ATTEMPTS', 3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         side_effect=capture_get):
@@ -1108,8 +1110,8 @@ class TestControllerHttpRetry:
         # Patch the attempt count up to 3 so the retry path is actually
         # exercised; the production default is 1 (see lazy-handle PR).
         with self._patch_record(), \
-             mock.patch('sky.serve.serve_utils._CONTROLLER_HTTP_RETRY_ATTEMPTS',
-                        3), \
+             mock.patch.object(controller_transport,
+                               '_CONTROLLER_HTTP_RETRY_ATTEMPTS', 3), \
              mock.patch('sky.serve.serve_utils.time.sleep'), \
              mock.patch('sky.serve.serve_utils.requests.get',
                         side_effect=side) as m:
@@ -1303,6 +1305,49 @@ def test_child_only_purge_skips_absent_clusters_with_one_inventory_snapshot():
     remove.assert_called_once_with('orphan', 9)
 
 
+def test_orphaned_service_cluster_fields_require_consolidation():
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=False), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_managed_cluster_status_fields') as get_candidates, \
+         mock.patch.object(serve_state,
+                           'get_replica_cluster_names') as get_owners:
+        result = serve_utils.get_orphaned_service_cluster_status_fields()
+
+    assert result == {}
+    get_candidates.assert_not_called()
+    get_owners.assert_not_called()
+
+
+def test_orphaned_service_cluster_fields_use_exact_replica_ownership():
+    candidates = {
+        'predecessor-r1': ('UP', 1),
+        'current-r1': ('UP', 2),
+        'failed-launch-r2': ('INIT', 3),
+    }
+    with mock.patch.object(serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(
+             serve_utils.global_user_state,
+             'get_managed_cluster_status_fields',
+             return_value=candidates) as get_candidates, \
+         mock.patch.object(
+             serve_state,
+             'get_replica_cluster_names',
+             return_value={'current-r1'}) as get_owners:
+        result = serve_utils.get_orphaned_service_cluster_status_fields()
+
+    assert result == {
+        'predecessor-r1': ('UP', 1),
+        'failed-launch-r2': ('INIT', 3),
+    }
+    get_candidates.assert_called_once_with('service')
+    get_owners.assert_called_once_with()
+
+
 def test_child_only_purge_termination_failure_retains_inventory():
     lifecycle_lock = mock.MagicMock(epoch=9)
     replica_infos = [
@@ -1338,6 +1383,10 @@ def test_child_only_purge_termination_failure_retains_inventory():
              return_value={
                  info.cluster_name: (None, None) for info in replica_infos
              }), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={info.replica_id: None for info in replica_infos}), \
          mock.patch('sky.serve.replica_managers.terminate_cluster',
                     side_effect=_terminate) as terminate, \
          mock.patch.object(serve_state,
@@ -1838,9 +1887,14 @@ class TestStreamReplicaLogsZeroByteFallback:
     """
 
     def _patch_healthy(self):
-        # _check_service_status_healthy returns None → continue past gate.
-        return mock.patch('sky.serve.serve_utils._check_service_status_healthy',
-                          return_value=None)
+        # Provide the slim owner snapshot expected by the log-stream entrypoint.
+        return mock.patch(
+            'sky.serve.serve_utils._get_healthy_service_log_owner_record',
+            return_value=({
+                'pool': True,
+                'resource_scope': None,
+                'status': serve_state.ServiceStatus.READY,
+            }, None))
 
     def test_zero_byte_main_log_falls_through_to_launch_log(
             self, tmp_path, capsys):
@@ -2536,6 +2590,90 @@ def test_set_service_status_from_replica_active_versions_ready_only():
     assert set_st.call_args.kwargs['active_versions'] == [2]
 
 
+@pytest.mark.parametrize(
+    ('replica_statuses', 'target_num_replicas', 'expected_service_status'), [
+        ([serve_state.ReplicaStatus.FAILED_PROVISION
+         ], 0, serve_state.ServiceStatus.NO_REPLICA),
+        ([
+            serve_state.ReplicaStatus.FAILED,
+            serve_state.ReplicaStatus.FAILED_INITIAL_DELAY,
+            serve_state.ReplicaStatus.FAILED_PROBING,
+            serve_state.ReplicaStatus.FAILED_PROVISION,
+        ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_INITIAL_DELAY
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_PROBING
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_PROVISION
+         ], 1, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_PROVISION
+         ], None, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.FAILED_CLEANUP
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([serve_state.ReplicaStatus.UNKNOWN
+         ], 0, serve_state.ServiceStatus.FAILED),
+        ([
+            serve_state.ReplicaStatus.READY,
+            serve_state.ReplicaStatus.FAILED_PROVISION,
+        ], 0, serve_state.ServiceStatus.READY),
+        ([
+            serve_state.ReplicaStatus.FAILED_PROVISION,
+            serve_state.ReplicaStatus.PROVISIONING,
+        ], 0, serve_state.ServiceStatus.FAILED),
+    ])
+def test_set_service_status_from_replica_distinguishes_idle_failure_history(
+        replica_statuses, target_num_replicas, expected_service_status):
+    replica_infos = [
+        _FakeReplicaInfo(status, version=1) for status in replica_statuses
+    ]
+    record = {
+        'status': serve_state.ServiceStatus.READY,
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+    }
+    with mock.patch.object(serve_state,
+                           'get_service_controller_owner',
+                           return_value=record), \
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_owner') as set_st:
+        serve_utils.set_service_status_and_active_versions_from_replica(
+            'svc',
+            replica_infos,
+            serve_utils.UpdateMode.ROLLING,
+            target_num_replicas=target_num_replicas)
+
+    set_st.assert_called_once()
+    assert set_st.call_args.args[4] == expected_service_status
+
+
+def test_idle_failed_provision_status_transition_is_persisted(_mock_serve_db):
+    _insert_orphan_service_row(_mock_serve_db, 'svc-idle')
+    _insert_version_spec(_mock_serve_db, 'svc-idle', 1, min_replicas=0)
+    replica_infos = [
+        _FakeReplicaInfo(serve_state.ReplicaStatus.FAILED_PROVISION, version=1)
+    ]
+
+    serve_utils.set_service_status_and_active_versions_from_replica(
+        'svc-idle',
+        replica_infos,
+        serve_utils.UpdateMode.ROLLING,
+        target_num_replicas=0)
+    assert serve_state.get_service_controller_owner(
+        'svc-idle')['status'] == serve_state.ServiceStatus.NO_REPLICA
+
+    serve_utils.set_service_status_and_active_versions_from_replica(
+        'svc-idle',
+        replica_infos,
+        serve_utils.UpdateMode.ROLLING,
+        target_num_replicas=1)
+    assert serve_state.get_service_controller_owner(
+        'svc-idle')['status'] == serve_state.ServiceStatus.FAILED
+
+
 def test_get_latest_version_with_min_replicas_batches_spec_reads(
         _mock_serve_db):
     _insert_version_spec(_mock_serve_db, 'svc', 1, min_replicas=1)
@@ -2705,11 +2843,14 @@ class TestTerminateFailedServices:
              exists,
              terminate_side_effect=None,
              lb_side_effect=None,
-             resource_scope=None):
+             resource_scope=None,
+             teardown_identities=None):
         terminated = []
+        self.termination_kwargs = []
 
-        def _terminate(cluster_name, _log_file, **_kwargs):
+        def _terminate(cluster_name, _log_file, **kwargs):
             terminated.append(cluster_name)
+            self.termination_kwargs.append(kwargs)
             if terminate_side_effect is not None:
                 terminate_side_effect(cluster_name)
 
@@ -2736,6 +2877,12 @@ class TestTerminateFailedServices:
                  'sky.serve.serve_utils.global_user_state.'
                  'get_cluster_status_fields',
                  side_effect=_cluster_snapshot), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.'
+                 'get_replica_resource_action_identities',
+                 side_effect=lambda _service_name, replica_ids:
+                 ({replica_id: None for replica_id in replica_ids}
+                  if teardown_identities is None else teardown_identities)), \
              mock.patch('sky.serve.replica_managers.terminate_cluster',
                         side_effect=_terminate), \
              mock.patch('sky.serve.serve_utils.get_service_lifecycle_lock',
@@ -2793,6 +2940,27 @@ class TestTerminateFailedServices:
                                                'incarnation-a',
                                                expected_lifecycle_epoch=17)
         assert message is None
+
+    def test_action_owned_cluster_termination_uses_exact_record_uuid(self):
+        info = self._replica(1, 'svc-1')
+        cluster_record_uuid = uuid.UUID('33333333-3333-4333-8333-333333333333')
+        identity = serve_state.ReplicaResourceActionIdentity(
+            replica_id=1,
+            cluster_name='svc-1',
+            replica_incarnation=uuid.UUID(
+                '11111111-1111-4111-8111-111111111111'),
+            desired_generation=2,
+            sky_cluster_record_uuid=cluster_record_uuid)
+
+        _, _, _, message, _, _ = self._run([info],
+                                           exists=lambda _name: True,
+                                           teardown_identities={1: identity})
+
+        assert message is None
+        assert self.termination_kwargs == [{
+            'continue_guard': mock.ANY,
+            'expected_cluster_record_uuid': str(cluster_record_uuid),
+        }]
 
     def test_large_absent_inventory_uses_one_cluster_snapshot(self):
         infos = [

@@ -50,6 +50,7 @@ then:
 """
 from collections.abc import Callable
 from collections.abc import Iterator
+from collections.abc import Mapping
 import contextlib
 import copy
 import json
@@ -436,6 +437,54 @@ def get_nested(keys: tuple[str, ...],
         disallowed_override_keys=None)
 
 
+def get_effective_workspace_region_config_from_snapshot(
+        config_snapshot: Mapping[str, Any],
+        cloud: str,
+        keys: tuple[str, ...],
+        region: str | None = None,
+        default_value: Any | None = None,
+        *,
+        workspace: str | None,
+        override_configs: dict[str, Any] | None = None) -> Any:
+    """Resolve effective config from an explicit immutable-time snapshot.
+
+    This has the same workspace, region, cloud, and resource-override
+    precedence as :func:`get_effective_workspace_region_config`, but never
+    reads the active workspace or the process-global loaded config. Passing
+    ``workspace=None`` deliberately skips the workspace layer.
+
+    Callers that need one coherent decision should capture the config and
+    workspace once, then use this function for every read in that decision.
+    The input mappings are not mutated.
+    """
+    snapshot = config_utils.Config(dict(config_snapshot))
+    workspaced_config_value = None
+    if workspace is not None:
+        workspace_cloud_config = snapshot.get_nested(keys=(
+            'workspaces',
+            workspace,
+        ),
+                                                     default_value=None)
+        if workspace_cloud_config is not None:
+            workspaced_config_value = (
+                config_utils.get_cloud_config_value_from_dict(
+                    dict_config=workspace_cloud_config,
+                    cloud=cloud,
+                    keys=keys,
+                    region=region,
+                    default_value=None,
+                    override_configs=override_configs))
+    if workspaced_config_value is not None:
+        return workspaced_config_value
+    return config_utils.get_cloud_config_value_from_dict(
+        dict_config=snapshot,
+        cloud=cloud,
+        keys=keys,
+        region=region,
+        default_value=default_value,
+        override_configs=override_configs)
+
+
 def get_effective_workspace_region_config(
         cloud: str,
         keys: tuple[str, ...],
@@ -445,24 +494,15 @@ def get_effective_workspace_region_config(
         override_configs: dict[str, Any] | None = None) -> Any:
     if workspace is None:
         workspace = get_active_workspace()
-    workspaced_config_value = None
-    workspace_cloud_config = get_nested(keys=(
-        'workspaces',
-        workspace,
-    ),
-                                        default_value=None)
-    if workspace_cloud_config is not None:
-        workspaced_config_value = config_utils.get_cloud_config_value_from_dict(
-            dict_config=workspace_cloud_config,
-            cloud=cloud,
-            keys=keys,
-            region=region,
-            default_value=None,
-            override_configs=override_configs)
-    if workspaced_config_value is not None:
-        return workspaced_config_value
-    return get_effective_region_config(cloud, keys, region, default_value,
-                                       override_configs)
+    config_snapshot = _get_loaded_config()
+    return get_effective_workspace_region_config_from_snapshot(
+        config_snapshot=config_snapshot,
+        cloud=cloud,
+        keys=keys,
+        region=region,
+        default_value=default_value,
+        workspace=workspace,
+        override_configs=override_configs)
 
 
 def get_effective_region_config(cloud: str,
@@ -855,14 +895,17 @@ def _reload_config_from_internal_file(internal_config_path: str) -> None:
 def _create_table(engine: sqlalchemy.engine.Engine):
     """Initialize the config database with migrations."""
     migration_utils.safe_alembic_upgrade(
-        engine, migration_utils.SKYPILOT_CONFIG_DB_NAME,
-        migration_utils.SKYPILOT_CONFIG_VERSION)
+        engine,
+        migration_utils.SKYPILOT_CONFIG_DB_NAME,
+        migration_utils.SKYPILOT_CONFIG_VERSION,
+        mode=migration_utils.configured_migration_mode())
 
 
 # We only store config in the DB when using Postgres,
 # so no need to pass in db_name here.
 _db_manager = db_utils.DatabaseManager(db_name='config',
                                        create_table_fn=_create_table)
+initialize_and_get_db = _db_manager.get_engine
 
 
 def _reload_config_as_server() -> None:
@@ -876,7 +919,13 @@ def _reload_config_as_server() -> None:
     # the db url specified in config file to the env var.
     db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
 
-    if db_url:
+    # A fresh-schema migration job must initialize global user state before
+    # any companion schema creates objects in the shared PostgreSQL schema.
+    # Importing ``sky`` loads this module before the migration entrypoint can
+    # call global_user_state.initialize_and_get_db(), so defer the config
+    # overlay only for explicit bootstrap mode.  The migration entrypoint
+    # initializes this config schema immediately after global user state.
+    if (db_url and migration_utils.configured_migration_mode() != 'bootstrap'):
         server_config = _overlay_db_config(server_config, db_url)
     if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
         safe_server_config = _redact_container_image_config_for_logging(

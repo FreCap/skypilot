@@ -5,6 +5,14 @@
 {{- $enableBasicAuthInAPIServer := include "skypilot.enableBasicAuthInAPIServer" . | trim | eq "true" -}}
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $unifiedIngress := .Values.ingress.unified | default false -}}
+{{- $haEnabled := .Values.apiService.highAvailability.enabled -}}
+{{- if and $haEnabled .Values.ingress.annotations -}}
+{{- range $annotationName, $_ := .Values.ingress.annotations -}}
+{{- if or (hasPrefix "nginx.ingress.kubernetes.io/affinity" $annotationName) (hasPrefix "nginx.ingress.kubernetes.io/session-cookie-" $annotationName) (hasPrefix "nginx.ingress.kubernetes.io/upstream-hash-by" $annotationName) -}}
+{{- fail (printf "ingress.annotations[%q] cannot enable pod affinity in guarded HA mode" $annotationName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -20,7 +28,7 @@ metadata:
     # transparently re-dispatched to a ready pod (zero-downtime upgrades).
     nginx.ingress.kubernetes.io/proxy-next-upstream: "http_502 non_idempotent"
     nginx.ingress.kubernetes.io/proxy-next-upstream-tries: "3"
-    {{- if .Values.ingress.sessionAffinity }}
+    {{- if and .Values.ingress.sessionAffinity (not $haEnabled) }}
     # Cookie-based session affinity keeps a client pinned to the same pod across
     # requests during a rolling upgrade. Disable via ingress.sessionAffinity=false
     # when stickiness is managed externally (e.g., upstream load balancer) or the

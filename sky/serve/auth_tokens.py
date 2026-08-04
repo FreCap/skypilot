@@ -1,5 +1,6 @@
 """SkyServe bearer-token configuration and trust-domain isolation."""
 
+from collections.abc import Mapping
 import os
 import pathlib
 import re
@@ -13,6 +14,23 @@ class AuthTokenConfigurationError(ValueError):
 
 
 _AUTH_TOKEN_PATTERN = re.compile(r'[A-Za-z0-9._~+/=-]+')
+_STRICT_RING_MAX_BYTES = 514
+_STRICT_TOKEN_MIN_BYTES = 32
+_STRICT_TOKEN_MAX_BYTES = 256
+
+
+def is_resource_action_authority_enabled(
+        environ: Mapping[str, str] | None = None) -> bool:
+    """Return the chart-owned resource-action authority activation state."""
+    source = os.environ if environ is None else environ
+    configured = source.get(constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR)
+    if configured is None:
+        return False
+    if type(configured) is str and configured == 'true':
+        return True
+    raise AuthTokenConfigurationError(
+        f'{constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR} must be '
+        'exactly "true" when present.')
 
 
 def is_lb_data_plane_auth_enabled() -> bool:
@@ -91,11 +109,12 @@ def _get_auth_tokens(file_env_var: str,
     return ()
 
 
-def _get_controller_auth_token_rings(
-        sync_required: bool = False,
-        admin_required: bool = False
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Read both controller rings and reject any cross-domain credential.
+def _get_serve_auth_token_rings(
+    sync_required: bool = False,
+    admin_required: bool = False,
+    data_plane_required: bool = False,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Read every mounted Serve ring and reject cross-domain credentials.
 
     Each ring may contain multiple credentials for an overlap rotation within
     that trust domain. A credential may never appear in both rings: otherwise
@@ -115,33 +134,137 @@ def _get_controller_auth_token_rings(
         constants.CONTROLLER_AUTH_TOKEN_ENV_VAR,
         'controller admin',
         required=admin_required)
-    if not set(sync_tokens).isdisjoint(admin_tokens):
+    data_plane_tokens = _get_auth_tokens(constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
+                                         constants.LB_AUTH_TOKEN_ENV_VAR,
+                                         'load-balancer data plane',
+                                         required=data_plane_required)
+    rings = (sync_tokens, admin_tokens, data_plane_tokens)
+    if any(not set(rings[left]).isdisjoint(rings[right])
+           for left in range(len(rings))
+           for right in range(left + 1, len(rings))):
         raise AuthTokenConfigurationError(
-            'Load-balancer sync and controller-admin token rings must be '
-            'disjoint.')
-    return sync_tokens, admin_tokens
+            'Load-balancer sync, controller-admin, and data-plane token rings '
+            'must be pairwise disjoint.')
+    return rings
 
 
 def validate_controller_auth_token_isolation(required: bool = False) -> None:
     """Validate the controller trust-domain boundary without exposing tokens."""
-    _get_controller_auth_token_rings(sync_required=required,
-                                     admin_required=required)
+    _get_serve_auth_token_rings(sync_required=required,
+                                admin_required=required,
+                                data_plane_required=required)
 
 
 def get_lb_sync_auth_tokens(required: bool = False) -> tuple[str, ...]:
     """Credentials accepted on, and presented to, the LB sync endpoint."""
-    sync_tokens, _ = _get_controller_auth_token_rings(sync_required=required)
+    sync_tokens, _, _ = _get_serve_auth_token_rings(sync_required=required)
     return sync_tokens
 
 
 def get_controller_admin_auth_tokens(required: bool = False) -> tuple[str, ...]:
     """Credentials accepted by trusted controller administration callers."""
-    _, admin_tokens = _get_controller_auth_token_rings(admin_required=required)
+    _, admin_tokens, _ = _get_serve_auth_token_rings(admin_required=required)
     return admin_tokens
 
 
 def get_lb_auth_tokens(required: bool = False) -> tuple[str, ...]:
     """Credentials accepted by the external LB inference data plane."""
-    return _get_auth_tokens(constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
-                            constants.LB_AUTH_TOKEN_ENV_VAR,
-                            'load-balancer data plane', required)
+    _, _, data_plane_tokens = _get_serve_auth_token_rings(
+        data_plane_required=required)
+    return data_plane_tokens
+
+
+def _read_strict_resource_action_preflight_ring(path: str) -> tuple[str, ...]:
+    """Read the closed purpose-token grammar used by private preflight."""
+
+    try:
+        contents = pathlib.Path(path).read_bytes()
+    except OSError as e:
+        raise AuthTokenConfigurationError(
+            'Cannot read the resource-action preflight token ring: '
+            f'{common_utils.format_exception(e)}') from e
+    if not contents or len(contents) > _STRICT_RING_MAX_BYTES:
+        raise AuthTokenConfigurationError(
+            'Resource-action preflight token ring must contain 1..514 bytes.')
+    if not contents.endswith(b'\n') or b'\r' in contents:
+        raise AuthTokenConfigurationError(
+            'Resource-action preflight token ring must use LF records and one '
+            'final LF.')
+    raw_tokens = contents[:-1].split(b'\n')
+    if len(raw_tokens) not in (1, 2) or any(not token for token in raw_tokens):
+        raise AuthTokenConfigurationError(
+            'Resource-action preflight token ring requires exactly one or two '
+            'nonempty records.')
+    try:
+        tokens = tuple(token.decode('ascii') for token in raw_tokens)
+    except UnicodeDecodeError as e:
+        raise AuthTokenConfigurationError(
+            'Resource-action preflight tokens must be ASCII.') from e
+    for token in tokens:
+        if (len(token) < _STRICT_TOKEN_MIN_BYTES or
+                len(token) > _STRICT_TOKEN_MAX_BYTES or
+                _AUTH_TOKEN_PATTERN.fullmatch(token) is None):
+            raise AuthTokenConfigurationError(
+                'Resource-action preflight tokens must be 32..256 characters '
+                'in the closed ASCII alphabet.')
+        if token.startswith('sky_'):
+            raise AuthTokenConfigurationError(
+                'Resource-action preflight tokens must not use the reserved '
+                'SkyPilot API-token namespace.')
+    if len(set(tokens)) != len(tokens):
+        raise AuthTokenConfigurationError(
+            'Resource-action preflight token ring contains a duplicate token.')
+    return tokens
+
+
+def get_resource_action_preflight_auth_tokens(
+        required: bool = False) -> tuple[str, ...]:
+    """Reread the private preflight purpose ring without caching it."""
+
+    token_file = os.environ.get(
+        constants.RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR)
+    if not token_file:
+        if required:
+            raise AuthTokenConfigurationError(
+                'Resource-action preflight authentication is required, but '
+                f'{constants.RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR} '
+                'is not configured.')
+        return ()
+    return _read_strict_resource_action_preflight_ring(token_file)
+
+
+def validate_resource_action_preflight_auth_token_isolation(
+    required: bool = False, api_user_tokens: tuple[str, ...] = ()) -> None:
+    """Reject a purpose token reused in any mounted authentication domain.
+
+    ``api_user_tokens`` is an explicit narrow input because API-user tokens are
+    database-backed rather than exposed through a Serve environment variable.
+    Startup code with that domain mounted supplies its already-validated byte
+    values; this module never reaches into user or database state.
+    """
+
+    get_isolated_resource_action_preflight_auth_tokens(
+        required=required, api_user_tokens=api_user_tokens)
+
+
+def get_isolated_resource_action_preflight_auth_tokens(
+    required: bool = False,
+    api_user_tokens: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    """Return one freshly read purpose ring after cross-domain validation."""
+
+    if type(api_user_tokens) is not tuple or any(
+            type(token) is not str for token in api_user_tokens):
+        raise TypeError('api_user_tokens must be a tuple of text tokens.')
+    purpose_tokens = get_resource_action_preflight_auth_tokens(
+        required=required)
+    sync_tokens, admin_tokens, data_plane_tokens = (
+        _get_serve_auth_token_rings())
+    other_domains = (api_user_tokens, sync_tokens, admin_tokens,
+                     data_plane_tokens)
+    purpose_set = set(purpose_tokens)
+    if any(not purpose_set.isdisjoint(tokens) for tokens in other_domains):
+        raise AuthTokenConfigurationError(
+            'Resource-action preflight token ring must be disjoint from every '
+            'other authentication trust domain.')
+    return purpose_tokens

@@ -1,8 +1,5 @@
 """Backend: runs on cloud virtual machines, managed by Ray."""
-from collections.abc import Callable
 from collections.abc import Iterable
-from collections.abc import Iterator
-from collections.abc import Sequence
 import contextlib
 import copy
 import dataclasses
@@ -11,6 +8,7 @@ import json
 import math
 import os
 import pathlib
+import pickle
 import random
 import re
 import shlex
@@ -24,12 +22,12 @@ import threading
 import time
 import typing
 from typing import Any, Optional
+import uuid
 
 import colorama
 import psutil
 
 from sky import backends
-from sky import catalog
 from sky import check as sky_check
 from sky import clouds
 from sky import exceptions
@@ -44,6 +42,10 @@ from sky import task as task_lib
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_file_sync
+from sky.backends import cloud_vm_resource_handle_serialization
+from sky.backends import skylet_client
+from sky.backends import skylet_transport
+from sky.backends import system_oom_recovery as backend_system_oom_recovery
 from sky.backends import task_codegen
 from sky.backends import wheel_utils
 from sky.clouds import cloud as sky_cloud
@@ -56,8 +58,10 @@ from sky.container_images import runtime as container_image_runtime
 from sky.dag import DEFAULT_EXECUTION
 from sky.data import storage as storage_lib
 from sky.provision import capacity_cache
+from sky.provision import capacity_policy
 from sky.provision import common as provision_common
 from sky.provision import constants as provision_constants
+from sky.provision import failover_error_policy
 from sky.provision import instance_setup
 from sky.provision import metadata_utils
 from sky.provision import provisioner
@@ -65,12 +69,15 @@ from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
+from sky.serve import system_oom_recovery as serve_system_oom_recovery
+from sky.serve import system_oom_recovery_observability
 from sky.server import common as server_common
 from sky.server.requests import requests as requests_lib
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.skylet import log_lib
+from sky.skylet import system_oom_recovery as skylet_system_oom_recovery
 from sky.usage import usage_lib
 from sky.utils import annotations
 from sky.utils import cluster_utils
@@ -106,15 +113,10 @@ if typing.TYPE_CHECKING:
 
     from sky import dag
     from sky.schemas.generated import autostopv1_pb2
-    from sky.schemas.generated import autostopv1_pb2_grpc
     from sky.schemas.generated import healthv1_pb2
-    from sky.schemas.generated import healthv1_pb2_grpc
     from sky.schemas.generated import jobsv1_pb2
-    from sky.schemas.generated import jobsv1_pb2_grpc
     from sky.schemas.generated import managed_jobsv1_pb2
-    from sky.schemas.generated import managed_jobsv1_pb2_grpc
     from sky.schemas.generated import servev1_pb2
-    from sky.schemas.generated import servev1_pb2_grpc
 else:
     # To avoid requiring grpcio to be installed on the client side.
     grpc = adaptors_common.LazyImport(
@@ -124,23 +126,13 @@ else:
         if not env_options.Options.SHOW_DEBUG_INFO.get() else None)
     autostopv1_pb2 = adaptors_common.LazyImport(
         'sky.schemas.generated.autostopv1_pb2')
-    autostopv1_pb2_grpc = adaptors_common.LazyImport(
-        'sky.schemas.generated.autostopv1_pb2_grpc')
     healthv1_pb2 = adaptors_common.LazyImport(
         'sky.schemas.generated.healthv1_pb2')
-    healthv1_pb2_grpc = adaptors_common.LazyImport(
-        'sky.schemas.generated.healthv1_pb2_grpc')
     jobsv1_pb2 = adaptors_common.LazyImport('sky.schemas.generated.jobsv1_pb2')
-    jobsv1_pb2_grpc = adaptors_common.LazyImport(
-        'sky.schemas.generated.jobsv1_pb2_grpc')
     servev1_pb2 = adaptors_common.LazyImport(
         'sky.schemas.generated.servev1_pb2')
-    servev1_pb2_grpc = adaptors_common.LazyImport(
-        'sky.schemas.generated.servev1_pb2_grpc')
     managed_jobsv1_pb2 = adaptors_common.LazyImport(
         'sky.schemas.generated.managed_jobsv1_pb2')
-    managed_jobsv1_pb2_grpc = adaptors_common.LazyImport(
-        'sky.schemas.generated.managed_jobsv1_pb2_grpc')
 
 Path = str
 
@@ -241,10 +233,6 @@ _TEARDOWN_PURGE_WARNING = (
     'Make sure resources are manually deleted.\n'
     'Details: {details}'
     f'{colorama.Style.RESET_ALL}')
-
-_RSYNC_NOT_FOUND_MESSAGE = (
-    '`rsync` command is not found in the specified image. '
-    'Please use an image with rsync installed.')
 
 _TPU_NOT_FOUND_ERROR = 'ERROR: (gcloud.compute.tpus.delete) NOT_FOUND'
 
@@ -459,462 +447,14 @@ class _ResourcesFeaturesUnsupportedError(Exception):
     """
 
 
-def _add_to_blocked_resources(blocked_resources: set['resources_lib.Resources'],
-                              resources: 'resources_lib.Resources') -> None:
-    # If the resources is already blocked by blocked_resources, we don't need to
-    # add it again to avoid duplicated entries.
-    for r in blocked_resources:
-        if resources.should_be_blocked_by(r):
-            return
-    blocked_resources.add(resources)
-
-
-class FailoverCloudErrorHandlerV1:
-    """Handles errors during provisioning and updates the blocked_resources.
-
-    Deprecated: Newly added cloud should use the FailoverCloudErrorHandlerV2,
-    which is more robust by parsing the errors raised by the cloud's API in a
-    more structured way, instead of directly based on the stdout and stderr.
-    """
-
-    @staticmethod
-    def _handle_errors(stdout: str, stderr: str,
-                       is_error_str_known: Callable[[str], bool]) -> list[str]:
-        stdout_splits = stdout.split('\n')
-        stderr_splits = stderr.split('\n')
-        errors = [
-            s.strip()
-            for s in stdout_splits + stderr_splits
-            if is_error_str_known(s.strip())
-        ]
-        if errors:
-            return errors
-        if 'rsync: command not found' in stderr:
-            with ux_utils.print_exception_no_traceback():
-                e = RuntimeError(_RSYNC_NOT_FOUND_MESSAGE)
-                setattr(e, 'detailed_reason',
-                        f'stdout: {stdout}\nstderr: {stderr}')
-                raise e
-        detailed_reason = textwrap.dedent(f"""\
-        ====== stdout ======
-        {stdout}
-        ====== stderr ======
-        {stderr}
-        """)
-        logger.info('====== stdout ======')
-        print(stdout)
-        logger.info('====== stderr ======')
-        print(stderr)
-        with ux_utils.print_exception_no_traceback():
-            e = RuntimeError('Errors occurred during provision; '
-                             'check logs above.')
-            setattr(e, 'detailed_reason', detailed_reason)
-            raise e
-
-    @staticmethod
-    def _ibm_handler(blocked_resources: set['resources_lib.Resources'],
-                     launchable_resources: 'resources_lib.Resources',
-                     region: 'clouds.Region', zones: list['clouds.Zone'] | None,
-                     stdout: str, stderr: str):
-
-        errors = FailoverCloudErrorHandlerV1._handle_errors(
-            stdout, stderr,
-            lambda x: 'ERR' in x.strip() or 'PANIC' in x.strip())
-
-        logger.warning(f'Got error(s) on IBM cluster, in {region.name}:')
-        messages = '\n\t'.join(errors)
-        style = colorama.Style
-        logger.warning(f'{style.DIM}\t{messages}{style.RESET_ALL}')
-
-        for zone in zones:  # type: ignore[union-attr]
-            _add_to_blocked_resources(blocked_resources,
-                                      launchable_resources.copy(zone=zone.name))
-
-    @staticmethod
-    def update_blocklist_on_error(
-            blocked_resources: set['resources_lib.Resources'],
-            launchable_resources: 'resources_lib.Resources',
-            region: 'clouds.Region', zones: list['clouds.Zone'] | None,
-            stdout: str | None, stderr: str | None) -> bool:
-        """Handles cloud-specific errors and updates the block list.
-
-        This parses textual stdout/stderr because we don't directly use the
-        underlying clouds' SDKs.  If we did that, we could catch proper
-        exceptions instead.
-
-        Returns:
-          definitely_no_nodes_launched: bool, True if definitely no nodes
-            launched (e.g., due to VPC errors we have never sent the provision
-            request), False otherwise.
-        """
-        assert launchable_resources.region == region.name, (
-            launchable_resources, region)
-        if stdout is None:
-            # Gang scheduling failure (head node is definitely up, but some
-            # workers' provisioning failed).  Simply block the zones.
-            assert stderr is None, stderr
-            if zones is not None:
-                for zone in zones:
-                    _add_to_blocked_resources(
-                        blocked_resources,
-                        launchable_resources.copy(zone=zone.name))
-            return False  # definitely_no_nodes_launched
-        assert stdout is not None and stderr is not None, (stdout, stderr)
-
-        # TODO(zongheng): refactor into Cloud interface?
-        cloud = launchable_resources.cloud
-        handler = getattr(FailoverCloudErrorHandlerV1,
-                          f'_{str(cloud).lower()}_handler')
-        if handler is None:
-            raise NotImplementedError(
-                f'Cloud {cloud} unknown, or has not added '
-                'support for parsing and handling provision failures. '
-                'Please implement a handler in FailoverCloudErrorHandlerV1 when'
-                'ray-autoscaler-based provisioner is used for the cloud.')
-        handler(blocked_resources, launchable_resources, region, zones, stdout,
-                stderr)
-
-        stdout_splits = stdout.split('\n')
-        stderr_splits = stderr.split('\n')
-        # Determining whether head node launch *may* have been requested based
-        # on outputs is tricky. We are conservative here by choosing an "early
-        # enough" output line in the following:
-        # https://github.com/ray-project/ray/blob/03b6bc7b5a305877501110ec04710a9c57011479/python/ray/autoscaler/_private/commands.py#L704-L737  # pylint: disable=line-too-long
-        # This is okay, because we mainly want to use the return value of this
-        # func to skip cleaning up never-launched clusters that encountered VPC
-        # errors; their launch should not have printed any such outputs.
-        head_node_launch_may_have_been_requested = any(
-            'Acquiring an up-to-date head node' in line
-            for line in stdout_splits + stderr_splits)
-        # If head node request has definitely not been sent (this happens when
-        # there are errors during node provider "bootstrapping", e.g.,
-        # VPC-not-found errors), then definitely no nodes are launched.
-        definitely_no_nodes_launched = (
-            not head_node_launch_may_have_been_requested)
-
-        return definitely_no_nodes_launched
-
-
-class FailoverCloudErrorHandlerV2:
-    """Handles errors during provisioning and updates the blocked_resources.
-
-    This is a more robust version of FailoverCloudErrorHandlerV1. V2 parses
-    the errors raised by the cloud's API using the exception, instead of the
-    stdout and stderr.
-    """
-
-    @staticmethod
-    def _azure_handler(blocked_resources: set['resources_lib.Resources'],
-                       launchable_resources: 'resources_lib.Resources',
-                       region: 'clouds.Region', zones: list['clouds.Zone'],
-                       err: Exception):
-        del region, zones  # Unused.
-        if '(ReadOnlyDisabledSubscription)' in str(err):
-            logger.info(
-                f'{colorama.Style.DIM}Azure subscription is read-only. '
-                'Skip provisioning on Azure. Please check the subscription set '
-                'with az account set -s <subscription_id>.'
-                f'{colorama.Style.RESET_ALL}')
-            _add_to_blocked_resources(
-                blocked_resources,
-                resources_lib.Resources(cloud=clouds.Azure()))
-        elif 'ClientAuthenticationError' in str(err):
-            _add_to_blocked_resources(
-                blocked_resources,
-                resources_lib.Resources(cloud=clouds.Azure()))
-        else:
-            _add_to_blocked_resources(blocked_resources,
-                                      launchable_resources.copy(zone=None))
-
-    @staticmethod
-    def _gcp_handler(blocked_resources: set['resources_lib.Resources'],
-                     launchable_resources: 'resources_lib.Resources',
-                     region: 'clouds.Region', zones: list['clouds.Zone'],
-                     err: Exception):
-        assert zones and len(zones) == 1, zones
-        zone = zones[0]
-
-        if not isinstance(err, provision_common.ProvisionerError):
-            logger.warning(f'{colorama.Style.DIM}Got an unparsed error: {err}; '
-                           f'blocking resources by its zone {zone.name}'
-                           f'{colorama.Style.RESET_ALL}')
-            _add_to_blocked_resources(blocked_resources,
-                                      launchable_resources.copy(zone=zone.name))
-            return
-        errors = err.errors
-
-        for e in errors:
-            code = e['code']
-            message = e['message']
-
-            if code in ('QUOTA_EXCEEDED', 'quotaExceeded'):
-                if '\'GPUS_ALL_REGIONS\' exceeded' in message:
-                    # Global quota.  All regions in GCP will fail.  Ex:
-                    # Quota 'GPUS_ALL_REGIONS' exceeded.  Limit: 1.0
-                    # globally.
-                    # This skip is only correct if we implement "first
-                    # retry the region/zone of an existing cluster with the
-                    # same name" correctly.
-                    _add_to_blocked_resources(
-                        blocked_resources,
-                        launchable_resources.copy(region=None, zone=None))
-                else:
-                    # Per region.  Ex: Quota 'CPUS' exceeded.  Limit: 24.0
-                    # in region us-west1.
-                    _add_to_blocked_resources(
-                        blocked_resources, launchable_resources.copy(zone=None))
-            elif code in [
-                    'ZONE_RESOURCE_POOL_EXHAUSTED',
-                    'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
-                    'UNSUPPORTED_OPERATION',
-                    'insufficientCapacity',
-            ]:  # Per zone.
-                # Return codes can be found at https://cloud.google.com/compute/docs/troubleshooting/troubleshooting-vm-creation # pylint: disable=line-too-long
-                # However, UNSUPPORTED_OPERATION is observed empirically
-                # when VM is preempted during creation.  This seems to be
-                # not documented by GCP.
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(zone=zone.name))
-            elif code in ['RESOURCE_NOT_READY']:
-                # This code is returned when the VM is still STOPPING.
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(zone=zone.name))
-            elif code in ['RESOURCE_OPERATION_RATE_EXCEEDED']:
-                # This code can happen when the VM is being created with a
-                # machine image, and the VM and the machine image are on
-                # different zones. We already have the retry when calling the
-                # insert API, but if it still fails, we should block the zone
-                # to avoid infinite retry.
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(zone=zone.name))
-            elif code in [3, 8, 9]:
-                # Error code 3 means TPU is preempted during creation.
-                # Example:
-                # {'code': 3, 'message': 'Cloud TPU received a bad request. update is not supported while in state PREEMPTED [EID: 0x73013519f5b7feb2]'} # pylint: disable=line-too-long
-                # Error code 8 means TPU resources is out of
-                # capacity. Example:
-                # {'code': 8, 'message': 'There is no more capacity in the zone "europe-west4-a"; you can try in another zone where Cloud TPU Nodes are offered (see https://cloud.google.com/tpu/docs/regions) [EID: 0x1bc8f9d790be9142]'} # pylint: disable=line-too-long
-                # Error code 9 means TPU resources is insufficient reserved
-                # capacity. Example:
-                # {'code': 9, 'message': 'Insufficient reserved capacity. Contact customer support to increase your reservation. [EID: 0x2f8bc266e74261a]'} # pylint: disable=line-too-long
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(zone=zone.name))
-            elif code == 'RESOURCE_NOT_FOUND':
-                # https://github.com/skypilot-org/skypilot/issues/1797
-                # In the inner provision loop we have used retries to
-                # recover but failed. This indicates this zone is most
-                # likely out of capacity. The provision loop will terminate
-                # any potentially live VMs before moving onto the next
-                # zone.
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(zone=zone.name))
-            elif code == 'VPC_NOT_FOUND':
-                # User has specified a VPC that does not exist. On GCP, VPC is
-                # global. So we skip the entire cloud.
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(region=None, zone=None))
-            elif code == 'SUBNET_NOT_FOUND_FOR_VPC':
-                if (launchable_resources.accelerators is not None and any(
-                        acc.lower().startswith('tpu-v4')
-                        for acc in launchable_resources.accelerators.keys()) and
-                        region.name == 'us-central2'):
-                    # us-central2 is a TPU v4 only region. The subnet for
-                    # this region may not exist when the user does not have
-                    # the TPU v4 quota. We should skip this region.
-                    logger.warning('Please check if you have TPU v4 quotas '
-                                   f'in {region.name}.')
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(region=region.name, zone=None))
-            elif code == 'type.googleapis.com/google.rpc.QuotaFailure':
-                # TPU VM pod specific error.
-                if 'in region' in message:
-                    # Example:
-                    # "Quota 'TPUV2sPreemptiblePodPerProjectPerRegionForTPUAPI'
-                    # exhausted. Limit 32 in region europe-west4"
-                    _add_to_blocked_resources(
-                        blocked_resources,
-                        launchable_resources.copy(region=region.name,
-                                                  zone=None))
-                elif 'in zone' in message:
-                    # Example:
-                    # "Quota 'TPUV2sPreemptiblePodPerProjectPerZoneForTPUAPI'
-                    # exhausted. Limit 32 in zone europe-west4-a"
-                    _add_to_blocked_resources(
-                        blocked_resources,
-                        launchable_resources.copy(zone=zone.name))
-
-            elif 'Requested disk size cannot be smaller than the image size' in message:
-                logger.info('Skipping all regions due to disk size issue.')
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(region=None, zone=None))
-            elif 'Policy update access denied.' in message or code == 'IAM_PERMISSION_DENIED':
-                logger.info(
-                    'Skipping all regions due to service account not '
-                    'having the required permissions and the user '
-                    'account does not have enough permission to '
-                    'update it. Please contact your administrator and '
-                    'check out: https://docs.skypilot.co/en/latest/cloud-setup/cloud-permissions/gcp.html\n'  # pylint: disable=line-too-long
-                    f'Details: {message}')
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(region=None, zone=None))
-            elif 'is not found or access is unauthorized' in message:
-                # Parse HttpError for unauthorized regions. Example:
-                # googleapiclient.errors.HttpError: <HttpError 403 when requesting ... returned "Location us-east1-d is not found or access is unauthorized.". # pylint: disable=line-too-long
-                # Details: "Location us-east1-d is not found or access is
-                # unauthorized.">
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(zone=zone.name))
-            else:
-                logger.debug('Got unparsed error blocking resources by zone: '
-                             f'{e}.')
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(zone=zone.name))
-
-    @staticmethod
-    def _lambda_handler(blocked_resources: set['resources_lib.Resources'],
-                        launchable_resources: 'resources_lib.Resources',
-                        region: 'clouds.Region',
-                        zones: list['clouds.Zone'] | None, error: Exception):
-        output = str(error)
-        # Sometimes, lambda cloud error will list available regions.
-        if output.find('Regions with capacity available:') != -1:
-            for r in catalog.regions('lambda'):
-                if output.find(r.name) == -1:
-                    _add_to_blocked_resources(
-                        blocked_resources,
-                        launchable_resources.copy(region=r.name, zone=None))
-        else:
-            FailoverCloudErrorHandlerV2._default_handler(
-                blocked_resources, launchable_resources, region, zones, error)
-
-    @staticmethod
-    def _aws_handler(blocked_resources: set['resources_lib.Resources'],
-                     launchable_resources: 'resources_lib.Resources',
-                     region: 'clouds.Region', zones: list['clouds.Zone'] | None,
-                     error: Exception) -> None:
-        logger.info(f'AWS handler error: {error}')
-        # Block AWS if the credential has expired.
-        if isinstance(error, exceptions.InvalidCloudCredentials):
-            _add_to_blocked_resources(
-                blocked_resources, resources_lib.Resources(cloud=clouds.AWS()))
-        else:
-            FailoverCloudErrorHandlerV2._default_handler(
-                blocked_resources, launchable_resources, region, zones, error)
-
-    @staticmethod
-    def _scp_handler(blocked_resources: set['resources_lib.Resources'],
-                     launchable_resources: 'resources_lib.Resources',
-                     region: 'clouds.Region', zones: list['clouds.Zone'] | None,
-                     error: Exception) -> None:
-        logger.info(f'SCP handler error: {error}')
-        # Block SCP if the credential has expired.
-        if isinstance(error, exceptions.InvalidCloudCredentials):
-            _add_to_blocked_resources(
-                blocked_resources, resources_lib.Resources(cloud=clouds.SCP()))
-        else:
-            FailoverCloudErrorHandlerV2._default_handler(
-                blocked_resources, launchable_resources, region, zones, error)
-
-    @staticmethod
-    def _default_handler(blocked_resources: set['resources_lib.Resources'],
-                         launchable_resources: 'resources_lib.Resources',
-                         region: 'clouds.Region',
-                         zones: list['clouds.Zone'] | None,
-                         error: Exception) -> None:
-        """Handles cloud-specific errors and updates the block list."""
-        del region  # Unused.
-        logger.debug(
-            f'Got error(s) in {launchable_resources.cloud}:'
-            f'{common_utils.format_exception(error, use_bracket=True)}')
-        if zones is None:
-            _add_to_blocked_resources(blocked_resources,
-                                      launchable_resources.copy(zone=None))
-        else:
-            for zone in zones:
-                _add_to_blocked_resources(
-                    blocked_resources,
-                    launchable_resources.copy(zone=zone.name))
-
-    @staticmethod
-    def update_blocklist_on_error(
-            blocked_resources: set['resources_lib.Resources'],
-            launchable_resources: 'resources_lib.Resources',
-            region: 'clouds.Region', zones: list['clouds.Zone'] | None,
-            error: Exception) -> None:
-        """Handles cloud-specific errors and updates the block list."""
-        cloud = launchable_resources.cloud
-        handler = getattr(FailoverCloudErrorHandlerV2,
-                          f'_{str(cloud).lower()}_handler',
-                          FailoverCloudErrorHandlerV2._default_handler)
-        handler(blocked_resources, launchable_resources, region, zones, error)
-
-
-# AWS error codes used to distinguish physical capacity from regional quota.
-_CAPACITY_ERROR_CODES = frozenset({'InsufficientInstanceCapacity'})
-_QUOTA_ERROR_CODES = frozenset({
-    'VcpuLimitExceeded',
-    'MaxSpotInstanceCountExceeded',
-    'InstanceLimitExceeded',
-})
-_PROVIDER_QUOTA_ERROR_CODES = _QUOTA_ERROR_CODES | frozenset({
-    'QUOTA_EXCEEDED',
-    'quotaExceeded',
-    'type.googleapis.com/google.rpc.QuotaFailure',
-    # The only producer, `sky/provision/gcp/tpu_node.py`, raises this for TPU
-    # quota exhaustion, not for an exhausted pool.
-    'RESOURCE_EXHAUSTED',
-})
-# Codes that identify physical capacity exhaustion across providers, used to
-# label recorded placement outcomes. This is deliberately wider than
-# `_CAPACITY_ERROR_CODES`, which stays AWS-only because it also gates the
-# AWS capacity cache. UNSUPPORTED_OPERATION is excluded: the failover zone
-# blocker treats it as capacity-like, but it is observed on preemption during
-# creation rather than on an exhausted pool.
-# NOTE(fcapponi): GCP also reports zonal TPU exhaustion as the bare numeric
-# operation code 8, which `_provider_error_codes` stringifies to '8'. That
-# token is too collision-prone to put in a cross-provider set; recognizing it
-# needs provider-scoped normalization first.
-_PLACEMENT_CAPACITY_ERROR_CODES = _CAPACITY_ERROR_CODES | frozenset({
-    'ZONE_RESOURCE_POOL_EXHAUSTED',
-    'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
-    'insufficientCapacity',
-    'CapacityExceeded',
-})
-# Codes that report that a request failed without saying why. They are dropped
-# before classification so that a provider which pairs a summary code with the
-# causal one still classifies, while a genuinely unknown code keeps the
-# conservative outcome.
-_NEUTRAL_PLACEMENT_ERROR_CODES = frozenset({'VM_MIN_COUNT_NOT_REACHED'})
-# Cache-gating code sets, scoped per provider. These decide whether a failure
-# suppresses a later launch, so each provider only ever matches its own codes.
-_GCP_CAPACITY_ERROR_CODES = frozenset({
-    'ZONE_RESOURCE_POOL_EXHAUSTED',
-    'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
-    'insufficientCapacity',
-    'CapacityExceeded',
-})
-_GCP_QUOTA_ERROR_CODES = frozenset({
-    'QUOTA_EXCEEDED',
-    'quotaExceeded',
-    'RESOURCE_EXHAUSTED',
-    'type.googleapis.com/google.rpc.QuotaFailure',
-})
-# Terminal optimizer exhaustion can nest per-location failover histories.
-# Bound defensive traversal so malformed or cyclic exception graphs remain
-# conservatively unclassified instead of consuming unbounded controller work.
-_MAX_TERMINAL_FAILOVER_HISTORY_DEPTH = 32
-_MAX_TERMINAL_FAILOVER_HISTORY_NODES = 1024
+# Direct aliases preserve historical imports, monkeypatching, and pickle lookup
+# while provider failure policy is owned by the provision package.
+_RSYNC_NOT_FOUND_MESSAGE = (failover_error_policy._RSYNC_NOT_FOUND_MESSAGE)  # pylint: disable=protected-access
+_add_to_blocked_resources = (failover_error_policy._add_to_blocked_resources)  # pylint: disable=protected-access
+FailoverCloudErrorHandlerV1 = (
+    failover_error_policy.FailoverCloudErrorHandlerV1)
+FailoverCloudErrorHandlerV2 = (
+    failover_error_policy.FailoverCloudErrorHandlerV2)
 
 
 def _record_capacity_metric(reason: str, action: str) -> None:
@@ -928,191 +468,58 @@ def _record_capacity_metric(reason: str, action: str) -> None:
                      f'{common_utils.format_exception(e)}')
 
 
-def _iter_error_chain(error: BaseException) -> Iterable[BaseException]:
-    """Yields explicit exception causes, excluding implicit context."""
-    seen: set[int] = set()
-    exc: BaseException | None = error
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        yield exc
-        exc = exc.__cause__
+# Direct aliases preserve the historical backend import and pickle identities
+# while capacity policy is owned by the provision package.
+_CAPACITY_ERROR_CODES = capacity_policy._CAPACITY_ERROR_CODES  # pylint: disable=protected-access
+_QUOTA_ERROR_CODES = capacity_policy._QUOTA_ERROR_CODES  # pylint: disable=protected-access
+_PROVIDER_QUOTA_ERROR_CODES = capacity_policy._PROVIDER_QUOTA_ERROR_CODES  # pylint: disable=protected-access
+_PLACEMENT_CAPACITY_ERROR_CODES = capacity_policy._PLACEMENT_CAPACITY_ERROR_CODES  # pylint: disable=protected-access
+_NEUTRAL_PLACEMENT_ERROR_CODES = capacity_policy._NEUTRAL_PLACEMENT_ERROR_CODES  # pylint: disable=protected-access
+_GCP_CAPACITY_ERROR_CODES = capacity_policy._GCP_CAPACITY_ERROR_CODES  # pylint: disable=protected-access
+_GCP_QUOTA_ERROR_CODES = capacity_policy._GCP_QUOTA_ERROR_CODES  # pylint: disable=protected-access
+_MAX_TERMINAL_FAILOVER_HISTORY_DEPTH = (
+    capacity_policy._MAX_TERMINAL_FAILOVER_HISTORY_DEPTH)  # pylint: disable=protected-access
+_MAX_TERMINAL_FAILOVER_HISTORY_NODES = (
+    capacity_policy._MAX_TERMINAL_FAILOVER_HISTORY_NODES)  # pylint: disable=protected-access
+_GCP_IDENTITY_PROJECT_RE = capacity_policy._GCP_IDENTITY_PROJECT_RE  # pylint: disable=protected-access
+_iter_error_chain = capacity_policy._iter_error_chain  # pylint: disable=protected-access
+_provider_error_codes = capacity_policy._provider_error_codes  # pylint: disable=protected-access
+_classify_capacity_error = capacity_policy._classify_capacity_error  # pylint: disable=protected-access
+_terminal_failover_leaves = capacity_policy._terminal_failover_leaves  # pylint: disable=protected-access
+_terminal_leaf_cause_nodes = capacity_policy._terminal_leaf_cause_nodes  # pylint: disable=protected-access
+classify_resources_unavailable_error = (
+    capacity_policy.classify_resources_unavailable_error)
+_is_quota_error = capacity_policy._is_quota_error  # pylint: disable=protected-access
+_canonical_accelerators = capacity_policy._canonical_accelerators  # pylint: disable=protected-access
+_capacity_cache_cloud_name = capacity_policy._capacity_cache_cloud_name  # pylint: disable=protected-access
+_capacity_cache_account = capacity_policy._capacity_cache_account  # pylint: disable=protected-access
+_capacity_cache_key = capacity_policy._capacity_cache_key  # pylint: disable=protected-access
+_quota_cooldown_key = capacity_policy._quota_cooldown_key  # pylint: disable=protected-access
+_fully_created_fresh_demand = capacity_policy._fully_created_fresh_demand  # pylint: disable=protected-access
+_failure_requested_full_demand = capacity_policy._failure_requested_full_demand  # pylint: disable=protected-access
+_placement_error_code = capacity_policy._placement_error_code  # pylint: disable=protected-access
+_placement_outcome = capacity_policy._placement_outcome  # pylint: disable=protected-access
 
-
-def _provider_error_codes(error: BaseException) -> list[str]:
-    """Return structured provider codes from the explicit exception chain."""
-    codes: list[str] = []
-    for exc in _iter_error_chain(error):
-        errors = getattr(exc, 'errors', None)
-        if isinstance(errors, list):
-            codes.extend(
-                str(item['code'])
-                for item in errors
-                if isinstance(item, dict) and item.get('code') is not None)
-        response = getattr(exc, 'response', None)
-        if not isinstance(response, dict):
-            continue
-        error_payload = response.get('Error')
-        if isinstance(error_payload, dict):
-            code = error_payload.get('Code')
-            if code is not None:
-                codes.append(str(code))
-    return codes
-
-
-def _classify_capacity_error(cloud: 'clouds.Cloud',
-                             error: BaseException) -> str | None:
-    """Classifies a provider failure using structured codes only.
-
-    A provisioner records every failed create attempt on a
-    ``ProvisionerError``. A batch is classified only when every code is a known
-    capacity/quota code for that provider. Quota dominates a mixed known batch
-    because it is regional; any unknown code takes the conservative normal
-    failover path.
-
-    Codes are matched per provider so one cloud's capacity code can never
-    classify another cloud's failure.
-    """
-    if isinstance(cloud, clouds.AWS):
-        capacity_codes = _CAPACITY_ERROR_CODES
-        quota_codes = _QUOTA_ERROR_CODES
-    elif isinstance(cloud, clouds.GCP):
-        capacity_codes = _GCP_CAPACITY_ERROR_CODES
-        quota_codes = _GCP_QUOTA_ERROR_CODES
-    else:
-        return None
-    # GCP pairs the causal code with a `VM_MIN_COUNT_NOT_REACHED` summary that
-    # says only that the request failed. Dropping it keeps the all-known check
-    # meaningful without weakening it for a genuinely unknown code.
-    neutral_codes = (_NEUTRAL_PLACEMENT_ERROR_CODES if isinstance(
-        cloud, clouds.GCP) else frozenset())
-    codes = [
-        code for code in _provider_error_codes(error)
-        if code not in neutral_codes
-    ]
-    known_codes = capacity_codes | quota_codes
-    if codes and all(code in known_codes for code in codes):
-        # A quota denial is regional and makes sibling-zone attempts for this
-        # demand futile, so it dominates an otherwise-known capacity/quota
-        # aggregate. Unknown codes remain unclassified and take the normal,
-        # conservative failover path.
-        if any(code in quota_codes for code in codes):
-            return 'quota'
-        return 'capacity'
-    return None
-
-
-def _terminal_failover_leaves(
-    error: exceptions.ResourcesUnavailableError,
-) -> tuple[list[tuple[BaseException, int]], int] | None:
-    """Flatten nested terminal failover histories conservatively.
-
-    ``_retry_zones()`` records provider failures in one
-    ``ResourcesUnavailableError``. Cross-location optimizer exhaustion wraps
-    that error in another terminal history. Preserve path-local ancestry so a
-    shared leaf may appear in independent branches while a real history cycle,
-    malformed entry, or excessive graph remains unclassified.
-    """
-    pending: list[tuple[BaseException, frozenset[int],
-                        int]] = [(error, frozenset(), 0)]
-    leaves: list[tuple[BaseException, int]] = []
-    visited = 0
-    while pending:
-        failure, ancestors, depth = pending.pop()
-        visited += 1
-        if visited > _MAX_TERMINAL_FAILOVER_HISTORY_NODES:
-            return None
-        history = None
-        if isinstance(failure, exceptions.ResourcesUnavailableError):
-            history = failure.failover_history
-            # Require the built-in type: a list subclass can override
-            # iteration or length and hide an unknown child.
-            if type(history) is not list:
-                return None
-        if history:
-            identity = id(failure)
-            if (identity in ancestors or
-                    depth >= _MAX_TERMINAL_FAILOVER_HISTORY_DEPTH):
-                return None
-            # Account for already-queued nodes before scanning this fanout.
-            # ``len(list)`` is constant-time, so an adversarially wide history
-            # is rejected without allocating one pending tuple per child.
-            remaining_nodes = (_MAX_TERMINAL_FAILOVER_HISTORY_NODES - visited -
-                               len(pending))
-            if len(history) > remaining_nodes:
-                return None
-            next_ancestors = ancestors | {identity}
-            for nested in reversed(history):
-                if not isinstance(nested, BaseException):
-                    return None
-                pending.append((nested, next_ancestors, depth + 1))
-            continue
-        leaves.append((failure, depth))
-    return leaves, visited
-
-
-def _terminal_leaf_cause_nodes(failure: BaseException, *, history_depth: int,
-                               remaining_nodes: int) -> int | None:
-    """Validate one leaf's explicit cause chain within terminal bounds."""
-    seen = {id(failure)}
-    cause = failure.__cause__
-    cause_nodes = 0
-    depth = history_depth
-    while cause is not None:
-        identity = id(cause)
-        cause_nodes += 1
-        depth += 1
-        if (identity in seen or cause_nodes > remaining_nodes or
-                depth > _MAX_TERMINAL_FAILOVER_HISTORY_DEPTH):
-            return None
-        seen.add(identity)
-        # A history-bearing terminal wrapper is an internal attempt node, not
-        # a valid member of one leaf's explicit cause chain. Treat this
-        # malformed mixed graph conservatively instead of choosing one edge.
-        if isinstance(cause, exceptions.ResourcesUnavailableError):
-            if type(cause.failover_history) is not list:
-                return None
-            if cause.failover_history:
-                return None
-        cause = cause.__cause__
-    return cause_nodes
-
-
-def classify_resources_unavailable_error(
-        cloud: 'clouds.Cloud',
-        error: exceptions.ResourcesUnavailableError) -> str | None:
-    """Classify a terminal failover history using typed provider evidence.
-
-    Every recorded attempt must be recognizable as capacity or quota.  A
-    mixed or unstructured history is intentionally left unclassified so
-    caller-local placement policy does not bench a healthy location for an
-    authentication, networking, throttling, or controller error.
-    """
-    traversal = _terminal_failover_leaves(error)
-    if traversal is None:
-        return None
-    failures, visited = traversal
-    reasons: list[str] = []
-    for failure, history_depth in failures:
-        cause_nodes = _terminal_leaf_cause_nodes(
-            failure,
-            history_depth=history_depth,
-            remaining_nodes=_MAX_TERMINAL_FAILOVER_HISTORY_NODES - visited)
-        if cause_nodes is None:
-            return None
-        visited += cause_nodes
-        reason = _classify_capacity_error(cloud, failure)
-        if reason is None:
-            return None
-        reasons.append(reason)
-    if not reasons:
-        return None
-    return 'quota' if 'quota' in reasons else 'capacity'
-
-
-def _is_quota_error(error: BaseException) -> bool:
-    """Whether an exception chain contains a recognized provider quota code."""
-    return any(code in _PROVIDER_QUOTA_ERROR_CODES
-               for code in _provider_error_codes(error))
+for _capacity_policy_symbol in (
+        _iter_error_chain,
+        _provider_error_codes,
+        _classify_capacity_error,
+        _terminal_failover_leaves,
+        _terminal_leaf_cause_nodes,
+        classify_resources_unavailable_error,
+        _is_quota_error,
+        _canonical_accelerators,
+        _capacity_cache_cloud_name,
+        _capacity_cache_account,
+        _capacity_cache_key,
+        _quota_cooldown_key,
+        _fully_created_fresh_demand,
+        _failure_requested_full_demand,
+        _placement_error_code,
+        _placement_outcome,
+):
+    _capacity_policy_symbol.__module__ = __name__
+del _capacity_policy_symbol
 
 
 def _record_insufficient_quota_notification(
@@ -1145,78 +552,6 @@ def _record_insufficient_quota_notification(
         return False
 
 
-def _canonical_accelerators(to_provision: 'resources_lib.Resources') -> str:
-    """Returns a stable string for the requested accelerators.
-
-    A machine type does not always determine the accelerator (GCP's N1 family
-    attaches them separately), so the accelerator has to be part of any key
-    that suppresses a later launch.
-    """
-    accelerators = to_provision.accelerators or {}
-    return ','.join(
-        f'{name}:{count}' for name, count in sorted(accelerators.items()))
-
-
-def _capacity_cache_cloud_name(
-        to_provision: 'resources_lib.Resources') -> str | None:
-    """Returns the cache-eligible cloud name, or None when not eligible."""
-    if isinstance(to_provision.cloud, clouds.AWS):
-        return 'aws'
-    if isinstance(to_provision.cloud, clouds.GCP):
-        # Enabled by default, with `provision.gcp_capacity_cache: false` as the
-        # escape hatch. Setting it false means no key is built, so nothing is
-        # ever written or read and behavior returns to pre-cache provisioning.
-        if skypilot_config.get_nested(('provision', 'gcp_capacity_cache'),
-                                      True):
-            return 'gcp'
-    return None
-
-
-_GCP_IDENTITY_PROJECT_RE = re.compile(r'\[project_id=([^\]]+)\]')
-
-
-def _capacity_cache_account(
-        cloud: Optional['clouds.Cloud'],
-        cloud_user_identity: list[str] | None) -> str | None:
-    """Returns the account that scopes cache keys, or None to skip caching.
-
-    Hints must never be shared across accounts, so a cloud whose identity
-    cannot be resolved simply does not participate. No extra provider call is
-    made: the identity has already been fetched for this provisioning attempt.
-    """
-    if not cloud_user_identity:
-        return None
-    identity = str(cloud_user_identity[-1])
-    if isinstance(cloud, clouds.AWS):
-        return identity
-    if isinstance(cloud, clouds.GCP):
-        # GCP formats its identity as `<account> [project_id=<project>]`. Only
-        # the project scopes capacity, and taking it alone keeps the user's
-        # email address out of the cache key.
-        match = _GCP_IDENTITY_PROJECT_RE.search(identity)
-        return match.group(1) if match is not None else None
-    return None
-
-
-def _capacity_cache_key(
-        to_provision: 'resources_lib.Resources', region: 'clouds.Region',
-        zones: list['clouds.Zone'] | None, num_nodes: int,
-        account: str | None) -> Optional['capacity_cache.ResourceKey']:
-    """Returns a key only for the exact, safe-to-cache incident path."""
-    cloud_name = _capacity_cache_cloud_name(to_provision)
-    if (cloud_name is None or not to_provision.use_spot or zones is None or
-            len(zones) != 1 or not account or not to_provision.instance_type):
-        return None
-    return capacity_cache.ResourceKey(
-        cloud=cloud_name,
-        account=account,
-        region=region.name,
-        zone=zones[0].name,
-        instance_type=to_provision.instance_type,
-        accelerators=_canonical_accelerators(to_provision),
-        num_nodes=num_nodes)
-
-
 def _capacity_cache_exhausted_zone_names(
         to_provision: 'resources_lib.Resources', region: 'clouds.Region',
         zones: list['clouds.Zone'] | None, num_nodes: int,
@@ -1236,24 +571,6 @@ def _capacity_cache_exhausted_zone_names(
     return {active_key.zone for active_key in active}
 
 
-def _quota_cooldown_key(
-        to_provision: 'resources_lib.Resources', region: 'clouds.Region',
-        num_nodes: int,
-        account: str | None) -> Optional['capacity_cache.QuotaCooldownKey']:
-    """Returns a demand-specific key for a brief Spot quota cooldown."""
-    cloud_name = _capacity_cache_cloud_name(to_provision)
-    if (cloud_name is None or not to_provision.use_spot or not account or
-            not to_provision.instance_type):
-        return None
-    return capacity_cache.QuotaCooldownKey(
-        cloud=cloud_name,
-        account=account,
-        region=region.name,
-        instance_type=to_provision.instance_type,
-        accelerators=_canonical_accelerators(to_provision),
-        num_nodes=num_nodes)
-
-
 def _quota_cooldown_is_active(
         key: Optional['capacity_cache.QuotaCooldownKey']) -> bool:
     if key is None:
@@ -1267,26 +584,6 @@ def _quota_cooldown_is_active(
         return False
     _record_capacity_metric('quota', 'hit' if active else 'miss')
     return active
-
-
-def _fully_created_fresh_demand(
-        provision_record: 'provision_common.ProvisionRecord', num_nodes: int,
-        cluster_exists: bool) -> bool:
-    """Whether success proves capacity/quota for the full requested demand."""
-    return (not cluster_exists and
-            len(provision_record.created_instance_ids) == num_nodes)
-
-
-def _failure_requested_full_demand(error: BaseException,
-                                   num_nodes: int) -> bool:
-    """Whether provider metadata proves the failed request covered all nodes."""
-    requested_counts = []
-    for exc in _iter_error_chain(error):
-        requested_count = getattr(exc, 'requested_count', None)
-        if isinstance(requested_count, int):
-            requested_counts.append(requested_count)
-    return bool(requested_counts) and all(
-        count == num_nodes for count in requested_counts)
 
 
 def _get_workload_attribution(
@@ -1333,36 +630,6 @@ def _get_image_demand_attribution(
     """Collapses physical launches onto one logical image target owner."""
     return container_image_consumers.derive(task, cluster_name, workload_type,
                                             launch_context)
-
-
-def _placement_error_code(error: BaseException) -> str | None:
-    """Return the first structured provider error code in an exception."""
-    codes = _provider_error_codes(error)
-    return codes[0] if codes else None
-
-
-def _placement_outcome(error: Exception,
-                       capacity_reason: str | None = None) -> str:
-    if capacity_reason is not None:
-        return f'{capacity_reason}_failed'
-    if _is_quota_error(error):
-        return 'quota_failed'
-    # Every code is examined, not just the first: GCP's bulk insert reports
-    # the generic VM_MIN_COUNT_NOT_REACHED summary ahead of the code that
-    # says why the minimum was not reached. Quota is checked above, so a
-    # mixed batch still reports the regional quota denial.
-    #
-    # Requiring every remaining code to be a capacity code keeps the
-    # conservative reading of a heterogeneous batch: AWS retries each subnet
-    # and appends one entry per distinct failure, so an aggregate that mixes
-    # capacity with an unrelated error is not capacity exhaustion.
-    codes = [
-        code for code in _provider_error_codes(error)
-        if code not in _NEUTRAL_PLACEMENT_ERROR_CODES
-    ]
-    if codes and all(code in _PLACEMENT_CAPACITY_ERROR_CODES for code in codes):
-        return 'capacity_failed'
-    return 'failed'
 
 
 def _record_service_placement_event(
@@ -1506,11 +773,88 @@ class RetryingVmProvisioner:
         self._is_launched_by_jobs_controller = is_launched_by_jobs_controller
         self._workload_type = workload_type
         self._active_cluster_hash: str | None = None
+        self._fresh_provision_evidence_lease: (
+            backend_system_oom_recovery.FreshProvisionEvidenceLease |
+            None) = None
 
     @property
     def active_cluster_hash(self) -> str | None:
         """Returns the cluster generation owned by this provisioning run."""
         return self._active_cluster_hash
+
+    def release_fresh_provision_evidence_lease(
+        self,
+    ) -> backend_system_oom_recovery.FreshProvisionEvidenceLease | None:
+        """Move this provisioner's one-shot evidence lease to its backend."""
+        lease = getattr(self, '_fresh_provision_evidence_lease', None)
+        self._fresh_provision_evidence_lease = None
+        return lease
+
+    def _reset_fresh_provision_evidence(self) -> None:
+        """Invalidate any unreleased proof held by this provisioner."""
+        lease = getattr(self, '_fresh_provision_evidence_lease', None)
+        self._fresh_provision_evidence_lease = None
+        if lease is not None:
+            lease.take()
+
+    def _record_fresh_provision_evidence(
+        self,
+        provision_record: provision_common.ProvisionRecord,
+        handle: 'CloudVmRayResourceHandle',
+        *,
+        requested_node_count: int,
+        cluster_existed: bool,
+        dryrun: bool,
+        cloud_user_identity: list[str] | None,
+    ) -> None:
+        """Capture one exact full-create result in a one-shot lease."""
+        self._reset_fresh_provision_evidence()
+        launch_context = self._extra_launch_context or {}
+        service_name = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        service_hash = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        cloud = handle.launched_resources.cloud
+        if (self._workload_type != 'service' or
+                not isinstance(service_name, str) or not service_name or
+                not isinstance(service_hash, str) or not service_hash or
+                self._active_cluster_hash is None or cloud is None):
+            return
+        try:
+            evidence_factory = (backend_system_oom_recovery.
+                                FreshProvisionEvidence.from_provision_record)
+            instance_type = handle.launched_resources.instance_type
+            if instance_type is None:
+                return
+            _, catalog_memory_gib = cloud.get_vcpus_mem_from_instance_type(
+                instance_type)
+            if catalog_memory_gib is None:
+                return
+            evidence = evidence_factory(
+                provision_record,
+                request_id=common_utils.get_current_request_id(),
+                workspace=skypilot_config.get_active_workspace(),
+                cluster_name=handle.cluster_name,
+                cluster_name_on_cloud=handle.cluster_name_on_cloud,
+                cluster_hash=self._active_cluster_hash,
+                provider_name=cloud.canonical_name(),
+                requested_node_count=requested_node_count,
+                service_name=service_name,
+                service_hash=service_hash,
+                cloud_user_identity=cloud_user_identity,
+                catalog_instance_type=instance_type,
+                catalog_memory_gib=catalog_memory_gib,
+                cluster_existed=cluster_existed,
+                dryrun=dryrun,
+                provisioning_skipped=False)
+        except Exception as error:  # pylint: disable=broad-except
+            # Provisioning itself succeeded and retains its established
+            # capacity/leadership behavior.  Only optional recovery is lost.
+            logger.debug('System-OOM fresh-provision evidence was not created: '
+                         f'{common_utils.format_exception(error)}')
+            return
+        self._fresh_provision_evidence_lease = (
+            backend_system_oom_recovery.FreshProvisionEvidenceLease(evidence))
 
     def _yield_zones(
             self, to_provision: resources_lib.Resources, num_nodes: int,
@@ -1854,16 +1198,15 @@ class RetryingVmProvisioner:
             # Let the registered Provisioner (if any) override the cluster
             # config template by returning a ``TemplateSpec``; otherwise
             # fall back to the default template for the cloud.
-            plugin = provision_lib.get_registered_provisioner(
+            template_override = provision_lib.get_provisioner_template_override(
                 to_provision.cloud.canonical_name())
-            template_spec = (plugin.template_override(
+            template_spec = (template_override(
                 task,
                 to_provision,
                 _extra_launch_context=self._extra_launch_context,
                 _is_launched_by_jobs_controller=self.
                 _is_launched_by_jobs_controller,
-            ) if plugin is not None and plugin.template_override is not None
-                             else None)
+            ) if template_override is not None else None)
             if template_spec is not None:
                 template = template_spec.template_path
                 extra_vars = template_spec.variables
@@ -2051,17 +1394,26 @@ class RetryingVmProvisioner:
                                     f'{region.name}{colorama.Style.RESET_ALL}'
                                     f'{zone_str}.'))
                         assert handle.cluster_yaml is not None
-                        provision_record = provisioner.bulk_provision(
-                            to_provision.cloud,
-                            region,
-                            zones,
+                        bulk_provision_fn = provisioner.bulk_provision
+                        builtin_bulk_provision_fn = getattr(
+                            provisioner, '_BUILTIN_BULK_PROVISION', None)
+                        bulk_provision_kwargs: dict[str, Any] = {
+                            'num_nodes': num_nodes,
+                            'cluster_yaml': handle.cluster_yaml,
+                            'prev_cluster_ever_up': prev_cluster_ever_up,
+                            'log_dir': self.log_dir,
+                            'ports_to_open_on_launch': ports_to_open_on_launch,
+                        }
+                        if (builtin_bulk_provision_fn is not None and
+                                bulk_provision_fn is builtin_bulk_provision_fn):
+                            assert self._active_cluster_hash is not None
+                            bulk_provision_kwargs['cluster_incarnation'] = (
+                                self._active_cluster_hash)
+                        provision_record = bulk_provision_fn(
+                            to_provision.cloud, region, zones,
                             resources_utils.ClusterName(
                                 cluster_name, handle.cluster_name_on_cloud),
-                            num_nodes=num_nodes,
-                            cluster_yaml=handle.cluster_yaml,
-                            prev_cluster_ever_up=prev_cluster_ever_up,
-                            log_dir=self.log_dir,
-                            ports_to_open_on_launch=ports_to_open_on_launch)
+                            **bulk_provision_kwargs)
                         # NOTE: We will handle the logic of '_ensure_cluster_ray_started'
                         # in 'provision_utils.post_provision_runtime_setup()' in the
                         # caller.
@@ -2074,6 +1426,13 @@ class RetryingVmProvisioner:
                         config_dict['provision_record'] = provision_record
                         config_dict['resources_vars'] = resources_vars
                         config_dict['handle'] = handle
+                        self._record_fresh_provision_evidence(
+                            provision_record,
+                            handle,
+                            requested_node_count=num_nodes,
+                            cluster_existed=cluster_exists,
+                            dryrun=dryrun,
+                            cloud_user_identity=cloud_user_identity)
                         # A full fresh create proves that this exact demand can
                         # launch now. Reusing orphaned/resumed nodes, or only
                         # creating the missing subset, proves neither the
@@ -2520,7 +1879,7 @@ class RetryingVmProvisioner:
             if retry_cnt > 1:
                 sleep = backoff.current_backoff()
                 logger.info(f'Retrying launching in {sleep:.1f} seconds.')
-                time.sleep(sleep)
+                context_utils.sleep_with_cancellation(sleep)
             # TODO(zhwu): when we retry ray up, it is possible that the ray
             # cluster fail to start because --no-restart flag is used.
             ray_up_return_value = ray_up()
@@ -2615,7 +1974,7 @@ class RetryingVmProvisioner:
             # Retry until ray status is ready. This is to avoid the case where
             # ray cluster is just started but the ray status is not ready yet.
             logger.info('Waiting for ray cluster to be ready remotely.')
-            time.sleep(1)
+            context_utils.sleep_with_cancellation(1)
             returncode, output, _ = backend.run_on_head(
                 handle,
                 instance_setup.RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND,
@@ -2662,6 +2021,7 @@ class RetryingVmProvisioner:
         prev_cluster_status = to_provision_config.prev_cluster_status
         prev_handle = to_provision_config.prev_handle
         prev_cluster_ever_up = to_provision_config.prev_cluster_ever_up
+        self._reset_fresh_provision_evidence()
         self._active_cluster_hash = to_provision_config.prev_cluster_hash
         launchable_retries_disabled = (self._dag is None or
                                        self._optimize_target is None)
@@ -2920,6 +2280,106 @@ class RetryingVmProvisioner:
 class SSHTunnelInfo:
     port: int
     pid: int
+    generation: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _OwnedSkyletTunnelProcessV1:
+    """An exact process identity owned by this Python process."""
+
+    pid: int
+    process: psutil.Process
+
+
+_skylet_tunnel_process_ownership_pid = os.getpid()
+_skylet_tunnel_process_ownership_lock = threading.Lock()
+_skylet_tunnel_process_ownership: dict[str, _OwnedSkyletTunnelProcessV1] = {}
+
+
+def _reset_skylet_tunnel_process_ownership_after_fork() -> None:
+    """Drops inherited process authority and replaces the inherited lock."""
+    global _skylet_tunnel_process_ownership_pid
+    global _skylet_tunnel_process_ownership_lock
+    global _skylet_tunnel_process_ownership
+    _skylet_tunnel_process_ownership_pid = os.getpid()
+    _skylet_tunnel_process_ownership_lock = threading.Lock()
+    _skylet_tunnel_process_ownership = {}
+
+
+def _ensure_skylet_tunnel_process_ownership_pid() -> None:
+    if _skylet_tunnel_process_ownership_pid != os.getpid():
+        # Never acquire an inherited lock: another thread may have held it at
+        # fork time. Replacing both the lock and registry also drops all
+        # inherited signal authority.
+        _reset_skylet_tunnel_process_ownership_after_fork()
+
+
+def _register_skylet_tunnel_process(generation: str, pid: int) -> None:
+    """Registers a newly opened tunnel's exact psutil process identity."""
+    process = psutil.Process(pid)
+    _ensure_skylet_tunnel_process_ownership_pid()
+    with _skylet_tunnel_process_ownership_lock:
+        if generation in _skylet_tunnel_process_ownership:
+            raise RuntimeError(
+                f'Duplicate Skylet tunnel generation {generation!r}.')
+        _skylet_tunnel_process_ownership[generation] = (
+            _OwnedSkyletTunnelProcessV1(pid=pid, process=process))
+
+
+def _take_skylet_tunnel_process(
+        tunnel_info: SSHTunnelInfo) -> psutil.Process | None:
+    """Consumes signal authority for an exact generation and PID match."""
+    _ensure_skylet_tunnel_process_ownership_pid()
+    with _skylet_tunnel_process_ownership_lock:
+        owned = _skylet_tunnel_process_ownership.get(tunnel_info.generation)
+        if owned is None or owned.pid != tunnel_info.pid:
+            return None
+        del _skylet_tunnel_process_ownership[tunnel_info.generation]
+        return owned.process
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(
+        after_in_child=_reset_skylet_tunnel_process_ownership_after_fork)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _SkyletTunnelStateV1:
+    """A decoded tunnel bound to its same-row cluster observation."""
+
+    observed: global_user_state.ClusterSkyletSSHTunnelSnapshotV1
+    tunnel: SSHTunnelInfo | None
+
+
+def _decode_skylet_ssh_tunnel_metadata(metadata: object) -> SSHTunnelInfo:
+    """Strictly decodes the persisted pair or generation-bearing triple."""
+    if type(metadata) is not tuple or len(metadata) not in (2, 3):
+        raise ValueError('Skylet SSH tunnel metadata must be a pair or triple.')
+
+    port, pid = metadata[:2]
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError('Skylet SSH tunnel port must be an integer from 1 to '
+                         '65535.')
+    if type(pid) is not int or not 1 <= pid <= 2**31 - 1:
+        raise ValueError('Skylet SSH tunnel PID must be an integer from 1 to '
+                         '2147483647.')
+
+    if len(metadata) == 2:
+        generation = f'legacy:{pid}:{port}'
+    else:
+        generation = metadata[2]
+        if type(generation) is not str:
+            raise ValueError('Skylet SSH tunnel generation must be text.')
+        try:
+            parsed_generation = uuid.UUID(generation)
+        except (AttributeError, ValueError) as e:
+            raise ValueError(
+                'Skylet SSH tunnel generation must be a canonical UUID.') from e
+        if str(parsed_generation) != generation:
+            raise ValueError(
+                'Skylet SSH tunnel generation must be a canonical UUID.')
+
+    return SSHTunnelInfo(port=port, pid=pid, generation=generation)
 
 
 def _is_tunnel_healthy(tunnel: SSHTunnelInfo) -> bool:
@@ -3360,42 +2820,100 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                                                     cluster_config_file)
         self.docker_user = docker_user
 
-    def _get_skylet_ssh_tunnel(self) -> SSHTunnelInfo | None:
-        metadata = global_user_state.get_cluster_skylet_ssh_tunnel_metadata(
+    def _get_skylet_ssh_tunnel_state(self) -> _SkyletTunnelStateV1:
+        """Reads and strictly decodes one same-row tunnel observation."""
+        observed = global_user_state.get_cluster_skylet_ssh_tunnel_snapshot(
             self.cluster_name)
-        if metadata is None:
-            return None
-        return SSHTunnelInfo(port=metadata[0], pid=metadata[1])
+        if observed is None:
+            raise exceptions.SkyletUnavailableError(
+                f'Cluster row {self.cluster_name!r} is unavailable while '
+                'opening the Skylet tunnel.')
+        if observed.metadata is None:
+            return _SkyletTunnelStateV1(observed=observed, tunnel=None)
+        try:
+            tunnel = _decode_skylet_ssh_tunnel_metadata(observed.metadata)
+        except (TypeError, ValueError) as e:
+            raise exceptions.SkyletUnavailableError(
+                f'Cluster {self.cluster_name!r} has malformed Skylet SSH '
+                'tunnel metadata.') from e
+        return _SkyletTunnelStateV1(observed=observed, tunnel=tunnel)
 
-    def _set_skylet_ssh_tunnel(self, tunnel: SSHTunnelInfo | None) -> None:
-        global_user_state.set_cluster_skylet_ssh_tunnel_metadata(
-            self.cluster_name,
-            (tunnel.port, tunnel.pid) if tunnel is not None else None)
+    def _get_skylet_ssh_tunnel(self) -> SSHTunnelInfo | None:
+        """Compatibility facade for tests and read-only legacy callers."""
+        return self._get_skylet_ssh_tunnel_state().tunnel
 
-    def close_skylet_ssh_tunnel(self) -> None:
-        """Terminate the SSH tunnel process and clear its metadata."""
-        tunnel = self._get_skylet_ssh_tunnel()
+    def close_skylet_ssh_tunnel(
+        self,) -> skylet_transport.TunnelMutationResult | None:
+        """CAS-clear metadata before terminating the exact observed process."""
+        tunnel_state = self._get_skylet_ssh_tunnel_state()
+        tunnel = tunnel_state.tunnel
         if tunnel is None:
-            return
+            return None
+        if tunnel_state.observed.cluster_hash is None:
+            return (skylet_transport.TunnelMutationResult.
+                    UNFENCED_CLUSTER_INCARNATION)
+
         logger.debug('Closing Skylet SSH tunnel for cluster %r on port %d',
                      self.cluster_name, tunnel.port)
-        try:
+        outcome = (global_user_state.
+                   compare_and_set_cluster_skylet_ssh_tunnel_metadata(
+                       self.cluster_name,
+                       observed=tunnel_state.observed,
+                       replacement=None,
+                   ))
+        if outcome is skylet_transport.TunnelMutationResult.UPDATED:
             self._terminate_ssh_tunnel_process(tunnel)
-        finally:
-            self._set_skylet_ssh_tunnel(None)
+        return outcome
+
+    @staticmethod
+    def _make_grpc_channel_snapshot(
+        tunnel_state: _SkyletTunnelStateV1,
+    ) -> skylet_transport.SkyletChannelSnapshotV1:
+        tunnel = tunnel_state.tunnel
+        if tunnel is None:
+            raise exceptions.SkyletUnavailableError(
+                'Skylet SSH tunnel metadata is unavailable.')
+        endpoint = f'localhost:{tunnel.port}'
+        channel = grpc.insecure_channel(
+            endpoint,
+            options=[
+                # Task YAMLs can exceed gRPC's default 4MB receive limit.
+                ('grpc.max_receive_message_length', -1),
+                # Detect half-dead TCP connections instead of indefinitely
+                # stalling a request worker.
+                ('grpc.keepalive_time_ms', 30_000),
+                ('grpc.keepalive_timeout_ms', 10_000),
+                ('grpc.keepalive_permit_without_calls', 1),
+            ])
+        key = skylet_transport.SkyletChannelKeyV1(
+            cluster_hash=tunnel_state.observed.cluster_hash,
+            endpoint=endpoint,
+            tunnel_generation=tunnel.generation,
+        )
+        return skylet_transport.SkyletChannelSnapshotV1(channel=channel,
+                                                        key=key)
+
+    def get_grpc_channel_with_snapshot(
+            self) -> skylet_transport.SkyletChannelSnapshotV1:
+        """Returns a channel bound to a non-null cluster incarnation."""
+        return self._get_grpc_channel_snapshot(allow_unfenced_read_only=False)
+
+    def get_capability_channel_with_snapshot(
+            self) -> skylet_transport.SkyletCapabilityChannelSnapshotV1:
+        """Returns an uncached-capability-safe channel snapshot."""
+        snapshot = self._get_grpc_channel_snapshot(
+            allow_unfenced_read_only=True)
+        return skylet_transport.SkyletCapabilityChannelSnapshotV1(
+            channel=snapshot.channel, key=snapshot.key)
 
     def get_grpc_channel(self) -> 'grpc.Channel':
-        grpc_options = [
-            # The task YAMLs can be large, so the default
-            # max_receive_message_length of 4MB might not be enough.
-            ('grpc.max_receive_message_length', -1),
-            # Keepalive so half-dead TCP connections (cloud LB / proxy /
-            # NAT silently dropping a connection mid-stream) get failed by
-            # gRPC instead of stalling a worker thread inside __next__.
-            ('grpc.keepalive_time_ms', 30_000),
-            ('grpc.keepalive_timeout_ms', 10_000),
-            ('grpc.keepalive_permit_without_calls', 1),
-        ]
+        """Compatibility facade returning only the current gRPC channel."""
+        return self._get_grpc_channel_snapshot(
+            allow_unfenced_read_only=True).channel
+
+    def _get_grpc_channel_snapshot(
+        self, *, allow_unfenced_read_only: bool
+    ) -> skylet_transport.SkyletChannelSnapshotV1:
         # It's fine to not grab the lock here, as we're only reading,
         # and writes are very rare.
         # It's acceptable to read while another process is opening a tunnel,
@@ -3405,11 +2923,19 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         # For (2), for processes that read the "stale" tunnel, it will fail
         # and on the next retry, it will call get_grpc_channel again
         # and get the new tunnel.
-        tunnel = self._get_skylet_ssh_tunnel()
+        tunnel_state = self._get_skylet_ssh_tunnel_state()
+        tunnel = tunnel_state.tunnel
+        if tunnel_state.observed.cluster_hash is None:
+            if (allow_unfenced_read_only and tunnel is not None and
+                    _is_tunnel_healthy(tunnel)):
+                return self._make_grpc_channel_snapshot(tunnel_state)
+            raise exceptions.SkyletUnavailableError(
+                f'Cluster {self.cluster_name!r} has no fenced healthy Skylet '
+                'SSH tunnel; recovery is disabled for an unfenced '
+                'incarnation.')
         if tunnel is not None:
             if _is_tunnel_healthy(tunnel):
-                return grpc.insecure_channel(f'localhost:{tunnel.port}',
-                                             options=grpc_options)
+                return self._make_grpc_channel_snapshot(tunnel_state)
             logger.debug('Failed to connect to SSH tunnel for cluster '
                          f'{self.cluster_name!r} on port {tunnel.port}')
 
@@ -3437,14 +2963,36 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     # lock-free fast-path check but before we acquired the
                     # exclusive lock. Recheck while holding the lock to avoid
                     # replacing that new tunnel with a second one.
-                    tunnel = self._get_skylet_ssh_tunnel()
+                    tunnel_state = self._get_skylet_ssh_tunnel_state()
+                    tunnel = tunnel_state.tunnel
+                    if tunnel_state.observed.cluster_hash is None:
+                        raise exceptions.SkyletUnavailableError(
+                            f'Cluster {self.cluster_name!r} became unfenced '
+                            'while acquiring the Skylet tunnel lock.')
                     if tunnel is not None and _is_tunnel_healthy(tunnel):
-                        return grpc.insecure_channel(f'localhost:{tunnel.port}',
-                                                     options=grpc_options)
+                        return self._make_grpc_channel_snapshot(tunnel_state)
                     try:
-                        tunnel = self._open_and_update_skylet_tunnel()
-                        return grpc.insecure_channel(f'localhost:{tunnel.port}',
-                                                     options=grpc_options)
+                        open_result = self._open_and_update_skylet_tunnel(
+                            tunnel_state)
+                        if isinstance(open_result, SSHTunnelInfo):
+                            published_state = _SkyletTunnelStateV1(
+                                observed=tunnel_state.observed,
+                                tunnel=open_result)
+                            return self._make_grpc_channel_snapshot(
+                                published_state)
+                        if open_result is (skylet_transport.TunnelMutationResult
+                                           .UNFENCED_CLUSTER_INCARNATION):
+                            raise exceptions.SkyletUnavailableError(
+                                f'Cluster {self.cluster_name!r} has no '
+                                'incarnation fence for Skylet tunnel '
+                                'publication.')
+                        logger.debug(
+                            'Skylet tunnel publication conflicted for cluster '
+                            '%r; retrying from a fresh row snapshot.',
+                            self.cluster_name)
+                        remaining_timeout = _get_remaining_timeout()
+                        attempt += 1
+                        continue
                     except Exception as e:  # pylint: disable=broad-except
                         # Failed to open tunnel, release the lock and retry.
                         logger.warning(f'Failed to open tunnel for cluster '
@@ -3489,11 +3037,15 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             time.sleep(jitter)
 
             # Re-read the tunnel metadata and verify it's healthy.
-            tunnel = self._get_skylet_ssh_tunnel()
+            tunnel_state = self._get_skylet_ssh_tunnel_state()
+            tunnel = tunnel_state.tunnel
+            if tunnel_state.observed.cluster_hash is None:
+                raise exceptions.SkyletUnavailableError(
+                    f'Cluster {self.cluster_name!r} became unfenced while '
+                    'waiting for a Skylet tunnel.')
             if tunnel is not None:
                 if _is_tunnel_healthy(tunnel):
-                    return grpc.insecure_channel(f'localhost:{tunnel.port}',
-                                                 options=grpc_options)
+                    return self._make_grpc_channel_snapshot(tunnel_state)
                 logger.debug('Failed to connect to SSH tunnel for cluster '
                              f'{self.cluster_name!r} on port {tunnel.port}')
             # Tunnel is still unhealthy or missing, try again with updated
@@ -3505,22 +3057,37 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                            f'{self.cluster_name!r} to be ready.')
 
     def _terminate_ssh_tunnel_process(self, tunnel_info: SSHTunnelInfo) -> None:
-        """Terminate the SSH tunnel process."""
+        """Terminates a tunnel only through locally owned process identities."""
+        process = _take_skylet_tunnel_process(tunnel_info)
+        if process is None:
+            return
         try:
-            proc = psutil.Process(tunnel_info.pid)
-            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                logger.debug(
-                    f'Terminating SSH tunnel process {tunnel_info.pid}')
-                subprocess_utils.kill_children_processes(proc.pid)
+            if (not process.is_running() or
+                    process.status() == psutil.STATUS_ZOMBIE):
+                return
+            try:
+                descendants = process.children(recursive=True)
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                descendants = []
+            logger.debug(f'Terminating SSH tunnel process {tunnel_info.pid}')
+            subprocess_utils.kill_process_with_grace_period(process)
+            for descendant in descendants:
+                subprocess_utils.kill_process_with_grace_period(descendant)
         except psutil.NoSuchProcess:
             pass
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
                 f'Failed to cleanup SSH tunnel process {tunnel_info.pid}: {e}')
 
-    def _open_and_update_skylet_tunnel(self) -> SSHTunnelInfo:
+    def _open_and_update_skylet_tunnel(
+        self, tunnel_state: _SkyletTunnelStateV1
+    ) -> SSHTunnelInfo | skylet_transport.TunnelMutationResult:
         """Opens an SSH tunnel to the Skylet on the head node,
         updates the cluster handle, and persists it to the database."""
+        if tunnel_state.observed.cluster_hash is None:
+            return (skylet_transport.TunnelMutationResult.
+                    UNFENCED_CLUSTER_INCARNATION)
+
         max_attempts = 3
         tunnel_info = None
         # There could be a race condition here, as multiple processes may
@@ -3529,6 +3096,7 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             runners = self.get_command_runners()
             head_runner = runners[0]
             local_port = random.randint(10000, 65535)
+            generation = str(uuid.uuid4())
             try:
                 ssh_tunnel_proc = backend_utils.open_ssh_tunnel(
                     head_runner, (local_port, constants.SKYLET_GRPC_PORT))
@@ -3548,7 +3116,21 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                     f'{e.error_msg}\n{e.detailed_reason}')
                 continue
             tunnel_info = SSHTunnelInfo(port=local_port,
-                                        pid=ssh_tunnel_proc.pid)
+                                        pid=ssh_tunnel_proc.pid,
+                                        generation=generation)
+            try:
+                _register_skylet_tunnel_process(generation, ssh_tunnel_proc.pid)
+            except Exception:  # pylint: disable=broad-except
+                # Registration can fail only after open_ssh_tunnel() returned
+                # a child owned by this process. Clean up through that exact
+                # Popen object rather than reconstructing from its numeric PID.
+                try:
+                    subprocess_utils.kill_process_with_grace_period(
+                        ssh_tunnel_proc)
+                except Exception as cleanup_error:  # pylint: disable=broad-except
+                    logger.warning('Failed to clean up unregistered Skylet SSH '
+                                   f'tunnel process: {cleanup_error}')
+                raise
             break
         else:
             raise RuntimeError('Failed to open an SSH tunnel after '
@@ -3560,12 +3142,21 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
             grpc.channel_ready_future(
                 grpc.insecure_channel(f'localhost:{tunnel_info.port}')).result(
                     timeout=constants.SKYLET_GRPC_TIMEOUT_SECONDS)
-            # Clean up existing tunnel before setting up the new one.
-            old_tunnel = self._get_skylet_ssh_tunnel()
-            if old_tunnel is not None:
-                self._terminate_ssh_tunnel_process(old_tunnel)
-            self._set_skylet_ssh_tunnel(tunnel_info)
-            return tunnel_info
+            outcome = (global_user_state.
+                       compare_and_set_cluster_skylet_ssh_tunnel_metadata(
+                           self.cluster_name,
+                           observed=tunnel_state.observed,
+                           replacement=(tunnel_info.port, tunnel_info.pid,
+                                        tunnel_info.generation),
+                       ))
+            if outcome is skylet_transport.TunnelMutationResult.UPDATED:
+                old_tunnel = tunnel_state.tunnel
+                if old_tunnel is not None:
+                    self._terminate_ssh_tunnel_process(old_tunnel)
+                return tunnel_info
+
+            self._terminate_ssh_tunnel_process(tunnel_info)
+            return outcome
         except grpc.FutureTimeoutError as e:
             self._terminate_ssh_tunnel_process(tunnel_info)
             logger.warning(
@@ -3633,180 +3224,16 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                 self.is_grpc_enabled and
                 not isinstance(self.launched_resources.cloud, clouds.Slurm))
 
-    def to_dict(self) -> dict:
-        """Serialize to a JSON-compatible dict."""
-        return {
-            'cluster_name': self.cluster_name,
-            'cluster_name_on_cloud': self.cluster_name_on_cloud,
-            'cluster_yaml': self._cluster_yaml,
-            'launched_nodes': self.launched_nodes,
-            'launched_resources':
-                (self.launched_resources.to_yaml_config()
-                 if self.launched_resources is not None else None),
-            'stable_internal_external_ips': self.stable_internal_external_ips,
-            'stable_ssh_ports': self.stable_ssh_ports,
-            'docker_user': self.docker_user,
-            'is_grpc_enabled': self.is_grpc_enabled,
-            'ssh_user': self.ssh_user,
-            'provision_runtime_metadata': dataclasses.asdict(
-                self.provision_runtime_metadata),
-        }
+    to_dict = cloud_vm_resource_handle_serialization.to_dict
+    from_dict: Any = classmethod(
+        cloud_vm_resource_handle_serialization.from_dict)
+    __getstate__ = cloud_vm_resource_handle_serialization.__getstate__
+    __setstate__ = cloud_vm_resource_handle_serialization.__setstate__
 
-    @classmethod
-    def from_dict(cls, d: dict) -> 'CloudVmRayResourceHandle':
-        """Reconstruct from a dict produced by to_dict()."""
-        resources_dict = d.get('launched_resources')
-        launched_resources: resources_lib.Resources | None
-        if resources_dict is not None:
-            launched_resources = (
-                resources_lib.Resources._from_yaml_config_single(  # pylint: disable=protected-access
-                    resources_dict.copy(),
-                    _allow_resolved_container_image=True))
-        else:
-            launched_resources = None
 
-        handle = cls.__new__(cls)
-        handle._version = cls._VERSION
-        handle.cluster_name = d['cluster_name']
-        handle.cluster_name_on_cloud = d.get('cluster_name_on_cloud', '')
-        handle._cluster_yaml = d.get('cluster_yaml')
-        handle.launched_nodes = d.get('launched_nodes', 0)
-        handle.launched_resources = launched_resources  # type: ignore
-        handle.stable_internal_external_ips = d.get(
-            'stable_internal_external_ips')
-        handle.stable_ssh_ports = d.get('stable_ssh_ports')
-        handle.docker_user = d.get('docker_user')
-        handle.is_grpc_enabled = d.get('is_grpc_enabled', True)
-        handle.cached_cluster_info = None
-        handle._ssh_user = d.get('ssh_user')
-        runtime_metadata = d.get('provision_runtime_metadata')
-        if runtime_metadata is not None:
-            known = {
-                f.name for f in dataclasses.fields(
-                    provision_common.ProvisionRuntimeMetadata)
-            }
-            handle.provision_runtime_metadata = (
-                provision_common.ProvisionRuntimeMetadata(**{
-                    k: v for k, v in runtime_metadata.items() if k in known
-                }))
-        else:
-            handle.provision_runtime_metadata = (
-                provision_common.ProvisionRuntimeMetadata())
-        return handle
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        # For backwards compatibility. Refer to
-        # https://github.com/skypilot-org/skypilot/pull/7133
-        state.setdefault('skylet_ssh_tunnel', None)
-        # Serialize provision_runtime_metadata as a plain dict.
-        runtime_metadata = state.get('provision_runtime_metadata')
-        if isinstance(runtime_metadata,
-                      provision_common.ProvisionRuntimeMetadata):
-            state['provision_runtime_metadata'] = dataclasses.asdict(
-                runtime_metadata)
-        return state
-
-    def __setstate__(self, state):
-        self._version = self._VERSION
-
-        version = state.pop('_version', None)
-        if version is None:
-            version = -1
-            state.pop('cluster_region', None)
-        if version < 2:
-            state['_cluster_yaml'] = state.pop('cluster_yaml')
-        head_ip = None
-        if version < 3:
-            head_ip = state.pop('head_ip', None)
-            state['stable_internal_external_ips'] = None
-        if version < 4:
-            # Version 4 adds self.stable_ssh_ports for Kubernetes support
-            state['stable_ssh_ports'] = None
-        if version < 5:
-            state['docker_user'] = None
-
-        if version < 6:
-            state['cluster_name_on_cloud'] = state['cluster_name']
-
-        if version < 8:
-            self.cached_cluster_info = None
-
-        if version < 9:
-            # For backward compatibility, we should update the region of a
-            # SkyPilot cluster on Kubernetes to the actual context it is using.
-            # pylint: disable=import-outside-toplevel
-            launched_resources = state['launched_resources']
-            if isinstance(launched_resources.cloud, clouds.Kubernetes):
-                yaml_config = global_user_state.get_cluster_yaml_dict(
-                    os.path.expanduser(state['_cluster_yaml']))
-                context = kubernetes_utils.get_context_from_config(
-                    yaml_config['provider'])
-                state['launched_resources'] = launched_resources.copy(
-                    region=context)
-
-        if version < 10:
-            # In #4660, we keep the cluster entry in the database even when it
-            # is in the transition from one region to another during the
-            # failover. We allow `handle.cluster_yaml` to be None to indicate
-            # that the cluster yaml is intentionally removed. Before that PR,
-            # the `handle.cluster_yaml` is always not None, even if it is
-            # intentionally removed.
-            #
-            # For backward compatibility, we set the `_cluster_yaml` to None
-            # if the file does not exist, assuming all the removal of the
-            # _cluster_yaml for existing clusters are intentional by SkyPilot.
-            # are intentional by SkyPilot.
-            if state['_cluster_yaml'] is not None and not os.path.exists(
-                    os.path.expanduser(state['_cluster_yaml'])):
-                state['_cluster_yaml'] = None
-
-        if version < 11:
-            state['is_grpc_enabled'] = False
-            state['skylet_ssh_tunnel'] = None
-
-        if version >= 12:
-            # DEPRECATED in favor of skylet_ssh_tunnel_metadata column in the DB
-            state.pop('skylet_ssh_tunnel', None)
-
-        # provision_runtime_metadata is serialized as a plain dict (see
-        # __getstate__). Reconstruct the dataclass here, defaulting if absent.
-        runtime_metadata = state.get('provision_runtime_metadata')
-        if isinstance(runtime_metadata, dict):
-            known = {
-                f.name for f in dataclasses.fields(
-                    provision_common.ProvisionRuntimeMetadata)
-            }
-            state['provision_runtime_metadata'] = (
-                provision_common.ProvisionRuntimeMetadata(**{
-                    k: v for k, v in runtime_metadata.items() if k in known
-                }))
-        elif runtime_metadata is None:
-            state['provision_runtime_metadata'] = (
-                provision_common.ProvisionRuntimeMetadata())
-
-        self.__dict__.update(state)
-
-        # Because the update_cluster_ips and update_ssh_ports
-        # functions use the handle, we call it on the current instance
-        # after the state is updated.
-        if version < 3 and head_ip is not None:
-            try:
-                self.update_cluster_ips()
-            except exceptions.FetchClusterInfoError:
-                # This occurs when an old cluster from was autostopped,
-                # so the head IP in the database is not updated.
-                pass
-        if version < 4:
-            self.update_ssh_ports()
-
-        if version < 8:
-            try:
-                self._update_cluster_info()
-            except exceptions.FetchClusterInfoError:
-                # This occurs when an old cluster from was autostopped,
-                # so the head IP in the database is not updated.
-                pass
+# Preserve runtime annotation resolution for the directly attached methods.
+setattr(cloud_vm_resource_handle_serialization, 'CloudVmRayResourceHandle',
+        CloudVmRayResourceHandle)
 
 
 class LocalResourcesHandle(CloudVmRayResourceHandle):
@@ -3855,261 +3282,8 @@ class LocalResourcesHandle(CloudVmRayResourceHandle):
         return [command_runner.LocalProcessCommandRunner()]
 
 
-class _CancelAwareStub:
-    """Proxy that makes a gRPC stub honor the current SkyPilotContext cancel.
-
-    Each method becomes cancellable: when the active context is cancelled
-    (e.g. on client disconnect), the in-flight RPC is aborted instead of
-    leaving the worker thread blocked in gRPC's ``Condition.wait()``.
-
-    Methods listed in ``streaming_methods`` go through
-    ``invoke_grpc_streaming``; everything else uses ``invoke_grpc_unary``.
-    """
-
-    def __init__(self, stub: Any, streaming_methods: Sequence[str] = ()):
-        self._stub = stub
-        self._streaming = frozenset(streaming_methods)
-
-    def __getattr__(self, name: str):
-        method = getattr(self._stub, name)
-        if name in self._streaming:
-
-            def wrapped_streaming(*args, **kwargs):
-                return backend_utils.invoke_grpc_streaming(
-                    method, *args, **kwargs)
-
-            return wrapped_streaming
-
-        def wrapped_unary(*args, **kwargs):
-            return backend_utils.invoke_grpc_unary(method, *args, **kwargs)
-
-        return wrapped_unary
-
-
-class SkyletClient:
-    """The client to interact with a remote cluster through Skylet."""
-
-    def __init__(self, channel: 'grpc.Channel'):
-        self._autostop_stub = _CancelAwareStub(
-            autostopv1_pb2_grpc.AutostopServiceStub(channel))
-        self._jobs_stub = _CancelAwareStub(
-            jobsv1_pb2_grpc.JobsServiceStub(channel),
-            streaming_methods=('TailLogs',))
-        self._serve_stub = _CancelAwareStub(
-            servev1_pb2_grpc.ServeServiceStub(channel))
-        self._managed_jobs_stub = _CancelAwareStub(
-            managed_jobsv1_pb2_grpc.ManagedJobsServiceStub(channel))
-        self._health_stub = _CancelAwareStub(
-            healthv1_pb2_grpc.HealthServiceStub(channel))
-
-    def set_autostop(
-        self,
-        request: 'autostopv1_pb2.SetAutostopRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'autostopv1_pb2.SetAutostopResponse':
-        return self._autostop_stub.SetAutostop(request, timeout=timeout)
-
-    def is_autostopping(
-        self,
-        request: 'autostopv1_pb2.IsAutostoppingRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'autostopv1_pb2.IsAutostoppingResponse':
-        return self._autostop_stub.IsAutostopping(request, timeout=timeout)
-
-    def add_job(
-        self,
-        request: 'jobsv1_pb2.AddJobRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.AddJobResponse':
-        return self._jobs_stub.AddJob(request, timeout=timeout)
-
-    def set_job_info_without_job_id(
-        self,
-        request: 'jobsv1_pb2.SetJobInfoWithoutJobIdRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.SetJobInfoWithoutJobIdResponse':
-        return self._jobs_stub.SetJobInfoWithoutJobId(request, timeout=timeout)
-
-    def queue_job(
-        self,
-        request: 'jobsv1_pb2.QueueJobRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.QueueJobResponse':
-        return self._jobs_stub.QueueJob(request, timeout=timeout)
-
-    def update_status(
-        self,
-        request: 'jobsv1_pb2.UpdateStatusRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.UpdateStatusResponse':
-        return self._jobs_stub.UpdateStatus(request, timeout=timeout)
-
-    def get_job_queue(
-        self,
-        request: 'jobsv1_pb2.GetJobQueueRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.GetJobQueueResponse':
-        return self._jobs_stub.GetJobQueue(request, timeout=timeout)
-
-    def cancel_jobs(
-        self,
-        request: 'jobsv1_pb2.CancelJobsRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.CancelJobsResponse':
-        return self._jobs_stub.CancelJobs(request, timeout=timeout)
-
-    def fail_all_in_progress_jobs(
-        self,
-        request: 'jobsv1_pb2.FailAllInProgressJobsRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.FailAllInProgressJobsResponse':
-        return self._jobs_stub.FailAllInProgressJobs(request, timeout=timeout)
-
-    def get_job_status(
-        self,
-        request: 'jobsv1_pb2.GetJobStatusRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.GetJobStatusResponse':
-        return self._jobs_stub.GetJobStatus(request, timeout=timeout)
-
-    def get_job_submitted_timestamp(
-        self,
-        request: 'jobsv1_pb2.GetJobSubmittedTimestampRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.GetJobSubmittedTimestampResponse':
-        return self._jobs_stub.GetJobSubmittedTimestamp(request,
-                                                        timeout=timeout)
-
-    def get_job_ended_timestamp(
-        self,
-        request: 'jobsv1_pb2.GetJobEndedTimestampRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.GetJobEndedTimestampResponse':
-        return self._jobs_stub.GetJobEndedTimestamp(request, timeout=timeout)
-
-    def get_log_dirs_for_jobs(
-        self,
-        request: 'jobsv1_pb2.GetLogDirsForJobsRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.GetLogDirsForJobsResponse':
-        return self._jobs_stub.GetLogDirsForJobs(request, timeout=timeout)
-
-    def get_job_exit_codes(
-        self,
-        request: 'jobsv1_pb2.GetJobExitCodesRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'jobsv1_pb2.GetJobExitCodesResponse':
-        return self._jobs_stub.GetJobExitCodes(request, timeout=timeout)
-
-    def tail_logs(
-        self,
-        request: 'jobsv1_pb2.TailLogsRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> Iterator['jobsv1_pb2.TailLogsResponse']:
-        return self._jobs_stub.TailLogs(request, timeout=timeout)
-
-    def get_service_status(
-        self,
-        request: 'servev1_pb2.GetServiceStatusRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'servev1_pb2.GetServiceStatusResponse':
-        return self._serve_stub.GetServiceStatus(request, timeout=timeout)
-
-    def add_serve_version(
-        self,
-        request: 'servev1_pb2.AddVersionRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'servev1_pb2.AddVersionResponse':
-        return self._serve_stub.AddVersion(request, timeout=timeout)
-
-    def terminate_services(
-        self,
-        request: 'servev1_pb2.TerminateServicesRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'servev1_pb2.TerminateServicesResponse':
-        return self._serve_stub.TerminateServices(request, timeout=timeout)
-
-    def terminate_replica(
-        self,
-        request: 'servev1_pb2.TerminateReplicaRequest',
-        timeout: float |
-        None = (serve_constants.TERMINATE_REPLICA_TIMEOUT_SECONDS + 10)
-    ) -> 'servev1_pb2.TerminateReplicaResponse':
-        # The controller acknowledges only after the replica-manager lock has
-        # admitted and durably scheduled teardown. Give that acceptance wait
-        # transport margin instead of preempting it at the generic 10s RPC
-        # deadline.
-        return self._serve_stub.TerminateReplica(request, timeout=timeout)
-
-    def wait_service_registration(
-        self,
-        request: 'servev1_pb2.WaitServiceRegistrationRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'servev1_pb2.WaitServiceRegistrationResponse':
-        # The skylet-side handler gives controller setup and service
-        # registration independent timeout budgets. Keep the outer RPC alive
-        # for both phases, with margin for polling and transport overhead.
-        if timeout is not None:
-            timeout = max(
-                timeout, serve_constants.CONTROLLER_SETUP_TIMEOUT_SECONDS +
-                serve_constants.SERVICE_REGISTER_TIMEOUT_SECONDS + 10)
-        return self._serve_stub.WaitServiceRegistration(request,
-                                                        timeout=timeout)
-
-    def update_service(
-        self,
-        request: 'servev1_pb2.UpdateServiceRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'servev1_pb2.UpdateServiceResponse':
-        # The skylet-side handler waits on the controller's replica-manager
-        # lock for up to UPDATE_SERVICE_TIMEOUT_SECONDS (see
-        # sky/serve/constants.py); give the outer gRPC deadline margin over
-        # that, mirroring wait_service_registration above.
-        if timeout is not None:
-            timeout = max(timeout,
-                          serve_constants.UPDATE_SERVICE_TIMEOUT_SECONDS + 10)
-        return self._serve_stub.UpdateService(request, timeout=timeout)
-
-    def get_ray_status(
-        self,
-        request: 'healthv1_pb2.GetRayStatusRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'healthv1_pb2.GetRayStatusResponse':
-        """Run `ray status` locally on the head node via skylet.
-
-        Replaces the SSH-exec'd ray status of the legacy health probe;
-        old skylets raise UNIMPLEMENTED and the caller falls back.
-        """
-        return self._health_stub.GetRayStatus(request, timeout=timeout)
-
-    def get_managed_job_controller_version(
-        self,
-        request: 'managed_jobsv1_pb2.GetVersionRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'managed_jobsv1_pb2.GetVersionResponse':
-        return self._managed_jobs_stub.GetVersion(request, timeout=timeout)
-
-    def get_managed_job_table(
-        self,
-        request: 'managed_jobsv1_pb2.GetJobTableRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'managed_jobsv1_pb2.GetJobTableResponse':
-        return self._managed_jobs_stub.GetJobTable(request, timeout=timeout)
-
-    def get_all_managed_job_ids_by_name(
-        self,
-        request: 'managed_jobsv1_pb2.GetAllJobIdsByNameRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'managed_jobsv1_pb2.GetAllJobIdsByNameResponse':
-        return self._managed_jobs_stub.GetAllJobIdsByName(request,
-                                                          timeout=timeout)
-
-    def cancel_managed_jobs(
-        self,
-        request: 'managed_jobsv1_pb2.CancelJobsRequest',
-        timeout: float | None = constants.SKYLET_GRPC_TIMEOUT_SECONDS
-    ) -> 'managed_jobsv1_pb2.CancelJobsResponse':
-        return self._managed_jobs_stub.CancelJobs(request, timeout=timeout)
+_CancelAwareStub = skylet_client._CancelAwareStub  # pylint: disable=protected-access
+SkyletClient = skylet_client.SkyletClient
 
 
 @registry.BACKEND_REGISTRY.type_register(name='cloudvmray')
@@ -4144,6 +3318,14 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._extra_launch_context: dict[str, Any] = {}
         self._is_launched_by_jobs_controller = False
         self._workload_type = 'cluster'
+        # Serializes the one decision that can consume a fresh-provider-create
+        # lease with the job-ID allocation it authorizes.  The lease itself is
+        # neither copied nor persisted on a cluster handle.
+        self._system_oom_recovery_submission_lock = threading.Lock()
+        self._fresh_provision_evidence_generation = 0
+        self._fresh_provision_evidence_lease: (
+            backend_system_oom_recovery.FreshProvisionEvidenceLease |
+            None) = None
         # Optional planner (via register_info): used under the per-cluster lock
         # to produce a fresh concrete plan when neither a reusable snapshot nor
         # a caller plan is available.
@@ -4157,6 +3339,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     # --- Implementation of Backend APIs ---
 
     def register_info(self, **kwargs) -> None:
+        self._reset_fresh_provision_evidence()
         self._dag = kwargs.pop('dag', self._dag)
         self._optimize_target = kwargs.pop(
             'optimize_target',
@@ -4173,6 +3356,218 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # reusable snapshot/caller plan exists. Keeps optimizer in upper layer.
         self._planner = kwargs.pop('planner', self._planner)
         assert not kwargs, f'Unexpected kwargs: {kwargs}'
+
+    def _reset_fresh_provision_evidence(self) -> int:
+        """Invalidate prior evidence and return the new binding generation."""
+        with self._system_oom_recovery_submission_lock:
+            lease = self._fresh_provision_evidence_lease
+            self._fresh_provision_evidence_lease = None
+            if lease is not None:
+                lease.take()
+            self._fresh_provision_evidence_generation += 1
+            return self._fresh_provision_evidence_generation
+
+    def _bind_fresh_provision_evidence(
+        self,
+        lease: backend_system_oom_recovery.FreshProvisionEvidenceLease | None,
+        generation: int,
+    ) -> bool:
+        """Bind a provision result only if no reset has overtaken it."""
+        if lease is None:
+            return False
+        if not isinstance(
+                lease, backend_system_oom_recovery.FreshProvisionEvidenceLease):
+            raise TypeError('lease must be FreshProvisionEvidenceLease.')
+        with self._system_oom_recovery_submission_lock:
+            if generation != self._fresh_provision_evidence_generation:
+                lease.take()
+                return False
+            if self._fresh_provision_evidence_lease is not None:
+                # Two successful results attempting to occupy the same
+                # generation are ambiguous.  Invalidate both leases instead
+                # of retaining whichever one happened to bind first.
+                self._fresh_provision_evidence_lease.take()
+                self._fresh_provision_evidence_lease = None
+                lease.take()
+                return False
+            self._fresh_provision_evidence_lease = lease
+            return True
+
+    def _fresh_provision_evidence_matches_handle(
+        self,
+        evidence: backend_system_oom_recovery.FreshProvisionEvidence,
+        handle: CloudVmRayResourceHandle,
+    ) -> bool:
+        """Revalidate one consumed payload against the submission handle."""
+        cloud = handle.launched_resources.cloud
+        current_request_id = common_utils.get_current_request_id()
+        bound_request_id = self._extra_launch_context.get(
+            serve_constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY)
+        try:
+            cluster_record = global_user_state.get_cluster_from_name(
+                handle.cluster_name,
+                include_user_info=False,
+                summary_response=True)
+        except Exception:  # pylint: disable=broad-except
+            return False
+        if cluster_record is None:
+            return False
+        cluster_owner_identity = cluster_record.get('owner')
+        if (not isinstance(cluster_owner_identity, list) or
+                tuple(cluster_owner_identity)
+                != evidence.provision_owner_identity):
+            return False
+        if (evidence.request_id != current_request_id or
+                bound_request_id != current_request_id or
+                evidence.workspace != skypilot_config.get_active_workspace() or
+                evidence.cluster_name != handle.cluster_name or
+                evidence.cluster_name_on_cloud != handle.cluster_name_on_cloud
+                or
+                evidence.cluster_hash != cluster_record.get('cluster_hash') or
+                evidence.requested_node_count != handle.launched_nodes or
+                not isinstance(cloud, clouds.AWS) or
+                evidence.provider_name != cloud.canonical_name()):
+            return False
+        launched_resources = handle.launched_resources
+        instance_type = launched_resources.instance_type
+        if (instance_type is None or instance_type != evidence.instance_type or
+                launched_resources.region != evidence.region or
+                launched_resources.zone != evidence.availability_zone):
+            return False
+        try:
+            _, catalog_memory_gib = cloud.get_vcpus_mem_from_instance_type(
+                instance_type)
+        except Exception:  # pylint: disable=broad-except
+            return False
+        if catalog_memory_gib != evidence.catalog_memory_gib:
+            return False
+        service_name = self._extra_launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        service_hash = self._extra_launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        if (evidence.service_name != service_name or
+                evidence.service_hash != service_hash):
+            return False
+        cluster_info = handle.cached_cluster_info
+        if (cluster_info is None or
+                cluster_info.provider_name != evidence.provider_name or
+                cluster_info.head_instance_id != evidence.head_instance_id or
+                cluster_info.num_instances != evidence.requested_node_count or
+                any(
+                    len(instances) != 1
+                    for instances in cluster_info.instances.values()) or
+                set(cluster_info.instances) != set(
+                    evidence.created_instance_ids)):
+            return False
+        return True
+
+    def _consume_system_oom_recovery_plan_no_lock(
+        self,
+        handle: CloudVmRayResourceHandle,
+        task: task_lib.Task,
+        job_id: int,
+    ) -> skylet_system_oom_recovery.RecoveryLaunchPlan | None:
+        """Consume the lease and make one fail-closed submission decision.
+
+        The caller holds ``_system_oom_recovery_submission_lock`` across job-ID
+        allocation and this method.  Clearing the backend slot before any
+        validation means every mismatch and exception consumes the decision.
+        """
+        is_v3_request = (
+            serve_system_oom_recovery.has_v3_system_oom_recovery_context(
+                self._extra_launch_context))
+
+        def _log_decision(
+            decision: str,
+            reason: str,
+            evidence: backend_system_oom_recovery.FreshProvisionEvidence |
+            None = None
+        ) -> None:
+            if not is_v3_request:
+                return
+            if decision == 'ordinary':
+                event = ('evidence_lost'
+                         if reason in ('fresh_evidence_lease_absent',
+                                       'fresh_evidence_lease_consumed') else
+                         'authorization_v3_ordinary')
+                if evidence is None:
+                    try:
+                        launched_cloud = handle.launched_resources.cloud
+                        provider = ('unknown' if launched_cloud is None else
+                                    launched_cloud.canonical_name())
+                    except Exception:  # pylint: disable=broad-except
+                        provider = 'unknown'
+                    market = 'unknown'
+                else:
+                    provider = evidence.provider_name
+                    market = evidence.market_type
+                system_oom_recovery_observability.record(event,
+                                                         provider=provider,
+                                                         market=market)
+            logger.info(
+                'system_oom_recovery_backend_admission '
+                f'decision={decision} reason={reason} '
+                f'service_hash={self._extra_launch_context.get(serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)!r} '
+                f'replica_id={self._extra_launch_context.get(serve_constants.SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY)!r} '
+                f'launch_generation={self._extra_launch_context.get(serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_GENERATION_KEY)!r} '
+                f'profile_id={self._extra_launch_context.get(serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY)!r} '
+                f'job_id={job_id!r} '
+                f'provider={(None if evidence is None else evidence.provider_name)!r} '
+                f'market={(None if evidence is None else evidence.market_type)!r} '
+                f'instance_type={(None if evidence is None else evidence.instance_type)!r} '
+                f'catalog_memory_gib={(None if evidence is None else evidence.catalog_memory_gib)!r}'
+            )
+
+        lease = self._fresh_provision_evidence_lease
+        self._fresh_provision_evidence_lease = None
+        if lease is None:
+            _log_decision('ordinary', 'fresh_evidence_lease_absent')
+            return None
+        evidence = lease.take()
+        if evidence is None:
+            _log_decision('ordinary', 'fresh_evidence_lease_consumed')
+            return None
+        try:
+            if (self._workload_type != 'service' or task.num_nodes != 1 or
+                    task.num_nodes * handle.num_ips_per_node != 1 or
+                    task.run is None or task.managed_job_dag is not None or
+                    handle.launched_nodes != 1 or
+                    not isinstance(handle.launched_resources.cloud, clouds.AWS)
+                    or not handle.provision_runtime_metadata.has_ray or
+                    not handle.provision_runtime_metadata.has_job_queue or
+                    not self._fresh_provision_evidence_matches_handle(
+                        evidence, handle)):
+                _log_decision('ordinary', 'eligibility_or_identity_mismatch',
+                              evidence)
+                return None
+            profile = serve_system_oom_recovery.match_trusted_profile(
+                task, self._extra_launch_context)
+            if not isinstance(
+                    profile,
+                    serve_system_oom_recovery.TrustedRecoveryAuthorizationV3):
+                _log_decision('ordinary', 'authorization_mismatch', evidence)
+                return None
+            envelope = profile.resource_envelope
+            if (evidence.aws_account_id not in envelope.allowed_aws_account_ids
+                    or not envelope.allows_location(
+                        evidence.region, evidence.availability_zone) or
+                    evidence.market_type not in envelope.allowed_market_types or
+                    evidence.instance_type
+                    not in envelope.allowed_instance_types or
+                    evidence.catalog_memory_gib > envelope.max_host_memory_gib):
+                _log_decision('ordinary', 'resource_envelope_mismatch',
+                              evidence)
+                return None
+            _log_decision('capable', 'accepted', evidence)
+            return profile.launch_plan()
+        except Exception as error:  # pylint: disable=broad-except
+            # Recovery is an optional capability.  Once the lease is consumed,
+            # any malformed optional state falls back to ordinary execution;
+            # it must not fail an otherwise valid service launch.
+            logger.warning('Disabling system-OOM recovery for this submission: '
+                           f'{common_utils.format_exception(error)}')
+            _log_decision('ordinary', 'admission_exception', evidence)
+            return None
 
     def check_resources_fit_cluster(
         self,
@@ -4385,6 +3780,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         retry_until_up: bool = False,
         skip_unnecessary_provisioning: bool = False,
     ) -> tuple[CloudVmRayResourceHandle | None, bool]:
+        evidence_generation = self._reset_fresh_provision_evidence()
         with contextlib.ExitStack() as lock_stack:
             lock_stack.enter_context(
                 lock_events.DistributedLockEvent(lock_id,
@@ -4440,6 +3836,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 # in if retry_until_up is set, which will kick off new "rounds"
                 # of optimization infinitely.
                 retry_provisioner: RetryingVmProvisioner | None = None
+                provision_evidence_lease: (
+                    backend_system_oom_recovery.FreshProvisionEvidenceLease |
+                    None) = None
                 try:
                     retry_provisioner = RetryingVmProvisioner(
                         self.log_dir,
@@ -4462,6 +3861,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     config_dict = retry_provisioner.provision_with_retries(
                         task, to_provision_config, dryrun, stream_logs,
                         skip_unnecessary_provisioning)
+                    provision_evidence_lease = (
+                        retry_provisioner.
+                        release_fresh_provision_evidence_lease())
                     break
                 except exceptions.ResourcesUnavailableError as e:
                     failed_cluster_hash = (retry_provisioner.active_cluster_hash
@@ -4621,6 +4023,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 self._update_after_cluster_provisioned(
                     handle, to_provision_config.prev_handle, task,
                     prev_cluster_status, config_hash, cluster_hash)
+                self._bind_fresh_provision_evidence(provision_evidence_lease,
+                                                    evidence_generation)
                 return handle, False
 
             cluster_config_file = config_dict['ray']
@@ -4686,6 +4090,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             self._update_after_cluster_provisioned(
                 handle, to_provision_config.prev_handle, task,
                 prev_cluster_status, config_hash, cluster_hash)
+            self._bind_fresh_provision_evidence(provision_evidence_lease,
+                                                evidence_generation)
             return handle, False
 
     def _open_ports(self, handle: CloudVmRayResourceHandle) -> None:
@@ -5264,7 +4670,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'retrying in {sleep_seconds:.1f} seconds '
                 f'(attempt {attempt + 1}/'
                 f'{_JOB_ID_SSM_RECONNECT_MAX_ATTEMPTS}).')
-            time.sleep(sleep_seconds)
+            context_utils.sleep_with_cancellation(sleep_seconds)
         raise AssertionError('SSM reconnect attempts must be positive.')
 
     def _add_job(self, handle: CloudVmRayResourceHandle, job_name: str | None,
@@ -5474,8 +4880,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             logger.info(f'Dryrun complete. Would have run:\n{task}')
             return None
 
-        job_id, log_dir = self._add_job(handle, task_copy.name, resources_str,
-                                        task.metadata_json)
+        with self._system_oom_recovery_submission_lock:
+            job_id, log_dir = self._add_job(handle, task_copy.name,
+                                            resources_str, task.metadata_json)
+            recovery_plan = self._consume_system_oom_recovery_plan_no_lock(
+                handle, task_copy, job_id)
 
         num_actual_nodes = task.num_nodes * handle.num_ips_per_node
         # Case: task_lib.Task(run, num_nodes=N) or TPU VM Pods
@@ -5483,7 +4892,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             self._execute_task_n_nodes(handle, task_copy, job_id, log_dir)
         else:
             # Case: task_lib.Task(run, num_nodes=1)
-            self._execute_task_one_node(handle, task_copy, job_id, log_dir)
+            self._execute_task_one_node(handle,
+                                        task_copy,
+                                        job_id,
+                                        log_dir,
+                                        recovery_plan=recovery_plan)
 
         return job_id
 
@@ -5503,7 +4916,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     def _teardown(self,
                   handle: CloudVmRayResourceHandle,
                   terminate: bool,
-                  purge: bool = False):
+                  purge: bool = False,
+                  *,
+                  expected_cluster_record_uuid: str | None = None):
         """Tear down or stop the cluster.
 
         Args:
@@ -5573,18 +4988,21 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             try:
                 with lock:
                     with resource_lock:
-                        self.teardown_no_lock(
-                            handle,
-                            terminate,
-                            purge,
+                        teardown_kwargs: dict[str, Any] = {
                             # When --purge is set and we already see an ID
                             # mismatch error, we skip the refresh codepath. This
                             # is because refresh checks current user identity
                             # can throw ClusterOwnerIdentityMismatchError. The
                             # argument/flag `purge` should bypass such ID
                             # mismatch errors.
-                            refresh_cluster_status=(
-                                not is_identity_mismatch_and_purge))
+                            'refresh_cluster_status':
+                                not is_identity_mismatch_and_purge,
+                        }
+                        if expected_cluster_record_uuid is not None:
+                            teardown_kwargs['expected_cluster_record_uuid'] = (
+                                expected_cluster_record_uuid)
+                        self.teardown_no_lock(handle, terminate, purge,
+                                              **teardown_kwargs)
                 if terminate:
                     lock.force_unlock()
                 break
@@ -5639,6 +5057,81 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             )
         statuses = job_lib.load_statuses_payload(stdout)
         return statuses
+
+    def get_job_status_with_system_recovery(
+        self,
+        handle: CloudVmRayResourceHandle,
+        job_ids: list[int] | None = None,
+        stream_logs: bool = True,
+    ) -> tuple[dict[int | None, job_lib.JobStatus | None], dict[
+            int, job_lib.JobSystemRecoveryInfo], dict[
+                int, job_lib.JobSystemRecoveryDetailStatus]]:
+        """Get statuses and optional typed recovery detail in one round trip.
+
+        This is an explicit internal capability for SkyServe.  The established
+        ``get_job_status()`` path above stays independent, so an optional
+        recovery-detail lookup can never make ordinary status unavailable.
+        """
+        if handle.is_grpc_enabled_with_flag:
+            try:
+                request = jobsv1_pb2.GetJobStatusRequest(job_ids=job_ids)
+                response = backend_utils.invoke_skylet_with_retries(
+                    lambda: SkyletClient(handle.get_grpc_channel()
+                                        ).get_job_status(request))
+                statuses: dict[int | None, job_lib.JobStatus | None] = {
+                    job_id: job_lib.JobStatus.from_protobuf(proto_status)
+                    for job_id, proto_status in response.job_statuses.items()
+                }
+                recovery_infos: dict[int, job_lib.JobSystemRecoveryInfo] = {}
+                detail_statuses = {
+                    job_id: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+                    for job_id in statuses
+                    if isinstance(job_id, int)
+                }
+                for job_id, proto_status in (
+                        response.system_recovery_detail_statuses.items()):
+                    detail_statuses[job_id] = (
+                        job_lib.JobSystemRecoveryDetailStatus.from_protobuf(
+                            proto_status))
+                for job_id, proto_info in response.system_recovery_infos.items(
+                ):
+                    try:
+                        recovery_infos[job_id] = (job_lib.JobSystemRecoveryInfo.
+                                                  from_protobuf(proto_info))
+                    except ValueError as error:
+                        detail_statuses[job_id] = (
+                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+                        logger.warning(
+                            'Ignoring malformed system recovery state for job '
+                            f'{job_id}: {error}')
+                for job_id in tuple(detail_statuses):
+                    if ((detail_statuses[job_id] ==
+                         job_lib.JobSystemRecoveryDetailStatus.PRESENT)
+                            != (job_id in recovery_infos)):
+                        detail_statuses[job_id] = (
+                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+                        recovery_infos.pop(job_id, None)
+                return statuses, recovery_infos, detail_statuses
+            except exceptions.SKYLET_GRPC_FALLBACK_ERRORS as error:
+                logger.debug(f'gRPC failed, falling back to SSH: {error}')
+
+        code = job_lib.JobLibCodeGen.get_job_status_with_system_recovery(
+            job_ids)
+        returncode, stdout, stderr = self.run_on_head(handle,
+                                                      code,
+                                                      stream_logs=stream_logs,
+                                                      require_outputs=True,
+                                                      separate_stderr=True)
+        subprocess_utils.handle_returncode(returncode, code,
+                                           'Failed to get job status.', stderr)
+        if not stdout:
+            raise exceptions.CommandFailureException(
+                command=code,
+                failure='produced no output',
+                error_msg='Failed to get job status.',
+                detailed_reason=f'stderr="{stderr}"',
+            )
+        return job_lib.load_statuses_with_system_recovery_payload(stdout)
 
     def cancel_jobs(self,
                     handle: CloudVmRayResourceHandle,
@@ -6225,13 +5718,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                      f'{colorama.Style.RESET_ALL}')
         return {str(job_id): local_log_dir}
 
-    def teardown_no_lock(self,
-                         handle: CloudVmRayResourceHandle,
-                         terminate: bool,
-                         purge: bool = False,
-                         post_teardown_cleanup: bool = True,
-                         refresh_cluster_status: bool = True,
-                         remove_from_db: bool = True) -> None:
+    def teardown_no_lock(
+            self,
+            handle: CloudVmRayResourceHandle,
+            terminate: bool,
+            purge: bool = False,
+            post_teardown_cleanup: bool = True,
+            refresh_cluster_status: bool = True,
+            remove_from_db: bool = True,
+            expected_cluster_record_uuid: str | None = None) -> None:
         """Teardown the cluster without acquiring the cluster status lock.
 
         NOTE: This method should not be called without holding the cluster
@@ -6316,12 +5811,36 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 'Skipped.')
             return
 
+        if expected_cluster_record_uuid is not None:
+            exact_snapshot = (
+                global_user_state.get_cluster_record_identity_snapshot(
+                    handle.cluster_name, expected_cluster_record_uuid))
+            if exact_snapshot is None:
+                logger.warning(
+                    f'Cluster {handle.cluster_name!r} was removed before '
+                    'action-fenced provider teardown. Skipped.')
+                return
+            expected_handle_bytes = pickle.dumps(handle)
+            if exact_snapshot.serialized_handle != expected_handle_bytes:
+                raise global_user_state.ClusterRecordIdentityConflictError(
+                    f'Cluster {handle.cluster_name!r} handle changed before '
+                    'action-fenced provider teardown.')
+            handle = typing.cast(CloudVmRayResourceHandle,
+                                 exact_snapshot.handle)
+
         if handle.cluster_yaml is None:
             logger.warning(f'Cluster {handle.cluster_name!r} has no '
                            f'provision yaml so it '
                            'has not been provisioned. Skipped.')
+            removal_kwargs: dict[str, Any] = {}
+            if expected_cluster_record_uuid is not None:
+                removal_kwargs.update({
+                    'expected_cluster_record_uuid': expected_cluster_record_uuid,
+                    'expected_cluster_handle': handle,
+                })
             global_user_state.remove_cluster(handle.cluster_name,
-                                             terminate=terminate)
+                                             terminate=terminate,
+                                             **removal_kwargs)
             return
         log_path = os.path.join(os.path.expanduser(self.log_dir),
                                 'teardown.log')
@@ -6380,8 +5899,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     raise
 
             if post_teardown_cleanup:
+                cleanup_kwargs: dict[str, Any] = {}
+                if expected_cluster_record_uuid is not None:
+                    cleanup_kwargs['expected_cluster_record_uuid'] = (
+                        expected_cluster_record_uuid)
                 self.post_teardown_cleanup(handle, terminate, purge,
-                                           remove_from_db)
+                                           remove_from_db, **cleanup_kwargs)
             return
 
         if (isinstance(cloud, clouds.IBM) and terminate and
@@ -6474,14 +5997,21 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # (i.e., prev_status is None), as the cleanup has already been done
         # if the cluster is removed from the status table.
         if post_teardown_cleanup:
-            self.post_teardown_cleanup(handle, terminate, purge)
+            final_cleanup_kwargs: dict[str, Any] = {}
+            if expected_cluster_record_uuid is not None:
+                final_cleanup_kwargs['expected_cluster_record_uuid'] = (
+                    expected_cluster_record_uuid)
+            self.post_teardown_cleanup(handle, terminate, purge,
+                                       **final_cleanup_kwargs)
 
-    def post_teardown_cleanup(self,
-                              handle: CloudVmRayResourceHandle,
-                              terminate: bool,
-                              purge: bool = False,
-                              remove_from_db: bool = True,
-                              failover: bool = False) -> None:
+    def post_teardown_cleanup(
+            self,
+            handle: CloudVmRayResourceHandle,
+            terminate: bool,
+            purge: bool = False,
+            remove_from_db: bool = True,
+            failover: bool = False,
+            expected_cluster_record_uuid: str | None = None) -> None:
         """Cleanup local configs/caches and delete TPUs after teardown.
 
         This method will handle the following cleanup steps:
@@ -6678,8 +6208,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     raise
 
         if not terminate or remove_from_db:
+            removal_kwargs: dict[str, Any] = {}
+            if expected_cluster_record_uuid is not None:
+                removal_kwargs.update({
+                    'expected_cluster_record_uuid': expected_cluster_record_uuid,
+                    'expected_cluster_handle': handle,
+                })
             global_user_state.remove_cluster(handle.cluster_name,
-                                             terminate=terminate)
+                                             terminate=terminate,
+                                             **removal_kwargs)
 
     def remove_cluster_config(self, handle: CloudVmRayResourceHandle) -> None:
         """Remove the YAML config of a cluster."""
@@ -7487,7 +7024,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         return None
 
     def _get_task_codegen_class(
-            self, handle: CloudVmRayResourceHandle) -> task_codegen.TaskCodeGen:
+        self,
+        handle: CloudVmRayResourceHandle,
+        recovery_plan: skylet_system_oom_recovery.RecoveryLaunchPlan |
+        None = None,
+    ) -> task_codegen.TaskCodeGen:
         """Returns the appropriate TaskCodeGen for the given handle."""
         if isinstance(handle.launched_resources.cloud, clouds.Slurm):
             assert (handle.cached_cluster_info
@@ -7509,11 +7050,18 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 container_name,
             )
         else:
-            return task_codegen.RayCodeGen()
+            return task_codegen.RayCodeGen(
+                system_oom_recovery_plan=recovery_plan)
 
-    def _execute_task_one_node(self, handle: CloudVmRayResourceHandle,
-                               task: task_lib.Task, job_id: int,
-                               remote_log_dir: str) -> None:
+    def _execute_task_one_node(
+        self,
+        handle: CloudVmRayResourceHandle,
+        task: task_lib.Task,
+        job_id: int,
+        remote_log_dir: str,
+        recovery_plan: skylet_system_oom_recovery.RecoveryLaunchPlan |
+        None = None
+    ) -> None:
         # Launch the command as a Ray task.
         log_dir = os.path.join(remote_log_dir, 'tasks')
 
@@ -7523,7 +7071,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
         task_env_vars = self._get_task_env_vars(task, job_id, handle)
 
-        codegen = self._get_task_codegen_class(handle)
+        if recovery_plan is not None:
+            logger.info('Enabling bounded same-VM system-OOM recovery with '
+                        f'capability {recovery_plan.capability!r}.')
+        codegen = self._get_task_codegen_class(handle, recovery_plan)
 
         codegen.add_prologue(job_id)
         codegen.add_setup(

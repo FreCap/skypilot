@@ -197,6 +197,13 @@ class Server(uvicorn.Server):
 
     def _wait_requests(self) -> None:
         """Wait until all on-going requests are finished or cancelled."""
+        if os.environ.get('SKYPILOT_API_SERVER_ROLE', 'all') == 'api':
+            # API-only pods do not own request execution. Their durable rows
+            # may be running on any executor replica, so a local API shutdown
+            # must never wait for or interrupt that fleet-wide work.
+            logger.info('API-only role has no local request executions to '
+                        'drain.')
+            return
         # Budget the final interrupt sweep against the true shutdown start
         # (captured in handle_exit when SIGTERM arrived), reserving a margin
         # before the SIGKILL deadline so the sweep -- and its should_retry DB
@@ -276,6 +283,7 @@ class Server(uvicorn.Server):
             req.status = requests_lib.RequestStatus.CANCELLED
             req.finished_at = time.time()
             req.should_retry = True
+            req.terminal_cause = 'graceful_shutdown_retry'
         logger.info(
             f'Request {request_id} interrupted and will be retried by client.')
 

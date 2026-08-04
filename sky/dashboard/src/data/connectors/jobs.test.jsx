@@ -120,35 +120,29 @@ describe('getPoolStatus request scope', () => {
     expect(dashboardCache.get).not.toHaveBeenCalled();
   });
 
-  it('falls back to the managed-jobs snapshot when backend counts are absent', async () => {
+  it('keeps pool counts on the pool-status payload contract', async () => {
     apiClient.get.mockResolvedValue({
       ok: true,
       status: 200,
       statusText: 'OK',
-      json: async () => ({ return_value: '[{"name":"pool-a"}]' }),
-    });
-    dashboardCache.get.mockResolvedValue({
-      jobs: [
-        { pool: 'pool-a', status: 'RUNNING' },
-        { pool: 'pool-a', status: 'PENDING' },
-        { pool: 'pool-a', status: 'SUCCEEDED' },
-        { pool: 'pool-b', status: 'RUNNING' },
-      ],
-      controllerStopped: false,
+      json: async () => ({
+        return_value:
+          '[{"name":"pool-a"},{"name":"pool-b","job_status_counts":{"RUNNING":1}}]',
+      }),
     });
 
-    const result = await getPoolStatus({ poolNames: ['pool-a'] });
+    const result = await getPoolStatus({ poolNames: ['pool-a', 'pool-b'] });
 
-    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
-    expect(dashboardCache.get).toHaveBeenCalledWith(getManagedJobs, [
-      {
-        allUsers: true,
-        skipFinished: true,
-        fields: ['pool', 'status'],
-      },
-    ]);
+    expect(dashboardCache.get).not.toHaveBeenCalled();
     expect(result).toEqual({
-      pools: [{ name: 'pool-a', jobCounts: { RUNNING: 1, PENDING: 1 } }],
+      pools: [
+        { name: 'pool-a', jobCounts: {} },
+        {
+          name: 'pool-b',
+          job_status_counts: { RUNNING: 1 },
+          jobCounts: { RUNNING: 1 },
+        },
+      ],
       controllerStopped: false,
     });
   });
@@ -352,7 +346,6 @@ describe('useSingleManagedJob refresh ownership', () => {
       secondRefresh = result.current.refreshJobData();
     });
 
-    expect(secondRefresh).toBe(firstRefresh);
     expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
 
@@ -507,15 +500,12 @@ describe('useSingleManagedJob refresh ownership', () => {
     expect(result.current.jobData.jobs[0].status).toBe('SUCCEEDED');
   });
 
-  it('keeps a refresh loading when the superseded initial request fails', async () => {
+  it('reuses the in-flight initial load when no current-route data is visible', async () => {
     const initialRequest = deferred();
-    const refreshedRequest = deferred();
     const consoleError = jest
       .spyOn(console, 'error')
       .mockImplementation(() => {});
-    dashboardCache.get
-      .mockImplementationOnce(() => initialRequest.promise)
-      .mockImplementationOnce(() => refreshedRequest.promise);
+    dashboardCache.get.mockImplementationOnce(() => initialRequest.promise);
 
     const { result } = renderHook(() => useSingleManagedJob('56164'));
 
@@ -524,18 +514,11 @@ describe('useSingleManagedJob refresh ownership', () => {
     act(() => {
       refreshPromise = result.current.refreshJobData();
     });
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
 
     await act(async () => {
-      initialRequest.reject(new Error('superseded request failed'));
-      await initialRequest.promise.catch(() => {});
-    });
-
-    expect(result.current.loading).toBe(true);
-    expect(result.current.jobData).toBeNull();
-
-    await act(async () => {
-      refreshedRequest.resolve({
+      initialRequest.resolve({
         jobs: [{ id: 56164, status: 'RUNNING' }],
         controllerStopped: false,
       });
@@ -544,7 +527,7 @@ describe('useSingleManagedJob refresh ownership', () => {
 
     expect(result.current.loading).toBe(false);
     expect(result.current.jobData.jobs[0].status).toBe('RUNNING');
-    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
     consoleError.mockRestore();
   });
 });

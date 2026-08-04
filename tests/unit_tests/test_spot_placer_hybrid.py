@@ -717,7 +717,9 @@ run: echo hi
         costs = {one_gpu: 0.2, four_gpu: 0.6}
 
         assert make_placer(costs).select_next_location() == one_gpu
-        assert _make_per_gpu_placer(costs).select_next_location() == four_gpu
+        per_gpu = _make_per_gpu_placer(costs)
+        assert per_gpu.select_next_location() == four_gpu
+        assert per_gpu.ranked_active_locations() == [four_gpu, one_gpu]
 
     def test_fractional_gpu_shape_uses_exact_configured_count(self):
         half_gpu = make_location('half', accelerators={'L4': 0.5})

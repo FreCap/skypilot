@@ -1,11 +1,15 @@
 """Rest APIs for SkyServe."""
 
 import asyncio
+import enum
 
 import fastapi
 
 from sky import sky_logging
+from sky.serve import serve_dashboard
+from sky.serve import serve_history
 from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.serve.server import core
 from sky.server import common as server_common
 from sky.server import stream_utils
@@ -21,6 +25,18 @@ from sky.utils import yaml_utils
 
 logger = sky_logging.init_logger(__name__)
 router = fastapi.APIRouter()
+
+
+class StatusHistorySection(str, enum.Enum):
+    REQUESTS = 'requests'
+    REPLICAS = 'replicas'
+    PREDICTION = 'prediction'
+    AUTOSCALER = 'autoscaler'
+
+
+class ReplicaScope(str, enum.Enum):
+    CURRENT_OR_UNCERTAIN = serve_dashboard.CURRENT_OR_UNCERTAIN_SCOPE
+    PAST_ATTEMPTS = serve_dashboard.PAST_ATTEMPTS_SCOPE
 
 
 def _require_admin(request: fastapi.Request) -> None:
@@ -124,6 +140,98 @@ def version_history(request: fastapi.Request, service_name: str) -> dict:
     """Return immutable version history to an administrator."""
     _require_admin(request)
     return _service_version_history(service_name)
+
+
+@router.get('/{service_name}/history')
+async def status_history(
+    service_name: str,
+    expected_service_hash: str = fastapi.Query(min_length=1),
+    hours: int = fastapi.Query(default=1,
+                               ge=1,
+                               le=serve_history.RETENTION_HOURS),
+    section: list[StatusHistorySection] = fastapi.Query(
+        default=list(StatusHistorySection)),
+) -> dict:
+    """Read selected persisted history without contacting the controller."""
+    requested_sections = {item.value for item in section}
+    if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
+        return serve_history.unavailable_status_history('non_consolidated',
+                                                        requested_sections)
+    service = await asyncio.to_thread(serve_state.get_service_status_snapshot,
+                                      service_name)
+    if service is None or service.get('pool'):
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    if service.get('hash') != expected_service_hash:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.')
+    history = await asyncio.to_thread(
+        serve_history.get_status_history,
+        service_name,
+        hours=hours,
+        expected_service_hash=expected_service_hash,
+        sections=requested_sections,
+    )
+    reason = history.get('reason')
+    if reason == 'service_not_found':
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    if reason == 'service_hash_mismatch':
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.')
+    return history
+
+
+@router.get('/replica-summaries')
+async def replica_summaries(
+        service_name: list[str] | None = fastapi.Query(default=None),) -> dict:
+    """Read compact persisted counts without contacting a controller."""
+    if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
+        return serve_dashboard.unavailable_replica_summaries('non_consolidated')
+    return await asyncio.to_thread(serve_dashboard.get_replica_summaries,
+                                   service_name)
+
+
+@router.get('/{service_name}/replicas')
+async def replica_page(
+    service_name: str,
+    expected_service_hash: str = fastapi.Query(min_length=1),
+    scope: ReplicaScope = fastapi.Query(),
+    limit: int = fastapi.Query(default=50, ge=1, le=100),
+    cursor: str | None = fastapi.Query(default=None,
+                                       min_length=1,
+                                       max_length=4096),
+) -> dict:
+    """Read one bounded persisted replica page without controller work."""
+    scope_value = scope.value
+    if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
+        return serve_dashboard.unavailable_replica_page(service_name,
+                                                        expected_service_hash,
+                                                        scope_value,
+                                                        'non_consolidated')
+    try:
+        return await asyncio.to_thread(
+            serve_dashboard.get_replica_page,
+            service_name,
+            expected_service_hash,
+            scope_value,
+            limit,
+            cursor,
+        )
+    except serve_dashboard.ServiceNotFoundError as exc:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.') from exc
+    except (serve_dashboard.ServiceHashMismatchError,
+            serve_dashboard.ReplicaCursorMismatchError) as exc:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation or replica cursor changed. Refresh '
+            'and retry.') from exc
+    except serve_dashboard.InvalidReplicaCursorError as exc:
+        raise fastapi.HTTPException(status_code=422,
+                                    detail='Invalid replica cursor.') from exc
 
 
 @router.post('/{service_name}/versions/elect')
@@ -265,24 +373,40 @@ async def tail_logs(
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
     stream_utils.ensure_request_log_storage_available()
-    executor.check_request_thread_executor_available()
-    request_task = await executor.prepare_request_async(
-        request_id=request.state.request_id,
-        request_name=request_names.RequestName.SERVE_LOGS,
-        request_body=log_body,
-        func=core.tail_logs,
-        schedule_type=api_requests.ScheduleType.SHORT,
-        request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
-        auth_user=request.state.auth_user,
-    )
-    task = executor.execute_request_in_coroutine(request_task)
-    # Cancel the coroutine after the request is done or client disconnects
-    background_tasks.add_task(task.cancel)
+    kill_request_on_disconnect = False
+    if executor.api_process_execution_enabled():
+        executor.check_request_thread_executor_available()
+        request_task = await executor.prepare_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.SERVE_LOGS,
+            request_body=log_body,
+            func=core.tail_logs,
+            schedule_type=api_requests.ScheduleType.SHORT,
+            request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
+            auth_user=request.state.auth_user,
+        )
+        task = executor.execute_request_in_coroutine(request_task)
+        # Cancel the coroutine after the request is done or client disconnects
+        background_tasks.add_task(task.cancel)
+    else:
+        await executor.schedule_request_async(
+            request_id=request.state.request_id,
+            request_name=request_names.RequestName.SERVE_LOGS,
+            request_body=log_body,
+            func=core.tail_logs,
+            schedule_type=api_requests.ScheduleType.SHORT,
+            request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
+            auth_user=request.state.auth_user,
+        )
+        request_task = await api_requests.get_request_async(
+            request.state.request_id)
+        assert request_task is not None
+        kill_request_on_disconnect = True
     return stream_utils.stream_response_for_long_request(
         request_id=request_task.request_id,
         logs_path=request_task.log_path,
         background_tasks=background_tasks,
-        kill_request_on_disconnect=False,
+        kill_request_on_disconnect=kill_request_on_disconnect,
     )
 
 

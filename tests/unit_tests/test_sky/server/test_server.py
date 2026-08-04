@@ -766,6 +766,165 @@ async def test_serve_launch_endpoint_attaches_owner_precondition():
     assert condition.service_hash == 'incarnation-a'
 
 
+def _unbound_system_recovery_launch_context() -> dict[str, object]:
+    from sky.serve import system_oom_recovery
+
+    digest = 'a' * 64
+    intent = {
+        'controller_contract_version': 2,
+        'recovery_authorization_version': 3,
+        'recovery_authorization_profile_id': 'boltz-l4-v3',
+        'recovery_authorization_sha256': digest,
+        'runtime_profile_version': 2,
+        'expected_runtime_capability': 'subreaper-v2+owned-local-docker-v1',
+        'service_hash': 'incarnation-a',
+        'replica_id': 7,
+        'launch_generation': 7,
+        'launch_nonce': 'b' * 64,
+        'workspace': 'default',
+        'resource_envelope_sha256': digest,
+        'task_sha256': digest,
+        'runtime_image_digest': f'sha256:{digest}',
+        'owned_container_spec_sha256': digest,
+        'execution_envelope_sha256': digest,
+    }
+    return system_oom_recovery.create_unbound_launch_context(
+        intent,
+        service_name='svc',
+        service_version=3,
+        controller_pid=123,
+        controller_ip='10.0.0.1')
+
+
+@pytest.mark.asyncio
+async def test_system_recovery_launch_binds_request_before_nonretryable_queue():
+    """The API consumes the nonce and queues only the bound one-shot body."""
+    from sky.serve import constants as serve_constants
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    unbound = _unbound_system_recovery_launch_context()
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica-7',
+                                      retry_until_up=True,
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=unbound)
+    events = []
+
+    with mock.patch.object(
+            server.serve_state,
+            'bind_replica_system_recovery_launch_request') as mock_bind, \
+         mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule:
+        mock_bind.side_effect = lambda *_: events.append('bind')
+        mock_schedule.side_effect = lambda *_, **__: events.append('schedule')
+        await server.launch(launch_body, request)
+
+    assert events == ['bind', 'schedule']
+    mock_bind.assert_called_once_with(unbound, 'launch-request-id')
+    assert serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY in unbound
+    queued_body = mock_schedule.await_args.kwargs['request_body']
+    assert queued_body.retry_until_up is True
+    queued_context = queued_body.extra_launch_context
+    assert serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY not in (
+        queued_context)
+    assert queued_context[
+        serve_constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY] == (
+            'launch-request-id')
+    assert mock_schedule.await_args.kwargs['retryable'] is False
+
+
+@pytest.mark.asyncio
+async def test_system_recovery_launch_rejects_invalid_or_consumed_nonce():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='svc-replica-7',
+        is_launched_by_sky_serve_controller=True,
+        extra_launch_context=_unbound_system_recovery_launch_context())
+
+    rejection = server.serve_state.ReplicaSystemRecoveryMutationRejected(
+        'nonce was already consumed')
+    with mock.patch.object(
+            server.serve_state,
+            'bind_replica_system_recovery_launch_request',
+            side_effect=rejection), \
+         mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='launch intent') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_system_recovery_context_is_rejected_before_binding():
+    from sky.serve import constants as serve_constants
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='svc-replica-7',
+        is_launched_by_sky_serve_controller=True,
+        extra_launch_context={
+            serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY: 'b' * 64,
+        })
+
+    with mock.patch.object(
+            server.serve_state,
+            'bind_replica_system_recovery_launch_request') as mock_bind, \
+         mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='launch intent'):
+        await server.launch(launch_body, request)
+
+    mock_bind.assert_not_called()
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_legacy_recovery_context_remains_retryable():
+    """The deprecated contract-1 tuple bypasses the v3 nonce protocol."""
+    from sky.serve import constants as serve_constants
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='svc-replica',
+        retry_until_up=True,
+        is_launched_by_sky_serve_controller=True,
+        extra_launch_context={
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+            serve_constants.SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY: 1,
+            serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY: 'boltz-l4-v1',
+            serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY: 1,
+        })
+
+    with mock.patch.object(
+            server.serve_state,
+            'bind_replica_system_recovery_launch_request') as mock_bind, \
+         mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule:
+        await server.launch(launch_body, request)
+
+    mock_bind.assert_not_called()
+    assert mock_schedule.await_args.kwargs['retryable'] is True
+
+
 @pytest.mark.asyncio
 async def test_serve_launch_endpoint_rejects_missing_owner_context():
     """Legacy/internal Serve launches cannot bypass the durable fence."""

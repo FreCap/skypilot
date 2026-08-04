@@ -51,7 +51,7 @@ def test_sweep_fires_once_budgeted_deadline_passes(monkeypatch):
     # The non-retriable launch request is interrupted-for-retry by the sweep,
     # and we do NOT keep sleeping past the SIGKILL deadline.
     assert interrupted == ['req-exec']
-    assert slept == []
+    assert not slept
 
 
 def test_handle_exit_captures_sigterm_arrival(monkeypatch):
@@ -84,7 +84,7 @@ def test_non_retriable_not_interrupted_before_deadline(monkeypatch):
 
     server._wait_requests()
 
-    assert interrupted == []  # not swept before the deadline
+    assert not interrupted  # not swept before the deadline
     assert slept == [uvicorn_module._WAIT_REQUESTS_INTERVAL_SECONDS]
 
 
@@ -103,8 +103,8 @@ def test_replayable_launch_neither_blocks_shutdown_nor_interrupted(monkeypatch):
 
     server._wait_requests()
 
-    assert interrupted == []
-    assert slept == []
+    assert not interrupted
+    assert not slept
 
 
 def test_replayable_filter_leaves_other_requests_to_the_sweep(monkeypatch):
@@ -119,4 +119,18 @@ def test_replayable_filter_leaves_other_requests_to_the_sweep(monkeypatch):
     server._wait_requests()
 
     assert interrupted == ['req-exec']
-    assert slept == []
+    assert not slept
+
+
+def test_api_only_shutdown_does_not_touch_executor_owned_requests(monkeypatch):
+    server, slept, interrupted = _server_at_shutdown(monkeypatch, now=151.0)
+    backend = mock.Mock()
+    monkeypatch.setattr(uvicorn_module.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
+
+    server._wait_requests()
+
+    backend.get_shutdown_active_requests.assert_not_called()
+    assert not interrupted
+    assert not slept

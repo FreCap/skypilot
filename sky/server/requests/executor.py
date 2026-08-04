@@ -41,6 +41,7 @@ from sky import models
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import kubernetes as kubernetes_adaptor
+from sky.events import api_models as event_api_models
 from sky.metrics import utils as metrics_utils
 from sky.serve import placement_history
 from sky.server import clean_env as clean_env_module
@@ -52,12 +53,16 @@ from sky.server import metrics as metrics_lib
 from sky.server import plugins
 from sky.server import versions
 from sky.server import watchdog
+from sky.server.events import models as event_models
+from sky.server.requests import authority_worker
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import process
+from sky.server.requests import registry as request_registry
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
 from sky.server.requests import role_filter
+from sky.server.requests import storage as request_storage
 from sky.server.requests import threads
 from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants
@@ -104,6 +109,11 @@ _REQUEST_THREAD_EXECUTOR_LOCK = threading.Lock()
 _REQUEST_THREAD_EXECUTOR: threads.OnDemandThreadExecutor | None = None
 
 
+def api_process_execution_enabled() -> bool:
+    """Whether HTTP handlers may use the legacy in-process execution path."""
+    return os.environ.get('SKYPILOT_API_SERVER_ROLE', 'all') != 'api'
+
+
 def get_request_thread_executor() -> threads.OnDemandThreadExecutor:
     """Lazy init and return the request thread executor for current process."""
     global _REQUEST_THREAD_EXECUTOR
@@ -127,7 +137,7 @@ class RequestQueue:
     def __init__(self, queue_backend_impl: queue_base.QueueBackend) -> None:
         self._backend = queue_backend_impl
 
-    def put(self, request: tuple[str, bool, bool]) -> None:
+    def put(self, request: queue_base.QueueItemLike) -> None:
         """Put a request to the queue.
 
         Args:
@@ -135,7 +145,7 @@ class RequestQueue:
         """
         self._backend.put(request)
 
-    async def put_async(self, request: tuple[str, bool, bool]) -> None:
+    async def put_async(self, request: queue_base.QueueItemLike) -> None:
         """Put a request to the queue, async.
 
         Args:
@@ -143,7 +153,7 @@ class RequestQueue:
         """
         await self._backend.put_async(request)
 
-    def get(self) -> tuple[str, bool, bool] | None:
+    def get(self) -> queue_base.QueueItem | None:
         """Get a request from the queue.
 
         It is non-blocking if the queue is empty, and returns None.
@@ -151,7 +161,9 @@ class RequestQueue:
         Returns:
             A tuple of request_id, ignore_return_value, and retryable.
         """
-        return self._backend.get()
+        item = self._backend.get()
+        return (queue_base.normalize_queue_item(item)
+                if item is not None else None)
 
     def __len__(self) -> int:
         """Get the length of the queue."""
@@ -164,6 +176,10 @@ _queue_factory: queue_base.QueueBackendFactory | None = None
 
 def executor_initializer(proc_group: str,
                          clean_env: dict[str, str] | None = None):
+    server_role = os.environ.get('SKYPILOT_API_SERVER_ROLE', 'all')
+    metrics_process_role = ('authority-worker' if server_role
+                            == 'authority-worker' else 'executor')
+    db_utils.set_postgres_connection_metrics_process_role(metrics_process_role)
     setproctitle.setproctitle(f'SkyPilot:executor:{proc_group}:'
                               f'{multiprocessing.current_process().pid}')
     # This runs in a child process of the API server. If the main process
@@ -240,20 +256,31 @@ class RequestWorker:
         self._thread = thread
 
     def cancel(self) -> None:
+        self.request_shutdown()
+        self.wait_for_shutdown()
+
+    def request_shutdown(self) -> None:
+        """Stop this worker from claiming another request."""
+        self._cancel_event.set()
+
+    def wait_for_shutdown(self) -> None:
+        """Wait for the worker dispatcher and its process pool to exit."""
         if self._thread is not None:
-            self._cancel_event.set()
             self._thread.join()
 
     def process_request(self, executor: process.BurstableExecutor,
                         queue: RequestQueue) -> None:
         request_id: str | None = None
+        request_element: queue_base.QueueItem | None = None
         fut: concurrent.futures.Future | None = None
         try:
-            request_element = queue.get()
-            if request_element is None:
+            queued = queue.get()
+            if queued is None:
                 time.sleep(0.1)
                 return
-            request_id, ignore_return_value, _ = request_element
+            request_element = queue_base.normalize_queue_item(queued)
+            request_id = request_element.request_id
+            ignore_return_value = request_element.ignore_return_value
             request = api_requests.get_request(request_id,
                                                fields=['status', 'created_at'])
             if request is None:
@@ -280,7 +307,9 @@ class RequestWorker:
             # the process, such as subprocess_daemon.py.
             fut = executor.submit_until_success(
                 _request_execution_wrapper, request_id, ignore_return_value,
-                self.num_db_connections_per_worker)
+                self.num_db_connections_per_worker,
+                request_element.execution_generation,
+                request_element.claim_token)
             # Decrement the free executor count when a request starts
             if metrics_utils.METRICS_ENABLED:
                 if self.schedule_type == api_requests.ScheduleType.LONG:
@@ -308,25 +337,23 @@ class RequestWorker:
                 # If a future exists, the request was submitted successfully
                 # and may already be RUNNING (or even finished); its lifecycle
                 # is owned by handle_task_result, so only log here.
-                self._fail_stranded_request(request_id, e)
+                self._fail_stranded_request(request_id, e, request_element)
 
-    def _fail_stranded_request(self, request_id: str, e: BaseException) -> None:
+    def _fail_stranded_request(
+            self, request_id: str, e: BaseException,
+            request_element: queue_base.QueueItem | None) -> None:
         """Best-effort: fail a dequeued request that never got submitted."""
+        claim_context_token = request_storage.activate_execution_claim(
+            request_id, request_element.execution_generation
+            if request_element is not None else 0, request_element.claim_token
+            if request_element is not None else None)
         try:
             api_requests.set_exception_stacktrace(e)
-            # Guard and write under a single update_request block (the lock
-            # is held across the read and the write), so a concurrent
-            # cancel/terminal write cannot land between the status check and
-            # the FAILED write and get clobbered.
-            with api_requests.update_request(request_id) as request_task:
-                if request_task is None:
-                    return
-                if request_task.status > api_requests.RequestStatus.RUNNING:
-                    # Already terminal, e.g. cancelled by a concurrent kill.
-                    return
-                request_task.status = api_requests.RequestStatus.FAILED
-                request_task.finished_at = time.time()
-                request_task.set_error(e)
+            request_storage.get_request_backend().transition_request_terminal(
+                request_id,
+                api_requests.RequestStatus.FAILED,
+                'dispatcher_submit_failed',
+                error=e)
         except (Exception, SystemExit) as recovery_e:  # pylint: disable=broad-except
             # Never let the recovery itself crash the dispatcher thread.
             logger.error(
@@ -334,6 +361,8 @@ class RequestWorker:
                 f'failed: '
                 f'{common_utils.format_exception(recovery_e, use_bracket=True)}'
             )
+        finally:
+            request_storage.deactivate_execution_claim(claim_context_token)
 
     def _mark_executor_free(self) -> None:
         """Increment the free-executor gauge for this worker's schedule type.
@@ -350,7 +379,63 @@ class RequestWorker:
             metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.inc()
 
     def handle_task_result(self, fut: concurrent.futures.Future,
-                           request_element: tuple[str, bool, bool]) -> None:
+                           request_element: queue_base.QueueItemLike) -> None:
+        original_request_element = request_element
+        request_element = queue_base.normalize_queue_item(request_element)
+        claim_context_token = request_storage.activate_execution_claim(
+            request_element.request_id, request_element.execution_generation,
+            request_element.claim_token)
+        heartbeat_stop = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
+        backend = request_storage.get_request_backend()
+        interval = backend.claim_heartbeat_interval_seconds
+        if request_element.claim_token is not None and interval is not None:
+            claim = request_storage.ExecutionClaim(
+                request_element.request_id,
+                request_element.execution_generation,
+                request_element.claim_token)
+
+            def heartbeat() -> None:
+                while not heartbeat_stop.is_set():
+                    try:
+                        if not backend.heartbeat_claim(claim):
+                            if backend.interrupt_cancelled_claim(claim):
+                                logger.info(f'Acknowledged cancellation for '
+                                            f'{claim.request_id} generation '
+                                            f'{claim.execution_generation}.')
+                                return
+                            logger.warning(
+                                f'Execution claim for {claim.request_id} '
+                                'became stale; subsequent writes are fenced.')
+                            return
+                    except Exception as e:  # pylint: disable=broad-except
+                        # A transient database failure must not kill the monitor
+                        # thread. If connectivity is not restored before lease
+                        # expiry, the next heartbeat and every result write are
+                        # rejected by the database-side fence.
+                        logger.warning(
+                            f'Failed to heartbeat execution claim for '
+                            f'{claim.request_id}: '
+                            f'{common_utils.format_exception(e)}')
+                    heartbeat_stop.wait(interval)
+
+            heartbeat_thread = threading.Thread(
+                target=heartbeat,
+                name=f'request-lease-{request_element.request_id}',
+                daemon=True)
+            heartbeat_thread.start()
+        try:
+            self._handle_task_result(fut, original_request_element)
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=interval)
+            request_storage.deactivate_execution_claim(claim_context_token)
+
+    def _handle_task_result(self, fut: concurrent.futures.Future,
+                            request_element: queue_base.QueueItemLike) -> None:
+        requeue_element = request_element
+        request_element = queue_base.normalize_queue_item(request_element)
         try:
             try:
                 fut.result()
@@ -364,7 +449,8 @@ class RequestWorker:
         except concurrent.futures.process.BrokenProcessPool as e:
             # Happens when the worker process dies unexpectedly, e.g. OOM
             # killed.
-            request_id, _, retryable = request_element
+            request_id = request_element.request_id
+            retryable = request_element.retryable
             logger.error(
                 f'Request {request_id} failed to get processed '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
@@ -392,9 +478,9 @@ class RequestWorker:
             # BurstableExecutor replaces the broken guaranteed pool on the
             # next submission, so reschedule immediately.
             queue = _get_queue(self.schedule_type)
-            queue.put(request_element)
+            queue.put(requeue_element)
         except exceptions.ExecutionRetryableError as e:
-            request_id, _, _ = request_element
+            request_id = request_element.request_id
             # Clamp to avoid ValueError from time.sleep() on a negative wait.
             retry_wait_seconds = max(0, e.retry_wait_seconds)
             # A pause (ExecutionPausedError) may carry a continue condition that
@@ -449,7 +535,7 @@ class RequestWorker:
                     not _request_is_gone_or_cancelled(request_id)):
                 # Reschedule the request.
                 queue = _get_queue(self.schedule_type)
-                queue.put(request_element)
+                queue.put(requeue_element)
                 logger.info(f'Rescheduled request {request_id} for retry')
 
     def run(self) -> None:
@@ -708,6 +794,14 @@ def override_request_env_and_config(
                             f'{request_id} permission denied to workspace: '
                             f'{skypilot_config.get_active_workspace()}: {e}')
                         raise e
+                    if event_models.request_kind(request_name) is not None:
+                        if not api_requests.set_event_workspace(
+                                request_id,
+                                skypilot_config.get_active_workspace()):
+                            raise RuntimeError(
+                                'The request lost its execution fence before '
+                                'its operational event workspace was '
+                                'persisted.')
                     logger.debug(f'{request_id} permission granted to '
                                  f'{request_name} request')
                     yield
@@ -725,6 +819,41 @@ def override_request_env_and_config(
         # leak to whichever request the worker handles next.
         os.environ.clear()
         os.environ.update(original_env)
+
+
+@contextlib.contextmanager
+def _controller_execution_environment(
+    controller_generation: int | None,
+    controller_instance_id: str | None,
+) -> Generator[None, None, None]:
+    """Expose the durable controller fence to one claimed request."""
+    if controller_generation is None:
+        yield
+        return
+    if controller_instance_id is None:
+        raise RuntimeError('A controller claim must have an owner instance.')
+
+    # Runtime import avoids loading the PostgreSQL backend for the legacy
+    # local and multiprocessing executors.
+    # pylint: disable=import-outside-toplevel
+    from sky.server.requests import postgres
+    generation_env_var = postgres.CONTROLLER_GENERATION_ENV_VAR
+    instance_env_var = postgres.CONTROLLER_INSTANCE_ID_ENV_VAR
+    previous_generation = os.environ.get(generation_env_var)
+    previous_instance = os.environ.get(instance_env_var)
+    os.environ[generation_env_var] = str(controller_generation)
+    os.environ[instance_env_var] = controller_instance_id
+    try:
+        yield
+    finally:
+        if previous_generation is None:
+            os.environ.pop(generation_env_var, None)
+        else:
+            os.environ[generation_env_var] = previous_generation
+        if previous_instance is None:
+            os.environ.pop(instance_env_var, None)
+        else:
+            os.environ[instance_env_var] = previous_instance
 
 
 def _sigterm_handler(signum: int, frame: Optional['types.FrameType']) -> None:
@@ -755,9 +884,48 @@ def _gated_sigterm_handler(signum: int,
         pass
 
 
+def _enrich_event_target_id(request_id: str, cluster_name: str | None) -> None:
+    """Best-effort capture of the cluster generation for an event."""
+    if cluster_name is None:
+        return
+    try:
+        cluster_hash = global_user_state.get_cluster_hash_for_name(cluster_name)
+        if cluster_hash is not None:
+            api_requests.set_event_target_id(request_id, cluster_hash)
+    except Exception as e:  # pylint: disable=broad-except
+        # Event target enrichment is observability. The authoritative request
+        # result must never depend on this optional identity lookup.
+        logger.warning(
+            f'Failed to enrich operational event target for {request_id}: '
+            f'{common_utils.format_exception(e)}')
+
+
+@contextlib.contextmanager
+def _capture_event_target(
+        request_id: str, request_name: str,
+        cluster_name: str | None) -> Generator[None, None, None]:
+    """Capture the stable cluster generation around an opted-in operation."""
+    event_kind = event_models.request_kind(request_name)
+    if event_kind is None:
+        yield
+        return
+    # A launch can replace an existing cluster generation, so only capture its
+    # target after the handler has run. Other lifecycle operations capture
+    # before and after: teardown removes the authoritative cluster record,
+    # while a failed operation may still create or replace it.
+    if event_kind != event_api_models.EventKind.CLUSTER_LAUNCH:
+        _enrich_event_target_id(request_id, cluster_name)
+    try:
+        yield
+    finally:
+        _enrich_event_target_id(request_id, cluster_name)
+
+
 def _request_execution_wrapper(request_id: str,
                                ignore_return_value: bool,
-                               num_db_connections_per_worker: int = 0) -> None:
+                               num_db_connections_per_worker: int = 0,
+                               execution_generation: int = 0,
+                               claim_token: str | None = None) -> None:
     """Wrapper for a request execution.
 
     It wraps the execution of a request to:
@@ -814,6 +982,8 @@ def _request_execution_wrapper(request_id: str,
     # Set _in_request_execution inside the try so `finally` always clears it,
     # even if a SIGTERM lands before any wrapper code runs.
     global _in_request_execution  # pylint: disable=global-statement
+    execution_claim_token = request_storage.activate_execution_claim(
+        request_id, execution_generation, claim_token)
     try:
         _in_request_execution = True
         placement_history.reset_request_buffer()
@@ -827,7 +997,8 @@ def _request_execution_wrapper(request_id: str,
         # takes the per-request FileLock internally so it serializes with
         # the remaining full-row read-modify-write writers (kill paths,
         # interrupt_request_for_retry).
-        if not api_requests.try_mark_running(request_id, pid):
+        if not api_requests.try_mark_running(request_id, pid,
+                                             execution_generation, claim_token):
             logger.warning(f'Request {request_id} is already finished or '
                            'cancelled, skipping execution')
             return
@@ -837,6 +1008,9 @@ def _request_execution_wrapper(request_id: str,
         func = request_task.entrypoint
         request_body = request_task.request_body
         request_name = request_task.name
+        request_cluster_name = request_task.cluster_name
+        controller_generation = request_task.controller_generation
+        controller_instance_id = request_task.worker_instance_id
         del request_task
 
         # Store copies of the original stdout and stderr file descriptors
@@ -861,6 +1035,8 @@ def _request_execution_wrapper(request_id: str,
             with debug_log_ctx, \
                 override_request_env_and_config(
                     request_body, request_id, request_name), \
+                _controller_execution_environment(
+                    controller_generation, controller_instance_id), \
                 tempstore.tempdir():
                 if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
                     config = debug_dump_helpers.redact_config(
@@ -870,7 +1046,9 @@ def _request_execution_wrapper(request_id: str,
                 (metrics_utils.SKY_APISERVER_PROCESS_EXECUTION_START_TOTAL.
                  labels(request=request_name, pid=pid).inc())
                 with metrics_utils.time_it(name=request_name,
-                                           group='request_execution'):
+                                           group='request_execution'), \
+                        _capture_event_target(
+                            request_id, request_name, request_cluster_name):
                     return_value = func(**request_body.to_kwargs())
                 f.flush()
     except KeyboardInterrupt:
@@ -924,6 +1102,7 @@ def _request_execution_wrapper(request_id: str,
         logger.info(f'Request {request_id} finished')
     finally:
         _in_request_execution = False
+        request_storage.deactivate_execution_claim(execution_claim_token)
         _restore_output()
         try:
             placement_history.flush_request_buffer()
@@ -1171,6 +1350,8 @@ async def prepare_request_async(
     auth_user: models.User | None = None,
     ignore_return_value: bool = False,
     retryable: bool = False,
+    should_enqueue: bool = False,
+    precondition: preconditions.Precondition | None = None,
 ) -> api_requests.Request:
     """Prepare a request for execution.
 
@@ -1181,23 +1362,39 @@ async def prepare_request_async(
     """
     role_filter.reject_non_admin_pod_config(auth_user, request_body)
     if auth_user is not None:
-        assert auth_user.name is not None
+        # Authenticated requests historically did not require either submitted
+        # identity field because both are replaced below.
+        submitted_user_hash = request_body.env_vars.get(
+            constants.USER_ID_ENV_VAR, '')
+    else:
+        # Preserve the legacy no-auth requirement for a submitted user hash.
+        submitted_user_hash = request_body.env_vars[constants.USER_ID_ENV_VAR]
+    submitted_original_user = request_body.env_vars.get(constants.USER_ENV_VAR,
+                                                        submitted_user_hash)
+    effective_original_user, user_id = (
+        server_common.resolve_effective_request_identity(
+            auth_user, submitted_original_user, submitted_user_hash))
+    if auth_user is not None:
         # Use the authenticated user identity as the single source of truth
         # if present.
-        user_id = auth_user.id
         # Set user identity for executors.
         request_body.env_vars[constants.USER_ID_ENV_VAR] = user_id
-        request_body.env_vars[constants.USER_ENV_VAR] = auth_user.name
-    else:
-        # Fallback to legacy environment variable based identity if no
-        # authentication is set.
-        user_id = request_body.env_vars[constants.USER_ID_ENV_VAR]
+        request_body.env_vars[constants.USER_ENV_VAR] = effective_original_user
+    actor_type: str | None
     if is_skypilot_system:
         user_id = constants.SKYPILOT_SYSTEM_USER_ID
+        actor_name = user_id
+        actor_type = models.UserType.SYSTEM.value
         global_user_state.add_or_update_user(
             models.User(id=user_id,
                         name=user_id,
                         user_type=models.UserType.SYSTEM.value))
+    elif auth_user is not None:
+        actor_name = effective_original_user or user_id
+        actor_type = auth_user.user_type
+    else:
+        actor_name = effective_original_user
+        actor_type = None
     # Capture the client's API version from the FastAPI dispatch context
     # into the request body so it survives the process boundary into the
     # worker that runs the request. APIVersionMiddleware set the
@@ -1208,6 +1405,7 @@ async def prepare_request_async(
     # clients (no header) yield None, which the worker-side gate treats
     # as "skip the workspace resolver".
     request_body.client_api_version = versions.get_remote_api_version()
+    durable_precondition = preconditions.serialize(precondition)
     request = api_requests.Request(
         request_id=request_id,
         name=server_constants.REQUEST_NAME_PREFIX + request_name,
@@ -1221,6 +1419,19 @@ async def prepare_request_async(
         file_mounts_blob_id=getattr(request_body, 'file_mounts_blob_id', None),
         ignore_return_value=ignore_return_value,
         retryable=retryable,
+        should_enqueue=should_enqueue,
+        precondition_type=(durable_precondition.type_name
+                           if durable_precondition is not None else None),
+        precondition_payload=(durable_precondition.payload
+                              if durable_precondition is not None else None),
+        precondition_deadline=(durable_precondition.deadline
+                               if durable_precondition is not None else None),
+        event_context=event_models.initial_context(
+            request_name,
+            actor_name=actor_name,
+            actor_type=actor_type,
+            cluster_name=request_cluster_name,
+        ),
     )
 
     if not await api_requests.create_if_not_exists_async(request):
@@ -1274,7 +1485,9 @@ async def schedule_request_async(request_id: str,
         is_skypilot_system,
         auth_user=auth_user,
         ignore_return_value=ignore_return_value,
-        retryable=retryable)
+        retryable=retryable,
+        should_enqueue=True,
+        precondition=precondition)
     await schedule_prepared_request(request_task, ignore_return_value,
                                     precondition, retryable)
 
@@ -1330,11 +1543,24 @@ async def schedule_prepared_request(request_task: api_requests.Request,
     """
 
     async def enqueue():
+        # The non-durable queue contract is intentionally the historical
+        # three-tuple. PostgreSQL inserts its queue row transactionally and
+        # returns above without calling this closure; durable claim metadata is
+        # attached only when that backend dequeues the row. Keeping this shape
+        # also preserves external queue plugins and test fixtures during M5.
         input_tuple = (request_task.request_id, ignore_return_value, retryable)
         logger.info(f'Queuing request: {request_task.request_id}')
         await _get_queue(request_task.schedule_type).put_async(input_tuple)
 
-    if precondition is not None:
+    durable_queue = (request_storage.get_request_backend().uses_durable_queue
+                     is True)
+    if durable_queue:
+        # The PostgreSQL backend inserted the request and queue delivery in one
+        # transaction. An API-only process deliberately has no local queue
+        # factory, and a second put would only re-read the row it just wrote.
+        logger.info(f'Durably queued request: {request_task.request_id}')
+        return
+    if precondition is not None and not durable_queue:
         # Schedule precondition wait as a background task so the caller
         # returns immediately.  The task reference is stored in a
         # module-level set to prevent garbage collection.
@@ -1347,7 +1573,12 @@ async def schedule_prepared_request(request_task: api_requests.Request,
 
 
 def start(
-    config: server_config.ServerConfig
+    config: server_config.ServerConfig,
+    *,
+    execution_classes: frozenset[request_registry.ExecutionClass] | None = None,
+    controller_generation: int | None = None,
+    authority_claim_config: (authority_worker.AuthorityWorkerClaimConfig |
+                             None) = None,
 ) -> tuple[multiprocessing.Process | None, list[RequestWorker]]:
     """Start the request workers.
 
@@ -1362,14 +1593,38 @@ def start(
     factory = queue_base.get_registered_queue_backend_factory()
     # Explicitly registered plugin backends take precedence over config.
     if factory is not None:
+        if execution_classes is not None or authority_claim_config is not None:
+            raise RuntimeError(
+                'Explicit queue plugins cannot be used with role-scoped '
+                'request execution because QueueBackendFactory has no closed '
+                'claim-filter contract.')
         _queue_factory = factory
+    elif os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
+        # Runtime import avoids loading the PostgreSQL implementation before
+        # plugins have had an opportunity to register a custom queue factory.
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import postgres
+        allowed_classes = (frozenset(
+            execution_class.value for execution_class in execution_classes)
+                           if execution_classes is not None else None)
+        _queue_factory = postgres.PostgresQueueFactory(
+            execution_classes=allowed_classes,
+            controller_generation=controller_generation,
+            authority_claim_config=authority_claim_config)
     elif config.queue_backend == server_config.QueueBackend.MULTIPROCESSING:
+        if execution_classes is not None or authority_claim_config is not None:
+            raise RuntimeError('Role-scoped request execution requires the '
+                               'PostgreSQL request backend.')
         _queue_factory = queue_base.MultiprocessingQueueFactory()
     elif config.queue_backend == server_config.QueueBackend.LOCAL:
+        if execution_classes is not None or authority_claim_config is not None:
+            raise RuntimeError('Role-scoped request execution requires the '
+                               'PostgreSQL request backend.')
         _queue_factory = queue_base.LocalQueueFactory()
     else:
         raise RuntimeError(f'Invalid queue backend: {config.queue_backend}')
 
+    _get_queue.cache_clear()
     queue_server = _queue_factory.start()
     logger.info('Request queues created')
 

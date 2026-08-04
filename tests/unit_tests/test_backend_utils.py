@@ -2,6 +2,10 @@
 
 # pylint: disable=protected-access,unused-argument
 
+import base64
+import gzip
+import hashlib
+import io
 import os
 import pathlib
 from types import SimpleNamespace
@@ -15,14 +19,37 @@ from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
 from sky.backends import backend_utils
+from sky.backends import cloud_vm_ray_backend
 from sky.exceptions import ClusterNotUpError
 from sky.provision import docker_utils
+from sky.provision import instance_setup
+from sky.provision import ray_commands
+from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.resources import Resources
 from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import controller_utils
+from sky.utils import registry
+from sky.utils import resources_utils
 from sky.utils import status_lib
 from sky.utils import yaml_utils
+
+
+def test_provider_templates_use_shared_wheel_installer():
+    """Every reachable provider template delegates worker installation."""
+    templates = {
+        cloud_vm_ray_backend._get_cluster_config_template(cloud)
+        for _, cloud in registry.CLOUD_REGISTRY.items()
+    }
+    assert 'local-ray.yml.j2' not in templates
+
+    template_root = pathlib.Path(__file__).parents[2] / 'sky' / 'templates'
+    shared_installers = ('ray_skypilot_installation_commands',
+                         'skypilot_wheel_installation_commands')
+    for template in templates:
+        contents = (template_root / template).read_text(encoding='utf-8')
+        assert any(installer in contents for installer in shared_installers), (
+            f'{template} bypasses the shared SkyPilot wheel installer')
 
 
 def test_add_auth_rejects_unsupported_cloud(tmp_path):
@@ -326,6 +353,447 @@ def test_write_cluster_config_w_post_provision_runcmd_kubernetes(
         'runcmd'] == expected_runcmd, 'runcmd not passed correctly'
 
 
+def _builtin_kubernetes_writer_kwargs(monkeypatch, tmp_path, test_name):
+    """Return one hermetic built-in Kubernetes writer invocation."""
+    monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
+    monkeypatch.setattr(kubernetes_utils, 'get_kubernetes_nodes',
+                        lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace',
+                        lambda **_kwargs: 'default')
+    monkeypatch.setattr(
+        clouds.Kubernetes, '_detect_network_type', lambda *_args, **_kwargs:
+        (kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE, None))
+    monkeypatch.setattr(clouds.Kubernetes,
+                        '_unsupported_features_for_resources',
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(backend_utils.auth_utils, 'get_or_generate_keys',
+                        lambda: ('/tmp/test-key', 'test-public-key'))
+    monkeypatch.setattr(backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', lambda *_args: {})
+    monkeypatch.setattr(backend_utils.logs, 'get_logging_agent', lambda: None)
+    monkeypatch.setattr('sky.catalog.get_image_id_from_tag',
+                        lambda *_args, **_kwargs: 'test-image:latest')
+    monkeypatch.setattr(common_utils, 'get_user_hash', lambda: '00000000')
+    monkeypatch.setattr(skypilot_config, 'get_active_workspace',
+                        lambda: 'default')
+    monkeypatch.setattr(backend_utils.sky, '__version__', '1.0.0')
+    monkeypatch.setattr(backend_utils, '_deterministic_cluster_yaml_hash',
+                        lambda _path: 'test-hash')
+
+    output_path = tmp_path / test_name / 'cluster.yaml'
+    monkeypatch.setattr(backend_utils, '_get_yaml_path_from_cluster_name',
+                        lambda *_args, **_kwargs: str(output_path))
+    return ({
+        'to_provision': Resources(cloud=clouds.Kubernetes(),
+                                  instance_type='4CPU--16GB'),
+        'num_nodes': 2,
+        'cluster_config_template': 'kubernetes-ray.yml.j2',
+        'cluster_name': 'display',
+        'local_wheel_path': pathlib.Path('/tmp/test-wheel'),
+        'wheel_hash': 'b1bd84059bc0342f7843fcbe04ab563e',
+        'region': clouds.Region(name='test-context'),
+        'dryrun': True,
+        'keep_launch_fields_in_existing_config': True,
+    }, output_path)
+
+
+def test_builtin_kubernetes_writer_preserves_fill_template_facade(
+        monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'direct-facade')
+    original_fill_template = common_utils.fill_template
+    fill_template = mock.Mock(wraps=original_fill_template)
+    safe_load = mock.Mock(wraps=yaml_utils.safe_load)
+    monkeypatch.setattr(common_utils, 'fill_template', fill_template)
+    monkeypatch.setattr(yaml_utils, 'safe_load', safe_load)
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    fill_template.assert_called_once()
+    call = fill_template.call_args
+    assert call.args[0] == 'kubernetes-ray.yml.j2'
+    assert type(call.args[1]) is dict
+    assert len(call.args) == 2
+    assert call.kwargs == {'output_path': f'{output_path}.tmp'}
+    assert result['ray'] == f'{output_path}.tmp'
+    safe_load.assert_called_once()
+
+
+def test_builtin_kubernetes_writer_preserves_delegating_wrapper(
+        monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'delegating-wrapper')
+    original_fill_template = common_utils.fill_template
+    wrapper_calls = []
+
+    def delegating_wrapper(template_ref, variables, output_path):
+        wrapper_calls.append((template_ref, variables, output_path))
+        return original_fill_template(template_ref, variables, output_path)
+
+    monkeypatch.setattr(common_utils, 'fill_template', delegating_wrapper)
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    assert len(wrapper_calls) == 1
+    template_ref, variables, rendered_path = wrapper_calls[0]
+    assert template_ref == 'kubernetes-ray.yml.j2'
+    assert type(variables) is dict
+    assert rendered_path == f'{output_path}.tmp'
+    assert result['ray'] == rendered_path
+
+
+def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
+        monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'replacement-renderer')
+    replacement_calls = []
+
+    def replacement_renderer(template_ref, variables, output_path):
+        replacement_calls.append((template_ref, variables, output_path))
+        if os.path.isabs(template_ref):
+            template_path = pathlib.Path(template_ref)
+        else:
+            template_path = (pathlib.Path(common_utils.__file__).parents[1] /
+                             'templates' / template_ref)
+        source_bytes = template_path.read_bytes()
+        assert hashlib.sha256(source_bytes).hexdigest() == (
+            '988b6d5e2afd7e96b3a6d7e0091c661a3d05d5a61d23fd7efa138ab75d55a6f8')
+        source = source_bytes.decode('utf-8')
+        assert '{{ skypilot_kubernetes_node_config_fragment_v1 }}\n' not in source
+        rendered = common_utils.jinja2.Template(source).render(**variables)
+        rendered += '\nreplacement_renderer_authoritative: true\n'
+        rendered_path = pathlib.Path(output_path)
+        rendered_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered_path.write_text(rendered, encoding='utf-8')
+
+    monkeypatch.setattr(common_utils, 'fill_template', replacement_renderer)
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    assert len(replacement_calls) == 1
+    assert replacement_calls[0][0] == 'kubernetes-ray.yml.j2'
+    assert replacement_calls[0][2] == f'{output_path}.tmp'
+    rendered_config = yaml_utils.read_yaml(result['ray'])
+    assert rendered_config['replacement_renderer_authoritative'] is True
+
+
+def _builtin_do_writer_kwargs(monkeypatch, tmp_path, test_name):
+    """Return one hermetic built-in DigitalOcean writer invocation."""
+    monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
+
+    # Keep every rendered local path relative to the isolated pytest root. This
+    # makes both the byte oracle and the real config-hash oracle independent of
+    # the machine-specific temporary-directory prefix.
+    monkeypatch.chdir(tmp_path)
+    input_dir = pathlib.Path('do-writer-inputs')
+    input_dir.mkdir(exist_ok=True)
+    private_key_path = input_dir / 'test-key'
+    private_key_path.write_text('test-private-key', encoding='utf-8')
+    wheel_path = input_dir / 'sky.whl'
+    wheel_path.write_bytes(b'test-wheel')
+
+    monkeypatch.setattr(backend_utils.auth_utils, 'get_or_generate_keys',
+                        lambda: (str(private_key_path), 'test-public-key'))
+    monkeypatch.setattr(backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', lambda *_args: {})
+    monkeypatch.setattr(backend_utils.logs, 'get_logging_agent', lambda: None)
+    monkeypatch.setattr(common_utils, 'get_user_hash', lambda: '00000000')
+    monkeypatch.setattr(skypilot_config, 'get_active_workspace',
+                        lambda: 'default')
+    monkeypatch.setattr(backend_utils.sky, '__version__', '1.0.0')
+
+    output_path = pathlib.Path(test_name) / 'cluster.yaml'
+    monkeypatch.setattr(backend_utils, '_get_yaml_path_from_cluster_name',
+                        lambda *_args, **_kwargs: str(output_path))
+    return ({
+        'to_provision': Resources(cloud=clouds.DO(),
+                                  instance_type='g-2vcpu-8gb'),
+        'num_nodes': 2,
+        'cluster_config_template': 'do-ray.yml.j2',
+        'cluster_name': 'display',
+        'local_wheel_path': wheel_path,
+        'wheel_hash': 'b1bd84059bc0342f7843fcbe04ab563e',
+        'region': clouds.Region(name='nyc1'),
+        'dryrun': True,
+        'keep_launch_fields_in_existing_config': True,
+    }, output_path)
+
+
+def test_builtin_do_writer_is_byte_and_hash_deterministic(
+        monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_do_writer_kwargs(
+        monkeypatch, tmp_path, 'do-deterministic')
+
+    first_result = backend_utils.write_cluster_config(**writer_kwargs)
+    first_bytes = pathlib.Path(first_result['ray']).read_bytes()
+    first_real_hash = backend_utils._deterministic_cluster_yaml_hash(
+        first_result['ray'])
+
+    second_result = backend_utils.write_cluster_config(**writer_kwargs)
+    second_bytes = pathlib.Path(second_result['ray']).read_bytes()
+    second_real_hash = backend_utils._deterministic_cluster_yaml_hash(
+        second_result['ray'])
+
+    normalized_config = yaml_utils.safe_load(first_bytes.decode('utf-8'))
+    setup_commands = normalized_config.pop('setup_commands')
+
+    assert first_result['ray'] == f'{output_path}.tmp'
+    assert second_result['ray'] == first_result['ray']
+    assert second_bytes == first_bytes
+    assert str(tmp_path).encode('utf-8') not in first_bytes
+    assert hashlib.sha256(first_bytes).hexdigest() == (
+        'afd42bbb1181835d8c12f2e9e5520b3b66bee87710d3513f3c1bbaab685e9787')
+    assert normalized_config == {
+        'cluster_name': 'display-00000000',
+        'max_workers': 1,
+        'upscaling_speed': 1,
+        'idle_timeout_minutes': 60,
+        'provider': {
+            'type': 'external',
+            'module': 'sky.provision.do',
+            'region': 'nyc1',
+        },
+        'auth': {
+            'ssh_user': 'root',
+            'ssh_private_key': 'do-writer-inputs/test-key',
+            'ssh_public_key': 'skypilot:ssh_public_key_content',
+        },
+        'available_node_types': {
+            'ray_head_default': {
+                'resources': {},
+                'node_config': {
+                    'InstanceType': 'g-2vcpu-8gb',
+                    'DiskSize': 256,
+                    'ImageId': None,
+                },
+            },
+        },
+        'head_node_type': 'ray_head_default',
+        'file_mounts': {
+            '~/.sky/sky_ray.yml': 'do-deterministic/cluster.yaml.tmp',
+            '~/.sky/wheels/b1bd84059bc0342f7843fcbe04ab563e': 'do-writer-inputs/sky.whl',
+        },
+        'rsync_exclude': [],
+        'initialization_commands': [],
+    }
+    assert len(setup_commands) == 1
+    assert hashlib.sha256(setup_commands[0].encode('utf-8')).hexdigest() == (
+        'd25c4252af5d93deed9c403d5fab38d58eecc9e50b8064f0e8cc4e235e39f261')
+    assert first_result['config_hash'] == first_real_hash
+    assert second_result['config_hash'] == second_real_hash
+    assert second_result['config_hash'] == first_result['config_hash']
+    assert first_result['config_hash'] == (
+        '2f5a14c8e3bce79349f48db4984c941493126af4934bd02701d3ad02e5dfa96d')
+
+
+def test_builtin_do_writer_restores_existing_cluster_before_hash_and_name(
+        monkeypatch, tmp_path):
+    writer_kwargs, _ = _builtin_do_writer_kwargs(monkeypatch, tmp_path,
+                                                 'do-existing-cluster')
+    baseline_result = backend_utils.write_cluster_config(**writer_kwargs)
+    old_yaml = yaml_utils.read_yaml(baseline_result['ray'])
+    old_yaml['cluster_name'] = 'restored-do-name'
+    old_yaml['provider']['region'] = 'restored-region'
+    old_yaml_content = yaml_utils.dump_yaml_str(old_yaml)
+
+    monkeypatch.setattr(backend_utils.global_user_state, 'get_cluster_yaml_str',
+                        lambda _yaml_path: old_yaml_content)
+    stored_yaml = {}
+
+    def _capture_cluster_yaml(cluster_name, content):
+        stored_yaml['cluster_name'] = cluster_name
+        stored_yaml['content'] = content
+
+    monkeypatch.setattr(backend_utils.global_user_state, 'set_cluster_yaml',
+                        _capture_cluster_yaml)
+    monkeypatch.setattr(backend_utils, '_add_auth_to_cluster_config',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend_utils, '_optimize_file_mounts',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend_utils.usage_lib.messages.usage,
+                        'update_ray_yaml', lambda *_args, **_kwargs: None)
+
+    real_hash = backend_utils._deterministic_cluster_yaml_hash
+    hash_observations = []
+
+    def _recording_real_hash(yaml_path):
+        observed_yaml = yaml_utils.read_yaml(yaml_path)
+        digest = real_hash(yaml_path)
+        hash_observations.append((observed_yaml, digest))
+        return digest
+
+    monkeypatch.setattr(backend_utils, '_deterministic_cluster_yaml_hash',
+                        _recording_real_hash)
+    writer_kwargs['dryrun'] = False
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    assert len(hash_observations) == 1
+    hashed_yaml, real_restored_hash = hash_observations[0]
+    assert hashed_yaml['cluster_name'] == 'restored-do-name'
+    assert hashed_yaml['provider']['region'] == 'restored-region'
+    assert result['cluster_name_on_cloud'] == 'restored-do-name'
+    assert result['config_hash'] == real_restored_hash
+    assert stored_yaml['cluster_name'] == 'display'
+    assert yaml_utils.safe_load(
+        stored_yaml['content'])['cluster_name'] == 'restored-do-name'
+
+
+@pytest.mark.parametrize(
+    ('scenario', 'cloud', 'region_name', 'config_cloud', 'host_network',
+     'network_type'), [
+         ('kubernetes-host-network-false', clouds.Kubernetes(), 'test-context',
+          'kubernetes', False,
+          kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE),
+         ('kubernetes-host-network-true', clouds.Kubernetes(), 'test-context',
+          'kubernetes', True,
+          kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE),
+         ('kubernetes-oci-roce', clouds.Kubernetes(), 'oci-context',
+          'kubernetes', False,
+          kubernetes_utils.KubernetesHighPerformanceNetworkType.OCI_ROCE),
+         ('ssh-host-network-false', clouds.SSH(), 'ssh-test-context', 'ssh',
+          False, kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE),
+         ('ssh-host-network-true', clouds.SSH(), 'ssh-test-context', 'ssh',
+          True, kubernetes_utils.KubernetesHighPerformanceNetworkType.NONE),
+     ])
+def test_host_network_probe_is_only_builtin_render_delta(
+        scenario, cloud, region_name, config_cloud, host_network, network_type,
+        monkeypatch, tmp_path):
+    """Locks the full built-in render differential for probe packaging."""
+    monkeypatch.setenv('SKYPILOT_USER', 'test-user')
+    # Earlier tests in this module exercise SKYPILOT_CONFIG reloads.  The
+    # process-wide environment is intentionally mutable, so make this render
+    # golden own an explicit empty config instead of depending on xdist order.
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, os.devnull)
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        skypilot_config.ConfigContext())
+    skypilot_config.reload_config()
+    assert not skypilot_config.loaded()
+    monkeypatch.setattr(kubernetes_utils, 'get_kubernetes_nodes',
+                        lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace',
+                        lambda **_kwargs: 'default')
+    monkeypatch.setattr(clouds.Kubernetes, '_detect_network_type',
+                        lambda *_args, **_kwargs: (network_type, None))
+    monkeypatch.setattr(clouds.Kubernetes,
+                        '_unsupported_features_for_resources',
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(backend_utils.auth_utils, 'get_or_generate_keys',
+                        lambda: ('/tmp/test-key', 'test-public-key'))
+    monkeypatch.setattr(backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', lambda *_args: {})
+    monkeypatch.setattr(backend_utils.logs, 'get_logging_agent', lambda: None)
+    monkeypatch.setattr('sky.catalog.get_image_id_from_tag',
+                        lambda *_args, **_kwargs: 'test-image:latest')
+    monkeypatch.setattr(common_utils, 'get_user_hash', lambda: '00000000')
+    monkeypatch.setattr(skypilot_config, 'get_active_workspace',
+                        lambda: 'default')
+    monkeypatch.setattr(backend_utils.sky, '__version__', '1.0.0')
+
+    output_path = tmp_path / scenario / 'cluster.yaml'
+    monkeypatch.setattr(backend_utils, '_get_yaml_path_from_cluster_name',
+                        lambda *_args, **_kwargs: str(output_path))
+    overrides = {}
+    if host_network:
+        overrides = {
+            config_cloud: {
+                'pod_config': {
+                    'spec': {
+                        'hostNetwork': True,
+                    },
+                },
+            },
+        }
+    network_tier = None
+    if network_type == (
+            kubernetes_utils.KubernetesHighPerformanceNetworkType.OCI_ROCE):
+        network_tier = resources_utils.NetworkTier.BEST
+    resource = Resources(cloud=cloud,
+                         instance_type='4CPU--16GB',
+                         network_tier=network_tier,
+                         _cluster_config_overrides=overrides)
+
+    current_b64 = ray_commands.host_network_probe_b64()
+    source = gzip.decompress(base64.b64decode(current_b64, validate=True))
+    legacy_buffer = io.BytesIO()
+    with gzip.GzipFile(filename='',
+                       mode='wb',
+                       fileobj=legacy_buffer,
+                       compresslevel=9,
+                       mtime=1) as gzip_file:
+        gzip_file.write(source)
+    legacy_b64 = base64.b64encode(legacy_buffer.getvalue()).decode('ascii')
+    legacy_compressed = base64.b64decode(legacy_b64, validate=True)
+    current_compressed = base64.b64decode(current_b64, validate=True)
+    assert legacy_compressed[:4] == current_compressed[:4]
+    assert legacy_compressed[8:] == current_compressed[8:]
+    assert legacy_compressed[4:8] == b'\x01\x00\x00\x00'
+    assert current_compressed[4:8] == b'\x00\x00\x00\x00'
+
+    def _render(payload: str) -> bytes:
+        monkeypatch.setattr(instance_setup, '_host_network_probe_b64',
+                            lambda: payload)
+        result = backend_utils.write_cluster_config(
+            to_provision=resource,
+            num_nodes=2,
+            cluster_config_template='kubernetes-ray.yml.j2',
+            cluster_name='display',
+            local_wheel_path=pathlib.Path('/tmp/test-wheel'),
+            wheel_hash='b1bd84059bc0342f7843fcbe04ab563e',
+            region=clouds.Region(name=region_name),
+            dryrun=True,
+            keep_launch_fields_in_existing_config=True)
+        return pathlib.Path(result['ray']).read_bytes()
+
+    legacy_render = _render(legacy_b64)
+    current_render = _render(current_b64)
+    legacy_member = legacy_b64.encode('ascii')
+    current_member = current_b64.encode('ascii')
+    assert legacy_render.count(legacy_member) == 2
+    assert current_render.count(current_member) == 2
+    assert legacy_render.replace(legacy_member,
+                                 current_member) == current_render
+
+    canonical_root = str(tmp_path).encode('utf-8')
+    legacy_hash = hashlib.sha256(legacy_render.replace(canonical_root,
+                                                       b'<TMP>')).hexdigest()
+    current_hash = hashlib.sha256(
+        current_render.replace(canonical_root, b'<TMP>')).hexdigest()
+    expected_hashes = {
+        'kubernetes-host-network-false': (
+            '37ea063f413cdac1f27140ec53da34336747e6c377260570cbd88afb3326a426',
+            '96bc26cba5c35bfdf4979c2372d0013fd5f15e062673fe5ea1b6a54ce54a1cac',
+        ),
+        'kubernetes-host-network-true': (
+            'd13b292460ca5c368c83b9e1b2cdd3f5f8790c7ed4e6d4317635d815989f1501',
+            '5d0e83ab72ae9905c8aeeaf1d18b08a8778cfa148c1aeffb4038c4a5bd1072d3',
+        ),
+        'kubernetes-oci-roce': (
+            'bd88f2c02829ceb298568983f940ef87f32f04b1e9b210b16feac53b037d2a8e',
+            '2161061192392c5d8957992c2b5d457f4531be630157d51838a167bd74b59959',
+        ),
+        'ssh-host-network-false': (
+            'bf08ce1722b84096d1c00d774915aa9853d9849ea5d35059f781fab447b58e7e',
+            '163feda8868fba7a2fd9b2df29fc0e04d16b390bb280e827aeed8158ee751127',
+        ),
+        'ssh-host-network-true': (
+            '675d42b13e23c215c56257ead94b3c25b3b40a8f45a2d38dca591aa9898ff9e9',
+            '5319addeb7e7fbe758184c9cd2a82330a5e8bbea13cc371f1b5b7f41f711e1b0',
+        ),
+    }
+    assert (legacy_hash, current_hash) == expected_hashes[scenario]
+
+
 @mock.patch.object(skypilot_config, '_global_config_context',
                    skypilot_config.ConfigContext())
 @mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
@@ -444,18 +912,14 @@ def test_get_clusters_launch_refresh(monkeypatch):
         return []
 
     def refresh_cluster(cluster_name, force_refresh_statuses, include_user_info,
-                        summary_response):
+                        summary_response, cluster_status_lock_timeout):
+        assert cluster_status_lock_timeout == 0
         if cluster_name == 'up-cluster':
             return _mock_cluster(False)
         elif cluster_name == 'launch-cluster':
             return _mock_cluster(True)
         else:
             return None
-
-    def get_request_tasks(*args, **kwargs):
-        magic_mock = mock.MagicMock()
-        magic_mock.cluster_name = 'launch-cluster'
-        return [magic_mock]
 
     monkeypatch.setattr('sky.global_user_state.get_clusters', get_clusters_mock)
     monkeypatch.setattr('sky.utils.resources_utils.get_readable_resources_repr',
@@ -465,8 +929,10 @@ def test_get_clusters_launch_refresh(monkeypatch):
         ssh_credentials_from_handles)
     monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
                         refresh_cluster)
-    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
-                        get_request_tasks)
+    monkeypatch.setattr(
+        'sky.server.requests.requests.get_request_tasks',
+        mock.Mock(side_effect=AssertionError(
+            'cluster refresh must not query request tasks')))
 
     assert len(
         backend_utils.get_clusters(refresh=common.StatusRefreshMode.FORCE)) == 2
@@ -494,9 +960,11 @@ def test_get_clusters_honors_include_handle_for_incomplete_record(
     monkeypatch.setattr('sky.utils.resources_utils.get_readable_resources_repr',
                         get_resources_repr)
 
-    launch_request = mock.MagicMock()
-    launch_request.cluster_name = 'launch-cluster'
-    get_request_tasks = mock.Mock(return_value=[launch_request])
+    refresh_cluster = mock.Mock(return_value=record)
+    monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
+                        refresh_cluster)
+    get_request_tasks = mock.Mock(side_effect=AssertionError(
+        'cluster refresh must not query request tasks'))
     monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
                         get_request_tasks)
 
@@ -510,9 +978,12 @@ def test_get_clusters_honors_include_handle_for_incomplete_record(
     get_clusters.assert_called_once()
     get_resources_repr.assert_called_once_with(handle, simplified_only=False)
     if refresh == common.StatusRefreshMode.FORCE:
-        get_request_tasks.assert_called_once()
+        refresh_cluster.assert_called_once()
+        assert refresh_cluster.call_args.kwargs[
+            'cluster_status_lock_timeout'] == 0
     else:
-        get_request_tasks.assert_not_called()
+        refresh_cluster.assert_not_called()
+    get_request_tasks.assert_not_called()
 
 
 def test_get_glob_clusters_batches_patterns(monkeypatch):
@@ -529,6 +1000,56 @@ def test_get_glob_clusters_batches_patterns(monkeypatch):
                                             ]
     get_glob_cluster_names.assert_called_once_with(patterns,
                                                    workspaces_filter=workspaces)
+
+
+@pytest.mark.parametrize(
+    ('requested_workspaces', 'expected_workspaces'),
+    [
+        (None, {'alpha', 'beta'}),
+        (['beta', 'gamma'], {'beta'}),
+        (['gamma'], set()),
+        ([], set()),
+    ],
+)
+def test_get_clusters_intersects_requested_workspaces_with_accessible_ones(
+        monkeypatch, requested_workspaces, expected_workspaces):
+    monkeypatch.setattr('sky.workspaces.core.get_accessible_workspace_names',
+                        mock.Mock(return_value={'alpha', 'beta'}))
+    monkeypatch.setattr('sky.backends.backend_utils._caller_is_viewer',
+                        mock.Mock(return_value=False))
+    get_clusters = mock.Mock(return_value=[])
+    monkeypatch.setattr('sky.global_user_state.get_clusters', get_clusters)
+
+    backend_utils.get_clusters(refresh=common.StatusRefreshMode.NONE,
+                               workspaces_filter=requested_workspaces)
+
+    get_clusters.assert_called_once()
+    assert (get_clusters.call_args.kwargs['workspaces_filter'] ==
+            expected_workspaces)
+
+
+def test_get_clusters_reuses_effective_workspace_filter_for_globs(monkeypatch):
+    monkeypatch.setattr('sky.workspaces.core.get_accessible_workspace_names',
+                        mock.Mock(return_value={'alpha', 'beta'}))
+    monkeypatch.setattr('sky.backends.backend_utils._caller_is_viewer',
+                        mock.Mock(return_value=False))
+    get_glob_clusters = mock.Mock(return_value=['alpha-glob'])
+    monkeypatch.setattr('sky.backends.backend_utils._get_glob_clusters',
+                        get_glob_clusters)
+    get_clusters = mock.Mock(return_value=[])
+    monkeypatch.setattr('sky.global_user_state.get_clusters', get_clusters)
+
+    backend_utils.get_clusters(refresh=common.StatusRefreshMode.NONE,
+                               cluster_names=['direct', 'alpha-*'],
+                               workspaces_filter=['alpha', 'inaccessible'])
+
+    get_glob_clusters.assert_called_once_with(['alpha-*'],
+                                              workspaces_filter={'alpha'})
+    get_clusters.assert_called_once()
+    assert get_clusters.call_args.kwargs['workspaces_filter'] == {'alpha'}
+    assert get_clusters.call_args.kwargs['cluster_names'] == [
+        'direct', 'alpha-glob'
+    ]
 
 
 def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
@@ -575,20 +1096,19 @@ def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
         return cloud_name, f'{cloud_name}-full'
 
     def refresh_cluster(cluster_name, force_refresh_statuses, include_user_info,
-                        summary_response):
+                        summary_response, cluster_status_lock_timeout):
         del force_refresh_statuses, include_user_info, summary_response
+        assert cluster_status_lock_timeout == 0
         if cluster_name == 'up-cluster':
             return _mock_cluster('up-cluster', status_lib.ClusterStatus.UP,
                                  'up-cluster-fresh-cloud')
+        if cluster_name == 'launch-cluster':
+            return _mock_cluster('launch-cluster',
+                                 status_lib.ClusterStatus.INIT,
+                                 'launch-cluster-cloud')
         if cluster_name == 'gone-cluster':
             return None
         raise AssertionError(f'unexpected refresh for {cluster_name!r}')
-
-    def get_request_tasks(*args, **kwargs):
-        del args, kwargs
-        launch_request = mock.MagicMock()
-        launch_request.cluster_name = 'launch-cluster'
-        return [launch_request]
 
     monkeypatch.setattr('sky.global_user_state.get_clusters',
                         lambda *args, **kwargs: cached_records)
@@ -599,8 +1119,10 @@ def test_get_clusters_refresh_enriches_only_final_records(monkeypatch):
         lambda handles: [{} for _ in handles])
     monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
                         refresh_cluster)
-    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
-                        get_request_tasks)
+    monkeypatch.setattr(
+        'sky.server.requests.requests.get_request_tasks',
+        mock.Mock(side_effect=AssertionError(
+            'cluster refresh must not query request tasks')))
 
     records = backend_utils.get_clusters(refresh=common.StatusRefreshMode.FORCE)
 
@@ -656,20 +1178,19 @@ def test_get_clusters_refresh_credentials_only_final_handles(monkeypatch):
         return [{} for _ in handles]
 
     def refresh_cluster(cluster_name, force_refresh_statuses, include_user_info,
-                        summary_response):
+                        summary_response, cluster_status_lock_timeout):
         del force_refresh_statuses, include_user_info, summary_response
+        assert cluster_status_lock_timeout == 0
         if cluster_name == 'up-cluster':
             return _mock_cluster('up-cluster', status_lib.ClusterStatus.UP,
                                  'up-cluster-fresh-cloud')
+        if cluster_name == 'launch-cluster':
+            return _mock_cluster('launch-cluster',
+                                 status_lib.ClusterStatus.INIT,
+                                 'launch-cluster-cloud')
         if cluster_name == 'gone-cluster':
             return None
         raise AssertionError(f'unexpected refresh for {cluster_name!r}')
-
-    def get_request_tasks(*args, **kwargs):
-        del args, kwargs
-        launch_request = mock.MagicMock()
-        launch_request.cluster_name = 'launch-cluster'
-        return [launch_request]
 
     monkeypatch.setattr('sky.global_user_state.get_clusters',
                         lambda *args, **kwargs: cached_records)
@@ -680,8 +1201,10 @@ def test_get_clusters_refresh_credentials_only_final_handles(monkeypatch):
         ssh_credentials_from_handles)
     monkeypatch.setattr('sky.backends.backend_utils._refresh_cluster',
                         refresh_cluster)
-    monkeypatch.setattr('sky.server.requests.requests.get_request_tasks',
-                        get_request_tasks)
+    monkeypatch.setattr(
+        'sky.server.requests.requests.get_request_tasks',
+        mock.Mock(side_effect=AssertionError(
+            'cluster refresh must not query request tasks')))
     monkeypatch.setattr('sky.backends.backend_utils._caller_is_viewer',
                         lambda: False)
 

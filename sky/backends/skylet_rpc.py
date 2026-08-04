@@ -2,7 +2,6 @@
 import asyncio
 from collections.abc import Callable
 from collections.abc import Iterator
-import time
 import typing
 from typing import Any, TypeVar
 
@@ -10,6 +9,7 @@ from sky import exceptions
 from sky.adaptors import common as adaptors_common
 from sky.utils import common_utils
 from sky.utils import context as context_lib
+from sky.utils import context_utils
 from sky.utils import ux_utils
 
 if typing.TYPE_CHECKING:
@@ -81,13 +81,15 @@ def invoke_skylet_with_retries(func: Callable[..., T],
     backoff = common_utils.Backoff(initial_backoff=0.5)
     last_exception: Exception | None = None
 
-    for _ in range(max_attempts):
+    for attempt in range(max_attempts):
         _raise_if_ctx_canceled()
         try:
             return func()
         except grpc.RpcError as e:
             last_exception = e
-            _handle_grpc_error(e, backoff.current_backoff())
+            _handle_grpc_error(e)
+            if attempt + 1 < max_attempts:
+                context_utils.sleep_with_cancellation(backoff.current_backoff())
 
     raise exceptions.SkyletUnavailableError(
         f'Failed to invoke Skylet after {max_attempts} attempts: '
@@ -101,30 +103,38 @@ def invoke_skylet_streaming_with_retries(
     backoff = common_utils.Backoff(initial_backoff=0.5)
     last_exception: Exception | None = None
 
-    for _ in range(max_attempts):
+    for attempt in range(max_attempts):
         _raise_if_ctx_canceled()
         try:
             yield from stream_func()
             return
         except grpc.RpcError as e:
             last_exception = e
-            _handle_grpc_error(e, backoff.current_backoff())
+            _handle_grpc_error(e)
+            if attempt + 1 < max_attempts:
+                context_utils.sleep_with_cancellation(backoff.current_backoff())
 
     raise exceptions.SkyletUnavailableError(
         f'Failed to stream Skylet response after {max_attempts} attempts'
     ) from last_exception
 
 
-def _handle_grpc_error(e: 'grpc.RpcError', current_backoff: float) -> None:
+def _handle_grpc_error(e: 'grpc.RpcError') -> None:
     if e.code() == grpc.StatusCode.INTERNAL:
         with ux_utils.print_exception_no_traceback():
             raise exceptions.SkyletInternalError(e.details())
+    elif e.code() == grpc.StatusCode.FAILED_PRECONDITION:
+        # The skylet rejected the request itself, not the transport: the
+        # node cannot honor what was asked (e.g. an autodown it has no
+        # permission to perform). Permanent, so surface it verbatim
+        # rather than burning retries on it.
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.NotSupportedError(e.details())
     elif e.code() == grpc.StatusCode.UNAVAILABLE:
         details = e.details() or ''
         if 'Connection refused' in details:
             raise exceptions.SkyletUnavailableError(
                 f'Skylet is not running (connection refused): {details}') from e
-        time.sleep(current_backoff)
     elif e.code() == grpc.StatusCode.UNIMPLEMENTED or e.code(
     ) == grpc.StatusCode.UNKNOWN:
         raise exceptions.SkyletMethodNotImplementedError(

@@ -1,3 +1,5 @@
+"""Unit tests for core module request threading and lifecycle helpers."""
+
 from unittest import mock
 
 import pytest
@@ -73,6 +75,7 @@ def test_status_best_effort(mock_get_clusters) -> None:
     mock_get_clusters.assert_called_once_with(
         refresh=common.StatusRefreshMode.NONE,
         cluster_names=None,
+        workspaces_filter=None,
         all_users=False,
         include_credentials=False,
         summary_response=False,
@@ -84,6 +87,21 @@ def test_status_best_effort(mock_get_clusters) -> None:
     log_message = mock_logger.warning.call_args[0][0]
     assert ('Failed to validate status responses for cluster malformed-cluster'
             in log_message)
+
+
+@mock.patch('sky.core.backend_utils.get_clusters', return_value=[])
+def test_status_threads_workspace_filter(mock_get_clusters) -> None:
+    core.status(workspaces_filter=['alpha'])
+
+    mock_get_clusters.assert_called_once_with(
+        refresh=common.StatusRefreshMode.NONE,
+        cluster_names=None,
+        workspaces_filter=['alpha'],
+        all_users=False,
+        include_credentials=False,
+        summary_response=False,
+        include_handle=True,
+    )
 
 
 class TestEnabledCloudsWorkspacePermission:

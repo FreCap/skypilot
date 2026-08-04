@@ -1,10 +1,14 @@
 """Constants for SkyPilot."""
+import base64
 import enum
+import shlex
+import zlib
 
 from packaging import version
 
 import sky
 from sky.setup_files import dependencies
+from sky.setup_files import worker_runtime_packaging as runtime_packaging
 
 # The base directory for all SkyPilot runtime artifacts.
 # Historically, we have always used $HOME, but we couldn't
@@ -157,11 +161,11 @@ MANAGED_JOB_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}MANAGED_JOB_ID'
 # cluster yaml is updated.
 #
 # TODO(zongheng,zhanghao): make the upgrading of skylet automatic?
-SKYLET_VERSION = '40'  # Nullable managed-job task roles over gRPC.
+SKYLET_VERSION = '44'  # Arm-time autodown capability preflight.
 # The version of the lib files that skylet/jobs use. Whenever there is an API
 # change for the job_lib or log_lib, we need to bump this version, so that the
 # user can be notified to update their SkyPilot version on the remote cluster.
-SKYLET_LIB_VERSION = 7  # Generalized lifecycle-hooks framework.
+SKYLET_LIB_VERSION = 9  # Typed bounded system-OOM recovery runtime APIs.
 SKYLET_VERSION_FILE = '.sky/skylet_version'
 SKYLET_LOG_FILE = '.sky/skylet.log'
 SKYLET_PID_FILE = '.sky/skylet_pid'
@@ -303,6 +307,29 @@ UV_INSTALLATION_COMMANDS = (
 )
 
 _sky_version = str(version.parse(sky.__version__))
+_worker_runtime_version = (
+    dependencies.COORDINATED_WORKER_RUNTIME_PACKAGE_VERSION)
+
+
+def _quote_python_script(script: str) -> str:
+    """Returns a shell-safe, single-line Python ``-c`` argument."""
+    payload = base64.b64encode(zlib.compress(script.encode('utf-8'),
+                                             level=9)).decode('ascii')
+    argument = (
+        'import base64,zlib;exec(compile(zlib.decompress(base64.b64decode('
+        f'{payload!r})),"<sky-bootstrap>","exec"))')
+    assert '\n' not in argument
+    return shlex.quote(argument)
+
+
+_wheel_bundle_verifier = _quote_python_script(
+    runtime_packaging.render_remote_bundle_verifier(_worker_runtime_version))
+_installed_distribution_probe = _quote_python_script(
+    runtime_packaging.render_installed_distribution_probe(
+        _sky_version, _worker_runtime_version))
+_installed_distribution_probe_command = (
+    f'{SKY_PYTHON_CMD} -c {_installed_distribution_probe} '
+    '"$SKYPILOT_MAIN_WHEEL" "$SKYPILOT_RUNTIME_WHEEL"')
 RAY_STATUS = f'RAY_ADDRESS=127.0.0.1:{SKY_REMOTE_RAY_PORT} {SKY_RAY_CMD} status'
 RAY_INSTALLATION_COMMANDS = (
     f'{SKY_UV_INSTALL_CMD};'
@@ -377,9 +404,18 @@ COPY_SKYPILOT_TEMPLATES_COMMANDS = (
 
 SKYPILOT_WHEEL_INSTALLATION_COMMANDS = (
     f'{SKY_UV_INSTALL_CMD};'
-    f'{{ {SKY_UV_PIP_CMD} list | grep "skypilot " && '
-    '[ "$(cat ~/.sky/wheels/current_sky_wheel_hash)" == "{sky_wheel_hash}" ]; } || '  # pylint: disable=line-too-long
-    f'{{ {SKY_UV_PIP_CMD} uninstall skypilot; '
+    f'_sky_probe() {{ {_installed_distribution_probe_command}; }}; '
+    f'_sky_bundle_dir="$HOME/.sky/wheels/{{sky_wheel_hash}}"; '
+    f'_sky_bundle_exports="$({SKY_PYTHON_CMD} -c {_wheel_bundle_verifier} '
+    '"$_sky_bundle_dir" "{sky_wheel_hash}")" || exit 1; '
+    'eval "$_sky_bundle_exports" || exit 1; '
+    f'{{ [ -f "$HOME/.sky/wheels/current_sky_wheel_hash" ] && '
+    '[ "$(cat "$HOME/.sky/wheels/current_sky_wheel_hash")" = '
+    '"{sky_wheel_hash}" ] && '
+    '_sky_probe; } || '
+    '{ '
+    f'{SKY_UV_PIP_CMD} uninstall skypilot '
+    f'{runtime_packaging.WORKER_RUNTIME_DISTRIBUTION} || exit 1; '
     # uv cannot install azure-cli normally, since it depends on pre-release
     # packages. Manually install azure-cli with the --prerelease=allow flag
     # first. This will allow skypilot to successfully install. See
@@ -390,11 +426,18 @@ SKYPILOT_WHEEL_INSTALLATION_COMMANDS = (
     'if [ "{cloud}" = "azure" ]; then '
     f'{SKY_UV_PIP_CMD} install --prerelease=allow "{dependencies.AZURE_CLI}";'
     'fi;'
-    # Install skypilot from wheel
-    f'{SKY_UV_PIP_CMD} install "$(echo ~/.sky/wheels/{{sky_wheel_hash}}/'
-    f'skypilot-{_sky_version}*.whl)[{{cloud}}, remote]" && '
-    'echo "{sky_wheel_hash}" > ~/.sky/wheels/current_sky_wheel_hash || '
-    'exit 1; }; ')
+    # Install both qualified local wheels in one resolver invocation.  The
+    # resolver may fetch ordinary SkyPilot dependencies, but it cannot satisfy
+    # the worker runtime from an index because that explicit local wheel is a
+    # root requirement.
+    f'{SKY_UV_PIP_CMD} install '
+    '"${SKYPILOT_MAIN_WHEEL}[{cloud}, remote]" '
+    '"${SKYPILOT_RUNTIME_WHEEL}" && '
+    '_sky_probe && '
+    '_sky_marker_tmp="$HOME/.sky/wheels/.current_sky_wheel_hash.$$" && '
+    'printf "%s\\n" "{sky_wheel_hash}" > "$_sky_marker_tmp" && '
+    'mv -f "$_sky_marker_tmp" '
+    '"$HOME/.sky/wheels/current_sky_wheel_hash" || exit 1; }; ')
 
 # Install ray and skypilot on the remote cluster if they are not already
 # installed. {var} will be replaced with the actual value in
@@ -651,6 +694,13 @@ SKYPILOT_API_SERVER_STORAGE_ENABLED = 'SKYPILOT_API_SERVER_STORAGE_ENABLED'
 
 SERVE_OVERRIDE_CONCURRENT_LAUNCHES = (
     f'{SKYPILOT_ENV_VAR_PREFIX}SERVE_OVERRIDE_CONCURRENT_LAUNCHES')
+SERVE_PAID_SERVICE_MAX_LAUNCH_WINDOW = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}SERVE_PAID_SERVICE_MAX_LAUNCH_WINDOW')
+SERVE_PAID_SERVICE_LAUNCH_WINDOW_PROFILES = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}SERVE_PAID_SERVICE_LAUNCH_WINDOW_PROFILES')
+SERVE_PAID_LOCATION_MAX_EXPLORATION_FRONTIER = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}'
+    'SERVE_PAID_LOCATION_MAX_EXPLORATION_FRONTIER')
 
 # Environment variable that is set to 'true' if metrics are enabled.
 ENV_VAR_SERVER_METRICS_ENABLED = 'SKY_API_SERVER_METRICS_ENABLED'

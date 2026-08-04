@@ -1,5 +1,6 @@
 """Unit tests for the cluster event recorded by core.down()."""
 import unittest.mock as mock
+import uuid
 
 from sky import core
 from sky import global_user_state
@@ -61,3 +62,34 @@ def test_down_without_user_initiated_records_no_event(monkeypatch):
     backend.teardown.assert_called_once_with(handle,
                                              terminate=True,
                                              purge=False)
+
+
+def test_down_reloads_and_propagates_expected_cluster_record_uuid(monkeypatch):
+    cluster_name = 'action-fenced'
+    record_uuid = '11111111-1111-4111-8111-111111111111'
+    handle = mock.MagicMock()
+    snapshot = global_user_state.ClusterRecordIdentitySnapshot(
+        cluster_name=cluster_name,
+        cluster_record_uuid=uuid.UUID(record_uuid),
+        serialized_handle=b'handle',
+        handle=handle)
+    backend = mock.MagicMock()
+    snapshot_reader = mock.MagicMock(return_value=snapshot)
+    monkeypatch.setattr(global_user_state,
+                        'get_cluster_record_identity_snapshot', snapshot_reader)
+    monkeypatch.setattr(core.backend_utils, 'get_backend_from_handle',
+                        lambda candidate: backend)
+    monkeypatch.setattr(core.usage_lib,
+                        'record_cluster_name_for_current_operation',
+                        lambda name: None)
+    monkeypatch.setattr(core, '_maybe_run_down_hooks',
+                        lambda *args, **kwargs: None)
+
+    core.down(cluster_name, _expected_cluster_record_uuid=record_uuid)
+
+    snapshot_reader.assert_called_once_with(cluster_name, record_uuid)
+    backend.teardown.assert_called_once_with(
+        handle,
+        terminate=True,
+        purge=False,
+        expected_cluster_record_uuid=record_uuid)

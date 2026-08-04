@@ -42,6 +42,8 @@ from test_reserved_fill_broker import clock  # noqa: F401
 import test_reserved_fill_broker as sqlite_suite
 
 from sky import clouds
+from sky import estimated_spend
+from sky import global_user_state
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
@@ -283,6 +285,61 @@ class TestPaidCapacityAuthorityPG:
         return location, paid_capacity.pool_key(location,
                                                 workspace='workspace',
                                                 num_nodes=1)
+
+    def test_outcome_persistence_reports_only_committed_claim_pools(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        _, pool_key = self._paid_pool('us-east-1a', 'g6.xlarge')
+        claimed = self._info('svc', 1)
+        unclaimed = self._info('svc', 2)
+        assert serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            claimed,
+            pool_key=pool_key,
+            priority=20,
+            base_limit=2,
+            max_limit=8,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1')) == 'acquired'
+        assert serve_state.add_or_update_replica('svc', 2, unclaimed)
+        claimed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        unclaimed.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        applied_pool_keys: set[str] = set()
+
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, claimed), (2, unclaimed)], {
+                1: paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+                2: paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+            },
+            base_limit=2,
+            max_limit=8,
+            now=101,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'),
+            applied_outcome_pool_keys=applied_pool_keys)
+        assert applied_pool_keys == {pool_key}
+
+        no_claim_pool_keys: set[str] = set()
+        assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
+            'svc',
+            'hash', [(1, claimed)],
+            {1: paid_capacity.LaunchOutcome.CAPACITY_FAILURE},
+            base_limit=2,
+            max_limit=8,
+            now=102,
+            success_ttl_seconds=60,
+            expected_controller_owner=(11, '10.0.0.1'),
+            applied_outcome_pool_keys=no_claim_pool_keys)
+        assert not no_claim_pool_keys
 
     def test_priority_waiter_and_success_failure_ramp(self, broker_engine,
                                                       monkeypatch):
@@ -603,6 +660,63 @@ class TestPaidCapacityAuthorityPG:
         assert set(pool_keys) == set(claim_pool_keys)
         assert len(replica_ids) == 3
         assert waiter_count == 0
+
+    def test_stale_dynamic_snapshots_serialize_last_service_slot(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+
+        def _claim(replica_id: int) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                self._info('svc', replica_id),
+                pool_key=f'pool-{replica_id}',
+                priority=20,
+                base_limit=4,
+                max_limit=8,
+                service_limit=24,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'))
+
+        for replica_id in range(1, 24):
+            assert _claim(replica_id) == 'acquired'
+
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def _race(replica_id: int) -> None:
+            try:
+                barrier.wait(timeout=20)
+                results.append(_claim(replica_id))
+            except Exception as error:  # pylint: disable=broad-except
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=_race, args=(replica_id,))
+            for replica_id in (24, 25)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), 'dynamic service admission hung'
+
+        assert not errors, errors
+        assert sorted(results) == ['acquired', 'service_saturated']
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claim_count = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(serve_state.paid_capacity_claims_table).where(
+                    serve_state.paid_capacity_claims_table.c.service_name ==
+                    'svc')).scalar_one()
+        assert claim_count == 24
 
     def test_service_envelope_preserves_legacy_overage_and_prunes_stale(
             self, broker_engine, monkeypatch):
@@ -1636,6 +1750,7 @@ class TestPaidCapacityAuthorityPG:
         infos = [(replica_id, self._info('svc', replica_id))
                  for replica_id in range(301)]
 
+        assert serve_state.add_or_update_replicas('svc', infos)
         assert serve_state.add_or_update_replicas_with_paid_capacity_outcomes(
             'svc',
             'hash',
@@ -1782,6 +1897,87 @@ class TestPaidCapacityAuthorityPG:
         assert waiters == []
         assert set(pools) == {pool_a, winner_pool}
 
+    def test_expanded_frontier_race_admits_only_one_third_pool(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        location_a, pool_a = self._paid_pool('us-east-1a', 'g6.xlarge')
+        _, pool_b = self._paid_pool('us-east-1b', 'g6.2xlarge')
+        _, pool_c = self._paid_pool('us-east-1c', 'g6.4xlarge')
+        _, pool_d = self._paid_pool('us-east-1d', 'g6.8xlarge')
+        frontier_key = paid_capacity.frontier_key(location_a)
+
+        def _claim(replica_id: int, pool_key: str) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                self._info('svc', replica_id),
+                pool_key=pool_key,
+                priority=20,
+                base_limit=4,
+                max_limit=16,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'),
+                frontier_key=frontier_key,
+                frontier_limit=3,
+                frontier_default_limit=2,
+                frontier_limits_by_key={frontier_key: 3})
+
+        assert _claim(1, pool_a) == 'acquired'
+        assert _claim(2, pool_b) == 'acquired'
+        barrier = threading.Barrier(2)
+        results = {}
+        errors = []
+        result_lock = threading.Lock()
+
+        def _race(replica_id: int, pool_key: str) -> None:
+            try:
+                barrier.wait(timeout=20)
+                result = _claim(replica_id, pool_key)
+                with result_lock:
+                    results[replica_id] = result
+            except Exception as e:  # pylint: disable=broad-except
+                errors.append(e)
+
+        candidates = {3: pool_c, 4: pool_d}
+        threads = [
+            threading.Thread(target=_race, args=(replica_id, pool_key))
+            for replica_id, pool_key in candidates.items()
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), 'expanded frontier thread hung'
+
+        assert not errors, errors
+        assert list(results.values()).count('acquired') == 1
+        assert list(results.values()).count('feedback_pending') == 1
+        winner_id = next(replica_id for replica_id, result in results.items()
+                         if result == 'acquired')
+        winner_pool = candidates[winner_id]
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claims = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.replica_id,
+                    serve_state.paid_capacity_claims_table.c.pool_key).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc')).all()
+            pools = session.execute(
+                sqlalchemy.select(serve_state.paid_capacity_pools_table.c.
+                                  pool_key)).scalars().all()
+
+        assert set(claims) == {
+            (1, pool_a),
+            (2, pool_b),
+            (winner_id, winner_pool),
+        }
+        assert set(pools) == {pool_a, pool_b, winner_pool}
+
     def test_paid_claim_redrive_cannot_change_exact_pool(
             self, broker_engine, monkeypatch):
         monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
@@ -1790,13 +1986,14 @@ class TestPaidCapacityAuthorityPG:
         location, pool_a = self._paid_pool('us-east-1a', 'g6.xlarge')
         _, pool_b = self._paid_pool('us-east-1b', 'g6.2xlarge')
         frontier_key = paid_capacity.frontier_key(location)
+        info = self._info('svc', 1)
 
         def _claim(pool_key: str, now: float) -> str:
             return serve_state.try_add_replica_with_paid_capacity_claim(
                 'svc',
                 'hash',
                 1,
-                self._info('svc', 1),
+                info,
                 pool_key=pool_key,
                 priority=20,
                 base_limit=4,
@@ -1838,6 +2035,54 @@ class TestPaidCapacityAuthorityPG:
         assert pools == [pool_a]
         assert waiters == []
         assert replica_pool == pool_a
+
+    def test_paid_claim_redrive_requires_same_replica_record_identity(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        original = self._info('svc', 1)
+
+        def _claim(info: replica_managers.ReplicaInfo, priority: int,
+                   now: float) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                1,
+                info,
+                pool_key='pool',
+                priority=priority,
+                base_limit=1,
+                max_limit=4,
+                now=now,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'))
+
+        assert _claim(original, 20, 100) == 'acquired'
+        original.version = 2
+        assert _claim(original, 21, 200) == 'acquired'
+
+        replacement = self._info('svc', 1)
+        replacement.version = 99
+        assert replacement.replica_record_id != original.replica_record_id
+        assert _claim(replacement, 99, 300) == 'ownership_lost'
+
+        persisted = serve_state.get_replica_info_from_id('svc', 1)
+        assert persisted is not None
+        assert persisted.replica_record_id == original.replica_record_id
+        assert persisted.version == 2
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claim = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.pool_key,
+                    serve_state.paid_capacity_claims_table.c.priority,
+                    serve_state.paid_capacity_claims_table.c.claimed_at).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc',
+                        serve_state.paid_capacity_claims_table.c.replica_id ==
+                        1)).one()
+        assert claim == ('pool', 21, 100)
 
     def test_frontier_fill_withdraws_ineligible_priority_waiter(
             self, broker_engine, monkeypatch):
@@ -1898,6 +2143,58 @@ class TestPaidCapacityAuthorityPG:
             expected_controller_owner=(11, '10.0.0.1'))
 
         assert _claim('low', 'hash-low', 11, 2, pool_a, 20, 105) == 'acquired'
+
+    def test_waiter_cleanup_uses_per_card_dynamic_frontier_limits(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        l4_location, l4_a = self._paid_pool('us-east-1a', 'g6.xlarge')
+        _, l4_b = self._paid_pool('us-east-1b', 'g6.2xlarge')
+        _, l4_waiter = self._paid_pool('us-east-1c', 'g6.4xlarge')
+        a100_location, a100_a = self._paid_pool('us-east-1a',
+                                                'p4d.24xlarge',
+                                                accelerator='A100')
+        _, a100_b = self._paid_pool('us-east-1b',
+                                    'p4de.24xlarge',
+                                    accelerator='A100')
+        _, a100_waiter = self._paid_pool('us-east-1c',
+                                         'p4d.48xlarge',
+                                         accelerator='A100')
+        pool_keys = (l4_a, l4_b, l4_waiter, a100_a, a100_b, a100_waiter)
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(
+                sqlalchemy.insert(serve_state.paid_capacity_pools_table), [{
+                    'pool_key': pool_key,
+                    'current_limit': 4,
+                    'successes_since_resize': 0,
+                    'updated_at': 100,
+                } for pool_key in pool_keys])
+            session.execute(
+                sqlalchemy.insert(serve_state.paid_capacity_waiters_table), [{
+                    'pool_key': pool_key,
+                    'service_name': 'svc',
+                    'service_hash': 'hash',
+                    'priority': 20,
+                    'first_wait_at': 100,
+                    'heartbeat_at': 100,
+                } for pool_key in (l4_waiter, a100_waiter)])
+            serve_state._withdraw_ineligible_frontier_waiters_in_session(
+                session,
+                'svc',
+                'hash', [(1, l4_a), (2, l4_b), (3, a100_a), (4, a100_b)],
+                frontier_limit=2,
+                frontier_limits_by_key={
+                    paid_capacity.frontier_key(l4_location): 3,
+                    paid_capacity.frontier_key(a100_location): 2,
+                })
+            session.commit()
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            waiters = session.execute(
+                sqlalchemy.select(serve_state.paid_capacity_waiters_table.c.
+                                  pool_key)).scalars().all()
+        assert waiters == [l4_waiter]
 
     def test_post_commit_waiter_cleanup_failure_keeps_claim_durable(
             self, broker_engine, monkeypatch):
@@ -2327,14 +2624,18 @@ class TestPaidCapacityAuthorityPG:
         serve_state.Base.metadata.create_all(broker_engine)
         self._add_service('low', 'hash-low', 11)
         self._add_service('high', 'hash-high', 22)
+        infos = {}
 
         def _claim(service_name: str, service_hash: str, pid: int,
                    replica_id: int, priority: int) -> str:
+            identity = (service_name, replica_id)
+            if identity not in infos:
+                infos[identity] = self._info(service_name, replica_id)
             return serve_state.try_add_replica_with_paid_capacity_claim(
                 service_name,
                 service_hash,
                 replica_id,
-                self._info(service_name, replica_id),
+                infos[identity],
                 pool_key='shared-pool',
                 priority=priority,
                 base_limit=1,
@@ -2572,6 +2873,7 @@ class TestMigrationChainPG:
                     'demand_capacity_observations',
                     'serve_replica_status_history',
                     'serve_request_activity_history',
+                    'serve_request_activity_daily',
                     'serve_response_time_history',
                     'serve_prediction_time_history',
                     'serve_autoscaler_history',
@@ -2647,6 +2949,23 @@ class TestMigrationChainPG:
                 assert request_columns['rejected_count']['default'] is not None
                 assert request_columns['rejection_count_available'][
                     'default'] is not None
+                assert {
+                    'classified_request_count',
+                    'counted_rejected_count',
+                }.issubset(request_columns)
+                daily_request_columns = {
+                    column['name']: column for column in inspector.get_columns(
+                        'serve_request_activity_daily')
+                }
+                assert {
+                    'classified_request_count',
+                    'counted_rejected_count',
+                    'classified_first_bucket_start',
+                    'classified_last_bucket_start',
+                    'classification_incomplete',
+                }.issubset(daily_request_columns)
+                assert daily_request_columns['classification_incomplete'][
+                    'default'] is not None
                 response_columns = {
                     column['name'] for column in inspector.get_columns(
                         'serve_response_time_history')
@@ -2704,7 +3023,7 @@ class TestMigrationChainPG:
         try:
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '031')
             with engine.begin() as connection:
                 connection.execute(
                     sqlalchemy.text(
@@ -2725,7 +3044,7 @@ class TestMigrationChainPG:
             alembic_command.downgrade(config, '028')
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '031')
 
             inspector = sqlalchemy.inspect(engine)
             service_columns = {
@@ -2746,13 +3065,120 @@ class TestMigrationChainPG:
         finally:
             engine.dispose()
 
+    def test_revision_031_daily_history_survives_rollback_and_reupgrade(
+            self, pg_server):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '031')
+            daily = serve_history.serve_request_activity_daily_table
+            day = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.insert(daily).values(day_start=day,
+                                                    service_name='svc',
+                                                    service_hash='hash-a',
+                                                    first_bucket_start=day,
+                                                    last_bucket_start=day,
+                                                    request_count=7,
+                                                    observed_at=day))
+
+            config = migration_utils.get_alembic_config(
+                engine, migration_utils.SERVE_DB_NAME)
+            alembic_command.downgrade(config, '030')
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 migration_utils.SERVE_VERSION)
+
+            with engine.connect() as connection:
+                assert connection.execute(
+                    sqlalchemy.select(daily.c.request_count)).scalar_one() == 7
+                revision = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT version_num FROM '
+                        'alembic_version_serve_state_db')).scalar_one()
+            assert revision == migration_utils.SERVE_VERSION
+        finally:
+            engine.dispose()
+
+    def test_revision_032_latches_preexisting_attempt_history(self, pg_server):
+        url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
+        engine = create_engine(url)
+        try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '031')
+            day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.text(
+                        'INSERT INTO serve_request_activity_daily '
+                        '(day_start, service_name, service_hash, '
+                        'first_bucket_start, last_bucket_start, request_count, '
+                        'observed_at) VALUES '
+                        '(:day, :name, :hash, :day, :day, 7, :day)'), {
+                            'day': day,
+                            'name': 'legacy',
+                            'hash': 'legacy-hash',
+                        })
+
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '032')
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT classified_request_count, '
+                        'counted_rejected_count, classification_incomplete '
+                        'FROM serve_request_activity_daily')).one()
+                constraints = {
+                    constraint['name']
+                    for constraint in sqlalchemy.inspect(engine).
+                    get_check_constraints('serve_request_activity_daily')
+                }
+            assert row == (None, None, True)
+            assert 'serve_request_activity_daily_classified_pair' in constraints
+            with pytest.raises(sqlalchemy.exc.IntegrityError):
+                with engine.begin() as connection:
+                    connection.execute(
+                        sqlalchemy.text(
+                            'INSERT INTO serve_request_activity_daily '
+                            '(day_start, service_name, service_hash, '
+                            'first_bucket_start, last_bucket_start, '
+                            'request_count, classified_request_count, '
+                            'counted_rejected_count, '
+                            'classified_first_bucket_start, '
+                            'classified_last_bucket_start, observed_at) VALUES '
+                            '(:day, :name, :hash, :day, :day, 1, 1, NULL, '
+                            ':day, :day, :day)'), {
+                                'day': day + datetime.timedelta(days=1),
+                                'name': 'invalid',
+                                'hash': 'invalid-hash',
+                            })
+
+            config = migration_utils.get_alembic_config(
+                engine, migration_utils.SERVE_DB_NAME)
+            alembic_command.downgrade(config, '031')
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '032')
+            with engine.connect() as connection:
+                assert connection.execute(
+                    sqlalchemy.text(
+                        'SELECT classification_incomplete FROM '
+                        'serve_request_activity_daily')).scalar_one() is True
+        finally:
+            engine.dispose()
+
     def test_revision_027_downgrades_cleanly_to_026(self, pg_server):
         url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
         engine = create_engine(url)
         try:
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
-                                                 migration_utils.SERVE_VERSION)
+                                                 '031')
             config = migration_utils.get_alembic_config(
                 engine, migration_utils.SERVE_DB_NAME)
             alembic_command.downgrade(config, '026')
@@ -3678,6 +4104,642 @@ class TestServeStatusHistoryPG:
         assert not current['request_samples']
         assert current['requests_last_hour'] == 0
 
+    def test_request_classification_is_exact_monotonic_and_version_safe(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        timestamp = day.timestamp() + 30
+        bucket_start = int(day.timestamp())
+
+        def request_history(count):
+            return {
+                'bucket_seconds': 60,
+                'buckets': [{
+                    'bucket_start': bucket_start,
+                    'request_count': count,
+                    'rejected_count': 0,
+                }],
+            }
+
+        def classification_history(classified, rejected):
+            return {
+                'classification_version': 1,
+                'bucket_seconds': 60,
+                'buckets': [{
+                    'bucket_start': bucket_start,
+                    'classified_request_count': classified,
+                    'counted_rejected_count': rejected,
+                }],
+            }
+
+        assert serve_history.record_request_activity('svc', 'hash-a', 'current',
+                                                     request_history(3),
+                                                     timestamp) == 1
+        raw = serve_history.serve_request_activity_history_table
+        with history_engine.connect() as connection:
+            unclassified = connection.execute(
+                sqlalchemy.select(raw.c.classified_request_count,
+                                  raw.c.counted_rejected_count)).one()
+        assert unclassified == (None, None)
+        assert serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'current',
+            classification_history(3, 1),
+            timestamp + 1,
+            request_history=request_history(3)) == 1
+        # Independent stale deliveries cannot lower either component.
+        serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'current',
+            classification_history(2, 0),
+            timestamp + 2,
+            request_history=request_history(3))
+        # A legacy reporter remains distinguishable from a capable reporter.
+        serve_history.record_request_activity('mixed', 'hash-b', 'legacy',
+                                              request_history(4), timestamp)
+
+        with history_engine.connect() as connection:
+            rows = connection.execute(
+                sqlalchemy.select(
+                    raw.c.service_name,
+                    raw.c.request_count,
+                    raw.c.classified_request_count,
+                    raw.c.counted_rejected_count,
+                    raw.c.rejection_count_available,
+                ).order_by(raw.c.service_name)).fetchall()
+        assert rows == [('mixed', 4, None, None, True), ('svc', 3, 3, 1, True)]
+
+        assert serve_history.rollup_request_activity_daily(timestamp + 60) == 2
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            bucket_start,
+            bucket_start, [{
+                'day_start_utc': bucket_start
+            }],
+            table_limit=50,
+            chart_limit=1)
+        exact = summary['non_rejected']
+        assert exact['available']
+        assert exact['coverage'] == 'partial'
+        assert exact['complete_by_day'] == [False]
+        assert exact['total_request_count'] == 2
+        assert exact['services'] == [{
+            'service_name': 'svc',
+            'request_count': 2,
+            'coverage': 'complete',
+            'complete_by_day': [True],
+        }, {
+            'service_name': 'mixed',
+            'request_count': 0,
+            'coverage': 'unavailable',
+            'complete_by_day': [False],
+        }]
+        assert exact['series'] == [{
+            'service_name': 'svc',
+            'request_count_by_day': [2],
+        }, {
+            'is_other': True,
+            'request_count_by_day': [None],
+        }]
+
+        daily = serve_history.serve_request_activity_daily_table
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.delete(raw))
+        assert serve_history.rollup_request_activity_daily(timestamp + 120) == 0
+        with history_engine.connect() as connection:
+            daily_rows = connection.execute(
+                sqlalchemy.select(
+                    daily.c.service_name,
+                    daily.c.classified_request_count,
+                    daily.c.counted_rejected_count,
+                    daily.c.classification_incomplete,
+                ).order_by(daily.c.service_name)).fetchall()
+        assert daily_rows == [('mixed', None, None, True), ('svc', 3, 1, False)]
+
+    def test_request_classification_constraints_reject_one_sided_nulls(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        raw = serve_history.serve_request_activity_history_table
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            with history_engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.insert(raw).values(
+                        service_name='svc',
+                        service_hash='hash-a',
+                        reporter_session_id='reporter',
+                        bucket_start=day,
+                        observed_at=day,
+                        request_count=1,
+                        classified_request_count=1,
+                        counted_rejected_count=None))
+
+        daily = serve_history.serve_request_activity_daily_table
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            with history_engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.insert(daily).values(
+                        day_start=day,
+                        service_name='svc',
+                        service_hash='hash-a',
+                        first_bucket_start=day,
+                        last_bucket_start=day,
+                        request_count=1,
+                        classified_request_count=1,
+                        counted_rejected_count=None,
+                        classified_first_bucket_start=day,
+                        classified_last_bucket_start=day,
+                        observed_at=day))
+
+    def test_empty_classification_atomically_promotes_support_buckets(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        timestamp = day.timestamp() + 30
+        bucket_start = int(day.timestamp())
+        request_history = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'request_count': 2,
+                'rejected_count': 0,
+            }],
+        }
+        empty_classification = {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [],
+        }
+        serve_history.record_request_activity('svc', 'hash-a', 'reporter',
+                                              request_history, timestamp)
+        assert serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'reporter',
+            empty_classification,
+            timestamp,
+            request_history=request_history) == 1
+
+        raw = serve_history.serve_request_activity_history_table
+        with history_engine.connect() as connection:
+            row = connection.execute(
+                sqlalchemy.select(raw.c.request_count,
+                                  raw.c.classified_request_count,
+                                  raw.c.counted_rejected_count)).one()
+        assert row == (2, 0, 0)
+
+        bad_classification = {
+            **empty_classification,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'classified_request_count': 1,
+                'counted_rejected_count': 2,
+            }],
+        }
+        with pytest.raises(ValueError, match='cannot exceed'):
+            serve_history.validate_request_classification_history(
+                bad_classification, timestamp)
+        with pytest.raises(ValueError, match='unsupported'):
+            serve_history.validate_request_classification_history(
+                {
+                    **empty_classification,
+                    'classification_version': True,
+                }, timestamp)
+
+    def test_daily_incomplete_latch_survives_late_classification_support(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        timestamp = day.timestamp() + 30
+        bucket_start = int(day.timestamp())
+        request_history = {
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'request_count': 1,
+                'rejected_count': 0,
+            }],
+        }
+        classification_history = {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [],
+        }
+
+        serve_history.record_request_activity('svc', 'hash-a', 'reporter',
+                                              request_history, timestamp)
+        assert serve_history.rollup_request_activity_daily(timestamp) == 1
+
+        serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'reporter',
+            classification_history,
+            timestamp + 1,
+            request_history=request_history)
+        assert serve_history.rollup_request_activity_daily(timestamp + 2) == 1
+
+        daily = serve_history.serve_request_activity_daily_table
+        with history_engine.connect() as connection:
+            row = connection.execute(
+                sqlalchemy.select(daily.c.request_count,
+                                  daily.c.classified_request_count,
+                                  daily.c.counted_rejected_count,
+                                  daily.c.classification_incomplete)).one()
+        assert row == (1, 0, 0, True)
+
+    def test_non_rejected_zero_range_after_coverage_is_available(
+            self, history_engine):
+        first_day = datetime.datetime(2026, 7, 30, tzinfo=datetime.timezone.utc)
+        selected_day = first_day + datetime.timedelta(days=1)
+        daily = serve_history.serve_request_activity_daily_table
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(daily),
+                [
+                    {
+                        'day_start': first_day,
+                        'service_name': 'svc',
+                        'service_hash': 'hash-a',
+                        'first_bucket_start': first_day,
+                        'last_bucket_start': first_day,
+                        'request_count': 1,
+                        'classified_request_count': 1,
+                        'counted_rejected_count': 0,
+                        'classified_first_bucket_start': first_day,
+                        'classified_last_bucket_start': first_day,
+                        'classification_incomplete': False,
+                        'observed_at': first_day,
+                    },
+                    {
+                        # This is the durable shape of a legacy pre-admission
+                        # rejection-only minute. It has no attempt to classify and
+                        # must remain an exact zero after service coverage begins.
+                        'day_start': selected_day,
+                        'service_name': 'svc',
+                        'service_hash': 'hash-a',
+                        'first_bucket_start': selected_day,
+                        'last_bucket_start': selected_day,
+                        'request_count': 0,
+                        'classified_request_count': None,
+                        'counted_rejected_count': None,
+                        'classified_first_bucket_start': None,
+                        'classified_last_bucket_start': None,
+                        'classification_incomplete': False,
+                        'observed_at': selected_day,
+                    }
+                ])
+
+        selected_epoch = int(selected_day.timestamp())
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            selected_epoch,
+            selected_epoch, [{
+                'day_start_utc': selected_epoch
+            }],
+            table_limit=50,
+            chart_limit=8)
+        assert summary['non_rejected'] == {
+            'available': True,
+            'definition': 'non_rejected_inbound_requests',
+            'coverage_start_utc': int(first_day.timestamp()),
+            'coverage': 'complete',
+            'complete_by_day': [True],
+            'total_request_count': 0,
+            'services': [{
+                'service_name': 'svc',
+                'request_count': 0,
+                'coverage': 'complete',
+                'complete_by_day': [True],
+            }],
+            'series': [{
+                'service_name': 'svc',
+                'request_count_by_day': [0],
+            }],
+        }
+
+    def test_daily_request_rollup_is_monotonic_and_groups_incarnations(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
+        request_table = serve_history.serve_request_activity_history_table
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.insert(request_table), [{
+                'service_name': 'svc',
+                'service_hash': 'hash-a',
+                'reporter_session_id': 'reporter-a',
+                'bucket_start': day + datetime.timedelta(minutes=1),
+                'observed_at': day + datetime.timedelta(minutes=2),
+                'request_count': 3,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }, {
+                'service_name': 'svc',
+                'service_hash': 'hash-a',
+                'reporter_session_id': 'reporter-b',
+                'bucket_start': day + datetime.timedelta(minutes=1),
+                'observed_at': day + datetime.timedelta(minutes=2),
+                'request_count': 4,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }, {
+                'service_name': 'svc',
+                'service_hash': 'hash-b',
+                'reporter_session_id': 'reporter-c',
+                'bucket_start': day + datetime.timedelta(minutes=2),
+                'observed_at': day + datetime.timedelta(minutes=3),
+                'request_count': 2,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }, {
+                'service_name': 'other',
+                'service_hash': 'hash-other',
+                'reporter_session_id': 'reporter-d',
+                'bucket_start': day + datetime.timedelta(minutes=3),
+                'observed_at': day + datetime.timedelta(minutes=4),
+                'request_count': 1,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }, {
+                'service_name': 'svc',
+                'service_hash': 'hash-b',
+                'reporter_session_id': 'reporter-c',
+                'bucket_start': day + datetime.timedelta(days=1, minutes=1),
+                'observed_at': day + datetime.timedelta(days=1, minutes=2),
+                'request_count': 5,
+                'rejected_count': 0,
+                'rejection_count_available': True,
+            }])
+            # UTC grouping must not depend on the database session timezone.
+            connection.execute(
+                sqlalchemy.text("SET TIME ZONE 'America/Los_Angeles'"))
+
+        timestamp = (day + datetime.timedelta(days=1, minutes=5)).timestamp()
+        assert serve_history.rollup_request_activity_daily(timestamp) == 4
+        days = [{
+            'day_start_utc': int(day.timestamp())
+        }, {
+            'day_start_utc': int((day + datetime.timedelta(days=1)).timestamp())
+        }]
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            int(day.timestamp()),
+            int((day + datetime.timedelta(days=1)).timestamp()),
+            days,
+            table_limit=50,
+            chart_limit=1)
+        assert summary['available']
+        assert summary['coverage_start_utc'] == int(
+            (day + datetime.timedelta(minutes=1)).timestamp())
+        assert summary['total_request_count'] == 15
+        assert summary['services'] == [{
+            'service_name': 'svc',
+            'request_count': 14,
+        }, {
+            'service_name': 'other',
+            'request_count': 1,
+        }]
+        assert summary['series'] == [{
+            'service_name': 'svc',
+            'request_count_by_day': [9, 5],
+        }, {
+            'is_other': True,
+            'request_count_by_day': [1, 0],
+        }]
+
+        # A late cumulative update increases the daily rollup.
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_table).where(
+                    request_table.c.reporter_session_id == 'reporter-a').values(
+                        request_count=8))
+        serve_history.rollup_request_activity_daily(timestamp + 60)
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            int(day.timestamp()),
+            int((day + datetime.timedelta(days=1)).timestamp()),
+            days,
+            table_limit=50,
+            chart_limit=1)
+        assert summary['total_request_count'] == 20
+
+        # Pruning the raw source cannot decrement durable daily totals.
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.delete(request_table))
+        assert serve_history.rollup_request_activity_daily(timestamp + 120) == 0
+        summary = serve_history.get_daily_request_summary(
+            history_engine,
+            int(day.timestamp()),
+            int((day + datetime.timedelta(days=1)).timestamp()),
+            days,
+            table_limit=50,
+            chart_limit=1)
+        assert summary['total_request_count'] == 20
+
+    def test_daily_request_coverage_query_is_bounded_to_first_day(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
+        daily = serve_history.serve_request_activity_daily_table
+        with history_engine.begin() as connection:
+            connection.execute(sqlalchemy.insert(daily), [{
+                'day_start': day + datetime.timedelta(days=offset),
+                'service_name': f'svc-{offset}',
+                'service_hash': f'hash-{offset}',
+                'first_bucket_start': day + datetime.timedelta(
+                    days=offset, minutes=offset + 1),
+                'last_bucket_start': day +
+                                     datetime.timedelta(days=offset, hours=1),
+                'request_count': offset + 1,
+                'observed_at': day + datetime.timedelta(days=offset, hours=2),
+            } for offset in range(3)])
+
+        statements = []
+
+        def capture_statement(_connection, _cursor, statement, _parameters,
+                              _context, _executemany):
+            statements.append(' '.join(statement.split()))
+
+        sqlalchemy.event.listen(history_engine, 'before_cursor_execute',
+                                capture_statement)
+        try:
+            summary = serve_history.get_daily_request_summary(
+                history_engine,
+                int(day.timestamp()),
+                int((day + datetime.timedelta(days=2)).timestamp()), [{
+                    'day_start_utc': int(
+                        (day + datetime.timedelta(days=offset)).timestamp())
+                } for offset in range(3)],
+                table_limit=50,
+                chart_limit=8)
+        finally:
+            sqlalchemy.event.remove(history_engine, 'before_cursor_execute',
+                                    capture_statement)
+
+        assert summary['coverage_start_utc'] == int(
+            (day + datetime.timedelta(minutes=1)).timestamp())
+        coverage_query = next(statement for statement in statements
+                              if 'min(serve_request_activity_daily.'
+                              'first_bucket_start)' in statement)
+        assert ('WHERE serve_request_activity_daily.day_start = '
+                '(SELECT min(serve_request_activity_daily.day_start)'
+               ) in coverage_query
+
+    def test_estimated_spend_joins_daily_service_cost_and_requests(
+            self, history_engine, monkeypatch):
+        global_user_state.estimated_spend_daily_table.create(history_engine)
+        global_user_state.estimated_spend_state_table.create(history_engine)
+        monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                            mock.Mock(return_value=history_engine))
+        day = datetime.datetime(2026, 7, 29, tzinfo=datetime.timezone.utc)
+        day_start = int(day.timestamp())
+        observed_at = day + datetime.timedelta(hours=1)
+        with history_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_history.serve_request_activity_daily_table),
+                [{
+                    'day_start': day,
+                    'service_name': 'svc',
+                    'service_hash': 'hash-a',
+                    'first_bucket_start': day,
+                    'last_bucket_start': day + datetime.timedelta(minutes=59),
+                    'request_count': 5,
+                    'classified_request_count': 5,
+                    'counted_rejected_count': 1,
+                    'classified_first_bucket_start': day,
+                    'classified_last_bucket_start':
+                        day + datetime.timedelta(minutes=59),
+                    'classification_incomplete': False,
+                    'observed_at': observed_at,
+                }, {
+                    'day_start': day,
+                    'service_name': 'zero-svc',
+                    'service_hash': 'hash-b',
+                    'first_bucket_start': day,
+                    'last_bucket_start': day + datetime.timedelta(minutes=59),
+                    'request_count': 2,
+                    'classified_request_count': 2,
+                    'counted_rejected_count': 0,
+                    'classified_first_bucket_start': day,
+                    'classified_last_bucket_start':
+                        day + datetime.timedelta(minutes=59),
+                    'classification_incomplete': False,
+                    'observed_at': observed_at,
+                }, {
+                    'day_start': day,
+                    'service_name': 'unknown-svc',
+                    'service_hash': 'hash-c',
+                    'first_bucket_start': day,
+                    'last_bucket_start': day + datetime.timedelta(minutes=59),
+                    'request_count': 1,
+                    'classified_request_count': 1,
+                    'counted_rejected_count': 0,
+                    'classified_first_bucket_start': day,
+                    'classified_last_bucket_start':
+                        day + datetime.timedelta(minutes=59),
+                    'classification_incomplete': False,
+                    'observed_at': observed_at,
+                }])
+            connection.execute(
+                sqlalchemy.insert(
+                    global_user_state.estimated_spend_daily_table), [{
+                        'day_start_utc': day_start,
+                        'cluster_hash': 'svc-replica-1',
+                        'cluster_name': 'svc-1',
+                        'workload_type': 'service',
+                        'workload_id': 'svc',
+                        'cloud': 'AWS',
+                        'use_spot': False,
+                        'machine_seconds': 3600,
+                        'catalog_hourly_rate': 2.0,
+                        'estimated_cost': 2.0,
+                        'exclusion_reason': None,
+                        'updated_at': int(observed_at.timestamp()),
+                    }, {
+                        'day_start_utc': day_start,
+                        'cluster_hash': 'svc-replica-2',
+                        'cluster_name': 'svc-2',
+                        'workload_type': 'service',
+                        'workload_id': 'svc',
+                        'cloud': 'Kubernetes',
+                        'use_spot': False,
+                        'machine_seconds': 3600,
+                        'catalog_hourly_rate': None,
+                        'estimated_cost': None,
+                        'exclusion_reason': 'kubernetes',
+                        'updated_at': int(observed_at.timestamp()),
+                    }, {
+                        'day_start_utc': day_start,
+                        'cluster_hash': 'zero-svc-replica-1',
+                        'cluster_name': 'zero-svc-1',
+                        'workload_type': 'service',
+                        'workload_id': 'zero-svc',
+                        'cloud': 'Kubernetes',
+                        'use_spot': False,
+                        'machine_seconds': 3600,
+                        'catalog_hourly_rate': None,
+                        'estimated_cost': None,
+                        'exclusion_reason': 'kubernetes',
+                        'updated_at': int(observed_at.timestamp()),
+                    }, {
+                        'day_start_utc': day_start,
+                        'cluster_hash': 'unknown-svc-replica-1',
+                        'cluster_name': 'unknown-svc-1',
+                        'workload_type': 'service',
+                        'workload_id': 'unknown-svc',
+                        'cloud': 'AWS',
+                        'use_spot': False,
+                        'machine_seconds': 3600,
+                        'catalog_hourly_rate': None,
+                        'estimated_cost': None,
+                        'exclusion_reason': 'unknown_price',
+                        'updated_at': int(observed_at.timestamp()),
+                    }])
+            connection.execute(
+                sqlalchemy.insert(
+                    global_user_state.estimated_spend_state_table).values(
+                        singleton_id=1,
+                        last_success_at=int(observed_at.timestamp()),
+                        backfill_complete=True,
+                        coverage_start_utc=day_start,
+                    ))
+        monkeypatch.setattr(estimated_spend.time, 'time',
+                            mock.Mock(return_value=observed_at.timestamp()))
+
+        response = estimated_spend.get_estimated_spend(days=1)
+
+        attempt_services = {
+            service['service_name']: service
+            for service in response['service_requests']['services']
+        }
+        assert attempt_services['svc']['request_count'] == 5
+        assert attempt_services['svc']['ratio_request_count'] == 0
+        assert attempt_services['svc']['estimated_cost_per_request'] is None
+        assert attempt_services['svc']['cost_coverage'] == 'unavailable'
+
+        exact = response['service_requests']['non_rejected']
+        services = {
+            service['service_name']: service for service in exact['services']
+        }
+        service = services['svc']
+        assert service['service_name'] == 'svc'
+        assert service['request_count'] == 4
+        assert service['ratio_request_count'] == 4
+        assert service['estimated_cost'] == 2.0
+        assert service['estimated_cost_per_request'] == 0.5
+        assert service['cost_coverage'] == 'complete'
+        assert service['priced_machine_seconds'] == 7200
+        assert service['excluded_machine_seconds'] == 0
+        assert exact['series'][0]['estimated_cost_per_request_by_day'] == [0.5]
+        zero_service = services['zero-svc']
+        assert zero_service['estimated_cost'] == 0
+        assert zero_service['estimated_cost_per_request'] == 0
+        assert zero_service['cost_coverage'] == 'complete'
+        assert zero_service['priced_machine_seconds'] == 3600
+        assert zero_service['excluded_machine_seconds'] == 0
+        unknown_service = services['unknown-svc']
+        assert unknown_service['estimated_cost_per_request'] is None
+        assert unknown_service['cost_coverage'] == 'partial'
+        assert unknown_service['priced_machine_seconds'] == 0
+        assert unknown_service['excluded_machine_seconds'] == 3600
+
     def test_prediction_time_history_is_idempotent_and_reporter_additive(
             self, history_engine):
         timestamp = 1784207110.0
@@ -4325,15 +5387,27 @@ def test_advisory_lock_does_not_consume_ordinary_pool(pg_server, monkeypatch):
         with pytest.raises(locks.LockTimeout):
             contender.acquire(blocking=False)
         assert engine.pool.checkedout() == 0
-        with engine.connect() as observer:
-            lock_sessions = observer.execute(
-                sqlalchemy.text('SELECT count(*) FROM pg_stat_activity '
-                                'WHERE datname = current_database() '
-                                'AND application_name = :application_name'), {
-                                    'application_name': 'skypilot-advisory-lock'
-                                }).scalar_one()
-        # Only the two acquired locks retain sessions; the failed contender
-        # commits and disconnects before returning LockTimeout.
+
+        # Only the two acquired locks may retain sessions; the failed contender
+        # commits and disconnects before returning LockTimeout. Closing the
+        # client socket does not synchronously remove the row from
+        # pg_stat_activity, though -- PostgreSQL reaps the backend process on
+        # its own schedule -- so poll for the contender to drain instead of
+        # racing the reaper. A contender that really leaked its session keeps
+        # the count at three for the whole window and still fails the assert.
+        deadline = time.monotonic() + 10
+        while True:
+            with engine.connect() as observer:
+                lock_sessions = observer.execute(
+                    sqlalchemy.text('SELECT count(*) FROM pg_stat_activity '
+                                    'WHERE datname = current_database() '
+                                    'AND application_name = :application_name'),
+                    {
+                        'application_name': 'skypilot-advisory-lock'
+                    }).scalar_one()
+            if lock_sessions <= 2 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
         assert lock_sessions == 2
 
         lock.release()
@@ -4471,7 +5545,9 @@ class TestUtilizationGateSkewPG:
             for row in serve_state.get_reserved_fill_claims(pool_key)
         }['svc']
         with _armed_gate():
-            assert broker._activity_input(fresh).blind is False
+            fresh_signal = broker._activity_input(fresh)
+        assert fresh_signal.armed is True
+        assert fresh_signal.blind is False
 
         # A pre-gate binary heartbeats the SAME row 61s later, omitting the
         # gate columns. Their ON CONFLICT set_ leaves them frozen.
@@ -4487,9 +5563,12 @@ class TestUtilizationGateSkewPG:
         assert row['activity_ts'] == 1000.0  # FROZEN, not refreshed to 1061
         assert row['demonstrated_need'] == 0  # FROZEN
         with _armed_gate():
-            # lag 61 > RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS (60) -> blind, so
-            # a frozen demonstrated_need of 0 does NOT decay a busy service.
-            assert broker._activity_input(row).blind is True
+            # lag 61 > RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS (60) ->
+            # armed-but-blind, so a frozen zero first gets blind grace rather
+            # than being trusted as confirmed idle.
+            stale_signal = broker._activity_input(row)
+        assert stale_signal.armed is True
+        assert stale_signal.blind is True
 
 
 class TestMigration030PopulatedClaimsPG:
@@ -4537,6 +5616,8 @@ class TestMigration030PopulatedClaimsPG:
             assert got['boot_hold'] is None
             assert got['activity_ts'] is None
             with _armed_gate():
-                assert broker._activity_input(dict(got)).blind is True
+                legacy_signal = broker._activity_input(dict(got))
+            assert legacy_signal.armed is False
+            assert legacy_signal.blind is True
         finally:
             engine.dispose()

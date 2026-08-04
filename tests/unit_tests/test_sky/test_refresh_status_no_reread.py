@@ -9,6 +9,7 @@ returned record contents and that no extra get_cluster_from_name SELECT
 happens on those paths.
 """
 # pylint: disable=protected-access
+import asyncio
 import time
 from unittest import mock
 
@@ -582,7 +583,8 @@ def test_refresh_reloads_record_when_autostop_changes_before_lock():
              backend_utils.locks,
              'get_lock',
              side_effect=[lock, resource_lock]) as get_lock, \
-         mock.patch.object(backend_utils.time, 'sleep') as sleep, \
+         mock.patch.object(backend_utils.context_utils,
+                           'sleep_with_cancellation') as sleep, \
          mock.patch.object(backend_utils, '_update_cluster_status',
                            return_value=fresh_record) as update:
         result = backend_utils.refresh_cluster_record(
@@ -631,7 +633,8 @@ def test_refresh_lock_wait_clamps_final_sleep_to_deadline():
              backend_utils.time,
              'perf_counter',
              side_effect=[100.0, 100.75, 101.001]) as perf_counter, \
-         mock.patch.object(backend_utils.time, 'sleep') as sleep, \
+         mock.patch.object(backend_utils.context_utils,
+                           'sleep_with_cancellation') as sleep, \
          mock.patch.object(backend_utils, '_update_cluster_status') as update:
         result = backend_utils.refresh_cluster_record(
             'test-cluster', cluster_status_lock_timeout=1)
@@ -674,7 +677,8 @@ def test_refresh_lock_wait_returns_concurrent_update_at_deadline():
          mock.patch.object(backend_utils.time,
                            'perf_counter',
                            side_effect=[100.0, 100.75]), \
-         mock.patch.object(backend_utils.time, 'sleep') as sleep, \
+         mock.patch.object(backend_utils.context_utils,
+                           'sleep_with_cancellation') as sleep, \
          mock.patch.object(backend_utils, '_update_cluster_status') as update:
         result = backend_utils.refresh_cluster_record(
             'test-cluster', cluster_status_lock_timeout=1)
@@ -685,6 +689,145 @@ def test_refresh_lock_wait_returns_concurrent_update_at_deadline():
     lock.acquire.assert_called_once_with(blocking=False)
     sleep.assert_called_once_with(pytest.approx(0.25))
     update.assert_not_called()
+
+
+def test_refresh_lock_wait_cancellation_stops_before_next_poll():
+    """Cancellation while waiting for the status lock must wake immediately."""
+    handle = _make_handle()
+    handle.launched_resources.use_spot = True
+    record = _make_refreshable_record(handle)
+    refresh_fields = ('UP', record['status_updated_at'], record['autostop'],
+                      record['to_down'])
+
+    blocked = mock.MagicMock()
+    blocked.__enter__.side_effect = backend_utils.locks.LockTimeout
+    lock = mock.MagicMock(poll_interval=1.0)
+    lock.acquire.side_effect = [
+        blocked,
+        AssertionError('retried the status lock after cancellation'),
+    ]
+
+    with mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=record) as full_read, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_refresh_fields',
+                           return_value=refresh_fields) as cheap_read, \
+         mock.patch.object(backend_utils,
+                           '_check_owner_identity_with_record'), \
+         mock.patch.object(backend_utils.locks, 'get_lock',
+                           return_value=lock), \
+         mock.patch.object(backend_utils.context_utils,
+                           'sleep_with_cancellation',
+                           side_effect=asyncio.CancelledError()) as sleep, \
+         mock.patch.object(
+             backend_utils.time,
+             'sleep',
+             side_effect=AssertionError(
+                 'used raw sleep instead of cancelable wait')), \
+         mock.patch.object(backend_utils, '_update_cluster_status') as update:
+        with pytest.raises(asyncio.CancelledError):
+            backend_utils.refresh_cluster_record('test-cluster',
+                                                 cluster_status_lock_timeout=-1)
+
+    full_read.assert_called_once()
+    cheap_read.assert_not_called()
+    lock.acquire.assert_called_once_with(blocking=False)
+    sleep.assert_called_once_with(lock.poll_interval)
+    update.assert_not_called()
+
+
+def test_update_cluster_status_cancellation_stops_before_next_ray_probe():
+    handle = _make_handle()
+    handle.launched_nodes = 1
+    handle.provision_runtime_metadata.has_ray = True
+    handle.launched_resources.cloud = mock.Mock()
+    handle.launched_resources.cloud.uses_ray.return_value = True
+    runner = mock.Mock()
+    runner.run.side_effect = [
+        (0, 'ray status output', ''),
+        AssertionError('probed ray status after cancellation'),
+    ]
+    handle.get_command_runners.return_value = [runner]
+    record = _make_record(handle)
+    node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses) as query_status, \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils,
+                           '_ray_status_via_skylet_grpc',
+                           return_value=None), \
+         mock.patch.object(backend_utils,
+                           '_count_healthy_nodes_from_ray',
+                           return_value=(0, 0)), \
+         mock.patch.object(backend_utils.context_utils,
+                           'sleep_with_cancellation',
+                           side_effect=asyncio.CancelledError()) as sleep, \
+         mock.patch.object(
+             backend_utils.time,
+             'sleep',
+             side_effect=AssertionError(
+                 'used raw sleep instead of cancelable wait')):
+        with pytest.raises(asyncio.CancelledError):
+            backend_utils._update_cluster_status('test-cluster',
+                                                 record,
+                                                 retry_if_missing=False)
+
+    query_status.assert_called_once_with(handle,
+                                         retry_if_missing=False,
+                                         get_ray_config=mock.ANY)
+    runner.run.assert_called_once_with(
+        backend_utils.instance_setup.RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND,
+        stream_logs=False,
+        require_outputs=True,
+        separate_stderr=True)
+    sleep.assert_called_once_with(1)
+
+
+def test_update_cluster_status_cancellation_stops_before_launch_double_check_reread(
+):
+    handle = _make_handle()
+    handle.launched_resources.cloud = mock.Mock(
+        STATUS_VERSION=clouds.StatusVersion.SKYPILOT)
+    handle.launched_resources.assert_launchable.return_value = (
+        handle.launched_resources)
+    record = _make_record(handle)
+    record['status'] = status_lib.ClusterStatus.INIT
+    record['launched_at'] = time.time()
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(
+            backend_utils,
+            '_query_cluster_status_via_cloud_api',
+            side_effect=[
+                {},
+                AssertionError('re-read cluster status after cancellation'),
+            ]) as query_status, \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils.context_utils,
+                           'sleep_with_cancellation',
+                           side_effect=asyncio.CancelledError()) as sleep, \
+         mock.patch.object(
+             backend_utils.time,
+             'sleep',
+             side_effect=AssertionError(
+                 'used raw sleep instead of cancelable wait')):
+        with pytest.raises(asyncio.CancelledError):
+            backend_utils._update_cluster_status('test-cluster',
+                                                 record,
+                                                 retry_if_missing=False)
+
+    query_status.assert_called_once_with(handle,
+                                         retry_if_missing=False,
+                                         get_ray_config=mock.ANY)
+    sleep.assert_called_once_with(backend_utils._LAUNCH_DOUBLE_CHECK_DELAY)
 
 
 def test_external_failures_return_record_without_reread():

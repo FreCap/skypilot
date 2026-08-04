@@ -111,6 +111,7 @@ def optimize(
 @usage_lib.entrypoint
 def status(
     cluster_names: str | list[str] | None = None,
+    workspaces_filter: list[str] | None = None,
     refresh: common.StatusRefreshMode = common.StatusRefreshMode.NONE,
     all_users: bool = False,
     include_credentials: bool = False,
@@ -181,6 +182,8 @@ def status(
     Args:
         cluster_names: a list of cluster names to query. If not
             provided, all clusters will be queried.
+        workspaces_filter: if provided, only clusters in these workspaces
+            will be queried.
         refresh: whether to query the latest cluster statuses from the cloud
             provider(s).
         include_credentials: whether to fetch ssh credentials for cluster
@@ -194,6 +197,7 @@ def status(
     clusters = backend_utils.get_clusters(
         refresh=refresh,
         cluster_names=cluster_names,
+        workspaces_filter=workspaces_filter,
         all_users=all_users,
         include_credentials=include_credentials,
         summary_response=summary_response,
@@ -904,11 +908,18 @@ def _graceful_job_cancel(handle: backends.ResourceHandle,
         logger.debug(f'All MOUNT_CACHED uploads completed on {cluster_name!r}')
 
 
-def user_initiated_down(cluster_name: str,
-                        purge: bool = False,
-                        graceful: bool = False,
-                        graceful_timeout: int | None = None) -> None:
-    down(cluster_name, purge, graceful, graceful_timeout, user_initiated=True)
+def user_initiated_down(
+        cluster_name: str,
+        purge: bool = False,
+        graceful: bool = False,
+        graceful_timeout: int | None = None,
+        _expected_cluster_record_uuid: str | None = None) -> None:
+    down(cluster_name,
+         purge,
+         graceful,
+         graceful_timeout,
+         user_initiated=True,
+         _expected_cluster_record_uuid=_expected_cluster_record_uuid)
 
 
 @usage_lib.entrypoint
@@ -916,7 +927,8 @@ def down(cluster_name: str,
          purge: bool = False,
          graceful: bool = False,
          graceful_timeout: int | None = None,
-         user_initiated: bool = False) -> None:
+         user_initiated: bool = False,
+         _expected_cluster_record_uuid: str | None = None) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Tears down a cluster.
 
@@ -944,7 +956,12 @@ def down(cluster_name: str,
         sky.exceptions.NotSupportedError: the specified cluster is the managed
           jobs controller.
     """
-    handle = global_user_state.get_handle_from_cluster_name(cluster_name)
+    if _expected_cluster_record_uuid is None:
+        handle = global_user_state.get_handle_from_cluster_name(cluster_name)
+    else:
+        snapshot = global_user_state.get_cluster_record_identity_snapshot(
+            cluster_name, _expected_cluster_record_uuid)
+        handle = None if snapshot is None else snapshot.handle
     if handle is None:
         raise exceptions.ClusterDoesNotExist(
             f'Cluster {cluster_name!r} does not exist.')
@@ -968,7 +985,11 @@ def down(cluster_name: str,
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
     _maybe_run_down_hooks(handle, backend, cluster_name)
-    backend.teardown(handle, terminate=True, purge=purge)
+    teardown_kwargs: dict[str, Any] = {}
+    if _expected_cluster_record_uuid is not None:
+        teardown_kwargs['expected_cluster_record_uuid'] = (
+            _expected_cluster_record_uuid)
+    backend.teardown(handle, terminate=True, purge=purge, **teardown_kwargs)
 
 
 def _maybe_run_teardown_hooks(handle: 'backends.ResourceHandle',
@@ -1276,13 +1297,7 @@ def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
                     'user_hash': job_info.username,
                 }
                 jobs.append(job_dict)
-            user_ids = {job['user_hash'] for job in jobs if job['user_hash']}
-            users = (global_user_state.get_users(user_ids) if user_ids else {})
-            for job_dict in jobs:
-                # Match job_lib.load_job_queue() for missing/legacy users.
-                user = users.get(job_dict['user_hash'])
-                job_dict['username'] = user.name if user is not None else None
-            return jobs
+            return job_lib.resolve_job_queue_users(jobs)
         except exceptions.SKYLET_GRPC_FALLBACK_ERRORS as e:
             logger.debug(f'gRPC failed, falling back to SSH: {e}')
 

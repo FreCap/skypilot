@@ -39,11 +39,13 @@ jobs:
       run: |
         source ~/test-env/bin/activate
         yapf --diff --recursive ./ --exclude 'sky/skylet/ray_patches/**' \
+            --exclude 'infra/terraform/modules/skypilot-control-plane/scripts/seed_config.py' \
             --exclude 'sky/schemas/generated/**' \
             --exclude 'tests/unit_tests/test_sky/backends/testdata/**'
     - name: Running isort for yapf formatted files
       run: |
         source ~/test-env/bin/activate
         isort --diff --check ./ --sg 'sky/skylet/ray_patches/**' \
+            --sg 'infra/terraform/modules/skypilot-control-plane/scripts/seed_config.py' \
             --sg 'sky/schemas/generated/**' \
             --sg 'tests/unit_tests/test_sky/backends/testdata/**'

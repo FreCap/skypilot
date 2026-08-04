@@ -473,79 +473,15 @@ export async function getPoolStatus({
       return { pools: [], controllerStopped: false };
     }
 
-    if (!includeJobCounts) {
-      return {
-        pools: poolData.map((pool) => ({ ...pool, jobCounts: {} })),
-        controllerStopped: false,
-      };
-    }
-
-    const hasBackendJobCounts = poolData.every((pool) =>
-      Object.prototype.hasOwnProperty.call(pool, 'job_status_counts')
-    );
-    if (hasBackendJobCounts) {
-      return {
-        pools: poolData.map((pool) => ({
-          ...pool,
-          jobCounts:
-            pool.job_status_counts &&
-            typeof pool.job_status_counts === 'object' &&
-            !Array.isArray(pool.job_status_counts)
-              ? pool.job_status_counts
-              : {},
-        })),
-        controllerStopped: false,
-      };
-    }
-
-    // Also fetch managed jobs to get job counts by pool
-    let jobsData = { jobs: [] };
-    try {
-      const jobsResponse = await dashboardCache.get(getManagedJobs, [
-        {
-          allUsers: true,
-          skipFinished: true,
-          fields: ['pool', 'status'],
-        },
-      ]);
-      if (!jobsResponse.controllerStopped) {
-        jobsData = jobsResponse;
-      }
-    } catch (jobsError) {
-      console.warn('Failed to fetch jobs for pool job counts:', jobsError);
-    }
-
-    // Process job counts by pool and status
-    const jobCountsByPool = {};
-    const terminalStatuses = [
-      'SUCCEEDED',
-      'FAILED',
-      'FAILED_SETUP',
-      'FAILED_PRECHECKS',
-      'FAILED_NO_RESOURCE',
-      'FAILED_CONTROLLER',
-      'CANCELLED',
-    ];
-
-    if (jobsData.jobs && Array.isArray(jobsData.jobs)) {
-      jobsData.jobs.forEach((job) => {
-        const poolName = job.pool;
-        const status = job.status;
-
-        if (poolName && !terminalStatuses.includes(status)) {
-          if (!jobCountsByPool[poolName]) {
-            jobCountsByPool[poolName] = {};
-          }
-          jobCountsByPool[poolName][status] =
-            (jobCountsByPool[poolName][status] || 0) + 1;
-        }
-      });
-    }
-
-    // Add job counts to each pool
     const pools = poolData.map((pool) => ({
       ...pool,
-      jobCounts: jobCountsByPool[pool.name] || {},
+      jobCounts:
+        includeJobCounts &&
+        pool.job_status_counts &&
+        typeof pool.job_status_counts === 'object' &&
+        !Array.isArray(pool.job_status_counts)
+          ? pool.job_status_counts
+          : {},
     }));
 
     return { pools, controllerStopped: false };
@@ -614,10 +550,34 @@ export function useSingleManagedJob(jobId) {
   const requestVersionRef = useRef(0);
   const activeJobIdRef = useRef(jobId);
   const refreshInFlightRef = useRef(null);
+  const visibleJobDataRef = useRef(null);
+
+  useEffect(() => {
+    visibleJobDataRef.current = jobData;
+  }, [jobData]);
 
   const fetchJobData = useCallback(
-    async ({ forceRefresh = false } = {}) => {
+    async ({
+      forceRefresh = false,
+      source = 'refresh',
+      supersede = false,
+    } = {}) => {
       if (!jobId) return;
+      const inFlight = refreshInFlightRef.current;
+      const hasVisibleCurrentJobData = Boolean(
+        visibleJobDataRef.current?.jobs?.some(
+          (job) => String(job.id) === String(jobId)
+        )
+      );
+      const shouldReuseInFlight =
+        inFlight?.jobId === jobId &&
+        (!supersede ||
+          !hasVisibleCurrentJobData ||
+          inFlight.source === 'manual');
+      if (shouldReuseInFlight) {
+        return inFlight.promise;
+      }
+
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
       const isCurrentRequest = () =>
@@ -671,17 +631,20 @@ export function useSingleManagedJob(jobId) {
   );
 
   const refreshJobData = useCallback(() => {
-    const inFlight = refreshInFlightRef.current;
-    if (inFlight?.jobId === jobId) {
-      return inFlight.promise;
-    }
-
-    const refreshPromise = fetchJobData({ forceRefresh: true }).finally(() => {
+    const refreshPromise = fetchJobData({
+      forceRefresh: true,
+      source: 'manual',
+      supersede: true,
+    }).finally(() => {
       if (refreshInFlightRef.current?.promise === refreshPromise) {
         refreshInFlightRef.current = null;
       }
     });
-    refreshInFlightRef.current = { jobId, promise: refreshPromise };
+    refreshInFlightRef.current = {
+      jobId,
+      promise: refreshPromise,
+      source: 'manual',
+    };
     return refreshPromise;
   }, [fetchJobData, jobId]);
 
@@ -690,7 +653,18 @@ export function useSingleManagedJob(jobId) {
       activeJobIdRef.current = jobId;
       setJobData(null);
     }
-    fetchJobData();
+    const loadPromise = fetchJobData({
+      source: 'initial',
+    }).finally(() => {
+      if (refreshInFlightRef.current?.promise === loadPromise) {
+        refreshInFlightRef.current = null;
+      }
+    });
+    refreshInFlightRef.current = {
+      jobId,
+      promise: loadPromise,
+      source: 'initial',
+    };
     return () => {
       requestVersionRef.current += 1;
       if (refreshInFlightRef.current?.jobId === jobId) {

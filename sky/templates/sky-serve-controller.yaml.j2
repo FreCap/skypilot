@@ -100,5 +100,5 @@ run: |
 
 envs:
 {%- for env_name, env_value in controller_envs.items() %}
-  {{env_name}}: {{env_value}}
+  {{env_name}}: {{env_value | tojson}}
 {%- endfor %}

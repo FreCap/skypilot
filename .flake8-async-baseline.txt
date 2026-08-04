@@ -1,12 +1,9 @@
 sky/client/interactive_utils.py:86:30: ASYNC231 Sync call os.fdopen in async function,  use a library such as aiofiles or anyio.
 sky/client/interactive_utils.py:92:31: ASYNC231 Sync call os.fdopen in async function,  use a library such as aiofiles or anyio.
 sky/client/interactive_utils.py:108:24: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/controller.py:1680:13: ASYNC120 checkpoint inside except on line 1678 will discard the active exception if cancelled.
-sky/jobs/controller.py:1847:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/controller.py:1898:13: ASYNC120 checkpoint inside except on line 1896 will discard the active exception if cancelled.
-sky/jobs/controller.py:1899:13: ASYNC120 checkpoint inside except on line 1896 will discard the active exception if cancelled.
-sky/jobs/controller.py:1958:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/server/requests/executor.py:1150:9: ASYNC120 checkpoint inside except on line 1145 will discard the active exception if cancelled.
+sky/jobs/controller.py:1900:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/jobs/controller.py:2018:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/server/requests/executor.py:1329:9: ASYNC120 checkpoint inside except on line 1324 will discard the active exception if cancelled.
 sky/server/requests/process.py:110:12: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
 sky/server/requests/threads.py:54:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/ssh_proxy.py:425:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.

@@ -2,7 +2,7 @@
 
 _Created: 2026-07-22_
 _Expanded: 2026-07-23_
-_Last updated: 2026-07-24_
+_Last updated: 2026-08-01_
 
 ## Status
 
@@ -56,6 +56,11 @@ bounds with no unattributable unresolved row; the API, service controller, and
 both load-balancer slots were healthy. A natural `boltz-l4-fleet` scale-up wave
 had not occurred at that snapshot. Later 1.1.789 evidence below records a
 natural bounded wave and typed provider-capacity failure.
+
+The 2026-08-01 follow-up adds a delayed, target-backed third-region
+exploration step without widening the 16-claim service envelope. It is not yet
+production-validated. Its rollout begins with the maximum held at two, then
+canaries three for one isolated service before broader activation.
 
 This follow-up shortens the terminal provider-feedback path without changing
 admission bounds or durable state. A launch worker that receives a typed,
@@ -210,9 +215,12 @@ zone. It is nested inside two complementary breadth controls. First, a service
 may hold at most 16 unresolved paid claims across every exact pool and
 accelerator shape. Second, each service and exact accelerator card may own at
 most two unresolved paid pools by default: a primary plus one hedge. Once both
-frontier slots are owned, additional demand for that card waits for provider
-feedback instead of opening a third pool. Different cards have independent
-frontiers but share the same 16-claim service envelope.
+frontier slots are owned, additional demand for that card normally waits for
+provider feedback. If every owned pool lacks headroom and each has remained
+unresolved for a bounded delay, one reconciliation wave may open a third pool
+in a new provider-region failure domain. The default maximum is three.
+Different cards have independent frontiers but share the same 16-claim service
+envelope.
 
 The three controls compose without replacing one another. The exact-pool
 authority limits global unresolved depth across services and retains its
@@ -259,6 +267,13 @@ The authority does not launch disposable probe machines, reserve provider
 capacity, predict future provider inventory, migrate READY replicas between
 regions, change accelerator compatibility allocation, or replace the spot
 placer's cost ordering and bench semantics.
+
+Delayed frontier expansion does not increase the autoscaler's target and does
+not persist speculative capacity beyond current demand. Every claim, including
+one in the third pool, is backed by existing target shortfall and remains
+inside the service-wide unresolved-claim envelope. Probabilistic target
+overshoot and early retirement of excess successful machines require a
+separate design and rollout.
 
 It also does not serialize the whole fleet, add arbitrary sleeps between
 healthy independent launches, cancel requests that may already be mutating a
@@ -582,6 +597,13 @@ The positive-integer environment variable
 `SKYPILOT_SERVE_PAID_LOCATION_EXPLORATION_FRONTIER` controls the width and
 defaults to two. Invalid or non-positive values fall back to two.
 
+Two additional positive-integer settings bound delayed expansion. The
+`SKYPILOT_SERVE_PAID_LOCATION_MAX_EXPLORATION_FRONTIER` default is three and
+is clamped to at least the normal frontier. Setting it equal to the normal
+frontier disables expansion. The
+`SKYPILOT_SERVE_PAID_LOCATION_EXPLORATION_FEEDBACK_DELAY_SECONDS` default is
+30 seconds. Invalid or non-positive values fall back to those defaults.
+
 The frontier is reconstructed from every durable, valid PENDING and
 PROVISIONING claim owned by the current service incarnation, including a pool
 that disappeared from a refreshed catalog or was benched in one process. A
@@ -609,21 +631,45 @@ compatible with the current exact-card batch:
 1. If the configured service envelope (16 by default) is exhausted, the batch
    stops fresh paid selection regardless of card or pool headroom.
 2. If fewer pools than the configured frontier (two by default) are open for
-   the card, normal cheapest-first selection may open another pool.
+   the card, normal cheapest-first selection may open another pool. When an
+   owned pool already exists, selection prefers an unowned pool in a new
+   provider-region failure domain when one is available, then preserves the
+   existing same-domain fallback.
 3. Once the configured frontier is full, selection is restricted to its owned
    pools while any has headroom.
-4. If every owned frontier pool is at its admission limit, the batch stops and
-   leaves the remaining paid target as autoscaler shortfall. It does not
-   persist more fresh paid PENDING rows elsewhere.
-5. A completed launch releases only its own claim. Success keeps the location
+4. If every owned frontier pool is at its admission limit, the budget may
+   expand that card's effective frontier by one, up to the configured maximum,
+   only after every unresolved claim in every owned pool has aged past the
+   feedback delay and an active unowned candidate exists in a provider-region
+   not already represented by the owned pools. Unknown pool identity or claim
+   age fails closed. One budget may expand a card at most once.
+5. If delayed expansion is ineligible, the batch stops and leaves the
+   remaining paid target as autoscaler shortfall. It does not persist more
+   fresh paid PENDING rows elsewhere.
+6. A completed launch releases only its own claim. Success keeps the location
    active and lets the normal 4, 8, 16 ramp deepen it on the next
    reconciliation tick, subject to the service envelope. A durably persisted
    typed failure closes admission to the pool, but unresolved siblings may
    already be mutating the provider and continue consuming the same frontier
    slot. The slot frees only after the last sibling receives a durable outcome
    or is authoritatively removed.
-6. A pool filled entirely by other services is not owned by this service and
+7. A pool filled entirely by other services is not owned by this service and
    may be skipped.
+
+The failure-domain key is the case-folded cloud name plus region. Zone and
+instance type remain part of the exact pool key but do not make two candidates
+regionally independent. Pool keys outside the active catalog still contribute
+their parsed failure domains. Any unknown or malformed owned pool prevents
+delayed expansion for that card because the controller cannot prove that a
+candidate is independent.
+
+Claim age is advisory pacing, not a lease. The selection snapshot reconstructs
+the newest unresolved creation time for each owned exact pool and expands only
+when the youngest unresolved claim across the entire owned cohort has also
+waited the configured delay. Controller wall-clock skew can delay or
+accelerate the advisory choice, but it cannot break an admission bound: the
+service-row-locked claim transaction re-reads current ownership and atomically
+enforces the candidate card's effective frontier before touching the pool row.
 
 Here, “batch stops” applies only to fresh paid admission. It is not a
 control-flow break for the whole scaling pass. The physical placement loop
@@ -654,13 +700,15 @@ snapshot.
 The snapshot is not the concurrency authority. Every claim transaction first
 locks and validates the current service-incarnation row, then re-reads all
 valid unresolved claims for both the service envelope and the candidate's
-canonical card. If the candidate pool is not already owned and the re-read
-finds the configured frontier full, the transaction withdraws now-ineligible
-waiters across every card frontier and returns `feedback_pending` without
-inserting a waiter, replica, or claim and without locking any pool row. Only
-after envelope and frontier eligibility are proven does it lock and evaluate
-the candidate pool row. This serializes overlapping batches and old/new
-controller handoff even when they select different pool rows.
+canonical card. The caller passes the base frontier plus the candidate card's
+effective delayed-expansion limit. If the candidate pool is not already owned
+and the re-read finds that effective frontier full, the transaction withdraws
+now-ineligible waiters across every card frontier and returns
+`feedback_pending` without inserting a waiter, replica, or claim and without
+locking any pool row. Only after envelope and frontier eligibility are proven
+does it lock and evaluate the candidate pool row. This serializes overlapping
+batches and old/new controller handoff even when they select different pool
+rows, so two stale snapshots cannot open both a third and fourth pool.
 
 Priority waiter insertion happens after frontier eligibility is proven. A
 service may leave a waiter on a saturated pool while it still has a frontier
@@ -733,8 +781,10 @@ and bounded exploration frontier is durably pinned. The existing global worker
 ceiling still limits how many accepted rows can enter provider execution, but
 it is no longer the first place an oversized wave is bounded. No schema
 migration is required because service identity, pool ownership, card identity
-inside the versioned pool key, and claim age are already durable in
-`paid_capacity_claims`.
+inside the versioned pool key, provider-region identity, and claim age are
+already durable in `paid_capacity_claims`. A restart reconstructs an existing
+three-pool cohort from its claims. It may continue using those owned pools, but
+cannot open a fourth when the configured maximum is three.
 
 Kubernetes zero-cost placement is deliberately separate. With a healthy
 capacity observation it already uses measured free GPUs, distinguishing a
@@ -1172,10 +1222,11 @@ capacity without deriving either durable claim envelope from it.
 | A typed failure creates a sticky negative epoch, permits one marked global probe after cooldown, and only that probe's success clears failure and reopens four slots | Pure policy and PostgreSQL concurrency tests |
 | Claim and outcome ordering use post-lock PostgreSQL `clock_timestamp()`; claimed_at is immutable; adopted claims use zero and cannot clear negative evidence | PostgreSQL ordering, adoption, clock-skew, and lock-wait regression tests |
 | A saturated pool spills regardless of waiter order; with real headroom the higher-priority waiter gets the next claim; no existing claim is revoked; one deferred physical wave performs one central claim and selection attempt without paid spill | PostgreSQL priority arbitration and large-wave replica-manager tests |
-| The default exploration frontier is two; invalid overrides fall back; one service/card cannot open a third pool while its first two own unresolved claims, but a pool saturated solely by another service may be skipped | Pure selection, configuration, and real-PostgreSQL ownership tests |
+| The normal exploration frontier is two, the delayed maximum is three, and invalid overrides fall back; before the feedback delay one service/card cannot open a third pool, after the delay it may atomically open one new provider-region while remaining inside the service envelope, and setting maximum equal to normal disables expansion | Pure selection, configuration, restart, clock-age, and real-PostgreSQL ownership/race tests |
+| Opening a second or delayed third pool prefers a provider-region not already represented by owned exact pools; same-domain fallback remains available before the normal frontier fills, while malformed owned identity prevents delayed expansion | Pure failure-domain selection and malformed-key tests |
 | Two overlapping claims for one service/card race on different candidates with one slot left; the service-row lock admits exactly one, the other returns `feedback_pending`, and neither a replica nor waiter leaks | Real-PostgreSQL concurrency test |
 | Service/frontier exhaustion suppresses only fresh paid admission: physical waves continue zero-cost reserved demand/fill and durable recovery-pinned cost-rebalance until a full pass makes no progress, while fresh cost replacements remain subject to paid admission and logical card loops continue zero-cost placement | Physical regressions with an envelope-blocked paid-only override ordered before later reserved fill, fresh rebalance admission-denial tests, durable replacement recovery tests, paid frontier and priority deferral followed by later real fill, exhausted-envelope zero-cost demand, initial service-envelope exhaustion and pre-existing frontier/priority stops across a 400-entry wave, plus logical exact-card zero-cost progress tests |
-| A frontier rejection reconciles every waiter/card under only the service lock before any pool lock; unknown or malformed owned keys count against every card and withdraw ineligible waiters across every affected frontier | Real-PostgreSQL waiter/frontier and malformed-key tests |
+| A frontier rejection reconciles every waiter/card under only the service lock before any pool lock, using each card's effective limit; an expanded L4 frontier does not widen A100, and unknown or malformed owned keys still count against every card | Real-PostgreSQL waiter/frontier, per-card-limit, and malformed-key tests |
 | A frontier- or envelope-filling acquisition commits first and cleans in a separate service-row-only transaction; cleanup failure still returns `ACQUIRED` and the stale waiter expires within the 45-second TTL | Real-PostgreSQL lock-order, failure-injection, and TTL tests |
 | A high-priority service waits on saturated A, then fills its frontier on B/C; its waiter on A is withdrawn after commit so a lower-priority service can acquire released A headroom without waiting for TTL | Real-PostgreSQL waiter/frontier interaction test |
 | Same-service saturation leaves target shortfall instead of persisting more PENDING rows; success deepens an existing frontier pool; typed failure closes it but cannot free its slot until every unresolved sibling drains; no existing claim is revoked | Physical/logical large-wave and outcome-transition tests |
@@ -1213,15 +1264,24 @@ count never exceeds four, a higher-priority waiter receives the next released
 claim, a pool saturated solely by the peer may be skipped, and no READY replica
 is preempted.
 
+For one service/card, hold two exact pools unresolved with no remaining
+headroom. Before 30 seconds, confirm the controller leaves paid target as
+shortfall. After 30 seconds, confirm it opens at most one third pool, chooses a
+new provider-region when available, remains at or below 16 service claims, and
+does not increase the autoscaler target. Restart the controller with three
+unresolved pools and confirm it reuses those pools without opening a fourth.
+
 For one exact card with at least three eligible paid pools, request 400
 replicas. Before provider feedback, confirm at most two pools and eight claims
 are pinned. Complete the primary cohort successfully and confirm the next
 cohort deepens that pool. Fail the hedge with a typed capacity error and
-confirm no third pool enters while the failed pool has unresolved siblings.
-After their durable outcomes drain the last claims, confirm the next cheapest
-pool enters. Repeat with two accelerator cards and confirm each card can
-maintain its own two-pool frontier while both share the 16-claim service
-envelope.
+confirm the failed pool continues owning its frontier slot while its siblings
+remain unresolved. Once every sibling has aged past the feedback delay,
+confirm at most one distinct-region third pool may enter and no fourth pool can
+enter. After the failed siblings' durable outcomes drain their last claims,
+confirm normal ownership reconstruction reflects the remaining pools. Repeat
+with two accelerator cards and confirm each card can maintain its own frontier
+while both share the 16-claim service envelope.
 
 For a shape with several exact instance types in one zone, confirm each type
 retains independent four-claim depth and durable ramp/failure evidence, while
@@ -1355,6 +1415,15 @@ values. A new controller immediately honors a recent persisted
 `last_failure_at`; this is intentional and prevents rollout-triggered retry
 storms.
 
+The delayed expansion follow-up is also schema-free. Roll it out first with
+`SKYPILOT_SERVE_PAID_LOCATION_MAX_EXPLORATION_FRONTIER` equal to the normal
+frontier, which preserves the existing two-pool behavior while publishing the
+new configuration and observability. Then canary the default maximum of three
+for `boltz-l4-fleet` or an isolated test controller. Do not enable target
+overshoot in this rollout. A rollback sets the maximum back to two or restores
+the prior image; existing third-pool claims are never revoked and continue to
+block a fresh fourth pool until their normal outcomes drain them.
+
 During earlier mixed-version windows, pre-PR-#909 revision-027 controllers did
 not honor the four-wide cooldown policy, service envelope, or frontier.
 v1.1.759/v1.1.760 controllers honored adaptive depth and sticky cooldown but
@@ -1377,12 +1446,14 @@ gain cross-service cooldown, service-envelope, or frontier authority.
 
 Monitor learned pool limit, effective admission limit, cooldown/probe state,
 active and service-owned claims, frontier width, feedback deferrals, oldest
-unresolved claim age, stale reconciliation, admission denials, priority
-deferrals, post-commit waiter-cleanup failures and TTL expiry, recovery
-pool-mismatch rejections, zero-cost and durable recovery-pinned rebalance
-progress during paid deferral, success ramps, failure resets, placement spread,
-API request queue depth, provider capacity errors, typed-outcome-to-pool-close
-latency, pending teardown duration, and launch latency.
+unresolved claim age, delayed-expansion decisions, effective and maximum
+frontier limits, represented provider-regions, stale reconciliation, admission
+denials, priority deferrals, post-commit waiter-cleanup failures and TTL expiry,
+recovery pool-mismatch rejections, zero-cost and durable recovery-pinned
+rebalance progress during paid deferral, success ramps, failure resets,
+placement spread, API request queue depth, provider capacity errors,
+typed-outcome-to-pool-close latency, pending teardown duration, and launch
+latency.
 
 Rollback is an image rollback. Existing pool, claim, waiter, success, and
 failure rows remain schema-compatible with revision 027. From current release

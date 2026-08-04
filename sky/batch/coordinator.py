@@ -43,6 +43,49 @@ from sky.server import constants as server_constants
 from sky.skylet import constants as skylet_constants
 
 logger = logging.getLogger(__name__)
+_process_cpu_count = getattr(os, 'process_cpu_count', os.cpu_count)
+_SUPERSEDED_CLEANUP_MAX_CONCURRENCY = max(
+    1, min(32, (_process_cpu_count() or 1) + 4))
+
+
+async def _run_bounded_async(items: list[Any], *, func) -> list[Any]:
+    """Run ``func(item)`` with bounded coroutine fanout.
+
+    ``handle_superseded()`` delegates sync SDK calls to ``asyncio.to_thread()``,
+    whose default executor already caps true parallelism. Matching that width
+    avoids queuing one cleanup coroutine per worker record while preserving the
+    throughput ceiling of the underlying thread pool.
+    """
+    if not items:
+        return []
+
+    work_queue: asyncio.Queue[tuple[int, Any]] = asyncio.Queue()
+    for index, item in enumerate(items):
+        work_queue.put_nowait((index, item))
+
+    results: list[Any] = [None] * len(items)
+    worker_count = min(_SUPERSEDED_CLEANUP_MAX_CONCURRENCY, len(items))
+
+    async def _worker() -> None:
+        while True:
+            try:
+                index, item = work_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                results[index] = await func(item)
+            finally:
+                work_queue.task_done()
+
+    workers = [asyncio.create_task(_worker()) for _ in range(worker_count)]
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    return results
 
 
 class SupersededCoordinator(RuntimeError):
@@ -99,7 +142,10 @@ class BatchCoordinator:
 
         # Worker tracking: cluster_name → worker_job_id
         self._active_workers: dict[str, int] = {}
+        self._launching_workers: set[str] = set()
+        self._cleaning_workers: set[tuple[str, int]] = set()
         self._active_workers_lock = threading.Lock()
+        self._worker_state_changed = threading.Event()
 
         # Cancellation flag for inline (controller) mode.
         self._cancelled = False
@@ -184,11 +230,31 @@ class BatchCoordinator:
         then shuts down any active worker services.
         """
         workers_snapshot = self._begin_cleanup()
+        shutdown_threads = []
         for cluster_name, worker_job_id in workers_snapshot:
             try:
-                self._shutdown_worker(cluster_name, worker_job_id)
-            except Exception:  # pylint: disable=broad-except
-                logger.warning(f'Failed to shutdown worker on {cluster_name}')
+                thread_ctx = contextvars.copy_context()
+                shutdown_thread = threading.Thread(target=thread_ctx.run,
+                                                   args=(self._cancel_worker,
+                                                         cluster_name,
+                                                         worker_job_id))
+                shutdown_thread.start()
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to start shutdown thread for %s; shutting down '
+                    'synchronously: %s', cluster_name, e)
+                self._cancel_worker(cluster_name, worker_job_id)
+            else:
+                shutdown_threads.append(shutdown_thread)
+        for shutdown_thread in shutdown_threads:
+            shutdown_thread.join()
+
+    def _cancel_worker(self, cluster_name: str, worker_job_id: int) -> None:
+        """Shut down one owned worker without aborting sibling cleanup."""
+        try:
+            self._shutdown_worker(cluster_name, worker_job_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(f'Failed to shutdown worker on {cluster_name}')
 
     def _begin_cleanup(self, superseded: bool = False) -> list[tuple[str, int]]:
         """Atomically assign cleanup ownership for tracked workers."""
@@ -201,16 +267,72 @@ class BatchCoordinator:
                 # Normal cancellation owns these workers synchronously.  A
                 # worker finalizer can only clean a later registration.
                 self._active_workers.clear()
+            self._worker_state_changed.set()
         return workers_snapshot
 
-    def _claim_worker_cleanup(self, cluster_name: str,
-                              worker_job_id: int) -> bool:
+    def _claim_worker_cleanup(self,
+                              cluster_name: str,
+                              worker_job_id: int,
+                              allow_superseded_cleanup: bool = False) -> bool:
         """Claim one worker and return whether local shutdown is allowed."""
         with self._active_workers_lock:
             if self._active_workers.get(cluster_name) != worker_job_id:
                 return False
             self._active_workers.pop(cluster_name)
-            return not self._superseded_cleanup_started
+            cleanup_allowed = (allow_superseded_cleanup or
+                               not self._superseded_cleanup_started)
+            if cleanup_allowed:
+                self._cleaning_workers.add((cluster_name, worker_job_id))
+            self._worker_state_changed.set()
+            return cleanup_allowed
+
+    def _finish_worker_cleanup(self, cluster_name: str,
+                               worker_job_id: int) -> None:
+        """Mark an externally owned worker shutdown as settled."""
+        with self._active_workers_lock:
+            self._cleaning_workers.discard((cluster_name, worker_job_id))
+            self._worker_state_changed.set()
+
+    def _retire_active_worker(self, cluster_name: str,
+                              worker_job_id: int) -> bool:
+        """Forget one active worker only if the exact snapshot still matches."""
+        with self._active_workers_lock:
+            if self._active_workers.get(cluster_name) != worker_job_id:
+                return False
+            self._active_workers.pop(cluster_name)
+            self._worker_state_changed.set()
+            return True
+
+    def _mark_worker_launch_started(self, cluster_name: str) -> None:
+        """Track a worker launch that has not published its job ID yet."""
+        with self._active_workers_lock:
+            self._launching_workers.add(cluster_name)
+            self._worker_state_changed.set()
+
+    def _mark_worker_launch_failed(self, cluster_name: str) -> None:
+        """Forget a launch that failed before a worker job ID existed."""
+        with self._active_workers_lock:
+            self._launching_workers.discard(cluster_name)
+            self._worker_state_changed.set()
+
+    def _register_active_worker(self, cluster_name: str,
+                                worker_job_id: int) -> bool:
+        """Publish a launched worker and return whether supersession is live."""
+        with self._active_workers_lock:
+            self._launching_workers.discard(cluster_name)
+            self._active_workers[cluster_name] = worker_job_id
+            late_superseded_launch = self._superseded_cleanup_started
+            self._worker_state_changed.set()
+            return late_superseded_launch
+
+    def _pending_worker_cleanup_snapshot(
+            self) -> tuple[list[str], list[str], list[str]]:
+        """Return sorted pending worker states for diagnostics."""
+        with self._active_workers_lock:
+            return (sorted(self._active_workers),
+                    sorted(self._launching_workers),
+                    sorted(f'{name}:{job_id}'
+                           for name, job_id in self._cleaning_workers))
 
     async def handle_superseded(self, timeout: float = 60) -> None:
         """Bound cleanup of only this superseded incarnation's workers.
@@ -266,9 +388,11 @@ class BatchCoordinator:
                     worker_token,
                     cluster_name,
                     worker_job_id=worker_job_id)
+                self._retire_active_worker(cluster_name, worker_job_id)
             return within_deadline
 
-        for cluster_name, worker_job_id in workers_snapshot:
+        async def _cleanup_active_worker(worker: tuple[str, int]) -> bool:
+            cluster_name, worker_job_id = worker
             shutdown_code = self._generate_shutdown_code()
             shutdown_task = sky.Task(
                 name=(f'batch-shutdown-{self._managed_job_id}-'
@@ -280,98 +404,151 @@ class BatchCoordinator:
                 shutdown_task,
                 cluster_name=cluster_name)
             if not within_deadline:
-                return
+                return False
             if succeeded:
                 within_deadline, _, _ = await _run_call('shutdown completion',
                                                         sdk.get, request_id)
                 if not within_deadline:
-                    return
-            if not await _cancel_exact(cluster_name, worker_job_id,
-                                       self._worker_token):
-                return
+                    return False
+            return await _cancel_exact(cluster_name, worker_job_id,
+                                       self._worker_token)
+
+        active_cleanup_results = await _run_bounded_async(
+            workers_snapshot, func=_cleanup_active_worker)
+        if not all(active_cleanup_results):
+            return
+
+        queue_snapshot_tasks: dict[str,
+                                   asyncio.Task[tuple[bool, bool,
+                                                      list[Any] | None]]] = {}
+
+        async def _get_queue_snapshot(
+                cluster_name: str) -> tuple[bool, bool, list[Any] | None]:
+            snapshot_task = queue_snapshot_tasks.get(cluster_name)
+            if snapshot_task is None:
+
+                async def _fetch_queue_snapshot(
+                ) -> tuple[bool, bool, list[Any] | None]:
+                    within_deadline, succeeded, queue_request_id = (
+                        await _run_call('worker queue request',
+                                        sdk.queue,
+                                        cluster_name,
+                                        skip_finished=True))
+                    if not within_deadline:
+                        return False, False, None
+                    if not succeeded:
+                        return True, False, None
+                    within_deadline, succeeded, queued_jobs = await _run_call(
+                        'worker queue result', sdk.get, queue_request_id)
+                    return within_deadline, succeeded, queued_jobs
+
+                snapshot_task = asyncio.create_task(_fetch_queue_snapshot())
+                queue_snapshot_tasks[cluster_name] = snapshot_task
+            return await snapshot_task
+
+        async def _resolve_durable_worker_job_id(
+                record: dict[str, Any]) -> tuple[bool, int | None]:
+            """Resolve one durable worker record under the shared deadline."""
+            worker_job_id = record.get('worker_job_id')
+            if worker_job_id is None and record.get('launch_request_id'):
+                within_deadline, succeeded, result = await _run_call(
+                    'launch request recovery', sdk.get,
+                    record['launch_request_id'])
+                if not within_deadline:
+                    return False, None
+                if succeeded:
+                    if isinstance(result, tuple) and result:
+                        worker_job_id = result[0]
+                    elif isinstance(result, int):
+                        worker_job_id = result
+
+            if worker_job_id is None:
+                cluster_name = record['worker_cluster']
+                within_deadline, succeeded, queued_jobs = (
+                    await _get_queue_snapshot(cluster_name))
+                if not within_deadline:
+                    return False, None
+                if not succeeded:
+                    return True, None
+                if queued_jobs is None:
+                    logger.warning(
+                        'Superseded Batch queue snapshot for %s returned None',
+                        cluster_name)
+                    return True, None
+                try:
+                    matching_ids = self._matching_worker_job_ids(
+                        record, queued_jobs)
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Invalid superseded Batch queue snapshot for %s: %s',
+                        cluster_name, e)
+                    return True, None
+                if len(matching_ids) > 1:
+                    logger.error(
+                        'Refusing ambiguous superseded Batch cleanup for %s: '
+                        'exact IDs %s', record['worker_job_name'], matching_ids)
+                    return True, None
+                if matching_ids:
+                    worker_job_id = matching_ids[0]
+
+            if worker_job_id is None:
+                return True, None
+            worker_job_id = int(worker_job_id)
+            within_deadline, _, _ = await _run_call(
+                'worker job ID persistence',
+                managed_job_state.record_batch_worker_job_id,
+                self._managed_job_id, record['coordinator_token'],
+                record['worker_cluster'], worker_job_id)
+            if not within_deadline:
+                return False, None
+            return True, worker_job_id
 
         within_deadline, succeeded, records = await _run_call(
-            'worker record read', managed_job_state.get_batch_worker_records,
-            self._managed_job_id)
+            'worker record read',
+            managed_job_state.get_batch_worker_records,
+            self._managed_job_id,
+            owner_token=self._worker_token)
         if not within_deadline:
             return
         if succeeded:
-            for record in records:
-                if record['coordinator_token'] != self._worker_token:
-                    continue
-                worker_job_id = record.get('worker_job_id')
-                if worker_job_id is None and record.get('launch_request_id'):
-                    within_deadline, request_succeeded, result = (
-                        await _run_call('launch request recovery', sdk.get,
-                                        record['launch_request_id']))
-                    if not within_deadline:
-                        return
-                    if request_succeeded:
-                        if isinstance(result, tuple) and result:
-                            worker_job_id = result[0]
-                        elif isinstance(result, int):
-                            worker_job_id = result
 
-                if worker_job_id is None:
-                    queued_jobs: list[Any] = []
-                    within_deadline, queue_succeeded, queue_request_id = (
-                        await _run_call('worker queue request',
-                                        sdk.queue,
-                                        record['worker_cluster'],
-                                        skip_finished=True))
-                    if not within_deadline:
-                        return
-                    if queue_succeeded:
-                        within_deadline, queue_succeeded, queued_jobs = (
-                            await _run_call('worker queue result', sdk.get,
-                                            queue_request_id))
-                    if not within_deadline:
-                        return
-                    if queue_succeeded:
-                        matching_ids = []
-                        for queued_job in queued_jobs:
-                            if isinstance(queued_job, dict):
-                                name = queued_job.get('job_name')
-                                queued_job_id = queued_job.get('job_id')
-                            else:
-                                name = queued_job.job_name
-                                queued_job_id = queued_job.job_id
-                            if (name == record['worker_job_name'] and
-                                    queued_job_id is not None):
-                                matching_ids.append(int(queued_job_id))
-                        matching_ids = sorted(set(matching_ids))
-                        if len(matching_ids) == 1:
-                            worker_job_id = matching_ids[0]
-                        elif len(matching_ids) > 1:
-                            logger.error(
-                                'Refusing ambiguous superseded Batch cleanup '
-                                'for %s: exact IDs %s',
-                                record['worker_job_name'], matching_ids)
-
-                if worker_job_id is None:
-                    continue
-                worker_job_id = int(worker_job_id)
-                within_deadline, _, _ = await _run_call(
-                    'worker job ID persistence',
-                    managed_job_state.record_batch_worker_job_id,
-                    self._managed_job_id, record['coordinator_token'],
-                    record['worker_cluster'], worker_job_id)
+            async def _cleanup_durable_worker(record: dict[str, Any]) -> bool:
+                within_deadline, worker_job_id = (
+                    await _resolve_durable_worker_job_id(record))
                 if not within_deadline:
-                    return
-                if not await _cancel_exact(record['worker_cluster'],
+                    return False
+                if worker_job_id is None:
+                    return True
+                worker_job_id = int(worker_job_id)
+                return await _cancel_exact(record['worker_cluster'],
                                            worker_job_id,
-                                           record['coordinator_token']):
-                    return
+                                           record['coordinator_token'])
+
+            durable_cleanup_results = await _run_bounded_async(
+                [
+                    record for record in records
+                    if record['coordinator_token'] == self._worker_token
+                ],
+                func=_cleanup_durable_worker)
+            if not all(durable_cleanup_results):
+                return
 
         while loop.time() < deadline:
             with self._active_workers_lock:
-                if not self._active_workers:
+                if (not self._active_workers and not self._launching_workers and
+                        not self._cleaning_workers):
                     return
-            await asyncio.sleep(min(0.2, max(0, deadline - loop.time())))
-        with self._active_workers_lock:
-            remaining_workers = sorted(self._active_workers)
-        logger.warning('Timed out waiting for superseded Batch workers: %s',
-                       remaining_workers)
+                self._worker_state_changed.clear()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.to_thread(self._worker_state_changed.wait, remaining)
+        remaining_workers, launching_workers, cleaning_workers = (
+            self._pending_worker_cleanup_snapshot())
+        logger.warning(
+            'Timed out waiting for superseded Batch workers: active=%s, '
+            'launching=%s, cleaning=%s', remaining_workers, launching_workers,
+            cleaning_workers)
 
     def mark_succeeded(self, end_time: float) -> None:
         """Durably succeed only if this coordinator still owns the job."""
@@ -930,10 +1107,30 @@ class BatchCoordinator:
     def _generate_shutdown_code(self) -> str:
         """Generate a script that shuts down the worker service."""
         port = constants.WORKER_SERVICE_PORT
+        wait_seconds = constants.WORKER_SHUTDOWN_HEALTH_WAIT_SECONDS
+        poll_interval = constants.WORKER_SHUTDOWN_POLL_INTERVAL_SECONDS
+        poll_attempts = max(1, int(wait_seconds / poll_interval))
         return textwrap.dedent(f"""\
+            shutdown_status=0
             curl -sf --connect-timeout 2 --max-time 5 -X POST \\
                 http://127.0.0.1:{port}/shutdown \\
-                -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' || true
+                -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' \\
+                >/dev/null || shutdown_status=$?
+            if [ "$shutdown_status" -ne 0 ]; then
+                exit 0
+            fi
+            for _ in $(seq 1 {poll_attempts}); do
+                http_code=$(curl -s -o /dev/null -w '%{{http_code}}' \\
+                    --connect-timeout 1 --max-time 1 \\
+                    http://127.0.0.1:{port}/health \\
+                    -H 'X-Sky-Batch-Worker-Token: {self._worker_token}' \\
+                    || true)
+                if [ "$http_code" = "000" ]; then
+                    exit 0
+                fi
+                sleep {poll_interval}
+            done
+            exit 0
             """)
 
     # ------------------------------------------------------------------
@@ -945,10 +1142,14 @@ class BatchCoordinator:
         return (f'batch-worker-{self._managed_job_id}-'
                 f'{worker_token}')
 
-    def _refresh_stale_worker_tokens(self) -> None:
+    def _refresh_stale_worker_tokens(self,
+                                     worker_records: list[dict[str, Any]] |
+                                     None = None) -> None:
         """Load every durable worker generation older than this owner."""
-        for record in managed_job_state.get_batch_worker_records(
-                self._managed_job_id):
+        if worker_records is None:
+            worker_records = managed_job_state.get_batch_worker_records(
+                self._managed_job_id)
+        for record in worker_records:
             token = record['coordinator_token']
             if token != self._worker_token:
                 self._stale_worker_tokens.add(token)
@@ -965,8 +1166,34 @@ class BatchCoordinator:
                                'attempt leases are drained')
         self._cleanup_worker_services_for_token(worker_token, [cluster_name])
 
-    def _resolve_worker_job_id(self, record: dict[str, Any]) -> int | None:
-        """Resolve one launch intent without guessing among duplicate names."""
+    @staticmethod
+    def _matching_worker_job_ids(record: dict[str, Any],
+                                 queued_jobs: list[Any]) -> list[int]:
+        """Return exact queue job IDs matching one durable worker record."""
+        matching_ids = []
+        for queued_job in queued_jobs:
+            if isinstance(queued_job, dict):
+                name = queued_job.get('job_name')
+                queued_job_id = queued_job.get('job_id')
+            else:
+                name = queued_job.job_name
+                queued_job_id = queued_job.job_id
+            if (name == record['worker_job_name'] and
+                    queued_job_id is not None):
+                matching_ids.append(int(queued_job_id))
+        return sorted(set(matching_ids))
+
+    def _resolve_worker_job_id(
+        self,
+        record: dict[str, Any],
+        queue_jobs_by_cluster: dict[str, list[Any]] | None = None
+    ) -> int | None:
+        """Resolve one launch intent without guessing among duplicate names.
+
+        ``queue_jobs_by_cluster`` memoizes one ``sdk.queue`` snapshot per
+        worker cluster so repeated stale generations on the same cluster are
+        judged against one queue view instead of one request per record.
+        """
         worker_job_id = record.get('worker_job_id')
         if worker_job_id is not None:
             return int(worker_job_id)
@@ -984,21 +1211,18 @@ class BatchCoordinator:
                                request_id, e)
 
         if worker_job_id is None:
-            queue_request_id = sdk.queue(record['worker_cluster'],
-                                         skip_finished=True)
-            queued_jobs = sdk.get(queue_request_id)
-            matching_ids = []
-            for queued_job in queued_jobs:
-                if isinstance(queued_job, dict):
-                    name = queued_job.get('job_name')
-                    queued_job_id = queued_job.get('job_id')
-                else:
-                    name = queued_job.job_name
-                    queued_job_id = queued_job.job_id
-                if (name == record['worker_job_name'] and
-                        queued_job_id is not None):
-                    matching_ids.append(int(queued_job_id))
-            matching_ids = sorted(set(matching_ids))
+            cluster_name = record['worker_cluster']
+            queued_jobs = (None if queue_jobs_by_cluster is None else
+                           queue_jobs_by_cluster.get(cluster_name))
+            if queued_jobs is None:
+                queue_request_id = sdk.queue(cluster_name, skip_finished=True)
+                queued_jobs = sdk.get(queue_request_id)
+            if queued_jobs is None:
+                raise TypeError(
+                    f'Queue snapshot for {cluster_name} returned None')
+            matching_ids = self._matching_worker_job_ids(record, queued_jobs)
+            if queue_jobs_by_cluster is not None:
+                queue_jobs_by_cluster[cluster_name] = queued_jobs
             if len(matching_ids) > 1:
                 logger.error(
                     'Refusing ambiguous Batch worker cleanup for %s on %s: '
@@ -1017,9 +1241,13 @@ class BatchCoordinator:
             record['worker_cluster'], worker_job_id)
         return worker_job_id
 
-    def _cancel_worker_record(self, record: dict[str, Any]) -> None:
+    def _cancel_worker_record(
+            self,
+            record: dict[str, Any],
+            queue_jobs_by_cluster: dict[str, list[Any]] | None = None) -> None:
         """Cancel one durable worker record by exactly one external job ID."""
-        worker_job_id = self._resolve_worker_job_id(record)
+        worker_job_id = self._resolve_worker_job_id(record,
+                                                    queue_jobs_by_cluster)
         if worker_job_id is None:
             return
         self._cancel_worker_job_by_id(record['worker_cluster'], worker_job_id,
@@ -1028,34 +1256,48 @@ class BatchCoordinator:
                     worker_job_id, record['coordinator_token'],
                     record['worker_cluster'])
 
-    def _cleanup_worker_services_for_token(self,
-                                           worker_token: str,
-                                           workers: list[str] | None = None
-                                          ) -> None:
+    def _cleanup_worker_services_for_token(
+            self,
+            worker_token: str,
+            workers: list[str] | None = None,
+            queue_jobs_by_cluster: dict[str, list[Any]] | None = None,
+            records: list[dict[str, Any]] | None = None) -> None:
         """Clean durable records for one token, one exact job ID at a time."""
         worker_filter = set(workers) if workers is not None else None
-        for record in managed_job_state.get_batch_worker_records(
-                self._managed_job_id):
+        if records is None:
+            records = managed_job_state.get_batch_worker_records(
+                self._managed_job_id, owner_token=worker_token)
+        for record in records:
             if record['coordinator_token'] != worker_token:
                 continue
             if (worker_filter is not None and
                     record['worker_cluster'] not in worker_filter):
                 continue
-            self._cancel_worker_record(record)
+            self._cancel_worker_record(record, queue_jobs_by_cluster)
 
     def _cleanup_stale_worker_services(self,
                                        workers: list[str] | None = None,
                                        strict: bool = False) -> None:
         """Clean exact old-token workers after their attempt leases expire."""
-        self._refresh_stale_worker_tokens()
+        stale_records_by_token: dict[str, list[dict[str, Any]]] = {}
+        for record in managed_job_state.get_batch_worker_records(
+                self._managed_job_id):
+            token = record['coordinator_token']
+            if token == self._worker_token:
+                continue
+            self._stale_worker_tokens.add(token)
+            stale_records_by_token.setdefault(token, []).append(record)
         if not self._stale_worker_tokens:
             return
         if not self._stale_attempt_leases_drained:
             raise RuntimeError('cannot clean stale Batch workers before old '
                                'attempt leases are drained')
+        queue_jobs_by_cluster: dict[str, list[Any]] = {}
         for worker_token in sorted(self._stale_worker_tokens):
             try:
-                self._cleanup_worker_services_for_token(worker_token, workers)
+                self._cleanup_worker_services_for_token(
+                    worker_token, workers, queue_jobs_by_cluster,
+                    stale_records_by_token.get(worker_token, []))
             except Exception as e:  # pylint: disable=broad-except
                 if strict:
                     raise
@@ -1165,6 +1407,7 @@ class BatchCoordinator:
                     worker_token,
                     cluster_name,
                     worker_job_id=worker_job_id)
+                self._retire_active_worker(cluster_name, worker_job_id)
                 return
             except Exception as e:  # pylint: disable=broad-except
                 if attempt == 1:
@@ -1189,7 +1432,6 @@ class BatchCoordinator:
             logger.warning('Failed to send shutdown to %s: %s', cluster_name, e)
 
         if worker_job_id is not None:
-            time.sleep(5)
             try:
                 self._cancel_worker_job_by_id(cluster_name, worker_job_id,
                                               self._worker_token)
@@ -1212,9 +1454,16 @@ class BatchCoordinator:
         """
         job_id = str(self._managed_job_id)
 
-        worker_job_id = self._launch_worker_service(cluster_name)
-        with self._active_workers_lock:
-            self._active_workers[cluster_name] = worker_job_id
+        self._mark_worker_launch_started(cluster_name)
+        worker_job_id = None
+        late_superseded_launch = False
+        try:
+            worker_job_id = self._launch_worker_service(cluster_name)
+            late_superseded_launch = self._register_active_worker(
+                cluster_name, worker_job_id)
+        except Exception:
+            self._mark_worker_launch_failed(cluster_name)
+            raise
 
         try:
             while not self._cancelled:
@@ -1343,8 +1592,15 @@ class BatchCoordinator:
         finally:
             # Cleanup ownership is claimed under the same lock used by cancel
             # and supersession.  Exactly one path may issue external shutdown.
-            if self._claim_worker_cleanup(cluster_name, worker_job_id):
-                self._shutdown_worker(cluster_name, worker_job_id=worker_job_id)
+            if worker_job_id is not None and self._claim_worker_cleanup(
+                    cluster_name,
+                    worker_job_id,
+                    allow_superseded_cleanup=late_superseded_launch):
+                try:
+                    self._shutdown_worker(cluster_name,
+                                          worker_job_id=worker_job_id)
+                finally:
+                    self._finish_worker_cleanup(cluster_name, worker_job_id)
 
     # ------------------------------------------------------------------
     # Dispatch orchestration

@@ -90,11 +90,17 @@ def _load_workspaces() -> dict[str, Any]:
     return workspaces
 
 
-def _accessible_workspace_names_for_user(user_id: str,
-                                         workspace_names: set[str]) -> set[str]:
+def _accessible_workspace_names_for_user(
+        user_id: str,
+        workspace_names: set[str],
+        *,
+        roles: list[str] | None = None) -> set[str]:
     """Return the subset of workspace_names the user can access."""
+    if roles is None:
+        return permission.permission_service.get_accessible_workspace_names(
+            user_id, workspace_names)
     return permission.permission_service.get_accessible_workspace_names(
-        user_id, workspace_names)
+        user_id, workspace_names, roles=roles)
 
 
 def get_accessible_workspace_names() -> set[str]:
@@ -106,6 +112,20 @@ def get_accessible_workspace_names() -> set[str]:
     workspaces = _load_workspaces()
     return _accessible_workspace_names_for_user(
         common_utils.get_current_user().id, set(workspaces.keys()))
+
+
+def get_configured_workspace_names() -> set[str]:
+    """Return all configured workspace names from the current snapshot."""
+    return set(_load_workspaces())
+
+
+def get_accessible_workspace_names_for_user(user_id: str,
+                                            *,
+                                            roles: list[str] | None = None
+                                           ) -> set[str]:
+    """Return configured workspace names visible to an explicit user."""
+    return _accessible_workspace_names_for_user(
+        user_id, get_configured_workspace_names(), roles=roles)
 
 
 def _update_workspaces_config(

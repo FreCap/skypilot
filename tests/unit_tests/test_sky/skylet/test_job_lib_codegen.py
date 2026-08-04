@@ -5,6 +5,7 @@ import inspect
 import pickle
 import shlex
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -90,6 +91,10 @@ _CODEGEN_CASES = [
      '30a9e3ecbc901f9eba640b26a5e8faa6e2bfd18eecac829ca00992396977588a'),
     ('get_job_status', (), {},
      '8b6f9826b2e3421826c2e87c322fab20d9fb2e81d50ac6a20f08585eccbbeba3'),
+    ('get_job_status_with_system_recovery', ([1, 3],), {},
+     '10f2a5c9a154abc712b0c90c99a41d64f0ed1de1946c4b3bd9b6e10106128c94'),
+    ('get_job_status_with_system_recovery', (), {},
+     '153557bb740605c115ec2902109e252509ca9a9c8d89e7287853096637ed74f2'),
     ('get_job_submitted_or_ended_timestamp_payload', (5,), {},
      '1e680decf0ed8c706245e58441b6c48dcd105d7ce0762bc937914ca3eb73597a'),
     ('get_job_submitted_or_ended_timestamp_payload', (), {
@@ -131,3 +136,22 @@ def test_job_lib_codegen_facade_contract() -> None:
         'tail',
         'tail_offset',
     )
+
+
+def test_recovery_status_codegen_falls_back_for_skewed_job_lib(
+        monkeypatch, capsys) -> None:
+    monkeypatch.setattr(constants, 'SKYLET_VERSION', '42')
+    monkeypatch.setattr(constants, 'SKYLET_LIB_VERSION', 8)
+    legacy = mock.Mock(return_value='legacy-status-payload')
+    structured = mock.Mock(return_value='structured-status-payload')
+    monkeypatch.setattr(job_lib, 'get_statuses_payload', legacy)
+    monkeypatch.setattr(job_lib, 'get_statuses_with_system_recovery_payload',
+                        structured)
+    generated = _extract_generated_python(
+        job_lib.JobLibCodeGen.get_job_status_with_system_recovery([7]))
+
+    exec(compile(generated, '<generated-job-code>', 'exec'), {})
+
+    legacy.assert_called_once_with([7])
+    structured.assert_not_called()
+    assert capsys.readouterr().out.strip() == 'legacy-status-payload'

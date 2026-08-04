@@ -6,8 +6,13 @@ import abc
 from collections.abc import AsyncGenerator
 from collections.abc import Generator
 import contextlib
+import contextvars
+import dataclasses
+import os
 import time
 from typing import Any, TYPE_CHECKING
+
+from sky.server.requests.serializers import encoders
 
 if TYPE_CHECKING:
     from sky.server import daemons as daemons_lib
@@ -17,8 +22,63 @@ if TYPE_CHECKING:
     from sky.server.requests.requests import StatusWithMsg
 
 
+@dataclasses.dataclass(frozen=True)
+class ExecutionClaim:
+    """Fencing identity carried by one request execution."""
+
+    request_id: str
+    execution_generation: int
+    claim_token: str
+
+
+_EXECUTION_CLAIM: contextvars.ContextVar[ExecutionClaim |
+                                         None] = (contextvars.ContextVar(
+                                             'sky_request_execution_claim',
+                                             default=None))
+
+
+def activate_execution_claim(
+    request_id: str,
+    execution_generation: int,
+    claim_token: str | None,
+) -> contextvars.Token:
+    """Activate a durable claim for fenced writes in this context."""
+    claim = None
+    if claim_token is not None:
+        claim = ExecutionClaim(request_id, execution_generation, claim_token)
+    return _EXECUTION_CLAIM.set(claim)
+
+
+def deactivate_execution_claim(token: contextvars.Token) -> None:
+    """Restore the previous execution claim."""
+    _EXECUTION_CLAIM.reset(token)
+
+
+def current_execution_claim(request_id: str) -> ExecutionClaim | None:
+    """Return the active claim only when it belongs to this request."""
+    claim = _EXECUTION_CLAIM.get()
+    if claim is None or claim.request_id != request_id:
+        return None
+    return claim
+
+
+def active_execution_claim() -> ExecutionClaim | None:
+    """Return the claim carried by the current execution context, if any."""
+    return _EXECUTION_CLAIM.get()
+
+
 class RequestBackend(abc.ABC):
     """Abstract interface for request persistence and lifecycle."""
+
+    @property
+    def uses_durable_queue(self) -> bool:
+        """Whether creation can atomically persist queue delivery."""
+        return False
+
+    @property
+    def claim_heartbeat_interval_seconds(self) -> float | None:
+        """Heartbeat cadence for claimed work, or None without leases."""
+        return None
 
     @abc.abstractmethod
     def get_request(self,
@@ -129,7 +189,11 @@ class RequestBackend(abc.ABC):
         """Update the status message of a request."""
         raise NotImplementedError
 
-    def try_mark_running(self, request_id: str, pid: int | None) -> bool:
+    def try_mark_running(self,
+                         request_id: str,
+                         pid: int | None,
+                         execution_generation: int = 0,
+                         claim_token: str | None = None) -> bool:
         """Atomically flip a request to RUNNING if it is still executable.
 
         Records `pid` and clears any stale retry-backoff status_msg. Non-
@@ -141,6 +205,7 @@ class RequestBackend(abc.ABC):
             True iff the request was in an executable status and is now
             RUNNING.
         """
+        del execution_generation, claim_token
         # Runtime import to avoid a circular import: the requests module
         # imports this module at the top level.
         # pylint: disable=import-outside-toplevel
@@ -157,11 +222,31 @@ class RequestBackend(abc.ABC):
             request.status_msg = None
         return True
 
+    def heartbeat_claim(self, claim: ExecutionClaim) -> bool:
+        """Extend a durable execution lease.
+
+        Returns False when the claim is stale. Local backends have no lease
+        and therefore always return True.
+        """
+        del claim
+        return True
+
+    def interrupt_cancelled_claim(self, claim: ExecutionClaim) -> bool:
+        """Signal a cancelled claim owned by this backend instance.
+
+        Distributed backends override this so an API process can record
+        cancellation intent and the remote owning executor can acknowledge
+        and deliver it. Returns True only when a matching local generation was
+        signalled or its process had already exited.
+        """
+        del claim
+        return False
+
     def set_request_finished(self,
                              request_id: str,
                              status: RequestStatus,
                              error: BaseException | None = None,
-                             result: Any | None = None) -> None:
+                             result: Any | None = None) -> bool:
         """Persist a terminal status (SUCCEEDED/FAILED) for a request.
 
         Must not overwrite a status that is already terminal: a late
@@ -170,42 +255,108 @@ class RequestBackend(abc.ABC):
         status guard on the kill paths. A `result` of None leaves the
         stored return value untouched. Non-abstract with a read-modify-
         write default so existing plugin backends stay source-compatible.
+
+        Returns:
+            True iff this call persisted the terminal transition.
         """
         # pylint: disable=import-outside-toplevel
         from sky.server.requests import requests as requests_lib
 
         with self.update_request(request_id) as request:
             if request is None:
-                return
+                return False
             if request.status in requests_lib.RequestStatus.finished_status():
-                return
+                return False
             request.status = status
             request.finished_at = time.time()
             if error is not None:
                 request.set_error(error)
-            if result is not None:
-                request.set_return_value(result)
+            should_encode_result = result is not None
+            if status == requests_lib.RequestStatus.SUCCEEDED:
+                should_encode_result = (should_encode_result or
+                                        encoders.requires_strict_return_value(
+                                            request.name))
+            if should_encode_result:
+                try:
+                    request.set_return_value(result)
+                except Exception as encoding_error:  # pylint: disable=broad-except
+                    request.status = requests_lib.RequestStatus.FAILED
+                    request.return_value = None
+                    request.set_error(encoding_error)
+        return True
 
     async def set_request_finished_async(self,
                                          request_id: str,
                                          status: RequestStatus,
                                          error: BaseException | None = None,
-                                         result: Any | None = None) -> None:
+                                         result: Any | None = None) -> bool:
         """Async version of set_request_finished."""
         # pylint: disable=import-outside-toplevel
         from sky.server.requests import requests as requests_lib
 
         async with self.update_request_async(request_id) as request:
             if request is None:
-                return
+                return False
             if request.status in requests_lib.RequestStatus.finished_status():
-                return
+                return False
             request.status = status
             request.finished_at = time.time()
             if error is not None:
                 request.set_error(error)
-            if result is not None:
-                request.set_return_value(result)
+            should_encode_result = result is not None
+            if status == requests_lib.RequestStatus.SUCCEEDED:
+                should_encode_result = (should_encode_result or
+                                        encoders.requires_strict_return_value(
+                                            request.name))
+            if should_encode_result:
+                try:
+                    request.set_return_value(result)
+                except Exception as encoding_error:  # pylint: disable=broad-except
+                    request.status = requests_lib.RequestStatus.FAILED
+                    request.return_value = None
+                    request.set_error(encoding_error)
+        return True
+
+    def transition_request_terminal(self,
+                                    request_id: str,
+                                    status: RequestStatus,
+                                    cause: str,
+                                    error: BaseException | None = None,
+                                    result: Any | None = None) -> bool:
+        """Persist a cause-aware terminal transition.
+
+        PostgreSQL overrides this to atomically emit an operational event.
+        The default keeps existing plugin and SQLite backends compatible.
+        """
+        del cause
+        return self.set_request_finished(request_id,
+                                         status,
+                                         error=error,
+                                         result=result)
+
+    async def transition_request_terminal_async(
+            self,
+            request_id: str,
+            status: RequestStatus,
+            cause: str,
+            error: BaseException | None = None,
+            result: Any | None = None) -> bool:
+        """Async cause-aware terminal transition."""
+        del cause
+        return await self.set_request_finished_async(request_id,
+                                                     status,
+                                                     error=error,
+                                                     result=result)
+
+    def set_event_workspace(self, request_id: str, workspace: str) -> bool:
+        """Persist an authoritative event workspace, if supported."""
+        del request_id, workspace
+        return True
+
+    def set_event_target_id(self, request_id: str, target_id: str) -> bool:
+        """Enrich an event target identity, if supported."""
+        del request_id, target_id
+        return True
 
     @abc.abstractmethod
     def kill_requests(self,
@@ -283,10 +434,22 @@ def get_request_backend() -> RequestBackend:
     """Get the registered request backend."""
     global _storage_backend
     if _storage_backend is None:
-        # pylint: disable=import-outside-toplevel
-        from sky.server.requests.requests import SqliteRequestBackend
-
-        _storage_backend = SqliteRequestBackend()
+        backend_name = os.environ.get('SKYPILOT_API_REQUEST_BACKEND', 'sqlite')
+        if backend_name == 'postgres':
+            # Runtime import avoids storage -> postgres -> storage while the
+            # abstract interface is still being defined.
+            # pylint: disable=import-outside-toplevel
+            from sky.server.requests import postgres
+            _storage_backend = postgres.PostgresRequestBackend()
+        elif backend_name == 'sqlite':
+            # Runtime import avoids storage -> requests -> storage while the
+            # abstract interface is still being defined.
+            # pylint: disable=import-outside-toplevel
+            from sky.server.requests.requests import SqliteRequestBackend
+            _storage_backend = SqliteRequestBackend()
+        else:
+            raise ValueError('SKYPILOT_API_REQUEST_BACKEND must be "sqlite" or '
+                             f'"postgres", got {backend_name!r}.')
     return _storage_backend
 
 

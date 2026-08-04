@@ -4,8 +4,12 @@ This module provides a standard low-level interface that all
 providers supported by SkyPilot need to follow.
 """
 import dataclasses
+import dis
+import enum
 import functools
 import inspect
+import types
+from types import MappingProxyType
 import typing
 from typing import Any, Optional, Protocol
 
@@ -18,6 +22,7 @@ from sky.provision import aws
 from sky.provision import azure
 from sky.provision import common
 from sky.provision import cudo
+from sky.provision import do
 from sky.provision import fluidstack
 from sky.provision import gcp
 from sky.provision import hyperbolic
@@ -26,7 +31,9 @@ from sky.provision import lambda_cloud
 from sky.provision import mithril
 from sky.provision import nebius
 from sky.provision import oci
+from sky.provision import paperspace
 from sky.provision import primeintellect
+from sky.provision import provider_facets
 from sky.provision import runpod
 from sky.provision import scp
 from sky.provision import seeweb
@@ -38,11 +45,14 @@ from sky.provision import verda
 from sky.provision import vsphere
 from sky.provision import yotta
 from sky.utils import command_runner
+from sky.utils import provider_registration
+from sky.utils import registry as registry_lib
 from sky.utils import timeline
 
 if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
     from sky import task as task_lib
+    from sky.provision import provider_registry_audit
     from sky.utils import status_lib
 
 logger = sky_logging.init_logger(__name__)
@@ -117,6 +127,288 @@ class Provisioner:
 
 
 _registered_provisioners: dict[str, Provisioner] = {}
+_registered_provisioner_bundles: dict[str,
+                                      provider_facets.ProvisionerBundleV1] = {}
+_legacy_mixed_owner_diagnostics: set[tuple[str, str]] = set()
+
+
+def _make_builtin_bundle(
+    canonical_name: str,
+    module: Any,
+) -> provider_facets.ProvisionerBundleV1:
+    diagnostic = None
+    try:
+        candidate = inspect.getattr_static(module,
+                                           '_QUERY_INSTANCES_DIAGNOSTIC_V1',
+                                           None)
+        if (type(candidate) is provider_facets.BuiltinQueryInstancesDiagnosticV1
+                and not provider_facets.
+                builtin_query_instances_diagnostic_v1_validation_errors(
+                    candidate)):
+            diagnostic = candidate
+    except Exception:  # pylint: disable=broad-exception-caught
+        # An optional diagnostic must not break authoritative provisioning.
+        diagnostic = None
+    return provider_facets.ProvisionerBundleV1(
+        canonical_name=canonical_name,
+        instance_lifecycle=provider_facets.LegacyInstanceLifecycleAdapter(
+            module),
+        legacy_module=module,
+        builtin_query_instances_diagnostic=diagnostic,
+    )
+
+
+# One explicit inventory owns the in-tree new-provisioner implementations.
+# Late-bound getters preserve whole-module and attribute monkeypatch seams while
+# avoiding the former import-order-dependent ``globals()`` discovery.
+_BUILTIN_PROVISIONER_MODULE_GETTERS: dict[str, typing.Callable[[], Any]] = {
+    'aws': lambda: aws,
+    'azure': lambda: azure,
+    'cudo': lambda: cudo,
+    'do': lambda: do,
+    'fluidstack': lambda: fluidstack,
+    'gcp': lambda: gcp,
+    'hyperbolic': lambda: hyperbolic,
+    'kubernetes': lambda: kubernetes,
+    'lambda': lambda: lambda_cloud,
+    'mithril': lambda: mithril,
+    'nebius': lambda: nebius,
+    'oci': lambda: oci,
+    'paperspace': lambda: paperspace,
+    'primeintellect': lambda: primeintellect,
+    'runpod': lambda: runpod,
+    'scp': lambda: scp,
+    'seeweb': lambda: seeweb,
+    'shadeform': lambda: shadeform,
+    'slurm': lambda: slurm,
+    'ssh': lambda: ssh,
+    'vast': lambda: vast,
+    'verda': lambda: verda,
+    'vsphere': lambda: vsphere,
+    'yotta': lambda: yotta,
+}
+
+
+class _BuiltinProvisionerAuditExpectation(typing.NamedTuple):
+    """Sealed direct-global getter shape used only by registry auditing."""
+
+    getter: typing.Callable[[], Any]
+    module: Any
+    function_type: type
+    code: types.CodeType
+    defaults: tuple[Any, ...] | None
+    keyword_defaults: dict[str, Any] | None
+    closure: tuple[types.CellType, ...] | None
+    globals_mapping: dict[str, Any]
+    global_name: str
+
+
+def _seal_builtin_provisioner_getter(
+    getter: typing.Callable[[], Any],) -> _BuiltinProvisionerAuditExpectation:
+    """Seal one trusted zero-argument direct-global getter without calling it."""
+    if type(getter) is not types.FunctionType:
+        raise TypeError(
+            'Built-in provisioner getter must be a Python function.')
+    code = getter.__code__
+    significant_instructions = tuple(
+        instruction for instruction in dis.get_instructions(code)
+        if instruction.opname not in ('CACHE', 'NOP', 'RESUME'))
+    if (code.co_argcount != 0 or code.co_posonlyargcount != 0 or
+            code.co_kwonlyargcount != 0 or getter.__defaults__ is not None or
+            getter.__kwdefaults__ is not None or
+            getter.__closure__ is not None or
+            len(significant_instructions) != 2 or
+            significant_instructions[0].opname != 'LOAD_GLOBAL' or
+            significant_instructions[1].opname != 'RETURN_VALUE' or
+            type(significant_instructions[0].argval) is not str):
+        raise ValueError('Built-in provisioner getter must be a direct-global '
+                         'zero-argument function.')
+    global_name = significant_instructions[0].argval
+    globals_mapping = getter.__globals__
+    module = dict.get(globals_mapping, global_name)
+    if module is None:
+        raise ValueError('Built-in provisioner getter global must be present.')
+    return _BuiltinProvisionerAuditExpectation(
+        getter=getter,
+        module=module,
+        function_type=types.FunctionType,
+        code=code,
+        defaults=getter.__defaults__,
+        keyword_defaults=getter.__kwdefaults__,
+        closure=getter.__closure__,
+        globals_mapping=globals_mapping,
+        global_name=global_name,
+    )
+
+
+# Audit-only expectations are sealed before server plugins can replace a
+# built-in inventory getter. Audit capture may read only these exact
+# allowlisted direct-global bindings and never executes a getter.
+_BUILTIN_PROVISIONER_AUDIT_BASELINE = MappingProxyType({
+    canonical_name: _seal_builtin_provisioner_getter(module_getter)
+    for canonical_name, module_getter in
+    _BUILTIN_PROVISIONER_MODULE_GETTERS.items()
+})
+
+
+def _canonical_provider_name(provider_name: str) -> str:
+    """Return the one canonical key used by registration and dispatch."""
+    normalized = provider_name.lower()
+    if normalized == 'lambda_cloud':
+        return 'lambda'
+    return normalized
+
+
+def _get_builtin_provisioner_bundle(
+        provider_name: str) -> provider_facets.ProvisionerBundleV1 | None:
+    canonical_name = _canonical_provider_name(provider_name)
+    module_getter = _BUILTIN_PROVISIONER_MODULE_GETTERS.get(canonical_name)
+    if module_getter is None:
+        return None
+    return _make_builtin_bundle(canonical_name, module_getter())
+
+
+@enum.unique
+class _ProvisionerOperationOwnerV1(enum.Enum):
+    """Source that owns one resolved provider operation."""
+
+    STRICT = 'strict'
+    LEGACY = 'legacy'
+    BUILTIN = 'builtin'
+
+
+@dataclasses.dataclass(frozen=True)
+class _ResolvedProvisionerOperation:
+    """One selected operation and its optional diagnostic entry point."""
+
+    owner: _ProvisionerOperationOwnerV1
+    authoritative_implementation: Any
+    diagnostic_implementation: Any | None = None
+
+    @property
+    def implementation(self) -> Any:
+        if self.diagnostic_implementation is not None:
+            return self.diagnostic_implementation
+        return self.authoritative_implementation
+
+
+_BUILTIN_LIFECYCLE_DISCARD_RETURN_METHODS: typing.Final[frozenset[str]] = (
+    frozenset(('stop_instances', 'terminate_instances', 'wait_instances')))
+
+
+def _pin_builtin_lifecycle_implementation(method_name: str,
+                                          implementation: Any) -> Any:
+    """Pin one raw built-in method while preserving adapter return semantics."""
+    if method_name not in _BUILTIN_LIFECYCLE_DISCARD_RETURN_METHODS:
+        return implementation
+
+    def _discard_return(*args: Any, **kwargs: Any) -> None:
+        implementation(*args, **kwargs)
+
+    return _discard_return
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProvisionerResolution:
+    """One provider lookup shared by lifecycle and template dispatch."""
+
+    canonical_name: str
+    strict_bundle: provider_facets.ProvisionerBundleV1 | None
+    legacy_registration: Provisioner | None
+    builtin_bundle: provider_facets.ProvisionerBundleV1 | None
+
+    @property
+    def exists(self) -> bool:
+        return (self.strict_bundle is not None or
+                self.legacy_registration is not None or
+                self.builtin_bundle is not None)
+
+    @property
+    def template_override(self) -> TemplateOverrideFn | None:
+        if self.strict_bundle is not None:
+            return self.strict_bundle.template_override
+        if (self.legacy_registration is not None and
+                self.legacy_registration.template_override is not None):
+            return self.legacy_registration.template_override
+        if self.builtin_bundle is not None:
+            return self.builtin_bundle.template_override
+        return None
+
+    def resolve_operation(
+            self, method_name: str) -> _ResolvedProvisionerOperation | None:
+        if (self.strict_bundle is not None and
+                method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS):
+            return _ResolvedProvisionerOperation(
+                owner=_ProvisionerOperationOwnerV1.STRICT,
+                authoritative_implementation=getattr(
+                    self.strict_bundle.instance_lifecycle, method_name),
+            )
+
+        legacy_module = (self.legacy_registration.module
+                         if self.legacy_registration is not None else None)
+        if legacy_module is not None:
+            implementation = getattr(legacy_module, method_name, None)
+            if implementation is not None:
+                return _ResolvedProvisionerOperation(
+                    owner=_ProvisionerOperationOwnerV1.LEGACY,
+                    authoritative_implementation=implementation,
+                )
+
+        if self.builtin_bundle is None:
+            return None
+        raw_builtin_module = self.builtin_bundle.legacy_module
+        if raw_builtin_module is None:
+            return None
+        raw_builtin_implementation = getattr(raw_builtin_module, method_name,
+                                             None)
+        if raw_builtin_implementation is None:
+            return None
+
+        if (legacy_module is not None and
+                method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS):
+            plugin_owns_part_of_facet = any(
+                callable(getattr(legacy_module, name, None))
+                for name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS)
+            diagnostic_key = (self.canonical_name, 'InstanceLifecycleV1')
+            if (plugin_owns_part_of_facet and
+                    diagnostic_key not in _legacy_mixed_owner_diagnostics):
+                _legacy_mixed_owner_diagnostics.add(diagnostic_key)
+                logger.warning(
+                    'Legacy provisioner %r mixes plugin and built-in '
+                    'InstanceLifecycleV1 methods. Register one complete '
+                    'ProvisionerBundleV1 to remove fallback.',
+                    self.canonical_name)
+
+        authoritative_implementation = raw_builtin_implementation
+        if method_name in provider_facets.INSTANCE_LIFECYCLE_V1_METHODS:
+            authoritative_implementation = (
+                _pin_builtin_lifecycle_implementation(
+                    method_name, raw_builtin_implementation))
+
+        diagnostic_implementation = None
+        diagnostic = self.builtin_bundle.builtin_query_instances_diagnostic
+        if (method_name == 'query_instances' and
+                self.legacy_registration is None and type(diagnostic)
+                is provider_facets.BuiltinQueryInstancesDiagnosticV1 and
+                diagnostic.authoritative_implementation
+                is raw_builtin_implementation):
+            diagnostic_implementation = diagnostic.diagnostic_implementation
+
+        return _ResolvedProvisionerOperation(
+            owner=_ProvisionerOperationOwnerV1.BUILTIN,
+            authoritative_implementation=authoritative_implementation,
+            diagnostic_implementation=diagnostic_implementation,
+        )
+
+
+def _resolve_provisioner(provider_name: str) -> _ProvisionerResolution:
+    canonical_name = _canonical_provider_name(provider_name)
+    return _ProvisionerResolution(
+        canonical_name=canonical_name,
+        strict_bundle=_registered_provisioner_bundles.get(canonical_name),
+        legacy_registration=_registered_provisioners.get(canonical_name),
+        builtin_bundle=_get_builtin_provisioner_bundle(canonical_name),
+    )
 
 
 def register_provisioner(
@@ -131,17 +423,85 @@ def register_provisioner(
     matches the lowercase canonical cloud name (e.g. ``'kubernetes'``,
     ``'aws'``).
     """
-    _registered_provisioners[cloud_name.lower()] = Provisioner(
-        module=module, template_override=template_override)
+    canonical_name = _canonical_provider_name(cloud_name)
+    with provider_registration.provider_registration_mutation():
+        _registered_provisioner_bundles.pop(canonical_name, None)
+        _registered_provisioners[canonical_name] = Provisioner(
+            module=module, template_override=template_override)
     logger.debug(
         'Registered Provisioner for %r: module=%s, '
-        'template_override=%s', cloud_name.lower(),
+        'template_override=%s', canonical_name,
         type(module).__name__, template_override is not None)
 
 
 def get_registered_provisioner(cloud_name: str) -> Provisioner | None:
     """Return the Provisioner registered for ``cloud_name``, or None."""
-    return _registered_provisioners.get(cloud_name.lower())
+    canonical_name = _canonical_provider_name(cloud_name)
+    legacy_registration = _registered_provisioners.get(canonical_name)
+    if legacy_registration is not None:
+        return legacy_registration
+    strict_bundle = _registered_provisioner_bundles.get(canonical_name)
+    if strict_bundle is None:
+        return None
+    return Provisioner(module=strict_bundle.instance_lifecycle,
+                       template_override=strict_bundle.template_override)
+
+
+def register_provisioner_bundle(
+        bundle: provider_facets.ProvisionerBundleV1) -> None:
+    """Register one complete, strictly owned V1 lifecycle facet."""
+    if bundle.builtin_query_instances_diagnostic is not None:
+        raise ValueError('Strict ProvisionerBundleV1 registration cannot '
+                         'declare a built-in query diagnostic.')
+    validation_errors = (
+        provider_facets.instance_lifecycle_v1_validation_errors(
+            bundle.instance_lifecycle))
+    if validation_errors:
+        raise ValueError('Incomplete InstanceLifecycleV1 for '
+                         f'{bundle.canonical_name!r}: '
+                         f'{"; ".join(validation_errors)}.')
+    if bundle.legacy_module is not None:
+        raise ValueError('Strict ProvisionerBundleV1 registration cannot '
+                         'declare a legacy module fallback.')
+
+    canonical_name = _canonical_provider_name(bundle.canonical_name)
+    if bundle.canonical_name != canonical_name:
+        bundle = dataclasses.replace(bundle, canonical_name=canonical_name)
+    existing_bundle = _registered_provisioner_bundles.get(canonical_name)
+    if (existing_bundle is not None and
+            existing_bundle.instance_lifecycle is bundle.instance_lifecycle and
+            existing_bundle.template_override is bundle.template_override and
+            existing_bundle.legacy_module is bundle.legacy_module and
+            existing_bundle.builtin_query_instances_diagnostic
+            is bundle.builtin_query_instances_diagnostic):
+        logger.debug('ProvisionerBundleV1 for %r is already registered.',
+                     canonical_name)
+        return
+    with provider_registration.provider_registration_mutation():
+        _registered_provisioners.pop(canonical_name, None)
+        replaced = existing_bundle is not None
+        _registered_provisioner_bundles[canonical_name] = bundle
+    if replaced:
+        logger.info('Replaced strict ProvisionerBundleV1 for %r.',
+                    canonical_name)
+    else:
+        logger.debug('Registered strict ProvisionerBundleV1 for %r.',
+                     canonical_name)
+
+
+def get_provisioner_bundle(
+        provider_name: str) -> provider_facets.ProvisionerBundleV1 | None:
+    """Return the strict or built-in typed bundle for a provider."""
+    resolution = _resolve_provisioner(provider_name)
+    if resolution.strict_bundle is not None:
+        return resolution.strict_bundle
+    return resolution.builtin_bundle
+
+
+def get_provisioner_template_override(
+        provider_name: str) -> TemplateOverrideFn | None:
+    """Return the template hook chosen by the shared provider resolver."""
+    return _resolve_provisioner(provider_name).template_override
 
 
 def _route_to_cloud_impl(func):
@@ -156,27 +516,13 @@ def _route_to_cloud_impl(func):
         else:
             provider_name = kwargs.pop('provider_name')
 
-        module_name = provider_name.lower()
-        if module_name == 'lambda':
-            module_name = 'lambda_cloud'
-        # Registered Provisioner methods take precedence over the static
-        # cloud module's; if the registered Provisioner's module does not
-        # define ``func.__name__``, dispatch falls through to the existing
-        # cloud module.
-        plugin = _registered_provisioners.get(module_name)
-        plugin_module = plugin.module if plugin is not None else None
-        existing_module = globals().get(module_name)
-        assert (plugin_module is not None or existing_module
-                is not None), (f'Unknown provider: {module_name}')
+        resolution = _resolve_provisioner(provider_name)
+        assert resolution.exists, (
+            f'Unknown provider: {resolution.canonical_name}')
+        operation = resolution.resolve_operation(func.__name__)
 
-        impl = None
-        if plugin_module is not None:
-            impl = getattr(plugin_module, func.__name__, None)
-        if impl is None and existing_module is not None:
-            impl = getattr(existing_module, func.__name__, None)
-
-        if impl is not None:
-            return impl(*args, **kwargs)
+        if operation is not None:
+            return operation.implementation(*args, **kwargs)
 
         # Neither side implements it — fall back to the decorator's default
         # body (typically ``raise NotImplementedError``).
@@ -471,3 +817,93 @@ def get_command_runners(
         node_list=node_list,
         **credentials,
     )
+
+
+def capture_provider_registry_audit(
+    receipt: object,
+) -> 'provider_registry_audit.ProviderRegistryAuditSnapshotV1':
+    """Capture one frozen read-only view of every provider registry axis."""
+    # Imported here because Cloud imports provisioner modules while its own
+    # built-in registry baseline is still being constructed.
+    # pylint: disable=import-outside-toplevel
+    from sky import clouds as clouds_lib
+    from sky.provision import provider_registry_audit as registry_audit
+
+    receipt_reason_map = {
+        provider_registration.ProviderRegistrationReceiptFailureV1.MISSING_RECEIPT:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            MISSING_RECEIPT,
+        provider_registration.ProviderRegistrationReceiptFailureV1.INVALID_RECEIPT:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            INVALID_RECEIPT,
+        provider_registration.ProviderRegistrationReceiptFailureV1.WRONG_PROCESS:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            WRONG_PROCESS,
+        provider_registration.ProviderRegistrationReceiptFailureV1.STALE_EPOCH:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            STALE_EPOCH,
+        provider_registration.ProviderRegistrationReceiptFailureV1.ACTIVE_SESSION:
+            registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+            ACTIVE_SESSION,
+    }
+    context_map = {
+        'main': registry_audit.ProviderAuditContextV1.MAIN,
+        'uvicorn': registry_audit.ProviderAuditContextV1.UVICORN,
+        'executor': registry_audit.ProviderAuditContextV1.EXECUTOR,
+        'controller': registry_audit.ProviderAuditContextV1.CONTROLLER,
+    }
+
+    def _observe(
+        context: 'provider_registry_audit.ProviderAuditContextV1',
+    ) -> 'provider_registry_audit._ProviderRegistryAuditObservationV1':
+        return registry_audit._observe_provider_registry_audit(  # pylint: disable=protected-access
+            capture_context=context,
+            cloud_entries=registry_lib.CLOUD_REGISTRY,
+            cloud_aliases=registry_lib.CLOUD_REGISTRY._aliases,  # pylint: disable=protected-access
+            strict_entries=_registered_provisioner_bundles,
+            legacy_entries=_registered_provisioners,
+            builtin_getters=_BUILTIN_PROVISIONER_MODULE_GETTERS,
+            builtin_cloud_expectations=(
+                clouds_lib._BUILTIN_CLOUD_AUDIT_BASELINE),  # pylint: disable=protected-access
+            builtin_alias_expectations=(
+                clouds_lib._BUILTIN_CLOUD_ALIAS_AUDIT_BASELINE),  # pylint: disable=protected-access
+            builtin_provisioner_expectations=(
+                _BUILTIN_PROVISIONER_AUDIT_BASELINE),
+            strict_container_type=provider_facets.ProvisionerBundleV1,
+            legacy_container_type=Provisioner,
+        )
+
+    try:
+        with provider_registration.provider_registration_capture(
+                receipt) as raw_context:
+            capture_context = context_map.get(raw_context)
+            if capture_context is None:
+                raise registry_audit.ProviderRegistryAuditCaptureErrorV1(
+                    registry_audit.ProviderRegistryAuditCaptureErrorReasonV1.
+                    INVALID_RECEIPT)
+            first_observation = _observe(capture_context)
+
+        with provider_registration.provider_registration_capture(receipt):
+            second_observation = _observe(capture_context)
+            first_signature = first_observation.signature
+            second_signature = second_observation.signature
+            if (first_signature != second_signature or
+                    first_observation.snapshot != second_observation.snapshot):
+                first_raw_signature = tuple(
+                    item for item in first_signature if item.startswith('raw|'))
+                second_raw_signature = tuple(item for item in second_signature
+                                             if item.startswith('raw|'))
+                if first_raw_signature != second_raw_signature:
+                    reason = (
+                        registry_audit.ProviderRegistryAuditCaptureErrorReasonV1
+                        .REGISTRY_CHANGED)
+                else:
+                    reason = (
+                        registry_audit.ProviderRegistryAuditCaptureErrorReasonV1
+                        .OBSERVED_MEMBER_CHANGED)
+                raise registry_audit.ProviderRegistryAuditCaptureErrorV1(reason)
+    except provider_registration.ProviderRegistrationReceiptError as error:
+        raise registry_audit.ProviderRegistryAuditCaptureErrorV1(
+            receipt_reason_map[error.reason]) from None
+
+    return first_observation.snapshot

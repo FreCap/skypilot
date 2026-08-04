@@ -327,8 +327,13 @@ class LocalDockerBackend(backends.Backend['LocalDockerResourceHandle']):
     def _teardown(self,
                   handle: LocalDockerResourceHandle,
                   terminate: bool,
-                  purge: bool = False):
+                  purge: bool = False,
+                  *,
+                  expected_cluster_record_uuid: str | None = None):
         """Teardown kills the container."""
+        if expected_cluster_record_uuid is not None:
+            raise RuntimeError('Action-aware expected-UUID teardown is not '
+                               'supported by the local Docker backend.')
         del purge  # Unused.
         if not terminate:
             logger.warning(

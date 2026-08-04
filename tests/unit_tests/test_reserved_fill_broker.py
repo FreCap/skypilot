@@ -427,7 +427,8 @@ def _upsert(name,
             gpus_per_replica=1,
             holdings_fill=0,
             launchable=True,
-            effective_cap=None):
+            effective_cap=None,
+            activity=None):
     broker.upsert_claim(name,
                         pool_key=pool_key,
                         weight=weight,
@@ -435,7 +436,8 @@ def _upsert(name,
                         gpus_per_replica=gpus_per_replica,
                         holdings_fill=holdings_fill,
                         launchable=launchable,
-                        effective_cap=effective_cap)
+                        effective_cap=effective_cap,
+                        activity=activity)
 
 
 def _obs(free, gpu_names=('A100',)):
@@ -635,6 +637,31 @@ class TestMultiClaimantRounds:
 
 @pytest.mark.usefixtures('_broker_db')
 class TestBlackout:
+
+    def test_explicit_opt_out_clears_gate_state_during_blackout(self, request):
+        test_clock = request.getfixturevalue('clock')
+        _upsert('svc-a',
+                floor=70,
+                holdings_fill=20,
+                activity={
+                    'demonstrated_need': 0,
+                    'boot_hold': False,
+                })
+        _upsert('svc-b')
+        assert _run('svc-a', free=0) is not None
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        assert 'svc-a' in json.loads(round_row['utilization_state'] or '{}')
+
+        test_clock.advance(61)
+        # All-NULL activity is the explicit opt-out. A blackout must restore
+        # static behavior immediately rather than carry the old gated cap.
+        _upsert('svc-a', floor=70, holdings_fill=20, activity=None)
+        _upsert('svc-b')
+        assert _run('svc-a', observation=_obs(None, gpu_names=())) is not None
+        round_row = serve_state.get_reserved_fill_round(_POOL)
+        assert round_row is not None
+        assert json.loads(round_row['utilization_state'] or '{}') == {}
 
     def test_blackout_releases_nothing_and_feeds_nothing(
             self, clock, monkeypatch):
@@ -1209,7 +1236,7 @@ class TestAtomicPersistFence:
         _upsert('svc-c', pool_key=pool_b)
         assert serve_state.add_replica_if_round_epoch('svc-c',
                                                       2,
-                                                      self._STUB_INFO,
+                                                      _replica(2),
                                                       pool_key=pool_b,
                                                       expected_epoch=99)
         assert self._replica_row_count() == 2
@@ -1229,22 +1256,34 @@ class TestAtomicPersistFence:
         assert stored.replica_id == 7
         assert stored.cluster_name == 'svc-7'
 
-        # A recovered controller can re-drive the same replica id. Exercise
-        # the ON CONFLICT path too: every authoritative column and the legacy
-        # rollback pickle must advance together, rather than leaving readers
-        # on the state from the first attempt.
-        info.cluster_name = 'svc-7-retry'
-        info.version = 2
-        info.created_at = 123.5
-        info.is_spot = True
-        info.planned_capacity = 4
-        info.reserved_fill = True
-        info.status_property.sky_launch_status = (
+        # A second fill admission cannot adopt or overwrite the same numeric
+        # key. Recovery instead refreshes the durable object and uses the
+        # identity-fenced expected-existing update path.
+        with pytest.raises(sqlalchemy_exc.IntegrityError):
+            serve_state.add_replica_if_round_epoch('svc-a',
+                                                   7,
+                                                   _replica(7),
+                                                   pool_key=_POOL,
+                                                   expected_epoch=alloc.epoch)
+        unchanged = serve_state.get_replica_info_from_id('svc-a', 7)
+        assert unchanged is not None
+        assert unchanged.replica_record_id == info.replica_record_id
+        assert unchanged.version == 1
+
+        unchanged.cluster_name = 'svc-7-retry'
+        unchanged.version = 2
+        unchanged.created_at = 123.5
+        unchanged.is_spot = True
+        unchanged.planned_capacity = 4
+        unchanged.reserved_fill = True
+        unchanged.status_property.sky_launch_status = (
             common_utils.ProcessStatus.RUNNING)
-        info.status_property.sky_down_status = (
+        unchanged.status_property.sky_down_status = (
             common_utils.ProcessStatus.SCHEDULED)
-        assert serve_state.add_replica_if_round_epoch(
-            'svc-a', 7, info, pool_key=_POOL, expected_epoch=alloc.epoch)
+        assert serve_state.add_or_update_replica('svc-a',
+                                                 7,
+                                                 unchanged,
+                                                 expected_replica_exists=True)
 
         engine = serve_state._db_manager.get_engine()
         with orm.Session(engine) as session:
@@ -1254,19 +1293,19 @@ class TestAtomicPersistFence:
                     serve_state.replicas_table.c.replica_id == 7)).one()
         raw = row._mapping  # pylint: disable=protected-access
         assert raw['replica_state_version'] == 1
-        assert raw['status'] == info.status.value
+        assert raw['status'] == unchanged.status.value
         assert (raw['sky_down_status'] ==
                 common_utils.ProcessStatus.SCHEDULED.value)
         assert raw['version'] == 2
         assert raw['cluster_name'] == 'svc-7-retry'
         assert raw['created_at'] == 123.5
         assert raw['is_spot'] is True
-        assert raw['replica_state'] == info.to_storage_dict()
-        assert (pickle.loads(
-            raw['replica_info']).to_storage_dict() == info.to_storage_dict())
+        assert raw['replica_state'] == unchanged.to_storage_dict()
+        assert (pickle.loads(raw['replica_info']).to_storage_dict() ==
+                unchanged.to_storage_dict())
         stored = serve_state.get_replica_info_from_id('svc-a', 7)
         assert stored is not None
-        assert stored.to_storage_dict() == info.to_storage_dict()
+        assert stored.to_storage_dict() == unchanged.to_storage_dict()
 
     def test_persist_requires_live_same_pool_claim(self):
         # A disabled/pruned claimant's queued fill launch must fence out
@@ -1408,11 +1447,8 @@ class TestRoundPersistExclusion:
                     rounds_table.c.pool_key == _POOL).values(epoch=alloc.epoch +
                                                              1))
             session.commit()
-        assert not broker.persist_fill_replica('svc-a',
-                                               2,
-                                               self._STUB_INFO,
-                                               pool_key=_POOL,
-                                               expected_epoch=alloc.epoch)
+        assert not broker.persist_fill_replica(
+            'svc-a', 2, _replica(2), pool_key=_POOL, expected_epoch=alloc.epoch)
         assert self._replica_row_count() == 1
 
 
@@ -2174,6 +2210,36 @@ class TestAdvanceReleaseTarget:
         assert entry['cap'] == 50
         assert entry['hot_until'] == 5300.0
 
+    def test_nonzero_need_restores_utilization_proportional_cap(self):
+        prev = {
+            'cap': 0,
+            'hot_until': 0.0,
+            'stepped_at': 0.0,
+            'blind_since': None
+        }
+        entry = self._advance(prev, floor=0, holdings=0, need=1, now=5000.0)
+        assert entry['cap'] == 2
+        assert entry['hot_until'] == 5300.0
+
+    def test_activity_backed_floor_releases_fully_while_idle(self):
+        prev = {
+            'cap': 70,
+            'hot_until': 0.0,
+            'stepped_at': 0.0,
+            'blind_since': None
+        }
+        now = 1000.0
+        for _ in range(50):
+            now += 400.0
+            prev = self._advance(prev,
+                                 floor=0,
+                                 holdings=int(prev['cap']),
+                                 need=0,
+                                 now=now)
+            if prev['cap'] == 0:
+                break
+        assert prev['cap'] == 0
+
     def test_dwell_blocks_the_first_step_in_wall_clock(self):
         prev = {
             'cap': 77,
@@ -2382,32 +2448,43 @@ class TestAdvanceReleaseTarget:
 
 
 class TestUtilizationCapEntitlements:
-    """compute_entitlements with the gate: floors immune, total conserved."""
+    """The gate can release floors while preserving total conservation."""
 
     def _claim(self, **kwargs):
         base = dict(floor=0, weight=1.0, holdings_fill=0, launchable=True)
         base.update(kwargs)
         return broker.ClaimInput(**base)
 
-    def test_gated_claimant_releases_its_share_to_a_busy_peer(self):
-        idle = self._claim(floor=0,
-                           weight=1e6,
-                           holdings_fill=74,
-                           utilization_cap=0)
-        busy = self._claim(floor=10, weight=100, holdings_fill=10)
-        out = broker.compute_entitlements(84, {'idle': idle, 'busy': busy})
-        # Despite a 10000:1 weight advantage, the idle claimant keeps only
-        # its floor and the whole remainder flows to the working peer.
-        assert out['idle'] == 0
-        assert out['busy'] == 84
+    def test_idle_opendde_releases_floor_and_share_to_ungated_boltz(self):
+        opendde = self._claim(floor=70,
+                              weight=1e6,
+                              holdings_fill=74,
+                              utilization_cap=0)
+        boltz = self._claim(floor=10, weight=100, holdings_fill=10)
+        out = broker.compute_entitlements(84, {
+            'opendde': opendde,
+            'boltz': boltz,
+        })
+        # The gate clamps both OpenDDE's 70-replica floor and its weighted
+        # headroom. Explicitly ungated Boltz receives the complete remainder.
+        assert out['opendde'] == 0
+        assert out['boltz'] == 84
 
-    def test_floor_is_immune_to_the_gate(self):
+    def test_idle_gate_releases_the_declared_floor(self):
         claim = self._claim(floor=10,
                             weight=1.0,
                             holdings_fill=40,
                             utilization_cap=0)
         out = broker.compute_entitlements(40, {'a': claim})
-        assert out['a'] == 10
+        assert out['a'] == 0
+
+    def test_positive_cap_clamps_the_declared_floor(self):
+        claim = self._claim(floor=70,
+                            weight=1.0,
+                            holdings_fill=0,
+                            utilization_cap=2)
+        out = broker.compute_entitlements(40, {'a': claim})
+        assert out['a'] == 2
 
     def test_conservation_holds_with_caps_on_both_sides(self):
         for cap in (None, 0, 5, 50):
@@ -2423,7 +2500,7 @@ class TestUtilizationCapEntitlements:
                 out = broker.compute_entitlements(60, claims)
                 assert sum(out.values()) <= 60, (cap, eff)
                 for name, claim in claims.items():
-                    assert out[name] >= claim.attainable_floor(), (cap, eff)
+                    assert out[name] >= claim.allocation_floor(), (cap, eff)
 
     def test_all_gated_collapses_to_the_sum_of_floors(self):
         claims = {
@@ -2457,21 +2534,31 @@ class TestActivityInputSkew:
 
     def test_paired_signal_is_trusted(self):
         got = broker._activity_input(self._row())
+        assert got.armed is True
         assert got.blind is False
         assert got.demonstrated_need == 3
 
     def test_absent_signal_reads_blind(self):
         # A pre-migration row, or a claimant whose gate is off.
-        assert broker._activity_input(
-            self._row(demonstrated_need=None, activity_ts=None)).blind
+        got = broker._activity_input(
+            self._row(demonstrated_need=None, activity_ts=None))
+        assert got.armed is False
+        assert got.blind
+
+    def test_fresh_null_need_is_armed_but_blind(self):
+        got = broker._activity_input(self._row(demonstrated_need=None))
+        assert got.armed is True
+        assert got.blind
 
     def test_frozen_signal_from_an_old_writer_reads_blind(self):
         # The upsert builds its values dict from the columns ITS binary
         # knows, so a pre-gate writer advances heartbeat_ts while leaving
         # demonstrated_need frozen. Trusting a frozen 0 would walk a fully
-        # busy service down to its floor.
+        # busy service down to zero.
         stale = self._row(demonstrated_need=0, heartbeat_ts=1000.0 + 61.0)
-        assert broker._activity_input(stale).blind
+        got = broker._activity_input(stale)
+        assert got.armed is True
+        assert got.blind
 
     def test_negative_lag_reads_blind(self):
         assert broker._activity_input(self._row(heartbeat_ts=999.0)).blind
@@ -2480,11 +2567,35 @@ class TestActivityInputSkew:
         with mock.patch.dict(
                 'os.environ',
             {serve_constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR: 'false'}):
-            assert broker._activity_input(self._row()).blind
+            got = broker._activity_input(self._row())
+        assert got.armed is False
+        assert got.blind
+
+
+def test_armed_blind_claim_persists_fresh_null_need(_broker_db):
+    broker.upsert_claim('svc',
+                        pool_key=_POOL,
+                        weight=1.0,
+                        floor_replicas=70,
+                        gpus_per_replica=1,
+                        holdings_fill=70,
+                        launchable=True,
+                        activity={
+                            'demonstrated_need': None,
+                            'boot_hold': False,
+                        })
+    rows = serve_state.get_reserved_fill_claims(pool_key=_POOL)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row['demonstrated_need'] is None
+    assert row['activity_ts'] is not None
+    signal = broker._activity_input(row)
+    assert signal.armed is True
+    assert signal.blind is True
 
 
 class TestApplyUtilizationGate:
-    """Only claimants that have ever reported a signal are gated."""
+    """Current writers gate by default; explicit opt-outs stay static."""
 
     def _claim(self, **kwargs):
         base = dict(floor=0, weight=1.0, holdings_fill=0, launchable=True)
@@ -2495,7 +2606,8 @@ class TestApplyUtilizationGate:
         # Services that do not opt in must be byte-identical to before.
         claims = {'a': self._claim(floor=2, holdings_fill=9)}
         activity = {
-            'a': broker.ActivityInput(demonstrated_need=0,
+            'a': broker.ActivityInput(armed=False,
+                                      demonstrated_need=0,
                                       boot_hold=False,
                                       blind=True)
         }
@@ -2509,7 +2621,8 @@ class TestApplyUtilizationGate:
         # entitlement on every deploy.
         claims = {'a': self._claim(floor=2, holdings_fill=40)}
         activity = {
-            'a': broker.ActivityInput(demonstrated_need=0,
+            'a': broker.ActivityInput(armed=True,
+                                      demonstrated_need=0,
                                       boot_hold=False,
                                       blind=True)
         }
@@ -2526,16 +2639,90 @@ class TestApplyUtilizationGate:
         assert gated['a'].utilization_cap == 20
         assert state['a']['cap'] == 20
 
+    def test_nonzero_need_caps_the_declared_floor_to_measured_need(self):
+        claims = {'a': self._claim(floor=70, holdings_fill=0)}
+        activity = {
+            'a': broker.ActivityInput(armed=True,
+                                      demonstrated_need=1,
+                                      boot_hold=False,
+                                      blind=False)
+        }
+        prev = {
+            'a': {
+                'cap': 0,
+                'hot_until': 0.0,
+                'stepped_at': 0.0,
+                'blind_since': None
+            }
+        }
+        gated, state = broker._apply_utilization_gate(claims, activity, prev,
+                                                      1000.0)
+        assert gated['a'].utilization_cap == 2
+        assert state['a']['cap'] == 2
+
+    def test_armed_blind_claimant_starts_blind_grace(self):
+        claims = {'a': self._claim(floor=70, holdings_fill=70)}
+        activity = {
+            'a': broker.ActivityInput(armed=True,
+                                      demonstrated_need=0,
+                                      boot_hold=False,
+                                      blind=True)
+        }
+        gated, state = broker._apply_utilization_gate(claims, activity, {},
+                                                      1000.0)
+        assert gated['a'].utilization_cap == 70
+        assert state['a']['blind_since'] == 1000.0
+
+    def test_armed_blind_claimant_decays_past_grace_through_floor(self):
+        claims = {'a': self._claim(floor=70, holdings_fill=70)}
+        activity = {
+            'a': broker.ActivityInput(armed=True,
+                                      demonstrated_need=0,
+                                      boot_hold=False,
+                                      blind=True)
+        }
+        prev = {
+            'a': {
+                'cap': 70,
+                'hot_until': 0.0,
+                'stepped_at': 0.0,
+                'blind_since': 0.0,
+            }
+        }
+        gated, state = broker._apply_utilization_gate(claims, activity, prev,
+                                                      901.0)
+        assert gated['a'].utilization_cap == 52
+        assert state['a']['cap'] == 52
+
+    def test_explicit_opt_out_clears_prior_release_state(self):
+        claims = {'a': self._claim(floor=70, holdings_fill=20)}
+        activity = {
+            'a': broker.ActivityInput(armed=False,
+                                      demonstrated_need=0,
+                                      boot_hold=False,
+                                      blind=True)
+        }
+        prev = {
+            'a': {
+                'cap': 2,
+                'hot_until': 0.0,
+                'stepped_at': 0.0,
+                'blind_since': None,
+            }
+        }
+        gated, state = broker._apply_utilization_gate(claims, activity, prev,
+                                                      1000.0)
+        assert gated['a'].utilization_cap is None
+        assert not state
+
     def test_env_kill_switch_ungates_an_already_gated_service(self):
-        # Requirement 2/10: the process-wide kill switch disables the gate
-        # for EVERY service and reverts each to today's entitlement; "the
-        # gate never fails toward release". A claimant that already accrued
-        # release state must be FULLY ungated (cap dropped, state cleared),
-        # not frozen at its decayed cap the way a transient telemetry blind
-        # is (contrast test_blind_round_keeps_an_already_earned_cap_applied,
-        # which runs with the gate armed). Freezing under the kill switch
-        # would, past RESERVED_FILL_BLIND_GRACE_SECONDS, walk a BUSY service
-        # down to its floor via the very lever meant to stop the gate.
+        # Requirement 10: the process-wide kill switch disables the gate for
+        # every service and restores static entitlement. A claimant that
+        # already accrued release state must be fully ungated (cap dropped,
+        # state cleared), not frozen at its decayed cap the way a transient
+        # telemetry blind is. Freezing under the kill switch would eventually
+        # walk a busy service down through the very lever meant to stop the
+        # gate.
         now = 1_000_000.0
         claims = {'a': self._claim(floor=16, weight=4.0, holdings_fill=40)}
         # A genuinely BUSY claim: fresh paired signal, high demonstrated need.

@@ -23,6 +23,7 @@ import { REFRESH_INTERVALS } from '@/lib/config';
 import { sortData } from '@/data/utils';
 import { RotateCwIcon, Trash2Icon, AlertTriangleIcon } from 'lucide-react';
 import { useMobile } from '@/hooks/useMobile';
+import { useVisibleRefreshInterval } from '@/hooks/useVisibleRefreshInterval';
 import { Card } from '@/components/ui/card';
 import {
   Dialog,
@@ -532,30 +533,20 @@ export function VolumesTable({
 
   useEffect(() => {
     setData([]);
-    let isCurrent = true;
 
     // Only start fetching data after preloading is complete
     if (preloadingComplete) {
       fetchData();
-
-      const interval = setInterval(() => {
-        if (isCurrent && window.document.visibilityState === 'visible') {
-          fetchData();
-        }
-      }, refreshInterval);
-
-      return () => {
-        isCurrent = false;
-        requestVersionRef.current += 1;
-        clearInterval(interval);
-      };
     }
 
     return () => {
-      isCurrent = false;
       requestVersionRef.current += 1;
     };
-  }, [refreshInterval, fetchData, preloadingComplete]);
+  }, [fetchData, preloadingComplete]);
+
+  useVisibleRefreshInterval(preloadingComplete, refreshInterval, fetchData, {
+    catchUpOnlyWhenOverdue: true,
+  });
 
   // Reset to first page when data changes
   useEffect(() => {

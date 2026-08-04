@@ -4,10 +4,10 @@
 
 import React from 'react';
 import { render, screen } from '@testing-library/react';
-import { VersionTooltip } from './version-display';
+import { VersionDetails } from './version-display';
 
 describe('VersionDisplay - Plugin Filtering', () => {
-  describe('VersionTooltip filters hidden plugins', () => {
+  describe('VersionDetails filters hidden plugins', () => {
     test('should display visible plugins', () => {
       const plugins = [
         {
@@ -25,14 +25,12 @@ describe('VersionDisplay - Plugin Filtering', () => {
       ];
 
       const { container } = render(
-        <VersionTooltip
+        <VersionDetails
           version="1.0.0"
           commit="core123"
           plugins={plugins}
           showCommit={true}
-        >
-          <div>Version</div>
-        </VersionTooltip>
+        />
       );
 
       // Check that both visible plugins are rendered
@@ -59,14 +57,12 @@ describe('VersionDisplay - Plugin Filtering', () => {
       ];
 
       const { container } = render(
-        <VersionTooltip
+        <VersionDetails
           version="1.0.0"
           commit="core123"
           plugins={plugins}
           showCommit={true}
-        >
-          <div>Version</div>
-        </VersionTooltip>
+        />
       );
 
       // Check that visible plugin is rendered
@@ -89,14 +85,12 @@ describe('VersionDisplay - Plugin Filtering', () => {
       ];
 
       const { container } = render(
-        <VersionTooltip
+        <VersionDetails
           version="1.0.0"
           commit="core123"
           plugins={plugins}
           showCommit={true}
-        >
-          <div>Version</div>
-        </VersionTooltip>
+        />
       );
 
       // Plugin without the flag should still be displayed (defensive filtering)
@@ -133,14 +127,12 @@ describe('VersionDisplay - Plugin Filtering', () => {
       ];
 
       const { container } = render(
-        <VersionTooltip
+        <VersionDetails
           version="1.0.0"
           commit="core123"
           plugins={plugins}
           showCommit={true}
-        >
-          <div>Version</div>
-        </VersionTooltip>
+        />
       );
 
       // Check that visible plugins are rendered
@@ -156,18 +148,16 @@ describe('VersionDisplay - Plugin Filtering', () => {
       const plugins = [];
 
       const { container } = render(
-        <VersionTooltip
+        <VersionDetails
           version="1.0.0"
           commit="core123"
           plugins={plugins}
           showCommit={true}
-        >
-          <div>Version</div>
-        </VersionTooltip>
+        />
       );
 
       // Should still show commit info
-      expect(container.textContent).toContain('Core commit');
+      expect(container.textContent).toContain('Commit');
       expect(container.textContent).toContain('core123');
     });
 
@@ -188,14 +178,12 @@ describe('VersionDisplay - Plugin Filtering', () => {
       ];
 
       const { container } = render(
-        <VersionTooltip
+        <VersionDetails
           version="1.0.0"
           commit="core123"
           plugins={plugins}
           showCommit={true}
-        >
-          <div>Version</div>
-        </VersionTooltip>
+        />
       );
 
       // Should not show any plugin names

@@ -96,6 +96,57 @@ class TestGetJobsToCheckStatusInfo:
         batched = state.get_jobs_to_check_status_info(job_ids)
         assert batched == full
 
+    def test_status_check_helper_dedupes_duplicate_job_ids(
+            self, _mock_managed_jobs_db_conn, _seed_test_jobs, monkeypatch):
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 1)
+        job_id = _seed_test_jobs['job_id1']
+        expected = state.get_jobs_status_check_info([job_id])[job_id]
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            info = state.get_jobs_status_check_info([job_id, job_id])
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert info == {job_id: expected}
+        assert select_count == 1
+
+    def test_duplicate_job_ids_do_not_duplicate_tasks_or_queries(
+            self, _mock_managed_jobs_db_conn, _seed_test_jobs, monkeypatch):
+        full = state.get_jobs_to_check_status_info()
+        job_id = next(iter(full))
+        expected = full[job_id]
+        monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 1)
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            info = state.get_jobs_to_check_status_info([job_id, job_id])
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert info == {job_id: expected}
+        assert select_count == 1
+
     def test_refresh_snapshot_issues_single_select(self,
                                                    _mock_managed_jobs_db_conn,
                                                    _seed_test_jobs):
@@ -120,17 +171,45 @@ class TestGetJobsToCheckStatusInfo:
         assert info
         assert select_count == 1
 
-    def test_cancel_legacy_job_skips_refresh_snapshot_and_writes_signal(
+    def test_get_num_tasks_uses_one_count_select(self,
+                                                 _mock_managed_jobs_db_conn,
+                                                 _seed_multi_task_job,
+                                                 monkeypatch):
+        pipeline_id = _seed_multi_task_job['pipeline_job_id']
+        monkeypatch.setattr(
+            state, '_get_all_task_ids_statuses', lambda _job_id:
+            (_ for _ in ()).throw(
+                AssertionError('status rows materialized for task count')))
+        select_count = 0
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal select_count
+            if statement.lstrip().upper().startswith('SELECT'):
+                select_count += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
+        try:
+            task_count = state.get_num_tasks(pipeline_id)
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
+
+        assert task_count == 2
+        assert select_count == 1
+
+    def test_cancel_legacy_job_is_not_cancellable_through_modern_snapshot(
             self, _mock_managed_jobs_db_conn, tmp_path, monkeypatch):
         legacy_job_id = _insert_legacy_running_job(_mock_managed_jobs_db_conn)
-        monkeypatch.setattr('sky.jobs.constants.SIGNAL_FILE_PREFIX',
-                            str(tmp_path / '{}'))
+        monkeypatch.setattr('sky.jobs.constants.CONSOLIDATED_SIGNAL_PATH',
+                            str(tmp_path))
         monkeypatch.setattr(jobs_utils, '_controller_is_restarting',
                             lambda: False)
 
         result = jobs_utils.cancel_jobs_by_id([legacy_job_id],
                                               current_workspace='default')
 
-        assert result == f'Job with ID {legacy_job_id} is scheduled to be cancelled.'
-        assert ((tmp_path / str(legacy_job_id)).read_text(
-            encoding='utf-8') == jobs_utils.UserSignal.CANCEL.value)
+        assert result == 'No job to cancel.'
+        assert not (tmp_path / str(legacy_job_id)).exists()

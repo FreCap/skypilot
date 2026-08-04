@@ -118,30 +118,23 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
             self._lock.acquire()
             logger.info('Consolidation mode lock acquired')
 
-        # Wait before recovery only when some job is already claimed by a
-        # controller, or otherwise past the pure backlog states. In those
-        # cases a prior leader may still have detached controllers alive for a
-        # moment after lock release (e.g. rolling update), so recovery must not
-        # race them. Empty or pending-only backlogs can recover immediately.
+        # Wait before recovery whenever a nonterminal job exists. A previous
+        # image may have a detached scheduler that can claim a WAITING row
+        # after this check without an outer-generation fence. The fixed wait is
+        # a mixed-version drain aid; current images also serialize every claim
+        # with the durable generation.
         if managed_job_state.has_jobs_requiring_recovery_grace_wait():
             logger.info(
                 f'Waiting {_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS}s after '
                 'acquiring the consolidation mode lock before running '
                 'recovery, to let any previous leader finish shutting down')
-            time.sleep(_RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS)
+            lock_still_held = self._wait_for_recovery_grace()
         else:
-            logger.info('No controller-owned managed jobs require a '
-                        'post-acquire grace wait; running recovery '
-                        'immediately')
+            logger.info('No nonterminal managed jobs require a post-acquire '
+                        'grace wait; running recovery immediately')
+            lock_still_held = self._lock_still_held()
 
-        # The wait above widens the window between acquiring the lock and
-        # running recovery, during which the lock's underlying session could go
-        # silently stale (PostgresLock only). Re-verify we still hold the lock
-        # before recovery; otherwise another replica may have taken it and
-        # could be recovering concurrently, so step down rather than run a
-        # second recovery loop. _suicide_on_lock_loss re-touches the signal
-        # file and SIGTERMs the process, so leave the file in place here.
-        if not self._lock_still_held():
+        if not lock_still_held:
             self._suicide_on_lock_loss()
             return
 
@@ -171,6 +164,24 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
                 last_event = now
             time.sleep(1)
 
+    def _wait_for_recovery_grace(self) -> bool:
+        """Wait for old controllers while probing this leader's lock.
+
+        A dead PostgreSQL session releases its advisory lock immediately.  Do
+        not leave local controllers alive for the whole rolling-update grace
+        period after another replica can become leader.
+        """
+        remaining = _RECOVERY_WAIT_AFTER_ACQUIRE_SECONDS
+        if remaining <= 0:
+            return self._lock_still_held()
+        while remaining > 0:
+            sleep_seconds = min(_LOCK_PROBE_INTERVAL_SECONDS, remaining)
+            time.sleep(sleep_seconds)
+            remaining -= sleep_seconds
+            if not self._lock_still_held():
+                return False
+        return True
+
     def _lock_still_held(self) -> bool:
         """True iff we are confident this replica still owns the lock."""
         assert self._lock is not None
@@ -194,9 +205,10 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # brain, e.g. new job controllers might have been launched on the new
         # replica during rolling-update
         try:
-            managed_job_scheduler.kill_local_job_controllers()
+            managed_job_scheduler.fail_stop_local_job_controllers()
         except Exception:  # pylint: disable=broad-except
-            logger.exception('Failed to kill local controllers on lock-loss')
+            logger.exception(
+                'Failed to fail-stop local controllers on lock-loss')
         # SIGTERM to trigger graceful shutdown
         os.kill(os.getpid(), signal.SIGTERM)
 

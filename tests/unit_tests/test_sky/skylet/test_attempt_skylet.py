@@ -228,3 +228,17 @@ class TestRestartSkylet:
         assert self.env['port_file'].read_text() == str(
             constants.SKYLET_GRPC_PORT)
         assert self.env['version_file'].read_text() == constants.SKYLET_VERSION
+
+
+def test_running_v42_skylet_restarts_for_capability_contract(
+        skylet_env, monkeypatch):  # pylint: disable=redefined-outer-name
+    assert constants.SKYLET_VERSION == '44'
+    skylet_env['version_file'].write_text('42')
+    monkeypatch.setattr(attempt_skylet, '_find_running_skylet_pids',
+                        lambda: [12345])
+    restart = mock.Mock()
+    monkeypatch.setattr(attempt_skylet, 'restart_skylet', restart)
+
+    attempt_skylet._check_and_maybe_restart()  # pylint: disable=protected-access
+
+    restart.assert_called_once_with()

@@ -281,10 +281,12 @@ def _wait_for_service_registration(handle: backends.CloudVmRayResourceHandle,
         serve_utils.load_service_initialization_result(lb_port_payload)
 
 
-def _get_service_record(
-        service_name: str, pool: bool,
-        handle: backends.CloudVmRayResourceHandle,
-        backend: backends.CloudVmRayBackend) -> dict[str, Any] | None:
+def _get_service_record(service_name: str,
+                        pool: bool,
+                        handle: backends.CloudVmRayResourceHandle,
+                        backend: backends.CloudVmRayBackend,
+                        *,
+                        include_yaml: bool = False) -> dict[str, Any] | None:
     """Get service metadata without materializing the replica inventory."""
     noun = 'pool' if pool else 'service'
 
@@ -294,9 +296,15 @@ def _get_service_record(
         # Update fencing only needs service-row metadata; routing this through
         # full status serializes every historical replica and can make a
         # large-fleet update unable to start.
-        service_record = serve_state.get_service_from_name(service_name)
+        service_record = serve_state.get_service_status_snapshot(
+            service_name, require_version=True)
         if service_record is None or service_record['pool'] != pool:
             return None
+        if include_yaml:
+            version = service_record.get('version')
+            if version is not None:
+                service_record['yaml_content'] = serve_utils.get_yaml_content(
+                    service_name, version, service_record.get('resource_scope'))
         return service_record
 
     use_legacy = not handle.is_grpc_enabled_with_flag
@@ -1176,7 +1184,12 @@ def _update_impl_body(
     backend = backend_utils.get_backend_from_handle(handle)
     assert isinstance(backend, backends.CloudVmRayBackend)
 
-    service_record = _get_service_record(service_name, pool, handle, backend)
+    service_record = _get_service_record(service_name,
+                                         pool,
+                                         handle,
+                                         backend,
+                                         include_yaml=task is None and
+                                         workers is not None and pool)
 
     if service_record is None:
         cmd = 'sky jobs pool up' if pool else 'sky serve up'

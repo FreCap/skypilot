@@ -1282,7 +1282,10 @@ Refer to :ref:`Setup OAuth for SkyPilot API Server <api-server-oauth>` for detai
 Optional: High availability
 ---------------------------
 
-For production deployments, the API server can be configured for high availability by backing it with an external PostgreSQL database. See :ref:`api-server-ha` for details.
+For production deployments, guarded high availability runs separate API,
+executor, and controller replicas backed by external PostgreSQL and shared
+ReadWriteMany storage. See :ref:`api-server-ha` for prerequisites, values, and
+rollout verification.
 
 .. _sky-api-server-config:
 
@@ -1432,7 +1435,12 @@ To uninstall the API server, run:
 
     helm uninstall $RELEASE_NAME --namespace $NAMESPACE --wait
 
-This will delete the API server and all associated resources. ``--wait`` ensures that all the resources of SkyPilot API server are deleted before the command returns.
+This deletes resources still managed by the Helm release. ``--wait`` waits for
+those deletions before returning. A PVC annotated with
+``helm.sh/resource-policy: keep`` is deliberately orphaned, and a claim selected
+through ``storage.existingClaim`` is managed outside the release; Helm does not
+delete either claim. Inventory and remove retained storage separately only
+after its data-retention and rollback gates have passed.
 
 
 Other notes
@@ -1452,6 +1460,8 @@ You can customize the storage settings using the following values by creating a 
     storage:
       # Enable/disable persistent storage
       enabled: true
+      # Optional same-namespace PVC managed outside this Helm release.
+      existingClaim: ""
       # Storage class name - leave empty to use cluster default
       storageClassName: ""
       # Access modes - ReadWriteOnce or ReadWriteMany depending on storage class support
@@ -1562,12 +1572,34 @@ In helm deployment, a set of default permissions are granted to the API server t
       helm upgrade --install $RELEASE_NAME skypilot/skypilot-nightly --devel --reuse-values \
         --set rbac.manageSystemComponents=false
 
-If you want to use an existing service account and permissions that meet the :ref:`minimum permissions required for SkyPilot<k8s-permissions>` instead of the one managed by Helm, you can disable the creation of RBAC policies and specify the service account name to use:
+If you want Helm to manage the required permissions while reusing an existing
+service account, enable the existing-service-account binding mode and specify
+the service account name:
 
 .. code-block:: bash
 
     helm upgrade --install $RELEASE_NAME skypilot/skypilot-nightly --devel --reuse-values \
       --set rbac.create=false \
+      --set rbac.bindExistingServiceAccount=true \
+      --set rbac.serviceAccountName=my-existing-service-account
+
+The service account must already exist in the Helm release namespace and must
+be externally managed, not owned by the current Helm release. This mode makes
+Helm own only the RBAC policies. Do not switch a chart-created service account
+from ``rbac.create=true`` to this mode under the same name: removing that
+ServiceAccount from the release manifest can delete it. Provision a separate
+external service account first and perform a controlled workload identity
+rollout instead.
+
+If both the existing service account and its permissions already meet the
+:ref:`minimum permissions required for SkyPilot<k8s-permissions>`, disable all
+chart-managed RBAC and specify the service account name:
+
+.. code-block:: bash
+
+    helm upgrade --install $RELEASE_NAME skypilot/skypilot-nightly --devel --reuse-values \
+      --set rbac.create=false \
+      --set rbac.bindExistingServiceAccount=false \
       --set rbac.serviceAccountName=my-existing-service-account
 
 

@@ -26,25 +26,42 @@ from sky import global_user_state
 from sky import serve
 from sky import sky_logging
 from sky import task as task_lib
+from sky.serve import auth_tokens
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
+from sky.serve import controller_history
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
-from sky.serve import serve_history
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
+from sky.serve import system_recovery_route_lease
+from sky.serve import system_recovery_state
 from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import context_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
+from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
+# Keep the historical controller-module patch surface for tests and plugins.
+serve_history = controller_history.serve_history
+
+
+def _uses_current_request_classification_protocol(
+        request_data: dict[str, Any]) -> bool:
+    """Whether one LB payload declares the controller's current protocol."""
+    classification_history = request_data.get('request_classification_history')
+    if not isinstance(classification_history, dict):
+        return False
+    version = classification_history.get('classification_version')
+    return (isinstance(version, int) and not isinstance(version, bool) and
+            version == serve_history.REQUEST_CLASSIFICATION_PROTOCOL_VERSION)
 
 
 class _PreparedLoadBalancerReport(NamedTuple):
@@ -408,12 +425,14 @@ class SkyServeController:
         # READY; a replica that recovers with a new endpoint is thus
         # re-resolved.
         self._lb_replica_cache: dict[int, tuple[str, str, int]] = {}
+        self._lb_replica_cache_record_ids: dict[int, str] = {}
         # Superset of _lb_replica_cache for url -> replica_id translation
         # of the LB's in-flight report: keeps entries for replicas that
         # left READY but are still nonterminal, so a probe-blipped
         # replica's running job stays attributed to it (see
         # _get_lb_replica_info / _translate_in_flight).
         self._lb_translation_cache: dict[int, tuple[str, str, int]] = {}
+        self._lb_translation_cache_record_ids: dict[int, str] = {}
         # Monotonic generation for complete LB demand/capacity reports. It is
         # intentionally process-local: after restart logical scale-down stays
         # disabled until the new controller consumes a fresh report.
@@ -431,6 +450,13 @@ class SkyServeController:
 
     @contextlib.asynccontextmanager
     async def lifespan(self, _: fastapi.FastAPI):
+        if auth_tokens.is_resource_action_authority_enabled():
+            # Refuse to publish controller routes if the private authority
+            # credential overlaps any other ring mounted in this process.
+            # Reads remain fresh in the request client so later projected
+            # Secret rotations keep the same fail-closed boundary.
+            auth_tokens.validate_resource_action_preflight_auth_token_isolation(
+                required=True)
         uvicorn_access_logger = logging.getLogger('uvicorn.access')
         for handler in uvicorn_access_logger.handlers:
             handler.setFormatter(sky_logging.FORMATTER)
@@ -527,16 +553,21 @@ class SkyServeController:
                                'the load balancer routing snapshot.')
         active_versions = set(runtime_snapshot['active_versions'])
         replica_cache: dict[int, tuple[str, str, int]] = {}
+        replica_cache_record_ids: dict[int, str] = {}
         replica_info: dict[str, dict[str, str]] = {}
+        resolved_url_sources: dict[str, replica_managers.ReplicaInfo] = {}
         ready_infos = [
             info for info in replica_infos
             if (info.status == serve_state.ReplicaStatus.READY and
-                info.version in active_versions)
+                info.version in active_versions and
+                self._replica_manager.system_recovery_allows_routing(info))
         ]
         uncached_cluster_names = [
             info.cluster_name
             for info in ready_infos
-            if info.replica_id not in self._lb_replica_cache
+            if (info.replica_id not in self._lb_replica_cache or
+                getattr(self, '_lb_replica_cache_record_ids', {}).get(
+                    info.replica_id) != info.replica_record_id)
         ]
         cluster_records: dict[str, dict[str, Any] | None] = {}
         if uncached_cluster_names:
@@ -549,7 +580,9 @@ class SkyServeController:
         # query before resolving endpoints.
         uncached_handles: dict[int, Any] = {}
         for info in ready_infos:
-            if info.replica_id in self._lb_replica_cache:
+            if (info.replica_id in self._lb_replica_cache and
+                    getattr(self, '_lb_replica_cache_record_ids', {}).get(
+                        info.replica_id) == info.replica_record_id):
                 continue
             cluster_record = cluster_records.get(info.cluster_name)
             if cluster_record is None:
@@ -560,10 +593,18 @@ class SkyServeController:
             uncached_handles)
 
         for info in ready_infos:
+            is_capable = (
+                info.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE)
             cached = self._lb_replica_cache.get(info.replica_id)
+            if getattr(self, '_lb_replica_cache_record_ids',
+                       {}).get(info.replica_id) != info.replica_record_id:
+                cached = None
             if cached is None:
                 cluster_record = cluster_records.get(info.cluster_name)
                 if cluster_record is None:
+                    if is_capable:
+                        self._replica_manager.retire_system_recovery_route(info)
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its cluster record is not available yet; '
                                    'skipping for this sync.')
@@ -580,6 +621,8 @@ class SkyServeController:
                     # crashing the whole load_balancer_sync — it is simply
                     # not routable this round and will be re-resolved on
                     # the next sync.
+                    if is_capable:
+                        self._replica_manager.retire_system_recovery_route(info)
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its endpoint is not resolvable yet; '
                                    'skipping for this sync.')
@@ -599,12 +642,73 @@ class SkyServeController:
                         except (TypeError, ValueError):
                             gpu_count = 1
                 cached = (url, gpu_type, gpu_count)
-            replica_cache[info.replica_id] = cached
             url, gpu_type, gpu_count = cached
+            try:
+                normalized_url = (
+                    system_recovery_route_lease.normalize_route_url(url))
+            except system_recovery_route_lease.RouteLeaseError:
+                if is_capable:
+                    self._replica_manager.retire_system_recovery_route(info)
+                    logger.warning(
+                        'Recovery-capable replica %s has an '
+                        'invalid route URL; withholding it.', info.replica_id)
+                else:
+                    logger.warning(
+                        'Replica %s has an invalid route URL; '
+                        'withholding it.', info.replica_id)
+                continue
+            url = normalized_url
+            cached = (url, gpu_type, gpu_count)
+            route_marker = None
+            if is_capable:
+                route_marker = (
+                    self._replica_manager.system_recovery_route_marker(
+                        info, url))
+            replica_cache[info.replica_id] = cached
+            replica_cache_record_ids[info.replica_id] = info.replica_record_id
+            prior_info = resolved_url_sources.get(url)
+            if prior_info is not None:
+                for source_info in (prior_info, info):
+                    if (source_info.system_recovery_disposition ==
+                            system_recovery_state.SystemRecoveryDisposition.
+                            CAPABLE):
+                        self._replica_manager.retire_system_recovery_route(
+                            source_info)
+                # Keep the transport key present so this coherent snapshot is
+                # not mistaken for a spurious empty resolution.  New LBs parse
+                # the closed fence field and remove any retained client/lease.
+                replica_info[url] = {
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                        serve_constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+                }
+                logger.error(
+                    'Replica route collision for normalized URL %s '
+                    '(replicas %s and %s); fencing the URL.', url,
+                    prior_info.replica_id, info.replica_id)
+                continue
+            resolved_url_sources[url] = info
+            if is_capable and route_marker is None:
+                # A capable row without its exact process-local marker must
+                # never fall through as an ordinary outage-retained route.
+                replica_info[url] = {
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                        serve_constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+                }
+                continue
             replica_info[url] = {
                 'gpu_type': gpu_type,
                 'gpu_count': str(gpu_count),
             }
+            if route_marker is not None:
+                replica_info[url].update({
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_KEY:
+                        serve_constants.
+                        SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_VERSION,
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_REPLICA_ID_KEY:
+                        route_marker.replica_id,
+                    serve_constants.SYSTEM_RECOVERY_ROUTE_TOKEN_KEY:
+                        route_marker.route_token,
+                })
             is_zero_cost = getattr(info, 'is_zero_cost', None)
             if isinstance(is_zero_cost, bool):
                 # Placement-cost provenance is independent from the launch
@@ -638,19 +742,30 @@ class SkyServeController:
         # the whole drain window. The retirement drain itself does not
         # need translation -- it matches the LB's raw url-keyed report
         # against the replica's own url (see _ReplicaDrainTracker).
-        nonterminal_ids = {
-            info.replica_id for info in replica_infos if not info.is_terminal
+        nonterminal_records = {
+            info.replica_id: info.replica_record_id
+            for info in replica_infos
+            if not info.is_terminal
         }
         translation_cache = {
             replica_id: cached
             for replica_id, cached in self._lb_translation_cache.items()
-            if replica_id in nonterminal_ids
+            if (replica_id in nonterminal_records and
+                getattr(self, '_lb_translation_cache_record_ids', {}).get(
+                    replica_id) == nonterminal_records[replica_id])
+        }
+        translation_cache_record_ids = {
+            replica_id: nonterminal_records[replica_id]
+            for replica_id in translation_cache
         }
         translation_cache.update(replica_cache)
+        translation_cache_record_ids.update(replica_cache_record_ids)
         self._lb_translation_cache = translation_cache
+        self._lb_translation_cache_record_ids = translation_cache_record_ids
         # Replacing the cache with this sync's active replicas prunes the
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
+        self._lb_replica_cache_record_ids = replica_cache_record_ids
         return replica_info, len(ready_infos)
 
     def _url_to_replica_id_map(self) -> dict[str, int]:
@@ -1232,9 +1347,11 @@ class SkyServeController:
                 None, self._get_replica_counts, replica_infos)
             history_capacity_hint = self._get_capacity_hint(
                 replica_infos, logical_versions, replica_counts=replica_counts)
-            (request_history_accepted, response_time_history_accepted,
-             prediction_time_history_accepted, _) = await asyncio.gather(
-                 self._persist_request_history(request_data),
+            ((request_history_accepted,
+              request_classification_history_accepted),
+             response_time_history_accepted, prediction_time_history_accepted,
+             _) = await asyncio.gather(
+                 self._persist_request_histories(request_data),
                  self._persist_response_time_history(request_data),
                  self._persist_prediction_time_history(request_data),
                  self._persist_autoscaler_history(replica_counts,
@@ -1295,7 +1412,7 @@ class SkyServeController:
 
             def raise_deferred_sync_cancellation() -> None:
                 if deferred_sync_cancellation is not None:
-                    raise deferred_sync_cancellation
+                    raise deferred_sync_cancellation  # pylint: disable=raising-bad-type
 
             tail_operation = loop.run_in_executor(
                 None,
@@ -1364,6 +1481,7 @@ class SkyServeController:
                 'routing_spec': routing_spec,
                 'capacity_hint': capacity_hint,
                 'request_history_accepted': request_history_accepted,
+                'request_classification_history_accepted': request_classification_history_accepted,
                 'response_time_history_accepted': response_time_history_accepted,
                 'prediction_time_history_accepted': prediction_time_history_accepted,
                 # Additive protocol negotiation for mixed-version rollouts.
@@ -1781,7 +1899,7 @@ class SkyServeController:
                 invalidate_demand_transition(transition_state)
                 cancellation = demand_transition_cancellation
                 demand_transition_cancellation = None
-                raise cancellation
+                raise cancellation  # pylint: disable=raising-bad-type
 
         lock_wait_started_at = time.monotonic()
         async with role_lock:
@@ -2155,291 +2273,66 @@ class SkyServeController:
             None, self._lb_report_authority, request_data.get('lb_session_id'))
         if not authority[0]:
             return fastapi.Response(status_code=503)
-        (request_accepted, response_time_accepted,
+        ((request_accepted, classification_accepted), response_time_accepted,
          prediction_time_accepted) = await asyncio.gather(
-             self._persist_request_history(request_data),
+             self._persist_request_histories(request_data),
              self._persist_response_time_history(request_data),
              self._persist_prediction_time_history(request_data),
          )
         return responses.JSONResponse(content={
             'request_history_accepted': request_accepted,
+            'request_classification_history_accepted': classification_accepted,
             'response_time_history_accepted': response_time_accepted,
             'prediction_time_history_accepted': prediction_time_accepted,
         },
                                       status_code=200)
 
-    async def _persist_request_history(self, request_data: dict[str,
-                                                                Any]) -> bool:
-        """Persist history without allowing observability to fail sync."""
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(None,
-                                              self._record_request_history,
-                                              request_data)
-        except ValueError as e:
-            # A malformed snapshot cannot become valid by retrying. Drop it
-            # with an acknowledgement so a mixed-version or corrupted LB
-            # cannot hammer the controller every sync forever.
-            logger.warning('Dropping invalid load balancer request history for '
-                           f'{self._service_name!r}: '
-                           f'{common_utils.format_exception(e)}')
-            return True
-        except Exception as e:  # pylint: disable=broad-except
-            # Request history is observability, not control-plane state.
-            # Keep routing and autoscaling available while asking the LB to
-            # retry only its bounded cumulative counters.
-            logger.warning(
-                'Failed to persist load balancer request history for '
-                f'{self._service_name!r}: '
-                f'{common_utils.format_exception(e)}')
-            return False
+    async def _persist_request_histories(
+            self, request_data: dict[str, Any]) -> tuple[bool, bool]:
+        """Persist arrivals only after current-v1 support is durable."""
+        if _uses_current_request_classification_protocol(request_data):
+            classification_accepted = (
+                await
+                self._persist_request_classification_history(request_data))
+            if not classification_accepted:
+                # Do not expose positive arrival rows without the paired
+                # support fields. The load balancer retains both snapshots and
+                # retries the classification transaction first.
+                return False, False
+            request_accepted = await self._persist_request_history(request_data)
+            return request_accepted, True
 
-    def _record_request_history(self, request_data: dict[str, Any]) -> bool:
-        """Persist one live LB process's cumulative minute counters."""
-        request_history = request_data.get('request_history')
-        if request_history is None:
-            return True
-        service_hash = getattr(self, '_service_hash', None)
-        if service_hash is None:
-            # Compatibility for direct/legacy controller construction without
-            # an incarnation fence. Do not create history that could leak into
-            # a later same-name service.
-            return True
-        lb_session_id = request_data.get('lb_session_id')
-        process_session_id = request_data.get('request_history_session_id')
-        if (not isinstance(lb_session_id, str) or not lb_session_id or
-                not isinstance(process_session_id, str) or
-                len(process_session_id) != 32 or
-                any(character not in '0123456789abcdef'
-                    for character in process_session_id)):
-            raise ValueError('Invalid request history reporter session.')
-        reporter_session_id = f'{lb_session_id}:{process_session_id}'
-        serve_history.record_request_activity(
-            self._service_name,
-            service_hash,
-            reporter_session_id,
-            request_history,
+        # Legacy and future-version payloads keep independent acknowledgement:
+        # their attempt history remains useful even when this controller cannot
+        # understand the classification envelope.
+        request_accepted, classification_accepted = await asyncio.gather(
+            self._persist_request_history(request_data),
+            self._persist_request_classification_history(request_data),
         )
-        return True
+        return request_accepted, classification_accepted
 
-    async def _persist_response_time_history(
-            self, request_data: dict[str, Any]) -> bool:
-        """Accept legacy HTTP histograms during a mixed-version rollout."""
-        if request_data.get('response_time_history') is None:
-            return True
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(
-                None, self._record_response_time_history, request_data)
-        except ValueError as e:
-            logger.warning(
-                'Dropping invalid legacy load balancer response-time '
-                f'history for {self._service_name!r}: '
-                f'{common_utils.format_exception(e)}')
-            return True
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to persist legacy load balancer '
-                           f'response-time history for '
-                           f'{self._service_name!r}: '
-                           f'{common_utils.format_exception(e)}')
-            return False
+    # These functions intentionally bind as methods on the controller facade.
+    # pylint: disable=protected-access
+    _persist_request_history = controller_history._persist_request_history
+    _record_request_history = controller_history._record_request_history
+    _persist_request_classification_history = (
+        controller_history._persist_request_classification_history)
+    _record_request_classification_history = (
+        controller_history._record_request_classification_history)
+    _persist_response_time_history = (
+        controller_history._persist_response_time_history)
+    _record_response_time_history = (
+        controller_history._record_response_time_history)
+    _persist_prediction_time_history = (
+        controller_history._persist_prediction_time_history)
+    _record_prediction_time_history = (
+        controller_history._record_prediction_time_history)
+    _persist_autoscaler_history = controller_history._persist_autoscaler_history
+    _record_autoscaler_history = controller_history._record_autoscaler_history
+    _get_accelerator_history_breakdown = (
+        controller_history._get_accelerator_history_breakdown)
 
-    def _record_response_time_history(self, request_data: dict[str,
-                                                               Any]) -> bool:
-        """Persist one legacy LB process's cumulative HTTP histograms."""
-        response_time_history = request_data.get('response_time_history')
-        if response_time_history is None:
-            return True
-        service_hash = getattr(self, '_service_hash', None)
-        if service_hash is None:
-            return True
-        lb_session_id = request_data.get('lb_session_id')
-        process_session_id = request_data.get('request_history_session_id')
-        if (not isinstance(lb_session_id, str) or not lb_session_id or
-                not isinstance(process_session_id, str) or
-                len(process_session_id) != 32 or
-                any(character not in '0123456789abcdef'
-                    for character in process_session_id)):
-            raise ValueError('Invalid response history reporter session.')
-        reporter_session_id = f'{lb_session_id}:{process_session_id}'
-        serve_history.record_response_times(
-            self._service_name,
-            service_hash,
-            reporter_session_id,
-            response_time_history,
-        )
-        return True
-
-    async def _persist_prediction_time_history(
-            self, request_data: dict[str, Any]) -> bool:
-        """Persist prediction histograms without allowing them to fail sync."""
-        if request_data.get('prediction_time_history') is None:
-            return True
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(
-                None, self._record_prediction_time_history, request_data)
-        except ValueError as e:
-            # A malformed bounded snapshot cannot become valid by retrying.
-            logger.warning('Dropping invalid load balancer prediction-time '
-                           f'history for {self._service_name!r}: '
-                           f'{common_utils.format_exception(e)}')
-            return True
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to persist load balancer prediction-time '
-                           f'history for {self._service_name!r}: '
-                           f'{common_utils.format_exception(e)}')
-            return False
-
-    def _record_prediction_time_history(self, request_data: dict[str,
-                                                                 Any]) -> bool:
-        """Persist one live LB process's cumulative prediction histograms."""
-        prediction_time_history = request_data.get('prediction_time_history')
-        if prediction_time_history is None:
-            return True
-        service_hash = getattr(self, '_service_hash', None)
-        if service_hash is None:
-            return True
-        lb_session_id = request_data.get('lb_session_id')
-        process_session_id = request_data.get('request_history_session_id')
-        if (not isinstance(lb_session_id, str) or not lb_session_id or
-                not isinstance(process_session_id, str) or
-                len(process_session_id) != 32 or
-                any(character not in '0123456789abcdef'
-                    for character in process_session_id)):
-            raise ValueError('Invalid prediction history reporter session.')
-        reporter_session_id = f'{lb_session_id}:{process_session_id}'
-        serve_history.record_prediction_times(
-            self._service_name,
-            service_hash,
-            reporter_session_id,
-            prediction_time_history,
-        )
-        return True
-
-    async def _persist_autoscaler_history(
-        self,
-        replica_counts: dict[str, int | str],
-        capacity_hint: dict[str, Any],
-    ) -> None:
-        """Persist controller gauges without allowing history to fail sync."""
-        loop = asyncio.get_running_loop()
-        observed_at = time.time()
-        try:
-            await loop.run_in_executor(None, self._record_autoscaler_history,
-                                       replica_counts, capacity_hint,
-                                       observed_at)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to persist autoscaler history for '
-                           f'{self._service_name!r}: '
-                           f'{common_utils.format_exception(e)}')
-
-    def _record_autoscaler_history(
-        self,
-        replica_counts: dict[str, Any],
-        capacity_hint: dict[str, Any],
-        timestamp: float | None = None,
-    ) -> int:
-        """Persist one minute observation from already-computed sync state."""
-        service_hash = getattr(self, '_service_hash', None)
-        if service_hash is None:
-            return 0
-        replica_unit = replica_counts.get('replica_unit')
-        ready_capacity = replica_counts.get('ready_replicas')
-        total_capacity = replica_counts.get('total_replicas')
-        provisioning_capacity = capacity_hint.get('provisioning_replicas')
-        if (not isinstance(replica_unit, str) or
-                replica_unit not in {'physical_backend', 'logical_slot'} or
-                not isinstance(ready_capacity, int) or
-                not isinstance(total_capacity, int) or
-                not isinstance(provisioning_capacity, int)):
-            return 0
-
-        autoscaler_info = self._autoscaler.info()
-        demand_target = self._autoscaler.get_final_target_num_replicas()
-        fill_target = autoscaler_info.get('fill_target')
-        if not isinstance(fill_target, int) or isinstance(fill_target, bool):
-            fill_target = 0
-        capacity_target = max(demand_target, fill_target)
-        peak_in_flight = autoscaler_info.get('in_flight_total')
-        peak_queue_depth = autoscaler_info.get('queue_depth')
-        if not isinstance(peak_in_flight, int) or isinstance(
-                peak_in_flight, bool):
-            peak_in_flight = None
-        if not isinstance(peak_queue_depth, int) or isinstance(
-                peak_queue_depth, bool):
-            peak_queue_depth = None
-        accelerator_breakdown = self._get_accelerator_history_breakdown(
-            replica_counts, fill_target)
-        return serve_history.record_autoscaler_snapshot(
-            self._service_name,
-            service_hash,
-            self._history_session_id,
-            version=self._applied_version,
-            replica_unit=replica_unit,
-            demand_target=demand_target,
-            capacity_target=capacity_target,
-            ready_capacity=ready_capacity,
-            provisioning_capacity=provisioning_capacity,
-            total_capacity=total_capacity,
-            peak_in_flight=peak_in_flight,
-            peak_queue_depth=peak_queue_depth,
-            accelerator_breakdown=accelerator_breakdown,
-            timestamp=timestamp,
-        )
-
-    def _get_accelerator_history_breakdown(
-            self, replica_counts: dict[str, Any],
-            aggregate_fill_target: int) -> dict[str, Any] | None:
-        """Build one complete exact-card observation, or mark unavailable."""
-        shapes = getattr(self._autoscaler, 'configured_accelerator_shapes', {})
-        if not isinstance(shapes, dict) or not shapes:
-            return None
-        if not self._autoscaler.has_recomputed_with_fresh_data():
-            return None
-        configured = list(shapes)
-        demand_target = getattr(self._autoscaler,
-                                'target_num_replicas_by_accelerator', {})
-        if (not isinstance(demand_target, dict) or sum(demand_target.values())
-                != self._autoscaler.target_num_replicas):
-            # An aggregate fallback or mixed-version report cannot be
-            # reconstructed as exact-card zeroes.
-            return None
-
-        def mapping(field: str) -> dict[str, int]:
-            raw = replica_counts.get(field, {})
-            return raw if isinstance(raw, dict) else {}
-
-        fill_target = mapping('fill_target_by_accelerator')
-        if sum(fill_target.values()) != aggregate_fill_target:
-            # A broker grant can briefly outlive the exact physical supply
-            # observation that attributed it. Preserve the aggregate target,
-            # but do not publish an invented exact-card history overlay.
-            return None
-
-        return {
-            'capacity_semantics_version':
-                serve_history.ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION,
-            'configured_accelerators': configured,
-            'min_replicas': dict(
-                getattr(self._autoscaler, 'min_replicas_by_accelerator', {})),
-            'demand_target': dict(demand_target),
-            'warm_retention_target': dict(
-                getattr(self._autoscaler,
-                        'warm_retention_target_by_accelerator', {})),
-            'cold_launch_authority': dict(
-                getattr(self._autoscaler,
-                        'cold_launch_authority_by_accelerator', {})),
-            'ready_capacity': mapping('ready_replicas_by_accelerator'),
-            'provisioning_capacity':
-                mapping('provisioning_replicas_by_accelerator'),
-            'total_capacity': mapping('total_replicas_by_accelerator'),
-            'zero_cost_ready_capacity':
-                mapping('zero_cost_ready_replicas_by_accelerator'),
-            'fill_target': fill_target,
-            'free_reserved_slots':
-                mapping('free_reserved_slots_by_accelerator'),
-        }
+    # pylint: enable=protected-access
 
     def _owns_current_service(self) -> bool:
         """Whether this controller parent still owns the exact DB row."""
@@ -2720,7 +2613,7 @@ class SkyServeController:
         getter = getattr(placer, 'zero_cost_locations', None)
         if not callable(getter):
             return {}
-        locations = getter()
+        locations = getter()  # pylint: disable=not-callable
         if not isinstance(locations, list) or not locations:
             return {}
         shapes = reserved_capacity.zero_cost_pool_shapes(locations)
@@ -3697,6 +3590,11 @@ class SkyServeController:
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
         while True:
+            # Clear before reading durable replica and placement state. Typed
+            # feedback that arrived before this point is consumed by this tick;
+            # feedback that arrives during the tick leaves the signal set and
+            # makes the interval wait below return immediately.
+            self._replica_manager.clear_scale_reconciliation_signal()
             try:
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
@@ -3731,6 +3629,22 @@ class SkyServeController:
                 # for better decoupling.
                 scaling_options = decision_autoscaler.generate_scaling_decisions(
                     replica_infos, active_versions)
+                target_num_replicas = None
+                if (decision_autoscaler.has_recomputed_with_fresh_data()
+                        is True):
+                    demand_target = (
+                        decision_autoscaler.get_final_target_num_replicas())
+                    fill_target = 0
+                    if (getattr(decision_autoscaler, 'reserved_capacity_fill',
+                                False) is True):
+                        fill_target = getattr(decision_autoscaler,
+                                              '_fill_target', 0)
+                    if (type(fill_target) is not int or  # pylint: disable=unidiomatic-typecheck
+                            fill_target < 0):
+                        fill_target = 0
+                    target_num_replicas = max(demand_target, fill_target)
+                self._replica_manager.publish_target_num_replicas(
+                    target_num_replicas, expected_version=decision_version)
                 if not self._persist_cost_rebalance_state(decision_autoscaler):
                     logger.warning(
                         'Suppressing new cost-rebalance replacements because '
@@ -3755,7 +3669,8 @@ class SkyServeController:
                         # reads the durable quarantine and active-version
                         # fallback before constructing any runtime objects.
                         os._exit(1)  # pylint: disable=protected-access
-                    time.sleep(self._autoscaler.get_decision_interval())
+                    self._replica_manager.wait_for_scale_reconciliation(
+                        self._autoscaler.get_decision_interval())
                     continue
                 if (isinstance(decision_autoscaler,
                                autoscalers.ConcurrencyAutoscaler) and
@@ -3947,7 +3862,8 @@ class SkyServeController:
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            time.sleep(self._autoscaler.get_decision_interval())
+            self._replica_manager.wait_for_scale_reconciliation(
+                self._autoscaler.get_decision_interval())
 
     def run(self, controller_socket: socket.socket | None = None) -> None:
 
@@ -3999,7 +3915,9 @@ class SkyServeController:
                                           constants.SKYPILOT_DEFAULT_WORKSPACE),
                         existing_replica_infos=replica_infos,
                         globally_managed=getattr(self, '_service_hash',
-                                                 None) is not None)
+                                                 None) is not None,
+                        service_name=self._service_name,
+                        service_hash=getattr(self, '_service_hash', None))
                     paid_admission = (
                         paid_capacity.admission_snapshot_by_location(budget))
                 except Exception as e:  # pylint: disable=broad-except
@@ -4044,6 +3962,17 @@ class SkyServeController:
                 request: fastapi.Request) -> fastapi.Response:
             request_data = await request.json()
             return await self._handle_load_balancer_sync(request_data)
+
+        @self._app.post(
+            serve_constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH,
+            dependencies=[sync_auth_dependency, controller_owner_dependency])
+        async def load_balancer_system_recovery_route_lease(
+        ) -> fastapi.Response:
+            # Constant-time in-memory projection: endpoint resolution, fleet
+            # rows, cloud APIs, and application state are deliberately absent.
+            return responses.JSONResponse(content=(
+                self._replica_manager.system_recovery_route_lease_snapshot()),
+                                          status_code=200)
 
         @self._app.post(
             serve_constants.LB_CONTROLLER_ROLE_PATH,
@@ -4282,6 +4211,7 @@ def run_controller(service_name: str,
                    controller_ip: str | None = None,
                    enforce_launch_fence: bool = False,
                    controller_socket: socket.socket | None = None):
+    db_utils.set_postgres_connection_metrics_process_role('serve-controller')
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()

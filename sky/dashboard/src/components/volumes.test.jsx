@@ -85,6 +85,13 @@ function volume(name) {
   };
 }
 
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
+
 async function flushPromises(rounds = 6) {
   for (let i = 0; i < rounds; i += 1) {
     await act(async () => {
@@ -139,6 +146,69 @@ describe('Volumes request ownership', () => {
     expect(screen.getByText('current-volume')).toBeInTheDocument();
     expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves the due boundary when visibility returns before the next refresh', async () => {
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    dashboardCache.get.mockResolvedValue([volume('current-volume')]);
+    setDocumentVisibility('hidden');
+    const { unmount } = render(<Volumes />);
+    let mounted = true;
+
+    try {
+      await screen.findByText('current-volume');
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        jest.advanceTimersByTime(30000 - 1);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(30000);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+      unmount();
+      mounted = false;
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => {
+        jest.advanceTimersByTime(30000);
+        await Promise.resolve();
+      });
+      expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+    } finally {
+      if (mounted) {
+        unmount();
+      }
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
   });
 
   it('lets a manual refresh own the only foreground fetch', async () => {

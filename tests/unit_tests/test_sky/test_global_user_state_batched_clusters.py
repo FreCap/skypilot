@@ -5,10 +5,13 @@ replicas) can avoid the per-name DB round-trip that would otherwise show up
 as a double N+1 inside ReplicaInfo.to_info_dict.
 """
 # pylint: disable=protected-access
+from unittest import mock
+
 import sqlalchemy
 from sqlalchemy import event
 
 from sky import global_user_state
+from sky import models
 from sky.skylet import constants
 from sky.utils.db import db_utils
 
@@ -34,14 +37,28 @@ class _MinimalHandle:
     launched_resources = None
 
 
-def _add_cluster(name: str, *, is_managed: bool = False) -> None:
+def _add_cluster(name: str,
+                 *,
+                 is_managed: bool = False,
+                 ready: bool = False,
+                 workload_type: str | None = None) -> None:
     global_user_state.add_or_update_cluster(
         cluster_name=name,
         cluster_handle=_MinimalHandle(),
         requested_resources=set(),
-        ready=False,
+        ready=ready,
         is_managed=is_managed,
+        workload_type=workload_type,
     )
+
+
+def _set_cluster_user_hash(name: str, user_hash: str | None) -> None:
+    engine = global_user_state._db_manager.get_engine()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(global_user_state.cluster_table).where(
+                global_user_state.cluster_table.c.name == name).values(
+                    user_hash=user_hash))
 
 
 def test_get_clusters_from_names_empty_input_returns_empty(
@@ -228,6 +245,21 @@ def test_get_cluster_status_fields_all_unmanaged_uses_one_select(
     assert len(select_statements) == 1
 
 
+def test_get_managed_cluster_status_fields_filters_workload_type(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('user-service', workload_type='service')
+    _add_cluster('managed-service', is_managed=True, workload_type='service')
+    _add_cluster('managed-pool', is_managed=True, workload_type='pool')
+    _add_cluster('managed-job', is_managed=True, workload_type='managed_job')
+    _add_cluster('managed-legacy', is_managed=True)
+
+    result = global_user_state.get_managed_cluster_status_fields('service')
+
+    assert set(result) == {'managed-service'}
+    assert result['managed-service'][0] == 'INIT'
+
+
 def test_get_clusters_from_names_matches_single_helper(tmp_path, monkeypatch):
     """Batched record for an existing cluster must match the single-name
     helper field-for-field in summary mode, so callers can swap one for the
@@ -251,3 +283,68 @@ def test_get_clusters_from_names_matches_single_helper(tmp_path, monkeypatch):
             assert type(batched[key]) is type(single[key])  # noqa: E721
         else:
             assert batched[key] == single[key], f'mismatch on {key}'
+
+
+def test_get_clusters_current_user_filter_includes_legacy_null_user_hash(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    global_user_state.add_or_update_user(models.User(id='user-a', name='Alice'))
+    global_user_state.add_or_update_user(models.User(id='user-b', name='Bob'))
+    _add_cluster('owned-by-user-a', ready=True)
+    _set_cluster_user_hash('owned-by-user-a', 'user-a')
+    _add_cluster('legacy-null-user', ready=True)
+    _set_cluster_user_hash('legacy-null-user', None)
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        with mock.patch('sky.global_user_state.common_utils.get_user_hash',
+                        return_value='user-a'):
+            records = global_user_state.get_clusters(
+                user_hashes_filter={'user-a'}, summary_response=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    names = {record['name'] for record in records}
+    assert names == {'legacy-null-user', 'owned-by-user-a'}
+    legacy_record = next(
+        record for record in records if record['name'] == 'legacy-null-user')
+    assert legacy_record['user_hash'] == 'user-a'
+    assert legacy_record['user_name'] == 'Alice'
+    assert len(select_statements) == 2
+
+
+def test_get_clusters_other_user_filter_excludes_legacy_null_user_hash(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    global_user_state.add_or_update_user(models.User(id='user-a', name='Alice'))
+    global_user_state.add_or_update_user(models.User(id='user-b', name='Bob'))
+    _add_cluster('owned-by-user-b', ready=True)
+    _set_cluster_user_hash('owned-by-user-b', 'user-b')
+    _add_cluster('legacy-null-user', ready=True)
+    _set_cluster_user_hash('legacy-null-user', None)
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        with mock.patch('sky.global_user_state.common_utils.get_user_hash',
+                        return_value='user-a'):
+            records = global_user_state.get_clusters(
+                user_hashes_filter={'user-b'}, summary_response=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert [record['name'] for record in records] == ['owned-by-user-b']
+    assert len(select_statements) == 1

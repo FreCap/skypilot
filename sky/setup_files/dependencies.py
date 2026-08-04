@@ -7,6 +7,8 @@ This file is imported by setup.py, so:
 """
 import sys
 
+COORDINATED_WORKER_RUNTIME_PACKAGE_VERSION = '1.0.0'
+
 clouds_with_ray = ['ibm', 'docker', 'scp']
 
 install_requires = [

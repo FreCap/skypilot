@@ -117,6 +117,7 @@ export default function PoolDetailPage() {
   const [initialLoading, setInitialLoading] = useState(true);
   const [error, setError] = useState(null);
   const requestVersionRef = useRef(0);
+  const activePoolNameRef = useRef(poolName);
   const refreshInFlightRef = useRef(null);
 
   // Pagination state
@@ -211,6 +212,11 @@ export default function PoolDetailPage() {
   }, [fetchPoolData, poolName, poolStatusArgs]);
 
   useEffect(() => {
+    if (activePoolNameRef.current !== poolName) {
+      activePoolNameRef.current = poolName;
+      setPoolData(null);
+      setError(null);
+    }
     fetchPoolData();
     return () => {
       requestVersionRef.current += 1;
@@ -366,7 +372,12 @@ export default function PoolDetailPage() {
     setCurrentPage(1);
   };
 
-  if (!router.isReady || initialLoading) {
+  // Effects run after render. On a route change, do not expose the previous
+  // pool's details, actions, or idle loading state before the effect above
+  // advances ownership and clears its snapshot.
+  const ownsRouteState = activePoolNameRef.current === poolName;
+
+  if (!router.isReady || !ownsRouteState || initialLoading) {
     return (
       <>
         <Head>

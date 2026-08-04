@@ -12,6 +12,18 @@ SkyPilot is a system to run, manage, and scale AI workloads on any AI infrastruc
 - **Multi-cloud and multi-Kubernetes**: Unified interface across 25+ clouds and multiple K8s clusters
 - Cost optimization and GPU availability maximization
 
+## Repository Authority
+
+Treat `boltz-bio/skypilot` and its `improvements` branch as the sole
+authoritative source for code, history, issues, pull requests, comparisons, and
+development baselines in this repository. Fetch, diff, blame, search, and branch
+from `origin/improvements`.
+
+Do not add, fetch, consult, compare, or cherry-pick from
+`skypilot-org/skypilot`, including its `main` or `master` branches, unless the
+user explicitly requests that upstream repository. Pin cross-repository modules
+and artifacts to an immutable commit or tag from `boltz-bio/skypilot`.
+
 ## Repository Structure
 
 ```
@@ -87,7 +99,7 @@ export SKYPILOT_DEBUG=1                    # Enable debug logging
 **Always run `format.sh` before committing:**
 
 ```bash
-bash format.sh         # Format changed files (vs origin/master)
+bash format.sh         # Format changed files (vs origin/improvements)
 bash format.sh --all   # Format entire codebase
 bash format.sh --files path/to/file.py  # Format specific files
 ```
@@ -368,7 +380,30 @@ kebab-case filename such as
 
 ## Pull Request Guidelines
 
-1. **Branch from master**, create descriptive branch name
+### Transitional Feature PR Stacks
+
+When a feature introduces temporary transition, compatibility, dual-write,
+rollout, or fallback code that should be removed after the new behavior is
+confirmed, create the removal change at the same time as the feature change.
+
+- Submit the feature/transition PR and the cleanup/removal PR as a stack using
+  [gh-stack](https://github.github.com/gh-stack/). Do not leave the cleanup as
+  only a TODO or a future issue.
+- When an initiative replaces an old solution with a better-architected one,
+  mark the old path as deprecated in the code, user/operator documentation,
+  and canonical design as applicable. Immediately create the stacked PR that
+  removes the deprecated path; do not wait until after rollout to author it.
+- Keep the removal PR in draft or otherwise blocked until the feature's
+  documented validation and rollout gates have passed. The feature PR must
+  link to the removal PR, and the removal PR must state its exact merge gate.
+- Include tests in both PRs: the transition PR must test mixed/rollout states,
+  while the removal PR must test the final steady state without the temporary
+  path.
+- Record both PRs and the evidence required to unblock removal in the canonical
+  design document. Update the stacked removal PR whenever implementation or
+  rollout decisions change.
+
+1. **Branch from improvements**, create descriptive branch name
 2. **Run `format.sh`** before committing
 3. **Add tests** for core system changes
 4. **Run smoke tests** for significant changes
@@ -580,6 +615,5 @@ sky jobs launch <job-spec.yaml>
 
 - **Full contributing guide**: `docs/source/developers/CONTRIBUTING.md`
 - **User docs**: https://docs.skypilot.co/
-- **GitHub Issues**: https://github.com/skypilot-org/skypilot/issues
-- **Discussions**: https://github.com/skypilot-org/skypilot/discussions
+- **GitHub Issues**: https://github.com/boltz-bio/skypilot/issues
 - **Slack**: http://slack.skypilot.co

@@ -415,7 +415,7 @@ export function WorkspaceEditor({ workspaceName, isNewWorkspace = false }) {
     try {
       const [clustersResponse, managedJobsResponse, enabledClouds] =
         await Promise.all([
-          dashboardCache.get(getClusters),
+          dashboardCache.get(getClusters, [{ workspaces: [workspaceName] }]),
           dashboardCache.get(getManagedJobs, [
             {
               allUsers: true,

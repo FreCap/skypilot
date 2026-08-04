@@ -302,6 +302,64 @@ describe('ContextDetails', () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
+  it('splits the used block by scheduling priority', async () => {
+    render(
+      <ContextDetails
+        contextName="dev-cluster"
+        gpusInContext={[
+          {
+            gpu_name: 'A100',
+            gpu_requestable_qty_per_node: 8,
+            gpu_total: 16,
+            gpu_free: 2,
+            gpu_not_ready: 0,
+            gpu_preemptible: 6,
+            gpu_preemptible_breakdown: {
+              'drill (-500)': 2,
+              'inference-low (-1000)': 4,
+            },
+          },
+        ]}
+        nodesInContext={[node]}
+      />
+    );
+
+    // 16 total - 2 free = 14 in use, of which 6 sit below the top tier.
+    expect(screen.getByTitle('8 used')).toBeInTheDocument();
+    expect(screen.getByTitle('2 free')).toBeInTheDocument();
+    // Classes are listed largest-first under the summary line. Asserted on the
+    // raw attribute because title queries collapse the newlines away.
+    expect(screen.getByTitle(/6 preemptible/)).toHaveAttribute(
+      'title',
+      '6 preemptible (reclaimable by higher-priority workloads)\n' +
+        'inference-low (-1000): 4\n' +
+        'drill (-500): 2'
+    );
+  });
+
+  it('renders a single used block when nothing is preemptible', async () => {
+    render(
+      <ContextDetails
+        contextName="dev-cluster"
+        gpusInContext={[
+          {
+            gpu_name: 'A100',
+            gpu_requestable_qty_per_node: 8,
+            gpu_total: 8,
+            gpu_free: 2,
+            gpu_not_ready: 0,
+            gpu_preemptible: 0,
+            gpu_preemptible_breakdown: {},
+          },
+        ]}
+        nodesInContext={[node]}
+      />
+    );
+
+    expect(screen.getByTitle('6 used')).toBeInTheDocument();
+    expect(screen.queryByTitle(/preemptible/)).not.toBeInTheDocument();
+  });
+
   it('keeps Grafana host discovery and filter updates bounded', async () => {
     checkGrafanaAvailability.mockResolvedValue(true);
     global.fetch.mockResolvedValue({

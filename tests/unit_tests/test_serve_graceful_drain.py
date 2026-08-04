@@ -6,7 +6,7 @@ finish -- bounded by the per-service `graceful_drain_seconds` cap --
 instead of sleeping a fixed 120s and then killing whatever is still
 running.
 """
-# pylint: disable=protected-access
+# pylint: disable=missing-class-docstring,protected-access
 import threading
 from unittest import mock
 
@@ -15,6 +15,7 @@ import pytest
 
 from sky import exceptions
 from sky import skypilot_config
+from sky.serve import constants as serve_constants
 from sky.serve import replica_managers
 from sky.serve import service_spec as service_spec_lib
 from sky.utils import schemas
@@ -108,14 +109,16 @@ class TestWaitForDrain:
                     '/tmp/replica.log',
                     continue_guard=lambda: next(ownership))
 
-        down.assert_called_once_with('svc-1')
+        down.assert_called_once_with('svc-1',
+                                     _expected_cluster_record_uuid=None)
 
     def test_terminate_pins_recorded_workspace_on_each_retry(self):
         context = mock.MagicMock()
         observed_workspaces = []
 
-        def _down(cluster_name):
+        def _down(cluster_name, *, _expected_cluster_record_uuid=None):
             assert cluster_name == 'svc-1'
+            assert _expected_cluster_record_uuid is None
             observed_workspaces.append(skypilot_config.get_active_workspace())
             if len(observed_workspaces) == 1:
                 raise RuntimeError('transient down failure')
@@ -146,7 +149,8 @@ class TestWaitForDrain:
         context = mock.MagicMock()
         observed_workspaces = []
 
-        def _down(cluster_name):
+        def _down(cluster_name, *, _expected_cluster_record_uuid=None):
+            assert _expected_cluster_record_uuid is None
             observed_workspaces.append(skypilot_config.get_active_workspace())
             raise exceptions.ClusterDoesNotExist(cluster_name)
 
@@ -687,6 +691,14 @@ class TestRecoveryRedrive:
         location = mock.sentinel.location
         info.get_spot_location.return_value = location
         writes = []
+
+        def _record_recovered_preemption(_service_name, _replica_id, _info, *,
+                                         expected_replica_exists,
+                                         **_fence_kwargs):
+            assert expected_replica_exists is True
+            writes.append(sp.preempted)
+            return True
+
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]), \
@@ -696,7 +708,7 @@ class TestRecoveryRedrive:
              mock.patch.object(
                  replica_managers.serve_state,
                  'add_or_update_replica',
-                 side_effect=lambda *args: writes.append(sp.preempted)):
+                 side_effect=_record_recovered_preemption):
             rm._recover_replica_operations()
 
         assert writes == [True]
@@ -804,6 +816,7 @@ class TestTerminateReplicaDrainAssembly:
             rm._replica_to_request_id = {7: 'req-7'}
         info = mock.Mock()
         info.cluster_name = 'svc-7-abc'
+        info.replica_record_id = '00000000-0000-4000-8000-000000000007'
         info.status_property = replica_managers.ReplicaStatusProperty()
         info.status_property.drain_started_at = started_at
         if url_error is not None:
@@ -821,11 +834,14 @@ class TestTerminateReplicaDrainAssembly:
 
         writes = []
 
-        def _snapshot_write(_service_name, _replica_id, written_info):
+        def _snapshot_write(_service_name, _replica_id, written_info, *,
+                            expected_replica_exists, **_fence_kwargs):
+            assert expected_replica_exists is True
             writes.append((written_info.status_property.sky_launch_status,
                            written_info.status_property.sky_down_status,
                            written_info.status_property.drain_cap_seconds,
                            written_info.status_property.drain_started_at))
+            return True
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
@@ -1020,7 +1036,7 @@ class TestRecoveredStrictDrainDeadline:
              pytest.raises(RuntimeError, match='db unavailable'):
             rm._register_wait_for_idle(info)
 
-        assert rm._wait_for_idle_trackers == {}
+        assert not rm._wait_for_idle_trackers
 
     def test_deferred_off_route_write_atomically_stamps_start(self):
         rm, info = self._manager_and_info(None)
@@ -1164,7 +1180,6 @@ class TestSpecField:
     def test_bounded_by_lb_occupancy_retention(self):
         # A drain longer than the LB's off-ready occupancy retention would
         # lose the unknown protection partway through.
-        from sky.serve import constants as serve_constants
         limit = serve_constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS
         spec = service_spec_lib.SkyServiceSpec.from_yaml_config(dict(
             self._BASE))

@@ -38,7 +38,7 @@ jobs:
     # Manual retries may only publish the integration branch; selecting a
     # feature branch must not reserve one of its deterministic versions.
     if: github.event_name == 'push' || github.ref == 'refs/heads/improvements'
-    runs-on: namespace-profile-skypilot-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-2x4
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,7 +127,7 @@ jobs:
               -e EXPECTED_VERSION="${RELEASE_VERSION}" \
               -e EXPECTED_COMMIT="${GITHUB_SHA}" \
               "${EXACT_REF}" python -c \
-              'import os, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
+              'import os, skypilot_serve_system_oom_recovery_authorization, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
             echo "exists=true" >> "${GITHUB_OUTPUT}"
           elif grep -q 'ImageNotFoundException' "${error_file}"; then
             echo "exists=false" >> "${GITHUB_OUTPUT}"
@@ -168,7 +168,7 @@ jobs:
             -e EXPECTED_VERSION="${RELEASE_VERSION}" \
             -e EXPECTED_COMMIT="${GITHUB_SHA}" \
             "${EXACT_REF}" python -c \
-            'import os, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
+            'import os, skypilot_serve_system_oom_recovery_authorization, sky; assert sky.__version__ == os.environ["EXPECTED_VERSION"], sky.__version__; assert sky.__commit__ == os.environ["EXPECTED_COMMIT"], sky.__commit__'
 
           digest="$(aws ecr describe-images \
             --region "${AWS_REGION}" \

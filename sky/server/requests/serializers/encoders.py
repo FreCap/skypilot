@@ -9,6 +9,7 @@ import typing
 from typing import Any, Optional
 
 from sky import models
+from sky.adaptors import common as adaptors_common
 from sky.catalog import common
 from sky.schemas.api import responses
 from sky.server import constants as server_constants
@@ -19,7 +20,11 @@ if typing.TYPE_CHECKING:
     from sky import clouds
     from sky.provision.kubernetes import utils as kubernetes_utils
 
+resource_action_progress = adaptors_common.LazyImport(
+    'sky.serve.resource_action_progress')
+
 handlers: dict[str, Any] = {}
+_STRICT_RETURN_VALUE_HANDLERS: set[str] = set()
 
 
 def pickle_and_encode(obj: Any) -> str:
@@ -48,7 +53,7 @@ def encode_resources(resources: Any) -> Any:
     return pickle_and_encode(resources)
 
 
-def register_encoder(*names: str):
+def register_encoder(*names: str, strict: bool = False):
     """Decorator to register an encoder."""
 
     def decorator(func):
@@ -56,6 +61,8 @@ def register_encoder(*names: str):
             if name != server_constants.DEFAULT_HANDLER_NAME:
                 name = server_constants.REQUEST_NAME_PREFIX + name
             handlers[name] = func
+            if strict:
+                _STRICT_RETURN_VALUE_HANDLERS.add(name)
         return func
 
     return decorator
@@ -66,10 +73,24 @@ def get_encoder(name: str):
     return handlers.get(name, handlers[server_constants.DEFAULT_HANDLER_NAME])
 
 
+def requires_strict_return_value(name: str) -> bool:
+    """Whether a successful request must persist an encoder-approved value."""
+    return name in _STRICT_RETURN_VALUE_HANDLERS
+
+
 @register_encoder(server_constants.DEFAULT_HANDLER_NAME)
 def default_encoder(return_value: Any) -> Any:
     """The default encoder."""
     return return_value
+
+
+@register_encoder('serve_resource_action_launch',
+                  'serve_resource_action_down',
+                  strict=True)
+def encode_serve_resource_action_return(return_value: Any) -> dict[str, Any]:
+    """Closed-validate a private Serve resource-action handler return."""
+    return resource_action_progress.ServeReplicaActionRequestReturnV1.from_value(
+        return_value).canonical_value()
 
 
 @register_encoder('status')

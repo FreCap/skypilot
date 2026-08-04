@@ -2,8 +2,12 @@
 # pylint: disable=protected-access,redefined-outer-name
 import os
 import sqlite3
+import subprocess
+import sys
 from unittest import mock
 
+from prometheus_client import CollectorRegistry
+from prometheus_client import multiprocess
 import pytest
 import pytest_asyncio
 import sqlalchemy
@@ -117,11 +121,19 @@ class TestGetEngine:
         db_utils._postgres_engine_cache.clear()
         db_utils._postgres_lock_engine_cache.clear()
         db_utils._sqlite_engine_cache.clear()
+        monkeypatch.setattr(
+            db_utils, '_postgres_connection_metrics_process_role_override',
+            None)
+        monkeypatch.setattr(db_utils,
+                            '_postgres_connection_metrics_warning_emitted',
+                            False)
         # Reset max_connections to default
         db_utils.set_max_connections(0)
         # Ensure we're not in server mode by default
         monkeypatch.delenv('IS_SKYPILOT_SERVER', raising=False)
         monkeypatch.delenv('SKYPILOT_DB_CONNECTION_URI', raising=False)
+        monkeypatch.delenv('SKYPILOT_API_SERVER_ROLE', raising=False)
+        monkeypatch.delenv('SKY_API_SERVER_METRICS_ENABLED', raising=False)
 
     def test_sqlite_sync_engine_creation(self, tmp_path, monkeypatch):
         """Test SQLite sync engine is created correctly."""
@@ -261,6 +273,35 @@ class TestGetEngine:
             assert call_args[1]['pool_size'] == 1
             assert call_args[1]['max_overflow'] == 0
             assert call_args[1]['pool_timeout'] == 15
+
+    def test_postgres_engine_namespaces_isolate_queuepools(self, monkeypatch):
+        """Named users get distinct strict pools for the same PostgreSQL DB."""
+        monkeypatch.setenv('IS_SKYPILOT_SERVER', 'true')
+        monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI',
+                           'postgresql://user:pass@localhost/db')
+        db_utils.set_max_connections(1)
+        ordinary_engine = mock.MagicMock()
+        request_control_engine = mock.MagicMock()
+
+        with mock.patch('sqlalchemy.create_engine',
+                        side_effect=[ordinary_engine,
+                                     request_control_engine]) as mock_create:
+            ordinary = db_utils.get_engine(db_name='state')
+            control = db_utils.get_engine(
+                db_name='api_requests', engine_namespace='api-requests-control')
+            ordinary_again = db_utils.get_engine(db_name='other_state')
+            control_again = db_utils.get_engine(
+                db_name='ignored', engine_namespace='api-requests-control')
+
+        assert ordinary is ordinary_engine
+        assert control is request_control_engine
+        assert ordinary_again is ordinary
+        assert control_again is control
+        assert mock_create.call_count == 2
+        for call in mock_create.call_args_list:
+            assert call.kwargs['poolclass'] == sqlalchemy.pool.QueuePool
+            assert call.kwargs['pool_size'] == 1
+            assert call.kwargs['max_overflow'] == 0
 
     def test_postgres_lock_connections_use_separate_nullpool(self):
         """Session locks must not consume an ordinary QueuePool checkout."""
@@ -474,3 +515,349 @@ class TestGetEngine:
             # Parent directory should be created
             expected_dir = runtime_dir / '.sky'
             assert expected_dir.exists()
+
+    @pytest.mark.parametrize(('namespace', 'expected'),
+                             [(None, 'shared'), ('', 'shared'),
+                              ('api-requests-control', 'api-requests-control'),
+                              ('advisory-lock', 'advisory-lock'),
+                              ('physical-capacity-evidence', 'other'),
+                              ('caller-controlled-value', 'other')])
+    def test_postgres_connection_metric_namespace_is_bounded(
+            self, namespace, expected):
+        assert (db_utils._postgres_connection_metrics_engine_namespace(
+            namespace) == expected)
+
+    def test_postgres_connection_metric_label_sets_are_closed(self):
+        assert db_utils._POSTGRES_CONNECTION_METRIC_PROCESS_ROLES == frozenset({
+            'all',
+            'api',
+            'executor',
+            'controller',
+            'authority-worker',
+            'managed-job-controller',
+            'serve-controller',
+            'unknown',
+        })
+        assert db_utils._POSTGRES_CONNECTION_METRIC_BASE_PROCESS_ROLES == (
+            frozenset({
+                'all',
+                'api',
+                'executor',
+                'controller',
+                'authority-worker',
+            }))
+        assert db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES == (
+            frozenset({
+                'shared',
+                'api-requests-control',
+                'advisory-lock',
+                'other',
+            }))
+        assert db_utils._POSTGRES_CONNECTION_METRIC_MODES == frozenset(
+            {'sync', 'async'})
+        assert (len(db_utils._POSTGRES_CONNECTION_METRIC_PROCESS_ROLES) *
+                len(db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES) *
+                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 64)
+
+    def test_postgres_connection_metric_process_role_is_write_once(
+            self, monkeypatch):
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
+        assert db_utils._postgres_connection_metrics_process_role() == 'api'
+
+        db_utils.set_postgres_connection_metrics_process_role(
+            'serve-controller')
+        db_utils.set_postgres_connection_metrics_process_role(
+            'serve-controller')
+        assert (db_utils._postgres_connection_metrics_process_role() ==
+                'serve-controller')
+
+        with pytest.raises(RuntimeError, match='already set'):
+            db_utils.set_postgres_connection_metrics_process_role(
+                'managed-job-controller')
+        with pytest.raises(ValueError, match='Invalid PostgreSQL'):
+            db_utils.set_postgres_connection_metrics_process_role(
+                'service-name-from-user-input')
+
+    def test_postgres_connection_metric_unknown_base_role_is_bounded(
+            self, monkeypatch):
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'unexpected-role')
+        assert (
+            db_utils._postgres_connection_metrics_process_role() == 'unknown')
+
+    def test_postgres_connections_opened_counter_has_only_bounded_labels(self):
+        labels = {
+            'process_role': 'managed-job-controller',
+            'engine_namespace': 'shared',
+            'mode': 'async',
+        }
+        counter = db_utils.metrics_utils.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL
+        counter.labels(**labels).inc()
+
+        samples = [
+            sample for family in counter.collect() for sample in family.samples
+            if sample.name == 'sky_postgres_connections_opened_total'
+        ]
+
+        assert any(sample.labels == labels for sample in samples)
+        assert all('pid' not in sample.labels for sample in samples)
+
+    def test_postgres_connections_opened_counter_is_collected_multiprocess(
+            self, tmp_path):
+        script = """
+from sky.metrics import utils as metrics_utils
+metrics_utils.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL.labels(
+    process_role='serve-controller',
+    engine_namespace='shared',
+    mode='async',
+).inc()
+"""
+        env = os.environ.copy()
+        env['PROMETHEUS_MULTIPROC_DIR'] = str(tmp_path)
+        env['SKY_API_SERVER_METRICS_ENABLED'] = 'true'
+        subprocess.run([sys.executable, '-c', script],
+                       env=env,
+                       capture_output=True,
+                       text=True,
+                       check=True,
+                       timeout=60)
+
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry, path=str(tmp_path))
+        samples = [
+            sample for family in registry.collect() for sample in family.samples
+            if sample.name == 'sky_postgres_connections_opened_total'
+        ]
+
+        assert len(samples) == 1
+        assert samples[0].labels == {
+            'process_role': 'serve-controller',
+            'engine_namespace': 'shared',
+            'mode': 'async',
+        }
+        assert samples[0].value == 1
+        assert 'pid' not in samples[0].labels
+
+    def test_postgres_metrics_disabled_does_not_resolve_or_listen(
+            self, monkeypatch):
+        monkeypatch.setenv('IS_SKYPILOT_SERVER', 'true')
+        monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI',
+                           'postgresql://user:pass@localhost/db')
+        lazy_metrics = mock.MagicMock()
+        monkeypatch.setattr(db_utils, 'metrics_utils', lazy_metrics)
+
+        with mock.patch('sqlalchemy.create_engine') as create_engine, \
+             mock.patch('sqlalchemy.event.listen') as listen:
+            db_utils.get_engine(db_name='ignored')
+
+        create_engine.assert_called_once()
+        listen.assert_not_called()
+        assert not lazy_metrics.mock_calls
+
+    def test_postgres_sync_listener_attaches_once_on_cache_miss(
+            self, monkeypatch):
+        monkeypatch.setenv('IS_SKYPILOT_SERVER', 'true')
+        monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI',
+                           'postgresql://user:pass@localhost/db')
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        engine = mock.MagicMock()
+
+        with mock.patch('sqlalchemy.create_engine', return_value=engine), \
+             mock.patch('sqlalchemy.event.listen') as listen:
+            first = db_utils.get_engine(db_name='state')
+            second = db_utils.get_engine(db_name='other')
+
+        assert first is second is engine
+        listen.assert_called_once()
+        assert listen.call_args.args[:2] == (engine, 'connect')
+        callback = listen.call_args.args[2]
+        assert callback.keywords == {
+            'engine_namespace': 'shared',
+            'mode': 'sync',
+        }
+
+    def test_postgres_async_listener_uses_sync_engine(self, monkeypatch):
+        monkeypatch.setenv('IS_SKYPILOT_SERVER', 'true')
+        monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI',
+                           'postgresql://user:pass@localhost/db')
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        engine = mock.MagicMock()
+
+        with mock.patch('sqlalchemy.ext.asyncio.create_async_engine',
+                        return_value=engine), \
+             mock.patch('sqlalchemy.event.listen') as listen:
+            db_utils.get_engine(db_name='state', async_engine=True)
+            db_utils.get_engine(db_name='other', async_engine=True)
+
+        listen.assert_called_once()
+        assert listen.call_args.args[:2] == (engine.sync_engine, 'connect')
+        assert listen.call_args.args[2].keywords == {
+            'engine_namespace': 'shared',
+            'mode': 'async',
+        }
+
+    def test_postgres_lock_engine_attaches_once_with_bounded_namespace(
+            self, monkeypatch):
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        base_engine = mock.MagicMock()
+        base_engine.dialect.name = (db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+        base_engine.url = sqlalchemy.engine.make_url(
+            'postgresql://user:pass@localhost/db')
+        lock_engine = mock.MagicMock()
+
+        with mock.patch('sqlalchemy.create_engine', return_value=lock_engine), \
+             mock.patch('sqlalchemy.event.listen') as listen:
+            first_lock = db_utils.get_postgres_lock_engine(base_engine)
+            second_lock = db_utils.get_postgres_lock_engine(base_engine)
+
+        assert first_lock is second_lock is lock_engine
+        listen.assert_called_once()
+        assert listen.call_args.args[:2] == (lock_engine, 'connect')
+        assert listen.call_args.args[2].keywords == {
+            'engine_namespace': 'advisory-lock',
+            'mode': 'sync',
+        }
+
+    def test_connection_metric_counts_connects_not_queuepool_checkouts(
+            self, monkeypatch):
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'api')
+        counter = mock.MagicMock()
+        metrics = mock.MagicMock(METRICS_ENABLED=True)
+        metrics.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL = counter
+        monkeypatch.setattr(db_utils, 'metrics_utils', metrics)
+
+        null_engine = sqlalchemy.create_engine('sqlite://',
+                                               poolclass=sqlalchemy.NullPool)
+        db_utils._install_postgres_connection_metrics_listener(
+            null_engine, engine_namespace='advisory-lock', mode='sync')
+        try:
+            with null_engine.connect():
+                pass
+            with null_engine.connect():
+                pass
+        finally:
+            null_engine.dispose()
+
+        assert counter.labels.call_count == 2
+        counter.labels.assert_called_with(process_role='api',
+                                          engine_namespace='advisory-lock',
+                                          mode='sync')
+        assert counter.labels.return_value.inc.call_count == 2
+
+        counter.reset_mock()
+        queue_engine = sqlalchemy.create_engine(
+            'sqlite://',
+            poolclass=sqlalchemy.pool.QueuePool,
+            pool_size=1,
+            max_overflow=0)
+        db_utils._install_postgres_connection_metrics_listener(
+            queue_engine, engine_namespace=None, mode='sync')
+        try:
+            with queue_engine.connect():
+                pass
+            with queue_engine.connect():
+                pass
+        finally:
+            queue_engine.dispose()
+
+        counter.labels.assert_called_once_with(process_role='api',
+                                               engine_namespace='shared',
+                                               mode='sync')
+        counter.labels.return_value.inc.assert_called_once_with()
+
+    def test_connection_metric_resolves_role_when_connection_opens(
+            self, monkeypatch):
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        counter = mock.MagicMock()
+        metrics = mock.MagicMock(METRICS_ENABLED=True)
+        metrics.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL = counter
+        monkeypatch.setattr(db_utils, 'metrics_utils', metrics)
+        engine = sqlalchemy.create_engine('sqlite://',
+                                          poolclass=sqlalchemy.NullPool)
+        db_utils._install_postgres_connection_metrics_listener(
+            engine, engine_namespace=None, mode='sync')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'controller')
+
+        try:
+            with engine.connect():
+                pass
+        finally:
+            engine.dispose()
+
+        counter.labels.assert_called_once_with(process_role='controller',
+                                               engine_namespace='shared',
+                                               mode='sync')
+
+    def test_failed_physical_connection_does_not_increment(self, monkeypatch):
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        counter = mock.MagicMock()
+        metrics = mock.MagicMock(METRICS_ENABLED=True)
+        metrics.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL = counter
+        monkeypatch.setattr(db_utils, 'metrics_utils', metrics)
+
+        def fail_to_connect():
+            raise sqlite3.OperationalError('expected connection failure')
+
+        engine = sqlalchemy.create_engine('sqlite://',
+                                          poolclass=sqlalchemy.NullPool,
+                                          creator=fail_to_connect)
+        db_utils._install_postgres_connection_metrics_listener(
+            engine, engine_namespace=None, mode='sync')
+        try:
+            with pytest.raises(sqlalchemy.exc.OperationalError):
+                engine.connect()
+        finally:
+            engine.dispose()
+
+        counter.labels.assert_not_called()
+
+    def test_metric_failure_is_fail_open_and_warns_once(self, monkeypatch,
+                                                        caplog):
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        metrics = mock.MagicMock(METRICS_ENABLED=True)
+        metrics.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL.labels.side_effect = (
+            OSError('expected metrics failure'))
+        monkeypatch.setattr(db_utils, 'metrics_utils', metrics)
+        engine = sqlalchemy.create_engine('sqlite://',
+                                          poolclass=sqlalchemy.NullPool)
+        db_utils._install_postgres_connection_metrics_listener(
+            engine, engine_namespace=None, mode='sync')
+
+        try:
+            with engine.connect():
+                pass
+            with engine.connect():
+                pass
+        finally:
+            engine.dispose()
+
+        assert caplog.text.count('database connection will continue') == 1
+
+    def test_metric_and_warning_failures_are_fail_open(self, monkeypatch):
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        metrics = mock.MagicMock(METRICS_ENABLED=True)
+        metrics.SKY_POSTGRES_CONNECTIONS_OPENED_TOTAL.labels.side_effect = (
+            OSError('expected metrics failure'))
+        monkeypatch.setattr(db_utils, 'metrics_utils', metrics)
+        monkeypatch.setattr(
+            db_utils.logger, 'warning',
+            mock.Mock(side_effect=RuntimeError('broken logger')))
+
+        db_utils._record_postgres_connection_opened(None,
+                                                    None,
+                                                    engine_namespace='shared',
+                                                    mode='sync')
+
+        db_utils.logger.warning.assert_called_once()
+
+    def test_listener_registration_failure_is_fail_open(self, monkeypatch,
+                                                        caplog):
+        monkeypatch.setenv('SKY_API_SERVER_METRICS_ENABLED', 'true')
+        engine = mock.MagicMock()
+
+        with mock.patch('sqlalchemy.event.listen',
+                        side_effect=TypeError('expected listener failure')):
+            db_utils._install_postgres_connection_metrics_listener(
+                engine, engine_namespace=None, mode='sync')
+
+        assert caplog.text.count('database connection will continue') == 1

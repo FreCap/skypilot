@@ -170,6 +170,29 @@ Compute full release name with optional fullnameOverride.
 {{- end -}}
 
 {{/*
+Return the state PVC selected by this release. An external claim is
+infrastructure-owned and must exist before any workload rollout begins.
+*/}}
+{{- define "skypilot.storageClaimName" -}}
+{{- default (printf "%s-state" (include "skypilot.fullname" .)) (get .Values.storage "existingClaim") -}}
+{{- end -}}
+
+{{/*
+Stable, release-scoped name for a proposed authority cohort's pre-apply
+manifest.  Do not use skypilot.fullname here: fullnameOverride is mutable,
+while namespace + Helm release name is the durable release anchor.
+*/}}
+{{- define "skypilot.resourceActionAuthorityPreflightManifestName" -}}
+{{- $identity := printf "%s\n%s\n%s" .namespace .helmReleaseName .cohortSuffix -}}
+{{- printf "skypilot-ra-preflight-%s" (sha256sum $identity | trunc 40) -}}
+{{- end -}}
+
+{{/* Exact read-only path consumed by the migration preflight parser. */}}
+{{- define "skypilot.resourceActionAuthorityPreflightManifestPath" -}}
+{{- printf "/etc/skypilot/resource-action-authority/release-preflight/%s/manifest.json" .cohortSuffix -}}
+{{- end -}}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "skypilot.serviceAccountName" -}}
@@ -251,7 +274,7 @@ false
 
 {{/* API server start arguments */}}
 {{- define "skypilot.apiArgs" -}}
---deploy{{ if include "skypilot.enableBasicAuthInAPIServer" . | trim | eq "true" }} --enable-basic-auth{{ end }}
+--deploy{{ if .Values.apiService.metrics.enabled }} --metrics --metrics-port {{ .Values.apiService.metrics.port }}{{ end }}{{ if include "skypilot.enableBasicAuthInAPIServer" . | trim | eq "true" }} --enable-basic-auth{{ end }}
 {{- end -}}
 
 {{- define "skypilot.oauth2ProxyURL" -}}

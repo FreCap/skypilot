@@ -19,8 +19,19 @@ apiService:
   # Docker image to use for the API server. The default value will be updated by the release pipeline to be consistent with the SkyPilot release or nightly build.
   # Refer to https://docs.skypilot.co/en/latest/reference/api-server/helm-values-spec.html#helm-values-apiservice-image for more details.
   image: berkeleyskypilot/skypilot-nightly:latest
-  # Number of replicas to deploy - replicas > 1 is not well tested.
+  # Number of stateless API replicas. highAvailability.enabled requires at
+  # least two.
   replicas: 1
+  highAvailability:
+    # Split public API serving from durable request execution. Requires
+    # PostgreSQL, ReadWriteMany storage, RollingUpdate, and executorService.
+    # @schema type: [boolean]
+    enabled: false
+    # Seconds between publishing an unready pod-local drain marker and
+    # Kubernetes sending SIGTERM. This must cover the configured readiness
+    # probe failure-detection window; the chart validates that relationship.
+    # @schema type: [integer]; minimum: 1
+    readinessDrainSeconds: 20
   preDeployHook: |-
     # Run commands before deploying the API server, e.g. installing an admin policy.
     # Refer to https://docs.skypilot.co/en/latest/cloud-setup/policy.html for more details about admin policy.
@@ -34,7 +45,9 @@ apiService:
 
   # Upgrade strategy for the API server, available options are:
   # - Recreate: delete the old pod first and create a new one (has downtime).
-  # - RollingUpdate: [EXPERIMENTAL] create a new pod first, wait for it to be ready, then delete the old one (zero downtime).
+  # - RollingUpdate: create a new pod first, wait for it to be ready, then
+  #   delete the old one. This remains experimental unless guarded high
+  #   availability is enabled.
   # Default to Recreate. When set to RollingUpdate, an external database must be configured via .apiService.dbConnectionSecretName or .apiService.dbConnectionString.
   # For persistent storage with RollingUpdate, use storage.accessMode=ReadWriteMany with an RWX-capable storage class.
   # If storage.enabled=false with RollingUpdate, file mounts and logs will be lost on pod restart; consider configuring
@@ -97,7 +110,7 @@ apiService:
   # @schema type: [object, null]
   readinessProbe:
     httpGet:
-      path: /api/health
+      path: /api/health/ready
       port: 46580
     failureThreshold: 3
     periodSeconds: 5
@@ -171,12 +184,14 @@ apiService:
   # Optional secret that contains SSH keys for the API server to use, all the entries in the secret will be mounted to ~/.ssh/ directory in the API server.
   # @schema type: [string, null]
   sshKeySecret: null
-  # Metrics configuration for the API server.
+  # Metrics configuration for API-server roles. In guarded HA mode the API,
+  # executor, and controller pods each expose their own process-local
+  # multiprocess registry on this port and are discovered independently.
   # Refer to https://docs.skypilot.co/en/latest/reference/api-server/examples/api-server-metrics-setup.html for more details.
   metrics:
     # Whether to enable metrics collection, default to false. If this is enabled and the API server image does not support metrics, the deployment will fail.
     enabled: false
-    # The port to expose the metrics on, default to 9090.
+    # The port to expose metrics on in every API-server role pod, default to 9090.
     port: 9090
     # NOTE: model-serving (/endpoints-metrics) federation + dashboards are
     # gated separately by prometheus.scrapeEndpointMetrics.
@@ -256,13 +271,145 @@ apiService:
   tolerations: []
   affinity: {}
 
-  # Spread API server pods across topology domains (e.g., zones).
-  # When set, a topologySpreadConstraints entry is rendered with
+  # Spread API server pods across topology domains. The default spreads across
+  # nodes; set topology.kubernetes.io/zone to spread across zones, or "" to
+  # disable the constraint. When set, a topologySpreadConstraints entry is
+  # rendered with
   # maxSkew=1, whenUnsatisfiable=DoNotSchedule, and a labelSelector
   # that matches the API server pods automatically.
-  # Example: "topology.kubernetes.io/zone"
   # @schema type: [string, null]
-  topologySpreadTopologyKey: null
+  topologySpreadTopologyKey: kubernetes.io/hostname
+
+# Active-active workers that claim durable requests from PostgreSQL. This
+# Deployment is rendered only when apiService.highAvailability.enabled=true.
+executorService:
+  # HA mode requires at least two, enforced contextually by the template.
+  # @schema type: [integer]; minimum: 0
+  replicas: 2
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Dependency-free liveness and readiness port.
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 46581
+  # @schema type: [integer]; minimum: 1
+  terminationGracePeriodSeconds: 60
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  # @schema type: [array, null]; item: object
+  extraVolumes: null
+  # @schema type: [array, null]; item: object
+  extraVolumeMounts: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # @schema type: [string, null]
+  topologySpreadTopologyKey: kubernetes.io/hostname
+
+# Active-standby owners of controller-class requests and singleton maintenance.
+# Both replicas remain Ready; PostgreSQL leadership fencing permits only one to
+# spawn controller workers or subsystem children at a time. This Deployment is
+# rendered only when apiService.highAvailability.enabled=true.
+controllerService:
+  # HA mode requires at least two, enforced contextually by the template.
+  # @schema type: [integer]; minimum: 0
+  replicas: 2
+  # Uses apiService.image when null.
+  # @schema type: [string, null]
+  image: null
+  # Uses apiService.imagePullPolicy when null.
+  # @schema type: [string, null]
+  imagePullPolicy: null
+  # Dependency-free liveness and readiness port.
+  # @schema type: [integer]; minimum: 1; maximum: 65535
+  healthPort: 46582
+  # @schema type: [integer]; minimum: 1
+  terminationGracePeriodSeconds: 60
+  # @schema skipProperties:true
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  # @schema type: [array, null]; item: object
+  extraEnvs: null
+  # @schema type: [array, null]; item: object
+  extraVolumes: null
+  # @schema type: [array, null]; item: object
+  extraVolumeMounts: null
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # @schema type: [string, null]
+  topologySpreadTopologyKey: kubernetes.io/hostname
+
+# Dedicated preflight-only authority cohorts for private Serve resource
+# actions. This surface stays dark until an immutable image has been built and
+# its separately reviewed OCI qualification artifact is packaged by the chart.
+resourceActions:
+  # @schema additionalProperties: false
+  authorityWorker:
+    # @schema type: [boolean]
+    enabled: false
+    # Immutable installation UUID used to derive database-wide cohort IDs.
+    # Never reuse or change this value while cohort or tombstone rows exist.
+    # @schema type: string; pattern: ^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+    installationId: ""
+    # Cohort selected for new preparation references.  Existing DRAINING
+    # cohorts remain listed until all of their frozen work is released.
+    # @schema type: string; maxLength: 42
+    activeCohort: ""
+    # Each cohort requires a <=42-character DNS-label suffix, exactly two
+    # replicas, a manifest-digest-pinned image and distinct OCI config digest,
+    # one chart-packaged qualification ref, and three installed-package refs.
+    # @schema type: array; item: object
+    # @schema itemProperties: {"id":{"type":"string","minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"},"replicas":{"type":"integer","const":2},"image":{"type":"string","minLength":1,"pattern":"^.+@sha256:[0-9a-f]{64}$"},"imagePullPolicy":{"type":"string","const":"Always"},"ociConfigDigest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"qualificationArtifact":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","minLength":1,"maxLength":253,"pattern":"^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"},"byteSize":{"type":"integer","minimum":1,"maximum":65536},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"podTemplateContract":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_provider_preflight.py"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"artifactInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"callableInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
+    # @schema allOf: [{"type":"array","items":{"properties":{"id":{},"replicas":{},"image":{},"imagePullPolicy":{},"ociConfigDigest":{},"qualificationArtifact":{},"podTemplateContract":{},"artifactInventory":{},"callableInventory":{}},"additionalProperties":false,"required":["id","replicas","image","imagePullPolicy","ociConfigDigest","qualificationArtifact","podTemplateContract","artifactInventory","callableInventory"]}}]
+    cohorts: []
+    # Cohort IDs whose removed Deployment/ServiceAccount names remain visible
+    # to the surviving API retirement verifier.  After the last cohort is
+    # removed, keep enabled=true, activeCohort="", cohorts=[], and at least one
+    # tombstone until every matching central row is RETIRED.
+    # @schema type: array; item: string; uniqueItems: true
+    # @schema allOf: [{"type":"array","items":{"minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"}}]
+    retirementTombstones: []
+    # @schema type: [integer]; minimum: 1; maximum: 65535
+    healthPort: 46581
+    # The future authenticated preflight endpoint.  The routing slice exposes
+    # no mutation service and does not treat this Service as activation proof.
+    # @schema type: [integer]; minimum: 1; maximum: 65535; const: 46583
+    preflightPort: 46583
+    # @schema additionalProperties: false
+    auth:
+      # This purpose-only Secret/key must differ from every external-LB auth
+      # Secret/key. The controller also rejects equal mounted token bytes.
+      # @schema type: string
+      existingSecret: ""
+      # @schema type: string
+      key: tokens
+    # @schema additionalProperties: false
+    tls:
+      # @schema type: string
+      existingSecret: ""
+      # @schema type: string
+      certKey: tls.crt
+      # @schema type: string
+      privateKeyKey: tls.key
+      # @schema type: string
+      caKey: ca.crt
 
 # Environment and files required by every central PostgreSQL client. Use these
 # for private CA bundles, client certificates, or shared libpq settings instead
@@ -276,10 +423,24 @@ databaseConnection:
   # @schema type: [array, null]; item: object
   extraVolumeMounts: null
 
+# Persistence and delivery backend for API request envelopes. PostgreSQL is an
+# explicit compatibility milestone: it is production-safe for one all-role
+# pod, while role-split multi-replica mode is enabled by later milestones.
+requestStore:
+  # @schema enum: [sqlite, postgres]; required: true
+  backend: sqlite
+  # Shared maintenance gate used by the one-way SQLite cutover command.
+  # @schema type: string; minLength: 1; required: true
+  cutoverGatePath: /root/.sky/api-request-cutover.json
+
 # Run central PostgreSQL schema upgrades in a revision-scoped Kubernetes Job.
 # API replicas verify the resulting revision and never execute deployment DDL.
-# The Job is a regular Helm resource, so chart-managed database Secrets exist
-# before it starts and Helm does not add a hook-induced deploy-time wait.
+# A PostgreSQL request store backed by a pre-existing
+# apiService.dbConnectionSecretName runs the Job as a blocking pre-install and
+# pre-upgrade hook, including after HA and authority-worker values are cleared.
+# That hook validates the proposed authority release inventory before Helm
+# mutates workloads. Compatibility mode keeps a regular Job so a chart-managed
+# dbConnectionString Secret can be created first.
 databaseMigration:
   # @schema type: [boolean]
   enabled: true
@@ -485,7 +646,7 @@ serve:
     # Each Secret value is a newline-delimited token ring. Keep the current and
     # previous token during rotation within ONE ring; projected Secret volumes
     # update in place. The lbSync and controllerAdmin rings must remain
-    # disjoint in content, and cannot reference the same Secret key.
+    # pairwise disjoint in content, and cannot reference the same Secret key.
     # @schema type: [object, null]
     auth:
       # Tokens presented by an external LB when syncing replica/load state.
@@ -612,6 +773,15 @@ storage:
   # - storage.enabled=false: Supported - but file mounts and logs will be lost on pod restart. Consider configuring
   #   'jobs.bucket' in the SkyPilot config to use cloud storage for file mounts.
   enabled: true
+  # Mount a pre-existing PersistentVolumeClaim instead of creating the
+  # release-owned <fullname>-state claim. This is useful when storage is
+  # provisioned independently or when migrating an existing release to a new
+  # volume without deleting the legacy claim. The referenced claim must exist
+  # in the release namespace before Helm rolls any pod. storage.accessMode
+  # remains the operator's declared capability and must be ReadWriteMany in HA
+  # mode; the chart cannot inspect the referenced claim at render time.
+  # @schema type: string
+  existingClaim: ""
   # Storage class name - leave empty to use cluster default
   # For RWX storage with RollingUpdate, use a storage class that supports ReadWriteMany access mode:
   # - GKE: Create a Filestore-backed storage class (https://cloud.google.com/filestore/docs/accessing-fileshares)
@@ -663,11 +833,9 @@ ingress:
   # Custom annotations for the ingress
   # @schema type: [object, null]
   annotations: null
-  # Enable cookie-based session affinity (sticky sessions) on the ingress. Only takes effect
-  # when apiService.upgradeStrategy is RollingUpdate, where it ensures consistent routing to
-  # the same pod during rolling upgrades. Set to false to disable it, e.g., when using an
-  # ingress controller that does not support sticky sessions, or when stickiness is managed
-  # externally (e.g., at an upstream load balancer).
+  # Enable cookie-based session affinity (sticky sessions) on compatibility
+  # RollingUpdate deployments. Guarded HA always disables affinity because
+  # every request and follow-up is replica-independent.
   sessionAffinity: true
 
   # TODO(aylei): deprecate skypilot managed proxy auth to reduce our maintenance burden, replace with examples instead.
@@ -749,8 +917,13 @@ ingress-nginx:
 
 # RBAC controls the in-cluster permissions for the SkyPilot API server.
 rbac:
-  # If false, the serviceaccount and rbac policies will not be created. An external service account is expected in this case.
+  # Create the API service account and RBAC policies.
   create: true
+  # Create RBAC policies for a pre-existing, externally managed API service
+  # account in the release namespace. This is mutually exclusive with create,
+  # requires serviceAccountName, and does not transfer Helm ownership. The
+  # policies include exact get/patch access to the release config ConfigMap.
+  bindExistingServiceAccount: false
   # If not specified, the service account name will be generated by the chart.
   serviceAccountName: ""
   # Namespace-scoped rules granted to kubernetesCredentials.inclusterNamespace
@@ -969,11 +1142,21 @@ prometheus:
     retentionSize: "43GB"
   # Configure additional scrape configs using extraScrapeConfigs
   extraScrapeConfigs: |
-    # Static scrape target for SkyPilot API server GPU metrics
+    # Discover the API Service's named metrics port so custom
+    # apiService.metrics.port values remain consistent.
     - job_name: 'skypilot-api-server-gpu-metrics'
-      static_configs:
-        # Use the API service created by this Helm chart
-        - targets: ['{{ include "skypilot.fullname" . }}-api-service.{{ .Release.Namespace }}.svc.cluster.local:9090']
+      kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - '{{ .Release.Namespace }}'
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_service_name]
+          action: keep
+          regex: '{{ include "skypilot.fullname" . }}-api-service'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: metrics
       metrics_path: '/gpu-metrics'
       scrape_interval: 60s
       scrape_timeout: 45s
@@ -985,7 +1168,7 @@ prometheus:
         target_label: node
         replacement: $1
     {{- if .Values.scrapeEndpointMetrics }}
-    # Static scrape target for SkyPilot API server endpoint serving
+    # Service-discovered target for SkyPilot API server endpoint serving
     # metrics. The /endpoints-metrics endpoint federates the serving
     # engines' native series (vllm:* today) from every remote Kubernetes
     # context the API server can see, with a cluster=<context> label
@@ -993,8 +1176,18 @@ prometheus:
     # filter by cluster.
     - job_name: 'skypilot-api-server-endpoints-metrics'
       honor_labels: true
-      static_configs:
-        - targets: ['{{ include "skypilot.fullname" . }}-api-service.{{ .Release.Namespace }}.svc.cluster.local:9090']
+      kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - '{{ .Release.Namespace }}'
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_service_name]
+          action: keep
+          regex: '{{ include "skypilot.fullname" . }}-api-service'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: metrics
       metrics_path: '/endpoints-metrics'
       scrape_interval: 60s
       scrape_timeout: 45s

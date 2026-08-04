@@ -88,6 +88,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/serve/{service_name}/versions', 'GET'),
     ('/serve/{service_name}/versions/elect', 'POST'),
     ('/serve/{service_name}/load-balancer/high-availability', 'POST'),
+    ('/internal/resource-actions/v1/launch-identity/canonicalize', 'POST'),
     # --- Managed container image writes ---
     ('/images/publications', 'POST'),
     ('/images/artifacts/{image_id}/prepare', 'POST'),
@@ -101,6 +102,8 @@ _KNOWN_VIEWER_DENIED: set = {
     ),
     ('/api/internal/serve/{service_name}/controller/load_balancer_role',
      'POST'),
+    ('/api/internal/serve/{service_name}/controller/'
+     'system_recovery_route_lease', 'POST'),
     ('/api/internal/serve/{service_name}/controller/'
      'load_balancer_request_history_sync', 'POST'),
     # --- Volumes writes ---
@@ -120,6 +123,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/users/service-account-tokens/rotate', 'POST'),
     # --- Admin-only estimates ---
     ('/estimated_spend', 'GET'),
+    ('/estimated_spend/drilldown', 'GET'),
     # --- Operator notifications ---
     ('/notifications', 'GET'),
     ('/notifications/read', 'POST'),
@@ -161,6 +165,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/api/stream', 'GET'),
     ('/api/status', 'GET'),
     ('/api/health', 'GET'),
+    ('/api/health/ready', 'GET'),
     ('/api/cancel', 'POST'),  # request cancellation
     ('/api/completion/cluster_name', 'GET'),
     ('/api/completion/storage_name', 'GET'),

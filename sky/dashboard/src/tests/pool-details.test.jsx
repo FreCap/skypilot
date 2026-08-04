@@ -15,6 +15,18 @@ jest.mock('next/router', () => ({
   useRouter: () => router,
 }));
 
+const mockInfraBadgeRenders = [];
+jest.mock('@/components/utils', () => {
+  const actual = jest.requireActual('@/components/utils');
+  return {
+    ...actual,
+    InfraBadges: (props) => {
+      mockInfraBadgeRenders.push(props);
+      return null;
+    },
+  };
+});
+
 jest.mock('@/lib/cache', () => ({
   __esModule: true,
   default: {
@@ -52,11 +64,46 @@ function pool(name, resources) {
 describe('PoolDetailPage request ownership', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockInfraBadgeRenders.length = 0;
     router.query.pool = 'pool-a';
   });
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('hides the previous pool on the first route render', async () => {
+    const poolB = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({ pools: [pool('pool-a', 'owned-a')] })
+      .mockImplementationOnce(() => poolB.promise);
+
+    const view = render(<PoolDetailPage />);
+    await screen.findByText('owned-a');
+    expect(mockInfraBadgeRenders).toHaveLength(1);
+
+    mockInfraBadgeRenders.length = 0;
+    router.query.pool = 'pool-b';
+    view.rerender(<PoolDetailPage />);
+
+    // Child renders capture the commit boundary before route effects run.
+    // Pool A must not render actions or details once the URL belongs to B.
+    expect(mockInfraBadgeRenders).toHaveLength(0);
+    expect(screen.queryByText('owned-a')).not.toBeInTheDocument();
+    expect(screen.getByText('Loading pool details...')).toBeInTheDocument();
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(dashboardCache.get).toHaveBeenNthCalledWith(2, getPoolStatus, [
+      { poolNames: ['pool-b'] },
+    ]);
+    expect(dashboardCache.invalidate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      poolB.resolve({ pools: [pool('pool-b', 'owned-b')] });
+      await poolB.promise;
+    });
+    expect(screen.getByText('owned-b')).toBeInTheDocument();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
   it('drops a stale result from the previous pool route', async () => {

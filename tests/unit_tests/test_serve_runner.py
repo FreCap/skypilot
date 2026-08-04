@@ -103,6 +103,7 @@ class TestDefaultRunnerRpcPath:
         rpc.assert_called_once_with(handle, ['p1'],
                                     True,
                                     summary_only=False,
+                                    metadata_only=False,
                                     include_target_num_replicas=None)
         codegen.assert_not_called()
         # RPC path must not even materialize a backend.
@@ -137,6 +138,7 @@ class TestDefaultRunnerRpcPath:
         codegen.assert_called_once_with(None,
                                         pool=False,
                                         summary_only=False,
+                                        metadata_only=False,
                                         include_target_num_replicas=None)
         backend.run_on_head.assert_called_once()
         load.assert_called_once_with(b'PAYLOAD')
@@ -170,6 +172,37 @@ class TestDefaultRunnerLegacyPath:
         rpc.assert_not_called()
         backend.run_on_head.assert_called_once()
         assert result == [{'name': 'p3'}]
+
+    def test_metadata_uses_v9_compatible_codegen_even_when_grpc_enabled(self):
+        runner = impl._DefaultServiceStatusRunner()
+        handle = _handle_mock(grpc_enabled=True)
+        backend = _backend_mock()
+        backend.run_on_head.return_value = (0, b'PAYLOAD', '')
+        with mock.patch(
+                'sky.serve.server.status.serve_rpc_utils.RpcRunner.'
+                'get_service_status') as rpc, \
+             mock.patch(
+                'sky.serve.server.status.serve_utils.ServeCodeGen.'
+                'get_service_status', return_value='CODE') as codegen, \
+             mock.patch(
+                'sky.serve.server.status.serve_utils.load_service_status',
+                return_value=[{'name': 'svc', 'metadata_only': True}]), \
+             mock.patch(
+                'sky.serve.server.status.backend_utils.'
+                'get_backend_from_handle', return_value=backend):
+            result = runner.get_service_status(handle=handle,
+                                               service_names=['svc'],
+                                               pool=False,
+                                               metadata_only=True)
+
+        rpc.assert_not_called()
+        codegen.assert_called_once_with(['svc'],
+                                        pool=False,
+                                        summary_only=False,
+                                        metadata_only=True,
+                                        include_target_num_replicas=None)
+        backend.run_on_head.assert_called_once()
+        assert result == [{'name': 'svc', 'metadata_only': True}]
 
     def test_legacy_command_error_surfaces_as_runtimeerror(self):
         runner = impl._DefaultServiceStatusRunner()
@@ -343,6 +376,56 @@ class TestStatusDelegatesToRunner:
 
         assert [record['endpoint'] for record in result] == [None, None]
         external_endpoint.assert_not_called()
+
+    def test_metadata_only_reaches_runner_and_skips_endpoint_resolution(self):
+        records = [{
+            'name': 'svc',
+            'load_balancer_port': 30001,
+            'tls_encrypted': False,
+        }]
+        runner = mock.Mock()
+        runner.get_service_status.return_value = records
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._common_patches():
+                stack.enter_context(patcher)
+            external_endpoint = stack.enter_context(
+                mock.patch.object(serve_status.lb_k8s,
+                                  'lb_service_endpoint_or_none'))
+            result = impl.status(pool=False, metadata_only=True)
+
+        assert result[0]['endpoint'] is None
+        external_endpoint.assert_not_called()
+        assert runner.get_service_status.call_args.kwargs[
+            'metadata_only'] is True
+
+    def test_summary_can_defer_then_opt_into_endpoint_resolution(self):
+        records = [{
+            'name': 'svc',
+            'resource_scope': 'scope-a',
+            'load_balancer_port': 30001,
+            'tls_encrypted': False,
+        }]
+        runner = mock.Mock()
+        runner.get_service_status.return_value = records
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._common_patches():
+                stack.enter_context(patcher)
+            endpoint = stack.enter_context(
+                mock.patch.object(
+                    serve_status.lb_k8s,
+                    'lb_service_endpoint_or_none',
+                    return_value='skypilot-serve-lb-svc.ns.svc:30001'))
+            result = impl.status(pool=False,
+                                 summary_only=True,
+                                 include_endpoints=True)
+
+        endpoint.assert_called_once_with('svc', 'scope-a')
+        assert (result[0]['endpoint'] ==
+                'http://skypilot-serve-lb-svc.ns.svc:30001')
 
     def test_status_history_requires_exactly_one_service(self):
         with pytest.raises(ValueError, match='requires exactly one service'):

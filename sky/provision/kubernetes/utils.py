@@ -10,9 +10,10 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import typing
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import ijson
 
@@ -66,6 +67,17 @@ DEFAULT_HOME_DIRECTORY = '/home/sky'
 HIGH_AVAILABILITY_DEPLOYMENT_VOLUME_MOUNT_PATH = DEFAULT_HOME_DIRECTORY
 
 IJSON_BUFFER_SIZE = 64 * 1024  # 64KB, default from ijson
+_MAX_OBSERVED_NODE_NAME_BYTES = 253
+_MAX_OBSERVED_RESOURCE_QUANTITY_BYTES = 128
+_MAX_OBSERVED_NODE_CONDITIONS = 256
+_MAX_OBSERVED_CONDITION_TYPE_BYTES = 256
+_MAX_OBSERVED_CONDITION_STATUS_BYTES = 64
+_MAX_OBSERVED_CONTINUE_TOKEN_BYTES = 4096
+_MAX_OBSERVED_JSON_KEY_BYTES = 1024
+_MAX_OBSERVED_JSON_STRING_BYTES = 256 * 1024
+_MAX_OBSERVED_JSON_CONTAINER_DEPTH = 64
+_MAX_OBSERVED_ACCELERATOR_LABEL_KEYS = 16
+_MAX_OBSERVED_ACCELERATOR_LABEL_KEY_BYTES = 317
 
 
 class KubernetesHighPerformanceNetworkType(enum.Enum):
@@ -887,10 +899,54 @@ class NebiusLabelFormatter(GPULabelFormatter):
 # discover the accelerator type from. The order of the list is important, as
 # it will be used to determine the priority of the label formats when
 # auto-detecting the GPU label type.
-LABEL_FORMATTER_REGISTRY = [
+LABEL_FORMATTER_REGISTRY: list[type[GPULabelFormatter]] = [
     SkyPilotLabelFormatter, GKELabelFormatter, KarpenterLabelFormatter,
     GFDLabelFormatter, CoreWeaveLabelFormatter, NebiusLabelFormatter
 ]
+
+_InvalidGPULabelCallback = Callable[
+    [int, str, type[GPULabelFormatter], str, str], None]
+
+
+class _GPULabelFormatterSelector:
+    """Single owner for provider-order GPU label formatter selection."""
+
+    __slots__ = ('_formatters', '_formatter_states', '_invalid_label_callback')
+
+    def __init__(
+        self,
+        invalid_label_callback: _InvalidGPULabelCallback | None = None,
+    ) -> None:
+        # None means that this formatter has not seen a nonempty matching
+        # label. False permanently disqualifies it after its first invalid
+        # nonempty match. True records its first valid nonempty match. The
+        # registry order is the formatter priority.
+        self._formatters = tuple(LABEL_FORMATTER_REGISTRY)
+        self._formatter_states: list[bool |
+                                     None] = [None] * len(self._formatters)
+        self._invalid_label_callback = invalid_label_callback
+
+    def accept(self, label_key: str, label_value: str | None) -> None:
+        """Consume one label in exact provider node and label-map order."""
+        for index, formatter in enumerate(self._formatters):
+            if self._formatter_states[index] is not None:
+                continue
+            if not formatter.match_label_key(label_key):
+                continue
+            if not label_value or label_value.strip() == '':
+                continue
+            valid, reason = formatter.validate_label_value(label_value)
+            self._formatter_states[index] = bool(valid)
+            if not valid and self._invalid_label_callback is not None:
+                self._invalid_label_callback(index, label_key, formatter,
+                                             label_value, reason)
+
+    def selected_formatter_type(self) -> type[GPULabelFormatter] | None:
+        """Resolve the first valid formatter in registry priority order."""
+        for formatter, state in zip(self._formatters, self._formatter_states):
+            if state:
+                return formatter
+        return None
 
 
 @annotations.lru_cache(scope='request')
@@ -912,30 +968,25 @@ def detect_gpu_label_formatter(
         for label, value in node.metadata.labels.items():
             node_labels[node.metadata.name].append((label, value))
 
-    invalid_label_values: list[tuple[str, str, str, str]] = []
-    # Check if the node labels contain any of the GPU label prefixes
-    for lf in LABEL_FORMATTER_REGISTRY:
-        skip = False
-        for _, label_list in node_labels.items():
-            for label, value in label_list:
-                if lf.match_label_key(label):
-                    # Skip empty label values
-                    if not value or value.strip() == '':
-                        continue
-                    valid, reason = lf.validate_label_value(value)
-                    if valid:
-                        return lf(), node_labels
-                    else:
-                        invalid_label_values.append(
-                            (label, lf.__name__, value, reason))
-                        skip = True
-                        break
-            if skip:
-                break
-        if skip:
-            continue
+    invalid_label_values: list[tuple[int, str, type[GPULabelFormatter], str,
+                                     str]] = []
 
-    for label, lf_name, value, reason in invalid_label_values:
+    def record_invalid_label(index: int, label: str,
+                             formatter: type[GPULabelFormatter], value: str,
+                             reason: str) -> None:
+        invalid_label_values.append((index, label, formatter, value, reason))
+
+    selector = _GPULabelFormatterSelector(record_invalid_label)
+    for label_list in node_labels.values():
+        for label, value in label_list:
+            selector.accept(label, value)
+
+    selected_formatter_type = selector.selected_formatter_type()
+    if selected_formatter_type is not None:
+        return selected_formatter_type(), node_labels
+
+    for _, label, formatter, value, reason in sorted(invalid_label_values):
+        lf_name = formatter.__name__
         logger.warning(f'GPU label {label} matched for label '
                        f'formatter {lf_name}, '
                        f'but has invalid value {value}. '
@@ -1419,6 +1470,26 @@ class V1NodeCondition:
     status: str
 
 
+@dataclasses.dataclass(frozen=True)
+class _KubernetesNodeReadinessState:
+    """Immutable result of streaming zero or more node conditions."""
+
+    decided: bool = False
+    is_ready: bool = False
+
+
+def _transition_kubernetes_node_readiness(
+    state: _KubernetesNodeReadinessState,
+    condition_type: str,
+    condition_status: str,
+) -> _KubernetesNodeReadinessState:
+    """Apply one condition while preserving the first-Ready contract."""
+    if state.decided or condition_type != 'Ready':
+        return state
+    return _KubernetesNodeReadinessState(decided=True,
+                                         is_ready=condition_status == 'True')
+
+
 @dataclasses.dataclass
 class V1NodeStatus:
     allocatable: dict[str, str]
@@ -1485,10 +1556,13 @@ class V1Node:
         A node is considered ready if it has a 'Ready' condition with
         status 'True'.
         """
+        readiness = _KubernetesNodeReadinessState()
         for condition in self.status.conditions:
-            if condition.type == 'Ready':
-                return condition.status == 'True'
-        return False
+            readiness = _transition_kubernetes_node_readiness(
+                readiness, condition.type, condition.status)
+            if readiness.decided:
+                break
+        return readiness.is_ready
 
     def is_cordoned(self) -> bool:
         """Check if the node is cordoned based on its spec.unschedulable."""
@@ -1551,6 +1625,465 @@ class V1Node:
                     taint_dict, tolerations)
             taints.append(taint_dict)
         return taints
+
+
+class KubernetesObservationLimitError(ValueError):
+    """A provider response exceeded a declared observation bound."""
+
+
+class _KubernetesObservationAcceptedByteLimitExhausted(
+        KubernetesObservationLimitError):
+    """The aggregate accepted-byte budget has been consumed exactly."""
+
+
+class KubernetesObservationBudget:
+    """Thread-safe, monotonic aggregate budget for provider observations.
+
+    Byte capacity is reserved before provider I/O. Successful reads convert
+    the returned byte count into a permanent charge and release only unused
+    reservation capacity. Failed reads permanently charge their full
+    reservation because the amount physically consumed is unknown. Node
+    records are charged before they are retained. Permanent charges are never
+    refunded, including when a response is partial or later fails validation,
+    so one instance can safely span concurrent context reads in a future
+    observation source.
+    """
+
+    __slots__ = (
+        '_consumed_node_records',
+        '_consumed_response_bytes',
+        '_lock',
+        '_maximum_node_records',
+        '_maximum_response_bytes',
+        '_reserved_response_bytes',
+    )
+
+    def __init__(self, *, maximum_response_bytes: int,
+                 maximum_node_records: int) -> None:
+        if (type(maximum_response_bytes) is not int or
+                maximum_response_bytes < 1):
+            raise ValueError(
+                'maximum_response_bytes must be a positive integer.')
+        if type(maximum_node_records) is not int or maximum_node_records < 1:
+            raise ValueError('maximum_node_records must be a positive integer.')
+        self._maximum_response_bytes = maximum_response_bytes
+        self._maximum_node_records = maximum_node_records
+        self._consumed_response_bytes = 0
+        self._consumed_node_records = 0
+        self._reserved_response_bytes = 0
+        self._lock = threading.Condition()
+
+    @property
+    def consumed_response_bytes(self) -> int:
+        with self._lock:
+            return self._consumed_response_bytes
+
+    @property
+    def remaining_response_bytes(self) -> int:
+        with self._lock:
+            return (self._maximum_response_bytes -
+                    self._consumed_response_bytes -
+                    self._reserved_response_bytes)
+
+    @property
+    def consumed_node_records(self) -> int:
+        with self._lock:
+            return self._consumed_node_records
+
+    @property
+    def remaining_node_records(self) -> int:
+        with self._lock:
+            return self._maximum_node_records - self._consumed_node_records
+
+    def consume_response_bytes(self, byte_count: int) -> None:
+        """Atomically charge bytes before returning them to a parser."""
+        if type(byte_count) is not int or byte_count < 0:
+            raise ValueError('byte_count must be a nonnegative integer.')
+        with self._lock:
+            if byte_count > (self._maximum_response_bytes -
+                             self._consumed_response_bytes -
+                             self._reserved_response_bytes):
+                raise KubernetesObservationLimitError(
+                    'Kubernetes observation exceeds its aggregate byte '
+                    'bound.')
+            self._consumed_response_bytes += byte_count
+
+    def _read_and_consume_response_bytes(self, source: Any,
+                                         requested_bytes: int) -> bytes:
+        """Reserve a bounded physical read and permanently charge its use."""
+        if type(requested_bytes) is not int or requested_bytes < 1:
+            raise ValueError('requested_bytes must be a positive integer.')
+        with self._lock:
+            while True:
+                remaining = (self._maximum_response_bytes -
+                             self._consumed_response_bytes -
+                             self._reserved_response_bytes)
+                if remaining > 0:
+                    break
+                if (self._consumed_response_bytes
+                        >= self._maximum_response_bytes):
+                    raise _KubernetesObservationAcceptedByteLimitExhausted(
+                        'Kubernetes observation aggregate byte bound is '
+                        'exhausted.')
+                # Capacity is only temporarily reserved by another read. Wait
+                # without holding the condition lock across provider I/O.
+                self._lock.wait()
+            bounded_request = min(requested_bytes, remaining)
+            self._reserved_response_bytes += bounded_request
+
+        permanent_charge = bounded_request
+        try:
+            data = source.read(bounded_request)
+            if not isinstance(data, bytes):
+                raise ValueError(
+                    'Kubernetes node response must be a byte stream.')
+            byte_count = len(data)
+            if byte_count > bounded_request:
+                raise KubernetesObservationLimitError(
+                    'Kubernetes node response violated its read bound.')
+            permanent_charge = byte_count
+        finally:
+            # On failure, the source may have physically consumed any portion
+            # of the reservation. Conservatively charge the whole reservation.
+            with self._lock:
+                self._reserved_response_bytes -= bounded_request
+                self._consumed_response_bytes += permanent_charge
+                self._lock.notify_all()
+        return data
+
+    def consume_node_record(self) -> None:
+        """Atomically charge one node before retaining its projection."""
+        with self._lock:
+            if self._consumed_node_records >= self._maximum_node_records:
+                raise KubernetesObservationLimitError(
+                    'Kubernetes observation exceeds its aggregate node '
+                    'bound.')
+            self._consumed_node_records += 1
+
+    def __repr__(self) -> str:
+        return (f'{type(self).__name__}('
+                f'consumed_response_bytes={self.consumed_response_bytes}, '
+                f'remaining_response_bytes={self.remaining_response_bytes}, '
+                f'consumed_node_records={self.consumed_node_records}, '
+                f'remaining_node_records={self.remaining_node_records})')
+
+
+@dataclasses.dataclass(frozen=True)
+class KubernetesNodeResources:
+    """Frozen provider-object-free resource projection of one node."""
+
+    name: str
+    is_ready: bool
+    cpu_capacity: float
+    memory_capacity_gb: float
+    cpu_allocatable: float
+    memory_allocatable_gb: float
+    _cpu_capacity_for_fitting: int | float = dataclasses.field(repr=False,
+                                                               compare=False)
+
+    def __post_init__(self) -> None:
+        _validate_observed_node_name(self.name)
+        if type(self.is_ready) is not bool:
+            raise ValueError('Kubernetes node readiness must be a bool.')
+        for value in (
+                self.cpu_capacity,
+                self.memory_capacity_gb,
+                self.cpu_allocatable,
+                self.memory_allocatable_gb,
+                self._cpu_capacity_for_fitting,
+        ):
+            if (isinstance(value, bool) or not isinstance(value,
+                                                          (int, float)) or
+                    not math.isfinite(value) or value < 0):
+                raise ValueError('Kubernetes node resources must be finite and '
+                                 'nonnegative.')
+
+
+@dataclasses.dataclass(frozen=True)
+class KubernetesNodeObservation:
+    """Frozen bounded result of one provider-order node-list observation."""
+
+    node_resources: tuple[KubernetesNodeResources, ...]
+    cpu_avoid_accelerator_label_keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (type(self.node_resources) is not tuple or
+                any(not isinstance(node, KubernetesNodeResources)
+                    for node in self.node_resources)):
+            raise ValueError('Kubernetes node resources must be a tuple.')
+        keys = self.cpu_avoid_accelerator_label_keys
+        if type(keys) is not tuple:
+            raise ValueError(
+                'Kubernetes CPU avoid-accelerator label keys must be a tuple.')
+        if len(keys) > _MAX_OBSERVED_ACCELERATOR_LABEL_KEYS:
+            raise KubernetesObservationLimitError(
+                'Kubernetes CPU avoid-accelerator label keys exceed their '
+                'count bound.')
+        for key in keys:
+            _bounded_observed_string(
+                key,
+                maximum_bytes=_MAX_OBSERVED_ACCELERATOR_LABEL_KEY_BYTES,
+                field_name='Kubernetes accelerator label key')
+
+
+def _bounded_observed_string(value: Any,
+                             *,
+                             maximum_bytes: int,
+                             field_name: str,
+                             allow_empty: bool = False) -> str:
+    if type(value) is not str or (not allow_empty and not value):
+        raise ValueError(f'{field_name} must be a string.')
+    if len(value.encode('utf-8')) > maximum_bytes:
+        raise KubernetesObservationLimitError(
+            f'{field_name} exceeds its byte bound.')
+    return value
+
+
+def _validate_observed_node_name(value: Any) -> str:
+    name = _bounded_observed_string(
+        value,
+        maximum_bytes=(_MAX_OBSERVED_NODE_NAME_BYTES),
+        field_name='Kubernetes node name')
+    if (re.fullmatch(r'[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?', name) is None or
+            '..' in name):
+        raise ValueError('Kubernetes node name is invalid.')
+    return name
+
+
+_JsonPath = tuple[str | None, ...]
+_NODE_ITEM_PATH: _JsonPath = ('items', None)
+_NODE_METADATA_PATH = (*_NODE_ITEM_PATH, 'metadata')
+_NODE_LABELS_PATH = (*_NODE_METADATA_PATH, 'labels')
+_NODE_STATUS_PATH = (*_NODE_ITEM_PATH, 'status')
+_NODE_CAPACITY_PATH = (*_NODE_STATUS_PATH, 'capacity')
+_NODE_ALLOCATABLE_PATH = (*_NODE_STATUS_PATH, 'allocatable')
+_NODE_CONDITIONS_PATH = (*_NODE_STATUS_PATH, 'conditions')
+_NODE_CONDITION_ITEM_PATH = (*_NODE_CONDITIONS_PATH, None)
+
+
+def _bounded_accelerator_label_keys(
+    selector: _GPULabelFormatterSelector,) -> tuple[str, ...]:
+    """Project the shared formatter decision into bounded canonical keys."""
+    formatter = selector.selected_formatter_type()
+    if formatter is None:
+        return ()
+    keys = formatter.get_label_keys()
+    if not isinstance(keys, (list, tuple)):
+        raise ValueError(
+            'Kubernetes accelerator label keys must be a sequence.')
+    if len(keys) > _MAX_OBSERVED_ACCELERATOR_LABEL_KEYS:
+        raise KubernetesObservationLimitError(
+            'Kubernetes CPU avoid-accelerator label keys exceed their count '
+            'bound.')
+    return tuple(
+        _bounded_observed_string(
+            key,
+            maximum_bytes=_MAX_OBSERVED_ACCELERATOR_LABEL_KEY_BYTES,
+            field_name='Kubernetes accelerator label key') for key in keys)
+
+
+class _KubernetesNodeResourceBuilder:
+    """Streaming state for the allowlisted fields of one node object."""
+
+    __slots__ = (
+        '_condition_count',
+        '_condition_status',
+        '_condition_type',
+        '_cpu_allocatable',
+        '_cpu_capacity',
+        '_accelerator_label_detector',
+        '_memory_allocatable',
+        '_memory_capacity',
+        '_name',
+        '_open_containers',
+        '_readiness',
+        '_seen',
+        '_seen_containers',
+    )
+
+    def __init__(
+            self,
+            accelerator_label_detector: _GPULabelFormatterSelector) -> None:
+        self._accelerator_label_detector = accelerator_label_detector
+        self._name: str | None = None
+        self._cpu_capacity: str | None = None
+        self._memory_capacity: str | None = None
+        self._cpu_allocatable = '0'
+        self._memory_allocatable = '0'
+        self._readiness = _KubernetesNodeReadinessState()
+        self._condition_count = 0
+        self._condition_type: str | None = None
+        self._condition_status: str | None = None
+        self._seen: set[str] = set()
+        self._seen_containers: set[_JsonPath] = set()
+        self._open_containers: set[_JsonPath] = set()
+
+    def _set_once(self, field: str, value: Any, *, maximum_bytes: int,
+                  field_name: str) -> str:
+        if field in self._seen:
+            raise ValueError(f'{field_name} must not be repeated.')
+        self._seen.add(field)
+        return _bounded_observed_string(value,
+                                        maximum_bytes=maximum_bytes,
+                                        field_name=field_name)
+
+    def accept(self, path: _JsonPath, event: str, value: Any) -> None:
+        """Consume one parser event without retaining unrelated fields."""
+        container_types = {
+            _NODE_METADATA_PATH: 'map',
+            _NODE_LABELS_PATH: 'map',
+            _NODE_STATUS_PATH: 'map',
+            _NODE_CAPACITY_PATH: 'map',
+            _NODE_ALLOCATABLE_PATH: 'map',
+            _NODE_CONDITIONS_PATH: 'array',
+        }
+        container_type = container_types.get(path)
+        if container_type is not None:
+            start_event = f'start_{container_type}'
+            end_event = f'end_{container_type}'
+            if event == start_event:
+                if path in self._seen_containers:
+                    raise ValueError(
+                        'Kubernetes node container must not be repeated.')
+                self._seen_containers.add(path)
+                self._open_containers.add(path)
+                return
+            if event == end_event:
+                if path not in self._open_containers:
+                    raise ValueError('Kubernetes node container is malformed.')
+                self._open_containers.remove(path)
+                return
+            raise ValueError(
+                f'Kubernetes node {path[-1]} must be a {container_type}.')
+
+        if path == (*_NODE_METADATA_PATH, 'name'):
+            if event != 'string':
+                raise ValueError('Kubernetes node name must be a string.')
+            self._name = self._set_once(
+                'name',
+                value,
+                maximum_bytes=_MAX_OBSERVED_NODE_NAME_BYTES,
+                field_name='Kubernetes node name')
+            return
+
+        if (len(path) == len(_NODE_LABELS_PATH) + 1 and
+                path[:-1] == _NODE_LABELS_PATH):
+            label_key = path[-1]
+            assert isinstance(label_key, str), path
+            if event == 'null':
+                label_value = None
+            elif event == 'string':
+                label_value = value
+            else:
+                raise ValueError(
+                    'Kubernetes node label value must be a string or null.')
+            self._accelerator_label_detector.accept(label_key, label_value)
+            return
+
+        resource_fields = {
+            (*_NODE_CAPACITY_PATH, 'cpu'): ('cpu_capacity', '_cpu_capacity'),
+            (*_NODE_CAPACITY_PATH, 'memory'):
+                ('memory_capacity', '_memory_capacity'),
+            (*_NODE_ALLOCATABLE_PATH, 'cpu'):
+                ('cpu_allocatable', '_cpu_allocatable'),
+            (*_NODE_ALLOCATABLE_PATH, 'memory'):
+                ('memory_allocatable', '_memory_allocatable'),
+        }
+        resource_field = resource_fields.get(path)
+        if resource_field is not None:
+            if event != 'string':
+                raise ValueError(
+                    'Kubernetes node resource quantity must be a string.')
+            seen_name, attribute_name = resource_field
+            quantity = self._set_once(
+                seen_name,
+                value,
+                maximum_bytes=_MAX_OBSERVED_RESOURCE_QUANTITY_BYTES,
+                field_name='Kubernetes node resource quantity')
+            setattr(self, attribute_name, quantity)
+            return
+
+        if path == _NODE_CONDITION_ITEM_PATH:
+            if event == 'start_map':
+                if self._condition_type is not None or self._condition_status is not None:
+                    raise ValueError('Kubernetes node condition is incomplete.')
+                self._condition_count += 1
+                if self._condition_count > _MAX_OBSERVED_NODE_CONDITIONS:
+                    raise KubernetesObservationLimitError(
+                        'Kubernetes node conditions exceed their count bound.')
+                return
+            if event == 'end_map':
+                if self._condition_type is None or self._condition_status is None:
+                    raise ValueError('Kubernetes node condition is incomplete.')
+                self._readiness = _transition_kubernetes_node_readiness(
+                    self._readiness, self._condition_type,
+                    self._condition_status)
+                self._condition_type = None
+                self._condition_status = None
+                self._seen.discard('condition_type')
+                self._seen.discard('condition_status')
+                return
+            raise ValueError('Kubernetes node condition must be an object.')
+        if path == (*_NODE_CONDITION_ITEM_PATH, 'type'):
+            if event != 'string':
+                raise ValueError(
+                    'Kubernetes node condition type must be a string.')
+            self._condition_type = self._set_once(
+                'condition_type',
+                value,
+                maximum_bytes=_MAX_OBSERVED_CONDITION_TYPE_BYTES,
+                field_name='Kubernetes node condition type')
+            return
+        if path == (*_NODE_CONDITION_ITEM_PATH, 'status'):
+            if event != 'string':
+                raise ValueError(
+                    'Kubernetes node condition status must be a string.')
+            self._condition_status = self._set_once(
+                'condition_status',
+                value,
+                maximum_bytes=_MAX_OBSERVED_CONDITION_STATUS_BYTES,
+                field_name='Kubernetes node condition status')
+
+    def build(self) -> KubernetesNodeResources:
+        """Validate and freeze this node's retained resource fields."""
+        if (self._open_containers or self._condition_type is not None or
+                self._condition_status is not None):
+            raise ValueError('Kubernetes node condition is incomplete.')
+        required_containers = {
+            _NODE_METADATA_PATH,
+            _NODE_STATUS_PATH,
+            _NODE_CAPACITY_PATH,
+            _NODE_ALLOCATABLE_PATH,
+        }
+        if not required_containers.issubset(self._seen_containers):
+            raise ValueError('Kubernetes node resource fields are incomplete.')
+        if (self._name is None or self._cpu_capacity is None or
+                self._memory_capacity is None):
+            raise ValueError('Kubernetes node resource fields are incomplete.')
+        name = _validate_observed_node_name(self._name)
+        try:
+            cpu_capacity = parse_cpu_or_gpu_resource_to_float(
+                self._cpu_capacity)
+            cpu_capacity_for_fitting = parse_cpu_or_gpu_resource(
+                self._cpu_capacity)
+            memory_capacity_gb = parse_memory_resource(self._memory_capacity,
+                                                       unit='G')
+            cpu_allocatable = parse_cpu_or_gpu_resource_to_float(
+                self._cpu_allocatable)
+            memory_allocatable_gb = parse_memory_resource(
+                self._memory_allocatable, unit='G')
+        except (IndexError, KeyError, OverflowError, TypeError, ValueError):
+            raise ValueError(
+                'Kubernetes node resource quantity is invalid.') from None
+        return KubernetesNodeResources(
+            name=name,
+            is_ready=self._readiness.is_ready,
+            cpu_capacity=cpu_capacity,
+            memory_capacity_gb=memory_capacity_gb,
+            cpu_allocatable=cpu_allocatable,
+            memory_allocatable_gb=memory_allocatable_gb,
+            _cpu_capacity_for_fitting=cpu_capacity_for_fitting,
+        )
 
 
 def get_allowed_nodes_config(
@@ -1889,6 +2422,396 @@ def inject_allowed_nodes_affinity(
     return pod_spec
 
 
+class _KubernetesObservationReader:
+    """Charges decompressed stream bytes before returning them to ijson."""
+
+    __slots__ = ('_budget', '_consumed_bytes', '_eof_probe_state',
+                 '_maximum_bytes', '_source')
+
+    _EOF_PROBE_NOT_RUN = 0
+    _EOF_PROBE_CONFIRMED = 1
+    _EOF_PROBE_REJECTED = 2
+
+    def __init__(self, source: Any, *, maximum_bytes: int,
+                 budget: KubernetesObservationBudget) -> None:
+        self._source = source
+        self._maximum_bytes = maximum_bytes
+        self._budget = budget
+        self._consumed_bytes = 0
+        self._eof_probe_state = self._EOF_PROBE_NOT_RUN
+
+    @property
+    def consumed_bytes(self) -> int:
+        return self._consumed_bytes
+
+    def _known_remaining_bytes(self) -> int | None:
+        try:
+            # urllib3's ``length_remaining`` tracks encoded wire bytes.  A
+            # decoding HTTPResponse can consume all of those bytes while its
+            # content decoder still buffers output, so zero is not decoded
+            # EOF.  Treat such responses as unknown-length and use the one-byte
+            # bounded EOF probe instead.
+            decode_content = getattr(self._source, 'decode_content', False)
+            headers = getattr(self._source, 'headers', None)
+            get_header = getattr(headers, 'get', None)
+            content_encoding = (get_header('content-encoding')
+                                if callable(get_header) else None)
+            if (decode_content is True and content_encoding is not None and
+                    str(content_encoding).strip().lower()
+                    not in ('', 'identity')):
+                return None
+            length_remaining = getattr(self._source, 'length_remaining', None)
+            if type(length_remaining) is int and length_remaining >= 0:
+                return length_remaining
+            getbuffer = getattr(self._source, 'getbuffer', None)
+            tell = getattr(self._source, 'tell', None)
+            if callable(getbuffer) and callable(tell):
+                remaining = len(getbuffer()) - tell()
+                if type(remaining) is int and remaining >= 0:
+                    return remaining
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+        return None
+
+    def _probe_unknown_length_eof(self) -> bytes:
+        """Perform this reader's sole discard-only one-byte EOF probe."""
+        if self._eof_probe_state == self._EOF_PROBE_CONFIRMED:
+            return b''
+        if self._eof_probe_state == self._EOF_PROBE_REJECTED:
+            raise KubernetesObservationLimitError(
+                'Kubernetes node response EOF probe was already rejected.')
+
+        # Mark the probe rejected before provider I/O so an error, including a
+        # BaseException, can never cause a second physical probe.
+        self._eof_probe_state = self._EOF_PROBE_REJECTED
+        data = self._source.read(1)
+        if not isinstance(data, bytes):
+            raise ValueError('Kubernetes node response must be a byte stream.')
+        if len(data) > 1:
+            raise KubernetesObservationLimitError(
+                'Kubernetes node response violated its EOF probe bound.')
+        if data:
+            raise KubernetesObservationLimitError(
+                'Kubernetes node response exceeds its accepted byte bound.')
+        self._eof_probe_state = self._EOF_PROBE_CONFIRMED
+        return b''
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b''
+        if self._eof_probe_state == self._EOF_PROBE_CONFIRMED:
+            return b''
+        if self._eof_probe_state == self._EOF_PROBE_REJECTED:
+            raise KubernetesObservationLimitError(
+                'Kubernetes node response EOF probe was already rejected.')
+        known_remaining = self._known_remaining_bytes()
+        if known_remaining == 0:
+            return b''
+        response_remaining = self._maximum_bytes - self._consumed_bytes
+        if response_remaining == 0:
+            if known_remaining is None:
+                return self._probe_unknown_length_eof()
+            raise KubernetesObservationLimitError(
+                'Kubernetes node response byte bound is exhausted.')
+        requested = (response_remaining if size is None or size < 0 else min(
+            size, response_remaining))
+        try:
+            data = self._budget._read_and_consume_response_bytes(  # pylint: disable=protected-access
+                self._source, requested)
+        except _KubernetesObservationAcceptedByteLimitExhausted:
+            if known_remaining is None:
+                return self._probe_unknown_length_eof()
+            raise KubernetesObservationLimitError(
+                'Kubernetes observation aggregate byte bound is exhausted '
+                'before response EOF.') from None
+        byte_count = len(data)
+        self._consumed_bytes += byte_count
+        return data
+
+
+@dataclasses.dataclass
+class _JsonContainerState:
+    """One bounded component of a structural JSON path."""
+
+    kind: Literal['map', 'array']
+    component: str | None
+    pending_key: str | None = None
+
+
+def _json_container_path(containers: list[_JsonContainerState]) -> _JsonPath:
+    """Build one ephemeral path from linear retained container state."""
+    # containers[0] is the root and therefore has no path component.
+    return tuple(container.component for container in containers[1:])
+
+
+def _iter_bounded_structured_json_events(
+    reader: _KubernetesObservationReader
+) -> typing.Iterator[tuple[_JsonPath, str, Any]]:
+    """Yield basic-parser events with paths derived from real containers."""
+    containers: list[_JsonContainerState] = []
+    saw_root = False
+    completed_root = False
+
+    for event, value in ijson.basic_parse(reader, buf_size=IJSON_BUFFER_SIZE):
+        if event == 'map_key':
+            _bounded_observed_string(value,
+                                     maximum_bytes=_MAX_OBSERVED_JSON_KEY_BYTES,
+                                     field_name='Kubernetes node JSON key')
+            if (not containers or containers[-1].kind != 'map' or
+                    containers[-1].pending_key is not None):
+                raise ValueError('Kubernetes node JSON structure is malformed.')
+            containers[-1].pending_key = value
+            continue
+
+        if event in ('end_map', 'end_array'):
+            expected_kind = 'map' if event == 'end_map' else 'array'
+            if not containers or containers[-1].kind != expected_kind:
+                raise ValueError('Kubernetes node JSON structure is malformed.')
+            container = containers[-1]
+            if container.pending_key is not None:
+                raise ValueError('Kubernetes node JSON structure is malformed.')
+            path = _json_container_path(containers)
+            containers.pop()
+        else:
+            if containers:
+                parent = containers[-1]
+                if parent.kind == 'map':
+                    if parent.pending_key is None:
+                        raise ValueError(
+                            'Kubernetes node JSON structure is malformed.')
+                    component = parent.pending_key
+                    parent.pending_key = None
+                else:
+                    component = None
+                path = (*_json_container_path(containers), component)
+            else:
+                if saw_root:
+                    raise ValueError(
+                        'Kubernetes node JSON must have one root object.')
+                component = None
+                path = ()
+
+            if event in ('start_map', 'start_array'):
+                kind: Literal['map', 'array'] = ('map' if event == 'start_map'
+                                                 else 'array')
+                if path == ():
+                    if event != 'start_map':
+                        raise ValueError(
+                            'Kubernetes node JSON root must be an object.')
+                    saw_root = True
+                if len(containers) >= _MAX_OBSERVED_JSON_CONTAINER_DEPTH:
+                    raise KubernetesObservationLimitError(
+                        'Kubernetes node JSON exceeds its container depth '
+                        'bound.')
+                containers.append(
+                    _JsonContainerState(kind=kind, component=component))
+            elif not containers:
+                raise ValueError('Kubernetes node JSON root must be an object.')
+
+        yield path, event, value
+        if path == () and event == 'end_map':
+            completed_root = True
+
+    if containers or not completed_root:
+        raise ValueError('Kubernetes node JSON collection is incomplete.')
+
+
+def _parse_bounded_kubernetes_node_observation(
+    response: Any,
+    *,
+    maximum_nodes: int,
+    maximum_response_bytes: int,
+    budget: KubernetesObservationBudget,
+) -> KubernetesNodeObservation:
+    """Stream only placement resource fields from one complete node list."""
+    reader = _KubernetesObservationReader(
+        response, maximum_bytes=(maximum_response_bytes), budget=budget)
+    nodes: list[KubernetesNodeResources] = []
+    accelerator_label_detector = _GPULabelFormatterSelector()
+    builder: _KubernetesNodeResourceBuilder | None = None
+    saw_items_start = False
+    saw_items_end = False
+    saw_metadata_start = False
+    saw_metadata_end = False
+    saw_continue = False
+    saw_remaining_item_count = False
+
+    for path, event, value in _iter_bounded_structured_json_events(reader):
+        if event == 'string':
+            _bounded_observed_string(
+                value,
+                maximum_bytes=_MAX_OBSERVED_JSON_STRING_BYTES,
+                field_name='Kubernetes node JSON string',
+                allow_empty=True)
+
+        if path == ('metadata',):
+            if event == 'start_map':
+                if saw_metadata_start:
+                    raise ValueError(
+                        'Kubernetes list metadata must not be repeated.')
+                saw_metadata_start = True
+                continue
+            if event == 'end_map':
+                if not saw_metadata_start or saw_metadata_end:
+                    raise ValueError('Kubernetes list metadata is malformed.')
+                saw_metadata_end = True
+                continue
+            raise ValueError('Kubernetes list metadata must be an object.')
+
+        if path == ('items',):
+            if event == 'start_array':
+                if saw_items_start:
+                    raise ValueError(
+                        'Kubernetes node items must not be repeated.')
+                saw_items_start = True
+                continue
+            if event == 'end_array':
+                if not saw_items_start or builder is not None:
+                    raise ValueError(
+                        'Kubernetes node collection is incomplete.')
+                saw_items_end = True
+                continue
+            raise ValueError('Kubernetes node items must be an array.')
+
+        if path == _NODE_ITEM_PATH:
+            if event == 'start_map':
+                if builder is not None or not saw_items_start or saw_items_end:
+                    raise ValueError('Kubernetes node collection is malformed.')
+                builder = _KubernetesNodeResourceBuilder(
+                    accelerator_label_detector)
+                continue
+            if event == 'end_map':
+                if builder is None:
+                    raise ValueError('Kubernetes node collection is malformed.')
+                node = builder.build()
+                builder = None
+                if len(nodes) >= maximum_nodes:
+                    raise KubernetesObservationLimitError(
+                        'Kubernetes node collection exceeds its count bound.')
+                budget.consume_node_record()
+                nodes.append(node)
+                continue
+            raise ValueError('Kubernetes node item must be an object.')
+
+        if builder is not None:
+            builder.accept(path, event, value)
+
+        if (len(path) > 2 and path[0] == 'metadata' and
+                path[-1] in ('continue', 'remainingItemCount')):
+            raise ValueError(
+                'Kubernetes list pagination metadata must be direct fields.')
+        if path == ('metadata', 'continue'):
+            if saw_continue:
+                raise ValueError(
+                    'Kubernetes list continuation must not be repeated.')
+            saw_continue = True
+            if event == 'null':
+                continue
+            if event != 'string':
+                raise ValueError(
+                    'Kubernetes list continuation must be a string.')
+            continuation = _bounded_observed_string(
+                value,
+                maximum_bytes=_MAX_OBSERVED_CONTINUE_TOKEN_BYTES,
+                field_name='Kubernetes list continuation',
+                allow_empty=True)
+            if continuation:
+                raise KubernetesObservationLimitError(
+                    'Kubernetes node collection is paginated.')
+            continue
+        if path == ('metadata', 'remainingItemCount'):
+            if saw_remaining_item_count:
+                raise ValueError(
+                    'Kubernetes remaining item count must not be repeated.')
+            saw_remaining_item_count = True
+            if event == 'null':
+                continue
+            if event != 'number' or type(value) is not int or value < 0:
+                raise ValueError(
+                    'Kubernetes remaining item count must be nonnegative.')
+            if value > 0:
+                raise KubernetesObservationLimitError(
+                    'Kubernetes node collection is paginated.')
+
+    if (builder is not None or not saw_items_start or not saw_items_end or
+            not saw_metadata_start or not saw_metadata_end):
+        raise ValueError('Kubernetes node collection is incomplete.')
+    node_names: set[str] = set()
+    for node in nodes:
+        if node.name in node_names:
+            raise ValueError('Kubernetes node names must be unique.')
+        node_names.add(node.name)
+    return KubernetesNodeObservation(
+        node_resources=tuple(nodes),
+        cpu_avoid_accelerator_label_keys=(
+            _bounded_accelerator_label_keys(accelerator_label_detector)),
+    )
+
+
+def _close_kubernetes_observation_response(response: Any) -> None:
+    """Best-effort close without replacing the response's primary failure."""
+    try:
+        close = getattr(response, 'close', None)
+        if callable(close):
+            close()
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
+        pass
+
+
+def get_kubernetes_node_observation_uncached_bounded(
+    *,
+    core_api: Any,
+    maximum_nodes: int,
+    maximum_response_bytes: int,
+    budget: KubernetesObservationBudget,
+) -> KubernetesNodeObservation:
+    """Read a complete bounded node projection through an explicit client.
+
+    The caller owns ``core_api`` and its underlying raw client. This helper
+    retains no V1Node, raw label map, label value, annotation, or unrecognized
+    provider field and always releases the response. Pagination and every
+    overflow fail closed; no input is truncated.
+    """
+    if type(maximum_nodes) is not int or maximum_nodes < 1:
+        raise ValueError('maximum_nodes must be a positive integer.')
+    if (type(maximum_response_bytes) is not int or maximum_response_bytes < 1):
+        raise ValueError('maximum_response_bytes must be a positive integer.')
+    if not isinstance(budget, KubernetesObservationBudget):
+        raise ValueError('budget must be a KubernetesObservationBudget.')
+
+    response = core_api.list_node(
+        limit=maximum_nodes + 1,
+        _request_timeout=kubernetes.API_TIMEOUT,
+        _preload_content=False,
+    )
+    try:
+        observation = _parse_bounded_kubernetes_node_observation(
+            response,
+            maximum_nodes=maximum_nodes,
+            maximum_response_bytes=maximum_response_bytes,
+            budget=budget,
+        )
+    except BaseException:  # pylint: disable=broad-exception-caught
+        # A partially consumed response must not be reused. Release is still
+        # attempted, but cleanup failures must never replace the primary parse
+        # or limit error.
+        _close_kubernetes_observation_response(response)
+        try:
+            response.release_conn()
+        except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
+            pass
+        raise
+
+    try:
+        response.release_conn()
+    except BaseException:  # pylint: disable=broad-exception-caught
+        # A release failure is the primary failure after a successful parse.
+        # Close is a best-effort fallback and must not mask it.
+        _close_kubernetes_observation_response(response)
+        raise
+    return observation
+
+
 @annotations.lru_cache(scope='request', maxsize=10)
 @_retry_on_error(resource_type='node')
 def get_kubernetes_nodes(*, context: str | None = None) -> list[V1Node]:
@@ -1993,6 +2916,10 @@ class V1Container:
 class V1PodSpec:
     containers: list[V1Container]
     node_name: str | None
+    # Scheduling priority resolved by the Priority admission controller from
+    # `priorityClassName`. Pods without a priority class resolve to 0.
+    priority: int = 0
+    priority_class_name: str | None = None
 
 
 @dataclasses.dataclass
@@ -2004,27 +2931,48 @@ class V1Pod:
     @classmethod
     def from_dict(cls, data: dict) -> 'V1Pod':
         """Create V1Pod from a dictionary."""
-        return cls(metadata=V1ObjectMeta(
-            name=data['metadata']['name'],
-            labels=data['metadata'].get('labels', {}),
-            namespace=data['metadata'].get('namespace'),
-        ),
-                   status=V1PodStatus(phase=data['status'].get('phase'),),
-                   spec=V1PodSpec(
-                       node_name=data['spec'].get('nodeName'),
-                       containers=[
-                           V1Container(resources=V1ResourceRequirements(
-                               requests=container.get('resources', {}).get(
-                                   'requests') or None))
-                           for container in data['spec'].get('containers', [])
-                       ]))
+        return cls(
+            metadata=V1ObjectMeta(
+                name=data['metadata']['name'],
+                labels=data['metadata'].get('labels', {}),
+                namespace=data['metadata'].get('namespace'),
+            ),
+            status=V1PodStatus(phase=data['status'].get('phase'),),
+            spec=V1PodSpec(
+                node_name=data['spec'].get('nodeName'),
+                priority=data['spec'].get('priority') or 0,
+                priority_class_name=data['spec'].get('priorityClassName'),
+                containers=[
+                    V1Container(
+                        resources=V1ResourceRequirements(requests=container.get(
+                            'resources', {}).get('requests') or None))
+                    for container in data['spec'].get('containers', [])
+                ]))
+
+
+class PriorityTier(NamedTuple):
+    """A scheduling priority tier that accelerators can be attributed to.
+
+    Two priority classes may share the same value, so the class name is part
+    of the identity to keep them distinguishable in the breakdown.
+    """
+    priority: int
+    class_name: str | None
+
+    @property
+    def label(self) -> str:
+        """Display label, e.g. 'inference-low (-1000)' or 'priority 0'."""
+        if self.class_name is None:
+            return f'priority {self.priority}'
+        return f'{self.class_name} ({self.priority})'
 
 
 @_retry_on_error(resource_type='pod')
 def get_allocated_resources_by_node(
     *,
     context: str | None = None,
-) -> tuple[dict[str, int], dict[str, tuple[float, float]]]:
+) -> tuple[dict[str, int], dict[str, tuple[float, float]], dict[str, dict[
+        PriorityTier, int]]]:
     """Gets allocated GPU, CPU, and memory by each node by fetching pods in
     all namespaces in kubernetes cluster indicated by context.
 
@@ -2032,9 +2980,12 @@ def get_allocated_resources_by_node(
     API call for better performance.
 
     Returns:
-        Tuple of (allocated_gpu_qty_by_node, allocated_cpu_memory_by_node):
+        Tuple of (allocated_gpu_qty_by_node, allocated_cpu_memory_by_node,
+        allocated_gpu_qty_by_node_by_priority):
         - allocated_gpu_qty_by_node: Dict mapping node name to allocated GPU count
         - allocated_cpu_memory_by_node: Dict mapping node name to (allocated_cpu, allocated_memory_gb) tuple
+        - allocated_gpu_qty_by_node_by_priority: Dict mapping node name to the
+          GPU count allocated at each scheduling priority tier on that node
     """
     if context is None:
         context = get_current_kube_config_context_name()
@@ -2054,6 +3005,9 @@ def get_allocated_resources_by_node(
         allocated_qty_by_node: dict[str, int] = collections.defaultdict(int)
         allocated_cpu_memory_by_node: dict[str, tuple[
             float, float]] = collections.defaultdict(lambda: (0.0, 0.0))
+        allocated_qty_by_node_by_priority: dict[str, dict[
+            PriorityTier, int]] = collections.defaultdict(
+                lambda: collections.defaultdict(int))
         for item_dict in ijson.items(response,
                                      'items.item',
                                      buf_size=IJSON_BUFFER_SIZE):
@@ -2087,13 +3041,18 @@ def get_allocated_resources_by_node(
 
             if pod_allocated_qty > 0:
                 allocated_qty_by_node[pod.spec.node_name] += pod_allocated_qty
+                tier = PriorityTier(pod.spec.priority,
+                                    pod.spec.priority_class_name)
+                allocated_qty_by_node_by_priority[
+                    pod.spec.node_name][tier] += pod_allocated_qty
             if pod_allocated_cpu > 0 or pod_allocated_memory_gb > 0:
                 current_cpu, current_memory = allocated_cpu_memory_by_node[
                     pod.spec.node_name]
                 allocated_cpu_memory_by_node[pod.spec.node_name] = (
                     current_cpu + pod_allocated_cpu,
                     current_memory + pod_allocated_memory_gb)
-        return allocated_qty_by_node, allocated_cpu_memory_by_node
+        return (allocated_qty_by_node, allocated_cpu_memory_by_node,
+                allocated_qty_by_node_by_priority)
     finally:
         response.release_conn()
 
@@ -2109,7 +3068,8 @@ def get_allocated_gpu_qty_by_node(
     Note: For better performance when you also need CPU/memory allocation,
     use get_allocated_resources_by_node() instead.
     """
-    allocated_qty_by_node, _ = get_allocated_resources_by_node(context=context)
+    allocated_qty_by_node, _, _ = get_allocated_resources_by_node(
+        context=context)
     return allocated_qty_by_node
 
 
@@ -3318,14 +4278,16 @@ def get_kubernetes_node_info(
     # Get the allocated resources (GPU, CPU, memory) by each node in a single call
     allocated_qty_by_node: dict[str, int] = collections.defaultdict(int)
     allocated_cpu_memory_by_node: dict[str, tuple[float, float]] = {}
+    allocated_qty_by_node_by_priority: dict[str, dict[PriorityTier, int]] = {}
     error_on_get_allocated_resources = False
     # Get resource allocation. For GPU allocation, only call if there are GPU nodes
     # (same as master branch). For CPU/memory, we always need it for all nodes.
     if has_accelerator_nodes:
         # When there are GPU nodes, get both GPU and CPU/memory in one call
         try:
-            allocated_qty_by_node, allocated_cpu_memory_by_node = get_allocated_resources_by_node(
-                context=context)
+            (allocated_qty_by_node, allocated_cpu_memory_by_node,
+             allocated_qty_by_node_by_priority) = (
+                 get_allocated_resources_by_node(context=context))
         except kubernetes.api_exception() as e:
             if e.status == 403:
                 error_on_get_allocated_resources = True
@@ -3336,7 +4298,7 @@ def get_kubernetes_node_info(
         # When there are no GPU nodes, we still need CPU/memory allocation
         # This is an extra API call compared to master branch
         try:
-            _, allocated_cpu_memory_by_node = get_allocated_resources_by_node(
+            _, allocated_cpu_memory_by_node, _ = get_allocated_resources_by_node(
                 context=context)
         except kubernetes.api_exception() as e:
             if e.status == 403:
@@ -3344,6 +4306,20 @@ def get_kubernetes_node_info(
                 pass
             else:
                 raise
+
+    # Accelerators are attributed as "preemptible" when the pod holding them
+    # sits below the cluster's top scheduling priority tier: a workload in the
+    # top tier can evict them, so they are reclaimable rather than committed.
+    # The top tier is derived from the accelerator-holding pods themselves
+    # instead of a fixed threshold, so a cluster that runs everything at one
+    # priority reports nothing preemptible, and a cluster that reserves a high
+    # class for production reports the tiers underneath it. Pods that hold no
+    # accelerators (system daemons and the like) never enter this set.
+    top_priority: int | None = None
+    for tiers in allocated_qty_by_node_by_priority.values():
+        for tier in tiers:
+            if top_priority is None or tier.priority > top_priority:
+                top_priority = tier.priority
 
     node_info_dict: dict[str, models.KubernetesNodeInfo] = {}
     has_multi_host_tpu = False
@@ -3446,6 +4422,20 @@ def get_kubernetes_node_info(
             allocated_qty = allocated_qty_by_node[node.metadata.name]
             accelerators_available = accelerator_count - allocated_qty
 
+        # Split what this node has allocated into the tiers below the top one.
+        # Left as None when pod allocation is unknown, so the caller can tell
+        # "nothing is preemptible" apart from "we could not look".
+        accelerators_preemptible: int | None = None
+        preemptible_breakdown: dict[str, int] | None = None
+        if not error_on_get_allocated_resources and top_priority is not None:
+            preemptible_breakdown = {
+                tier.label: qty
+                for tier, qty in allocated_qty_by_node_by_priority.get(
+                    node.metadata.name, {}).items()
+                if tier.priority < top_priority
+            }
+            accelerators_preemptible = sum(preemptible_breakdown.values())
+
         # Exclude multi-host TPUs from being processed.
         # TODO(Doyoung): Remove the logic when adding support for
         # multi-host TPUs.
@@ -3466,6 +4456,8 @@ def get_kubernetes_node_info(
             is_ready=node_is_ready,
             is_cordoned=node.is_cordoned(),
             taints=node_taints,
+            accelerators_preemptible=accelerators_preemptible,
+            preemptible_breakdown=preemptible_breakdown,
         )
     hint = ''
     if has_multi_host_tpu:
@@ -4011,48 +5003,12 @@ def format_kubeconfig_exec_auth(config: Any,
         inject_wrapper (bool): Whether to inject the wrapper script
     Returns: whether config was updated, for logging purposes
     """
-    updated = False
-    for user in config.get('users', []):
-        exec_info = user.get('user', {}).get('exec', {})
-        current_command = exec_info.get('command', '')
-
-        if current_command:
-            # Strip the path and keep only the executable name
-            executable = os.path.basename(current_command)
-            if executable == kubernetes_constants.SKY_K8S_EXEC_AUTH_WRAPPER:
-                # we don't want this happening recursively.
-                continue
-
-            if inject_wrapper:
-                exec_info[
-                    'command'] = kubernetes_constants.SKY_K8S_EXEC_AUTH_WRAPPER
-                if exec_info.get('args') is None:
-                    exec_info['args'] = []
-                exec_info['args'].insert(0, executable)
-                updated = True
-            elif executable != current_command:
-                exec_info['command'] = executable
-                updated = True
-
-            # Handle Nebius kubeconfigs: change --profile to 'sky'
-            if executable == 'nebius':
-                args = exec_info.get('args', [])
-                if args and '--profile' in args:
-                    try:
-                        profile_index = args.index('--profile')
-                        if profile_index + 1 < len(args):
-                            old_profile = args[profile_index + 1]
-                            if old_profile != 'sky':
-                                args[profile_index + 1] = 'sky'
-                                updated = True
-                    except ValueError:
-                        pass
-
-    os.makedirs(os.path.dirname(os.path.expanduser(output_path)), exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as file:
-        yaml.safe_dump(config, file)
-
-    return updated
+    return context_utils.format_kubeconfig_exec_auth(
+        config,
+        output_path,
+        inject_wrapper,
+        safe_dump_fn=yaml.safe_dump,
+    )
 
 
 def format_kubeconfig_exec_auth_with_cache(kubeconfig_path: str) -> str:
@@ -4066,32 +5022,14 @@ def format_kubeconfig_exec_auth_with_cache(kubeconfig_path: str) -> str:
         kubeconfig_path (str): kubeconfig path
     Returns: updated kubeconfig path
     """
-    # TODO(kyuds): GC cache files
-    with open(kubeconfig_path, encoding='utf-8') as file:
-        config = yaml_utils.safe_load(file)
-    normalized = yaml.dump(config, sort_keys=True)
-    hashed = hashlib.sha1(normalized.encode('utf-8'),
-                          usedforsecurity=False).hexdigest()
-    path = os.path.expanduser(
-        f'{kubernetes_constants.SKY_K8S_EXEC_AUTH_KUBECONFIG_CACHE}/{hashed}.yaml'
+    return context_utils.format_kubeconfig_exec_auth_with_cache(
+        kubeconfig_path,
+        safe_load_fn=yaml_utils.safe_load,
+        dump_fn=yaml.dump,
+        format_kubeconfig_exec_auth_fn=format_kubeconfig_exec_auth,
+        warning_fn=logger.warning,
+        format_exception_fn=common_utils.format_exception,
     )
-
-    # If we have already converted the same kubeconfig before, just return.
-    if os.path.isfile(path):
-        return path
-
-    try:
-        format_kubeconfig_exec_auth(config, path)
-        return path
-    except Exception as e:  # pylint: disable=broad-except
-        # There may be problems with kubeconfig, but the user is not actually
-        # using Kubernetes (or SSH Node Pools)
-        logger.warning(
-            f'Failed to format kubeconfig at {kubeconfig_path}. '
-            'Please check if the kubeconfig is valid. This may cause '
-            'problems when Kubernetes infra is used. '
-            f'Reason: {common_utils.format_exception(e)}')
-        return kubeconfig_path
 
 
 def delete_k8s_resource_with_retry(delete_func: Callable, resource_type: str,

@@ -1,0 +1,5 @@
+resourceActions:
+  authorityWorker:
+    activeCohort: ""
+    cohorts: []
+    retirementTombstones: []

@@ -15,6 +15,7 @@ import sqlalchemy
 
 from sky import sky_logging
 from sky.skylet import constants
+from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
 
@@ -42,16 +43,16 @@ def configured_migration_mode() -> MigrationMode:
 
 
 GLOBAL_USER_STATE_DB_NAME = 'state_db'
-GLOBAL_USER_STATE_VERSION = '027'  # qualification phases and repo tombstones
+GLOBAL_USER_STATE_VERSION = '028'  # action-aware cluster record identity
 GLOBAL_USER_STATE_JOB_MINIMUM_REVISION = '023'
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 
 SPOT_JOBS_DB_NAME = 'spot_jobs_db'
-SPOT_JOBS_VERSION = '025'  # exact managed-job task identity lookups
+SPOT_JOBS_VERSION = '027'  # ordered managed-job scheduler lookup
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '030'  # reserved-fill utilization signal and release state
+SERVE_VERSION = '034'  # durable authority-worker Helm release ledger
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'
@@ -65,6 +66,19 @@ KV_CACHE_LOCK_PATH = f'~/.sky/locks/.{KV_CACHE_DB_NAME}.lock'
 RECIPES_DB_NAME = 'recipes_db'
 RECIPES_VERSION = '001'
 RECIPES_LOCK_PATH = f'~/.sky/locks/.{RECIPES_DB_NAME}.lock'
+
+API_REQUESTS_DB_NAME = 'api_requests_db'
+API_REQUESTS_VERSION = '007'
+API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
+
+LIFECYCLE_ACTIONS_DB_NAME = 'lifecycle_actions_db'
+LIFECYCLE_ACTIONS_VERSION = '001'  # inert lifecycle store identity and scope
+LIFECYCLE_ACTIONS_LOCK_PATH = (
+    f'~/.sky/locks/.{LIFECYCLE_ACTIONS_DB_NAME}.lock')
+
+CAPACITY_STATE_DB_NAME = 'capacity_state_db'
+CAPACITY_STATE_VERSION = '001'  # read-only physical-capacity projection core
+CAPACITY_STATE_LOCK_PATH = f'~/.sky/locks/.{CAPACITY_STATE_DB_NAME}.lock'
 
 
 @contextlib.contextmanager
@@ -188,21 +202,26 @@ def _distributed_migration_lock(engine: sqlalchemy.engine.Engine, section: str):
     # blocking pg_advisory_lock statement still owns a transaction while it
     # waits, which can deadlock with CREATE INDEX CONCURRENTLY running under
     # the current lock owner.
-    with engine.connect().execution_options(
-            isolation_level='AUTOCOMMIT') as connection:
-        lock_query = sqlalchemy.text(
-            'SELECT pg_try_advisory_lock(hashtext(:name))')
-        while not bool(
+    lock_engine = db_utils.get_postgres_lock_engine(engine)
+    lock_query = sqlalchemy.text('SELECT pg_try_advisory_lock(hashtext(:name))')
+    while True:
+        with lock_engine.connect().execution_options(
+                isolation_level='AUTOCOMMIT') as connection:
+            acquired = bool(
                 connection.execute(lock_query, {
                     'name': lock_name
-                }).scalar_one()):
-            time.sleep(_DISTRIBUTED_MIGRATION_LOCK_POLL_SECONDS)
-        try:
-            yield
-        finally:
-            connection.execute(
-                sqlalchemy.text('SELECT pg_advisory_unlock(hashtext(:name))'),
-                {'name': lock_name})
+                }).scalar_one())
+            if acquired:
+                try:
+                    yield
+                finally:
+                    connection.execute(
+                        sqlalchemy.text(
+                            'SELECT pg_advisory_unlock(hashtext(:name))'),
+                        {'name': lock_name})
+                return
+        # Do not retain a nonwinning PostgreSQL session while waiting.
+        time.sleep(_DISTRIBUTED_MIGRATION_LOCK_POLL_SECONDS)
 
 
 def _validate_global_user_state_upgrade_start(

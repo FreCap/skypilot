@@ -375,7 +375,22 @@ class JobCancellationState(typing.NamedTuple):
     """State needed to authorize and route a managed-job cancellation."""
     status: ManagedJobStatus
     workspace: str
-    is_legacy_controller: bool
+
+
+class JobLogStreamSnapshot(typing.NamedTuple):
+    """Latest-task status and routing fields for one log-follow poll."""
+    task_id: int | None
+    status: ManagedJobStatus | None
+    pool: str | None
+    cluster_name: str | None
+    job_id_on_pool_cluster: int | None
+    task_name: str | None
+
+
+class ControllerLogFollowState(typing.NamedTuple):
+    """Latest-task status plus scheduler finalization for controller logs."""
+    status: ManagedJobStatus | None
+    schedule_state: ManagedJobScheduleState | None
 
 
 # These types were historically defined in sky.jobs.state. Keep their module
@@ -383,5 +398,6 @@ class JobCancellationState(typing.NamedTuple):
 # remains the public facade.
 for _status_type in (ManagedJobStatus, BatchLifecycleTransition,
                      ManagedJobScheduleState, ControllerPidRecord,
-                     JobCancellationState):
+                     JobCancellationState, JobLogStreamSnapshot,
+                     ControllerLogFollowState):
     _status_type.__module__ = 'sky.jobs.state'

@@ -8,6 +8,7 @@ Concepts:
 """
 import asyncio
 import contextlib
+import dataclasses
 import enum
 import json
 import os
@@ -24,17 +25,27 @@ from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import asyncio as sql_async
-from sqlalchemy.ext import declarative
 
+from sky import global_user_state_cloud_checks
+from sky import global_user_state_cluster_events
+from sky import global_user_state_cluster_yaml
+from sky import global_user_state_notifications
+from sky import global_user_state_schema
+from sky import global_user_state_service_account_tokens
+from sky import global_user_state_skylet_tunnels
+from sky import global_user_state_storage
+from sky import global_user_state_system_config
+from sky import global_user_state_users
+from sky import global_user_state_volumes
 from sky import models
 from sky import sky_logging
 from sky import skypilot_config
+from sky.adaptors import common as adaptors_common
 from sky.metrics import utils as metrics_lib
 from sky.skylet import constants
 from sky.utils import annotations
 from sky.utils import common_utils
 from sky.utils import context_utils
-from sky.utils import registry
 from sky.utils import status_lib
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
@@ -44,13 +55,14 @@ from sky.utils.db import retries as db_retries
 if typing.TYPE_CHECKING:
     from sky import backends
     from sky import clouds
+    from sky.backends import skylet_transport
     from sky.clouds import cloud
     from sky.data import Storage
+else:
+    skylet_transport = adaptors_common.LazyImport(
+        'sky.backends.skylet_transport')
 
 logger = sky_logging.init_logger(__name__)
-
-_ENABLED_CLOUDS_KEY_PREFIX = 'enabled_clouds_'
-_ALLOWED_CLOUDS_KEY_PREFIX = 'allowed_clouds_'
 
 DEFAULT_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
 DEBUG_CLUSTER_EVENT_RETENTION_HOURS = 30 * 24.0
@@ -63,140 +75,42 @@ _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
     'duplicate key value violates unique constraint',
 ]
 
-Base = declarative.declarative_base()
+Base = global_user_state_schema.Base
+auth_session_table = global_user_state_schema.auth_session_table
+cluster_event_table = global_user_state_schema.cluster_event_table
+cluster_history_table = global_user_state_schema.cluster_history_table
+cluster_table = global_user_state_schema.cluster_table
+cluster_yaml_table = global_user_state_schema.cluster_yaml_table
+config_table = global_user_state_schema.config_table
+estimated_spend_daily_table = global_user_state_schema.estimated_spend_daily_table
+estimated_spend_state_table = global_user_state_schema.estimated_spend_state_table
+operator_notification_cursor_table = global_user_state_schema.operator_notification_cursor_table
+operator_notification_sequence_table = global_user_state_schema.operator_notification_sequence_table
+operator_notification_table = global_user_state_schema.operator_notification_table
+service_account_token_table = global_user_state_schema.service_account_token_table
+ssh_key_table = global_user_state_schema.ssh_key_table
+storage_table = global_user_state_schema.storage_table
+system_config_table = global_user_state_schema.system_config_table
+user_table = global_user_state_schema.user_table
+volume_table = global_user_state_schema.volume_table
 
-config_table = sqlalchemy.Table(
-    'config',
-    Base.metadata,
-    sqlalchemy.Column('key', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('value', sqlalchemy.Text),
-)
-
-user_table = sqlalchemy.Table(
-    'users',
-    Base.metadata,
-    sqlalchemy.Column('id', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('name', sqlalchemy.Text),
-    sqlalchemy.Column('password', sqlalchemy.Text),
-    sqlalchemy.Column('created_at', sqlalchemy.Integer),
-    sqlalchemy.Column('type', sqlalchemy.Text, server_default=None),
-    # User-set default workspace; null when unset. Resolution and RBAC
-    # validation are handled in sky/workspaces/; this column is the
-    # persisted value only.
-    sqlalchemy.Column('preferred_workspace',
-                      sqlalchemy.Text,
-                      server_default=None),
-)
-
-auth_session_table = sqlalchemy.Table(
-    'auth_sessions',
-    Base.metadata,
-    sqlalchemy.Column('code_challenge', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('token', sqlalchemy.Text, nullable=False),
-    sqlalchemy.Column('created_at', sqlalchemy.Float, nullable=False),
-)
-
-cluster_table = sqlalchemy.Table(
-    'clusters',
-    Base.metadata,
-    sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('launched_at', sqlalchemy.Integer),
-    sqlalchemy.Column('handle', sqlalchemy.LargeBinary),
-    sqlalchemy.Column('last_use', sqlalchemy.Text),
-    sqlalchemy.Column('status', sqlalchemy.Text),
-    sqlalchemy.Column('autostop', sqlalchemy.Integer, server_default='-1'),
-    sqlalchemy.Column('to_down', sqlalchemy.Integer, server_default='0'),
-    sqlalchemy.Column('metadata', sqlalchemy.Text, server_default='{}'),
-    sqlalchemy.Column('owner', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('cluster_hash', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('storage_mounts_metadata',
-                      sqlalchemy.LargeBinary,
-                      server_default=None),
-    sqlalchemy.Column('cluster_ever_up', sqlalchemy.Integer,
-                      server_default='0'),
-    sqlalchemy.Column('status_updated_at',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('config_hash', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('user_hash', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('workspace',
-                      sqlalchemy.Text,
-                      server_default=constants.SKYPILOT_DEFAULT_WORKSPACE),
-    sqlalchemy.Column('last_creation_yaml',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('last_creation_command',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('is_managed', sqlalchemy.Integer, server_default='0'),
-    # Exact managed-image owner bound by the INIT transaction. A false known bit
-    # means pre-binding or indeterminate; true plus NULL fields means no owner.
-    sqlalchemy.Column('container_image_binding_known',
-                      sqlalchemy.Integer,
-                      server_default='0'),
-    sqlalchemy.Column('container_image_consumer_kind',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('container_image_consumer_owner',
-                      sqlalchemy.Text,
-                      server_default=None),
-    # Best-effort cost attribution. These scalar fields are populated during
-    # launch without adding a separate lifecycle write or lookup.
-    sqlalchemy.Column('workload_type', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('workload_id', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('workload_task_id',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('provision_log_path',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('skylet_ssh_tunnel_metadata',
-                      sqlalchemy.LargeBinary,
-                      server_default=None),
-    # Infrastructure columns for efficient filtering
-    sqlalchemy.Column('cloud', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('region', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('zone', sqlalchemy.Text, server_default=None),
-    # Node names for dashboard display (comma-separated)
-    sqlalchemy.Column('node_names', sqlalchemy.Text, server_default=None),
-    # External links for dashboard display, e.g. cloud-provider instance
-    # console URLs generated at launch time. Same shape as the `links` field
-    # on managed-job rows: a JSON object mapping {label: url}.
-    sqlalchemy.Column('links', sqlalchemy.JSON, server_default=None),
-)
-
-storage_table = sqlalchemy.Table(
-    'storage',
-    Base.metadata,
-    sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('launched_at', sqlalchemy.Integer),
-    sqlalchemy.Column('handle', sqlalchemy.LargeBinary),
-    sqlalchemy.Column('last_use', sqlalchemy.Text),
-    sqlalchemy.Column('status', sqlalchemy.Text),
-)
-
-volume_table = sqlalchemy.Table(
-    'volumes',
-    Base.metadata,
-    sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('launched_at', sqlalchemy.Integer),
-    sqlalchemy.Column('handle', sqlalchemy.LargeBinary),
-    sqlalchemy.Column('user_hash', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('workspace',
-                      sqlalchemy.Text,
-                      server_default=constants.SKYPILOT_DEFAULT_WORKSPACE),
-    sqlalchemy.Column('last_attached_at',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('last_use', sqlalchemy.Text),
-    sqlalchemy.Column('status', sqlalchemy.Text),
-    sqlalchemy.Column('is_ephemeral', sqlalchemy.Integer, server_default='0'),
-    sqlalchemy.Column('error_message', sqlalchemy.Text, server_default=None),
-    # JSON-encoded lists of pods/clusters using the volume
-    sqlalchemy.Column('usedby_pods', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('usedby_clusters', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('creation_yaml', sqlalchemy.Text, server_default=None),
-)
+# These historical helpers remain available through this facade.
+# pylint: disable=protected-access
+_operator_notification_insert_func = (
+    global_user_state_notifications._operator_notification_insert_func)
+_next_operator_notification_sequence = (
+    global_user_state_notifications._next_operator_notification_sequence)
+# Cloud-check key helpers are stateless direct aliases.  Retain their
+# historical facade identity for protected import and inspection compatibility.
+_get_enabled_clouds_key = (
+    global_user_state_cloud_checks._get_enabled_clouds_key)
+_get_enabled_clouds_key.__module__ = __name__
+_get_check_results_key = global_user_state_cloud_checks._get_check_results_key
+_get_check_results_key.__module__ = __name__
+_get_allowed_clouds_key = (
+    global_user_state_cloud_checks._get_allowed_clouds_key)
+_get_allowed_clouds_key.__module__ = __name__
+# pylint: enable=protected-access
 
 
 def lock_container_image_cluster_lifecycle_in_session(
@@ -334,142 +248,6 @@ def _validate_container_image_inline_credentials(resources: Any) -> None:
             'workload identity.')
 
 
-# Table for Cluster History
-# usage_intervals: List[Tuple[int, int]]
-#  Specifies start and end timestamps of cluster.
-#  When the last end time is None, the cluster is still UP.
-#  Example: [(start1, end1), (start2, end2), (start3, None)]
-
-# requested_resources: Set[resource_lib.Resource]
-#  Requested resources fetched from task that user specifies.
-
-# launched_resources: Optional[resources_lib.Resources]
-#  Actual launched resources fetched from handle for cluster.
-
-# num_nodes: Optional[int] number of nodes launched.
-cluster_history_table = sqlalchemy.Table(
-    'cluster_history',
-    Base.metadata,
-    sqlalchemy.Column('cluster_hash', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('name', sqlalchemy.Text),
-    sqlalchemy.Column('num_nodes', sqlalchemy.Integer),
-    sqlalchemy.Column('requested_resources', sqlalchemy.LargeBinary),
-    sqlalchemy.Column('launched_resources', sqlalchemy.LargeBinary),
-    sqlalchemy.Column('usage_intervals', sqlalchemy.LargeBinary),
-    sqlalchemy.Column('user_hash', sqlalchemy.Text),
-    sqlalchemy.Column('last_creation_yaml',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('last_creation_command',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('workspace', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('provision_log_path',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('last_activity_time',
-                      sqlalchemy.Integer,
-                      server_default=None,
-                      index=True),
-    sqlalchemy.Column('launched_at',
-                      sqlalchemy.Integer,
-                      server_default=None,
-                      index=True),
-    # Infrastructure columns for efficient filtering
-    sqlalchemy.Column('cloud', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('region', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('zone', sqlalchemy.Text, server_default=None),
-    # Node names for dashboard display (comma-separated)
-    sqlalchemy.Column('node_names', sqlalchemy.Text, server_default=None),
-    # Whether the cluster was launched by a controller (managed job or
-    # service). Mirrors the `is_managed` column on the clusters table so that
-    # history queries (e.g. the dashboard's cost report) can filter out
-    # controller-backed clusters even after they are terminated, since at that
-    # point the clusters table row is gone and the join can no longer supply
-    # the flag.
-    sqlalchemy.Column('is_managed', sqlalchemy.Integer, server_default='0'),
-    sqlalchemy.Column('workload_type', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('workload_id', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('workload_task_id',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    # Updated only when usage_intervals changes. The estimated-spend daemon
-    # uses this as an incremental watermark.
-    sqlalchemy.Column('usage_updated_at',
-                      sqlalchemy.Integer,
-                      server_default='0',
-                      index=True),
-)
-
-# Materialized, best-effort compute-cost estimates. One row represents the
-# overlap of one cluster-history record with one UTC day. Request paths only
-# aggregate this table; pricing and interval splitting happen in a daemon.
-estimated_spend_daily_table = sqlalchemy.Table(
-    'estimated_spend_daily',
-    Base.metadata,
-    sqlalchemy.Column('day_start_utc', sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column('cluster_hash', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('cluster_name', sqlalchemy.Text, nullable=False),
-    sqlalchemy.Column('workload_type', sqlalchemy.Text, nullable=False),
-    sqlalchemy.Column('workload_id', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('workload_task_id',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('user_hash', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('workspace', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('cloud', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('region', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('use_spot', sqlalchemy.Boolean, server_default=None),
-    sqlalchemy.Column('num_nodes', sqlalchemy.Integer, server_default=None),
-    sqlalchemy.Column('machine_seconds', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Column('catalog_hourly_rate',
-                      sqlalchemy.Float,
-                      server_default=None),
-    sqlalchemy.Column('estimated_cost', sqlalchemy.Float, server_default=None),
-    sqlalchemy.Column('exclusion_reason', sqlalchemy.Text, server_default=None),
-    sqlalchemy.Column('priced_at', sqlalchemy.Integer, server_default=None),
-    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Index('idx_estimated_spend_day_workspace', 'day_start_utc',
-                     'workspace'),
-    sqlalchemy.Index('idx_estimated_spend_day_workload', 'day_start_utc',
-                     'workload_type', 'workload_id'),
-)
-
-estimated_spend_state_table = sqlalchemy.Table(
-    'estimated_spend_state',
-    Base.metadata,
-    sqlalchemy.Column('singleton_id', sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column('last_started_at',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('last_success_at',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('source_watermark',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('source_watermark_hash',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('active_cursor_hash',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('backfill_cursor_launched_at',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('backfill_cursor_hash',
-                      sqlalchemy.Text,
-                      server_default=None),
-    sqlalchemy.Column('backfill_complete',
-                      sqlalchemy.Boolean,
-                      server_default=sqlalchemy.sql.expression.false()),
-    sqlalchemy.Column('coverage_start_utc',
-                      sqlalchemy.Integer,
-                      server_default=None),
-    sqlalchemy.Column('last_error', sqlalchemy.Text, server_default=None),
-)
-
-
 class ClusterEventType(enum.Enum):
     """Type of cluster event."""
     DEBUG = 'DEBUG'
@@ -487,111 +265,6 @@ class ClusterEventType(enum.Enum):
     # 'Launching (1 pod(s) pending due to Pulling)'). Read for the
     # LAUNCHING-state badge tooltip on the dashboard.
     LAUNCH_PROGRESS = 'LAUNCH_PROGRESS'
-
-
-# Table for cluster status change events.
-# starting_status: Status of the cluster at the start of the event.
-# ending_status: Status of the cluster at the end of the event.
-# reason: Reason for the transition.
-# transitioned_at: Timestamp of the transition.
-cluster_event_table = sqlalchemy.Table(
-    'cluster_events',
-    Base.metadata,
-    sqlalchemy.Column('cluster_hash', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('name', sqlalchemy.Text),
-    sqlalchemy.Column('starting_status', sqlalchemy.Text),
-    sqlalchemy.Column('ending_status', sqlalchemy.Text),
-    sqlalchemy.Column('reason', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('transitioned_at', sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column('type', sqlalchemy.Text),
-    sqlalchemy.Column('request_id', sqlalchemy.Text, server_default=None),
-)
-
-ssh_key_table = sqlalchemy.Table(
-    'ssh_key',
-    Base.metadata,
-    sqlalchemy.Column('user_hash', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('ssh_public_key', sqlalchemy.Text),
-    sqlalchemy.Column('ssh_private_key', sqlalchemy.Text),
-)
-
-service_account_token_table = sqlalchemy.Table(
-    'service_account_tokens',
-    Base.metadata,
-    sqlalchemy.Column('token_id', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('token_name', sqlalchemy.Text),
-    # Indexed + unique: the auth middleware looks up rows by hash on every
-    # request to enforce revocation/rotation/expiration.
-    sqlalchemy.Column('token_hash', sqlalchemy.Text, index=True, unique=True),
-    sqlalchemy.Column('created_at', sqlalchemy.Integer),
-    sqlalchemy.Column('last_used_at', sqlalchemy.Integer, server_default=None),
-    sqlalchemy.Column('expires_at', sqlalchemy.Integer, server_default=None),
-    sqlalchemy.Column('creator_user_hash',
-                      sqlalchemy.Text),  # Who created this token
-    sqlalchemy.Column('service_account_user_id',
-                      sqlalchemy.Text),  # Service account's own user ID
-)
-
-cluster_yaml_table = sqlalchemy.Table(
-    'cluster_yaml',
-    Base.metadata,
-    sqlalchemy.Column('cluster_name', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('yaml', sqlalchemy.Text),
-)
-
-system_config_table = sqlalchemy.Table(
-    'system_config',
-    Base.metadata,
-    sqlalchemy.Column('config_key', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('config_value', sqlalchemy.Text),
-    sqlalchemy.Column('created_at', sqlalchemy.Integer),
-    sqlalchemy.Column('updated_at', sqlalchemy.Integer),
-)
-
-# Low-cardinality operator notifications. One row is retained per category;
-# repeated occurrences update the same row instead of appending an event.
-operator_notification_table = sqlalchemy.Table(
-    'operator_notifications',
-    Base.metadata,
-    sqlalchemy.Column('category', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('message', sqlalchemy.Text, nullable=False),
-    sqlalchemy.Column('first_seen_at', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Column('last_seen_at',
-                      sqlalchemy.Integer,
-                      nullable=False,
-                      index=True),
-    sqlalchemy.Column('occurrence_count', sqlalchemy.Integer, nullable=False),
-    sqlalchemy.Column('sequence',
-                      sqlalchemy.Integer,
-                      nullable=False,
-                      index=True),
-)
-
-# Each dashboard operator acknowledges a single global sequence, rather than
-# multiplying notification rows by (user, category).
-operator_notification_cursor_table = sqlalchemy.Table(
-    'operator_notification_cursors',
-    Base.metadata,
-    sqlalchemy.Column('user_id', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('last_seen_sequence',
-                      sqlalchemy.Integer,
-                      nullable=False,
-                      server_default='0'),
-    sqlalchemy.Column('updated_at', sqlalchemy.Integer, nullable=False),
-)
-
-# A singleton counter gives notification incidents a total order across
-# categories. Gaps are harmless: suppressed occurrences consume a sequence but
-# keep their category's previous incident sequence.
-operator_notification_sequence_table = sqlalchemy.Table(
-    'operator_notification_sequence',
-    Base.metadata,
-    sqlalchemy.Column('singleton_id', sqlalchemy.Integer, primary_key=True),
-    sqlalchemy.Column('value',
-                      sqlalchemy.Integer,
-                      nullable=False,
-                      server_default='0'),
-)
 
 
 def _glob_to_similar(glob_pattern):
@@ -692,6 +365,210 @@ def _session_scope(session: 'orm.Session | None' = None):
             yield owned_session
 
 
+class ClusterRecordIdentityWriteOutcome(enum.Enum):
+    """Successful outcomes of the action-aware cluster identity primitive."""
+
+    INSERTED = 'inserted'
+    ADOPTED = 'adopted'
+
+
+class ClusterRecordIdentityConflictError(RuntimeError):
+    """A cluster name or record UUID is already committed incompatibly."""
+
+
+class ClusterRecordRemovalOutcome(enum.Enum):
+    """Successful outcomes of expected-identity cluster-row removal."""
+
+    REMOVED_EXACT = 'removed_exact'
+    ALREADY_ABSENT = 'already_absent'
+
+
+SkyletSSHTunnelMetadata = (
+    global_user_state_skylet_tunnels.SkyletSSHTunnelMetadata)
+ClusterSkyletSSHTunnelSnapshotV1 = (
+    global_user_state_skylet_tunnels.ClusterSkyletSSHTunnelSnapshotV1)
+
+
+@dataclasses.dataclass(frozen=True)
+class ClusterRecordIdentitySnapshot:
+    """One exact action-aware cluster row read under its resource locks."""
+
+    cluster_name: str
+    cluster_record_uuid: uuid.UUID
+    serialized_handle: bytes
+    handle: Any
+
+
+_CLUSTER_RECORD_HANDLE_UNSET = object()
+
+
+def _canonical_cluster_record_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    """Validates one UUID value without accepting alternate text spellings."""
+    if isinstance(value, uuid.UUID):
+        return value
+    if not isinstance(value, str):
+        raise TypeError('cluster_record_uuid must be a UUID or canonical UUID '
+                        'text.')
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as e:
+        raise ValueError(
+            'cluster_record_uuid must be canonical UUID text.') from e
+    if str(parsed) != value:
+        raise ValueError('cluster_record_uuid must be canonical UUID text.')
+    return parsed
+
+
+def _lock_cluster_record_uuid_in_session(session: orm.Session,
+                                         record_uuid: uuid.UUID) -> None:
+    """Serializes claims of one cluster-record UUID across cluster names."""
+    lock_key = json.dumps(
+        ('resource_action_cluster_record_uuid', str(record_uuid)),
+        separators=(',', ':'))
+    session.execute(
+        sqlalchemy.text('SELECT pg_advisory_xact_lock('
+                        'hashtextextended(CAST(:lock_key AS text), 0))'),
+        {'lock_key': lock_key})
+
+
+def _commit_cluster_record_identity_in_session(
+    session: orm.Session,
+    cluster_name: str,
+    cluster_record_uuid: uuid.UUID | str,
+    *,
+    insert_values: typing.Mapping[str, Any] | None = None,
+) -> ClusterRecordIdentityWriteOutcome:
+    """Insert or exactly adopt one identity in a caller-owned transaction.
+
+    A caller inserting a missing row must either pass all ordinary insert
+    values or finish populating it before committing this same transaction.
+    """
+    if not isinstance(cluster_name, str):
+        raise TypeError('cluster_name must be text.')
+    if not cluster_name:
+        raise ValueError('cluster_name must be nonempty.')
+    parsed_uuid = _canonical_cluster_record_uuid(cluster_record_uuid)
+    bind = session.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Action-aware cluster identity requires the central PostgreSQL '
+            'database.')
+
+    # The name lock is shared with ordinary cluster upserts and removal.  The
+    # UUID lock closes the independent same-UUID/different-name race before the
+    # partial unique index becomes the last line of defense.
+    lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
+    _lock_cluster_record_uuid_in_session(session, parsed_uuid)
+
+    name_row = session.execute(
+        sqlalchemy.select(
+            cluster_table.c.name, cluster_table.c.cluster_record_uuid).where(
+                cluster_table.c.name ==
+                cluster_name).with_for_update()).mappings().one_or_none()
+    if name_row is not None:
+        committed_uuid = name_row['cluster_record_uuid']
+        if committed_uuid == parsed_uuid:
+            return ClusterRecordIdentityWriteOutcome.ADOPTED
+        observed = ('null' if committed_uuid is None else str(committed_uuid))
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster {cluster_name!r} has incompatible cluster-record UUID '
+            f'{observed}; expected {parsed_uuid}.')
+
+    uuid_row = session.execute(
+        sqlalchemy.select(cluster_table.c.name).where(
+            cluster_table.c.cluster_record_uuid ==
+            parsed_uuid).with_for_update()).mappings().one_or_none()
+    if uuid_row is not None:
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster-record UUID {parsed_uuid} is already committed '
+            f'to cluster {uuid_row["name"]!r}, not {cluster_name!r}.')
+
+    values = dict(insert_values or {})
+    unexpected_identity = {'name', 'cluster_record_uuid'}.intersection(values)
+    if unexpected_identity:
+        raise ValueError('insert_values must omit identity-owned columns: ' +
+                         ', '.join(sorted(unexpected_identity)))
+    insert_statement = postgresql.insert(cluster_table).values(
+        name=cluster_name, cluster_record_uuid=parsed_uuid, **values)
+    inserted = session.execute(
+        insert_statement.on_conflict_do_nothing()).rowcount
+    if inserted != 1:
+        # Every action-aware writer takes both advisory locks above, so a
+        # conflict here means an out-of-contract writer raced the commitment.
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster identity for {cluster_name!r} and '
+            f'{parsed_uuid} changed concurrently.')
+    return ClusterRecordIdentityWriteOutcome.INSERTED
+
+
+def _read_cluster_record_identity_in_session(
+    session: orm.Session,
+    cluster_name: str,
+    expected_cluster_record_uuid: uuid.UUID | str,
+) -> ClusterRecordIdentitySnapshot | None:
+    """Read one exact action-aware cluster row in a caller transaction.
+
+    The absence result is authoritative only for the row in this PostgreSQL
+    transaction.  A present legacy/null or differently identified same-name
+    row is a conflict, never an absence result.
+    """
+    if not isinstance(cluster_name, str):
+        raise TypeError('cluster_name must be text.')
+    if not cluster_name:
+        raise ValueError('cluster_name must be nonempty.')
+    parsed_uuid = _canonical_cluster_record_uuid(expected_cluster_record_uuid)
+    bind = session.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Action-aware cluster identity requires the central PostgreSQL '
+            'database.')
+
+    lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
+    _lock_cluster_record_uuid_in_session(session, parsed_uuid)
+    row = session.execute(
+        sqlalchemy.select(
+            cluster_table.c.cluster_record_uuid,
+            cluster_table.c.handle,
+        ).where(cluster_table.c.name ==
+                cluster_name).with_for_update()).mappings().one_or_none()
+    if row is None:
+        return None
+    observed_uuid = row['cluster_record_uuid']
+    if observed_uuid != parsed_uuid:
+        observed = ('null' if observed_uuid is None else str(observed_uuid))
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster {cluster_name!r} has incompatible cluster-record UUID '
+            f'{observed}; expected {parsed_uuid}.')
+    serialized_handle = row['handle']
+    if not isinstance(serialized_handle, bytes) or not serialized_handle:
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster {cluster_name!r} with cluster-record UUID '
+            f'{parsed_uuid} has no exact persisted handle.')
+    try:
+        handle = pickle.loads(serialized_handle)
+    except Exception as e:  # pylint: disable=broad-except
+        raise ClusterRecordIdentityConflictError(
+            f'Cluster {cluster_name!r} with cluster-record UUID '
+            f'{parsed_uuid} has an unreadable persisted handle.') from e
+    return ClusterRecordIdentitySnapshot(
+        cluster_name=cluster_name,
+        cluster_record_uuid=parsed_uuid,
+        serialized_handle=serialized_handle,
+        handle=handle,
+    )
+
+
+@db_retries.retry
+def get_cluster_record_identity_snapshot(
+    cluster_name: str,
+    expected_cluster_record_uuid: uuid.UUID | str,
+) -> ClusterRecordIdentitySnapshot | None:
+    """Read one expected-UUID cluster row through the action-aware fence."""
+    with orm.Session(_db_manager.get_engine()) as session, session.begin():
+        return _read_cluster_record_identity_in_session(
+            session, cluster_name, expected_cluster_record_uuid)
+
+
 @metrics_lib.time_me
 def add_or_update_user(
         user: models.User,
@@ -703,252 +580,48 @@ def add_or_update_user(
         If return_user=False: bool (whether the user is newly added)
         If return_user=True: Tuple[bool, models.User]
     """
-    if user.name is None:
-        return (False, user) if return_user else False
-    engine = _db_manager.get_engine()
-    # Set created_at if not already set
-    created_at = user.created_at
-    if created_at is None:
-        created_at = int(time.time())
-    with orm.Session(engine) as session:
-        # Check for duplicate names if not allowed (within the same transaction)
-        if not allow_duplicate_name:
-            existing_user = session.query(user_table).filter(
-                user_table.c.name == user.name).first()
-            if existing_user is not None:
-                return (False, user) if return_user else False
-
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            # For SQLite, use INSERT OR IGNORE followed by UPDATE to detect new
-            # vs existing
-            insert_func = sqlite.insert
-
-            # First try INSERT OR IGNORE - this won't fail if user exists
-            insert_stmnt = insert_func(user_table).prefix_with(
-                'OR IGNORE').values(
-                    id=user.id,
-                    name=user.name,
-                    password=user.password,
-                    created_at=created_at,
-                    type=user.user_type,
-                )
-            use_returning = return_user and _sqlite_supports_returning()
-            if use_returning:
-                insert_stmnt = insert_stmnt.returning(
-                    user_table.c.id,
-                    user_table.c.name,
-                    user_table.c.password,
-                    user_table.c.created_at,
-                    user_table.c.type,
-                    user_table.c.preferred_workspace,
-                )
-            result = session.execute(insert_stmnt)
-
-            row = None
-            if use_returning:
-                # With RETURNING, check if we got a row back.
-                row = result.fetchone()
-                was_inserted = row is not None
-            else:
-                # Without RETURNING, use rowcount.
-                was_inserted = result.rowcount > 0
-
-            if not was_inserted:
-                # User existed, so update it (but don't update created_at)
-                update_values = {user_table.c.name: user.name}
-                if user.password:
-                    update_values[user_table.c.password] = user.password
-                if user.user_type:
-                    update_values[user_table.c.type] = user.user_type
-
-                update_stmnt = sqlalchemy.update(user_table).where(
-                    user_table.c.id == user.id).values(update_values)
-                if use_returning:
-                    update_stmnt = update_stmnt.returning(
-                        user_table.c.id,
-                        user_table.c.name,
-                        user_table.c.password,
-                        user_table.c.created_at,
-                        user_table.c.type,
-                        user_table.c.preferred_workspace,
-                    )
-
-                result = session.execute(update_stmnt)
-                if use_returning:
-                    row = result.fetchone()
-
-            session.commit()
-
-            if return_user:
-                if row is None:
-                    # row=None means the sqlite used has no RETURNING support,
-                    # so we need to do a separate query
-                    row = session.query(user_table).filter_by(
-                        id=user.id).first()
-                updated_user = models.User(
-                    id=row.id,
-                    name=row.name,
-                    password=row.password,
-                    created_at=row.created_at,
-                    user_type=row.type,
-                    preferred_workspace=row.preferred_workspace,
-                )
-                return was_inserted, updated_user
-            else:
-                return was_inserted
-
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            # For PostgreSQL, use INSERT ... ON CONFLICT with RETURNING to
-            # detect insert vs update
-            insert_func = postgresql.insert
-
-            insert_stmnt = insert_func(user_table).values(
-                id=user.id,
-                name=user.name,
-                password=user.password,
-                created_at=created_at,
-                type=user.user_type,
-            )
-
-            # Use a sentinel in the RETURNING clause to detect insert vs update
-            if user.password:
-                set_ = {
-                    user_table.c.name: user.name,
-                    user_table.c.password: user.password
-                }
-            else:
-                set_ = {user_table.c.name: user.name}
-            if user.user_type:
-                set_[user_table.c.type] = user.user_type
-            upsert_stmnt = insert_stmnt.on_conflict_do_update(
-                index_elements=[user_table.c.id], set_=set_).returning(
-                    user_table.c.id,
-                    user_table.c.name,
-                    user_table.c.password,
-                    user_table.c.created_at,
-                    user_table.c.type,
-                    user_table.c.preferred_workspace,
-                    # This will be True for INSERT, False for UPDATE
-                    sqlalchemy.literal_column('(xmax = 0)').label('was_inserted'
-                                                                 ))
-
-            result = session.execute(upsert_stmnt)
-            row = result.fetchone()
-
-            was_inserted = bool(row.was_inserted) if row else False
-            session.commit()
-
-            if return_user:
-                updated_user = models.User(
-                    id=row.id,
-                    name=row.name,
-                    password=row.password,
-                    created_at=row.created_at,
-                    user_type=row.type,
-                    preferred_workspace=row.preferred_workspace,
-                )
-                return was_inserted, updated_user
-            else:
-                return was_inserted
-        else:
-            raise ValueError('Unsupported database dialect')
+    return global_user_state_users.add_or_update_user(
+        _db_manager.get_engine, orm.Session, sqlite, postgresql, user_table,
+        _sqlite_supports_returning, time.time, user, allow_duplicate_name,
+        return_user)
 
 
 @metrics_lib.time_me
 def get_user(user_id: str,
              session: 'orm.Session | None' = None) -> models.User | None:
-    with _session_scope(session) as active_session:
-        row = active_session.query(user_table).filter_by(id=user_id).first()
-    if row is None:
-        return None
-    return models.User(
-        id=row.id,
-        name=row.name,
-        password=row.password,
-        created_at=row.created_at,
-        user_type=row.type,
-        preferred_workspace=row.preferred_workspace,
-    )
+    return global_user_state_users.get_user(_session_scope(session), user_table,
+                                            user_id)
 
 
 @metrics_lib.time_me
 def get_users(user_ids: set[str]) -> dict[str, models.User]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(user_table).filter(
-            user_table.c.id.in_(user_ids)).all()
-    return {
-        row.id: models.User(
-            id=row.id,
-            name=row.name,
-            password=row.password,
-            created_at=row.created_at,
-            user_type=row.type,
-            preferred_workspace=row.preferred_workspace,
-        ) for row in rows
-    }
+    return global_user_state_users.get_users(_db_manager.get_engine(),
+                                             orm.Session, user_table, user_ids)
 
 
 @metrics_lib.time_me
 def get_user_by_name(username: str) -> list[models.User]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(user_table).filter_by(name=username).all()
-    if len(rows) == 0:
-        return []
-    return [
-        models.User(
-            id=row.id,
-            name=row.name,
-            password=row.password,
-            created_at=row.created_at,
-            user_type=row.type,
-            preferred_workspace=row.preferred_workspace,
-        ) for row in rows
-    ]
+    return global_user_state_users.get_user_by_name(_db_manager.get_engine(),
+                                                    orm.Session, user_table,
+                                                    username)
 
 
 @metrics_lib.time_me
 def get_user_by_name_match(username_match: str) -> list[models.User]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(user_table).filter(
-            user_table.c.name.like(f'%{username_match}%')).all()
-    return [
-        models.User(
-            id=row.id,
-            name=row.name,
-            created_at=row.created_at,
-            user_type=row.type,
-            preferred_workspace=row.preferred_workspace,
-        ) for row in rows
-    ]
+    return global_user_state_users.get_user_by_name_match(
+        _db_manager.get_engine(), orm.Session, user_table, username_match)
 
 
 @metrics_lib.time_me
 def delete_user(user_id: str) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(user_table).filter_by(id=user_id).delete()
-        session.commit()
+    global_user_state_users.delete_user(_db_manager.get_engine(), orm.Session,
+                                        user_table, user_id)
 
 
 @metrics_lib.time_me
 def get_all_users() -> list[models.User]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(user_table).all()
-    return [
-        models.User(
-            id=row.id,
-            name=row.name,
-            password=row.password,
-            created_at=row.created_at,
-            user_type=row.type,
-            preferred_workspace=row.preferred_workspace,
-        ) for row in rows
-    ]
+    return global_user_state_users.get_all_users(_db_manager.get_engine(),
+                                                 orm.Session, user_table)
 
 
 @db_retries.retry
@@ -961,30 +634,26 @@ def set_user_preferred_workspace(user_id: str, workspace: str | None) -> bool:
     invoking this. Returns True if a row was updated, False if the user_id
     does not exist.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        result = session.execute(
-            sqlalchemy.update(user_table).where(
-                user_table.c.id == user_id).values(
-                    preferred_workspace=workspace))
-        session.commit()
-        return result.rowcount > 0
+    return global_user_state_users.set_user_preferred_workspace(
+        _db_manager.get_engine(), orm.Session, user_table, user_id, workspace)
 
 
 @metrics_lib.time_me
-def add_or_update_cluster(cluster_name: str,
-                          cluster_handle: 'backends.ResourceHandle',
-                          requested_resources: set[Any] | None,
-                          ready: bool,
-                          is_launch: bool = True,
-                          config_hash: str | None = None,
-                          task_config: dict[str, Any] | None = None,
-                          is_managed: bool = False,
-                          provision_log_path: str | None = None,
-                          existing_cluster_hash: str | None = None,
-                          workload_type: str | None = None,
-                          workload_id: str | None = None,
-                          workload_task_id: int | None = None) -> str:
+def add_or_update_cluster(
+        cluster_name: str,
+        cluster_handle: 'backends.ResourceHandle',
+        requested_resources: set[Any] | None,
+        ready: bool,
+        is_launch: bool = True,
+        config_hash: str | None = None,
+        task_config: dict[str, Any] | None = None,
+        is_managed: bool = False,
+        provision_log_path: str | None = None,
+        existing_cluster_hash: str | None = None,
+        workload_type: str | None = None,
+        workload_id: str | None = None,
+        workload_task_id: int | None = None,
+        cluster_record_uuid: uuid.UUID | str | None = None) -> str:
     """Adds or updates cluster_name -> cluster_handle mapping.
 
     Args:
@@ -1006,11 +675,23 @@ def add_or_update_cluster(cluster_name: str,
         workload_type: Best-effort cost attribution type.
         workload_id: Best-effort cost attribution identifier.
         workload_task_id: Managed-job task ID, when available.
+        cluster_record_uuid: Internal action-aware write-once cluster identity.
+            Ordinary callers must omit this argument.  When present, the
+            PostgreSQL identity primitive inserts or exactly adopts it in the
+            same transaction as the ordinary cluster row fields.
 
     Returns:
         The stable hash identifying the inserted or updated cluster generation.
     """
     engine = _db_manager.get_engine()
+    parsed_cluster_record_uuid = (
+        None if cluster_record_uuid is None else
+        _canonical_cluster_record_uuid(cluster_record_uuid))
+    if (parsed_cluster_record_uuid is not None and
+            engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+        raise RuntimeError(
+            'Action-aware cluster identity requires the central PostgreSQL '
+            'database.')
 
     # Restored or internally constructed handles can bypass current Resources
     # construction. Fence them before pickle allocates any durable bytes.
@@ -1132,6 +813,12 @@ def add_or_update_cluster(cluster_name: str,
 
     with orm.Session(engine) as session:
         lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
+        if parsed_cluster_record_uuid is not None:
+            # Every action-aware writer acquires name -> UUID -> row.  Taking
+            # the UUID before the initial row lock prevents an inverse claimant
+            # for another name and the same UUID from deadlocking adoption.
+            _lock_cluster_record_uuid_in_session(session,
+                                                 parsed_cluster_record_uuid)
         # with_for_update() locks the row until commit() or rollback()
         # is called, or until the code escapes the with block.
         cluster_row = session.query(cluster_table).filter_by(
@@ -1215,6 +902,38 @@ def add_or_update_cluster(cluster_name: str,
             session.rollback()
             raise ValueError('Unsupported database dialect')
 
+        row_insert_values = {
+            **conditional_values,
+            'handle': handle,
+            'status': status.value,
+            # set metadata to server default ('{}')
+            # set owner to server default (null)
+            'cluster_hash': cluster_hash,
+            # set storage_mounts_metadata to server default (null)
+            'status_updated_at': status_updated_at,
+            'is_managed': int(is_managed),
+            'cloud': cloud,
+            'region': region,
+            'zone': zone,
+            'node_names': node_names,
+            'container_image_binding_known': int(container_image_binding_known),
+            'container_image_consumer_kind': container_image_consumer_kind,
+            'container_image_consumer_owner': container_image_consumer_owner,
+        }
+        if parsed_cluster_record_uuid is not None:
+            # A generation-fenced update must retain its old missing-row
+            # rejection.  It may adopt only the row already selected above.
+            if existing_cluster_hash is None:
+                _commit_cluster_record_identity_in_session(
+                    session,
+                    cluster_name,
+                    parsed_cluster_record_uuid,
+                    insert_values=row_insert_values,
+                )
+            elif cluster_row is not None:
+                _commit_cluster_record_identity_in_session(
+                    session, cluster_name, parsed_cluster_record_uuid)
+
         if existing_cluster_hash is not None:
             count = session.query(cluster_table).filter_by(
                 name=cluster_name, cluster_hash=existing_cluster_hash
@@ -1239,23 +958,7 @@ def add_or_update_cluster(cluster_name: str,
         else:
             insert_stmnt = insert_func(cluster_table).values(
                 name=cluster_name,
-                **conditional_values,
-                handle=handle,
-                status=status.value,
-                # set metadata to server default ('{}')
-                # set owner to server default (null)
-                cluster_hash=cluster_hash,
-                # set storage_mounts_metadata to server default (null)
-                status_updated_at=status_updated_at,
-                is_managed=int(is_managed),
-                cloud=cloud,
-                region=region,
-                zone=zone,
-                node_names=node_names,
-                container_image_binding_known=int(
-                    container_image_binding_known),
-                container_image_consumer_kind=container_image_consumer_kind,
-                container_image_consumer_owner=container_image_consumer_owner,
+                **row_insert_values,
             )
             insert_or_update_stmt = insert_stmnt.on_conflict_do_update(
                 index_elements=[cluster_table.c.name],
@@ -1412,143 +1115,38 @@ def add_cluster_event(cluster_name: str,
         existing_cluster_hash: If provided, add the event only when the current
             row has this cluster-generation hash.
     """
-    engine = _db_manager.get_engine()
-    if transitioned_at is None:
-        transitioned_at = int(time.time())
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            session.rollback()
-            raise ValueError('Unsupported database dialect')
-
-        # Read hash and status in a single query so they come from the same
-        # row snapshot (a separate hash pre-fetch could pair a stale hash
-        # with a newer status under concurrent removal/re-creation).
-        query = session.query(
-            cluster_table.c.cluster_hash,
-            cluster_table.c.status).filter_by(name=cluster_name)
-        if existing_cluster_hash is not None:
-            query = query.filter_by(cluster_hash=existing_cluster_hash)
-        cluster_row = query.first()
-        if cluster_row is None or cluster_row.cluster_hash is None:
-            logger.debug(f'Hash for cluster {cluster_name} not found. '
-                         'Skipping event.')
-            return
-        cluster_hash = cluster_row.cluster_hash
-        last_status = cluster_row.status
-        if nop_if_duplicate:
-            # Reuse this session: add_cluster_event already holds a pooled
-            # connection here, and a nested checkout self-deadlocks a
-            # single-connection sync pool.
-            last_event = get_last_cluster_event(cluster_hash,
-                                                event_type=event_type,
-                                                session=session)
-            if duplicate_regex is not None and last_event is not None:
-                if re.search(duplicate_regex, last_event):
-                    return
-            elif last_event == reason:
-                return
-        try:
-            request_id = common_utils.get_current_request_id()
-            session.execute(
-                insert_func(cluster_event_table).values(
-                    cluster_hash=cluster_hash,
-                    name=cluster_name,
-                    starting_status=last_status,
-                    ending_status=new_status.value if new_status else None,
-                    reason=reason,
-                    transitioned_at=transitioned_at,
-                    type=event_type.value,
-                    request_id=request_id,
-                ))
-            session.commit()
-        except sqlalchemy.exc.IntegrityError as e:
-            for msg in _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS:
-                if msg in str(e):
-                    # This can happen if the cluster event is added twice.
-                    # We can ignore this error unless the caller requests
-                    # to expose the error.
-                    if expose_duplicate_error:
-                        raise db_utils.UniqueConstraintViolationError(
-                            value=reason, message=str(e))
-                    else:
-                        return
-            raise e
+    global_user_state_cluster_events.add_cluster_event(
+        _db_manager.get_engine, orm.Session, sqlite, postgresql, cluster_table,
+        cluster_event_table, get_last_cluster_event, logger,
+        common_utils.get_current_request_id, time.time,
+        _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS, cluster_name, new_status, reason,
+        event_type, nop_if_duplicate, duplicate_regex, expose_duplicate_error,
+        transitioned_at, existing_cluster_hash)
 
 
 def get_last_cluster_event(cluster_hash: str,
                            event_type: ClusterEventType,
                            session: 'orm.Session | None' = None) -> str | None:
-    with _session_scope(session) as active_session:
-        row = active_session.query(cluster_event_table).filter_by(
-            cluster_hash=cluster_hash, type=event_type.value).order_by(
-                cluster_event_table.c.transitioned_at.desc()).first()
-    if row is None:
-        return None
-    return row.reason
+    return global_user_state_cluster_events.get_last_cluster_event(
+        _session_scope(session), cluster_event_table, cluster_hash, event_type)
 
 
 def get_terminal_or_last_status_change_event(cluster_hash: str) -> str | None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        # Order by type (TERMINAL first, STATUS_CHANGE after),
-        # then by transitioned_at desc.
-        # Use a CASE expression for ordering type.
-        type_priority = sqlalchemy.case(
-            (cluster_event_table.c.type == ClusterEventType.TERMINAL.value, 0),
-            else_=1)
-        row = session.query(cluster_event_table).filter(
-            cluster_event_table.c.cluster_hash == cluster_hash,
-            cluster_event_table.c.type.in_([
-                ClusterEventType.TERMINAL.value,
-                ClusterEventType.STATUS_CHANGE.value
-            ])).order_by(type_priority,
-                         cluster_event_table.c.transitioned_at.desc()).first()
-    if row is None:
-        return None
-    return row.reason
+    return (global_user_state_cluster_events.
+            get_terminal_or_last_status_change_event(_db_manager.get_engine(),
+                                                     orm.Session,
+                                                     cluster_event_table,
+                                                     ClusterEventType,
+                                                     cluster_hash))
 
 
 def _get_last_or_terminal_cluster_event_multiple(
         cluster_hashes: set[str]) -> dict[str, str]:
     """Returns the last or terminal cluster event for each cluster."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        # Create a priority expression: TERMINAL (0) before STATUS_CHANGE (1)
-        type_priority = sqlalchemy.case(
-            (cluster_event_table.c.type == ClusterEventType.TERMINAL.value, 0),
-            else_=1)
-
-        # Use ROW_NUMBER to rank events within each cluster_hash,
-        # ordered by type priority (TERMINAL first) then by transitioned_at
-        # (latest first)
-        row_number = sqlalchemy.func.row_number().over(
-            partition_by=cluster_event_table.c.cluster_hash,
-            order_by=[
-                type_priority,
-                cluster_event_table.c.transitioned_at.desc()
-            ]).label('rn')
-
-        # Subquery to get all events with their rank
-        ranked_events = session.query(
-            cluster_event_table.c.cluster_hash, cluster_event_table.c.reason,
-            row_number).filter(
-                cluster_event_table.c.cluster_hash.in_(cluster_hashes),
-                cluster_event_table.c.type.notin_([
-                    ClusterEventType.DEBUG.value,
-                    ClusterEventType.LAUNCH_PROGRESS.value,
-                ])).subquery()
-
-        # Select only the top-ranked event for each cluster
-        rows = session.query(
-            ranked_events.c.cluster_hash,
-            ranked_events.c.reason).filter(ranked_events.c.rn == 1).all()
-
-    return {row.cluster_hash: row.reason for row in rows}
+    return (global_user_state_cluster_events.
+            get_last_or_terminal_cluster_event_multiple(
+                _db_manager.get_engine(), orm.Session, cluster_event_table,
+                ClusterEventType, cluster_hashes))
 
 
 def get_last_cluster_event_of_type_multiple(
@@ -1559,29 +1157,11 @@ def get_last_cluster_event_of_type_multiple(
     Mirrors _get_last_or_terminal_cluster_event_multiple but filters to a
     single event type (no TERMINAL-priority ordering).
     """
-    if not cluster_hashes:
-        return {}
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row_number = sqlalchemy.func.row_number().over(
-            partition_by=cluster_event_table.c.cluster_hash,
-            order_by=cluster_event_table.c.transitioned_at.desc()).label('rn')
-
-        ranked = session.query(
-            cluster_event_table.c.cluster_hash,
-            cluster_event_table.c.reason,
-            row_number,
-        ).filter(
-            cluster_event_table.c.cluster_hash.in_(cluster_hashes),
-            cluster_event_table.c.type == event_type.value,
-        ).subquery()
-
-        rows = session.query(
-            ranked.c.cluster_hash,
-            ranked.c.reason,
-        ).filter(ranked.c.rn == 1).all()
-
-    return {row.cluster_hash: row.reason for row in rows}
+    return (global_user_state_cluster_events.
+            get_last_cluster_event_of_type_multiple(_db_manager.get_engine,
+                                                    orm.Session,
+                                                    cluster_event_table,
+                                                    cluster_hashes, event_type))
 
 
 def get_last_status_change_times(
@@ -1597,38 +1177,10 @@ def get_last_status_change_times(
     ``_CLUSTER_IN_QUERY_CHUNK_SIZE`` to stay under SQLite's 999-parameter
     cap (PostgreSQL has no such cap but the chunking is harmless there).
     """
-    if not cluster_hashes:
-        return {}
-    engine = _db_manager.get_engine()
-    hashes_list = list(cluster_hashes)
-    result: dict[str, int] = {}
-    with orm.Session(engine) as session:
-        for offset in range(0, len(hashes_list), _CLUSTER_IN_QUERY_CHUNK_SIZE):
-            batch = hashes_list[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
-            row_number = sqlalchemy.func.row_number().over(
-                partition_by=cluster_event_table.c.cluster_hash,
-                order_by=cluster_event_table.c.transitioned_at.desc()).label(
-                    'rn')
-
-            ranked = session.query(
-                cluster_event_table.c.cluster_hash,
-                cluster_event_table.c.transitioned_at,
-                row_number,
-            ).filter(
-                cluster_event_table.c.cluster_hash.in_(batch),
-                cluster_event_table.c.type ==
-                ClusterEventType.STATUS_CHANGE.value,
-                cluster_event_table.c.ending_status == ending_status.value,
-            ).subquery()
-
-            rows = session.query(
-                ranked.c.cluster_hash,
-                ranked.c.transitioned_at,
-            ).filter(ranked.c.rn == 1).all()
-
-            for row in rows:
-                result[row.cluster_hash] = int(row.transitioned_at)
-    return result
+    return global_user_state_cluster_events.get_last_status_change_times(
+        _db_manager.get_engine, orm.Session, cluster_event_table,
+        _CLUSTER_IN_QUERY_CHUNK_SIZE, ClusterEventType.STATUS_CHANGE.value,
+        cluster_hashes, ending_status)
 
 
 def get_first_status_change_time_since(cluster_hash: str,
@@ -1645,31 +1197,17 @@ def get_first_status_change_time_since(cluster_hash: str,
     status can be re-entered by a transient probe failure: the repeated entry
     writes a fresh row, and the latest one would keep sliding forward.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(
-            sqlalchemy.func.min(cluster_event_table.c.transitioned_at)).filter(
-                cluster_event_table.c.cluster_hash == cluster_hash,
-                cluster_event_table.c.type ==
-                ClusterEventType.STATUS_CHANGE.value,
-                cluster_event_table.c.ending_status == ending_status.value,
-                cluster_event_table.c.transitioned_at >= since,
-            ).scalar()
-    return None if row is None else int(row)
+    return global_user_state_cluster_events.get_first_status_change_time_since(
+        _db_manager.get_engine(), orm.Session, cluster_event_table,
+        ClusterEventType.STATUS_CHANGE.value, cluster_hash, ending_status,
+        since)
 
 
 def cleanup_cluster_events_with_retention(retention_hours: float,
                                           event_type: ClusterEventType) -> None:
-    engine = _db_manager.get_engine()
-    # Once for events with type STATUS_CHANGE.
-    with orm.Session(engine) as session:
-        query = session.query(cluster_event_table).filter(
-            cluster_event_table.c.transitioned_at
-            < time.time() - retention_hours * 3600,
-            cluster_event_table.c.type == event_type.value)
-        logger.debug(f'Deleting {query.count()} cluster events.')
-        query.delete()
-        session.commit()
+    global_user_state_cluster_events.cleanup_cluster_events_with_retention(
+        _db_manager.get_engine(), orm.Session, cluster_event_table, logger,
+        time.time, retention_hours, event_type)
 
 
 async def cluster_event_retention_daemon():
@@ -1786,36 +1324,9 @@ def get_cluster_events(
     cluster_hash = _resolve_cluster_hash(cluster_hash, cluster_name)
     if cluster_hash is None:
         raise ValueError(f'Hash for cluster {cluster_name} not found.')
-
-    event_types = ([event_type]
-                   if isinstance(event_type, ClusterEventType) else event_type)
-    type_filter = cluster_event_table.c.type.in_(
-        [et.value for et in event_types])
-
-    with orm.Session(engine) as session:
-        if limit is not None:
-            # To get the most recent N events in ASC order, we use a subquery:
-            # 1. Get most recent N events (ORDER BY DESC LIMIT N)
-            # 2. Re-order them by ASC
-            subquery = session.query(cluster_event_table).filter(
-                cluster_event_table.c.cluster_hash == cluster_hash,
-                type_filter).order_by(
-                    cluster_event_table.c.transitioned_at.desc()).limit(
-                        limit).subquery()
-            rows = session.query(subquery).order_by(
-                subquery.c.transitioned_at.asc()).all()
-        else:
-            rows = session.query(cluster_event_table).filter(
-                cluster_event_table.c.cluster_hash == cluster_hash,
-                type_filter).order_by(
-                    cluster_event_table.c.transitioned_at.asc()).all()
-
-    if include_timestamps:
-        return [{
-            'reason': row.reason,
-            'transitioned_at': row.transitioned_at
-        } for row in rows]
-    return [row.reason for row in rows]
+    return global_user_state_cluster_events.get_cluster_events(
+        engine, orm.Session, cluster_event_table, cluster_hash,
+        ClusterEventType, event_type, include_timestamps, limit)
 
 
 _CLUSTER_EVENT_NAMES_CHUNK = 500
@@ -1845,35 +1356,9 @@ def get_cluster_events_by_names(
         List of dicts with 'reason' and 'transitioned_at' (unix timestamp)
         fields, ordered from newest to oldest.
     """
-    cluster_names = list(dict.fromkeys(cluster_names))
-    if not cluster_names or not event_types or limit == 0:
-        return []
-    engine = _db_manager.get_engine()
-    type_values = [event_type.value for event_type in event_types]
-    rows = []
-    with orm.Session(engine) as session:
-        for start in range(0, len(cluster_names), _CLUSTER_EVENT_NAMES_CHUNK):
-            names = cluster_names[start:start + _CLUSTER_EVENT_NAMES_CHUNK]
-            query = session.query(
-                cluster_event_table.c.reason,
-                cluster_event_table.c.transitioned_at,
-            ).filter(cluster_event_table.c.name.in_(names),
-                     cluster_event_table.c.type.in_(type_values)).order_by(
-                         cluster_event_table.c.transitioned_at.desc())
-            if limit is not None:
-                # The global newest L events must be within each chunk's
-                # newest L, so bounding every query preserves the final result
-                # without materializing older rows that cannot survive.
-                query = query.limit(limit)
-            rows.extend(query.all())
-    if len(cluster_names) > _CLUSTER_EVENT_NAMES_CHUNK:
-        rows.sort(key=lambda row: row.transitioned_at, reverse=True)
-        if limit is not None and limit >= 0:
-            rows = rows[:limit]
-    return [{
-        'reason': row.reason,
-        'transitioned_at': row.transitioned_at,
-    } for row in rows]
+    return global_user_state_cluster_events.get_cluster_events_by_names(
+        _db_manager.get_engine, orm.Session, cluster_event_table,
+        _CLUSTER_EVENT_NAMES_CHUNK, cluster_names, event_types, limit)
 
 
 def _get_user_hash_or_current_user(user_hash: str | None) -> str:
@@ -1955,22 +1440,58 @@ def update_last_use(cluster_name: str):
 
 @db_retries.retry
 @metrics_lib.time_me
-def remove_cluster(cluster_name: str,
-                   terminate: bool,
-                   existing_cluster_hash: str | None = None) -> None:
+def remove_cluster(
+    cluster_name: str,
+    terminate: bool,
+    existing_cluster_hash: str | None = None,
+    *,
+    expected_cluster_record_uuid: uuid.UUID | str | None = None,
+    expected_cluster_handle: Any = _CLUSTER_RECORD_HANDLE_UNSET
+) -> ClusterRecordRemovalOutcome | None:
     """Removes or stops a cluster mapping.
 
     If ``existing_cluster_hash`` is provided, only that cluster generation is
     mutated. A missing or replaced generation is a no-op.
+
+    ``expected_cluster_record_uuid`` is the internal action-aware teardown
+    fence.  It is PostgreSQL-only, requires ``terminate=True`` and an explicit
+    ``expected_cluster_handle`` (``None`` means the admission-time row was
+    absent), and compares a present row's exact persisted handle bytes before
+    deletion.  A missing row is an idempotent ``ALREADY_ABSENT`` result; a
+    legacy/null, differently identified, or byte-different row is a conflict.
     """
     engine = _db_manager.get_engine()
+    parsed_cluster_record_uuid = (
+        None if expected_cluster_record_uuid is None else
+        _canonical_cluster_record_uuid(expected_cluster_record_uuid))
+    if parsed_cluster_record_uuid is not None:
+        if existing_cluster_hash is not None:
+            raise ValueError('Expected cluster-record UUID and legacy cluster '
+                             'hash fences are mutually exclusive.')
+        if not terminate:
+            raise ValueError('Expected cluster-record UUID removal requires '
+                             'terminate=True.')
+        if expected_cluster_handle is _CLUSTER_RECORD_HANDLE_UNSET:
+            raise ValueError('Expected cluster-record UUID removal requires '
+                             'an explicit expected handle or None.')
+        if (engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+            raise RuntimeError(
+                'Action-aware cluster identity requires the central '
+                'PostgreSQL database.')
+    elif expected_cluster_handle is not _CLUSTER_RECORD_HANDLE_UNSET:
+        raise ValueError('An expected cluster handle requires an expected '
+                         'cluster-record UUID.')
     with orm.Session(engine) as session:
         lock_container_image_cluster_lifecycle_in_session(session, cluster_name)
+        if parsed_cluster_record_uuid is not None:
+            _lock_cluster_record_uuid_in_session(session,
+                                                 parsed_cluster_record_uuid)
         # Read every clusters-table field this function needs in one snapshot;
         # the stop path below writes the handle back in the same session.
         query = session.query(
             cluster_table.c.cluster_hash, cluster_table.c.provision_log_path,
-            cluster_table.c.handle, cluster_table.c.workspace,
+            cluster_table.c.handle, cluster_table.c.cluster_record_uuid,
+            cluster_table.c.workspace,
             cluster_table.c.container_image_binding_known,
             cluster_table.c.container_image_consumer_kind,
             cluster_table.c.container_image_consumer_owner).filter_by(
@@ -1979,7 +1500,29 @@ def remove_cluster(cluster_name: str,
             query = query.filter_by(cluster_hash=existing_cluster_hash)
         row = query.with_for_update().first()
         if row is None and existing_cluster_hash is not None:
-            return
+            return None
+        if parsed_cluster_record_uuid is not None:
+            if row is None:
+                session.commit()
+                return ClusterRecordRemovalOutcome.ALREADY_ABSENT
+            observed_uuid = row.cluster_record_uuid
+            if observed_uuid != parsed_cluster_record_uuid:
+                observed = ('null'
+                            if observed_uuid is None else str(observed_uuid))
+                raise ClusterRecordIdentityConflictError(
+                    f'Cluster {cluster_name!r} has incompatible '
+                    f'cluster-record UUID {observed}; expected '
+                    f'{parsed_cluster_record_uuid}.')
+            if expected_cluster_handle is None:
+                raise ClusterRecordIdentityConflictError(
+                    f'Cluster {cluster_name!r} unexpectedly has a row for '
+                    f'cluster-record UUID {parsed_cluster_record_uuid}.')
+            expected_handle_bytes = pickle.dumps(expected_cluster_handle)
+            if row.handle != expected_handle_bytes:
+                raise ClusterRecordIdentityConflictError(
+                    f'Cluster {cluster_name!r} has a different persisted '
+                    f'handle for cluster-record UUID '
+                    f'{parsed_cluster_record_uuid}.')
         cluster_hash = row.cluster_hash if row is not None else None
         provision_log_path = (row.provision_log_path
                               if row is not None else None)
@@ -2049,6 +1592,9 @@ def remove_cluster(cluster_name: str,
         if existing_cluster_hash is not None:
             mutation_query = mutation_query.filter_by(
                 cluster_hash=existing_cluster_hash)
+        if parsed_cluster_record_uuid is not None:
+            mutation_query = mutation_query.filter_by(
+                cluster_record_uuid=parsed_cluster_record_uuid)
         if terminate:
             if (terminal_workspace is not None and
                 ((terminal_binding_known and terminal_consumer_kind == 'cluster'
@@ -2078,7 +1624,7 @@ def remove_cluster(cluster_name: str,
             count = mutation_query.delete()
         else:
             if row is None or row.handle is None:
-                return
+                return None
             handle = pickle.loads(row.handle)
             # Must invalidate IP list to avoid directly trying to ssh into a
             # stopped VM, which leads to timeout.
@@ -2093,7 +1639,13 @@ def remove_cluster(cluster_name: str,
                 cluster_table.c.status_updated_at: current_time
             })
         assert count <= 1, count
+        if parsed_cluster_record_uuid is not None and count != 1:
+            raise ClusterRecordIdentityConflictError(
+                f'Cluster {cluster_name!r} changed during exact removal.')
         session.commit()
+        if parsed_cluster_record_uuid is not None:
+            return ClusterRecordRemovalOutcome.REMOVED_EXACT
+        return None
 
 
 @db_retries.retry
@@ -2379,34 +1931,38 @@ def set_cluster_storage_mounts_metadata(
 
 
 @metrics_lib.time_me
-def get_cluster_skylet_ssh_tunnel_metadata(
-        cluster_name: str) -> tuple[int, int] | None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(
-            cluster_table.c.skylet_ssh_tunnel_metadata).filter_by(
-                name=cluster_name).first()
-    if row is None or row.skylet_ssh_tunnel_metadata is None:
-        return None
-    return pickle.loads(row.skylet_ssh_tunnel_metadata)
+def get_cluster_skylet_ssh_tunnel_snapshot(
+        cluster_name: str) -> ClusterSkyletSSHTunnelSnapshotV1 | None:
+    return (
+        global_user_state_skylet_tunnels.get_cluster_skylet_ssh_tunnel_snapshot(
+            _db_manager.get_engine, orm.Session, cluster_table, cluster_name))
 
 
 @metrics_lib.time_me
-def set_cluster_skylet_ssh_tunnel_metadata(
-        cluster_name: str,
-        skylet_ssh_tunnel_metadata: tuple[int, int] | None) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        value = pickle.dumps(
-            skylet_ssh_tunnel_metadata
-        ) if skylet_ssh_tunnel_metadata is not None else None
-        count = session.query(cluster_table).filter_by(
-            name=cluster_name).update(
-                {cluster_table.c.skylet_ssh_tunnel_metadata: value})
-        session.commit()
-    assert count <= 1, count
-    if count == 0:
-        raise ValueError(f'Cluster {cluster_name} not found.')
+def get_cluster_skylet_ssh_tunnel_metadata(cluster_name: str) -> object | None:
+    """Compatibility facade returning only decoded tunnel metadata."""
+    snapshot = get_cluster_skylet_ssh_tunnel_snapshot(cluster_name)
+    if snapshot is None:
+        return None
+    return snapshot.metadata
+
+
+@metrics_lib.time_me
+def compare_and_set_cluster_skylet_ssh_tunnel_metadata(
+    cluster_name: str,
+    *,
+    observed: ClusterSkyletSSHTunnelSnapshotV1,
+    replacement: SkyletSSHTunnelMetadata | None,
+) -> 'skylet_transport.TunnelMutationResult':
+    return (global_user_state_skylet_tunnels.
+            compare_and_set_cluster_skylet_ssh_tunnel_metadata(
+                _db_manager.get_engine,
+                orm.Session,
+                cluster_table,
+                cluster_name,
+                observed=observed,
+                replacement=replacement,
+            ))
 
 
 @metrics_lib.time_me
@@ -2519,6 +2075,11 @@ def _get_hash_for_existing_cluster(cluster_name: str) -> str | None:
     if row is None or row.cluster_hash is None:
         return None
     return row.cluster_hash
+
+
+def get_cluster_hash_for_name(cluster_name: str) -> str | None:
+    """Return the stable generation ID for a live cluster, if present."""
+    return _get_hash_for_existing_cluster(cluster_name)
 
 
 def _resolve_cluster_hash(cluster_hash: str | None = None,
@@ -2807,6 +2368,29 @@ def get_cluster_status_fields(
 
 
 @metrics_lib.time_me
+def get_managed_cluster_status_fields(
+    workload_type: str,) -> dict[str, tuple[str | None, int | None]]:
+    """Returns plain status fields for one managed workload type.
+
+    This is intentionally separate from ``get_cluster_status_fields``:
+    ordinary cluster refresh excludes every managed cluster, while a
+    workload owner may use this narrower inventory to nominate only rows for
+    which it no longer has an exact child record.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.query(
+            cluster_table.c.name,
+            cluster_table.c.status,
+            cluster_table.c.status_updated_at,
+        ).filter(
+            cluster_table.c.is_managed == int(True),
+            cluster_table.c.workload_type == workload_type,
+        ).all()
+    return {row.name: (row.status, row.status_updated_at) for row in rows}
+
+
+@metrics_lib.time_me
 def get_cluster_image_consumers(
     cluster_names: list[str],
 ) -> dict[str, tuple[str | None, str | None] | None]:
@@ -2965,7 +2549,7 @@ def get_clusters(
                 # clusters that have a null user_hash.
                 query = query.filter(
                     cluster_table.c.user_hash.in_(user_hashes_filter) |
-                    (cluster_table.c.user_hash is None))
+                    cluster_table.c.user_hash.is_(None))
             else:
                 query = query.filter(
                     cluster_table.c.user_hash.in_(user_hashes_filter))
@@ -3284,61 +2868,18 @@ def get_cluster_names_start_with(starts_with: str) -> list[str]:
 @metrics_lib.time_me
 def get_cached_enabled_clouds(cloud_capability: 'cloud.CloudCapability',
                               workspace: str) -> list['clouds.Cloud']:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(config_table).filter_by(
-            key=_get_enabled_clouds_key(cloud_capability, workspace)).first()
-    ret = []
-    if row:
-        ret = json.loads(row.value)
-    enabled_clouds: list[clouds.Cloud] = []
-    for c in ret:
-        try:
-            cloud = registry.CLOUD_REGISTRY.from_str(c)
-        except ValueError:
-            # Handle the case for the clouds whose support has been
-            # removed from SkyPilot, e.g., 'local' was a cloud in the past
-            # and may be stored in the database for users before #3037.
-            # We should ignore removed clouds and continue.
-            continue
-        if cloud is not None:
-            enabled_clouds.append(cloud)
-    return enabled_clouds
+    return global_user_state_cloud_checks.get_cached_enabled_clouds(
+        _db_manager.get_engine(), cloud_capability, workspace)
 
 
 @metrics_lib.time_me
 def set_enabled_clouds(enabled_clouds: list[str],
                        cloud_capability: 'cloud.CloudCapability',
                        workspace: str) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(config_table).values(
-            key=_get_enabled_clouds_key(cloud_capability, workspace),
-            value=json.dumps(enabled_clouds))
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[config_table.c.key],
-            set_={config_table.c.value: json.dumps(enabled_clouds)})
-        session.execute(do_update_stmt)
-        session.commit()
-
-
-def _get_enabled_clouds_key(cloud_capability: 'cloud.CloudCapability',
-                            workspace: str) -> str:
-    return _ENABLED_CLOUDS_KEY_PREFIX + workspace + '_' + cloud_capability.value
-
-
-_CHECK_RESULTS_KEY_PREFIX = 'check_results_'
-
-
-def _get_check_results_key(workspace: str) -> str:
-    return f'{_CHECK_RESULTS_KEY_PREFIX}{workspace}'
+    global_user_state_cloud_checks.set_enabled_clouds(_db_manager.get_engine(),
+                                                      enabled_clouds,
+                                                      cloud_capability,
+                                                      workspace)
 
 
 @metrics_lib.time_me
@@ -3349,19 +2890,8 @@ def get_cached_check_results(
     Shape:
         {cloud_repr: {context_or_empty_str: {"enabled": bool, "reason": str}}}.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(config_table).filter_by(
-            key=_get_check_results_key(workspace)).first()
-    if row is None or row.value is None:
-        return {}
-    try:
-        return json.loads(row.value)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning(
-            f'Corrupt check_results row for workspace {workspace!r}; '
-            f'returning empty dict.')
-        return {}
+    return global_user_state_cloud_checks.get_cached_check_results(
+        _db_manager.get_engine(), workspace, logger)
 
 
 @metrics_lib.time_me
@@ -3385,325 +2915,117 @@ def set_check_results(
     for contexts that have since been removed from a cloud will linger
     until the next full-workspace run rewrites the row.
     """
-    engine = _db_manager.get_engine()
-    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-        insert_func = sqlite.insert
-    elif engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-        insert_func = postgresql.insert
-    else:
-        raise ValueError('Unsupported database dialect')
-
-    key = _get_check_results_key(workspace)
-    with orm.Session(engine) as session:
-        if is_full_workspace_run:
-            new_value = results
-        else:
-            # Read-modify-write under the default session isolation. This
-            # is NOT race-safe against concurrent scoped writes for
-            # different clouds in the same workspace: SQLAlchemy
-            # `orm.Session` does not acquire row locks, and under the
-            # default isolation (READ COMMITTED on Postgres, deferred on
-            # SQLite) two interleaved RMW cycles can clobber each
-            # other's per-cloud updates. The blast radius is limited
-            # (one scoped run's leaves get overwritten until the next
-            # write rewrites the row) and the source-of-truth
-            # enabled_clouds_* rows are unaffected, so we accept the
-            # race here rather than serialize through a per-workspace
-            # advisory lock. If this row ever becomes load-bearing for
-            # correctness, switch to `with_for_update()` (postgres) and
-            # an explicit BEGIN IMMEDIATE (sqlite).
-            row = session.query(config_table).filter_by(key=key).first()
-            existing: dict[str, dict[str, dict[str, Any]]] = {}
-            if row is not None and row.value is not None:
-                try:
-                    existing = json.loads(row.value)
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning(f'Corrupt check_results row for workspace '
-                                   f'{workspace!r}; replacing.')
-                    existing = {}
-            new_value = dict(existing)
-            for cloud_repr, ctx_dict in results.items():
-                existing_for_cloud = new_value.get(cloud_repr)
-                if not isinstance(existing_for_cloud, dict):
-                    existing_for_cloud = {}
-                new_value[cloud_repr] = {**existing_for_cloud, **ctx_dict}
-
-        serialized = json.dumps(new_value)
-        insert_stmnt = insert_func(config_table).values(key=key,
-                                                        value=serialized)
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[config_table.c.key],
-            set_={config_table.c.value: serialized})
-        session.execute(do_update_stmt)
-        session.commit()
+    global_user_state_cloud_checks.set_check_results(
+        _db_manager.get_engine(),
+        results,
+        workspace,
+        logger,
+        is_full_workspace_run=is_full_workspace_run)
 
 
 @metrics_lib.time_me
 def get_allowed_clouds(workspace: str) -> list[str]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(config_table).filter_by(
-            key=_get_allowed_clouds_key(workspace)).first()
-    if row:
-        return json.loads(row.value)
-    return []
+    return global_user_state_cloud_checks.get_allowed_clouds(
+        _db_manager.get_engine(), workspace)
 
 
 @metrics_lib.time_me
 def set_allowed_clouds(allowed_clouds: list[str], workspace: str) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(config_table).values(
-            key=_get_allowed_clouds_key(workspace),
-            value=json.dumps(allowed_clouds))
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[config_table.c.key],
-            set_={config_table.c.value: json.dumps(allowed_clouds)})
-        session.execute(do_update_stmt)
-        session.commit()
-
-
-def _get_allowed_clouds_key(workspace: str) -> str:
-    return _ALLOWED_CLOUDS_KEY_PREFIX + workspace
+    global_user_state_cloud_checks.set_allowed_clouds(_db_manager.get_engine(),
+                                                      allowed_clouds, workspace)
 
 
 @metrics_lib.time_me
 def add_or_update_storage(storage_name: str,
                           storage_handle: 'Storage.StorageMetadata',
                           storage_status: status_lib.StorageStatus):
-    engine = _db_manager.get_engine()
-    storage_launched_at = int(time.time())
-    handle = pickle.dumps(storage_handle)
-    last_use = common_utils.get_current_command()
-
-    def status_check(status):
-        return status in status_lib.StorageStatus
-
-    if not status_check(storage_status):
-        raise ValueError(f'Error in updating global state. Storage Status '
-                         f'{storage_status} is passed in incorrectly')
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(storage_table).values(
-            name=storage_name,
-            handle=handle,
-            last_use=last_use,
-            launched_at=storage_launched_at,
-            status=storage_status.value)
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[storage_table.c.name],
-            set_={
-                storage_table.c.handle: handle,
-                storage_table.c.last_use: last_use,
-                storage_table.c.launched_at: storage_launched_at,
-                storage_table.c.status: storage_status.value
-            })
-        session.execute(do_update_stmt)
-        session.commit()
+    global_user_state_storage.add_or_update_storage(
+        _db_manager.get_engine(), orm.Session, sqlite, postgresql,
+        storage_table, storage_name, storage_handle, storage_status)
 
 
 @metrics_lib.time_me
 def remove_storage(storage_name: str):
     """Removes Storage from Database"""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(storage_table).filter_by(name=storage_name).delete()
-        session.commit()
+    global_user_state_storage.remove_storage(_db_manager.get_engine(),
+                                             orm.Session, storage_table,
+                                             storage_name)
 
 
 @metrics_lib.time_me
 def set_storage_status(storage_name: str,
                        status: status_lib.StorageStatus) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        count = session.query(storage_table).filter_by(
-            name=storage_name).update({storage_table.c.status: status.value})
-        session.commit()
-    assert count <= 1, count
-    if count == 0:
-        raise ValueError(f'Storage {storage_name} not found.')
+    global_user_state_storage.set_storage_status(_db_manager.get_engine(),
+                                                 orm.Session, storage_table,
+                                                 storage_name, status)
 
 
 @metrics_lib.time_me
 def get_storage_status(storage_name: str) -> status_lib.StorageStatus | None:
-    engine = _db_manager.get_engine()
-    assert storage_name is not None, 'storage_name cannot be None'
-    with orm.Session(engine) as session:
-        row = session.query(storage_table).filter_by(name=storage_name).first()
-    if row:
-        return status_lib.StorageStatus[row.status]
-    return None
+    return global_user_state_storage.get_storage_status(
+        _db_manager.get_engine(), orm.Session, storage_table, storage_name)
 
 
 @metrics_lib.time_me
 def set_storage_handle(storage_name: str,
                        handle: 'Storage.StorageMetadata') -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        count = session.query(storage_table).filter_by(
-            name=storage_name).update(
-                {storage_table.c.handle: pickle.dumps(handle)})
-        session.commit()
-    assert count <= 1, count
-    if count == 0:
-        raise ValueError(f'Storage{storage_name} not found.')
+    global_user_state_storage.set_storage_handle(_db_manager.get_engine(),
+                                                 orm.Session, storage_table,
+                                                 storage_name, handle)
 
 
 @metrics_lib.time_me
 def get_handle_from_storage_name(
         storage_name: str | None) -> Optional['Storage.StorageMetadata']:
-    engine = _db_manager.get_engine()
-    if storage_name is None:
-        return None
-    with orm.Session(engine) as session:
-        row = session.query(storage_table).filter_by(name=storage_name).first()
-    if row:
-        return pickle.loads(row.handle)
-    return None
+    return global_user_state_storage.get_handle_from_storage_name(
+        _db_manager.get_engine(), orm.Session, storage_table, storage_name)
 
 
 @metrics_lib.time_me
 def get_glob_storage_name(storage_name: str) -> list[str]:
-    engine = _db_manager.get_engine()
-    assert storage_name is not None, 'storage_name cannot be None'
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            rows = session.query(storage_table).filter(
-                storage_table.c.name.op('GLOB')(storage_name)).all()
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            rows = session.query(storage_table).filter(
-                storage_table.c.name.op('SIMILAR TO')(
-                    _glob_to_similar(storage_name))).all()
-        else:
-            raise ValueError('Unsupported database dialect')
-    return [row.name for row in rows]
+    return global_user_state_storage.get_glob_storage_name(
+        _db_manager.get_engine(), orm.Session, storage_table, storage_name,
+        _glob_to_similar)
 
 
 @metrics_lib.time_me
 def get_storage_names_start_with(starts_with: str) -> list[str]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(storage_table).filter(
-            storage_table.c.name.like(f'{starts_with}%')).all()
-    return [row.name for row in rows]
+    return global_user_state_storage.get_storage_names_start_with(
+        _db_manager.get_engine(), orm.Session, storage_table, starts_with)
 
 
 @metrics_lib.time_me
 def get_storage() -> list[dict[str, Any]]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(storage_table).all()
-    records = []
-    for row in rows:
-        # TODO: use namedtuple instead of dict
-        records.append({
-            'name': row.name,
-            'launched_at': row.launched_at,
-            'handle': pickle.loads(row.handle),
-            'last_use': row.last_use,
-            'status': status_lib.StorageStatus[row.status],
-        })
-    return records
+    return global_user_state_storage.get_storage(_db_manager.get_engine(),
+                                                 orm.Session, storage_table)
 
 
 @metrics_lib.time_me
 def get_volume_names_start_with(starts_with: str) -> list[str]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(volume_table).filter(
-            volume_table.c.name.like(f'{starts_with}%')).all()
-    return [row.name for row in rows]
+    return global_user_state_volumes.get_volume_names_start_with(
+        _db_manager.get_engine(), orm.Session, volume_table, starts_with)
 
 
 @metrics_lib.time_me
 def get_volumes(is_ephemeral: bool | None = None,
                 name: str | None = None) -> list[dict[str, Any]]:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        filters: dict[str, Any] = {}
-        if name is not None:
-            filters['name'] = name
-        if is_ephemeral is not None:
-            filters['is_ephemeral'] = int(is_ephemeral)
-        query = session.query(volume_table)
-        rows = query.filter_by(**filters).all() if filters else query.all()
-    records = []
-    for row in rows:
-        # Decode JSON-encoded usedby fields
-        usedby_pods = json.loads(row.usedby_pods) if row.usedby_pods else []
-        usedby_clusters = (json.loads(row.usedby_clusters)
-                           if row.usedby_clusters else [])
-        records.append({
-            'name': row.name,
-            'launched_at': row.launched_at,
-            'handle': pickle.loads(row.handle),
-            'user_hash': row.user_hash,
-            'workspace': row.workspace,
-            'last_attached_at': row.last_attached_at,
-            'last_use': row.last_use,
-            'status': status_lib.VolumeStatus[row.status],
-            'is_ephemeral': bool(row.is_ephemeral),
-            'error_message': row.error_message,
-            'usedby_pods': usedby_pods,
-            'usedby_clusters': usedby_clusters,
-            'creation_yaml': row.creation_yaml,
-        })
-    return records
+    return global_user_state_volumes.get_volumes(_db_manager.get_engine(),
+                                                 orm.Session, volume_table,
+                                                 is_ephemeral, name)
 
 
 @metrics_lib.time_me
 def get_volume_configs_by_names(
         names: list[str]) -> dict[str, models.VolumeConfig]:
     """Returns one snapshot of the requested volume configs, keyed by name."""
-    unique_names = tuple(dict.fromkeys(names))
-    if not unique_names:
-        return {}
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(volume_table.c.name, volume_table.c.handle).filter(
-            volume_table.c.name.in_(unique_names)).all()
-    return {row.name: pickle.loads(row.handle) for row in rows}
+    return global_user_state_volumes.get_volume_configs_by_names(
+        _db_manager.get_engine, orm.Session, volume_table, names)
 
 
 @metrics_lib.time_me
 def get_volume_by_name(name: str) -> dict[str, Any] | None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(volume_table).filter_by(name=name).first()
-    if row:
-        # Decode JSON-encoded usedby fields
-        usedby_pods = json.loads(row.usedby_pods) if row.usedby_pods else []
-        usedby_clusters = (json.loads(row.usedby_clusters)
-                           if row.usedby_clusters else [])
-        return {
-            'name': row.name,
-            'launched_at': row.launched_at,
-            'handle': pickle.loads(row.handle),
-            'user_hash': row.user_hash,
-            'workspace': row.workspace,
-            'last_attached_at': row.last_attached_at,
-            'last_use': row.last_use,
-            'status': status_lib.VolumeStatus[row.status],
-            'error_message': row.error_message,
-            'usedby_pods': usedby_pods,
-            'usedby_clusters': usedby_clusters,
-            'creation_yaml': row.creation_yaml,
-        }
-    return None
+    return global_user_state_volumes.get_volume_by_name(
+        _db_manager.get_engine(), orm.Session, volume_table, name)
 
 
 @metrics_lib.time_me
@@ -3714,63 +3036,25 @@ def add_volume(
     is_ephemeral: bool = False,
     creation_yaml: str | None = None,
 ) -> None:
-    engine = _db_manager.get_engine()
-    volume_launched_at = int(time.time())
-    handle = pickle.dumps(config)
-    last_use = common_utils.get_current_command()
-    user_hash = common_utils.get_current_user().id
-    active_workspace = skypilot_config.get_active_workspace()
-    if is_ephemeral:
-        last_attached_at = int(time.time())
-        status = status_lib.VolumeStatus.IN_USE
-    else:
-        last_attached_at = None
-
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(volume_table).values(
-            name=name,
-            launched_at=volume_launched_at,
-            handle=handle,
-            user_hash=user_hash,
-            workspace=active_workspace,
-            last_attached_at=last_attached_at,
-            last_use=last_use,
-            status=status.value,
-            is_ephemeral=int(is_ephemeral),
-            creation_yaml=creation_yaml,
-        )
-        do_update_stmt = insert_stmnt.on_conflict_do_nothing()
-        session.execute(do_update_stmt)
-        session.commit()
+    global_user_state_volumes.add_volume(_db_manager.get_engine(), orm.Session,
+                                         sqlite, postgresql, volume_table, name,
+                                         config, status, is_ephemeral,
+                                         creation_yaml)
 
 
 @metrics_lib.time_me
 def update_volume_config(name: str, config: models.VolumeConfig) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(volume_table).filter_by(name=name).update({
-            volume_table.c.handle: pickle.dumps(config),
-        })
-        session.commit()
+    global_user_state_volumes.update_volume_config(_db_manager.get_engine(),
+                                                   orm.Session, volume_table,
+                                                   name, config)
 
 
 @metrics_lib.time_me
 def update_volume(name: str, last_attached_at: int,
                   status: status_lib.VolumeStatus) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(volume_table).filter_by(name=name).update({
-            volume_table.c.last_attached_at: last_attached_at,
-            volume_table.c.status: status.value,
-        })
-        session.commit()
+    global_user_state_volumes.update_volume(_db_manager.get_engine(),
+                                            orm.Session, volume_table, name,
+                                            last_attached_at, status)
 
 
 @metrics_lib.time_me
@@ -3788,29 +3072,16 @@ def update_volume_status(name: str,
         usedby_pods: List of pods using the volume (None keeps existing value).
         usedby_clusters: List of clusters using the volume (None keeps it).
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        update_dict: dict[str, Any] = {
-            volume_table.c.status: status.value,
-        }
-        # Always update error_message (None clears it)
-        update_dict[volume_table.c.error_message] = error_message
-        # Update usedby fields if provided (encode as JSON)
-        if usedby_pods is not None:
-            update_dict[volume_table.c.usedby_pods] = json.dumps(usedby_pods)
-        if usedby_clusters is not None:
-            update_dict[volume_table.c.usedby_clusters] = json.dumps(
-                usedby_clusters)
-        session.query(volume_table).filter_by(name=name).update(update_dict)
-        session.commit()
+    global_user_state_volumes.update_volume_status(_db_manager.get_engine(),
+                                                   orm.Session, volume_table,
+                                                   name, status, error_message,
+                                                   usedby_pods, usedby_clusters)
 
 
 @metrics_lib.time_me
 def delete_volume(name: str) -> None:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(volume_table).filter_by(name=name).delete()
-        session.commit()
+    global_user_state_volumes.delete_volume(_db_manager.get_engine(),
+                                            orm.Session, volume_table, name)
 
 
 @metrics_lib.time_me
@@ -3859,47 +3130,17 @@ def add_service_account_token(token_id: str,
     """Add a service account token to the database."""
     engine = _db_manager.get_engine()
     created_at = int(time.time())
-
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-
-        insert_stmnt = insert_func(service_account_token_table).values(
-            token_id=token_id,
-            token_name=token_name,
-            token_hash=token_hash,
-            created_at=created_at,
-            expires_at=expires_at,
-            creator_user_hash=creator_user_hash,
-            service_account_user_id=service_account_user_id)
-        session.execute(insert_stmnt)
-        session.commit()
+    global_user_state_service_account_tokens.add_service_account_token(
+        engine, orm.Session, sqlite.insert, postgresql.insert, token_id,
+        token_name, token_hash, creator_user_hash, service_account_user_id,
+        expires_at, created_at)
 
 
 @metrics_lib.time_me
 def get_service_account_token(token_id: str) -> dict[str, Any] | None:
     """Get a service account token by token_id."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(service_account_token_table).filter_by(
-            token_id=token_id).first()
-    if row is None:
-        return None
-    return {
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    }
+    return global_user_state_service_account_tokens.get_service_account_token(
+        _db_manager.get_engine(), orm.Session, token_id)
 
 
 @metrics_lib.time_me
@@ -3911,41 +3152,15 @@ def get_service_account_token_by_hash(token_hash: str) -> dict[str, Any] | None:
     take effect (the DB row's hash is updated on rotation, so old JWTs
     stop matching). Relies on the unique index on token_hash.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(service_account_token_table).filter_by(
-            token_hash=token_hash).first()
-    if row is None:
-        return None
-    return {
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    }
+    return global_user_state_service_account_tokens.get_service_account_token_by_hash(
+        _db_manager.get_engine(), orm.Session, token_hash)
 
 
 @metrics_lib.time_me
 def get_user_service_account_tokens(user_hash: str) -> list[dict[str, Any]]:
     """Get all service account tokens for a user (as creator)."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(service_account_token_table).filter_by(
-            creator_user_hash=user_hash).all()
-    return [{
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    } for row in rows]
+    return global_user_state_service_account_tokens.get_user_service_account_tokens(
+        _db_manager.get_engine(), orm.Session, user_hash)
 
 
 @metrics_lib.time_me
@@ -3954,11 +3169,8 @@ def update_service_account_token_last_used(token_id: str) -> None:
     engine = _db_manager.get_engine()
     last_used_at = int(time.time())
 
-    with orm.Session(engine) as session:
-        session.query(service_account_token_table).filter_by(
-            token_id=token_id).update(
-                {service_account_token_table.c.last_used_at: last_used_at})
-        session.commit()
+    global_user_state_service_account_tokens.update_service_account_token_last_used(
+        engine, orm.Session, token_id, last_used_at)
 
 
 @db_retries.retry
@@ -3969,12 +3181,8 @@ def delete_service_account_token(token_id: str) -> bool:
     Returns:
         True if token was found and deleted.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        result = session.query(service_account_token_table).filter_by(
-            token_id=token_id).delete()
-        session.commit()
-    return result > 0
+    return global_user_state_service_account_tokens.delete_service_account_token(
+        _db_manager.get_engine(), orm.Session, token_id)
 
 
 @metrics_lib.time_me
@@ -3991,20 +3199,9 @@ def rotate_service_account_token(token_id: str,
     engine = _db_manager.get_engine()
     current_time = int(time.time())
 
-    with orm.Session(engine) as session:
-        count = session.query(service_account_token_table).filter_by(
-            token_id=token_id
-        ).update({
-            service_account_token_table.c.token_hash: new_token_hash,
-            service_account_token_table.c.expires_at: new_expires_at,
-            service_account_token_table.c.last_used_at: None,  # Reset last used
-            # Update creation time
-            service_account_token_table.c.created_at: current_time,
-        })
-        session.commit()
-
-    if count == 0:
-        raise ValueError(f'Service account token {token_id} not found.')
+    global_user_state_service_account_tokens.rotate_service_account_token(
+        engine, orm.Session, token_id, new_token_hash, new_expires_at,
+        current_time)
 
 
 @db_retries.retry
@@ -4021,12 +3218,11 @@ def get_cluster_yaml_str(cluster_yaml_path: str | None) -> str | None:
         raise ValueError('Attempted to read a None YAML.')
     cluster_file_name = os.path.basename(cluster_yaml_path)
     cluster_name, _ = os.path.splitext(cluster_file_name)
-    with orm.Session(engine) as session:
-        row = session.query(cluster_yaml_table).filter_by(
-            cluster_name=cluster_name).first()
-    if row is None:
+    found, yaml_str = global_user_state_cluster_yaml.get_cluster_yaml(
+        engine, orm.Session, cluster_yaml_table, cluster_name)
+    if not found:
         return _set_cluster_yaml_from_file(cluster_yaml_path, cluster_name)
-    return row.yaml
+    return yaml_str
 
 
 def get_cluster_yaml_str_multiple(
@@ -4044,12 +3240,8 @@ def get_cluster_yaml_str_multiple(
         cluster_names_to_yaml_paths[cluster_name] = cluster_yaml_path
 
     unique_cluster_names = list(cluster_names_to_yaml_paths)
-    with orm.Session(engine) as session:
-        rows = session.query(cluster_yaml_table).filter(
-            cluster_yaml_table.c.cluster_name.in_(unique_cluster_names)).all()
-    cluster_names_to_yaml: dict[str, str | None] = {
-        row.cluster_name: row.yaml for row in rows
-    }
+    cluster_names_to_yaml = global_user_state_cluster_yaml.get_cluster_yamls(
+        engine, orm.Session, cluster_yaml_table, unique_cluster_names)
 
     for cluster_name in unique_cluster_names:
         if cluster_name not in cluster_names_to_yaml:
@@ -4112,30 +3304,20 @@ def get_cluster_yaml_dict_multiple(
 def set_cluster_yaml(cluster_name: str, yaml_str: str) -> None:
     """Set the cluster yaml in the database."""
     engine = _db_manager.get_engine()
-    with orm.Session(_db_manager.get_engine()) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmnt = insert_func(cluster_yaml_table).values(
-            cluster_name=cluster_name, yaml=yaml_str)
-        do_update_stmt = insert_stmnt.on_conflict_do_update(
-            index_elements=[cluster_yaml_table.c.cluster_name],
-            set_={cluster_yaml_table.c.yaml: yaml_str})
-        session.execute(do_update_stmt)
-        session.commit()
+    global_user_state_cluster_yaml.set_cluster_yaml(engine,
+                                                    _db_manager.get_engine(),
+                                                    orm.Session, sqlite,
+                                                    postgresql,
+                                                    cluster_yaml_table,
+                                                    cluster_name, yaml_str)
 
 
 @metrics_lib.time_me
 def remove_cluster_yaml(cluster_name: str):
     engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(cluster_yaml_table).filter_by(
-            cluster_name=cluster_name).delete()
-        session.commit()
+    global_user_state_cluster_yaml.remove_cluster_yaml(engine, orm.Session,
+                                                       cluster_yaml_table,
+                                                       cluster_name)
 
 
 @metrics_lib.time_me
@@ -4146,120 +3328,45 @@ def get_expired_service_account_tokens_by_name_prefix(
     Tokens with no expiration are excluded. The LIKE pattern is built with
     SQLAlchemy parameterization so the prefix cannot inject SQL.
     """
-    engine = _db_manager.get_engine()
-    # Escape the LIKE metacharacters in the prefix so callers can pass an
-    # arbitrary string without it being treated as a pattern.
-    escaped_prefix = name_prefix.replace('\\', '\\\\').replace('%',
-                                                               '\\%').replace(
-                                                                   '_', '\\_')
-    like_pattern = f'{escaped_prefix}%'
-    with orm.Session(engine) as session:
-        rows = session.query(service_account_token_table).filter(
-            service_account_token_table.c.token_name.like(like_pattern,
-                                                          escape='\\'),
-            service_account_token_table.c.expires_at.isnot(None),
-            service_account_token_table.c.expires_at < now,
-        ).all()
-    return [{
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    } for row in rows]
+    return global_user_state_service_account_tokens.get_expired_service_account_tokens_by_name_prefix(
+        _db_manager.get_engine(), orm.Session, name_prefix, now)
 
 
 @metrics_lib.time_me
 def get_all_service_account_tokens() -> list[dict[str, Any]]:
     """Get all service account tokens across all users (for admin access)."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(service_account_token_table).all()
-    return [{
-        'token_id': row.token_id,
-        'token_name': row.token_name,
-        'token_hash': row.token_hash,
-        'created_at': row.created_at,
-        'last_used_at': row.last_used_at,
-        'expires_at': row.expires_at,
-        'creator_user_hash': row.creator_user_hash,
-        'service_account_user_id': row.service_account_user_id,
-    } for row in rows]
+    return global_user_state_service_account_tokens.get_all_service_account_tokens(
+        _db_manager.get_engine(), orm.Session)
 
 
 @metrics_lib.time_me
 def get_system_config(config_key: str) -> str | None:
     """Get a system configuration value by key."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(system_config_table).filter_by(
-            config_key=config_key).first()
-    if row is None:
-        return None
-    return row.config_value
+    return global_user_state_system_config.get_system_config(
+        _db_manager.get_engine(), config_key)
+
+
+@metrics_lib.time_me
+def get_or_set_system_config(config_key: str, default_value: str) -> str:
+    """Atomically return an existing configuration or install a default.
+
+    This is the multi-replica-safe form of a read followed by
+    ``set_system_config``. Concurrent first writers may propose different
+    defaults, but every caller returns the single value that won the unique-key
+    insert.
+    """
+    return global_user_state_system_config.get_or_set_system_config(
+        _db_manager.get_engine(), config_key, default_value, int(time.time()),
+        sqlite, postgresql)
 
 
 @metrics_lib.time_me
 def set_system_config(config_key: str, config_value: str) -> None:
     """Set a system configuration value."""
-    engine = _db_manager.get_engine()
-    current_time = int(time.time())
-
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-
-        insert_stmnt = insert_func(system_config_table).values(
-            config_key=config_key,
-            config_value=config_value,
-            created_at=current_time,
-            updated_at=current_time)
-
-        upsert_stmnt = insert_stmnt.on_conflict_do_update(
-            index_elements=[system_config_table.c.config_key],
-            set_={
-                system_config_table.c.config_value: config_value,
-                system_config_table.c.updated_at: current_time,
-            })
-        session.execute(upsert_stmnt)
-        session.commit()
-
-
-def _operator_notification_insert_func(
-    engine: sqlalchemy.engine.Engine,) -> Any:
-    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-        return sqlite.insert
-    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-        return postgresql.insert
-    raise ValueError('Unsupported database dialect')
-
-
-def _next_operator_notification_sequence(session: orm.Session,
-                                         insert_func: Any) -> int:
-    ensure_counter = insert_func(operator_notification_sequence_table).values(
-        singleton_id=1, value=0
-    ).on_conflict_do_nothing(
-        index_elements=[operator_notification_sequence_table.c.singleton_id])
-    session.execute(ensure_counter)
-    # This UPDATE takes the row's write lock before computing value + 1 on
-    # both SQLite and PostgreSQL. Reading it back in the same transaction is
-    # therefore race-free without depending on SQLite RETURNING support.
-    session.execute(operator_notification_sequence_table.update().where(
-        operator_notification_sequence_table.c.singleton_id == 1).values(
-            value=operator_notification_sequence_table.c.value + 1))
-    sequence = session.execute(
-        sqlalchemy.select(operator_notification_sequence_table.c.value).where(
-            operator_notification_sequence_table.c.singleton_id ==
-            1)).scalar_one()
-    return int(sequence)
+    global_user_state_system_config.set_system_config(_db_manager.get_engine(),
+                                                      config_key, config_value,
+                                                      int(time.time()), sqlite,
+                                                      postgresql)
 
 
 @metrics_lib.time_me
@@ -4280,82 +3387,16 @@ def record_operator_notification(category: str,
         raise ValueError('dedupe_window_seconds must be non-negative')
 
     engine = _db_manager.get_engine()
-    insert_func = _operator_notification_insert_func(engine)
-    with orm.Session(engine) as session:
-        sequence = _next_operator_notification_sequence(session, insert_func)
-        insert_stmnt = insert_func(operator_notification_table).values(
-            category=category,
-            message=message,
-            first_seen_at=emitted_at,
-            last_seen_at=emitted_at,
-            occurrence_count=1,
-            sequence=sequence,
-        )
-        current = operator_notification_table.c
-        starts_new_incident = (current.last_seen_at
-                               <= emitted_at - dedupe_window_seconds)
-        is_earliest_occurrence = current.first_seen_at > emitted_at
-        advances_last_seen = current.last_seen_at < emitted_at
-        is_latest_occurrence = current.last_seen_at <= emitted_at
-        upsert_stmnt = insert_stmnt.on_conflict_do_update(
-            index_elements=[current.category],
-            set_={
-                current.message: sqlalchemy.case(
-                    (is_latest_occurrence, message), else_=current.message),
-                current.first_seen_at: sqlalchemy.case(
-                    (is_earliest_occurrence, emitted_at),
-                    else_=current.first_seen_at),
-                current.last_seen_at: sqlalchemy.case(
-                    (advances_last_seen, emitted_at),
-                    else_=current.last_seen_at),
-                current.occurrence_count: current.occurrence_count + 1,
-                current.sequence: sqlalchemy.case(
-                    (starts_new_incident, sequence), else_=current.sequence),
-            })
-        session.execute(upsert_stmnt)
-        session.commit()
+    global_user_state_notifications.record_operator_notification(
+        engine, category, message, dedupe_window_seconds, emitted_at)
 
 
 @metrics_lib.time_me
 def get_operator_notifications(user_id: str, since: int) -> dict[str, Any]:
     """Return recent notification categories and this user's unread state."""
     engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        cursor = session.execute(
-            sqlalchemy.select(
-                operator_notification_cursor_table.c.last_seen_sequence).where(
-                    operator_notification_cursor_table.c.user_id ==
-                    user_id)).scalar_one_or_none()
-        last_seen_sequence = int(cursor or 0)
-        rows = session.execute(
-            sqlalchemy.select(operator_notification_table).
-            where(operator_notification_table.c.last_seen_at >= since).order_by(
-                operator_notification_table.c.last_seen_at.desc(),
-                operator_notification_table.c.category.asc())).mappings().all()
-
-    notifications = []
-    latest_sequence = 0
-    unread_count = 0
-    for item in rows:
-        sequence = int(item['sequence'])
-        unread = sequence > last_seen_sequence
-        latest_sequence = max(latest_sequence, sequence)
-        unread_count += int(unread)
-        notifications.append({
-            'category': item['category'],
-            'message': item['message'],
-            'first_seen_at': int(item['first_seen_at']),
-            'last_seen_at': int(item['last_seen_at']),
-            'occurrence_count': int(item['occurrence_count']),
-            'sequence': sequence,
-            'unread': unread,
-        })
-    return {
-        'notifications': notifications,
-        'unread_count': unread_count,
-        'latest_sequence': latest_sequence,
-        'last_seen_sequence': last_seen_sequence,
-    }
+    return global_user_state_notifications.get_operator_notifications(
+        engine, user_id, since)
 
 
 @db_retries.retry
@@ -4370,35 +3411,8 @@ def mark_operator_notifications_read(user_id: str,
         updated_at = int(time.time())
 
     engine = _db_manager.get_engine()
-    insert_func = _operator_notification_insert_func(engine)
-    with orm.Session(engine) as session:
-        issued_sequence = session.execute(
-            sqlalchemy.select(
-                operator_notification_sequence_table.c.value).where(
-                    operator_notification_sequence_table.c.singleton_id ==
-                    1)).scalar_one_or_none()
-        clamped_sequence = min(through_sequence, int(issued_sequence or 0))
-        insert_stmnt = insert_func(operator_notification_cursor_table).values(
-            user_id=user_id,
-            last_seen_sequence=clamped_sequence,
-            updated_at=updated_at)
-        current = operator_notification_cursor_table.c
-        advances_cursor = current.last_seen_sequence < clamped_sequence
-        upsert_stmnt = insert_stmnt.on_conflict_do_update(
-            index_elements=[current.user_id],
-            set_={
-                current.last_seen_sequence: sqlalchemy.case(
-                    (advances_cursor, clamped_sequence),
-                    else_=current.last_seen_sequence),
-                current.updated_at: sqlalchemy.case(
-                    (advances_cursor, updated_at), else_=current.updated_at),
-            })
-        session.execute(upsert_stmnt)
-        session.commit()
-        effective_cursor = session.execute(
-            sqlalchemy.select(current.last_seen_sequence).where(
-                current.user_id == user_id)).scalar_one()
-    return int(effective_cursor)
+    return global_user_state_notifications.mark_operator_notifications_read(
+        engine, user_id, through_sequence, updated_at)
 
 
 def get_max_db_connections() -> int | None:

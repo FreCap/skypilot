@@ -12,7 +12,16 @@ jest.mock('@/lib/cache', () => ({
   },
 }));
 
+jest.mock('@/data/connectors/client', () => ({
+  apiClient: { fetch: jest.fn() },
+}));
+
+jest.mock('@/plugins/dataEnhancement', () => ({
+  applyEnhancements: jest.fn(async (data) => data),
+}));
+
 import dashboardCache from '@/lib/cache';
+import { apiClient } from '@/data/connectors/client';
 import {
   getClusterJobs,
   getClusters,
@@ -29,6 +38,53 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
+
+describe('getClusters request shape', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('passes workspace filters through to /status', async () => {
+    apiClient.fetch.mockResolvedValue([
+      {
+        name: 'cluster-a',
+        status: 'UP',
+        cloud: 'AWS',
+        region: 'us-east-1',
+        cpus: 4,
+        memory: 16,
+        accelerators: null,
+        resources_str: '4 CPUs',
+        resources_str_full: '4 CPUs',
+        launched_at: 1,
+        nodes: 1,
+        workspace: 'alpha',
+        autostop: 0,
+        last_event: null,
+        to_down: false,
+        labels: {},
+      },
+    ]);
+
+    await getClusters({ workspaces: ['alpha'] });
+
+    expect(apiClient.fetch).toHaveBeenCalledWith('/status', {
+      cluster_names: null,
+      workspaces_filter: ['alpha'],
+      all_users: true,
+      include_credentials: false,
+      include_handle: false,
+      summary_response: true,
+    });
+  });
+});
 
 describe('useClusterDetails request ownership', () => {
   beforeEach(() => {
@@ -561,16 +617,155 @@ describe('useClusterData request ownership', () => {
     sortConfig: { key: null, direction: 'ascending' },
     filters: [],
   };
+  let visibilityDescriptor;
 
   beforeEach(() => {
     jest.clearAllMocks();
     delete window.__skyPaginationFetch;
+    visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
   });
 
   afterEach(() => {
+    if (visibilityDescriptor) {
+      Object.defineProperty(
+        window.document,
+        'visibilityState',
+        visibilityDescriptor
+      );
+    } else {
+      delete window.document.visibilityState;
+    }
     jest.useRealTimers();
     delete window.__skyPaginationFetch;
     jest.restoreAllMocks();
+  });
+
+  it('pauses hidden refreshes, catches up once, and resumes visible cadence', async () => {
+    jest.useFakeTimers();
+    dashboardCache.get.mockResolvedValue([{ cluster: 'cluster-a' }]);
+    const { unmount } = renderHook(() =>
+      useClusterData({ ...stableOptions, refreshInterval: 1000 })
+    );
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+
+    setDocumentVisibility('hidden');
+    await act(async () => {
+      jest.advanceTimersByTime(2999);
+      await Promise.resolve();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(1);
+
+    setDocumentVisibility('visible');
+    await act(async () => {
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+    unmount();
+    window.document.dispatchEvent(new Event('visibilitychange'));
+    await act(async () => {
+      jest.advanceTimersByTime(2000);
+      await Promise.resolve();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+  });
+
+  it('fences a pre-hide automatic refresh when visibility returns', async () => {
+    jest.useFakeTimers();
+    const staleRefresh = deferred();
+    const restoredRefresh = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce([{ cluster: 'initial' }])
+      .mockImplementationOnce(() => staleRefresh.promise)
+      .mockImplementationOnce(() => restoredRefresh.promise);
+    const { result, unmount } = renderHook(() =>
+      useClusterData({ ...stableOptions, refreshInterval: 1000 })
+    );
+
+    await waitFor(() =>
+      expect(result.current.data).toEqual([
+        { cluster: 'initial', isHistorical: false },
+      ])
+    );
+
+    act(() => jest.advanceTimersByTime(1000));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    setDocumentVisibility('hidden');
+    setDocumentVisibility('visible');
+    act(() => {
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      restoredRefresh.resolve([{ cluster: 'restored' }]);
+      await restoredRefresh.promise;
+    });
+    expect(result.current.data).toEqual([
+      { cluster: 'restored', isHistorical: false },
+    ]);
+
+    await act(async () => {
+      staleRefresh.resolve([{ cluster: 'stale' }]);
+      await staleRefresh.promise;
+    });
+    expect(result.current.data).toEqual([
+      { cluster: 'restored', isHistorical: false },
+    ]);
+    unmount();
+  });
+
+  it('reuses a manual refresh when visibility returns', async () => {
+    jest.useFakeTimers();
+    const manualRefresh = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce([{ cluster: 'initial' }])
+      .mockImplementationOnce(() => manualRefresh.promise);
+    const { result, unmount } = renderHook(() =>
+      useClusterData({ ...stableOptions, refreshInterval: 1000 })
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+
+    let refreshPromise;
+    act(() => {
+      refreshPromise = result.current.refresh();
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    setDocumentVisibility('hidden');
+    setDocumentVisibility('visible');
+    act(() => {
+      window.document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      manualRefresh.resolve([{ cluster: 'manual' }]);
+      await refreshPromise;
+    });
+    expect(result.current.data).toEqual([
+      { cluster: 'manual', isHistorical: false },
+    ]);
+    unmount();
   });
 
   it('coalesces manual refreshes and overdue ticks for one context', async () => {

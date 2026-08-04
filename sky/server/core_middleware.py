@@ -1,5 +1,9 @@
 """Core HTTP middleware policies for the SkyPilot API server."""
 
+import asyncio
+import os
+import uuid
+
 import fastapi
 import starlette.middleware.base
 
@@ -8,6 +12,7 @@ from sky.server import constants as server_constants
 from sky.server import middleware_utils
 from sky.server import state
 from sky.server import versions
+from sky.server.requests import cutover as request_cutover
 from sky.server.requests import requests as requests_lib
 
 
@@ -101,18 +106,83 @@ class GracefulShutdownMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     """Middleware to control requests when server is shutting down."""
 
     async def dispatch(self, request: fastapi.Request, call_next):
-        if state.get_block_requests():
+        shutting_down = state.get_block_requests()
+        cutting_over = request_cutover.legacy_submissions_blocked()
+        if shutting_down or cutting_over:
             # Allow /api/ paths to continue, which are critical to operate
             # on-going requests but will not submit new requests.
             if not request.url.path.startswith('/api/'):
                 # Client will retry on 503 error.
+                detail = ('The API request store is being migrated to '
+                          'PostgreSQL, please try again later.'
+                          if cutting_over else
+                          'Server is shutting down, please try again later.')
                 return fastapi.responses.JSONResponse(
-                    status_code=503,
-                    content={
-                        'detail': 'Server is shutting down, '
-                                  'please try again later.'
-                    })
+                    status_code=503, content={'detail': detail})
 
+        return await call_next(request)
+
+
+@middleware_utils.websocket_aware
+class ControllerGenerationMiddleware(
+        starlette.middleware.base.BaseHTTPMiddleware):
+    """Reject nested work submitted by a fenced controller generation."""
+
+    async def dispatch(self, request: fastapi.Request, call_next):
+        instance_id = request.headers.get(
+            server_constants.CONTROLLER_INSTANCE_ID_HEADER)
+        generation = request.headers.get(
+            server_constants.CONTROLLER_GENERATION_HEADER)
+        if instance_id is None and generation is None:
+            return await call_next(request)
+        if instance_id is None or generation is None:
+            return fastapi.responses.JSONResponse(
+                status_code=400,
+                content={
+                    'detail': 'Controller origin requires both instance and '
+                              'generation headers.'
+                })
+        try:
+            uuid.UUID(instance_id)
+            parsed_generation = int(generation)
+        except (TypeError, ValueError):
+            return fastapi.responses.JSONResponse(
+                status_code=400,
+                content={'detail': 'Controller origin is malformed.'})
+        if parsed_generation <= 0:
+            return fastapi.responses.JSONResponse(
+                status_code=400,
+                content={'detail': 'Controller generation must be positive.'})
+        if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') != 'postgres':
+            return fastapi.responses.JSONResponse(
+                status_code=409,
+                content={
+                    'detail': 'Controller generation admission requires the '
+                              'PostgreSQL request backend.'
+                })
+
+        # Runtime import keeps the compatibility SQLite middleware path light.
+        # The synchronous SQL probe runs outside the serving event loop.
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import postgres as request_postgres
+        try:
+            is_current = await asyncio.to_thread(
+                request_postgres.controller_leadership_is_current, instance_id,
+                parsed_generation)
+        except Exception as e:  # pylint: disable=broad-except
+            return fastapi.responses.JSONResponse(
+                status_code=503,
+                content={
+                    'detail': 'Could not verify controller generation: '
+                              f'{type(e).__name__}.'
+                })
+        if not is_current:
+            return fastapi.responses.JSONResponse(
+                status_code=409,
+                content={
+                    'detail': 'Controller generation is no longer current.'
+                })
+        request.state.controller_origin = (instance_id, parsed_generation)
         return await call_next(request)
 
 

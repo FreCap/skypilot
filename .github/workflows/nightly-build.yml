@@ -106,6 +106,12 @@ jobs:
           pip install
           build
           --user
+      - name: Verify standalone worker runtime release resource
+        run: |
+          python sky/setup_files/worker_runtime_packaging.py \
+            verify-source-resource \
+            --repo-root . \
+            --output-dir "${RUNNER_TEMP}/worker-runtime"
       - name: Set release version
         id: set-release-version
         run: |

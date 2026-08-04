@@ -126,11 +126,39 @@ EXTERNAL_LOCAL_ENV_VARS = [
     'KUBECONFIG',
 ]
 
-# Platform capabilities must come from the server deployment, never a client
-# process or a hand-crafted request body. The external-LB variable predates the
-# SKYPILOT_SERVER_ naming convention, so classify it explicitly while keeping
-# the existing name compatible across rolling chart/image upgrades.
+# Platform identity and capabilities must come from the server deployment,
+# never a client process, an older API pod's persisted environment, or a
+# hand-crafted request body. Most of these variables predate the
+# SKYPILOT_SERVER_ naming convention, so classify them explicitly while
+# keeping their existing names compatible across rolling chart/image upgrades.
 _SERVER_OWNED_ENV_VARS = frozenset({
+    'POD_IP',
+    'SKY_API_SERVER_METRICS_ENABLED',
+    'SKYPILOT_APISERVER_UUID',
+    'SKYPILOT_API_DEPLOYMENT_NAME',
+    'SKYPILOT_API_REQUEST_BACKEND',
+    'SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH',
+    'SKYPILOT_API_SERVER_INSTANCE_ID',
+    'SKYPILOT_API_SERVER_ROLE',
+    'SKYPILOT_API_SERVER_STORAGE_ENABLED',
+    'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS',
+    'SKYPILOT_GRACE_PERIOD_SECONDS',
+    'SKYPILOT_IN_CLUSTER_NAMESPACE',
+    'SKYPILOT_POD_NAME',
+    'SKYPILOT_POD_NAMESPACE',
+    'SKYPILOT_POD_UID',
+    'SKYPILOT_RELEASE_NAME',
+    'SKYPILOT_ROLLING_UPDATE_ENABLED',
+    'SKYPILOT_SERVE_API_SERVICE_URL',
+    'SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE',
+    'SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE',
+    'SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED',
+    'SKYPILOT_SERVE_LB_HA_RBAC_READY',
+    'SKYPILOT_SERVE_LB_RESOURCES_JSON',
+    'SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE',
+    'SKYPILOT_STATE_DB_MIGRATION_MODE',
+    constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR,
+    constants.SKY_API_SERVER_URL_ENV_VAR,
     serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR,
 })
 
@@ -805,15 +833,29 @@ class ExecBody(RequestBody):
 
 
 class StopOrDownBody(RequestBody):
+    """Shared stop/down payload with an optional internal teardown fence."""
+
     cluster_name: str
     purge: bool = False
     graceful: bool = False
     graceful_timeout: int | None = None
+    # Internal only.  The public SDK never populates this; SkyServe shadow and
+    # action paths use it to prevent a stale down request from deleting a
+    # same-name successor cluster record.
+    resource_action_expected_cluster_record_uuid: str | None = pydantic.Field(
+        default=None, exclude_if=lambda value: value is None)
+
+    def to_kwargs(self) -> dict[str, Any]:
+        kwargs = super().to_kwargs()
+        kwargs['_expected_cluster_record_uuid'] = kwargs.pop(
+            'resource_action_expected_cluster_record_uuid', None)
+        return kwargs
 
 
 class StatusBody(RequestBody):
     """The request body for the status endpoint."""
     cluster_names: list[str] | None = None
+    workspaces_filter: list[str] | None = None
     refresh: common_lib.StatusRefreshMode = common_lib.StatusRefreshMode.NONE
     all_users: bool = True
     # TODO (kyuds): default to False post 0.12.0
@@ -1262,6 +1304,9 @@ class ServeStatusBody(RequestBody):
     # Skip per-replica info; return cheap replica_status_counts instead.
     # Used by the dashboard for fast list/header rendering at fleet scale.
     summary_only: bool = False
+    # Return persisted service metadata without replica counts/details,
+    # autoscaler data, history, YAML, endpoint resolution, or provider calls.
+    metadata_only: bool = False
     # Optional override for target_num_replicas. If unset, the server keeps
     # full status behavior (include targets) but leaves summary-only requests
     # on the cheap DB-only path.
@@ -1269,6 +1314,9 @@ class ServeStatusBody(RequestBody):
     # Include aggregate physical-machine history for one named service.
     # Central history is PostgreSQL-only and retained for up to 72 hours.
     history_hours: int | None = None
+    # Summary responses skip endpoint resolution by default because it requires
+    # Kubernetes reads. Dashboard list enrichment opts in after metadata lands.
+    include_endpoints: bool = False
 
 
 class ServePlacementBody(RequestBody):

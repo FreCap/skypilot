@@ -99,6 +99,16 @@ async def test_scheduled_launch_records_backoff_and_releases_slot():
 
 
 @pytest.mark.asyncio
+async def test_job_resumed_restores_alive_without_launching():
+    with mock.patch.object(scheduler.state,
+                           'scheduler_set_alive_async',
+                           new_callable=mock.AsyncMock) as set_alive:
+        await scheduler.job_resumed(7)
+
+    set_alive.assert_awaited_once_with(7)
+
+
+@pytest.mark.asyncio
 async def test_scheduled_launch_uses_preclaimed_slot_at_capacity():
     starting = {7}
     starting_lock = asyncio.Lock()
@@ -278,6 +288,55 @@ def test_submit_jobs_returns_before_file_reads_when_every_controller_is_live(
     start_controllers.assert_not_called()
 
 
+def test_submit_jobs_empty_input_returns_without_work(tmp_path):
+    missing = tmp_path / 'must-not-be-read'
+
+    with mock.patch.object(
+            scheduler.state,
+            'get_job_controller_processes',
+            side_effect=AssertionError('controller lookup used')), \
+            mock.patch.object(
+                scheduler.state,
+                'scheduler_set_waiting',
+                side_effect=AssertionError('state transition used')), \
+            mock.patch.object(
+                scheduler,
+                'maybe_start_controllers',
+                side_effect=AssertionError('controller start used')):
+        scheduler.submit_jobs([], str(missing), str(missing), str(missing), 50)
+
+
+def test_submit_jobs_deduplicates_ids_before_controller_checks_and_submit(
+        tmp_path):
+    dag, user, env = _submission_files(tmp_path)
+    records = {
+        1: _record(101, 1001.0),
+        2: _record(202, 1002.0),
+    }
+
+    with mock.patch.object(
+            scheduler.state,
+            'get_job_controller_processes',
+            return_value=records) as get_processes, mock.patch.object(
+                scheduler.state,
+                'get_job_controller_process',
+                side_effect=AssertionError('scalar lookup used')), \
+            mock.patch.object(scheduler.managed_job_utils,
+                              'controller_process_alive',
+                              return_value=False) as is_alive, \
+            mock.patch.object(scheduler.state,
+                              'scheduler_set_waiting') as set_waiting, \
+            mock.patch.object(scheduler,
+                              'maybe_start_controllers') as start_controllers:
+        scheduler.submit_jobs([1, 2, 1, 2], str(dag), str(user), str(env), 50)
+
+    get_processes.assert_called_once_with([1, 2])
+    assert [call.args[0].pid for call in is_alive.call_args_list] == [101, 202]
+    set_waiting.assert_called_once_with([1, 2], 'name: dag\n', 'name: user\n',
+                                        'KEY=value\n', None, 50, None)
+    start_controllers.assert_called_once_with(from_scheduler=True)
+
+
 class TestKillLocalConsolidationControllers:
     """Tests shutdown cleanup for consolidated controller processes."""
 
@@ -390,3 +449,82 @@ class TestKillLocalConsolidationControllers:
                 mock.patch.object(scheduler.os, 'kill') as kill_mock:
             scheduler.kill_local_job_controllers(sig=signal.SIGKILL)
         kill_mock.assert_called_once_with(101, signal.SIGKILL)
+
+    def test_fail_stop_kills_validated_process_group_and_descendants(self):
+        recs = [_record(101, 1700000000.0)]
+        process = mock.Mock()
+        process.create_time.return_value = 1700000000.0
+        descendant = mock.Mock()
+        process.children.return_value = [descendant]
+        with mock.patch.object(scheduler,
+                               'get_controller_process_records',
+                               return_value=recs), \
+                mock.patch.object(scheduler.managed_job_utils,
+                                  'controller_process_alive',
+                                  return_value=True), \
+                mock.patch.object(scheduler.psutil,
+                                  'Process',
+                                  return_value=process), \
+                mock.patch.object(scheduler.os,
+                                  'getpgrp',
+                                  return_value=999), \
+                mock.patch.object(scheduler.os,
+                                  'getpgid',
+                                  return_value=700), \
+                mock.patch.object(scheduler.os, 'killpg') as kill_group:
+            n = scheduler.fail_stop_local_job_controllers()
+
+        assert n == 1
+        process.children.assert_called_once_with(recursive=True)
+        kill_group.assert_called_once_with(700, signal.SIGKILL)
+        process.kill.assert_not_called()
+        descendant.kill.assert_called_once_with()
+
+    def test_fail_stop_revalidates_process_start_time(self):
+        recs = [_record(101, 1700000000.0)]
+        process = mock.Mock()
+        process.create_time.return_value = 1700000001.0
+        with mock.patch.object(scheduler,
+                               'get_controller_process_records',
+                               return_value=recs), \
+                mock.patch.object(scheduler.managed_job_utils,
+                                  'controller_process_alive',
+                                  return_value=True), \
+                mock.patch.object(scheduler.psutil,
+                                  'Process',
+                                  return_value=process), \
+                mock.patch.object(scheduler.os, 'getpgid') as get_group, \
+                mock.patch.object(scheduler.os, 'killpg') as kill_group:
+            n = scheduler.fail_stop_local_job_controllers()
+
+        assert n == 0
+        get_group.assert_not_called()
+        kill_group.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_fail_stop_never_kills_supervisor_process_group(self):
+        recs = [_record(101, 1700000000.0)]
+        process = mock.Mock()
+        process.create_time.return_value = 1700000000.0
+        process.children.return_value = []
+        with mock.patch.object(scheduler,
+                               'get_controller_process_records',
+                               return_value=recs), \
+                mock.patch.object(scheduler.managed_job_utils,
+                                  'controller_process_alive',
+                                  return_value=True), \
+                mock.patch.object(scheduler.psutil,
+                                  'Process',
+                                  return_value=process), \
+                mock.patch.object(scheduler.os,
+                                  'getpgrp',
+                                  return_value=700), \
+                mock.patch.object(scheduler.os,
+                                  'getpgid',
+                                  return_value=700), \
+                mock.patch.object(scheduler.os, 'killpg') as kill_group:
+            n = scheduler.fail_stop_local_job_controllers()
+
+        assert n == 1
+        kill_group.assert_not_called()
+        process.kill.assert_called_once_with()

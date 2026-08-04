@@ -35,6 +35,9 @@ message GetServiceStatusRequest {
     // Optional override for target_num_replicas. Unset keeps full status
     // behavior but lets summary-only callers stay on the cheap DB-only path.
     optional bool include_target_num_replicas = 4;
+    // Return only persisted service metadata. New callers use this as the
+    // first phase of progressive dashboard rendering.
+    bool metadata_only = 5;
 }
 
 message GetServiceStatusResponse {

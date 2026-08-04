@@ -478,6 +478,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler._bare_key_warned = set()
         autoscaler._snap_target_on_next_recompute = False
         autoscaler._qps_dict_by_version = {}
+        autoscaler._qps_dict_unavailable_versions_for_tick = None
         autoscaler.latest_version = 1
         return autoscaler
 
@@ -1165,6 +1166,110 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
             self.assertEqual(
                 autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1),
                 10.0)
+
+    def test_version_fallback_read_once_per_tick_and_retries(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=3)
+        recovered_spec = mock.Mock()
+        recovered_spec.target_qps_per_replica = {'L4': 0.1}
+        state = {'recovered': False}
+
+        def _get_spec(*_args):
+            if not state['recovered']:
+                raise RuntimeError('state store unavailable')
+            return recovered_spec
+
+        def _resolve_repeatedly(*_args):
+            return [
+                autoscaler._get_target_qps_for_gpu_shape('L4', 1, version=1)
+                for _ in range(3)
+            ]
+
+        with mock.patch.object(autoscalers.serve_state,
+                               'get_spec',
+                               side_effect=_get_spec) as mock_get, \
+             mock.patch.object(autoscaler,
+                               '_generate_scaling_decisions_locked',
+                               side_effect=_resolve_repeatedly):
+            self.assertEqual(autoscaler.generate_scaling_decisions([], [3]),
+                             [10.0, 10.0, 10.0])
+            mock_get.assert_called_once_with('svc', 1)
+
+            state['recovered'] = True
+            self.assertEqual(autoscaler.generate_scaling_decisions([], [3]),
+                             [0.1, 0.1, 0.1])
+            self.assertEqual(mock_get.call_count, 2)
+
+    def test_version_fallback_does_not_authorize_rolling_drain(self):
+        # Controller restart mid-update: only the latest spec is cached.
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=2)
+        replicas = [self._replica(i, 'L4', version=1) for i in range(1, 101)]
+        replicas.append(self._replica(101, 'A100', version=2))
+        autoscaler.request_timestamps = [0.0
+                                        ] * (60 * autoscaler.qps_window_size)
+        for info in replicas:
+            gpu_type = 'A100' if info.version == 2 else 'L4'
+            autoscaler._gpu_shape_cache[info.replica_id] = (gpu_type, 1)
+            autoscaler._replica_cost_cache[info.replica_id] = 0.5
+        recovered_spec = self._spec({'L4': 0.1})
+
+        with mock.patch.object(
+                autoscalers.serve_state,
+                'get_spec',
+                side_effect=[RuntimeError('state store unavailable'),
+                             recovered_spec]) as mock_get, \
+             mock.patch.object(autoscalers.logger,
+                               'warning') as mock_warning:
+            first = autoscaler.generate_scaling_decisions(replicas, [1, 2])
+            self.assertEqual([
+                decision for decision in first if decision.operator ==
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+            ], [])
+            self.assertEqual(
+                len([
+                    decision for decision in first if decision.operator ==
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP
+                ]), 5)
+            mock_get.assert_called_once_with('svc', 1)
+            self.assertEqual(mock_warning.call_count, 1)
+
+            second = autoscaler.generate_scaling_decisions(replicas, [1, 2])
+            self.assertEqual([
+                decision for decision in second if decision.operator ==
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+            ], [])
+            self.assertEqual(mock_get.call_count, 2)
+
+    def test_version_fallback_tick_cleanup_after_decision_failure(self):
+        autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', self._spec({'A100': 10.0}), version=3)
+        recovered_spec = mock.Mock()
+        recovered_spec.target_qps_per_replica = {'L4': 0.1}
+        calls = 0
+
+        def _decide(*_args):
+            nonlocal calls
+            calls += 1
+            capacity = autoscaler._get_target_qps_for_gpu_shape('L4',
+                                                                1,
+                                                                version=1)
+            if calls == 1:
+                raise RuntimeError('decision failed')
+            return [capacity]
+
+        with mock.patch.object(
+                autoscalers.serve_state,
+                'get_spec',
+                side_effect=[None, recovered_spec]) as mock_get, \
+             mock.patch.object(autoscaler,
+                               '_generate_scaling_decisions_locked',
+                               side_effect=_decide):
+            with self.assertRaisesRegex(RuntimeError, 'decision failed'):
+                autoscaler.generate_scaling_decisions([], [3])
+            self.assertEqual(autoscaler.generate_scaling_decisions([], [3]),
+                             [0.1])
+        self.assertEqual(mock_get.call_count, 2)
 
     def test_rebuilt_autoscaler_first_tick_snaps_before_drain(self):
         # Controller restart mid-rolling-update: the fresh autoscaler

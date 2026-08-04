@@ -41,6 +41,51 @@ REPLICA_LAUNCH_FENCE_KEYS = (
     REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY,
 )
 
+# Server-only allowlist for the first same-VM system-OOM recovery rollout.
+# The value is a versioned JSON document binding an exact service incarnation
+# to a safety-profile digest.  It is read only by the API server and is never
+# forwarded into a user task's environment.
+SYSTEM_OOM_RECOVERY_PROFILES_ENV_VAR = (
+    'SKYPILOT_INTERNAL_SERVE_SYSTEM_OOM_RECOVERY_PROFILES')
+# Recovery-capable code generation requires one exact controller-owned
+# contract tuple.  Contract 1 remains a deprecated transition reader until the
+# stacked cleanup PR.  New candidates use contract 2 and a closed context that
+# is atomically bound to the API server's own ordinary request ID.
+SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY = (
+    'sky_serve_system_oom_recovery_controller_contract_version')
+SYSTEM_OOM_RECOVERY_LEGACY_CONTROLLER_CONTRACT_VERSION = 1
+SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION = 2
+SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY = 'sky_serve_system_oom_recovery_profile_id'
+SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY = (
+    'sky_serve_system_oom_recovery_profile_version')
+SYSTEM_OOM_RECOVERY_AUTHORIZATION_VERSION_KEY = (
+    'sky_serve_system_oom_recovery_authorization_version')
+SYSTEM_OOM_RECOVERY_AUTHORIZATION_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_authorization_sha256')
+SYSTEM_OOM_RECOVERY_RUNTIME_PROFILE_VERSION_KEY = (
+    'sky_serve_system_oom_recovery_runtime_profile_version')
+SYSTEM_OOM_RECOVERY_EXPECTED_RUNTIME_CAPABILITY_KEY = (
+    'sky_serve_system_oom_recovery_expected_runtime_capability')
+SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY = (
+    'sky_serve_system_oom_recovery_replica_id')
+SYSTEM_OOM_RECOVERY_LAUNCH_GENERATION_KEY = (
+    'sky_serve_system_oom_recovery_launch_generation')
+SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY = (
+    'sky_serve_system_oom_recovery_launch_nonce')
+SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY = (
+    'sky_serve_system_oom_recovery_bound_request_id')
+SYSTEM_OOM_RECOVERY_WORKSPACE_KEY = ('sky_serve_system_oom_recovery_workspace')
+SYSTEM_OOM_RECOVERY_RESOURCE_ENVELOPE_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_resource_envelope_sha256')
+SYSTEM_OOM_RECOVERY_TASK_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_task_sha256')
+SYSTEM_OOM_RECOVERY_RUNTIME_IMAGE_DIGEST_KEY = (
+    'sky_serve_system_oom_recovery_runtime_image_digest')
+SYSTEM_OOM_RECOVERY_OWNED_CONTAINER_SPEC_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_owned_container_spec_sha256')
+SYSTEM_OOM_RECOVERY_EXECUTION_ENVELOPE_SHA256_KEY = (
+    'sky_serve_system_oom_recovery_execution_envelope_sha256')
+
 # The consolidation mode lock ensures that if multiple API servers are running
 # at the same time (e.g. during a rolling update), recovery can only happen once
 # the previous API server has exited.
@@ -74,6 +119,24 @@ CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR = (
     'SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE')
 LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR = (
     'SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED')
+
+# Chart-owned marker for role-local authority behavior. Absence is the only
+# disabled representation; charts never emit a false value.
+RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR = (
+    'SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED')
+# Dedicated controller-to-authority-worker preflight trust domain.  This ring
+# has no legacy environment fallback and must never share a token with any
+# public API, LB sync, controller administration, or inference credential.
+RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR = (
+    'SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE')
+RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_PATH = (
+    '/etc/skypilot/resource-action-authority/auth/tokens')
+RESOURCE_ACTION_PREFLIGHT_TLS_DIRECTORY = (
+    '/etc/skypilot/resource-action-authority/tls')
+RESOURCE_ACTION_PREFLIGHT_PATH = (
+    '/internal/resource-actions/v1/kubernetes/preflight')
+RESOURCE_ACTION_PREFLIGHT_PORT = 46583
+RESOURCE_ACTION_PREFLIGHT_SERVICE_SUFFIX = 'authority-preflight'
 
 # A load balancer stamps the durable service incarnation it was created for.
 # The stable API-server proxy rejects stale same-name LBs before forwarding.
@@ -326,7 +389,37 @@ LB_CONTROLLER_SYNC_PATH = '/controller/load_balancer_sync'
 LB_CONTROLLER_ROLE_PATH = '/controller/load_balancer_role'
 LB_CONTROLLER_HISTORY_SYNC_PATH = (
     '/controller/load_balancer_request_history_sync')
+LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH = (
+    '/controller/system_recovery_route_lease')
 LB_ROLE_PROXY_OBSERVABILITY_HEADER = ('X-SkyServe-LB-Role-Proxy-Observability')
+
+# A recovery-capable backend can bind the same route after Ray has killed its
+# first process.  The heavyweight 20-second controller sync deliberately keeps
+# stale ordinary routes during controller outages, so capable routes carry an
+# independent, short-lived marker/heartbeat lease.  These values are a closed
+# correctness contract with the driver's replay-quiescence fence; do not make
+# them service-configurable.
+SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_KEY = 'system_recovery_route_lease'
+SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_VERSION = 'v1'
+SYSTEM_RECOVERY_ROUTE_REPLICA_ID_KEY = 'system_recovery_replica_id'
+SYSTEM_RECOVERY_ROUTE_TOKEN_KEY = 'system_recovery_route_token'
+# A coherent heavyweight snapshot uses this closed sentinel to revoke an
+# ambiguous transport URL (duplicate normalized rows or a capable row without
+# an exact marker).  It is a fence, never a routable marker.
+SYSTEM_RECOVERY_ROUTE_FENCE_KEY = 'system_recovery_route_fence'
+SYSTEM_RECOVERY_ROUTE_FENCE_VERSION = 'v1'
+SYSTEM_RECOVERY_ROUTE_LEASE_PROTOCOL_VERSION = 1
+SYSTEM_RECOVERY_ROUTE_PROBE_INTERVAL_SECONDS = 5
+SYSTEM_RECOVERY_ROUTE_PROBE_TIMEOUT_SECONDS = 15
+SYSTEM_RECOVERY_ROUTE_LEASE_SECONDS = 60
+SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS = 1000
+SYSTEM_RECOVERY_MAX_ELIGIBLE_PROBE_INTERVAL_SECONDS = 10
+SYSTEM_RECOVERY_MAX_ELIGIBLE_READINESS_TIMEOUT_SECONDS = 15
+LB_SYSTEM_RECOVERY_LEASE_HEARTBEAT_INTERVAL_SECONDS = 2
+LB_SYSTEM_RECOVERY_LEASE_HEARTBEAT_TIMEOUT_SECONDS = 10
+# Leave one second inside the LB's total timeout for stable-proxy owner reads
+# and response forwarding.
+LB_SYSTEM_RECOVERY_LEASE_PROXY_TIMEOUT_SECONDS = 9
 
 # [boltz fork] The timeout in seconds for the load balancer to sync with the
 # controller (raised from the previous inline 5s). A cold 215-replica routing
@@ -448,6 +541,9 @@ LB_DRAIN_CLOSE_GRACE_SECONDS = 60
 # replica must fail fast into the retry loop even when the stream
 # timeout is sized for hour-long synchronous predictions.
 LB_CONNECT_TIMEOUT_SECONDS = 10
+# Marked recovery routes have a bounded connection-pool wait as well as the
+# bounded connect above.  The driver's 83-second fence includes both budgets.
+LB_SYSTEM_RECOVERY_POOL_TIMEOUT_SECONDS = 10
 
 # Passive LB-side replica eviction, for the window where the controller is
 # paused (e.g. during a control-plane roll) and cannot update the ready set.
@@ -604,22 +700,26 @@ RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS = 3
 # ratio while staying far from float overflow.
 RESERVED_FILL_MAX_WEIGHT = 1e6
 
-# [boltz fork] Utilization gate (opt-in via
-# reserved_capacity_fill.utilization_gate): a claimant that demonstrates no
-# work walks its entitlement down to floor_replicas in bounded steps, and
-# the released capacity returns to genuinely free GPUs where any service
-# can take it -- including one that declares no reserved_capacity_fill at
-# all and can therefore only reach the pool through ordinary
-# cheapest-first demand placement. Floors are structurally immune: the gate
-# only tightens the water-fill headroom, never scale_floors.
+# [boltz fork] Utilization gate (default for reserved_capacity_fill; explicit
+# utilization_gate:false opts out): a claimant that demonstrates no work
+# walks its whole fill entitlement down to zero in bounded steps, including
+# its declared reserved floor. Positive utilization restores a cap proportional
+# to demonstrated need; a large declared floor cannot inflate that cap.
+# Released capacity returns to genuinely free GPUs
+# where any service can take it -- including one that declares no
+# reserved_capacity_fill at all and can therefore only reach the pool through
+# ordinary cheapest-first demand placement.
 #
 # These are POOL-GLOBAL on purpose. A per-service dwell or step rate would
 # let the slower-decaying claimant win every contested transient purely by
 # decaying slower, which re-creates through timing exactly the static
 # priority this feature removes.
 #
-# Continuously-zero demonstrated need required before the first release
-# step. Equals downscale_delay_seconds on both live services, equals
+# Continuously-zero demonstrated need required before the first release step.
+# A gated writer with no usable utilization telemetry reports armed-but-blind:
+# it freezes for the bounded blind grace before decay resumes. Retaining a
+# static reservation requires the explicit per-service opt-out. Equals
+# downscale_delay_seconds on both live services, equals
 # RESERVED_FILL_CLAIM_TTL_SECONDS, and is 5 poll intervals / 15 LB syncs /
 # 5x the report-staleness threshold.
 RESERVED_FILL_IDLE_DWELL_SECONDS = 300.0
@@ -729,7 +829,7 @@ CONTROLLER_AUTOSTOP = {
 # A period of time to initialize your service. Any readiness probe failures
 # during this period will be ignored.
 DEFAULT_INITIAL_DELAY_SECONDS = 1200
-DEFAULT_MIN_REPLICAS = 1
+DEFAULT_MIN_REPLICAS = 0
 
 # Default dynamic controller-port start and fixed per-service LB container
 # port. Controller ports stay pod-local; only each Kubernetes LB Service
@@ -748,11 +848,10 @@ INITIAL_VERSION = 1
 REPLICA_ID_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_ID'
 
 # Name of the environment variable holding the controller pod's own name.
-# In external load balancer mode the controller (running in the api-server pod)
-# reads its own pod spec to mirror its container image onto the LB Deployment
-# it creates. The platform must inject this via the downward API
-# (metadata.name). It is a hard contract: without it the controller cannot
-# resolve the LB image.
+# In external load balancer mode the controller reads its own pod spec to
+# mirror its container image onto the LB Deployment it creates. The platform
+# must inject this via the downward API (metadata.name). It is a hard contract:
+# without it the controller cannot resolve the LB image.
 POD_NAME_ENV_VAR = 'SKYPILOT_POD_NAME'
 # Helm-rendered name of the stable API Deployment that owns generated external
 # LB objects. Unlike the API Pod/ReplicaSet identities, this Deployment UID is
@@ -784,7 +883,9 @@ POD_NAMESPACE_ENV_VAR = 'SKYPILOT_POD_NAMESPACE'
 #        can skip per-service autoscaler HTTP fetches unless they render it.
 # v8.0 - Added per-GPU logical replica semantics and logical capacity hints.
 # v9.0 - Added the authenticated, read-only placement snapshot endpoint.
-SERVE_VERSION = 9
+# v10.0 - Added metadata_only to get_service_status for progressive dashboard
+#         rendering without replica, autoscaler, history, or endpoint reads.
+SERVE_VERSION = 10
 
 TERMINATE_REPLICA_VERSION_MISMATCH_ERROR = (
     'The version of service is outdated and does not support manually '

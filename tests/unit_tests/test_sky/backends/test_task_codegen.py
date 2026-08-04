@@ -16,6 +16,7 @@ import pytest
 
 from sky.backends import task_codegen
 from sky.provision.slurm import utils as slurm_utils
+from sky.skylet import system_oom_recovery
 
 TESTDATA_DIR = Path(__file__).parent / 'testdata' / 'ray_codegen'
 SLURM_TESTDATA_DIR = Path(__file__).parent / 'testdata' / 'slurm_codegen'
@@ -145,6 +146,89 @@ def test_multi_node_2nodes():
 
     result = codegen.build()
     assert_codegen_matches_snapshot('multi_node_2nodes', result)
+
+
+def test_system_oom_recovery_codegen_is_single_attempt_authority():
+    """The private Serve path emits one replayable, Ray-nonretrying task."""
+    codegen = task_codegen.RayCodeGen(
+        system_oom_recovery_plan=system_oom_recovery.RecoveryLaunchPlan.
+        direct_shell())
+    codegen.add_prologue(job_id=1)
+    codegen.add_setup(
+        1,
+        resources_dict={
+            'CPU': 4.0,
+            'GPU': 1.0
+        },
+        stable_cluster_internal_ips=['10.0.0.1'],
+        env_vars={},
+        log_dir='/sky/logs',
+        setup_cmd=None,
+    )
+    codegen.add_task(
+        1,
+        bash_script='python serve.py',
+        task_name='serve',
+        resources_dict={
+            'CPU': 4.0,
+            'GPU': 1.0
+        },
+        log_dir='/sky/logs/tasks',
+        env_vars={},
+    )
+    codegen.add_epilogue()
+
+    result = codegen.build()
+    compile(result, '<system-oom-recovery-codegen>', 'exec')
+    assert 'max_retries=0' in result
+    assert result.count('def submit_task_attempt_0(') == 1
+    assert 'task_future = submit_task_attempt_0(0, task_attempt_context)' in result
+    assert 'if attempt_number == 0:' in result
+    assert result.index('arm_started_monotonics.append(time.monotonic())') < (
+        result.index('future = remote_task.remote('))
+    assert 'arm_started_monotonics[0]' in result
+    session_capture = ('system_oom_recovery.capture_ray_session_identity(ray)')
+    assert result.index('future = remote_task.remote(') < result.index(
+        session_capture) < result.index('get_or_fail_with_recovery(')
+    assert 'ray_session_identities[0]' in result
+    assert 'get_or_fail_with_recovery(' in result
+    assert ('run_bash_command_with_log_and_return_pid_with_system_oom_recovery'
+            in result)
+    assert 'with job_lib.job_status_lock(1):' in result
+    assert 'not current_job_status.is_terminal()' in result
+
+
+def test_system_oom_recovery_codegen_rejects_multiple_run_tasks():
+    codegen = task_codegen.RayCodeGen(
+        system_oom_recovery_plan=system_oom_recovery.RecoveryLaunchPlan.
+        direct_shell())
+    codegen.add_prologue(job_id=1)
+    codegen.add_setup(
+        1,
+        resources_dict={'CPU': 1.0},
+        stable_cluster_internal_ips=['10.0.0.1'],
+        env_vars={},
+        log_dir='/sky/logs',
+        setup_cmd=None,
+    )
+    codegen.add_task(
+        1,
+        bash_script='python serve.py',
+        task_name='serve',
+        resources_dict={'CPU': 1.0},
+        log_dir='/sky/logs/tasks',
+        env_vars={},
+    )
+
+    with pytest.raises(AssertionError, match='only supports one run task'):
+        codegen.add_task(
+            1,
+            bash_script='python serve-again.py',
+            task_name='serve-again',
+            resources_dict={'CPU': 1.0},
+            log_dir='/sky/logs/tasks',
+            env_vars={},
+        )
 
 
 def test_slurm_single_node_with_gpu():

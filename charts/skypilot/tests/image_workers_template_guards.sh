@@ -42,3 +42,6 @@ expect_failure \
 expect_failure \
   'imageCanaryWorker.terminationGracePeriodSeconds must be an integer' \
   --set-string imageCanaryWorker.terminationGracePeriodSeconds=600
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+bash "$script_dir/resource_action_authority_workers_template_guards.sh" "$chart_dir"

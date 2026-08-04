@@ -408,7 +408,8 @@ class BearerTokenMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
 
             # Set the authenticated user
             auth_user = models.User(id=user_id,
-                                    name=user_name or user_info.name)
+                                    name=user_name or user_info.name,
+                                    user_type=user_info.user_type)
             request.state.auth_user = auth_user
 
             logger.debug(f'Authenticated service account: {user_id}')

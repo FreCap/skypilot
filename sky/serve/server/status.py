@@ -50,9 +50,14 @@ class _DefaultServiceStatusRunner:
         pool: bool,
         summary_only: bool = False,
         include_target_num_replicas: bool | None = None,
+        metadata_only: bool = False,
     ) -> list[dict[str, Any]]:
         noun = 'pool' if pool else 'service'
-        use_legacy = not handle.is_grpc_enabled_with_flag
+        # Existing Serve v9 skylets parse but ignore the new optional proto
+        # field and would return the full replica inventory. Metadata requests
+        # therefore use the compatibility codegen path, which is built from
+        # the slim snapshot primitive already present in Serve v9.
+        use_legacy = metadata_only or not handle.is_grpc_enabled_with_flag
 
         service_records: list[dict[str, Any]] = []
         if not use_legacy:
@@ -62,6 +67,7 @@ class _DefaultServiceStatusRunner:
                     service_names,
                     pool,
                     summary_only=summary_only,
+                    metadata_only=metadata_only,
                     include_target_num_replicas=include_target_num_replicas)
             except exceptions.SkyletMethodNotImplementedError:
                 use_legacy = True
@@ -74,6 +80,7 @@ class _DefaultServiceStatusRunner:
                 service_names,
                 pool=pool,
                 summary_only=summary_only,
+                metadata_only=metadata_only,
                 include_target_num_replicas=include_target_num_replicas)
             returncode, serve_status_payload, stderr = backend.run_on_head(
                 handle,
@@ -103,6 +110,8 @@ def status(
     summary_only: bool = False,
     include_target_num_replicas: bool | None = None,
     history_hours: int | None = None,
+    metadata_only: bool = False,
+    include_endpoints: bool = False,
 ) -> list[dict[str, Any]]:
     """Gets statuses of services or pools.
 
@@ -112,6 +121,14 @@ def status(
     while summary-only requests stay on the cheap DB-only path.
     """
     noun = 'pool' if pool else 'service'
+    if summary_only and metadata_only:
+        raise ValueError(
+            'summary_only and metadata_only are mutually exclusive.')
+    if metadata_only and (include_target_num_replicas or
+                          history_hours is not None or include_endpoints):
+        raise ValueError(
+            'metadata_only cannot include target replicas, history, '
+            'or endpoints.')
     if service_names is not None:
         if isinstance(service_names, str):
             service_names = [service_names]
@@ -136,12 +153,18 @@ def status(
 
     assert isinstance(handle, backends.CloudVmRayResourceHandle)
 
-    service_records = serve_runner.current().get_service_status(
+    runner_kwargs: dict[str, Any] = dict(
         handle=handle,
         service_names=service_names,
         pool=pool,
         summary_only=summary_only,
         include_target_num_replicas=include_target_num_replicas)
+    if metadata_only:
+        # Keep the standard call shape compatible with third-party runners
+        # compiled against Serve v9. The new keyword is only required for the
+        # new projection and is guarded by the API/Serve version bump.
+        runner_kwargs['metadata_only'] = True
+    service_records = serve_runner.current().get_service_status(**runner_kwargs)
 
     # Keep summary-only requests on the cheap DB-only path: callers that opt
     # out of replica detail should not pay an extra per-service Kubernetes
@@ -149,7 +172,7 @@ def status(
     for service_record in service_records:
         service_record['endpoint'] = None
         # Pool doesn't have an endpoint.
-        if pool or summary_only:
+        if pool or metadata_only or (summary_only and not include_endpoints):
             continue
         if service_record['load_balancer_port'] is not None:
             # load_balancer_port remains the registration sentinel exposed by

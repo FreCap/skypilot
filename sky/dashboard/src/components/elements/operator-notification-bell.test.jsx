@@ -48,6 +48,13 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function setDocumentVisibility(value) {
+  Object.defineProperty(window.document, 'visibilityState', {
+    configurable: true,
+    value,
+  });
+}
+
 const empty = {
   notifications: [],
   unread_count: 0,
@@ -160,6 +167,108 @@ describe('OperatorNotificationBell', () => {
     await screen.findByRole('button', {
       name: 'Operator notifications: 1 unread',
     });
+  });
+
+  it('pauses hidden polls, catches up once, and resumes visible cadence', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    const { unmount } = render(<OperatorNotificationBell role="admin" />);
+    let mounted = true;
+
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('hidden');
+      await act(async () => {
+        jest.advanceTimersByTime(OPERATOR_NOTIFICATION_POLL_MS * 3 - 1000);
+        await Promise.resolve();
+      });
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(1);
+
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1000);
+        await Promise.resolve();
+      });
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(OPERATOR_NOTIFICATION_POLL_MS);
+        await Promise.resolve();
+      });
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(3);
+
+      unmount();
+      mounted = false;
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => {
+        jest.advanceTimersByTime(OPERATOR_NOTIFICATION_POLL_MS);
+        await Promise.resolve();
+      });
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(3);
+    } finally {
+      if (mounted) unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('removes recurring refresh ownership after leaving the admin role', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    const { rerender, unmount } = render(
+      <OperatorNotificationBell role="admin" />
+    );
+
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(1);
+
+      rerender(<OperatorNotificationBell role="user" />);
+      window.document.dispatchEvent(new Event('visibilitychange'));
+      await act(async () => {
+        jest.advanceTimersByTime(OPERATOR_NOTIFICATION_POLL_MS * 2);
+        await Promise.resolve();
+      });
+      expect(getOperatorNotifications).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
   });
 
   it('fences a poll from an earlier admin role lifecycle', async () => {

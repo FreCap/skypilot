@@ -41,13 +41,13 @@ from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.backends import skylet_rpc
 from sky.backends import ssh_tunnel
+from sky.backends import ssm_proxy
 from sky.jobs import utils as managed_job_utils
 from sky.provision import common as provision_common
 from sky.provision import instance_setup
 from sky.provision.kubernetes import instance as k8s_instance
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.serve import serve_utils
-from sky.server.requests import requests as requests_lib
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.usage import usage_lib
@@ -142,115 +142,24 @@ _TRANSIENT_SSH_FAILURE_PATTERN = re.compile(
     r'Connection reset by peer|Connection closed by remote host|Broken pipe|'
     r'ThrottlingException|RequestLimitExceeded)', re.IGNORECASE)
 
-# Adaptive-retry settings for the SSM ProxyCommand: make the AWS CLI wait
-# out StartSession throttling (low account-wide TPS quota) with client-side
-# rate limiting instead of failing the SSH connection.
-_SSM_ADAPTIVE_RETRY_ENV = 'AWS_RETRY_MODE=adaptive AWS_MAX_ATTEMPTS=12'
+# pylint: disable=protected-access
+_SSM_ADAPTIVE_RETRY_ENV = ssm_proxy._SSM_ADAPTIVE_RETRY_ENV
 _SSM_ADAPTIVE_RETRY_WRAPPER_PREFIX = (
-    f'env {_SSM_ADAPTIVE_RETRY_ENV} /bin/sh -c ')
-_SSM_TARGET_VARIABLE = 'skypilot_ssm_target'
-_SSM_TARGET_NOT_FOUND_MESSAGE = (
-    'SkyPilot SSM target instance not found for SSH host %h')
-_SSM_LEGACY_TARGET_NOT_FOUND_PRINTF = "printf '%s\\n'"
-# ProxyCommand percent tokens are expanded by OpenSSH before the shell runs.
-# Escape printf's literal percent so OpenSSH passes ``%s`` to /bin/sh.
-_SSM_TARGET_NOT_FOUND_PRINTF = "printf '%%s\\n'"
-_SSM_START_SESSION_WITH_LOOKUP_PATTERN = re.compile(
-    r'^aws ssm start-session --target "\$\((?P<lookup>.*)\)" '
-    r'(?P<arguments>.*)$', re.DOTALL)
-# The broken prefix form shipped briefly: OpenSSH executes ProxyCommand as
-# `$SHELL -c "exec <command>"`, so a multi-command string starting with
-# `export ...;` makes the shell try to exec the `export` builtin and fail
-# hard (`/bin/sh: 1: exec: export: not found`) — EVERY proxied SSH dies,
-# and the serve controller then classifies healthy just-launched replicas
-# as preempted (job-status walk + forced refresh both SSH). Kept only to
-# recognize and repair commands persisted in that form.
-_SSM_LEGACY_BROKEN_EXPORT_PREFIX = ('export AWS_RETRY_MODE=adaptive '
-                                    'AWS_MAX_ATTEMPTS=12;')
-
-
-def _guard_ssm_proxy_command_target(ssm_proxy_command: str) -> str:
-    """Avoid invoking SSM StartSession with an empty EC2 lookup result.
-
-    A stale cluster record can outlive its EC2 instance.  The generated
-    ProxyCommand resolves the instance ID from ``%h`` at connection time; if
-    that lookup returns no rows, passing an empty ``--target`` to the AWS CLI
-    emits a misleading parameter-validation error.  Preserve a failed lookup's
-    exit status, and classify a successful empty lookup explicitly before
-    StartSession is invoked.
-    """
-    if f'{_SSM_TARGET_VARIABLE}=' in ssm_proxy_command:
-        # Repair guarded commands persisted by releases that emitted an
-        # unescaped printf format.  OpenSSH rejects ``%s`` as an unknown
-        # ProxyCommand token before executing the otherwise healthy command.
-        return ssm_proxy_command.replace(_SSM_LEGACY_TARGET_NOT_FOUND_PRINTF,
-                                         _SSM_TARGET_NOT_FOUND_PRINTF)
-    match = _SSM_START_SESSION_WITH_LOOKUP_PATTERN.fullmatch(ssm_proxy_command)
-    if match is None:
-        return ssm_proxy_command
-    lookup = match.group('lookup')
-    arguments = match.group('arguments')
-    message = shlex.quote(_SSM_TARGET_NOT_FOUND_MESSAGE)
-    return (f'{_SSM_TARGET_VARIABLE}="$({lookup})"; '
-            f'skypilot_ssm_lookup_status=$?; '
-            'if [ "$skypilot_ssm_lookup_status" -ne 0 ]; then '
-            'exit "$skypilot_ssm_lookup_status"; fi; '
-            f'if [ -z "${_SSM_TARGET_VARIABLE}" ]; then '
-            f'{_SSM_TARGET_NOT_FOUND_PRINTF} {message} >&2; '
-            'exit 255; fi; '
-            'exec aws ssm start-session '
-            f'--target "${_SSM_TARGET_VARIABLE}" {arguments}')
-
-
-def _wrap_ssm_proxy_command_with_adaptive_retry(ssm_proxy_command: str) -> str:
-    """exec-safe adaptive-retry wrapper for an SSM ProxyCommand.
-
-    `env VAR=... /bin/sh -c '<cmd>'` stays a single exec-able command under
-    OpenSSH's `exec` wrapping, and the variables still reach the
-    describe-instances $() command substitution because the inner shell
-    inherits them (verified live; an `export ...;` prefix instead kills the
-    connection before any handshake).
-    """
-    return (_SSM_ADAPTIVE_RETRY_WRAPPER_PREFIX + shlex.quote(ssm_proxy_command))
-
-
-def _upgrade_legacy_ssm_proxy_command(
-        ssh_proxy_command: str | None) -> str | None:
-    """Normalize persisted SSM proxy commands to the adaptive-retry form.
-
-    Clusters keep their originally-written auth section forever: on
-    re-provision it is restored verbatim from the old YAML (see
-    _RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY). Applied in every
-    credential read path so (1) pre-retry-prefix clusters also wait out
-    StartSession throttling and (2) commands persisted with the broken
-    `export ...;` prefix are repaired instead of failing every SSH, and
-    (3) both forms reject an empty instance lookup before StartSession.
-    """
-    if ssh_proxy_command is None:
-        return None
-    if ssh_proxy_command.startswith(_SSM_LEGACY_BROKEN_EXPORT_PREFIX):
-        stripped = ssh_proxy_command[len(_SSM_LEGACY_BROKEN_EXPORT_PREFIX
-                                        ):].lstrip()
-        guarded = _guard_ssm_proxy_command_target(stripped)
-        return _wrap_ssm_proxy_command_with_adaptive_retry(guarded)
-    if (ssh_proxy_command.startswith('aws ssm start-session') and
-            'AWS_RETRY_MODE' not in ssh_proxy_command):
-        guarded = _guard_ssm_proxy_command_target(ssh_proxy_command)
-        return _wrap_ssm_proxy_command_with_adaptive_retry(guarded)
-    if ssh_proxy_command.startswith(_SSM_ADAPTIVE_RETRY_WRAPPER_PREFIX):
-        quoted_inner = ssh_proxy_command[len(_SSM_ADAPTIVE_RETRY_WRAPPER_PREFIX
-                                            ):]
-        try:
-            parsed_inner = shlex.split(quoted_inner)
-        except ValueError:
-            return ssh_proxy_command
-        if len(parsed_inner) != 1:
-            return ssh_proxy_command
-        guarded = _guard_ssm_proxy_command_target(parsed_inner[0])
-        if guarded != parsed_inner[0]:
-            return _wrap_ssm_proxy_command_with_adaptive_retry(guarded)
-    return ssh_proxy_command
-
+    ssm_proxy._SSM_ADAPTIVE_RETRY_WRAPPER_PREFIX)
+_SSM_TARGET_VARIABLE = ssm_proxy._SSM_TARGET_VARIABLE
+_SSM_TARGET_NOT_FOUND_MESSAGE = ssm_proxy._SSM_TARGET_NOT_FOUND_MESSAGE
+_SSM_LEGACY_TARGET_NOT_FOUND_PRINTF = (
+    ssm_proxy._SSM_LEGACY_TARGET_NOT_FOUND_PRINTF)
+_SSM_TARGET_NOT_FOUND_PRINTF = ssm_proxy._SSM_TARGET_NOT_FOUND_PRINTF
+_SSM_START_SESSION_WITH_LOOKUP_PATTERN = (
+    ssm_proxy._SSM_START_SESSION_WITH_LOOKUP_PATTERN)
+_SSM_LEGACY_BROKEN_EXPORT_PREFIX = (ssm_proxy._SSM_LEGACY_BROKEN_EXPORT_PREFIX)
+_guard_ssm_proxy_command_target = ssm_proxy._guard_ssm_proxy_command_target
+_wrap_ssm_proxy_command_with_adaptive_retry = (
+    ssm_proxy._wrap_ssm_proxy_command_with_adaptive_retry)
+_upgrade_legacy_ssm_proxy_command = (
+    ssm_proxy._upgrade_legacy_ssm_proxy_command)
+# pylint: enable=protected-access
 
 K8S_PODS_NOT_FOUND_PATTERN = re.compile(r'.*(NotFound|pods .* not found).*',
                                         re.IGNORECASE)
@@ -2120,7 +2029,7 @@ def wait_until_ray_cluster_ready(
             if remaining_progress_wait is not None:
                 poll_interval = min(poll_interval,
                                     max(0, remaining_progress_wait))
-            time.sleep(poll_interval)
+            context_utils.sleep_with_cancellation(poll_interval)
     return True, docker_user  # success
 
 
@@ -2364,7 +2273,7 @@ def _query_head_ip_with_retries(cluster_yaml: str,
                     reason=exceptions.FetchClusterInfoError.Reason.HEAD) from e
             # Retry if the cluster is not up yet.
             logger.debug('Retrying to get head ip.')
-            time.sleep(backoff.current_backoff())
+            context_utils.sleep_with_cancellation(backoff.current_backoff())
     raise exceptions.FetchClusterInfoError(
         reason=exceptions.FetchClusterInfoError.Reason.HEAD)
 
@@ -2451,7 +2360,7 @@ def get_node_ips(cluster_yaml: str,
                 logger.debug('Retrying to get worker ip '
                              f'[{retry_cnt}/{worker_ip_max_attempts}] in '
                              f'{backoff_time} seconds.')
-                time.sleep(backoff_time)
+                context_utils.sleep_with_cancellation(backoff_time)
         else:
             raise exceptions.FetchClusterInfoError(
                 exceptions.FetchClusterInfoError.Reason.WORKER)
@@ -3142,7 +3051,7 @@ def _update_cluster_status(
                             raise e
                     # We retry for kubernetes because coreweave can have a
                     # transient network issue.
-                    time.sleep(1)
+                    context_utils.sleep_with_cancellation(1)
                     continue
                 if ready_head + ready_workers == total_nodes:
                     return True
@@ -3159,7 +3068,7 @@ def _update_cluster_status(
                 #   (not preempted), but
                 # - The ray cluster is somehow degraded so not all instances are
                 #   showing up
-                time.sleep(1)
+                context_utils.sleep_with_cancellation(1)
 
             ray_status_details = (
                 f'{ready_head + ready_workers}/{total_nodes} ready')
@@ -3306,7 +3215,7 @@ def _update_cluster_status(
             # and haven't appeared yet in the cloud API/console. Wait for a bit
             # and check again. This is a best-effort leak prevention check.
             # See https://github.com/skypilot-org/skypilot/issues/4431.
-            time.sleep(_LAUNCH_DOUBLE_CHECK_DELAY)
+            context_utils.sleep_with_cancellation(_LAUNCH_DOUBLE_CHECK_DELAY)
             node_statuses = _query_cluster_status_via_cloud_api(
                 handle, retry_if_missing=False, get_ray_config=_get_ray_config)
             # Note: even if all the node_statuses are UP now, we will still
@@ -3903,6 +3812,13 @@ def refresh_cluster_record(
         summary_response=summary_response)
     if record is None:
         return None
+    handle = record['handle']
+    if handle is None or handle.launched_resources is None:
+        # An in-progress launch may persist its handle before runtime metadata
+        # is complete. There is no provider identity or resource description
+        # to refresh yet, so keep the cached INIT record. This also preserves
+        # opportunistic refresh latency without consulting request state.
+        return record
     # TODO(zhwu, 05/20): switch to the specific workspace to make sure we are
     # using the correct cloud credentials.
     workspace = record.get('workspace', constants.SKYPILOT_DEFAULT_WORKSPACE)
@@ -3968,7 +3884,7 @@ def refresh_cluster_record(
                         f'{cluster_name!r}. Using the cached status.')
                     return record
                 sleep_seconds = min(sleep_seconds, remaining_wait)
-            time.sleep(sleep_seconds)
+            context_utils.sleep_with_cancellation(sleep_seconds)
 
             # Refresh for next loop iteration.
             record = _reload_record_if_refresh_fields_changed(
@@ -4418,16 +4334,19 @@ def _summarize_pod_reasons(
     return '; '.join(parts)
 
 
-def _refresh_cluster(cluster_name: str,
-                     force_refresh_statuses: set[status_lib.ClusterStatus] |
-                     None,
-                     include_user_info: bool = True,
-                     summary_response: bool = False) -> dict[str, Any] | None:
+def _refresh_cluster(
+    cluster_name: str,
+    force_refresh_statuses: set[status_lib.ClusterStatus] | None,
+    include_user_info: bool = True,
+    summary_response: bool = False,
+    cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS
+) -> dict[str, Any] | None:
     try:
         record = refresh_cluster_record(
             cluster_name,
             force_refresh_statuses=force_refresh_statuses,
             cluster_lock_already_held=False,
+            cluster_status_lock_timeout=cluster_status_lock_timeout,
             include_user_info=include_user_info,
             summary_response=summary_response)
     except (exceptions.ClusterStatusFetchingError,
@@ -4522,7 +4441,7 @@ def _sort_clusters_for_refresh(
 
 
 def refresh_cluster_records() -> None:
-    """Refreshes the status of all clusters, except managed clusters.
+    """Refreshes user clusters and ownerless managed service clusters.
 
     Used by the background status refresh daemon.
     This function is a stripped-down version of get_clusters, with only the
@@ -4536,7 +4455,9 @@ def refresh_cluster_records() -> None:
     """
     # We force to exclude managed clusters to avoid multiple sources
     # manipulating them. For example, SkyServe assumes the replica manager
-    # is the only source of truth for the cluster status.
+    # is the only source of truth for the cluster status. Consolidated
+    # SkyServe separately nominates exact cluster rows for which no replica
+    # owner remains; those rows no longer have a competing lifecycle writer.
     try:
         status_fields = global_user_state.get_cluster_status_fields(
             None, exclude_managed_clusters=True)
@@ -4551,35 +4472,37 @@ def refresh_cluster_records() -> None:
             global_user_state.get_cluster_names(exclude_managed_clusters=True))
         status_fields = {}
 
-    # TODO(syang): we should try not to leak
-    # request info in backend_utils.py.
-    # Refactor this to use some other info to
-    # determine if a launch is in progress.
-    cluster_names_with_launch_request = {
-        request.cluster_name for request in requests_lib.get_request_tasks(
-            req_filter=requests_lib.RequestTaskFilter(
-                status=[requests_lib.RequestStatus.RUNNING],
-                include_request_names=['sky.launch'],
-                fields=['cluster_name']))
-    }
-    cluster_names_without_launch_request = [
-        cluster_name for cluster_name in cluster_names
-        if cluster_name not in cluster_names_with_launch_request
-    ]
+    try:
+        orphaned_service_status_fields = (
+            serve_utils.get_orphaned_service_cluster_status_fields())
+    except Exception as e:  # pylint: disable=broad-except
+        # Owner discovery is an additive repair path. Never let a Serve-state
+        # read failure stop the ordinary user-cluster refresh sweep.
+        logger.debug('Failed to discover ownerless managed service clusters; '
+                     'continuing with ordinary cluster refresh: '
+                     f'{common_utils.format_exception(e, use_bracket=True)}')
+        orphaned_service_status_fields = {}
+    if orphaned_service_status_fields:
+        logger.info('Reconciling provider status for '
+                    f'{len(orphaned_service_status_fields)} managed service '
+                    'cluster(s) without an exact replica owner.')
+        for cluster_name, fields in orphaned_service_status_fields.items():
+            if cluster_name not in status_fields:
+                cluster_names.append(cluster_name)
+                status_fields[cluster_name] = fields
 
     def _refresh_cluster_record(cluster_name):
         return _refresh_cluster(cluster_name,
                                 force_refresh_statuses=set(
                                     status_lib.ClusterStatus),
+                                cluster_status_lock_timeout=0,
                                 include_user_info=False,
                                 summary_response=True)
 
-    if cluster_names_without_launch_request:
-        # Do not refresh the clusters that have an active launch request.
+    if cluster_names:
         subprocess_utils.run_in_parallel(
             _refresh_cluster_record,
-            _sort_clusters_for_refresh(cluster_names_without_launch_request,
-                                       status_fields),
+            _sort_clusters_for_refresh(cluster_names, status_fields),
             num_threads=_get_cluster_refresh_parallelism())
 
 
@@ -4609,6 +4532,7 @@ def _update_records_with_handle_info(records_with_handle: list[dict[str, Any]],
 def get_clusters(
     refresh: common.StatusRefreshMode,
     cluster_names: str | list[str] | None = None,
+    workspaces_filter: list[str] | set[str] | None = None,
     all_users: bool = True,
     include_credentials: bool = False,
     summary_response: bool = False,
@@ -4629,6 +4553,9 @@ def get_clusters(
             set the status to STOPPED if the cluster cannot be pinged.)
         cluster_names: If provided, only return records for the given cluster
             names.
+        workspaces_filter: If provided, further restrict records to these
+            workspaces. This can only narrow the caller's accessible-workspace
+            view, never widen it.
         all_users: If True, return clusters from all users. If False, only
             return clusters from the current user.
         include_credentials: If True, include cluster ssh credentials in the
@@ -4641,6 +4568,10 @@ def get_clusters(
         terminated, the record will be omitted from the returned list.
     """
     accessible_workspaces = workspaces_core.get_accessible_workspace_names()
+    effective_workspaces_filter = accessible_workspaces
+    if workspaces_filter is not None:
+        effective_workspaces_filter = accessible_workspaces.intersection(
+            workspaces_filter)
 
     # Defense-in-depth: even if some caller bypasses the HTTP layer's
     # role_filter shim and reaches here with include_credentials=True
@@ -4668,7 +4599,8 @@ def get_clusters(
         cluster_names = non_glob_cluster_names
         if glob_cluster_names:
             cluster_names += _get_glob_clusters(
-                glob_cluster_names, workspaces_filter=accessible_workspaces)
+                glob_cluster_names,
+                workspaces_filter=effective_workspaces_filter)
 
     exclude_managed_clusters = False
     if not (_include_is_managed or env_options.Options.SHOW_DEBUG_INFO.get()):
@@ -4679,7 +4611,7 @@ def get_clusters(
     records = global_user_state.get_clusters(
         exclude_managed_clusters=exclude_managed_clusters,
         user_hashes_filter=user_hashes_filter,
-        workspaces_filter=accessible_workspaces,
+        workspaces_filter=effective_workspaces_filter,
         cluster_names=cluster_names,
         summary_response=summary_response)
 
@@ -4790,6 +4722,7 @@ def get_clusters(
     def _refresh_cluster_record(cluster_name):
         record = _refresh_cluster(cluster_name,
                                   force_refresh_statuses=force_refresh_statuses,
+                                  cluster_status_lock_timeout=0,
                                   include_user_info=True,
                                   summary_response=summary_response)
         # record may be None if the cluster is deleted during refresh,
@@ -4800,48 +4733,16 @@ def get_clusters(
         return record
 
     cluster_names = [record['name'] for record in records]
-    # TODO(syang): we should try not to leak
-    # request info in backend_utils.py.
-    # Refactor this to use some other info to
-    # determine if a launch is in progress.
-    cluster_names_with_launch_request = {
-        request.cluster_name for request in requests_lib.get_request_tasks(
-            req_filter=requests_lib.RequestTaskFilter(
-                status=[requests_lib.RequestStatus.RUNNING],
-                include_request_names=['sky.launch'],
-                cluster_names=cluster_names,
-                fields=['cluster_name']))
-    }
-    # Preserve the index of the cluster name as it appears on "records"
-    cluster_names_without_launch_request = [
-        (i, cluster_name)
-        for i, cluster_name in enumerate(cluster_names)
-        if cluster_name not in cluster_names_with_launch_request
-    ]
-    # for clusters that have an active launch request, we do not refresh the status
     updated_records = []
-    if len(cluster_names_without_launch_request) > 0:
+    if cluster_names:
         with progress:
             updated_records = subprocess_utils.run_in_parallel(
-                _refresh_cluster_record, [
-                    cluster_name
-                    for _, cluster_name in cluster_names_without_launch_request
-                ])
-    # Preserve the index of the cluster name as it appears on "records"
-    # before filtering for clusters being launched.
-    updated_records_dict: dict[int, dict[str, Any] | None] = {
-        cluster_names_without_launch_request[i][0]: updated_records[i]
-        for i in range(len(cluster_names_without_launch_request))
-    }
+                _refresh_cluster_record, cluster_names)
     # Show information for removed clusters.
     kept_records = []
     autodown_clusters, remaining_clusters, failed_clusters = [], [], []
     for i, record in enumerate(records):
-        if i not in updated_records_dict:
-            # record was not refreshed, keep the original record
-            kept_records.append(record)
-            continue
-        updated_record = updated_records_dict[i]
+        updated_record = updated_records[i]
         if updated_record is None:
             if record['to_down']:
                 autodown_clusters.append(record['name'])

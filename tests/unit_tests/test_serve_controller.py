@@ -18,23 +18,75 @@ from unittest import mock
 import pytest
 
 from sky.serve import autoscalers
+from sky.serve import constants
 from sky.serve import controller
 from sky.serve import drain_observability
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import system_recovery_route_lease
+from sky.serve import system_recovery_state
 from sky.utils import yaml_utils
 
 
 @pytest.fixture(autouse=True)
 def _restore_consolidation_override():
-    """Keep the in-process controller marker scoped to each test."""
+    """Keep in-process controller markers scoped to each test."""
     marker = controller.constants.OVERRIDE_CONSOLIDATION_MODE
     original = os.environ.pop(marker, None)
+    original_metrics_role = (
+        controller.db_utils._postgres_connection_metrics_process_role_override)
+    controller.db_utils._postgres_connection_metrics_process_role_override = None
     yield
     os.environ.pop(marker, None)
     if original is not None:
         os.environ[marker] = original
+    controller.db_utils._postgres_connection_metrics_process_role_override = (
+        original_metrics_role)
+
+
+def test_lifespan_validates_resource_action_auth_isolation(monkeypatch):
+    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
+    monkeypatch.setenv(
+        controller.serve_constants.
+        RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR, '/purpose/tokens')
+    monkeypatch.setenv(
+        controller.serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
+        'true')
+    validate = mock.Mock()
+    monkeypatch.setattr(
+        controller.auth_tokens,
+        'validate_resource_action_preflight_auth_token_isolation', validate)
+
+    async def _run_lifespan():
+        async with ctrl.lifespan(None):
+            pass
+
+    asyncio.run(_run_lifespan())
+    validate.assert_called_once_with(required=True)
+
+
+def test_lifespan_ignores_custom_preflight_env_while_authority_disabled(
+        monkeypatch):
+    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
+    monkeypatch.delenv(
+        controller.serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
+        raising=False)
+    monkeypatch.setenv(
+        controller.serve_constants.
+        RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR,
+        '/compatibility/tokens')
+    validate = mock.Mock()
+    monkeypatch.setattr(
+        controller.auth_tokens,
+        'validate_resource_action_preflight_auth_token_isolation', validate)
+
+    async def _run_lifespan():
+        async with ctrl.lifespan(None):
+            pass
+
+    asyncio.run(_run_lifespan())
+    validate.assert_not_called()
 
 
 def test_update_ignores_stale_submitted_yaml_without_request_declaration():
@@ -70,6 +122,26 @@ def test_missing_declared_submitted_yaml_does_not_block_update(caplog):
 
     assert submitted is None
     assert 'is unavailable' in caplog.text
+
+
+def test_run_controller_sets_connection_metric_role_before_initialization(
+        monkeypatch):
+    initialization_order = []
+    monkeypatch.setattr(
+        controller.db_utils, 'set_postgres_connection_metrics_process_role',
+        lambda role: initialization_order.append(('metrics-role', role)))
+    monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
+                        lambda: initialization_order.append(('context', None)))
+    controller_instance = mock.Mock()
+    monkeypatch.setattr(controller, 'SkyServeController',
+                        mock.Mock(return_value=controller_instance))
+
+    controller.run_controller('pool', mock.Mock(), 1, '127.0.0.1', 20001,
+                              'fingerprint')
+
+    assert initialization_order[:2] == [('metrics-role', 'serve-controller'),
+                                        ('context', None)]
+    controller_instance.run.assert_called_once_with()
 
 
 def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
@@ -130,6 +202,28 @@ def test_run_controller_uses_parent_owner_for_child_cutover_fence(monkeypatch):
     assert observed['fence'] == ('incarnation-a', (parent_pid, '10.0.0.1'), 7)
 
 
+def test_recovery_lease_child_dependencies_require_sync_and_owner_tokens(
+        monkeypatch):
+    monkeypatch.setattr(controller.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: ('sync-token',)
+                        if required else ())
+    sync_dependency = controller._make_auth_dependency(  # pylint: disable=protected-access
+        sync=True, required=True)
+    owner_dependency = controller._make_controller_owner_dependency(  # pylint: disable=protected-access
+        'owner-fingerprint')
+
+    with pytest.raises(controller.fastapi.HTTPException) as missing_sync:
+        asyncio.run(sync_dependency(None))
+    assert missing_sync.value.status_code == 401
+    asyncio.run(sync_dependency('Bearer sync-token'))
+
+    with pytest.raises(controller.fastapi.HTTPException) as wrong_owner:
+        asyncio.run(owner_dependency('wrong-owner'))
+    assert wrong_owner.value.status_code == 409
+    asyncio.run(owner_dependency('owner-fingerprint'))
+
+
 class _FakeHandle:
     """Stub for the resource handle returned by ReplicaInfo.handle()."""
 
@@ -151,6 +245,7 @@ class _FakeReplicaInfo:
                  accelerators: Optional[Dict[str, int]] = None,
                  handle_is_none: bool = False) -> None:
         self.replica_id = replica_id
+        self.replica_record_id = (f'00000000-0000-0000-0000-{replica_id:012d}')
         self.cluster_name = f'replica-{replica_id}'
         self.status = status
         self.version = version
@@ -162,6 +257,8 @@ class _FakeReplicaInfo:
         self.last_provider_config = None
         self.planned_capacity = 1
         self.logical_bridge_capacity_verified = False
+        self.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.ORDINARY)
 
     @property
     def url(self) -> Optional[str]:
@@ -199,7 +296,13 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
     ctrl._resource_scope = None  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
+    ctrl._lb_replica_cache_record_ids = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
+    ctrl._lb_translation_cache_record_ids = {}  # pylint: disable=protected-access
+    ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+        system_recovery_allows_routing=lambda _info: True,
+        system_recovery_route_marker=lambda _info, _url: None,
+        retire_system_recovery_route=lambda _info: None)
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
     ctrl._lb_role_lock = None  # pylint: disable=protected-access
     ctrl._lb_demand_lock = None  # pylint: disable=protected-access
@@ -1474,6 +1577,220 @@ class TestGetLbReplicaInfo:
             },
         }
 
+    def test_capable_route_requires_and_emits_exact_marker(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080/',
+                                accelerators={'L4': 1})
+        info.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=lambda _info, url:
+            (system_recovery_route_lease.RouteMarker('1', 'a' * 32)
+             if url == 'http://1.1.1.1:8080' else None),
+            retire_system_recovery_route=lambda _info: None)
+
+        result = _sync(ctrl, [info])
+        assert result == {
+            'http://1.1.1.1:8080': {
+                'gpu_type': 'L4',
+                'gpu_count': '1',
+                constants.SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_LEASE_MARKER_VERSION,
+                constants.SYSTEM_RECOVERY_ROUTE_REPLICA_ID_KEY: '1',
+                constants.SYSTEM_RECOVERY_ROUTE_TOKEN_KEY: 'a' * 32,
+            }
+        }
+
+        ctrl._replica_manager.system_recovery_route_marker = (
+            lambda _info, _url: None)
+        replica_info, num_ready = _sync_full(ctrl, [info])
+        assert replica_info == {
+            'http://1.1.1.1:8080': {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+        assert num_ready == 1
+
+    @pytest.mark.parametrize('unusable_url', [None, 'not-a-route-url'])
+    def test_capable_unusable_url_retires_prior_generation(self, unusable_url):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'L4': 1})
+        info.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+        retire = mock.Mock()
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=lambda _info, _url:
+            (system_recovery_route_lease.RouteMarker('1', 'a' * 32)),
+            retire_system_recovery_route=retire)
+
+        assert list(_sync(ctrl, [info])) == ['http://1.1.1.1:8080']
+        retire.assert_not_called()
+
+        # Force endpoint re-resolution as happens after the READY cache is
+        # invalidated.  A malformed/missing replacement must stop heartbeat
+        # renewal for the retained URL A even though this heavyweight snapshot
+        # is intentionally treated as transiently empty by the LB.
+        ctrl._lb_replica_cache.clear()  # pylint: disable=protected-access
+        ctrl._lb_replica_cache_record_ids.clear()  # pylint: disable=protected-access
+        info._url = unusable_url
+        replica_info, num_ready = _sync_full(ctrl, [info])
+
+        assert replica_info == {}
+        assert num_ready == 1
+        retire.assert_called_once_with(info)
+
+    def test_invalid_ordinary_url_is_withheld(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://user:password@example.com:80',
+                                accelerators={'L4': 1})
+
+        replica_info, num_ready = _sync_full(ctrl, [info])
+
+        assert replica_info == {}
+        assert num_ready == 1
+
+    @pytest.mark.parametrize('capable_url,ordinary_url,canonical_url', [
+        ('HTTP://Example.COM:80/', 'http://example.com', 'http://example.com'),
+        ('https://Example.COM:443', 'https://example.com/',
+         'https://example.com'),
+        ('http://[2001:0db8:0:0::1]:80', 'http://[2001:db8::1]/',
+         'http://[2001:db8::1]'),
+    ])
+    def test_transport_alias_capable_ordinary_collision_is_fenced(
+            self, capable_url, ordinary_url, canonical_url):
+        ctrl = _make_controller()
+        capable = _FakeReplicaInfo(1,
+                                   serve_state.ReplicaStatus.READY,
+                                   url=capable_url,
+                                   accelerators={'L4': 1})
+        capable.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+        ordinary = _FakeReplicaInfo(2,
+                                    serve_state.ReplicaStatus.READY,
+                                    url=ordinary_url,
+                                    accelerators={'L4': 1})
+        retire = mock.Mock()
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=lambda info, _url:
+            (system_recovery_route_lease.RouteMarker(str(
+                info.replica_id), f'{info.replica_id:032x}')),
+            retire_system_recovery_route=retire)
+
+        assert _sync(ctrl, [capable, ordinary]) == {
+            canonical_url: {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+        retire.assert_called_once_with(capable)
+
+    @pytest.mark.parametrize('capable_first', [False, True])
+    def test_normalized_capable_ordinary_collision_is_fenced(
+            self, capable_first):
+        ctrl = _make_controller()
+        capable = _FakeReplicaInfo(1,
+                                   serve_state.ReplicaStatus.READY,
+                                   url='http://1.1.1.1:8080/',
+                                   accelerators={'L4': 1})
+        capable.system_recovery_disposition = (
+            system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+        ordinary = _FakeReplicaInfo(2,
+                                    serve_state.ReplicaStatus.READY,
+                                    url='http://1.1.1.1:8080',
+                                    accelerators={'L4': 1})
+        retired = set()
+
+        def _marker(info, _url):
+            if info.replica_id in retired:
+                return None
+            return system_recovery_route_lease.RouteMarker(
+                str(info.replica_id), f'{info.replica_id:032x}')
+
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=_marker,
+            retire_system_recovery_route=(
+                lambda info: retired.add(info.replica_id)))
+        infos = ([capable, ordinary] if capable_first else [ordinary, capable])
+
+        replica_info, num_ready = _sync_full(ctrl, infos)
+        assert replica_info == {
+            'http://1.1.1.1:8080': {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+        assert num_ready == 2
+        assert retired == {1}
+
+        # Removing the duplicate cannot rehabilitate the same capable
+        # generation: collision retirement leaves an explicit fence.
+        assert _sync(ctrl, [capable]) == {
+            'http://1.1.1.1:8080': {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+
+    def test_two_capable_rows_with_distinct_tokens_are_fenced(self):
+        ctrl = _make_controller()
+        infos = []
+        retired = set()
+        for replica_id in (1, 2):
+            info = _FakeReplicaInfo(replica_id,
+                                    serve_state.ReplicaStatus.READY,
+                                    url='http://1.1.1.1:8080',
+                                    accelerators={'L4': 1})
+            info.system_recovery_disposition = (
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+            infos.append(info)
+        ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+            system_recovery_allows_routing=lambda _info: True,
+            system_recovery_route_marker=lambda info, _url:
+            (system_recovery_route_lease.RouteMarker(str(
+                info.replica_id), f'{info.replica_id:032x}')),
+            retire_system_recovery_route=(
+                lambda info: retired.add(info.replica_id)))
+
+        assert _sync(ctrl, infos) == {
+            'http://1.1.1.1:8080': {
+                constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+                    constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+            }
+        }
+        assert retired == {1, 2}
+
+    def test_cache_rejects_recreated_same_numeric_replica_row(self):
+        ctrl = _make_controller()
+        old = _FakeReplicaInfo(1,
+                               serve_state.ReplicaStatus.READY,
+                               url='http://1.1.1.1:8080',
+                               accelerators={'L4': 1})
+        assert list(_sync(ctrl, [old])) == ['http://1.1.1.1:8080']
+
+        replacement = _FakeReplicaInfo(1,
+                                       serve_state.ReplicaStatus.READY,
+                                       url='http://2.2.2.2:8080',
+                                       accelerators={'A100': 8})
+        replacement.replica_record_id = ('00000000-0000-0000-0000-000000000099')
+        assert _sync(ctrl, [replacement]) == {
+            'http://2.2.2.2:8080': {
+                'gpu_type': 'A100',
+                'gpu_count': '8'
+            }
+        }
+
     def test_async_occupancy_declaration_is_per_replica_version(self):
         ctrl = _make_controller()
         old = _FakeReplicaInfo(1,
@@ -1832,13 +2149,41 @@ class TestAutoscalerRuntimeSnapshot:
     def test_run_autoscaler_uses_runtime_snapshot_for_active_versions(self):
         ctrl = _make_controller()
         ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = False
         ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
+        ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
         ctrl._autoscaler.get_decision_interval.return_value = 0
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
 
+        call_order = []
+
+        def _clear_reconciliation_signal():
+            call_order.append('clear')
+
+        def _get_replica_infos(_service_name):
+            call_order.append('replica-read')
+            return []
+
+        def _get_runtime_snapshot(_service_name, *, require_version):
+            assert require_version
+            call_order.append('runtime-read')
+            return {'active_versions': [2]}
+
+        def _wait_for_reconciliation(interval):
+            call_order.append('wait')
+            assert interval == 0
+            raise StopIteration
+
+        ctrl._replica_manager.clear_scale_reconciliation_signal.side_effect = (  # pylint: disable=line-too-long
+            _clear_reconciliation_signal)
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            _wait_for_reconciliation)
+
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
-                               return_value=[]), \
+                               side_effect=_get_replica_infos), \
              mock.patch.object(
                  controller.serve_state,
                  'get_service_from_name',
@@ -1847,17 +2192,161 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [2]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
-            try:
+                 side_effect=_get_runtime_snapshot):
+            with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
-            except StopIteration:
-                pass
 
         ctrl._autoscaler.generate_scaling_decisions.assert_called_once_with([],
                                                                             [2])
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            0, expected_version=2)
+        assert call_order == ['clear', 'replica-read', 'runtime-read', 'wait']
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
+
+    def test_run_autoscaler_withholds_rebuilt_blind_target(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = False
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = False
+        ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
+        ctrl._autoscaler.get_decision_interval.return_value = 0
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            None, expected_version=2)
+        ctrl._autoscaler.get_final_target_num_replicas.assert_not_called()
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
+
+    def test_run_autoscaler_publishes_fill_capacity_target(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = True
+        ctrl._autoscaler._fill_target = 3  # pylint: disable=protected-access
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
+        ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
+        ctrl._autoscaler.get_decision_interval.return_value = 0
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            3, expected_version=2)
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
+
+    def test_run_autoscaler_ignores_disabled_stale_fill_target(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = False
+        ctrl._autoscaler._fill_target = 3  # pylint: disable=protected-access
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
+        ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
+        ctrl._autoscaler.get_decision_interval.return_value = 0
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            0, expected_version=2)
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
+
+    def test_feedback_during_tick_is_observed_by_interval_wait(self):
+        ctrl = _make_controller()
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.latest_version = 2
+        ctrl._autoscaler.reserved_capacity_fill = False
+        ctrl._autoscaler.generate_scaling_decisions.return_value = []
+        ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = False
+        ctrl._autoscaler.get_decision_interval.return_value = 60
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        reconciliation_signal = threading.Event()
+        call_order = []
+
+        def _clear_reconciliation_signal():
+            call_order.append('clear')
+            reconciliation_signal.clear()
+
+        def _record_feedback(_service_name):
+            call_order.append('feedback')
+            reconciliation_signal.set()
+            return []
+
+        def _wait_for_reconciliation(interval):
+            call_order.append('wait')
+            assert interval == 60
+            assert reconciliation_signal.wait(timeout=0)
+            raise StopIteration
+
+        ctrl._replica_manager.clear_scale_reconciliation_signal.side_effect = (  # pylint: disable=line-too-long
+            _clear_reconciliation_signal)
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            _wait_for_reconciliation)
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               side_effect=_record_feedback), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        assert call_order == ['clear', 'feedback', 'wait']
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            60)
 
     def test_incomplete_exact_logical_tick_revokes_prior_target(self):
         ctrl = _make_controller()
@@ -1873,6 +2362,8 @@ class TestAutoscalerRuntimeSnapshot:
         decision_autoscaler.get_decision_interval.return_value = 0
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -1880,15 +2371,16 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [1]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={'active_versions': [1]}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
         ctrl._replica_manager.invalidate_logical_target.assert_called_once_with(  # pylint: disable=line-too-long
         )
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
     def test_logical_scale_down_waves_are_batched_without_reordering(self):
         ctrl = _make_controller()
@@ -1918,6 +2410,8 @@ class TestAutoscalerRuntimeSnapshot:
         ]
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -1925,10 +2419,7 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  controller.serve_state,
                  'get_service_runtime_snapshot',
-                 return_value={'active_versions': [1]}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={'active_versions': [1]}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
@@ -1946,6 +2437,10 @@ class TestAutoscalerRuntimeSnapshot:
             mock.call.scale_down(99, wait_for_idle=False, expected_version=1),
             mock.call.scale_down_logically_batch([4], 4, 1, 8),
         ]
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
     def test_instance_aware_physical_batches_keep_per_card_priority(self):
         ctrl = _make_controller()
@@ -1982,6 +2477,8 @@ class TestAutoscalerRuntimeSnapshot:
         decision_autoscaler.get_decision_interval = mock.Mock(return_value=0)
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
 
         with mock.patch.object(controller.serve_state,
                                'get_replica_infos',
@@ -1993,10 +2490,7 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  ctrl,
                  '_get_free_reserved_slots_by_accelerator',
-                 return_value={}), \
-             mock.patch.object(controller.time,
-                               'sleep',
-                               side_effect=StopIteration):
+                 return_value={}):
             with pytest.raises(StopIteration):
                 ctrl._run_autoscaler()  # pylint: disable=protected-access
 
@@ -2006,6 +2500,10 @@ class TestAutoscalerRuntimeSnapshot:
         ]
         decision_autoscaler.current_launch_priorities_by_accelerator.assert_called_once_with(  # pylint: disable=line-too-long
             ['L4', 'A100'])
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_called_once_with(  # pylint: disable=line-too-long
+        )
+        ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
+            0)
 
 
 class TestTranslateInFlight:
@@ -2861,6 +3359,58 @@ class TestAuthoritativeLbReportIngestion:
         assert response.status_code == 200
         assert (json.loads(response.body)['request_history_accepted']
                 is history_accepted)
+
+    def test_v1_classification_failure_retains_both_history_snapshots(self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        ctrl._routing_spec = {'policy': 'round_robin'}  # pylint: disable=protected-access
+        report.update({
+            'request_history_session_id': 'a' * 32,
+            'request_history': {
+                'bucket_seconds': 60,
+                'buckets': [{
+                    'bucket_start': 120,
+                    'request_count': 3,
+                }],
+            },
+            'request_classification_history': {
+                'classification_version': 1,
+                'bucket_seconds': 60,
+                'buckets': [],
+            },
+        })
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 controller.lb_k8s,
+                 'get_lb_pod_authority',
+                 return_value=controller.lb_k8s.LbPodAuthority(
+                     {'lb-a'}, {'lb-a'})), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl, '_get_lb_replica_info', return_value=({}, 1)), \
+             mock.patch.object(
+                 ctrl, '_get_capacity_hint', return_value={}), \
+             mock.patch.object(
+                 ctrl, '_record_request_history', return_value=True), \
+             mock.patch.object(
+                 ctrl,
+                 '_record_request_classification_history',
+                 side_effect=RuntimeError('database unavailable')):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 200
+        body = json.loads(response.body)
+        assert body['request_classification_history_accepted'] is False
+        assert body['request_history_accepted'] is False
 
     def test_sync_with_mid_snapshot_update_withholds_mixed_routing_epoch(self):
         ctrl, info, report = self._controller_and_report()
@@ -3882,6 +4432,7 @@ class TestLbSyncBlockingReadsOffLoop:
         assert set(body) == {
             'replica_info', 'num_ready_replicas', 'routing_spec',
             'capacity_hint', 'request_history_accepted',
+            'request_classification_history_accepted',
             'response_time_history_accepted',
             'prediction_time_history_accepted',
             'queued_compatibility_demand_supported', 'service_version'
@@ -4414,6 +4965,7 @@ class TestLbSyncOwnershipFences:
         assert response.status_code == 200
         assert json.loads(response.body) == {
             'request_history_accepted': True,
+            'request_classification_history_accepted': True,
             'response_time_history_accepted': True,
             'prediction_time_history_accepted': True,
         }

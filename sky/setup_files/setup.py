@@ -92,6 +92,32 @@ def get_commit_hash():
         return commit_hash
 
 
+def get_commit_timestamp():
+    with open(INIT_FILE_PATH, encoding='utf-8') as fp:
+        timestamp_match = re.search(
+            r'^_SKYPILOT_COMMIT_TIMESTAMP = [\'"]([^\'"]*)[\'"]', fp.read(),
+            re.M)
+        if timestamp_match:
+            commit_timestamp = timestamp_match.group(1)
+        else:
+            raise RuntimeError('Unable to find commit timestamp string.')
+
+    if 'SKYPILOT_COMMIT_TIMESTAMP' not in commit_timestamp:
+        return commit_timestamp
+    try:
+        cwd = os.path.dirname(__file__)
+        commit_timestamp = subprocess.check_output(
+            ['git', 'show', '-s', '--format=%cI', 'HEAD'],
+            cwd=cwd,
+            universal_newlines=True,
+            stderr=subprocess.DEVNULL).strip()
+    except Exception as e:  # pylint: disable=broad-except
+        print(_COMMIT_FAILURE_MESSAGE.format(verb='get', error=str(e)),
+              file=sys.stderr)
+        return ''
+    return commit_timestamp
+
+
 def get_commit_count():
     """Get the commit count, i.e. a build number that auto-increments with
     every commit."""
@@ -120,7 +146,7 @@ def get_commit_count():
 
 
 def replace_commit_hash():
-    """Fill in the commit hash and commit count in the __init__.py file."""
+    """Fill in commit identity metadata in the __init__.py file."""
     try:
         with open(INIT_FILE_PATH, encoding='utf-8') as fp:
             content = fp.read()
@@ -130,6 +156,12 @@ def replace_commit_hash():
                              f'_SKYPILOT_COMMIT_SHA = \'{get_commit_hash()}\'',
                              content,
                              flags=re.M)
+            content = re.sub(
+                r'^_SKYPILOT_COMMIT_TIMESTAMP = [\'"]([^\'"]*)[\'"]',
+                f'_SKYPILOT_COMMIT_TIMESTAMP = '
+                f'\'{get_commit_timestamp()}\'',
+                content,
+                flags=re.M)
             content = re.sub(
                 r'^_SKYPILOT_COMMIT_COUNT = [\'"]([^\'"]*)[\'"]',
                 f'_SKYPILOT_COMMIT_COUNT = \'{get_commit_count()}\'',
@@ -189,7 +221,13 @@ if __name__ == '__main__':
         # (templates/*.j2 and wheel_utils.py).
         name='skypilot',
         version=find_version(),
-        packages=setuptools.find_packages(),
+        packages=setuptools.find_packages(include=(
+            'sky',
+            'sky.*',
+            'sky_templates',
+            'sky_templates.*',
+        )),
+        py_modules=['skypilot_serve_system_oom_recovery_authorization'],
         author='SkyPilot Team',
         license='Apache 2.0',
         readme='README.md',

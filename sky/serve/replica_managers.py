@@ -1,13 +1,15 @@
 """ReplicaManager: handles the creation and deletion of endpoint replicas."""
+import asyncio
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Mapping
 import contextlib
 import dataclasses
 import functools
-import math
 from multiprocessing import pool as mp_pool
 import os
 import pathlib
+import queue
 import threading
 import time
 import traceback
@@ -15,7 +17,7 @@ import typing
 from typing import Any, Optional
 import uuid
 
-import colorama
+import aiohttp
 import filelock
 
 from sky import backends
@@ -31,12 +33,18 @@ from sky.client import sdk
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
 from sky.serve import paid_capacity
+from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_tls
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
+from sky.serve import system_oom_recovery
+from sky.serve import system_oom_recovery_observability
+from sky.serve import system_recovery_route_lease
+from sky.serve import system_recovery_state
+from sky.server import common as server_common
 from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.usage import usage_lib
@@ -54,9 +62,29 @@ from sky.utils import yaml_utils
 if typing.TYPE_CHECKING:
 
     from sky.serve import service_spec
-    SpotPlacerType = spot_placer.SpotPlacer
+    from sky.serve.replica_info import ReplicaInfo
+    from sky.serve.replica_info import ReplicaStatusProperty
+    SpotPlacerType: typing.TypeAlias = spot_placer.SpotPlacer
+else:
+    ReplicaStatusProperty = replica_info_lib.ReplicaStatusProperty
+    ReplicaInfo = replica_info_lib.ReplicaInfo
 
 logger = sky_logging.init_logger(__name__)
+
+# Keep the established replica_managers import and pickle identities while the
+# versioned record implementation lives in its own low-state module.
+replica_info_lib.logger = logger
+replica_info_lib.estimated_spend = estimated_spend
+replica_info_lib.env_options = env_options
+colorama = replica_info_lib.colorama
+# pylint: disable=protected-access
+_NOT_PROVIDED = replica_info_lib._NOT_PROVIDED
+_is_valid_drain_started_at = replica_info_lib._is_valid_drain_started_at
+_encode_replica_resource_state = (
+    replica_info_lib._encode_replica_resource_state)
+_decode_replica_resource_state = (
+    replica_info_lib._decode_replica_resource_state)
+# pylint: enable=protected-access
 
 _JOB_STATUS_FETCH_INTERVAL = 30
 _PROCESS_POOL_REFRESH_INTERVAL = 20
@@ -103,6 +131,8 @@ _FAILED_CLEANUP_RETRY_MAX_SECONDS = 15 * 60
 # queued intent, but bound live worker threads so one controller process cannot
 # exhaust its memory or refresh-loop CPU while the global budget is spacious.
 _MAX_CONCURRENT_DOWNS_PER_SERVICE = 64
+_CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR = (
+    'SKYPILOT_SERVE_CHANGED_ONLY_READINESS_PERSISTENCE')
 # An autoscaler tick can place a full wave before any sky.launch result benches
 # an unavailable location. Without a bound, a zero-cost-first placer can pin
 # hundreds of replicas to one full Kubernetes pool. Demand placement consumes
@@ -110,16 +140,22 @@ _MAX_CONCURRENT_DOWNS_PER_SERVICE = 64
 # measurement blackout, keep only a few probes per ACTIVE zero-cost shape.
 # Four matches SkyServe's historical per-service launch parallelism.
 _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
-# Sentinel for to_info_dict's pre-fetched cluster_record
-# parameters. We can't use None because None is a legitimate value (it means
-# "no cluster row" / "no handle"). The sentinel lets callers opt in to the
-# batched fetch path while preserving the existing self-fetch behavior for
-# back-compat callers like ReplicaInfo.__repr__.
-_NOT_PROVIDED: Any = object()
 # Sentinel for drain registration's optional pre-resolved replica URL. ``None``
 # is a real batched result: the cluster has no resolvable endpoint and the
 # bounded deadline must remain the only completion path.
 _REPLICA_URL_NOT_PROVIDED: Any = object()
+
+
+def _changed_only_readiness_persistence_enabled() -> bool:
+    value = os.environ.get(_CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR)
+    if value is None or value.lower() == 'false':
+        return False
+    if value.lower() == 'true':
+        return True
+    logger.warning(
+        f'Invalid {_CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR} value '
+        f'{value!r}; changed-only readiness persistence remains disabled.')
+    return False
 
 
 def load_task_with_service_spec(
@@ -151,6 +187,28 @@ class _ZeroCostDemandBudget:
 
     remaining_by_pool: dict[tuple[str, str], int]
     measured_by_pool: dict[tuple[str, str], int | None]
+
+
+class _ReplicaLaunchThread(thread_utils.SafeThread):
+    """Launch worker that publishes a joinable completion notification."""
+
+    def __init__(self, *args: Any, replica_id: int,
+                 completion_queue: 'queue.SimpleQueue[int]',
+                 completion_event: threading.Event, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._completion_replica_id = replica_id
+        self._completion_queue = completion_queue
+        self._completion_event = completion_event
+
+    def run(self) -> None:
+        try:
+            super().run()
+        finally:
+            # This callback runs just before Thread.run returns, so the receiver
+            # joins the notified worker before relying on is_alive(). The queue
+            # preserves completion across Event coalescing and clear races.
+            self._completion_queue.put(self._completion_replica_id)
+            self._completion_event.set()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -304,6 +362,10 @@ class _UnfencedExternalLbLaunchError(RuntimeError):
     """A legacy controller cannot satisfy the API replica-launch fence."""
 
 
+class _SystemRecoveryLaunchCaptureError(RuntimeError):
+    """A recovery-bearing request could not be associated exactly."""
+
+
 def _scope_security_group_to_service(task: 'task_lib.Task',
                                      service_name: str | None) -> None:
     """Pins a service's replicas to ONE security group instead of one each.
@@ -384,29 +446,116 @@ def _inject_replica_tls_material(task: 'task_lib.Task') -> None:
         {serve_constants.REPLICA_TLS_KEY_SECRET_ENV_VAR: private_key_pem})
 
 
+def _build_replica_launch_task(
+    yaml_content: str,
+    replica_id: int,
+    resources_override: dict[str, Any] | None,
+    *,
+    exact_resources_override: bool,
+    authoritative_service_spec: 'service_spec.SkyServiceSpec | None',
+    service_name: str | None,
+) -> task_lib.Task:
+    """Build the exact pre-policy task submitted by a replica launch.
+
+    Candidate authorization and the launch worker must hash/submit the same
+    task. Keeping their construction in one helper also makes a later
+    controller-side environment or security-group change fail closed through
+    the backend's post-policy rematch instead of silently widening recovery.
+    """
+    task = load_task_with_service_spec(yaml_content, authoritative_service_spec)
+    if resources_override is not None:
+        resources = task.resources
+        if exact_resources_override:
+            # Placement already selected the complete location and shape.
+            resource = next(iter(resources)).copy(**resources_override)
+            task.set_resources(resource)
+        else:
+            overridden_resources = [
+                resource.copy(**resources_override) for resource in resources
+            ]
+            task.set_resources(type(resources)(overridden_resources))
+    task.update_envs({serve_constants.REPLICA_ID_ENV_VAR: str(replica_id)})
+    _inject_replica_tls_material(task)
+    _scope_security_group_to_service(task, service_name)
+    return task
+
+
+def _task_is_known_non_aws(task: task_lib.Task) -> bool:
+    """Whether every pre-policy alternative names a non-AWS provider."""
+    providers = {
+        repr(resource.cloud).lower()
+        for resource in task.resources
+        if resource.cloud is not None
+    }
+    return bool(providers) and 'aws' not in providers
+
+
+def _system_recovery_launch_result_job_id(result: Any,
+                                          cluster_name: str) -> int:
+    """Validate the exact ordinary launch result used by recovery."""
+    if (not isinstance(result, tuple) or len(result) != 2 or
+            isinstance(result[0], bool) or not isinstance(result[0], int) or
+            result[0] < 1 or
+            not isinstance(result[1], backends.CloudVmRayResourceHandle) or
+            result[1].cluster_name != cluster_name):
+        raise _SystemRecoveryLaunchCaptureError(
+            'Recovery-bearing launch returned a malformed or mismatched '
+            '(job_id, handle) result.')
+    return result[0]
+
+
+@context.contextual
+def adopt_system_recovery_launch(
+    replica_id: int,
+    cluster_name: str,
+    log_file: str,
+    request_id: str,
+    persist_system_recovery_job_id: Callable[[str, int], bool],
+) -> None:
+    """Adopt one already-bound launch request after controller restart."""
+    ctx = context.get()
+    assert ctx is not None, 'Context is not initialized'
+    ctx.redirect_log(pathlib.Path(log_file))
+    launch_request_id = server_common.RequestId[tuple[int | None,
+                                                      backends.ResourceHandle |
+                                                      None]](request_id)
+    result = sdk.get(launch_request_id)
+    job_id = _system_recovery_launch_result_job_id(result, cluster_name)
+    if not persist_system_recovery_job_id(request_id, job_id):
+        raise _SystemRecoveryLaunchCaptureError(
+            f'Failed to persist exact service job {job_id} for recovery '
+            f'candidate replica {replica_id}.')
+
+
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
 @context.contextual
 def launch_cluster(
-        replica_id: int,
-        yaml_content: str,
-        cluster_name: str,
-        log_file: str,
-        replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
-        replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
-        resources_override: dict[str, Any] | None = None,
-        retry_until_up: bool = True,
-        max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
-        availability_max_retry: int | None = None,
-        exact_resources_override: bool = False,
-        pre_launch_guard: Callable[[], bool] | None = None,
-        cloud_launch_guard: Callable[[], bool | tuple[bool, str]] | None = None,
-        continue_guard: Callable[[], bool] | None = None,
-        launch_fence: dict[str, Any] | None = None,
-        service_spec: 'service_spec.SkyServiceSpec | None' = None,
-        workspace: str | None = None,
-        service_name: str | None = None) -> None:
+    replica_id: int,
+    yaml_content: str,
+    cluster_name: str,
+    log_file: str,
+    replica_to_request_id: thread_utils.ThreadSafeDict[int, str],
+    replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
+    resources_override: dict[str, Any] | None = None,
+    retry_until_up: bool = True,
+    max_retry: int = _DEFAULT_LAUNCH_MAX_RETRY,
+    availability_max_retry: int | None = None,
+    exact_resources_override: bool = False,
+    pre_launch_guard: Callable[[], bool] | None = None,
+    cloud_launch_guard: Callable[[], bool | tuple[bool, str]] | None = None,
+    continue_guard: Callable[[], bool] | None = None,
+    launch_fence: dict[str, Any] | None = None,
+    service_spec: 'service_spec.SkyServiceSpec | None' = None,
+    workspace: str | None = None,
+    service_name: str | None = None,
+    system_recovery_launch_context: dict[str, Any] | None = None,
+    get_bound_system_recovery_request_id: Callable[[], str | None] |
+    None = None,
+    persist_system_recovery_job_id: Callable[[str, int], bool] | None = None,
+    demote_system_recovery_candidate: Callable[[], bool] | None = None,
+) -> None:
     """Launch a sky serve replica cluster.
 
     This function will not wait for the job starts running. It will return
@@ -434,26 +583,13 @@ def launch_cluster(
                     f'{cluster_name} with resources override: '
                     f'{resources_override}')
     try:
-        task = load_task_with_service_spec(yaml_content, service_spec)
-        if resources_override is not None:
-            resources = task.resources
-            if exact_resources_override:
-                # Spot placement has already selected the complete launch
-                # location and shape. All entries have the same non-location
-                # fields (validated by SpotPlacer), so one is sufficient.
-                # Keeping the whole any_of set here would turn N entries into
-                # N identical pinned candidates and make sky.launch retry the
-                # same unavailable zone N times before reporting failure.
-                resource = next(iter(resources)).copy(**resources_override)
-                task.set_resources(resource)
-            else:
-                overrided_resources = [
-                    r.copy(**resources_override) for r in resources
-                ]
-                task.set_resources(type(resources)(overrided_resources))
-        task.update_envs({serve_constants.REPLICA_ID_ENV_VAR: str(replica_id)})
-        _inject_replica_tls_material(task)
-        _scope_security_group_to_service(task, service_name)
+        task = _build_replica_launch_task(
+            yaml_content,
+            replica_id,
+            resources_override,
+            exact_resources_override=exact_resources_override,
+            authoritative_service_spec=service_spec,
+            service_name=service_name)
 
         logger.info(f'Launching replica (id: {replica_id}) cluster '
                     f'{cluster_name} with resources: {task.resources}')
@@ -530,11 +666,10 @@ def launch_cluster(
                 f'Refusing to launch replica {replica_id} after service '
                 'controller ownership was lost.')
 
-    def _stream_with_owner_watchdog(request_id: Any) -> None:
+    def _stream_with_owner_watchdog(request_id: Any) -> Any:
         """Cancel an async launch promptly when the shared owner fence trips."""
         if continue_guard is None:
-            sdk.stream_and_get(request_id)
-            return
+            return sdk.stream_and_get(request_id)
         stop_watchdog = threading.Event()
 
         def _watch_ownership() -> None:
@@ -551,13 +686,52 @@ def launch_cluster(
                                     daemon=True)
         watchdog.start()
         try:
-            sdk.stream_and_get(request_id)
+            return sdk.stream_and_get(request_id)
         finally:
             stop_watchdog.set()
             watchdog.join(timeout=1)
 
+    recovery_callbacks_configured = all(callback is not None for callback in (
+        get_bound_system_recovery_request_id,
+        persist_system_recovery_job_id,
+        demote_system_recovery_candidate,
+    ))
+    recovery_context_available = (system_recovery_launch_context is not None and
+                                  recovery_callbacks_configured)
+
+    def _bound_recovery_request_id() -> str | None:
+        assert get_bound_system_recovery_request_id is not None
+        request_id = get_bound_system_recovery_request_id()
+        if request_id is not None and (not isinstance(request_id, str) or
+                                       not request_id):
+            raise _SystemRecoveryLaunchCaptureError(
+                'Recovery request association returned an invalid request ID.')
+        return request_id
+
+    def _demote_recovery_candidate() -> None:
+        nonlocal recovery_context_available
+        if not recovery_context_available:
+            return
+        assert demote_system_recovery_candidate is not None
+        if not demote_system_recovery_candidate():
+            raise _SystemRecoveryLaunchCaptureError(
+                f'Failed to demote recovery candidate for replica '
+                f'{replica_id}; refusing a second launch request.')
+        recovery_context_available = False
+
+    def _capture_recovery_result(request_id: str, result: Any) -> None:
+        job_id = _system_recovery_launch_result_job_id(result, cluster_name)
+        assert persist_system_recovery_job_id is not None
+        if not persist_system_recovery_job_id(request_id, job_id):
+            raise _SystemRecoveryLaunchCaptureError(
+                f'Failed to persist exact service job {job_id} for '
+                f'recovery candidate replica {replica_id}.')
+
     if availability_max_retry is None:
         availability_max_retry = max_retry
+    # TODO(fcapponi): DEPRECATED resource-action retry/request association
+    # owner. Remove at M5 after action-only launch proves its rollback gate;
+    # never use this loop for an eligible authoritative service.
     retry_cnt = 0
     availability_retry_cnt = 0
     backoff = common_utils.Backoff(_RETRY_INIT_GAP_SECONDS)
@@ -565,6 +739,7 @@ def launch_cluster(
         retry_cnt += 1
         capacity_error: exceptions.ResourcesUnavailableError | None = None
         availability_reason: str | None = None
+        recovery_request_attempted = False
         try:
             if _check_is_cancelled():
                 return
@@ -593,23 +768,52 @@ def launch_cluster(
                     'and recreate it to establish a current lifecycle fence.')
             usage_lib.messages.usage.set_internal()
             launch_kwargs: dict[str, Any] = {}
-            if launch_fence is not None:
-                launch_kwargs['_extra_launch_context'] = launch_fence
+            launch_context = (system_recovery_launch_context
+                              if recovery_context_available else launch_fence)
+            if launch_context is not None:
+                launch_kwargs['_extra_launch_context'] = launch_context
             workspace_ctx: contextlib.AbstractContextManager = (
                 skypilot_config.local_active_workspace_ctx(workspace)
                 if workspace is not None else contextlib.nullcontext())
-            with workspace_ctx:
-                request_id = sdk.launch(
-                    task,
-                    cluster_name,
-                    retry_until_up=retry_until_up,
-                    _is_launched_by_sky_serve_controller=True,
-                    **launch_kwargs)
+            try:
+                with workspace_ctx:
+                    recovery_request_attempted = recovery_context_available
+                    request_id = sdk.launch(
+                        task,
+                        cluster_name,
+                        retry_until_up=retry_until_up,
+                        _is_launched_by_sky_serve_controller=True,
+                        **launch_kwargs)
+            except Exception:  # pylint: disable=broad-except
+                if not recovery_request_attempted:
+                    raise
+                # The response can be lost after /launch durably bound the
+                # server-known request ID. Adopt only that exact association;
+                # never search request history or infer the latest request.
+                bound_request_id = _bound_recovery_request_id()
+                if bound_request_id is None:
+                    _demote_recovery_candidate()
+                    raise
+                request_id = server_common.RequestId[
+                    tuple[int | None,
+                          backends.ResourceHandle | None]](bound_request_id)
+                logger.warning(
+                    f'Adopting bound recovery launch request {request_id} for '
+                    f'replica {replica_id} after sdk.launch did not return it.')
+            if recovery_request_attempted:
+                bound_request_id = _bound_recovery_request_id()
+                if request_id != bound_request_id:
+                    raise _SystemRecoveryLaunchCaptureError(
+                        f'Recovery launch request mismatch for replica '
+                        f'{replica_id}: returned={request_id!r}, '
+                        f'bound={bound_request_id!r}.')
             logger.info(f'Replica cluster {cluster_name} launch requested '
                         f'with request_id: {request_id}.')
             replica_to_request_id[replica_id] = request_id
-            _stream_with_owner_watchdog(request_id)
+            launch_result = _stream_with_owner_watchdog(request_id)
             _assert_launch_authorized()
+            if recovery_request_attempted:
+                _capture_recovery_result(request_id, launch_result)
             logger.info(f'Replica cluster {cluster_name} launched.')
         except _ReplicaLaunchOwnershipLostError:
             # In-memory request/cancellation entries belong to this stale
@@ -625,6 +829,8 @@ def launch_cluster(
         except (exceptions.InvalidClusterNameError,
                 exceptions.NoCloudAccessError,
                 exceptions.ResourcesMismatchError) as e:
+            if recovery_request_attempted and recovery_context_available:
+                _demote_recovery_candidate()
             logger.error('Failure happened before provisioning. '
                          f'{common_utils.format_exception(e)}')
             raise RuntimeError('Failed to launch the sky serve replica '
@@ -659,6 +865,12 @@ def launch_cluster(
                 logger.info(f'  Traceback: {traceback.format_exc()}')
         else:  # No exception, the launch succeeds.
             return
+
+        if recovery_request_attempted and recovery_context_available:
+            # At most the first outer request carries recovery authority. A
+            # later request is allowed only after this generation is durably
+            # and irreversibly ordinary; its historical association remains.
+            _demote_recovery_candidate()
 
         # Cleanup the request id and the failed cluster.
         replica_to_request_id.pop(replica_id)
@@ -738,11 +950,6 @@ def _wait_for_drain(drain_deadline: float,
         time.sleep(
             min(_DRAIN_POLL_SECONDS, max(drain_deadline - time.monotonic(), 0)))
     logger.info('Drain deadline reached; proceeding with termination.')
-
-
-def _is_valid_drain_started_at(value: Any) -> bool:
-    return (not isinstance(value, bool) and isinstance(value, (int, float)) and
-            math.isfinite(value) and value > 0)
 
 
 def _ensure_drain_started_at(status: 'ReplicaStatusProperty',
@@ -906,7 +1113,8 @@ def terminate_cluster(cluster_name: str,
                       max_retry: int = 3,
                       drain_deadline: float | None = None,
                       drain_complete: Callable[[], bool] | None = None,
-                      continue_guard: Callable[[], bool] | None = None) -> None:
+                      continue_guard: Callable[[], bool] | None = None,
+                      expected_cluster_record_uuid: str | None = None) -> None:
     """Terminate the sky serve replica cluster."""
     from sky import core  # pylint: disable=import-outside-toplevel
 
@@ -930,6 +1138,9 @@ def terminate_cluster(cluster_name: str,
     cluster_record = global_user_state.get_cluster_from_name(cluster_name)
     cluster_workspace = (cluster_record.get('workspace')
                          if cluster_record is not None else None)
+    # TODO(fcapponi): DEPRECATED resource-action retry owner. Remove at M5
+    # after action-only down proves its rollback gate; never use this loop for
+    # an eligible authoritative service.
     retry_cnt = 0
     backoff = common_utils.Backoff()
     while True:
@@ -945,7 +1156,9 @@ def terminate_cluster(cluster_name: str,
                 skypilot_config.local_active_workspace_ctx(cluster_workspace)
                 if cluster_workspace else contextlib.nullcontext())
             with workspace_ctx:
-                core.down(cluster_name)
+                core.down(
+                    cluster_name,
+                    _expected_cluster_record_uuid=expected_cluster_record_uuid)
             logger.info(f'Replica cluster {cluster_name} terminated.')
             return
         except exceptions.ClusterDoesNotExist:
@@ -953,6 +1166,11 @@ def terminate_cluster(cluster_name: str,
             logger.info(
                 f'Replica cluster {cluster_name} is already terminated.')
             return
+        except global_user_state.ClusterRecordIdentityConflictError:
+            # A different/null durable identity is not a transient provider
+            # failure. Never turn the exact action fence into repeated
+            # name-only teardown attempts.
+            raise
         except Exception as e:  # pylint: disable=broad-except
             if retry_cnt >= max_retry:
                 raise RuntimeError('Failed to terminate the sky serve replica '
@@ -1151,874 +1369,6 @@ def with_lock(func):
     return wrapper
 
 
-@dataclasses.dataclass
-class ReplicaStatusProperty:
-    """Some properties that determine replica status.
-
-    Attributes:
-        sky_launch_status: Process status of sky.launch.
-        user_app_failed: Whether the service job failed.
-        service_ready_now: Latest readiness probe result.
-        first_ready_time: The first time the service is ready.
-        sky_down_status: Process status of sky.down.
-    """
-    # sky.launch will always be scheduled on creation of ReplicaStatusProperty.
-    sky_launch_status: common_utils.ProcessStatus = (
-        common_utils.ProcessStatus.SCHEDULED)
-    user_app_failed: bool = False
-    service_ready_now: bool = False
-    # None means readiness probe is not succeeded yet;
-    # -1 means the initial delay seconds is exceeded.
-    first_ready_time: float | None = None
-    # None means sky.down is not called yet.
-    sky_down_status: common_utils.ProcessStatus | None = None
-    # Whether the termination is caused by autoscaler's decision
-    is_scale_down: bool = False
-    # The replica's underlying capacity was interrupted. This includes spot
-    # preemption and reclamation of low-priority zero-cost Kubernetes pods.
-    preempted: bool = False
-    # Whether the replica is purged.
-    purged: bool = False
-    # Whether the replica failed to launch due to spot availability.
-    # This is only possible when spot placer is enabled, so the retry until up
-    # is set to True and it can fail immediately due to spot availability.
-    failed_spot_availability: bool = False
-    # [boltz fork] The graceful-drain cap resolved when this replica's
-    # retirement was scheduled, persisted so a recovery re-drive reuses
-    # it exactly instead of re-resolving (the spec lookup can fail after
-    # a crash and silently substitute the 120s default). None on purge
-    # and failure teardowns, and on rows written before this field
-    # existed (read via getattr for unpickle back-compat).
-    drain_cap_seconds: int | None = None
-    # Wall-clock epoch seconds at which the bounded drain first became
-    # durable. Unlike time.monotonic(), this survives controller restarts and
-    # prevents repeated recovery from restarting the full drain cap. None for
-    # unbounded/immediate cleanup and rows written before this field existed.
-    drain_started_at: float | None = None
-    # Economic replacement is fail-closed: persist the off-route retirement
-    # intent, but do not admit sky.down until a fresh LB report proves zero
-    # occupancy.  getattr is used for rows predating this field.
-    wait_for_idle_before_termination: bool = False
-    # Logical autoscaling retirement fence. None on physical services and
-    # destructive purge/failure cleanup.
-    logical_retirement_version: int | None = None
-    logical_retirement_controller_epoch: str | None = None
-    logical_retirement_generation: int | None = None
-    logical_retirement_target_capacity: int | None = None
-    logical_retirement_confirmed_generation: int | None = None
-    # True only after an outdated backend consumed the full configured drain
-    # deadline without an explicit idle proof and replacement capacity was
-    # revalidated.  Persisted so down-thread admission can distinguish that
-    # bounded rolling-update completion from an ordinary idle confirmation.
-    logical_retirement_bounded_deadline: bool = False
-    # Persisted at down admission immediately before the worker starts. A
-    # SCHEDULED row without this bit is queued but unadmitted and may still be
-    # safely aborted after a controller restart. RUNNING/FAILED rows predate
-    # the bit but are already unambiguously committed cleanup.
-    logical_retirement_committed: bool | None = False
-
-    def unrecoverable_failure(self) -> bool:
-        """Whether the replica fails and cannot be recovered.
-
-        Autoscaler should stop scaling if any of the replica has unrecoverable
-        failure, e.g., the user app fails before the service endpoint being
-        ready for the current version.
-        """
-        replica_status = self.to_replica_status()
-        if replica_status not in serve_state.ReplicaStatus.terminal_statuses():
-            return False
-        if self.first_ready_time is not None:
-            if self.first_ready_time >= 0:
-                # If the service is ever up, we assume there is no bug in the
-                # user code and the scale down is successful, thus enabling the
-                # controller to remove the replica from the replica table and
-                # auto restart the replica.
-                # For replica with a failed sky.launch, it is likely due to some
-                # misconfigured resources, so we don't want to auto restart it.
-                # For replica with a failed sky.down, we cannot restart it since
-                # otherwise we will have a resource leak.
-                return False
-            else:
-                # If the initial delay exceeded, it is likely the service is not
-                # recoverable.
-                return True
-        if self.user_app_failed:
-            return True
-        # TODO(zhwu): launch failures not related to resource unavailability
-        # should be considered as unrecoverable failure. (refer to
-        # `spot.recovery_strategy.StrategyExecutor::_launch`)
-        return False
-
-    def should_track_service_status(self) -> bool:
-        """Should we track the status of the replica.
-
-        This includes:
-            (1) Job status;
-            (2) Readiness probe.
-        """
-        if self.sky_launch_status != common_utils.ProcessStatus.SUCCEEDED:
-            return False
-        if self.sky_down_status is not None:
-            return False
-        if self.user_app_failed:
-            return False
-        if self.preempted:
-            return False
-        if self.purged:
-            return False
-        return True
-
-    def to_replica_status(self) -> serve_state.ReplicaStatus:
-        """Convert status property to human-readable replica status."""
-        # Backward compatibility. Before we introduce ProcessStatus.SCHEDULED,
-        # we use None to represent sky.launch is not called yet.
-        if (self.sky_launch_status is None or
-                self.sky_launch_status == common_utils.ProcessStatus.SCHEDULED):
-            # Pending to launch
-            return serve_state.ReplicaStatus.PENDING
-        if self.sky_launch_status == common_utils.ProcessStatus.RUNNING:
-            if self.sky_down_status == common_utils.ProcessStatus.FAILED:
-                return serve_state.ReplicaStatus.FAILED_CLEANUP
-            if self.sky_down_status == common_utils.ProcessStatus.SUCCEEDED:
-                # This indicate it is a scale_down with correct teardown.
-                # Should have been cleaned from the replica table.
-                return serve_state.ReplicaStatus.UNKNOWN
-            # Still launching
-            return serve_state.ReplicaStatus.PROVISIONING
-        if self.sky_launch_status == common_utils.ProcessStatus.INTERRUPTED:
-            # sky.down is running and a scale down interrupted sky.launch
-            return serve_state.ReplicaStatus.SHUTTING_DOWN
-        if self.sky_down_status is not None:
-            if self.preempted:
-                # The replica's underlying capacity was interrupted.
-                return serve_state.ReplicaStatus.PREEMPTED
-            if self.sky_down_status == common_utils.ProcessStatus.SCHEDULED:
-                # sky.down is scheduled to run, but not started yet.
-                return serve_state.ReplicaStatus.SHUTTING_DOWN
-            if self.sky_down_status == common_utils.ProcessStatus.RUNNING:
-                # sky.down is running
-                return serve_state.ReplicaStatus.SHUTTING_DOWN
-            if self.sky_down_status == common_utils.ProcessStatus.FAILED:
-                # sky.down failed
-                return serve_state.ReplicaStatus.FAILED_CLEANUP
-            if self.user_app_failed:
-                # Failed on user setup/run
-                return serve_state.ReplicaStatus.FAILED
-            if self.sky_launch_status == common_utils.ProcessStatus.FAILED:
-                # sky.launch failed
-                return serve_state.ReplicaStatus.FAILED_PROVISION
-            if self.first_ready_time is None:
-                # readiness probe is not executed yet, but a scale down is
-                # triggered.
-                return serve_state.ReplicaStatus.SHUTTING_DOWN
-            if self.first_ready_time == -1:
-                # initial delay seconds exceeded
-                return serve_state.ReplicaStatus.FAILED_INITIAL_DELAY
-            if not self.service_ready_now:
-                # Max continuous failure exceeded
-                return serve_state.ReplicaStatus.FAILED_PROBING
-            # This indicate it is a scale_down with correct teardown.
-            # Should have been cleaned from the replica table.
-            return serve_state.ReplicaStatus.UNKNOWN
-        if self.sky_launch_status == common_utils.ProcessStatus.FAILED:
-            # sky.launch failed
-            # The down thread has not been started if it reaches here,
-            # due to the `if self.sky_down_status is not None`` check above.
-            # However, it should have been started by _refresh_thread_pool.
-            # If not started, this means some bug prevent sky.down from
-            # executing. It is also a potential resource leak, so we mark
-            # it as FAILED_CLEANUP.
-            return serve_state.ReplicaStatus.FAILED_CLEANUP
-        if self.user_app_failed:
-            # Failed on user setup/run
-            # Same as above, the down thread should have been started.
-            return serve_state.ReplicaStatus.FAILED_CLEANUP
-        if self.service_ready_now:
-            # Service is ready
-            return serve_state.ReplicaStatus.READY
-        if self.first_ready_time is not None and self.first_ready_time >= 0.0:
-            # Service was ready before but not now
-            return serve_state.ReplicaStatus.NOT_READY
-        else:
-            # No readiness probe passed and sky.launch finished
-            return serve_state.ReplicaStatus.STARTING
-
-
-def _encode_replica_resource_state(
-        state: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Makes a location/resources override lossless in a JSON object.
-
-    ``Resources.image_id`` is keyed by a region or by ``None`` for a
-    region-independent image. JSON object keys cannot represent ``None``:
-    PostgreSQL JSONB reads it back as the string ``"null"``. Store this one
-    nested mapping as key/value pairs so its key types survive the round trip.
-    """
-    if state is None:
-        return None
-    encoded = dict(state)
-    image_id = encoded.get('image_id')
-    if isinstance(image_id, dict):
-        encoded['image_id'] = [
-            [region, image] for region, image in image_id.items()
-        ]
-    return encoded
-
-
-def _decode_replica_resource_state(
-        state: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Restores the internal location/resources override representation."""
-    if state is None:
-        return None
-    decoded = dict(state)
-    image_id = decoded.get('image_id')
-    if isinstance(image_id, list):
-        restored_image_id = {}
-        for item in image_id:
-            if not isinstance(item, list) or len(item) != 2:
-                raise ValueError('Invalid replica image_id storage state: '
-                                 f'{image_id!r}')
-            restored_image_id[item[0]] = item[1]
-        decoded['image_id'] = restored_image_id
-    elif isinstance(image_id, dict) and 'null' in image_id:
-        # Compatibility for version-1 rows written before image_id mappings
-        # used a lossless representation. The JSON encoder coerced a None key
-        # to the literal string "null".
-        decoded['image_id'] = {
-            None if region == 'null' else region: image
-            for region, image in image_id.items()
-        }
-    return decoded
-
-
-class ReplicaInfo:
-    """Replica info for each replica."""
-
-    # Version 6 is also a worker-runtime compatibility marker for immutable
-    # Sky Batch attempt outputs. New Batch clients reject older pool replicas
-    # so an incompatible worker fails before dispatch rather than mid-run.
-    # Version 7 replaces the consecutive_failure_times list with the single
-    # first_consecutive_failure_time timestamp.
-    # Version 8 persists the immutable logical slot width selected for this
-    # physical backend. Version 9 marks bounded unknown-capacity replacement
-    # rows so a persistent telemetry outage cannot recursively replace them.
-    # Version 10 records that a pre-activation physical bridge has published
-    # a load-balancer-verified logical width.
-    # Version 11 persists placement-cost provenance independently from the
-    # reserved_fill launch reason. Demand launches can also land on free
-    # reserved capacity and must receive the same routing preference.
-    # Version 12 stores the exact global paid-capacity pool claim associated
-    # with an unresolved fresh demand launch.
-    _VERSION = 12
-
-    def __init__(self,
-                 replica_id: int,
-                 cluster_name: str,
-                 replica_port: str,
-                 is_spot: bool,
-                 location: spot_placer.Location | None,
-                 version: int,
-                 resources_override: dict[str, Any] | None,
-                 planned_capacity: int = 1,
-                 unknown_capacity_replacement: bool = False) -> None:
-        self._version = self._VERSION
-        self.replica_id: int = replica_id
-        self.cluster_name: str = cluster_name
-        self.version: int = version
-        self.replica_port: str = replica_port
-        # Row creation time, set the moment the row object is built (before
-        # the row is persisted or any launch/pod exists), so it is present
-        # for every nonterminal status including PROVISIONING. The
-        # reserved-capacity fill overlay compares it against its free-slot
-        # snapshot time to debit replicas that landed on the zero-cost tier
-        # after the snapshot was taken (see
-        # Autoscaler._fill_row_occupies_free_slot).
-        self.created_at: float | None = time.time()
-        self.first_not_ready_time: float | None = None
-        # Start of the current run of consecutive failed readiness probes
-        # after the replica was once READY; None while the replica is
-        # passing probes. The failure window is measured against the
-        # current probe time, so only the first failure needs to be kept.
-        self.first_consecutive_failure_time: float | None = None
-        self.status_property: ReplicaStatusProperty = ReplicaStatusProperty()
-        self.is_spot: bool = is_spot
-        self.location: dict[str, str | None] | None = (
-            location.to_pickleable() if location is not None else None)
-        self.resources_override: dict[str, Any] | None = resources_override
-        if (isinstance(planned_capacity, bool) or
-                not isinstance(planned_capacity, int) or planned_capacity < 1):
-            raise ValueError('planned_capacity must be a positive integer. '
-                             f'Got: {planned_capacity!r}')
-        self.planned_capacity: int = planned_capacity
-        self.unknown_capacity_replacement = bool(unknown_capacity_replacement)
-        # A physical row created before implicit logical replicas starts at
-        # width one. It becomes part of the logical capacity contract only
-        # after the live LB probes the local router and the controller clamps
-        # that observation to the backend's launched GPU count.
-        self.logical_bridge_capacity_verified: bool = False
-        # Launch-origin attribution: True only for sentinel (fill)
-        # launches; set by _launch_replica before the row is persisted.
-        # The broker's holdings split and the grant ceiling's demand
-        # exemption both key on it. A fill row re-driven after a
-        # controller crash mid-PENDING keeps the flag: the sentinel was
-        # consumed at original emission, so the recovery path carries the
-        # prior row's attribution into _launch_replica explicitly
-        # (prior_reserved_fill) -- otherwise the replacement row would
-        # read as demand-placed and stay ceiling-exempt for its lifetime.
-        self.reserved_fill: bool = False
-        # Placement-cost provenance, not launch intent. True means the
-        # replica occupies capacity the placer classifies as zero cost.
-        self.is_zero_cost: bool = False
-        # Incumbent id this replica was launched to replace economically.
-        # None for ordinary demand/fill launches.
-        self.cost_rebalance_for_replica_id: int | None = None
-        # Exact provider capacity pool whose unresolved-launch allowance this
-        # row consumes. None for zero-cost, recovery-only, and pre-v12 rows.
-        self.paid_capacity_pool_key: str | None = None
-
-    def to_storage_dict(self) -> dict[str, Any]:
-        """Serialize control-plane state into the versioned JSON contract."""
-        status_property = self.status_property
-        # getattr() is insufficient for old pickles. If a pre-field dataclass
-        # instance lacks this key, attribute lookup falls through to the new
-        # class-level default False and destroys the missing-vs-uncommitted
-        # distinction needed to recover an ambiguous SCHEDULED teardown.
-        logical_retirement_committed = vars(status_property).get(
-            'logical_retirement_committed')
-        if type(logical_retirement_committed) is not bool:
-            logical_retirement_committed = None
-        drain_started_at = getattr(status_property, 'drain_started_at', None)
-        if not _is_valid_drain_started_at(drain_started_at):
-            drain_started_at = None
-        location = _encode_replica_resource_state(self.location)
-        resources_override = _encode_replica_resource_state(
-            self.resources_override)
-        if resources_override is not None:
-            cloud = resources_override.get('cloud')
-            if cloud is not None and not isinstance(cloud, str):
-                # Placer-pinned overrides carry a Cloud instance. The recovery
-                # path accepts its registry name and reconstructs the object.
-                resources_override['cloud'] = str(cloud)
-
-        def _process_status_value(
-            status: common_utils.ProcessStatus | None,) -> str | None:
-            return status.value if status is not None else None
-
-        return {
-            'replica_info_version': self._version,
-            'replica_id': self.replica_id,
-            'cluster_name': self.cluster_name,
-            'version': self.version,
-            'replica_port': self.replica_port,
-            'created_at': getattr(self, 'created_at', None),
-            'first_not_ready_time': getattr(self, 'first_not_ready_time', None),
-            'first_consecutive_failure_time': getattr(
-                self, 'first_consecutive_failure_time', None),
-            'is_spot': self.is_spot,
-            'location': location,
-            'resources_override': resources_override,
-            'planned_capacity': int(getattr(self, 'planned_capacity', 1)),
-            'unknown_capacity_replacement': bool(
-                getattr(self, 'unknown_capacity_replacement', False)),
-            'logical_bridge_capacity_verified': bool(
-                getattr(self, 'logical_bridge_capacity_verified', False)),
-            'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
-            'is_zero_cost': bool(getattr(self, 'is_zero_cost', False)),
-            'cost_rebalance_for_replica_id': getattr(
-                self, 'cost_rebalance_for_replica_id', None),
-            'paid_capacity_pool_key': getattr(self, 'paid_capacity_pool_key',
-                                              None),
-            'status_property': {
-                'sky_launch_status': _process_status_value(
-                    status_property.sky_launch_status),
-                'user_app_failed': status_property.user_app_failed,
-                'service_ready_now': status_property.service_ready_now,
-                'first_ready_time': status_property.first_ready_time,
-                'sky_down_status': _process_status_value(
-                    status_property.sky_down_status),
-                'is_scale_down': status_property.is_scale_down,
-                'preempted': status_property.preempted,
-                'purged': status_property.purged,
-                'failed_spot_availability':
-                    status_property.failed_spot_availability,
-                'drain_cap_seconds': getattr(status_property,
-                                             'drain_cap_seconds', None),
-                'drain_started_at': drain_started_at,
-                'wait_for_idle_before_termination': bool(
-                    getattr(status_property, 'wait_for_idle_before_termination',
-                            False)),
-                'logical_retirement_version': getattr(
-                    status_property, 'logical_retirement_version', None),
-                'logical_retirement_controller_epoch': getattr(
-                    status_property, 'logical_retirement_controller_epoch',
-                    None),
-                'logical_retirement_generation': getattr(
-                    status_property, 'logical_retirement_generation', None),
-                'logical_retirement_target_capacity': getattr(
-                    status_property, 'logical_retirement_target_capacity',
-                    None),
-                'logical_retirement_confirmed_generation': getattr(
-                    status_property, 'logical_retirement_confirmed_generation',
-                    None),
-                'logical_retirement_bounded_deadline':
-                    (getattr(status_property,
-                             'logical_retirement_bounded_deadline', False)
-                     is True),
-                'logical_retirement_committed': logical_retirement_committed,
-            },
-        }
-
-    @classmethod
-    def from_storage_dict(cls, state: dict[str, Any]) -> 'ReplicaInfo':
-        """Reconstruct a replica from the JSON storage contract."""
-        status_state = state['status_property']
-
-        def _process_status(
-            value: str | None,) -> common_utils.ProcessStatus | None:
-            return (common_utils.ProcessStatus(value)
-                    if value is not None else None)
-
-        replica = cls.__new__(cls)
-        replica._version = int(state['replica_info_version'])
-        replica.replica_id = int(state['replica_id'])
-        replica.cluster_name = str(state['cluster_name'])
-        replica.version = int(state['version'])
-        replica.replica_port = str(state['replica_port'])
-        replica.created_at = state.get('created_at')
-        replica.first_not_ready_time = state.get('first_not_ready_time')
-        replica.first_consecutive_failure_time = state.get(
-            'first_consecutive_failure_time')
-        replica.is_spot = bool(state['is_spot'])
-        replica.location = _decode_replica_resource_state(state.get('location'))
-        replica.resources_override = _decode_replica_resource_state(
-            state.get('resources_override'))
-        planned_capacity = state.get('planned_capacity', 1)
-        if (isinstance(planned_capacity, bool) or
-                not isinstance(planned_capacity, int) or planned_capacity < 1):
-            raise ValueError('Stored planned_capacity must be a positive '
-                             f'integer. Got: {planned_capacity!r}')
-        replica.planned_capacity = planned_capacity
-        replica.unknown_capacity_replacement = bool(
-            state.get('unknown_capacity_replacement', False))
-        replica.logical_bridge_capacity_verified = bool(
-            state.get('logical_bridge_capacity_verified', False))
-        replica.reserved_fill = bool(state.get('reserved_fill', False))
-        replica.is_zero_cost = bool(state.get('is_zero_cost', False))
-        replica.cost_rebalance_for_replica_id = state.get(
-            'cost_rebalance_for_replica_id')
-        replica.paid_capacity_pool_key = state.get('paid_capacity_pool_key')
-        replica.status_property = ReplicaStatusProperty(
-            sky_launch_status=typing.cast(
-                common_utils.ProcessStatus,
-                _process_status(status_state['sky_launch_status'])),
-            user_app_failed=bool(status_state['user_app_failed']),
-            service_ready_now=bool(status_state['service_ready_now']),
-            first_ready_time=status_state.get('first_ready_time'),
-            sky_down_status=_process_status(
-                status_state.get('sky_down_status')),
-            is_scale_down=bool(status_state['is_scale_down']),
-            preempted=bool(status_state['preempted']),
-            purged=bool(status_state['purged']),
-            failed_spot_availability=bool(
-                status_state['failed_spot_availability']),
-            drain_cap_seconds=status_state.get('drain_cap_seconds'),
-            drain_started_at=(status_state.get('drain_started_at')
-                              if _is_valid_drain_started_at(
-                                  status_state.get('drain_started_at')) else
-                              None),
-            wait_for_idle_before_termination=bool(
-                status_state.get('wait_for_idle_before_termination', False)),
-            logical_retirement_version=status_state.get(
-                'logical_retirement_version'),
-            logical_retirement_controller_epoch=status_state.get(
-                'logical_retirement_controller_epoch'),
-            logical_retirement_generation=status_state.get(
-                'logical_retirement_generation'),
-            logical_retirement_target_capacity=status_state.get(
-                'logical_retirement_target_capacity'),
-            logical_retirement_confirmed_generation=status_state.get(
-                'logical_retirement_confirmed_generation'),
-            logical_retirement_bounded_deadline=(status_state.get(
-                'logical_retirement_bounded_deadline', False) is True),
-            logical_retirement_committed=(
-                status_state.get('logical_retirement_committed') if type(
-                    status_state.get('logical_retirement_committed')) is bool
-                else None),
-        )
-        return replica
-
-    def get_spot_location(self) -> spot_placer.Location | None:
-        return spot_placer.Location.from_pickleable(self.location)
-
-    def handle(
-        self,
-        cluster_record: dict[str, Any] | None = None
-    ) -> backends.CloudVmRayResourceHandle | None:
-        """Get the handle of the cluster.
-
-        Args:
-            cluster_record: The cluster record in the cluster table. If not
-                provided, will fetch the cluster record from the cluster table
-                based on the cluster name.
-        """
-        if cluster_record is None:
-            handle = global_user_state.get_handle_from_cluster_name(
-                self.cluster_name)
-        else:
-            handle = cluster_record['handle']
-        if handle is None:
-            return None
-        assert isinstance(handle, backends.CloudVmRayResourceHandle)
-        return handle
-
-    @property
-    def is_terminal(self) -> bool:
-        return self.status in serve_state.ReplicaStatus.terminal_statuses()
-
-    @property
-    def is_ready(self) -> bool:
-        return self.status == serve_state.ReplicaStatus.READY
-
-    def _resolve_url(
-        self,
-        cluster_record: Any = _NOT_PROVIDED,
-        handle: backends.CloudVmRayResourceHandle | None = None,
-        provider_config: dict[str, Any] | None = None,
-    ) -> str | None:
-        if handle is None:
-            if cluster_record is _NOT_PROVIDED:
-                handle = self.handle()
-            elif cluster_record is None:
-                return None
-            else:
-                handle = self.handle(cluster_record)
-        if handle is None:
-            return None
-        if self.replica_port == '-':
-            # This is a pool replica so there is no endpoint and it's filled
-            # with this dummy value. We return None here so that we can
-            # get the active ready replicas and perform autoscaling. Otherwise,
-            # would error out when trying to get the endpoint.
-            return None
-        replica_port_int = int(self.replica_port)
-        try:
-            endpoint_kwargs = {}
-            if (cluster_record is not _NOT_PROVIDED and
-                    cluster_record is not None):
-                endpoint_kwargs['cluster_record'] = cluster_record
-            if provider_config is not None:
-                endpoint_kwargs['provider_config'] = provider_config
-            endpoint_dict = backend_utils.get_endpoints(self.cluster_name,
-                                                        replica_port_int,
-                                                        **endpoint_kwargs)
-        except exceptions.ClusterNotUpError:
-            return None
-        endpoint = endpoint_dict.get(replica_port_int, None)
-        if not endpoint:
-            return None
-        assert isinstance(endpoint, str), endpoint
-        # If replica doesn't start with http or https, add the configured
-        # scheme. The LB reaches replicas over public IPs across clouds and
-        # regions, so this hop is https whenever replica TLS is enabled.
-        if not endpoint.startswith('http'):
-            scheme = ('https' if serve_utils.replica_tls_mode()
-                      != serve_constants.REPLICA_TLS_MODE_OFF else 'http')
-            endpoint = f'{scheme}://{endpoint}'
-        return endpoint
-
-    @property
-    def url(self) -> str | None:
-        return self._resolve_url()
-
-    @property
-    def status(self) -> serve_state.ReplicaStatus:
-        replica_status = self.status_property.to_replica_status()
-        if replica_status == serve_state.ReplicaStatus.UNKNOWN:
-            logger.error('Detecting UNKNOWN replica status for '
-                         f'replica {self.replica_id}.')
-        return replica_status
-
-    def to_info_dict(
-            self,
-            with_handle: bool,
-            with_url: bool = True,
-            cluster_record: Any = _NOT_PROVIDED,
-            rate_cache: dict[str, float] | None = None) -> dict[str, Any]:
-        """Build the dashboard/CLI view dict for this replica.
-
-        Args:
-            with_handle: include the (pickled) ResourceHandle and derived
-                cloud/region/resources_str fields.
-            with_url: resolve the replica endpoint via ``self.url`` (does a
-                cluster lookup itself). Off for pool views.
-            cluster_record: optional pre-fetched record from
-                ``global_user_state.get_cluster_from_name`` /
-                ``get_clusters_from_names``. Pass to avoid the per-replica
-                DB round-trip when iterating many replicas. Use
-                ``_NOT_PROVIDED`` (the default) to fall back to the
-                self-fetch path for backward compatibility (e.g. ``__repr__``
-                still works without changes).
-            rate_cache: optional per-status-request pricing cache shared by
-                replicas with identical launched resources.
-        """
-        if cluster_record is _NOT_PROVIDED:
-            cluster_record = global_user_state.get_cluster_from_name(
-                self.cluster_name,
-                include_user_info=False,
-                summary_response=True)
-        # Resolve the handle once. When the cluster row is missing, the
-        # handle is also missing (they live in the same row), so
-        # short-circuit to avoid an extra DB lookup.
-        if cluster_record is None:
-            handle = None
-        else:
-            handle = self.handle(cluster_record)
-        created_at = getattr(self, 'created_at', None)
-        ready_at = self.status_property.first_ready_time
-        # ``-1`` is the persisted sentinel for an exhausted initial-delay
-        # window, not a successful readiness probe.
-        if ready_at is not None and ready_at < 0:
-            ready_at = None
-        time_to_ready_seconds = None
-        if (created_at is not None and ready_at is not None and
-                ready_at >= created_at):
-            # End-to-end launch latency: replica row creation -> first
-            # successful readiness probe. This includes placement queueing,
-            # cloud provisioning, setup, and application startup.
-            time_to_ready_seconds = ready_at - created_at
-        info_dict = {
-            'replica_id': self.replica_id,
-            'name': self.cluster_name,
-            'status': self.status,
-            'version': self.version,
-            'replica_info_version': self._version,
-            # Immutable logical width selected when this physical backend was
-            # placed. It is one for ordinary and legacy physical replicas.
-            'planned_capacity': int(getattr(self, 'planned_capacity', 1)),
-            'endpoint':
-                (self._resolve_url(cluster_record=cluster_record, handle=handle)
-                 if with_url else None),
-            'is_spot': self.is_spot,
-            'launched_at': (cluster_record['launched_at']
-                            if cluster_record is not None else None),
-            'ready_at': ready_at,
-            'time_to_ready_seconds': time_to_ready_seconds,
-        }
-        # Always populate the small derived strings — new clients read
-        # these instead of touching the handle, and the cost is just a
-        # dict lookup + isinstance on a cluster_record we already have.
-        if handle is not None and handle.launched_resources is not None:
-            info_dict['cloud'] = repr(handle.launched_resources.cloud)
-            info_dict['region'] = handle.launched_resources.region
-            hourly_cost, exclusion_reason = (
-                estimated_spend.estimate_hourly_cost(handle.launched_resources,
-                                                     handle.launched_nodes,
-                                                     rate_cache))
-            info_dict['hourly_cost'] = hourly_cost
-            info_dict['hourly_cost_exclusion_reason'] = exclusion_reason
-            simple, full = resources_utils.get_readable_resources_repr(
-                handle, simplified_only=False)
-            info_dict['resources_str'] = simple
-            info_dict['resources_str_full'] = (full
-                                               if full is not None else simple)
-            info_dict['infra'] = handle.launched_resources.infra.formatted_str()
-        else:
-            # A placer-selected location exists before the replica has a
-            # cluster handle, including while it is PENDING or early
-            # PROVISIONING. Publish it through the existing placement fields
-            # so status consumers can account for every replica by
-            # cloud/region. Avoid reconstructing it for launched replicas,
-            # whose resources above are authoritative.
-            location = self.get_spot_location()
-            if location is not None:
-                cloud = repr(location.cloud)
-                info_dict['cloud'] = cloud
-                info_dict['region'] = location.region
-                info_dict['infra'] = f'{cloud} ({location.region})'
-        if with_handle:
-            info_dict['handle'] = handle
-        return info_dict
-
-    def __repr__(self) -> str:
-        show_details = env_options.Options.SHOW_DEBUG_INFO.get()
-        info_dict = self.to_info_dict(with_handle=show_details,
-                                      with_url=show_details)
-        handle_str = ''
-        if 'handle' in info_dict:
-            handle_str = f', handle={info_dict["handle"]}'
-        info = (f'ReplicaInfo(replica_id={self.replica_id}, '
-                f'cluster_name={self.cluster_name}, '
-                f'version={self.version}, '
-                f'replica_port={self.replica_port}, '
-                f'is_spot={self.is_spot}, '
-                f'location={self.location}, '
-                f'status={self.status}, '
-                f'launched_at={info_dict["launched_at"]}{handle_str})')
-        return info
-
-    def probe_pool(self) -> tuple['ReplicaInfo', bool, float]:
-        """Probe the replica for pool management.
-
-        This function will check the first job status of the cluster, which is a
-        dummy job that only echoes "setup done". The success of this job means
-        the setup command is done and the replica is ready to be used. Check
-        sky/serve/server/core.py::up for more details.
-
-        Returns:
-            Tuple of (self, is_ready, probe_time).
-        """
-        probe_time = time.time()
-        try:
-            handle = backend_utils.check_cluster_available(
-                self.cluster_name, operation='probing pool')
-            if handle is None:
-                return self, False, probe_time
-            backend = backend_utils.get_backend_from_handle(handle)
-            statuses = backend.get_job_status(handle, [1], stream_logs=False)
-            if statuses[1] == job_lib.JobStatus.SUCCEEDED:
-                return self, True, probe_time
-            return self, False, probe_time
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error(f'Error when probing pool of {self.cluster_name}: '
-                         f'{common_utils.format_exception(e)}.')
-            return self, False, probe_time
-
-    def probe(
-        self,
-        readiness_path: str,
-        post_data: dict[str, Any] | None,
-        timeout: int,
-        headers: dict[str, str] | None,
-        resolved_url: Any = _NOT_PROVIDED,
-    ) -> tuple['ReplicaInfo', bool, float]:
-        """Probe the readiness of the replica.
-
-        Returns:
-            Tuple of (self, is_ready, probe_time).
-        """
-        url = self.url if resolved_url is _NOT_PROVIDED else resolved_url
-        assert url is None or isinstance(url, str), url
-        replica_identity = f'replica {self.replica_id} with url {url}'
-        # TODO(tian): This requiring the clock on each replica to be aligned,
-        # which may not be true when the GCP VMs have run for a long time. We
-        # should have a better way to do this. See #2539 for more information.
-        probe_time = time.time()
-        try:
-            msg = ''
-            if url is None:
-                logger.info(f'Error when probing {replica_identity}: '
-                            'Cannot get the endpoint.')
-                return self, False, probe_time
-            readiness_path = (f'{url}{readiness_path}')
-            logger.info(f'Probing {replica_identity} with {readiness_path}.')
-            # This probe is a second, independent client on the same hop as the
-            # load balancer's proxy. It decides readiness, so if it cannot
-            # complete the TLS handshake every healthy replica is marked
-            # NOT_READY and the controller tears down live capacity. It must
-            # therefore trust exactly what the proxy trusts.
-            # With TLS off this IS the `requests` module, so the default
-            # path is unchanged; under TLS it is a session carrying the same
-            # trust the proxy uses.
-            client = replica_tls.probe_client()
-            if post_data is not None:
-                msg += 'POST'
-                response = client.post(readiness_path,
-                                       json=post_data,
-                                       headers=headers,
-                                       timeout=timeout)
-            else:
-                msg += 'GET'
-                response = client.get(readiness_path,
-                                      headers=headers,
-                                      timeout=timeout)
-            msg += (f' request to {replica_identity} returned status '
-                    f'code {response.status_code}')
-            if response.status_code == 200:
-                msg += '.'
-                log_method = logger.info
-            else:
-                msg += f' and response {response.text}.'
-                msg = f'{colorama.Fore.YELLOW}{msg}{colorama.Style.RESET_ALL}'
-                log_method = logger.error
-            log_method(msg)
-            if response.status_code == 200:
-                logger.debug(f'{replica_identity.capitalize()} is ready.')
-                return self, True, probe_time
-        except Exception as e:  # pylint: disable=broad-except
-            # Catch all errors, not just RequestException: probe inputs
-            # (readiness path/headers/post data) come from user YAML and can
-            # make the HTTP stack raise e.g. UnicodeEncodeError or ValueError.
-            # An escaping exception aborts the whole probe round when the
-            # prober drains futures, stalling status updates for every
-            # replica on each tick.
-            logger.error(
-                f'{colorama.Fore.YELLOW}Error when probing {replica_identity}:'
-                f' {common_utils.format_exception(e)}.'
-                f'{colorama.Style.RESET_ALL}')
-        return self, False, probe_time
-
-    def __setstate__(self, state):
-        """Set state from pickled state, for backward compatibility."""
-        version = state.pop('_version', None)
-        # Handle old version(s) here.
-        if version is None:
-            version = -1
-
-        if version < 0:
-            # It will be handled with RequestRateAutoscaler.
-            # Treated similar to on-demand instances.
-            self.is_spot = False
-
-        if version < 1:
-            self.location = None
-
-        if version < 2:
-            self.resources_override = None
-
-        if version < 4:
-            # Pre-upgrade rows carry no creation time. None deliberately
-            # reads as "older than any fill snapshot" in
-            # Autoscaler._fill_row_occupies_free_slot: these rows predate
-            # the build, their bound pods are already excluded by fresh
-            # polls, and treating them as new would debit free slots for
-            # their whole lifetime.
-            self.created_at = None
-
-        if version < 5:
-            # Pre-broker rows carry no launch-origin flag. False reads as
-            # demand-placed: they keep their scale-down shelter and stay
-            # exempt from the broker's grant ceiling until natural churn
-            # replaces them with flagged rows -- the conservative
-            # direction for a live fleet crossing the upgrade.
-            self.reserved_fill = False
-
-        if version < 11:
-            # Old rows do not contain authoritative cost provenance. False is
-            # conservative: it preserves correctness and only forgoes the new
-            # economic tie-break until natural replacement.
-            self.is_zero_cost = False
-
-        state.setdefault('cost_rebalance_for_replica_id', None)
-        state.setdefault('paid_capacity_pool_key', None)
-
-        if version < 7:
-            # Rows written before version 7 carry the full list of failed
-            # probe timestamps; only its first entry was ever read (the
-            # window is first-failure -> current probe time), so migrate
-            # to the single timestamp.
-            failure_times = state.pop('consecutive_failure_times', [])
-            self.first_consecutive_failure_time = (failure_times[0]
-                                                   if failure_times else None)
-
-        if version < 8:
-            # Historical rows represent one physical replica. They are never
-            # inferred into logical mode during activation; the rolling bridge
-            # launches a new logical service version instead.
-            self.planned_capacity = 1
-
-        self.__dict__.update(state)
-        self._version = version if version >= 0 else 0
-
-
 class ReplicaManager:
     """Each replica manager monitors one service."""
 
@@ -2034,14 +1384,24 @@ class ReplicaManager:
         self.lock = threading.Lock()
         self._next_replica_id: int = 1
         self._service_name: str = service_name
+        self._changed_only_readiness_persistence = (
+            _changed_only_readiness_persistence_enabled())
         service_record = serve_state.get_service_from_name(service_name)
         if service_record is not None:
             self._workspace = serve_utils.resolve_service_workspace(
                 service_name, service_record,
                 skypilot_config.get_active_workspace())
+            resource_action_mode = service_record.get('resource_action_mode',
+                                                      'legacy')
         else:
             self._workspace = (skypilot_config.get_active_workspace() or
                                constants.SKYPILOT_DEFAULT_WORKSPACE)
+            resource_action_mode = 'legacy'
+        if resource_action_mode not in ('legacy', 'shadow', 'authoritative'):
+            raise RuntimeError(
+                f'Service {service_name!r} has an invalid resource-action '
+                'mode.')
+        self._resource_action_mode = resource_action_mode
         self._resource_scope = resource_scope
         self._service_hash = service_hash
         self._controller_owner = ((controller_pid,
@@ -2090,6 +1450,73 @@ class ReplicaManager:
 
         # Newest version among the currently provisioned and launched replicas
         self.latest_version: int = version
+        # Published only after an autoscaler decision tick has produced an
+        # authoritative target. None preserves failure reporting across
+        # controller startup and version transitions until that first tick.
+        self._target_num_replicas_lock = threading.Lock()
+        self._target_num_replicas: int | None = None
+        self._target_num_replicas_generation = 0
+        # Status writes are serialized only with applied-version transitions,
+        # not with autoscaler target publication. This keeps scaling responsive
+        # while preventing an old probe from committing across an update.
+        # Lock order is self.lock -> status epoch -> target; never reverse it.
+        self._status_epoch_lock = threading.Lock()
+        self._status_epoch_generation = 0
+
+    def _get_target_num_replicas_lock(self):
+        lock = getattr(self, '_target_num_replicas_lock', None)
+        if lock is None:
+            # Compatibility for embedders and tests that construct a manager
+            # without running the current base constructor.
+            lock = threading.Lock()
+            self._target_num_replicas_lock = lock
+        return lock
+
+    def _get_status_epoch_lock(self):
+        lock = getattr(self, '_status_epoch_lock', None)
+        if lock is None:
+            # Compatibility for embedders and tests that construct a manager
+            # without running the current base constructor.
+            lock = threading.Lock()
+            self._status_epoch_lock = lock
+        return lock
+
+    def publish_target_num_replicas(self, target_num_replicas: int | None,
+                                    expected_version: int) -> bool:
+        """Publish autoscaler intent for target-aware status aggregation."""
+        if (target_num_replicas is not None and
+            (type(target_num_replicas) is not int or  # pylint: disable=unidiomatic-typecheck
+             target_num_replicas < 0)):
+            raise ValueError(
+                'target_num_replicas must be a nonnegative integer '
+                'or None.')
+        with self._get_target_num_replicas_lock():
+            if expected_version != self.latest_version:
+                return False
+            if target_num_replicas != getattr(self, '_target_num_replicas',
+                                              None):
+                self._target_num_replicas_generation = getattr(
+                    self, '_target_num_replicas_generation', 0) + 1
+            self._target_num_replicas = target_num_replicas
+            return True
+
+    def get_target_num_replicas(self) -> int | None:
+        """Return the latest version-fenced authoritative autoscaler target."""
+        with self._get_target_num_replicas_lock():
+            return getattr(self, '_target_num_replicas', None)
+
+    def _transition_status_epoch_for_version(
+            self, version: int, update_mode: serve_utils.UpdateMode) -> None:
+        """Atomically advance status aggregation to a new applied version."""
+        with self._get_status_epoch_lock():
+            with self._get_target_num_replicas_lock():
+                self._target_num_replicas = None
+                self._target_num_replicas_generation = getattr(
+                    self, '_target_num_replicas_generation', 0) + 1
+                self.latest_version = version
+                self._update_mode = update_mode
+                self._status_epoch_generation = getattr(
+                    self, '_status_epoch_generation', 0) + 1
 
     def update_lb_in_flight(self,
                             in_flight_by_url: dict[str, int] | None,
@@ -2297,6 +1724,14 @@ class ReplicaManager:
     def clear_pending_version(self, version: int) -> None:
         """Clear a previously announced pending version."""
 
+    def clear_scale_reconciliation_signal(self) -> None:
+        """Prepare an ordinary autoscaler tick to consume prior feedback."""
+
+    def wait_for_scale_reconciliation(self, timeout_seconds: float) -> bool:
+        """Wait for feedback or the ordinary autoscaler interval."""
+        time.sleep(timeout_seconds)
+        return False
+
     def scale_down(self,
                    replica_id: int,
                    purge: bool = False,
@@ -2350,6 +1785,30 @@ class ReplicaManager:
         """Get the urls of the active replicas."""
         raise NotImplementedError
 
+    def system_recovery_allows_routing(self, info: 'ReplicaInfo') -> bool:
+        """Whether recovery state permits a READY row to route."""
+        del info
+        return True
+
+    def system_recovery_route_marker(
+            self, info: 'ReplicaInfo',
+            route_url: str) -> 'system_recovery_route_lease.RouteMarker | None':
+        """Return a closed capable-route marker, or no usable marker."""
+        del info, route_url
+        return None
+
+    def system_recovery_route_lease_snapshot(self) -> dict[str, Any]:
+        """Return the closed v1 heartbeat payload for external LBs."""
+        return {
+            'version':
+                serve_constants.SYSTEM_RECOVERY_ROUTE_LEASE_PROTOCOL_VERSION,
+            'entries': [],
+        }
+
+    def retire_system_recovery_route(self, info: 'ReplicaInfo') -> None:
+        """Permanently retire one exact row after route ambiguity."""
+        del info
+
     @property
     def _drain_proof_stats(self) -> 'drain_observability.DrainProofStats':
         """Process-local drain/retirement counters, lazily created.
@@ -2374,6 +1833,67 @@ class ReplicaManager:
         return self._drain_proof_stats.snapshot()
 
 
+@dataclasses.dataclass
+class _LegacyReplicaMutationRuntime:
+    """Process-local owner for the legacy/shadow replica mutation path.
+
+    This is a behavior-preserving removal seam, not the durable action runtime.
+    Authoritative launch/down cannot use these pools, request associations, or
+    retry clocks once M4 exists. Keeping them behind one object lets the M5
+    cleanup delete a named runtime instead of rediscovering state spread across
+    ``SkyPilotReplicaManager``.
+    """
+
+    launch_completion_queue: queue.SimpleQueue[int] = dataclasses.field(
+        default_factory=queue.SimpleQueue)
+    launch_completion_event: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+    launch_thread_pool: thread_utils.ThreadSafeDict[
+        int, thread_utils.SafeThread] = dataclasses.field(
+            default_factory=thread_utils.ThreadSafeDict)
+    replica_to_request_id: thread_utils.ThreadSafeDict[
+        int,
+        str] = dataclasses.field(default_factory=thread_utils.ThreadSafeDict)
+    replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
+        int,
+        bool] = dataclasses.field(default_factory=thread_utils.ThreadSafeDict)
+    replica_to_logical_launch_fence: thread_utils.ThreadSafeDict[
+        int, LogicalTargetState] = dataclasses.field(
+            default_factory=thread_utils.ThreadSafeDict)
+    down_thread_pool: thread_utils.ThreadSafeDict[
+        int, thread_utils.SafeThread] = dataclasses.field(
+            default_factory=thread_utils.ThreadSafeDict)
+    failed_cleanup_retry_attempts: dict[int, int] = dataclasses.field(
+        default_factory=dict)
+    failed_cleanup_retry_at: dict[int, float] = dataclasses.field(
+        default_factory=dict)
+
+    def recover(self, recover: Callable[[], None]) -> None:
+        """Run legacy status-inference recovery through the removal seam."""
+        recover()
+
+    def refresh(self, refresh: Callable[[], None]) -> None:
+        """Run legacy thread completion through the removal seam."""
+        refresh()
+
+    def clear_failed_cleanup_retry(self, replica_id: int) -> None:
+        """Forget process-local cleanup rate limiting after success."""
+        self.failed_cleanup_retry_attempts.pop(replica_id, None)
+        self.failed_cleanup_retry_at.pop(replica_id, None)
+
+    def schedule_failed_cleanup_retry(self, replica_id: int,
+                                      now: float) -> tuple[int, float]:
+        """Record one process-local retry and return attempt and delay."""
+        attempt = self.failed_cleanup_retry_attempts.get(replica_id, 0) + 1
+        self.failed_cleanup_retry_attempts[replica_id] = attempt
+        exponential_step = min(attempt - 1, 30)
+        delay_seconds = min(
+            _FAILED_CLEANUP_RETRY_BASE_SECONDS * 2**exponential_step,
+            _FAILED_CLEANUP_RETRY_MAX_SECONDS)
+        self.failed_cleanup_retry_at[replica_id] = now + delay_seconds
+        return attempt, delay_seconds
+
+
 class SkyPilotReplicaManager(ReplicaManager):
     """Replica Manager for SkyPilot clusters.
 
@@ -2385,6 +1905,236 @@ class SkyPilotReplicaManager(ReplicaManager):
         (3) _replica_prober: Do readiness probe to the replicas to monitor
             whether it is still responding to requests.
     """
+
+    _scale_reconciliation_event: threading.Event
+    _LEGACY_MUTATION_RUNTIME_INIT_LOCK = threading.Lock()
+
+    _LEGACY_MUTATION_FIELD_MAP = {
+        '_launch_completion_queue': 'launch_completion_queue',
+        '_launch_completion_event': 'launch_completion_event',
+        '_launch_thread_pool': 'launch_thread_pool',
+        '_replica_to_request_id': 'replica_to_request_id',
+        '_replica_to_launch_cancelled': 'replica_to_launch_cancelled',
+        '_replica_to_logical_launch_fence': 'replica_to_logical_launch_fence',
+        '_down_thread_pool': 'down_thread_pool',
+        '_failed_cleanup_retry_attempts': 'failed_cleanup_retry_attempts',
+        '_failed_cleanup_retry_at': 'failed_cleanup_retry_at',
+    }
+
+    def _publish_legacy_mutation_runtime_state(
+            self, runtime: _LegacyReplicaMutationRuntime) -> None:
+        """Publish one runtime and synchronized compatibility aliases."""
+        # Data-descriptor properties below remain the only read owner. Keeping
+        # identity-matched instance entries makes unittest.mock treat legacy
+        # instance patch points as local, so context teardown restores the
+        # captured value through the setter without retaining old worker pools.
+        for legacy_name, runtime_name in self._LEGACY_MUTATION_FIELD_MAP.items(
+        ):
+            self.__dict__[legacy_name] = getattr(runtime, runtime_name)
+        # Publish last. A caller that observes the runtime also observes every
+        # compatibility alias from the same critical section.
+        self.__dict__['_legacy_mutation_runtime'] = runtime
+
+    def _set_legacy_mutation_compat_field(self, legacy_name: str,
+                                          runtime_name: str,
+                                          value: Any) -> None:
+        """Keep a temporary instance patch point identical to its owner."""
+        runtime = self._legacy_mutation_runtime_state()
+        setattr(runtime, runtime_name, value)
+        self.__dict__[legacy_name] = value
+
+    def _reset_legacy_mutation_compat_field(
+            self, legacy_name: str, runtime_name: str,
+            default_factory: Callable[[], Any]) -> None:
+        """Recreate a deleted compatibility field with its historical type."""
+        self._set_legacy_mutation_compat_field(legacy_name, runtime_name,
+                                               default_factory())
+
+    def _legacy_mutation_runtime_state(self) -> _LegacyReplicaMutationRuntime:
+        """Return the legacy owner, adopting pre-refactor instance fields."""
+        runtime = self.__dict__.get('_legacy_mutation_runtime')
+        if runtime is not None:
+            if '_launch_completion_queue' not in self.__dict__:
+                # Lightweight tests and embedders may inject only the runtime.
+                # Repair their patch metadata once under the publication lock.
+                with self._LEGACY_MUTATION_RUNTIME_INIT_LOCK:
+                    runtime = self.__dict__['_legacy_mutation_runtime']
+                    self._publish_legacy_mutation_runtime_state(runtime)
+            return runtime
+        # Compatibility managers reconstructed without the current __init__
+        # can first touch this accessor from multiple daemon threads. Adopt and
+        # publish their old fields exactly once so a losing initializer cannot
+        # overwrite live queues, events, or workers with fresh defaults.
+        with self._LEGACY_MUTATION_RUNTIME_INIT_LOCK:
+            runtime = self.__dict__.get('_legacy_mutation_runtime')
+            if runtime is not None:
+                return runtime
+            runtime = _LegacyReplicaMutationRuntime()
+            for legacy_name, runtime_name in (
+                    self._LEGACY_MUTATION_FIELD_MAP.items()):
+                legacy_value = self.__dict__.get(legacy_name)
+                if legacy_value is not None:
+                    setattr(runtime, runtime_name, legacy_value)
+            self._publish_legacy_mutation_runtime_state(runtime)
+            return runtime
+
+    @property
+    def _launch_completion_queue(self) -> queue.SimpleQueue[int]:
+        return self._legacy_mutation_runtime_state().launch_completion_queue
+
+    @_launch_completion_queue.setter
+    def _launch_completion_queue(self, value: queue.SimpleQueue[int]) -> None:
+        self._set_legacy_mutation_compat_field('_launch_completion_queue',
+                                               'launch_completion_queue', value)
+
+    @_launch_completion_queue.deleter
+    def _launch_completion_queue(self) -> None:
+        self._reset_legacy_mutation_compat_field('_launch_completion_queue',
+                                                 'launch_completion_queue',
+                                                 queue.SimpleQueue)
+
+    @property
+    def _launch_completion_event(self) -> threading.Event:
+        return self._legacy_mutation_runtime_state().launch_completion_event
+
+    @_launch_completion_event.setter
+    def _launch_completion_event(self, value: threading.Event) -> None:
+        self._set_legacy_mutation_compat_field('_launch_completion_event',
+                                               'launch_completion_event', value)
+
+    @_launch_completion_event.deleter
+    def _launch_completion_event(self) -> None:
+        self._reset_legacy_mutation_compat_field('_launch_completion_event',
+                                                 'launch_completion_event',
+                                                 threading.Event)
+
+    @property
+    def _launch_thread_pool(
+            self) -> thread_utils.ThreadSafeDict[int, thread_utils.SafeThread]:
+        return self._legacy_mutation_runtime_state().launch_thread_pool
+
+    @_launch_thread_pool.setter
+    def _launch_thread_pool(
+        self,
+        value: thread_utils.ThreadSafeDict[int,
+                                           thread_utils.SafeThread]) -> None:
+        self._set_legacy_mutation_compat_field('_launch_thread_pool',
+                                               'launch_thread_pool', value)
+
+    @_launch_thread_pool.deleter
+    def _launch_thread_pool(self) -> None:
+        self._reset_legacy_mutation_compat_field('_launch_thread_pool',
+                                                 'launch_thread_pool',
+                                                 thread_utils.ThreadSafeDict)
+
+    @property
+    def _replica_to_request_id(self) -> thread_utils.ThreadSafeDict[int, str]:
+        return self._legacy_mutation_runtime_state().replica_to_request_id
+
+    @_replica_to_request_id.setter
+    def _replica_to_request_id(
+            self, value: thread_utils.ThreadSafeDict[int, str]) -> None:
+        self._set_legacy_mutation_compat_field('_replica_to_request_id',
+                                               'replica_to_request_id', value)
+
+    @_replica_to_request_id.deleter
+    def _replica_to_request_id(self) -> None:
+        self._reset_legacy_mutation_compat_field('_replica_to_request_id',
+                                                 'replica_to_request_id',
+                                                 thread_utils.ThreadSafeDict)
+
+    @property
+    def _replica_to_launch_cancelled(
+            self) -> thread_utils.ThreadSafeDict[int, bool]:
+        return self._legacy_mutation_runtime_state().replica_to_launch_cancelled
+
+    @_replica_to_launch_cancelled.setter
+    def _replica_to_launch_cancelled(
+            self, value: thread_utils.ThreadSafeDict[int, bool]) -> None:
+        self._set_legacy_mutation_compat_field('_replica_to_launch_cancelled',
+                                               'replica_to_launch_cancelled',
+                                               value)
+
+    @_replica_to_launch_cancelled.deleter
+    def _replica_to_launch_cancelled(self) -> None:
+        self._reset_legacy_mutation_compat_field('_replica_to_launch_cancelled',
+                                                 'replica_to_launch_cancelled',
+                                                 thread_utils.ThreadSafeDict)
+
+    @property
+    def _replica_to_logical_launch_fence(
+            self) -> thread_utils.ThreadSafeDict[int, LogicalTargetState]:
+        return (self._legacy_mutation_runtime_state().
+                replica_to_logical_launch_fence)
+
+    @_replica_to_logical_launch_fence.setter
+    def _replica_to_logical_launch_fence(
+            self,
+            value: thread_utils.ThreadSafeDict[int,
+                                               LogicalTargetState]) -> None:
+        self._set_legacy_mutation_compat_field(
+            '_replica_to_logical_launch_fence',
+            'replica_to_logical_launch_fence', value)
+
+    @_replica_to_logical_launch_fence.deleter
+    def _replica_to_logical_launch_fence(self) -> None:
+        self._reset_legacy_mutation_compat_field(
+            '_replica_to_logical_launch_fence',
+            'replica_to_logical_launch_fence', thread_utils.ThreadSafeDict)
+
+    @property
+    def _down_thread_pool(
+            self) -> thread_utils.ThreadSafeDict[int, thread_utils.SafeThread]:
+        return self._legacy_mutation_runtime_state().down_thread_pool
+
+    @_down_thread_pool.setter
+    def _down_thread_pool(
+        self,
+        value: thread_utils.ThreadSafeDict[int,
+                                           thread_utils.SafeThread]) -> None:
+        self._set_legacy_mutation_compat_field('_down_thread_pool',
+                                               'down_thread_pool', value)
+
+    @_down_thread_pool.deleter
+    def _down_thread_pool(self) -> None:
+        self._reset_legacy_mutation_compat_field('_down_thread_pool',
+                                                 'down_thread_pool',
+                                                 thread_utils.ThreadSafeDict)
+
+    @property
+    def _failed_cleanup_retry_attempts(self) -> dict[int, int]:
+        return (
+            self._legacy_mutation_runtime_state().failed_cleanup_retry_attempts)
+
+    @_failed_cleanup_retry_attempts.setter
+    def _failed_cleanup_retry_attempts(self, value: dict[int, int]) -> None:
+        self._set_legacy_mutation_compat_field('_failed_cleanup_retry_attempts',
+                                               'failed_cleanup_retry_attempts',
+                                               value)
+
+    @_failed_cleanup_retry_attempts.deleter
+    def _failed_cleanup_retry_attempts(self) -> None:
+        self._reset_legacy_mutation_compat_field(
+            '_failed_cleanup_retry_attempts', 'failed_cleanup_retry_attempts',
+            dict)
+
+    @property
+    def _failed_cleanup_retry_at(self) -> dict[int, float]:
+        return self._legacy_mutation_runtime_state().failed_cleanup_retry_at
+
+    @_failed_cleanup_retry_at.setter
+    def _failed_cleanup_retry_at(self, value: dict[int, float]) -> None:
+        self._set_legacy_mutation_compat_field('_failed_cleanup_retry_at',
+                                               'failed_cleanup_retry_at', value)
+
+    @_failed_cleanup_retry_at.deleter
+    def _failed_cleanup_retry_at(self) -> None:
+        self._reset_legacy_mutation_compat_field('_failed_cleanup_retry_at',
+                                                 'failed_cleanup_retry_at',
+                                                 dict)
+
+    _candidate_release_monotonic_deadlines: dict[int, float]
+    _system_recovery_status_initialized: set[int]
 
     def _restore_spot_placement_state(self) -> None:
         """Restore durable exact-location benches once per manager process."""
@@ -2416,6 +2166,39 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'while persisting placement retry state.')
         placer.mark_retry_state_persisted()
 
+    def _launch_completion_state(
+        self,) -> tuple['queue.SimpleQueue[int]', threading.Event]:
+        """Return lazily compatible completion state for launch workers."""
+        runtime = self._legacy_mutation_runtime_state()
+        return (runtime.launch_completion_queue,
+                runtime.launch_completion_event)
+
+    def _join_notified_launch_workers(self) -> None:
+        """Join completion callbacks before the reducer checks is_alive()."""
+        completion_queue, _ = self._launch_completion_state()
+        while True:
+            try:
+                replica_id = completion_queue.get_nowait()
+            except queue.Empty:
+                return
+            worker = self._launch_thread_pool.get(replica_id)
+            if worker is not None and worker is not threading.current_thread():
+                worker.join()
+
+    def clear_scale_reconciliation_signal(self) -> None:
+        """Clear feedback before a tick that will read durable state."""
+        event = getattr(self, '_scale_reconciliation_event', None)
+        if event is not None:
+            event.clear()
+
+    def wait_for_scale_reconciliation(self, timeout_seconds: float) -> bool:
+        """Wait interruptibly for committed typed provider feedback."""
+        event = getattr(self, '_scale_reconciliation_event', None)
+        if event is None:
+            time.sleep(timeout_seconds)
+            return False
+        return event.wait(timeout_seconds)
+
     def _db_fence_kwargs(self) -> dict[str, Any]:
         """Exact owner predicates, omitted for legacy/direct test managers."""
         kwargs: dict[str, Any] = {}
@@ -2426,6 +2209,42 @@ class SkyPilotReplicaManager(ReplicaManager):
         if controller_owner is not None:
             kwargs['expected_controller_owner'] = controller_owner
         return kwargs
+
+    def _resource_action_fence_kwargs(self) -> dict[str, Any] | None:
+        """Snapshot the current fence for a later locked action admission.
+
+        A lifecycle epoch fences one API lifecycle operation; it is not a
+        stable controller credential and legitimately advances during updates.
+        The action store revalidates this optimistic snapshot under the
+        service-row lock, so a concurrent advance safely rejects admission.
+        """
+        service_hash = getattr(self, '_service_hash', None)
+        controller_owner = getattr(self, '_controller_owner', None)
+        if service_hash is None or controller_owner is None:
+            return None
+        try:
+            owner = serve_state.get_service_controller_owner(self._service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Failed to snapshot the current resource-action '
+                           f'fence: {common_utils.format_exception(e)}')
+            return None
+        if owner is None:
+            return None
+        service_status = owner.get('status')
+        if (owner.get('hash') != service_hash or
+            (owner.get('controller_pid'),
+             owner.get('controller_ip')) != controller_owner or
+                not isinstance(service_status, serve_state.ServiceStatus) or
+                service_status in
+                serve_state.ServiceStatus.replica_launch_blocking_statuses()):
+            return None
+        lifecycle_epoch = owner.get('lifecycle_epoch')
+        if (type(lifecycle_epoch) is not int or lifecycle_epoch <= 0):
+            return None
+        return {
+            'expected_controller_owner': controller_owner,
+            'expected_lifecycle_epoch': lifecycle_epoch,
+        }
 
     def _service_launch_authorization(self) -> bool | None:
         """Return True/False for proven authority/loss, None if unverifiable."""
@@ -2456,6 +2275,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
         if not authorized and ownership_lost is not None:
             ownership_lost.set()
+            completion_event = getattr(self, '_launch_completion_event', None)
+            if completion_event is not None:
+                completion_event.set()
         return authorized
 
     def _service_is_launch_authorized(self) -> bool:
@@ -2514,23 +2336,501 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'refusing queued launches.')
                 return
 
+    @staticmethod
+    def _has_system_recovery_teardown_intent(info: ReplicaInfo) -> bool:
+        status = info.status_property
+        return bool(info.is_terminal or status.preempted or status.purged or
+                    status.is_scale_down or status.sky_down_status is not None)
+
+    def _initialize_system_recovery_process_guards(
+            self, infos: list[ReplicaInfo]) -> list[ReplicaInfo]:
+        """Rebuild conservative monotonic/startup barriers after restart."""
+        monotonic_now = time.monotonic()
+        wall_now = time.time()
+        self._prune_system_recovery_process_guards(infos)
+        deadlines = getattr(self, '_candidate_release_monotonic_deadlines',
+                            None)
+        if deadlines is None:
+            deadlines = {}
+            self._candidate_release_monotonic_deadlines = deadlines
+        if getattr(self, '_system_recovery_status_initialized', None) is None:
+            self._system_recovery_status_initialized = set()
+        changed = False
+        for info in infos:
+            if info.system_recovery_quarantine is not None:
+                continue
+            disposition = info.system_recovery_disposition
+            if (disposition
+                    == system_recovery_state.SystemRecoveryDisposition.CANDIDATE
+                    and info.candidate_ready_observed_at is not None):
+                # A process replacement can never prove continuity with the
+                # old monotonic clock, so every unresolved anchored candidate
+                # waits a complete fresh guard.
+                deadlines[info.replica_id] = (
+                    monotonic_now +
+                    system_recovery_state.CANDIDATE_RELEASE_GUARD_SECONDS)
+            if (disposition
+                    == system_recovery_state.SystemRecoveryDisposition.CANDIDATE
+                    and info.status_property.service_ready_now):
+                info.status_property.service_ready_now = False
+                self._persist_replica(info.replica_id, info)
+                changed = True
+            if (disposition
+                    != system_recovery_state.SystemRecoveryDisposition.CAPABLE
+                    or info.system_recovery is None or
+                    info.system_recovery.state
+                    == system_recovery_state.ControllerRecoveryState.EXHAUSTED
+                    or self._has_system_recovery_teardown_intent(info)):
+                continue
+
+            def _start_barrier(fresh: ReplicaInfo) -> bool:
+                if (fresh.system_recovery_disposition != system_recovery_state.
+                        SystemRecoveryDisposition.CAPABLE or
+                        fresh.system_recovery is None or
+                        fresh.system_recovery.state == system_recovery_state.
+                        ControllerRecoveryState.EXHAUSTED or
+                        self._has_system_recovery_teardown_intent(fresh)):
+                    return False
+                fresh.system_recovery = dataclasses.replace(
+                    fresh.system_recovery, status_barrier_started_at=wall_now)
+                return True
+
+            updated = self._patch_system_recovery_with_latest(
+                info.replica_id, _start_barrier)
+            if updated is not None:
+                if updated.status_property.service_ready_now:
+                    updated.status_property.service_ready_now = False
+                    self._persist_replica(updated.replica_id, updated)
+                changed = True
+        if changed:
+            return serve_state.get_replica_infos(self._service_name)
+        return infos
+
+    def _prune_system_recovery_process_guards(self,
+                                              infos: list[ReplicaInfo]) -> None:
+        """Bound process-local recovery guards to their live durable rows."""
+        candidate_ids = {
+            info.replica_id
+            for info in infos
+            if (info.system_recovery_quarantine is None and
+                info.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.CANDIDATE and
+                not self._has_system_recovery_teardown_intent(info))
+        }
+        deadlines = getattr(self, '_candidate_release_monotonic_deadlines',
+                            None)
+        if deadlines is None:
+            self._candidate_release_monotonic_deadlines = {}
+        else:
+            self._candidate_release_monotonic_deadlines = {
+                replica_id: deadline
+                for replica_id, deadline in deadlines.items()
+                if replica_id in candidate_ids
+            }
+
+        capable_ids = {
+            info.replica_id
+            for info in infos
+            if (info.system_recovery_quarantine is None and
+                info.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE and
+                info.system_recovery is not None and info.system_recovery.state
+                != system_recovery_state.ControllerRecoveryState.EXHAUSTED and
+                not self._has_system_recovery_teardown_intent(info))
+        }
+        initialized = getattr(self, '_system_recovery_status_initialized', None)
+        if initialized is None:
+            self._system_recovery_status_initialized = set()
+        else:
+            initialized.intersection_update(capable_ids)
+
+    def _suspend_system_recovery_route_if_unroutable(
+        self, info: ReplicaInfo
+    ) -> system_recovery_route_lease.RouteSuspension | None:
+        """Reversibly omit one exact row around an off-route DB mutation."""
+        if (info.system_recovery_disposition
+                != system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+            return None
+        if (info.status == serve_state.ReplicaStatus.READY and
+                self.system_recovery_allows_routing(info)):
+            return None
+        return self._route_lease_registry().suspend_record(
+            info.replica_id, info.replica_record_id)
+
+    def _commit_system_recovery_route_suspensions(
+            self, suspensions: list[system_recovery_route_lease.RouteSuspension]
+    ) -> None:
+        for suspension in suspensions:
+            self._route_lease_registry().commit_suspension(suspension)
+
+    def _rollback_system_recovery_route_suspensions(
+            self, suspensions: list[system_recovery_route_lease.RouteSuspension]
+    ) -> None:
+        for suspension in suspensions:
+            self._route_lease_registry().rollback_suspension(suspension)
+
+    def _resolve_ambiguous_system_recovery_route_suspensions(
+            self, suspensions: list[system_recovery_route_lease.RouteSuspension]
+    ) -> None:
+        """Resolve holds after a DB exception without reviving stale routes.
+
+        An exception can be raised before commit or after a successful commit.
+        Rollback is therefore allowed only when a fresh durable read proves
+        that this controller still owns the service and every exact suspended
+        generation remains a routable row.  Every unproven hold is retired.
+        """
+        if not suspensions:
+            return
+        expected_service_hash = getattr(self, '_service_hash', None)
+        expected_controller_owner = getattr(self, '_controller_owner', None)
+        if (not isinstance(expected_service_hash, str) or
+                not expected_service_hash or
+                not isinstance(expected_controller_owner, tuple) or
+                len(expected_controller_owner) != 2):
+            self._commit_system_recovery_route_suspensions(suspensions)
+            return
+        try:
+            owner = serve_state.get_service_controller_owner(self._service_name)
+            if (not isinstance(owner, Mapping) or
+                    owner.get('hash') != expected_service_hash or
+                (owner.get('controller_pid'), owner.get('controller_ip'))
+                    != expected_controller_owner):
+                self._commit_system_recovery_route_suspensions(suspensions)
+                return
+            fresh_infos = serve_state.get_replica_infos_from_ids(
+                self._service_name,
+                sorted({suspension.replica_id for suspension in suspensions}))
+            if not isinstance(fresh_infos, Mapping):
+                self._commit_system_recovery_route_suspensions(suspensions)
+                return
+        except asyncio.CancelledError:
+            # A cancelled reconciliation must not strand a reversible hold or
+            # make an old generation routable again. Retire every suspended
+            # route, then preserve task cancellation semantics.
+            self._commit_system_recovery_route_suspensions(suspensions)
+            raise
+        except BaseException:  # pylint: disable=broad-exception-caught
+            self._commit_system_recovery_route_suspensions(suspensions)
+            return
+
+        for suspension in suspensions:
+            try:
+                fresh = fresh_infos.get(suspension.replica_id)
+                generation = (None if fresh is None else
+                              self._system_recovery_route_generation(fresh))
+                can_restore = (
+                    fresh is not None and
+                    fresh.replica_id == suspension.replica_id and
+                    fresh.replica_record_id
+                    == suspension.generation.replica_record_id and
+                    generation == suspension.generation and
+                    fresh.status == serve_state.ReplicaStatus.READY and
+                    self.system_recovery_allows_routing(fresh) and
+                    not self._has_system_recovery_teardown_intent(fresh))
+            except asyncio.CancelledError:
+                self._commit_system_recovery_route_suspensions(suspensions)
+                raise
+            except BaseException:  # pylint: disable=broad-exception-caught
+                can_restore = False
+            if can_restore:
+                self._route_lease_registry().rollback_suspension(suspension)
+            else:
+                self._route_lease_registry().commit_suspension(suspension)
+
     def _persist_replica(self, replica_id: int, info: ReplicaInfo) -> None:
+        suspension = self._suspend_system_recovery_route_if_unroutable(info)
+        try:
+            persisted = serve_state.add_or_update_replica(
+                self._service_name,
+                replica_id,
+                info,
+                **self._db_fence_kwargs(),
+                expected_replica_exists=True)
+        except BaseException:
+            if suspension is not None:
+                self._resolve_ambiguous_system_recovery_route_suspensions(
+                    [suspension])
+            raise
+        if persisted is False:
+            if suspension is not None:
+                self._route_lease_registry().commit_suspension(suspension)
+            raise RuntimeError(
+                f'Service {self._service_name!r} ownership changed or replica '
+                f'{replica_id} disappeared while persisting bookkeeping.')
+        if suspension is not None:
+            self._route_lease_registry().commit_suspension(suspension)
+
+    def _persist_new_replica(self, replica_id: int, info: ReplicaInfo) -> None:
+        """Persist an explicitly admitted initial replica row."""
         persisted = serve_state.add_or_update_replica(self._service_name,
                                                       replica_id, info,
                                                       **self._db_fence_kwargs())
         if persisted is False:
             raise RuntimeError(
                 f'Service {self._service_name!r} incarnation changed while '
-                f'persisting replica {replica_id}.')
+                f'admitting replica {replica_id}.')
+        # A successfully inserted recreation is now the live row even if a
+        # delayed callback still carries the same numeric replica ID.
+        self._route_lease_registry().observe_record_identity(
+            replica_id, info.replica_record_id)
 
-    def _persist_replicas(self,
-                          replica_infos: list[tuple[int, ReplicaInfo]]) -> None:
-        persisted = serve_state.add_or_update_replicas(
-            self._service_name, replica_infos, **self._db_fence_kwargs())
+    def _persist_replicas(
+        self,
+        replica_infos: list[tuple[int, ReplicaInfo]],
+        *,
+        route_suspensions: list[system_recovery_route_lease.RouteSuspension] |
+        None = None,
+    ) -> None:
+        """Persist a batch and resolve every route hold with its outcome.
+
+        ``route_suspensions`` transfers ownership of holds acquired before
+        this call.  In particular, the readiness probe uses them to omit a
+        route at the off-route decision instead of waiting until the later
+        batched write.  Do not acquire a nested hold for a transferred
+        replica: suspensions intentionally have no unique hold identifier, so
+        double resolution could consume another concurrent owner's hold.
+        """
+        suspensions = list(route_suspensions or ())
+        suspended_replica_ids = {
+            suspension.replica_id for suspension in suspensions
+        }
+        try:
+            for _, info in replica_infos:
+                if info.replica_id in suspended_replica_ids:
+                    continue
+                suspension = (
+                    self._suspend_system_recovery_route_if_unroutable(info))
+                if suspension is not None:
+                    suspensions.append(suspension)
+                    suspended_replica_ids.add(suspension.replica_id)
+        except BaseException:
+            self._rollback_system_recovery_route_suspensions(suspensions)
+            raise
+        try:
+            fence_kwargs = self._db_fence_kwargs()
+            if not replica_infos and suspensions:
+                fence_kwargs['validate_fence_on_empty'] = True
+            persisted = serve_state.add_or_update_replicas(
+                self._service_name,
+                replica_infos,
+                **fence_kwargs,
+                expected_replica_exists=True)
+        except BaseException:
+            self._resolve_ambiguous_system_recovery_route_suspensions(
+                suspensions)
+            raise
         if persisted is False:
+            self._commit_system_recovery_route_suspensions(suspensions)
             raise RuntimeError(
-                f'Service {self._service_name!r} incarnation changed while '
-                'persisting a replica batch.')
+                f'Service {self._service_name!r} ownership changed or an '
+                'expected replica disappeared while persisting a batch.')
+        self._commit_system_recovery_route_suspensions(suspensions)
+
+    def _system_recovery_mutation_fence(self) -> dict[str, Any] | None:
+        """Snapshot the exact owner/lifecycle tuple for one recovery CAS."""
+        service_hash = getattr(self, '_service_hash', None)
+        controller_owner = getattr(self, '_controller_owner', None)
+        if (not isinstance(service_hash, str) or not service_hash or
+                controller_owner is None):
+            return None
+        owner = serve_state.get_service_controller_owner(self._service_name)
+        if (owner is None or owner.get('hash') != service_hash or
+            (owner.get('controller_pid'), owner.get('controller_ip'))
+                != controller_owner):
+            return None
+        lifecycle_epoch = owner.get('lifecycle_epoch')
+        if (isinstance(lifecycle_epoch, bool) or
+                not isinstance(lifecycle_epoch, int) or lifecycle_epoch < 1):
+            return None
+        return {
+            'expected_service_hash': service_hash,
+            'expected_lifecycle_epoch': lifecycle_epoch,
+            'expected_controller_owner': controller_owner,
+        }
+
+    def _patch_system_recovery_with_latest(
+        self,
+        replica_id: int,
+        transition: Callable[[ReplicaInfo], bool],
+    ) -> ReplicaInfo | None:
+        """Refresh and rerun a recovery transition after revision conflicts."""
+        for _ in range(8):
+            fresh = serve_state.get_replica_info_from_id(
+                self._service_name, replica_id)
+            fence = self._system_recovery_mutation_fence()
+            if fresh is None or fence is None:
+                return None
+            if not transition(fresh):
+                return fresh
+            suspension = self._suspend_system_recovery_route_if_unroutable(
+                fresh)
+            try:
+                updated = serve_state.patch_replica_system_recovery(
+                    self._service_name,
+                    replica_id,
+                    fresh,
+                    expected_revision=fresh.system_recovery_revision,
+                    **fence)
+            except serve_state.ReplicaSystemRecoveryRevisionConflict:
+                if suspension is not None:
+                    self._resolve_ambiguous_system_recovery_route_suspensions(
+                        [suspension])
+                continue
+            except serve_state.ReplicaSystemRecoveryStateError as e:
+                if suspension is not None:
+                    self._resolve_ambiguous_system_recovery_route_suspensions(
+                        [suspension])
+                logger.warning(
+                    f'Recovery-state patch was rejected for replica '
+                    f'{replica_id}: {common_utils.format_exception(e)}')
+                return None
+            except BaseException:
+                if suspension is not None:
+                    self._resolve_ambiguous_system_recovery_route_suspensions(
+                        [suspension])
+                raise
+            if suspension is not None:
+                self._route_lease_registry().commit_suspension(suspension)
+            return updated
+        logger.warning(f'Recovery-state patch for replica {replica_id} '
+                       'remained conflicted after repeated refreshes.')
+        return None
+
+    def _create_system_recovery_candidate(
+        self, replica_id: int,
+        intent: system_recovery_state.SystemRecoveryLaunchIntent
+    ) -> ReplicaInfo | None:
+        """Transition a freshly persisted ordinary row to CANDIDATE."""
+        for _ in range(8):
+            fresh = serve_state.get_replica_info_from_id(
+                self._service_name, replica_id)
+            fence = self._system_recovery_mutation_fence()
+            if fresh is None or fence is None:
+                return None
+            if (fresh.system_recovery_quarantine is not None or
+                    fresh.system_recovery_launch_intent is not None or
+                    fresh.system_recovery_disposition !=
+                    system_recovery_state.SystemRecoveryDisposition.ORDINARY):
+                return None
+            fresh.system_recovery_launch_intent = intent
+            fresh.system_recovery_disposition = (
+                system_recovery_state.SystemRecoveryDisposition.CANDIDATE)
+            try:
+                created = serve_state.create_replica_system_recovery_candidate(
+                    self._service_name,
+                    replica_id,
+                    fresh,
+                    expected_revision=fresh.system_recovery_revision,
+                    **fence)
+                system_oom_recovery_observability.record_for_replica(
+                    'authorization_v3_candidate', created)
+                return created
+            except serve_state.ReplicaSystemRecoveryRevisionConflict:
+                continue
+            except serve_state.ReplicaSystemRecoveryStateError as e:
+                logger.warning(
+                    f'Recovery candidacy was rejected for replica '
+                    f'{replica_id}: {common_utils.format_exception(e)}')
+                return None
+        logger.warning(f'Recovery candidacy for replica {replica_id} kept '
+                       'conflicting; leaving the launch ordinary.')
+        return None
+
+    def _get_bound_system_recovery_request_id(
+            self, replica_id: int,
+            intent: system_recovery_state.SystemRecoveryLaunchIntent
+    ) -> str | None:
+        """Read only the exact durable request association for one intent."""
+        fresh = serve_state.get_replica_info_from_id(self._service_name,
+                                                     replica_id)
+        if (fresh is None or fresh.system_recovery_quarantine is not None or
+                fresh.system_recovery_launch_intent != intent or
+                fresh.system_recovery_disposition
+                != system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+            return None
+        request_id = fresh.launch_request_id
+        return request_id if isinstance(request_id,
+                                        str) and request_id else None
+
+    def _persist_system_recovery_job_id(
+            self, replica_id: int,
+            intent: system_recovery_state.SystemRecoveryLaunchIntent,
+            request_id: str, service_job_id: int) -> bool:
+        """Persist one exact request result without taking the manager lock."""
+        for _ in range(8):
+            fresh = serve_state.get_replica_info_from_id(
+                self._service_name, replica_id)
+            fence = self._system_recovery_mutation_fence()
+            if fresh is None or fence is None:
+                return False
+            if (fresh.system_recovery_quarantine is not None or
+                    fresh.system_recovery_launch_intent != intent or
+                    fresh.system_recovery_disposition
+                    != system_recovery_state.SystemRecoveryDisposition.CANDIDATE
+                    or fresh.launch_request_id != request_id):
+                return False
+            if fresh.service_job_id == service_job_id:
+                return True
+            if fresh.service_job_id is not None:
+                return False
+            try:
+                serve_state.set_replica_system_recovery_job_id(
+                    self._service_name,
+                    replica_id,
+                    service_job_id,
+                    expected_launch_request_id=request_id,
+                    expected_revision=fresh.system_recovery_revision,
+                    **fence)
+                return True
+            except serve_state.ReplicaSystemRecoveryRevisionConflict:
+                continue
+            except serve_state.ReplicaSystemRecoveryStateError as e:
+                logger.warning(
+                    f'Exact recovery job association was rejected for '
+                    f'replica {replica_id}: '
+                    f'{common_utils.format_exception(e)}')
+                return False
+        return False
+
+    def _demote_system_recovery_candidate(
+            self, replica_id: int,
+            intent: system_recovery_state.SystemRecoveryLaunchIntent) -> bool:
+        """Irreversibly demote one failed first request before any retry."""
+        for _ in range(8):
+            fresh = serve_state.get_replica_info_from_id(
+                self._service_name, replica_id)
+            fence = self._system_recovery_mutation_fence()
+            if fresh is None or fence is None:
+                return False
+            if (fresh.system_recovery_quarantine is not None or
+                    fresh.system_recovery_launch_intent != intent):
+                return False
+            if (fresh.system_recovery_disposition ==
+                    system_recovery_state.SystemRecoveryDisposition.ORDINARY):
+                return True
+            if (fresh.system_recovery_disposition !=
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+                return False
+            fresh.system_recovery_disposition = (
+                system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+            try:
+                demoted = serve_state.demote_replica_system_recovery_to_ordinary(
+                    self._service_name,
+                    replica_id,
+                    fresh,
+                    expected_revision=fresh.system_recovery_revision,
+                    **fence)
+                system_oom_recovery_observability.record_for_replica(
+                    'authorization_v3_ordinary', demoted)
+                return True
+            except serve_state.ReplicaSystemRecoveryRevisionConflict:
+                continue
+            except serve_state.ReplicaSystemRecoveryStateError as e:
+                logger.warning(
+                    f'Recovery demotion was rejected for replica '
+                    f'{replica_id}: {common_utils.format_exception(e)}')
+                return False
+        return False
 
     @with_lock
     def confirm_logical_bridge_capacities(
@@ -2572,74 +2872,99 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._persist_replicas(updates)
         return confirmed
 
-    def _remove_replica(self, replica_id: int) -> None:
-        removed = serve_state.remove_replica(self._service_name, replica_id,
-                                             **self._db_fence_kwargs())
+    def _remove_replica(self, replica_id: int, replica_record_id: str) -> None:
+        suspension = self._route_lease_registry().suspend_record(
+            replica_id, replica_record_id)
+        try:
+            removed = serve_state.remove_replica(
+                self._service_name,
+                replica_id,
+                **self._db_fence_kwargs(),
+                expected_replica_record_id=replica_record_id)
+        except BaseException:
+            if suspension is not None:
+                self._resolve_ambiguous_system_recovery_route_suspensions(
+                    [suspension])
+            raise
         if removed is False:
+            if suspension is not None:
+                self._route_lease_registry().commit_suspension(suspension)
             raise RuntimeError(
                 f'Service {self._service_name!r} incarnation changed while '
                 f'removing replica {replica_id}.')
+        if suspension is not None:
+            self._route_lease_registry().commit_suspension(suspension)
 
-    def _remove_replicas(self, replica_ids: list[int]) -> None:
+    def _remove_replicas(self, replica_infos: list[ReplicaInfo]) -> None:
         """Remove one replica wave under a single durable owner fence."""
-        if not replica_ids:
+        if not replica_infos:
             return
+        replica_ids = [info.replica_id for info in replica_infos]
+        if len(set(replica_ids)) != len(replica_ids):
+            raise ValueError('Replica cleanup wave contains duplicate IDs.')
+        expected_record_ids = {
+            info.replica_id: info.replica_record_id for info in replica_infos
+        }
         service_hash = getattr(self, '_service_hash', None)
         if service_hash is None:
             # Legacy/direct managers do not have the durable incarnation
             # identity required by the batch-delete API.
-            for replica_id in replica_ids:
-                self._remove_replica(replica_id)
+            for info in replica_infos:
+                self._remove_replica(info.replica_id, info.replica_record_id)
             return
-        removed = serve_state.remove_replicas(self._service_name,
-                                              replica_ids,
-                                              service_hash,
-                                              expected_controller_owner=getattr(
-                                                  self, '_controller_owner',
-                                                  None))
+        suspensions = []
+        try:
+            for info in replica_infos:
+                suspension = self._route_lease_registry().suspend_record(
+                    info.replica_id, info.replica_record_id)
+                if suspension is not None:
+                    suspensions.append(suspension)
+        except BaseException:
+            self._rollback_system_recovery_route_suspensions(suspensions)
+            raise
+        try:
+            removed = serve_state.remove_replicas(
+                self._service_name,
+                replica_ids,
+                service_hash,
+                expected_controller_owner=getattr(self, '_controller_owner',
+                                                  None),
+                expected_replica_record_ids=(expected_record_ids))
+        except BaseException:
+            self._resolve_ambiguous_system_recovery_route_suspensions(
+                suspensions)
+            raise
         if removed is False:
+            self._commit_system_recovery_route_suspensions(suspensions)
             raise RuntimeError(
                 f'Service {self._service_name!r} incarnation changed while '
                 f'removing {len(replica_ids)} replicas.')
+        self._commit_system_recovery_route_suspensions(suspensions)
 
     def _failed_cleanup_retry_state(
             self) -> tuple[dict[int, int], dict[int, float]]:
-        """Return retry maps, tolerating managers built before these fields.
+        """Return retry maps, tolerating managers built before the runtime.
 
-        Normal construction initializes both maps in ``__init__``.  Keeping
-        this accessor backward-compatible also protects lightweight embedders,
-        tests, and upgrade/recovery paths that reconstruct a manager without
-        replaying the newest initializer in full.
+        Normal construction initializes the legacy runtime in ``__init__``.
+        Its accessor also adopts old instance fields, protecting lightweight
+        embedders, tests, and upgrade/recovery paths that reconstruct a manager
+        without replaying the newest initializer in full.
         """
-        attempts: dict[int, int] | None = getattr(
-            self, '_failed_cleanup_retry_attempts', None)
-        retry_at: dict[int, float] | None = getattr(self,
-                                                    '_failed_cleanup_retry_at',
-                                                    None)
-        if attempts is None:
-            attempts = {}
-            self._failed_cleanup_retry_attempts = attempts
-        if retry_at is None:
-            retry_at = {}
-            self._failed_cleanup_retry_at = retry_at
-        return attempts, retry_at
+        # TODO(fcapponi): DEPRECATED resource-action retry-clock owner. Remove
+        # at M5 after action-only down proves its rollback gate.
+        runtime = self._legacy_mutation_runtime_state()
+        return (runtime.failed_cleanup_retry_attempts,
+                runtime.failed_cleanup_retry_at)
 
     def _clear_failed_cleanup_retry(self, replica_id: int) -> None:
         """Forget in-memory cleanup rate limiting after confirmed success."""
-        attempts, retry_at = self._failed_cleanup_retry_state()
-        attempts.pop(replica_id, None)
-        retry_at.pop(replica_id, None)
+        self._legacy_mutation_runtime_state().clear_failed_cleanup_retry(
+            replica_id)
 
     def _schedule_failed_cleanup_retry(self, replica_id: int) -> None:
         """Rate-limit, but never give up on, a durable cleanup failure."""
-        attempts, retry_at = self._failed_cleanup_retry_state()
-        attempt = attempts.get(replica_id, 0) + 1
-        attempts[replica_id] = attempt
-        exponential_step = min(attempt - 1, 30)
-        delay_seconds = min(
-            _FAILED_CLEANUP_RETRY_BASE_SECONDS * 2**exponential_step,
-            _FAILED_CLEANUP_RETRY_MAX_SECONDS)
-        retry_at[replica_id] = time.monotonic() + delay_seconds
+        attempt, delay_seconds = self._legacy_mutation_runtime_state(
+        ).schedule_failed_cleanup_retry(replica_id, time.monotonic())
         logger.warning(f'Replica {replica_id} cleanup will retry in '
                        f'{delay_seconds}s (attempt {attempt}).')
 
@@ -2685,20 +3010,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                self._spot_placer,
                                                task.num_nodes)
         self._fill_skip_last_log_time: float = 0.0
-        # TODO(tian): Store launch/down request id in the replica table, to make
-        # the manager more persistent.
-        self._launch_thread_pool: thread_utils.ThreadSafeDict[
-            int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
-        self._replica_to_request_id: thread_utils.ThreadSafeDict[
-            int, str] = thread_utils.ThreadSafeDict()
-        self._replica_to_launch_cancelled: thread_utils.ThreadSafeDict[
-            int, bool] = thread_utils.ThreadSafeDict()
+        # TODO(fcapponi): DEPRECATED resource-action owner. Remove this whole
+        # legacy/shadow runtime at M5 after action-only launch/down proves its
+        # rollback gate; never select it for an eligible authoritative service.
+        self._publish_legacy_mutation_runtime_state(
+            _LegacyReplicaMutationRuntime())
         # Exact-card authority is assigned when a queued thread is admitted,
         # then checked by that thread immediately before sdk.launch(). The
-        # separate map lets recovered PENDING rows use the same current target
-        # fence without rewriting their durable replica format.
-        self._replica_to_logical_launch_fence: thread_utils.ThreadSafeDict[
-            int, LogicalTargetState] = thread_utils.ThreadSafeDict()
+        # runtime-owned map lets recovered PENDING rows use the same current
+        # target fence without rewriting their durable replica format.
         # update_service persists a version before waiting for the manager
         # lock.  A large placer-backed scale-up batch can hold that lock for
         # minutes while it assigns hundreds of replicas.  Publish the waiting
@@ -2712,10 +3032,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         # individual launch watchdogs poll the event rather than multiplying
         # ownership queries by the number of in-flight replicas.
         self._ownership_lost = threading.Event()
-        self._down_thread_pool: thread_utils.ThreadSafeDict[
-            int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
-        self._failed_cleanup_retry_attempts = {}
-        self._failed_cleanup_retry_at = {}
+        self._scale_reconciliation_event = threading.Event()
+        self._system_recovery_route_epoch = str(uuid.uuid4())
+        self._system_recovery_route_registry = (
+            system_recovery_route_lease.ManagerRouteLeaseRegistry())
+        # Wall-clock anchors are durable; these process-monotonic guards are
+        # intentionally rebuilt in full after every controller replacement.
+        self._candidate_release_monotonic_deadlines = {}
+        self._system_recovery_status_initialized = set()
         self._wait_for_idle_trackers: dict[int,
                                            tuple[_ReplicaDrainTracker | None,
                                                  float]] = {}
@@ -2814,26 +3138,44 @@ class SkyPilotReplicaManager(ReplicaManager):
         # job-status reaping / readiness probing while the controller keeps
         # serving HTTP -- they are restarted instead.
         thread_utils.start_supervised_thread(self._thread_pool_refresher,
-                                             'replica-thread-pool-refresher')
+                                             'replica-thread-pool-refresher',
+                                             stop_event=self._ownership_lost)
         thread_utils.start_supervised_thread(self._job_status_fetcher,
-                                             'replica-job-status-fetcher')
+                                             'replica-job-status-fetcher',
+                                             stop_event=self._ownership_lost)
         thread_utils.start_supervised_thread(self._replica_prober,
-                                             'replica-prober')
+                                             'replica-prober',
+                                             stop_event=self._ownership_lost)
+        thread_utils.start_supervised_thread(
+            self._system_recovery_route_prober,
+            'replica-system-recovery-route-prober',
+            stop_event=self._ownership_lost)
 
     def _recover_replica_operations(self):
+        """Route restart inference through the removable legacy runtime."""
+        self._legacy_mutation_runtime_state().recover(
+            self._recover_legacy_replica_operations)
+
+    def _recover_legacy_replica_operations(self) -> None:
         """Re-drive interrupted replica operations from durable state.
 
         Runs in the dedicated recovery thread started by __init__, which
         holds the manager lock for the whole pass (see __init__ for the
         lock-ordering handshake with the daemon threads)."""
-        if self._launch_thread_pool or self._down_thread_pool:
+        # TODO(fcapponi): DEPRECATED status-inference owner. Remove the
+        # launch/down reconstruction branches at M5 after durable action links
+        # become the sole recovery source for eligible authoritative services.
+        legacy_runtime = self._legacy_mutation_runtime_state()
+        if (legacy_runtime.launch_thread_pool or
+                legacy_runtime.down_thread_pool):
             # Only possible on a RETRY of a partially-completed recovery
             # pass: the per-replica enqueues below skip anything already in
             # the pools, so re-running is safe.
-            logger.warning('Recovery pass re-entered with '
-                           f'{len(self._launch_thread_pool)} launch / '
-                           f'{len(self._down_thread_pool)} down threads '
-                           'already enqueued; continuing idempotently.')
+            logger.warning(
+                'Recovery pass re-entered with '
+                f'{len(legacy_runtime.launch_thread_pool)} launch / '
+                f'{len(legacy_runtime.down_thread_pool)} down threads '
+                'already enqueued; continuing idempotently.')
 
         # Seed the replica-id allocator from durable state. A fresh
         # ReplicaManager initializes `self._next_replica_id` to 1 (see
@@ -2849,7 +3191,46 @@ class SkyPilotReplicaManager(ReplicaManager):
         # `sky.launch` against its live serving cluster. Advance the allocator
         # past every persisted id so new replicas always get a fresh id. On a
         # first run there are no replicas, so this stays at 1 (no-op).
+        # A rollback to the last compatible v12 writer can erase the complete
+        # recovery bundle while retaining the v13 replica version label.  The
+        # v13 reader accepts only that exact all-fields-absent shape, and the
+        # first rewritten controller that owns the service must immediately
+        # canonicalize it again.  Do this before any recovery decisions so a
+        # later generic whole-row write cannot perpetuate the temporary shape.
+        recovery_fence = self._system_recovery_mutation_fence()
+        if (recovery_fence is not None and
+                not getattr(self, '_is_pool', False) and
+                getattr(self, '_resource_action_mode', 'legacy') == 'legacy' and
+                getattr(self, '_enforce_launch_fence', True) and
+                serve_state.system_recovery_persistence_available()):
+            rewritten = (
+                serve_state.rewrite_rollback_replica_system_recovery_state(
+                    self._service_name, **recovery_fence))
+            if rewritten:
+                logger.info(
+                    f'Rewrote {rewritten} rollback-shaped system-recovery '
+                    'replica row(s) into the complete v13 representation.')
+
         all_replica_infos = serve_state.get_replica_infos(self._service_name)
+        all_replica_infos = self._initialize_system_recovery_process_guards(
+            all_replica_infos)
+        recovery_teardowns = [
+            info for info in all_replica_infos
+            if (info.system_recovery_quarantine is not None or
+                (info.system_recovery is not None and info.system_recovery.state
+                 == system_recovery_state.ControllerRecoveryState.EXHAUSTED)
+               ) and not self._has_system_recovery_teardown_intent(info)
+        ]
+        for info in recovery_teardowns:
+            logger.warning(
+                f'Replica {info.replica_id} has terminal or quarantined '
+                'system-recovery state; adopting legacy teardown.')
+            self._terminate_replica(info.replica_id,
+                                    sync_down_logs=True,
+                                    replica_drain_delay_seconds=0)
+        if recovery_teardowns:
+            all_replica_infos = serve_state.get_replica_infos(
+                self._service_name)
         self._restore_spot_placement_state()
         if not paid_capacity.adopt_existing_claims(
                 service_name=self._service_name,
@@ -2913,6 +3294,96 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{replica_info.version} because version '
                             f'{pending_version} is waiting to be applied.')
                 break
+            if replica_info.system_recovery_quarantine is not None:
+                logger.warning(
+                    f'Replica {replica_info.replica_id} has quarantined '
+                    'system-recovery state; scheduling legacy teardown.')
+                self._terminate_replica(replica_info.replica_id,
+                                        sync_down_logs=True,
+                                        replica_drain_delay_seconds=0)
+                continue
+            disposition = replica_info.system_recovery_disposition
+            if (disposition ==
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+                # Exact job capture proves the original launch completed. A
+                # controller crash before the ordinary launch-status write
+                # must not submit another request for the same generation.
+                replica_info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.SUCCEEDED)
+                self._persist_replica(replica_info.replica_id, replica_info)
+                continue
+            if (disposition ==
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+                intent = replica_info.system_recovery_launch_intent
+                assert intent is not None
+                request_id = replica_info.launch_request_id
+                service_job_id = replica_info.service_job_id
+                if service_job_id is not None:
+                    # The callback committed the exact result before the old
+                    # controller died; only the ordinary status write remains.
+                    replica_info.status_property.sky_launch_status = (
+                        common_utils.ProcessStatus.SUCCEEDED)
+                    self._persist_replica(replica_info.replica_id, replica_info)
+                    continue
+                if request_id is not None:
+                    if (replica_info.replica_id
+                            in legacy_runtime.launch_thread_pool):
+                        # A recovery-pass retry must retain the already-started
+                        # exact-request adopter; replacing it would orphan the
+                        # only worker that can capture this generation's job.
+                        continue
+                    log_file_name = (
+                        serve_utils.generate_replica_launch_log_file_name(
+                            self._service_name, replica_info.replica_id,
+                            getattr(self, '_resource_scope', None)))
+                    launch_thread = _ReplicaLaunchThread(
+                        target=adopt_system_recovery_launch,
+                        replica_id=replica_info.replica_id,
+                        completion_queue=(
+                            legacy_runtime.launch_completion_queue),
+                        completion_event=(
+                            legacy_runtime.launch_completion_event),
+                        args=(
+                            replica_info.replica_id,
+                            replica_info.cluster_name,
+                            log_file_name,
+                            request_id,
+                            functools.partial(
+                                self._persist_system_recovery_job_id,
+                                replica_info.replica_id, intent),
+                        ))
+                    # The cloud request was already admitted before the old
+                    # controller died, so this waiter consumes no new launch
+                    # budget.  Restore its exact request association before
+                    # starting it: teardown can then cancel sdk.get() instead
+                    # of joining an untracked retry-until-up request forever.
+                    legacy_runtime.replica_to_request_id[
+                        replica_info.replica_id] = request_id
+                    legacy_runtime.launch_thread_pool[
+                        replica_info.replica_id] = launch_thread
+                    try:
+                        launch_thread.start()
+                    except Exception:
+                        legacy_runtime.launch_thread_pool.pop(
+                            replica_info.replica_id)
+                        legacy_runtime.replica_to_request_id.pop(
+                            replica_info.replica_id)
+                        raise
+                    continue
+                # The endpoint never consumed the nonce, so no request could
+                # have been scheduled. Demote first, then let the established
+                # recovery re-drive issue one ordinary request.
+                if not self._demote_system_recovery_candidate(
+                        replica_info.replica_id, intent):
+                    self._terminate_replica(replica_info.replica_id,
+                                            sync_down_logs=True,
+                                            replica_drain_delay_seconds=0)
+                    continue
+                refreshed = serve_state.get_replica_info_from_id(
+                    self._service_name, replica_info.replica_id)
+                if refreshed is None:
+                    continue
+                replica_info = refreshed
             # It should be robust enough for `execution.launch` to handle cases
             # where the provisioning is partially done.
             # So we mock the original request based on all call sites,
@@ -2955,6 +3426,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'prior_unknown_capacity_replacement': bool(
                         getattr(replica_info, 'unknown_capacity_replacement',
                                 False)),
+                    'prior_replica_record_id': replica_info.replica_record_id,
+                    'prior_created_at': getattr(replica_info, 'created_at',
+                                                None),
                     'prior_version': replica_info.version,
                     'prior_yaml_content': prior_yaml_content,
                 }
@@ -3175,6 +3649,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         prior_is_zero_cost: bool = False,
         prior_cost_rebalance_for_replica_id: int | None = None,
         prior_paid_capacity_pool_key: str | None = None,
+        prior_replica_record_id: str | None = None,
+        prior_created_at: float | None = None,
         prior_planned_capacity: int | None = None,
         prior_unknown_capacity_replacement: bool = False,
         prior_version: int | None = None,
@@ -3207,6 +3683,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         recovery-pinned unresolved paid row. Recovery does not acquire a new
         claim, but its ordinary replica upsert must not erase the adopted one.
 
+        prior_replica_record_id: immutable database-record identity retained
+        by a recovery re-drive. Numeric replica IDs can be reused after a
+        terminal delete, so an update must carry this exact fence.
+
+        prior_created_at: original durable row creation timestamp retained by
+        a recovery re-drive. It is also an input to the deterministic identity
+        used by v12/rollback-shaped transition rows.
+
         recovering_existing_replica: the replica already has a durable row
         and cluster identity. Reuse an exact persisted placement instead of
         asking the spot placer to select a new location.
@@ -3232,7 +3716,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         fresh launch. It gates new global claims only and never preempts an
         existing launch.
         """
-        if replica_id in self._launch_thread_pool:
+        legacy_runtime = self._legacy_mutation_runtime_state()
+        if replica_id in legacy_runtime.launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
                            'already exists. Skipping.')
             return False
@@ -3354,7 +3839,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 constants.SKYPILOT_DEFAULT_WORKSPACE),
                             existing_replica_infos=existing_replica_infos,
                             globally_managed=(getattr(self, '_service_hash',
-                                                      None) is not None)))
+                                                      None) is not None),
+                            service_name=self._service_name,
+                            service_hash=getattr(self, '_service_hash', None),
+                            requested_frontier_keys={
+                                paid_capacity.frontier_key(location)
+                            }))
                 if location in (
                         paid_location_launch_budget.remaining_by_location):
                     if (paid_location_launch_budget.
@@ -3459,7 +3949,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 constants.SKYPILOT_DEFAULT_WORKSPACE),
                             existing_replica_infos=existing_replica_infos,
                             globally_managed=(getattr(self, '_service_hash',
-                                                      None) is not None)))
+                                                      None) is not None),
+                            service_name=self._service_name,
+                            service_hash=getattr(self, '_service_hash', None),
+                            requested_frontier_keys=(
+                                None if allowed_locations is None else {
+                                    paid_capacity.frontier_key(candidate)
+                                    for candidate in allowed_locations
+                                })))
                 assert paid_location_launch_budget is not None
                 if self._demand_should_skip_zero_cost(existing_replica_infos):
                     # The broker grant or speculative-probe budget says this
@@ -3587,28 +4084,103 @@ class SkyPilotReplicaManager(ReplicaManager):
                 not prior_unknown_capacity_replacement):
             logical_cloud_launch_guard = lambda: (
                 self._queued_logical_launch_fence_decision(replica_id)[:2])
-        t = thread_utils.SafeThread(
-            target=launch_cluster,
-            args=(replica_id, launch_yaml_content, cluster_name, log_file_name,
-                  self._replica_to_request_id,
-                  self._replica_to_launch_cancelled, resources_override,
-                  retry_until_up),
-            kwargs={
-                'availability_max_retry': availability_max_retry,
-                'exact_resources_override': location is not None,
-                'pre_launch_guard': self._service_is_launch_authorized,
-                'cloud_launch_guard': logical_cloud_launch_guard,
-                'continue_guard': self._launch_owner_watchdog_allows_continue,
-                'launch_fence':
-                    self._replica_launch_fence_context(launch_version),
-                'service_spec': launch_spec,
-                'service_name': self._service_name,
-                'workspace': getattr(
-                    self, '_workspace',
-                    skypilot_config.get_active_workspace() or
-                    constants.SKYPILOT_DEFAULT_WORKSPACE),
-            },
-        )
+        launch_fence = self._replica_launch_fence_context(launch_version)
+        recovery_intent: (system_recovery_state.SystemRecoveryLaunchIntent |
+                          None) = None
+        recovery_launch_context: dict[str, Any] | None = None
+        candidate_prerequisites = (
+            not recovering_existing_replica and
+            not getattr(self, '_is_pool', False) and
+            getattr(self, '_resource_action_mode', 'legacy') == 'legacy' and
+            getattr(self, '_enforce_launch_fence', True) and
+            launch_fence is not None and launch_spec is not None and
+            serve_state.system_recovery_persistence_available() and
+            launch_spec.endpoint_probe_interval_seconds <= serve_constants.
+            SYSTEM_RECOVERY_MAX_ELIGIBLE_PROBE_INTERVAL_SECONDS and
+            launch_spec.readiness_timeout_seconds <= serve_constants.
+            SYSTEM_RECOVERY_MAX_ELIGIBLE_READINESS_TIMEOUT_SECONDS)
+        if candidate_prerequisites:
+            try:
+                candidate_task = _build_replica_launch_task(
+                    launch_yaml_content,
+                    replica_id,
+                    resources_override,
+                    exact_resources_override=location is not None,
+                    authoritative_service_spec=launch_spec,
+                    service_name=self._service_name)
+                if not _task_is_known_non_aws(candidate_task):
+                    workspace = getattr(
+                        self, '_workspace',
+                        skypilot_config.get_active_workspace() or
+                        constants.SKYPILOT_DEFAULT_WORKSPACE)
+                    with skypilot_config.local_active_workspace_ctx(workspace):
+                        requested_authorization = (
+                            system_oom_recovery.
+                            resolve_requested_authorization_v3(
+                                candidate_task,
+                                service_name=self._service_name,
+                                service_hash=self._service_hash))
+                    if requested_authorization is not None:
+                        assert isinstance(self._service_hash, str)
+                        recovery_intent = (
+                            system_recovery_state.SystemRecoveryLaunchIntent(
+                                version=1,
+                                controller_contract_version=
+                                (serve_constants.
+                                 SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION
+                                ),
+                                recovery_authorization_version=(
+                                    requested_authorization.
+                                    authorization_version),
+                                recovery_authorization_profile_id=(
+                                    requested_authorization.profile_id),
+                                recovery_authorization_sha256=(
+                                    requested_authorization.authorization_sha256
+                                ),
+                                runtime_profile_version=(
+                                    requested_authorization.
+                                    runtime_profile_version),
+                                expected_runtime_capability=(
+                                    requested_authorization.
+                                    expected_runtime_capability),
+                                service_hash=self._service_hash,
+                                replica_id=replica_id,
+                                launch_generation=replica_id,
+                                launch_nonce=(
+                                    system_oom_recovery.new_launch_nonce()),
+                                workspace=requested_authorization.workspace,
+                                resource_envelope_sha256=(
+                                    requested_authorization.
+                                    resource_envelope_sha256),
+                                task_sha256=(
+                                    requested_authorization.task_sha256),
+                                runtime_image_digest=(requested_authorization.
+                                                      runtime_image_digest),
+                                owned_container_spec_sha256=(
+                                    requested_authorization.
+                                    owned_container_spec_sha256),
+                                execution_envelope_sha256=(
+                                    requested_authorization.
+                                    execution_envelope_sha256)))
+                        assert self._controller_owner is not None
+                        controller_pid, controller_ip = self._controller_owner
+                        recovery_launch_context = (
+                            system_oom_recovery.create_unbound_launch_context(
+                                recovery_intent,
+                                service_name=self._service_name,
+                                service_version=launch_version,
+                                controller_pid=controller_pid,
+                                controller_ip=controller_ip))
+            except Exception as e:  # pylint: disable=broad-except
+                # Candidate authorization is additive. A malformed/missing
+                # operator document or local pre-policy mismatch must leave
+                # the existing replica launch ordinary, not fail capacity.
+                recovery_intent = None
+                recovery_launch_context = None
+                logger.warning(
+                    'System-OOM recovery candidate resolution failed closed; '
+                    f'launching replica {replica_id} ordinarily: '
+                    f'{common_utils.format_exception(e)}')
         replica_port = _get_resources_ports(launch_yaml_content, launch_spec)
 
         planned_capacity = 1
@@ -3638,6 +4210,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             resources_override,
             planned_capacity=planned_capacity,
             unknown_capacity_replacement=prior_unknown_capacity_replacement)
+        if recovering_existing_replica and prior_replica_record_id is not None:
+            info.replica_record_id = prior_replica_record_id
+            info.created_at = prior_created_at
         # Persisted launch-origin attribution: the broker's holdings split
         # and the ceiling's demand exemption key on this flag. OR in the
         # replaced row's attribution on recovery re-drives (the sentinel
@@ -3739,9 +4314,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'Service {self._service_name!r} controller '
                             'ownership changed while claiming paid capacity.')
                     if claim_result == paid_capacity.ClaimResult.LEGACY_LOCAL:
-                        self._persist_replica(replica_id, info)
+                        if recovering_existing_replica:
+                            self._persist_replica(replica_id, info)
+                        else:
+                            self._persist_new_replica(replica_id, info)
                 else:
-                    self._persist_replica(replica_id, info)
+                    if recovering_existing_replica:
+                        self._persist_replica(replica_id, info)
+                    else:
+                        self._persist_new_replica(replica_id, info)
             if debit_paid_location_launch_budget:
                 paid_capacity.debit(paid_location_launch_budget, location)
             if info.unknown_capacity_replacement:
@@ -3752,6 +4333,56 @@ class SkyPilotReplicaManager(ReplicaManager):
                     replacement_ids = set()
                     self._unknown_capacity_replacement_ids = replacement_ids
                 replacement_ids.add(replica_id)
+
+        if recovery_intent is not None:
+            candidate_info = self._create_system_recovery_candidate(
+                replica_id, recovery_intent)
+            if candidate_info is None:
+                recovery_intent = None
+                recovery_launch_context = None
+            else:
+                info = candidate_info
+
+        recovery_launch_kwargs: dict[str, Any] = {}
+        if recovery_intent is not None:
+            recovery_launch_kwargs = {
+                'system_recovery_launch_context': recovery_launch_context,
+                'get_bound_system_recovery_request_id': functools.partial(
+                    self._get_bound_system_recovery_request_id, replica_id,
+                    recovery_intent),
+                'persist_system_recovery_job_id': functools.partial(
+                    self._persist_system_recovery_job_id, replica_id,
+                    recovery_intent),
+                'demote_system_recovery_candidate': functools.partial(
+                    self._demote_system_recovery_candidate, replica_id,
+                    recovery_intent),
+            }
+        completion_queue, completion_event = self._launch_completion_state()
+        t = _ReplicaLaunchThread(
+            target=launch_cluster,
+            replica_id=replica_id,
+            completion_queue=completion_queue,
+            completion_event=completion_event,
+            args=(replica_id, launch_yaml_content, cluster_name, log_file_name,
+                  legacy_runtime.replica_to_request_id,
+                  legacy_runtime.replica_to_launch_cancelled,
+                  resources_override, retry_until_up),
+            kwargs={
+                'availability_max_retry': availability_max_retry,
+                'exact_resources_override': location is not None,
+                'pre_launch_guard': self._service_is_launch_authorized,
+                'cloud_launch_guard': logical_cloud_launch_guard,
+                'continue_guard': self._launch_owner_watchdog_allows_continue,
+                'launch_fence': launch_fence,
+                'service_spec': launch_spec,
+                'service_name': self._service_name,
+                'workspace': getattr(
+                    self, '_workspace',
+                    skypilot_config.get_active_workspace() or
+                    constants.SKYPILOT_DEFAULT_WORKSPACE),
+                **recovery_launch_kwargs,
+            },
+        )
         if existing_replica_infos is not None:
             # Bulk callers (recovery re-drive) reuse one snapshot across a
             # whole wave of launches. Append each accepted replica so shared
@@ -3759,7 +4390,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             existing_replica_infos.append(info)
         # Don't start right now; we will start it later in _refresh_thread_pool
         # to avoid too many sky.launch running at the same time.
-        self._launch_thread_pool[replica_id] = t
+        legacy_runtime.launch_thread_pool[replica_id] = t
         return True
 
     def _demand_should_skip_zero_cost(
@@ -3869,6 +4500,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                 for name, count in location.accelerators.items()
             } == requested_shape
         }
+
+    def _requested_paid_frontier_keys(
+        self, resources_overrides: Iterable[dict[str, Any] | None]
+    ) -> set[paid_capacity.FrontierKey] | None:
+        """Return exact cards targeted by a batch, or None for task defaults."""
+        requested_frontiers: set[paid_capacity.FrontierKey] = set()
+        for resources_override in resources_overrides:
+            if resources_override is None:
+                return None
+            allowed = self._locations_for_accelerator_override(
+                resources_override)
+            if allowed is None:
+                return None
+            requested_frontiers.update(
+                paid_capacity.frontier_key(location) for location in allowed)
+        return requested_frontiers
 
     def _build_zero_cost_demand_budget(
         self,
@@ -4225,7 +4872,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                                   constants.SKYPILOT_DEFAULT_WORKSPACE),
                 existing_replica_infos=existing_replica_infos,
                 globally_managed=(getattr(self, '_service_hash', None)
-                                  is not None)))
+                                  is not None),
+                service_name=self._service_name,
+                service_hash=getattr(self, '_service_hash', None),
+                requested_frontier_keys=self._requested_paid_frontier_keys(
+                    resources_overrides)))
         deferred_paid_overrides: list[dict[str, Any] | None] = []
         for resources_override in resources_overrides:
             pending_version = getattr(self, '_pending_version', None)
@@ -4516,9 +5167,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             workspace=getattr(self, '_workspace',
                               constants.SKYPILOT_DEFAULT_WORKSPACE),
             existing_replica_infos=existing_replica_infos,
-            globally_managed=(getattr(self, '_service_hash', None) is not None))
-                                       if self._spot_placer is not None else
-                                       None)
+            globally_managed=(getattr(self, '_service_hash', None) is not None),
+            service_name=self._service_name,
+            service_hash=getattr(self, '_service_hash', None),
+            requested_frontier_keys=(None if not card_targets else {
+                (str(card).casefold(),)
+                for card, target in card_targets.items()
+                if committed_by_card.get(card, 0) < target
+            })) if self._spot_placer is not None else None)
         deferred_cards: set[str] = set()
         launched_capacity = 0
         while True:
@@ -4709,6 +5365,9 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
                                 format_exc: str | None) -> None:
+        # TODO(fcapponi): DEPRECATED resource-action result reducer. Remove at
+        # M5 for eligible authoritative services after the durable reducer
+        # owns this projection.
         if format_exc is not None:
             logger.error(f'Down thread for replica {info.replica_id} '
                          f'exited abnormally with exception {format_exc}.')
@@ -4757,7 +5416,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'failure detected.')
             self._persist_replica(info.replica_id, info)
         if removal_reason is not None:
-            self._remove_replica(info.replica_id)
+            self._remove_replica(info.replica_id, info.replica_record_id)
             logger.info(f'Replica {info.replica_id} removed from the '
                         f'replica table {removal_reason}.')
 
@@ -4771,6 +5430,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             is_scale_down: bool = False,
             purge: bool = False,
             in_flight_drain_cap_seconds: int | None = None) -> None:
+        # TODO(fcapponi): DEPRECATED resource-action scheduler. Remove at M5
+        # for eligible authoritative services after durable down admission
+        # owns scheduling and retry.
+        legacy_runtime = self._legacy_mutation_runtime_state()
         left_in_record = not (is_scale_down or purge)
         if left_in_record:
             assert sync_down_logs, (
@@ -4778,7 +5441,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'the logs should always be synced down. '
                 'So that the user can see the logs to debug.')
 
-        if replica_id in self._launch_thread_pool:
+        if replica_id in legacy_runtime.launch_thread_pool:
             info = serve_state.get_replica_info_from_id(self._service_name,
                                                         replica_id)
             assert info is not None
@@ -4799,19 +5462,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                                      in_flight_drain_cap_seconds)
             info.status_property.wait_for_idle_before_termination = False
             self._persist_replica(replica_id, info)
-            launch_thread = self._launch_thread_pool[replica_id]
+            launch_thread = legacy_runtime.launch_thread_pool[replica_id]
             if launch_thread.is_alive():
-                self._replica_to_launch_cancelled[replica_id] = True
+                legacy_runtime.replica_to_launch_cancelled[replica_id] = True
                 wait_deadline = (time.monotonic() +
                                  _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS)
                 timeout_reached = False
                 while True:
                     # Launch request id found. cancel it.
-                    if replica_id in self._replica_to_request_id:
-                        request_id = self._replica_to_request_id[replica_id]
+                    if replica_id in legacy_runtime.replica_to_request_id:
+                        request_id = legacy_runtime.replica_to_request_id[
+                            replica_id]
                         sdk.api_cancel(request_id)
                         break
-                    if replica_id not in self._replica_to_launch_cancelled:
+                    if replica_id not in legacy_runtime.replica_to_launch_cancelled:
                         # Indicates that the cancellation was received.
                         break
                     if not launch_thread.is_alive():
@@ -4836,13 +5500,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             else:
                 logger.info(f'Launch thread for replica {replica_id} '
                             'already finished. Delete the cluster now.')
-            self._launch_thread_pool.pop(replica_id)
-            self._replica_to_request_id.pop(replica_id)
-            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-            if fence_map is not None:
-                fence_map.pop(replica_id)
+            legacy_runtime.launch_thread_pool.pop(replica_id)
+            legacy_runtime.replica_to_request_id.pop(replica_id)
+            legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
 
-        if replica_id in self._down_thread_pool:
+        if replica_id in legacy_runtime.down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '
                            'already exists. Skipping.')
             return
@@ -4887,7 +5549,22 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert isinstance(handle, backends.CloudVmRayResourceHandle)
             replica_job_logs_dir = os.path.join(constants.SKY_LOGS_DIRECTORY,
                                                 'replica_jobs')
-            job_ids = ['1'] if self._is_pool else None
+            if self._is_pool:
+                job_ids = ['1']
+            elif info.system_recovery_disposition in (
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+                service_job_id = info.service_job_id
+                if (isinstance(service_job_id, bool) or
+                        not isinstance(service_job_id, int) or
+                        service_job_id < 1):
+                    logger.warning(
+                        f'Replica {replica_id} has no exact recovery service '
+                        'job ID; refusing a latest-job log lookup.')
+                    return
+                job_ids = [str(service_job_id)]
+            else:
+                job_ids = None
             job_log_file_name = controller_utils.download_and_stream_job_log(
                 backend, handle, replica_job_logs_dir, job_ids)
             if job_log_file_name is not None:
@@ -4905,9 +5582,46 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f' {replica_id}.\n')
 
         logger.info(f'Terminating replica {replica_id}...')
-        info = serve_state.get_replica_info_from_id(self._service_name,
-                                                    replica_id)
-        assert info is not None
+        if hasattr(self, '_resource_action_mode'):
+            teardown_snapshot = (
+                serve_state.get_replica_info_with_resource_action_identity(
+                    self._service_name, replica_id))
+            assert teardown_snapshot is not None
+            info, resource_action_identity = teardown_snapshot
+        else:
+            # Compatibility for lightweight embedders/tests constructed with
+            # ``__new__``. Every normally initialized manager takes the
+            # atomic action-aware snapshot above.
+            info = serve_state.get_replica_info_from_id(self._service_name,
+                                                        replica_id)
+            assert info is not None
+            resource_action_identity = None
+        # Revoke the exact process-local route before recovery terminalization,
+        # log download, drain bookkeeping, or provider cleanup can block.  A
+        # row recreation with the same numeric ID first retires only the prior
+        # record and can never be revoked through its stale identity.  A
+        # still-launching row has never owned a route and is handled above.
+        registry = self._route_lease_registry()
+        registry.observe_record_identity(replica_id, info.replica_record_id)
+        registry.deactivate_record(replica_id, info.replica_record_id)
+        expected_cluster_record_uuid = (
+            str(resource_action_identity.sky_cluster_record_uuid)
+            if resource_action_identity is not None else None)
+
+        if info.system_recovery is not None:
+
+            def _terminalize_recovery(fresh: ReplicaInfo) -> bool:
+                terminal = system_recovery_state.terminalize_for_teardown(
+                    fresh.system_recovery, now=time.time())
+                if terminal == fresh.system_recovery:
+                    return False
+                fresh.system_recovery = terminal
+                return True
+
+            recovery_info = self._patch_system_recovery_with_latest(
+                replica_id, _terminalize_recovery)
+            if recovery_info is not None:
+                info = recovery_info
 
         # A controller restart loses the in-memory down worker.  Once a
         # logical retirement crossed the durable teardown boundary, its
@@ -4992,13 +5706,18 @@ class SkyPilotReplicaManager(ReplicaManager):
             kwargs={
                 'drain_deadline': drain_deadline,
                 'drain_complete': drain_complete,
+                'expected_cluster_record_uuid': expected_cluster_record_uuid,
             },
         )
-        self._down_thread_pool[replica_id] = t
+        legacy_runtime.down_thread_pool[replica_id] = t
 
     def _reconcile_failed_cleanup(self,
                                   replica_infos: list[ReplicaInfo]) -> None:
         """Re-drive every durable cleanup failure until absence is proven."""
+        # TODO(fcapponi): DEPRECATED resource-action retry scheduler. Remove at
+        # M5 for eligible authoritative services after database-clock action
+        # retries own cleanup.
+        legacy_runtime = self._legacy_mutation_runtime_state()
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in replica_infos:
@@ -5009,8 +5728,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     not down_failed and not retry_pending):
                 continue
             replica_id = info.replica_id
-            if (replica_id in self._down_thread_pool or
-                    replica_id in self._launch_thread_pool):
+            if (replica_id in legacy_runtime.down_thread_pool or
+                    replica_id in legacy_runtime.launch_thread_pool):
                 continue
             retry_at = retry_at_by_replica.get(replica_id, 0)
             if now < retry_at:
@@ -5915,7 +6634,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     f'{info.replica_id}: {reason}.')
         self._drain_proof_stats.record_logical_abort(
             _classify_abort_reason(reason))
-        down_thread_pool = getattr(self, '_down_thread_pool', {})
+        down_thread_pool = self._legacy_mutation_runtime_state(
+        ).down_thread_pool
         queued_down = down_thread_pool.get(info.replica_id)
         if (queued_down is not None and not queued_down.is_alive() and
                 info.status_property.sky_down_status
@@ -5999,7 +6719,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # instantiate the manager without running the current constructor.
         if not hasattr(self, '_wait_for_idle_trackers'):
             self._wait_for_idle_trackers = {}
-        down_thread_pool = getattr(self, '_down_thread_pool', {})
+        down_thread_pool = self._legacy_mutation_runtime_state(
+        ).down_thread_pool
         tracker_items = list(self._wait_for_idle_trackers.items())
         if not tracker_items:
             return
@@ -6273,8 +6994,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             # down worker retains the existing cancellation/cleanup path.
             bulk_absent_replica_ids: set[int] = set()
             if getattr(self, '_service_hash', None) is not None:
-                launch_pool = getattr(self, '_launch_thread_pool', {})
-                down_pool = getattr(self, '_down_thread_pool', {})
+                legacy_runtime = self._legacy_mutation_runtime_state()
+                launch_pool = legacy_runtime.launch_thread_pool
+                down_pool = legacy_runtime.down_thread_pool
                 absence_candidates: list[ReplicaInfo] = []
                 seen_candidate_ids: set[int] = set()
                 for replica_id in replica_ids:
@@ -6347,7 +7069,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                         ready_width, card)
 
             accepted = 0
-            absent_finished_launch_ids: list[int] = []
+            absent_finished_launch_infos: list[ReplicaInfo] = []
             seen_ids: set[int] = set()
             for replica_id in replica_ids:
                 if replica_id in seen_ids:
@@ -6377,7 +7099,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 target_capacity_by_accelerator)):
                         continue
                     if replica_id in bulk_absent_replica_ids:
-                        absent_finished_launch_ids.append(replica_id)
+                        absent_finished_launch_infos.append(info)
                     else:
                         self._terminate_replica(replica_id,
                                                 sync_down_logs=False,
@@ -6420,22 +7142,24 @@ class SkyPilotReplicaManager(ReplicaManager):
                     ready_by_accelerator[card] -= ready_width
                 accepted += 1
 
-            if absent_finished_launch_ids:
-                self._remove_replicas(absent_finished_launch_ids)
-                for replica_id in absent_finished_launch_ids:
+            if absent_finished_launch_infos:
+                self._remove_replicas(absent_finished_launch_infos)
+                for info in absent_finished_launch_infos:
+                    replica_id = info.replica_id
                     # Delete local worker bookkeeping only after the durable
                     # fenced delete succeeds. A failed transaction therefore
                     # leaves the entire wave retryable on the next tick.
-                    for attr in ('_launch_thread_pool',
-                                 '_replica_to_request_id',
-                                 '_replica_to_launch_cancelled',
-                                 '_replica_to_logical_launch_fence'):
-                        mapping = getattr(self, attr, None)
-                        if mapping is not None and replica_id in mapping:
+                    legacy_runtime = self._legacy_mutation_runtime_state()
+                    for mapping in (
+                            legacy_runtime.launch_thread_pool,
+                            legacy_runtime.replica_to_request_id,
+                            legacy_runtime.replica_to_launch_cancelled,
+                            legacy_runtime.replica_to_logical_launch_fence):
+                        if replica_id in mapping:
                             mapping.pop(replica_id)
                     self._clear_failed_cleanup_retry(replica_id)
                 logger.info(
-                    f'Removed {len(absent_finished_launch_ids)} replicas from '
+                    f'Removed {len(absent_finished_launch_infos)} replicas from '
                     'the replica table in one batch (clusters were never '
                     'created).')
 
@@ -6555,6 +7279,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'Kubernetes capacity')
         logger.info(f'Replica {info.replica_id} was {interruption}'
                     f'{cluster_status_str}.')
+        if info.system_recovery_disposition in (
+                system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+            system_oom_recovery_observability.record_for_replica(
+                'preemption_observed', info)
         info.status_property.preempted = True
         if info.is_spot and self._spot_placer is not None:
             spot_location = info.get_spot_location()
@@ -6774,9 +7503,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self, replica_id: int
     ) -> tuple[bool, str, _LogicalPendingLaunchAdmission | None]:
         """Return the final cloud-launch decision and a stable reason code."""
-        fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-        if fence_map is None:
-            return False, 'fence-map-unavailable', None
+        fence_map = (self._legacy_mutation_runtime_state().
+                     replica_to_logical_launch_fence)
         fence = fence_map.get(replica_id)
         if fence is None:
             return False, 'replica-fence-missing', None
@@ -6797,9 +7525,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         allowed, reason, admission = (
             self._queued_logical_launch_fence_decision(replica_id))
         if not allowed:
-            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-            stored_fence = (None
-                            if fence_map is None else fence_map.get(replica_id))
+            fence_map = (self._legacy_mutation_runtime_state().
+                         replica_to_logical_launch_fence)
+            stored_fence = fence_map.get(replica_id)
             authorized_ids = ([] if admission is None else sorted(
                 admission.authorized_ids))
             logger.info(
@@ -6815,12 +7543,21 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     @with_lock
     def _refresh_thread_pool(self) -> None:
+        """Route mutation completion through the removable legacy runtime."""
+        self._legacy_mutation_runtime_state().refresh(
+            self._refresh_legacy_mutation_runtime)
+
+    def _refresh_legacy_mutation_runtime(self) -> None:
         """Refresh the launch/down thread pool.
 
         This function will checks all sky.launch and sky.down thread on
         the fly. If any of them finished, it will update the status of the
         corresponding replica.
         """
+        # TODO(fcapponi): DEPRECATED launch/down mutation owner. Remove its
+        # eligible authoritative branches at M5 after action-only execution
+        # and the compatible rollback gate are proven.
+        legacy_runtime = self._legacy_mutation_runtime_state()
         # A pre-field SCHEDULED retirement stays off-route across an upgrade
         # until current replacement capacity proves it can be re-driven.
         self._reconcile_legacy_uncertain_logical_retirements()
@@ -6834,7 +7571,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._clear_known_unknown_capacity_replacements()
 
         # To avoid `dictionary changed size during iteration` error.
-        launch_thread_pool_snapshot = list(self._launch_thread_pool.items())
+        launch_thread_pool_snapshot = list(
+            legacy_runtime.launch_thread_pool.items())
         # Process finished launch threads BEFORE taking the cross-process
         # resources lock: this pass performs per-replica DB writes and, for a
         # failed launch, an inline log sync that may SSH into the replica.
@@ -6880,12 +7618,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.warning(
                 f'Discarding completed launch worker for replica '
                 f'{replica_id}: its durable replica row no longer exists.')
-            self._launch_thread_pool.pop(replica_id)
-            self._replica_to_request_id.pop(replica_id)
-            self._replica_to_launch_cancelled.pop(replica_id)
-            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-            if fence_map is not None:
-                fence_map.pop(replica_id)
+            legacy_runtime.launch_thread_pool.pop(replica_id)
+            legacy_runtime.replica_to_request_id.pop(replica_id)
+            legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+            legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
         if stale_finished_launches:
             stale_replica_ids = set(stale_finished_launches)
             finished_launches = [(replica_id, t)
@@ -7002,12 +7738,15 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         availability_launch_failures = (capacity_launch_failures |
                                         quota_launch_failures)
+        affected_pool_keys: set[str] = set()
         if availability_launch_failures:
             affected_pool_keys = {
                 info.paid_capacity_pool_key
                 for replica_id, info, _ in completed_launches
                 if replica_id in availability_launch_failures and
-                isinstance(info.paid_capacity_pool_key, str)
+                isinstance(info.paid_capacity_pool_key, str) and
+                paid_capacity.frontier_key_from_pool_key(
+                    info.paid_capacity_pool_key) is not None
             }
             pool_count = len(affected_pool_keys)
             pool_count_text = str(pool_count) if pool_count else 'unknown'
@@ -7047,16 +7786,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                 outcomes=outcomes)
             if paid_outcome_persisted is None:
                 self._persist_replicas(completed_replica_infos)
-            elif paid_outcome_persisted is False:
+            elif not paid_outcome_persisted.ownership_valid:
                 raise RuntimeError(
                     f'Service {self._service_name!r} controller ownership '
                     'changed while persisting paid-capacity launch outcomes.')
+            elif (availability_launch_failures and affected_pool_keys &
+                  set(paid_outcome_persisted.applied_pool_keys)):
+                # The PostgreSQL transaction above is the authorization
+                # boundary. Wake only after it applied the typed failure to a
+                # matching exact paid pool and released that claim; the
+                # controller then performs one ordinary target-fenced
+                # autoscaler tick.
+                reconciliation_event = getattr(self,
+                                               '_scale_reconciliation_event',
+                                               None)
+                if reconciliation_event is not None:
+                    reconciliation_event.set()
         for replica_id, info, error_in_sky_launch in completed_launches:
-            self._launch_thread_pool.pop(replica_id)
-            self._replica_to_request_id.pop(replica_id)
-            fence_map = getattr(self, '_replica_to_logical_launch_fence', None)
-            if fence_map is not None:
-                fence_map.pop(replica_id)
+            legacy_runtime.launch_thread_pool.pop(replica_id)
+            legacy_runtime.replica_to_request_id.pop(replica_id)
+            legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
             if error_in_sky_launch:
                 # Teardown after update replica info since
                 # _terminate_replica will update the replica info too.
@@ -7092,14 +7841,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     logger.warning(
                         f'Discarding queued launch for replica {replica_id} '
                         'after controller ownership loss.')
-                    self._launch_thread_pool.pop(replica_id)
-                    self._replica_to_request_id.pop(replica_id)
-                    self._replica_to_launch_cancelled.pop(replica_id)
-                    fence_map = getattr(self,
-                                        '_replica_to_logical_launch_fence',
-                                        None)
-                    if fence_map is not None:
-                        fence_map.pop(replica_id)
+                    legacy_runtime.launch_thread_pool.pop(replica_id)
+                    legacy_runtime.replica_to_request_id.pop(replica_id)
+                    legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
                     continue
                 special_logical_launch = bool(
                     getattr(info, 'reserved_fill', False) or
@@ -7151,30 +7897,26 @@ class SkyPilotReplicaManager(ReplicaManager):
                         logger.info(
                             f'Discarding queued launch for replica '
                             f'{replica_id}: placement {location} is benched.')
-                        self._remove_replica(replica_id)
-                        self._launch_thread_pool.pop(replica_id)
-                        self._replica_to_request_id.pop(replica_id)
-                        self._replica_to_launch_cancelled.pop(replica_id)
-                        fence_map = getattr(self,
-                                            '_replica_to_logical_launch_fence',
-                                            None)
-                        if fence_map is not None:
-                            fence_map.pop(replica_id)
+                        self._remove_replica(replica_id, info.replica_record_id)
+                        legacy_runtime.launch_thread_pool.pop(replica_id)
+                        legacy_runtime.replica_to_request_id.pop(replica_id)
+                        legacy_runtime.replica_to_launch_cancelled.pop(
+                            replica_id)
+                        legacy_runtime.replica_to_logical_launch_fence.pop(
+                            replica_id)
                         continue
                 # sky.launch not started yet; admitted below under the
                 # resources lock.
                 if (logical_target_fence is not None and
                         not special_logical_launch):
-                    fence_map = getattr(self,
-                                        '_replica_to_logical_launch_fence',
-                                        None)
-                    if fence_map is not None:
-                        fence_map[replica_id] = logical_target_fence
+                    legacy_runtime.replica_to_logical_launch_fence[
+                        replica_id] = logical_target_fence
                 launch_to_admit.append((replica_id, t, info))
 
         # Snapshot AFTER the finished-launch pass so down threads it scheduled
         # (via _terminate_replica for failed launches) are admitted this tick.
-        down_thread_pool_snapshot = list(self._down_thread_pool.items())
+        down_thread_pool_snapshot = list(
+            legacy_runtime.down_thread_pool.items())
         concurrent_downs = sum(
             1 for _, t in down_thread_pool_snapshot if t.is_alive())
         down_to_admit: list[tuple[int, thread_utils.SafeThread,
@@ -7199,7 +7941,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # Pop only after the durable completion update succeeds.  If a DB
             # write fails, retaining the finished worker makes the next tick
             # retry the handler instead of stranding a RUNNING down status.
-            self._down_thread_pool.pop(replica_id)
+            legacy_runtime.down_thread_pool.pop(replica_id)
 
         # Admission pass: read the launch budget ONCE per tick, under the
         # cross-process resources lock held across ALL admission decisions
@@ -7307,7 +8049,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             # started worker and immediately re-read/re-drive:
                             # committed readback detaches into ordinary cleanup;
                             # uncommitted readback recreates the fenced worker.
-                            self._down_thread_pool.pop(replica_id)
+                            legacy_runtime.down_thread_pool.pop(replica_id)
                             status = info.status_property
                             is_scale_down = (status.is_scale_down or
                                              status.preempted)
@@ -7344,7 +8086,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 f'Failed to start terminate worker for '
                                 f'replica {replica_id}: '
                                 f'{common_utils.format_exception(e)}')
-                            self._down_thread_pool.pop(replica_id)
+                            legacy_runtime.down_thread_pool.pop(replica_id)
                             self._wait_for_idle_trackers.pop(replica_id, None)
                             info.status_property.sky_down_status = (
                                 common_utils.ProcessStatus.SCHEDULED)
@@ -7368,7 +8110,13 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _thread_pool_refresher(self) -> None:
         """Periodically refresh the launch/down thread pool."""
-        while True:
+        while not self._ownership_lost.is_set():
+            _, completion_event = self._launch_completion_state()
+            # Clear before draining the durable-in-process queue. A completion
+            # racing after this clear is either drained now or leaves the event
+            # set so the wait below returns immediately.
+            completion_event.clear()
+            self._join_notified_launch_workers()
             logger.debug('Refreshing thread pool.')
             try:
                 self._refresh_thread_pool()
@@ -7379,7 +8127,265 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            time.sleep(_PROCESS_POOL_REFRESH_INTERVAL)
+            if self._ownership_lost.is_set():
+                return
+            completion_event.wait(_PROCESS_POOL_REFRESH_INTERVAL)
+
+    def _system_recovery_status_initialized_ids(self) -> set[int]:
+        initialized = getattr(self, '_system_recovery_status_initialized', None)
+        if initialized is None:
+            initialized = set()
+            self._system_recovery_status_initialized = initialized
+        return initialized
+
+    def _system_recovery_status_barrier_expired(self,
+                                                info: ReplicaInfo) -> bool:
+        if (info.system_recovery_disposition
+                != system_recovery_state.SystemRecoveryDisposition.CAPABLE or
+                info.replica_id
+                in self._system_recovery_status_initialized_ids()):
+            return False
+        recovery = info.system_recovery
+        if recovery is None:
+            return True
+        anchor = recovery.status_barrier_started_at
+        if not isinstance(anchor, (int, float)):
+            return True
+        return (time.time() - float(anchor)
+                >= system_recovery_state.CANDIDATE_RELEASE_GUARD_SECONDS)
+
+    def _system_recovery_controller_grace_seconds(
+            self, info: ReplicaInfo,
+            observation: system_recovery_state.RecoveryObservation) -> float:
+        initial_delay = max(0, self._get_initial_delay_seconds(info.version))
+        remaining_local = 120.0
+        if observation.deadline_at is not None:
+            remaining_local = max(0.0, observation.deadline_at - time.time())
+        return max(1.0, min(900.0, remaining_local + initial_delay))
+
+    def _reconcile_system_recovery_status(
+        self,
+        snapshot: ReplicaInfo,
+        job_status: job_lib.JobStatus | None,
+        detail: job_lib.JobSystemRecoveryInfo | None,
+        detail_status: job_lib.JobSystemRecoveryDetailStatus,
+    ) -> bool:
+        """Reduce one exact-job observation and schedule legacy teardown."""
+        outcome: dict[str, Any] = {
+            'off_route': True,
+            'clear_probe': False,
+            'teardown': False,
+            'valid_present': False,
+            'events': set(),
+        }
+
+        def _reduce(fresh: ReplicaInfo) -> bool:
+            # A revision conflict reruns this closure on a newer row.  No
+            # decision derived from the stale attempt may survive into that
+            # retry, including side effects emitted after the CAS succeeds.
+            outcome.update({
+                'off_route': True,
+                'clear_probe': False,
+                'teardown': False,
+                'valid_present': False,
+                'events': set(),
+            })
+            disposition = fresh.system_recovery_disposition
+            if disposition not in (
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+                outcome['off_route'] = False
+                return False
+            if (fresh.system_recovery_quarantine is not None or
+                    self._has_system_recovery_teardown_intent(fresh)):
+                outcome['teardown'] = True
+                return False
+            intent = fresh.system_recovery_launch_intent
+            exact_job_id = fresh.service_job_id
+            if (intent is None or not isinstance(exact_job_id, int) or
+                    isinstance(exact_job_id, bool) or exact_job_id < 1 or
+                    exact_job_id != snapshot.service_job_id or
+                    fresh.launch_request_id != snapshot.launch_request_id or
+                    not isinstance(job_status, job_lib.JobStatus)):
+                outcome['teardown'] = True
+                outcome['events'].add('evidence_lost')
+                return False
+
+            observation = None
+            if detail_status == job_lib.JobSystemRecoveryDetailStatus.PRESENT:
+                try:
+                    if detail is None:
+                        raise system_recovery_state.RecoveryStateError(
+                            'Recovery detail is missing.')
+                    observation = (system_recovery_state.RecoveryObservation.
+                                   from_job_system_recovery_info(
+                                       exact_job_id, detail))
+                except system_recovery_state.RecoveryStateError as e:
+                    logger.warning(
+                        f'Replica {fresh.replica_id} returned malformed '
+                        f'recovery detail for exact job {exact_job_id}: '
+                        f'{common_utils.format_exception(e)}')
+                if observation is not None and observation.profile_version == 1:
+                    outcome['events'].add('runtime_capability_v1_observed')
+                if (observation is None or observation.capability
+                        != intent.expected_runtime_capability or
+                        observation.profile_version
+                        != intent.runtime_profile_version):
+                    outcome['teardown'] = True
+                    outcome['events'].add('evidence_lost')
+                    observation = None
+                else:
+                    outcome['valid_present'] = True
+            elif (detail is not None or detail_status
+                  not in (job_lib.JobSystemRecoveryDetailStatus.ABSENT,
+                          job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED,
+                          job_lib.JobSystemRecoveryDetailStatus.MALFORMED)):
+                outcome['teardown'] = True
+                outcome['events'].add('evidence_lost')
+            if (detail_status ==
+                    job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED):
+                outcome['events'].add('status_only_read')
+                outcome['events'].add('evidence_lost')
+            elif (detail_status ==
+                  job_lib.JobSystemRecoveryDetailStatus.MALFORMED):
+                outcome['events'].add('evidence_lost')
+
+            previous_recovery = fresh.system_recovery
+            if disposition == (
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+                if observation is None:
+                    # ABSENT is a valid unresolved-candidate sample until the
+                    # guarded release protocol sees it in the same cycle as a
+                    # fresh successful probe. Every other shape fails closed.
+                    if (detail_status
+                            != job_lib.JobSystemRecoveryDetailStatus.ABSENT or
+                            job_status.is_terminal()):
+                        outcome['teardown'] = True
+                    return False
+                reduction = system_recovery_state.reduce_remote_observation(
+                    None,
+                    observation,
+                    now=time.time(),
+                    controller_grace_seconds=(
+                        self._system_recovery_controller_grace_seconds(
+                            fresh, observation)),
+                    job_terminal=job_status.is_terminal(),
+                    teardown_intent=False)
+                fresh.system_recovery_disposition = (
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+                outcome['events'].add('authorization_v3_capable')
+            else:
+                if observation is None:
+                    outcome['teardown'] = True
+                    reduction = (
+                        system_recovery_state.reduce_remote_observation(
+                            fresh.system_recovery,
+                            None,
+                            now=time.time(),
+                            controller_grace_seconds=max(
+                                1.0,
+                                min(
+                                    900.0,
+                                    120.0 + self._get_initial_delay_seconds(
+                                        fresh.version))),
+                            job_terminal=job_status.is_terminal(),
+                            teardown_intent=True))
+                else:
+                    reduction = (
+                        system_recovery_state.reduce_remote_observation(
+                            fresh.system_recovery,
+                            observation,
+                            now=time.time(),
+                            controller_grace_seconds=(
+                                self._system_recovery_controller_grace_seconds(
+                                    fresh, observation)),
+                            job_terminal=job_status.is_terminal(),
+                            teardown_intent=False))
+
+            fresh.system_recovery = reduction.state
+            previous_state = (None if previous_recovery is None else
+                              previous_recovery.state)
+            updated_state = (None if reduction.state is None else
+                             reduction.state.state)
+            route_generation = self._system_recovery_route_generation(fresh)
+            if (route_generation is not None and
+                    self._route_lease_registry().is_retired(
+                        fresh.replica_id, route_generation)):
+                fresh.system_recovery = (
+                    system_recovery_state.terminalize_for_teardown(
+                        fresh.system_recovery, now=time.time()))
+                updated_state = (None if fresh.system_recovery is None else
+                                 fresh.system_recovery.state)
+                outcome['teardown'] = True
+            if (updated_state in
+                (system_recovery_state.ControllerRecoveryState.RECOVERING,
+                 system_recovery_state.ControllerRecoveryState.RETRY_SUBMITTED)
+                    and previous_state
+                    in (None,
+                        system_recovery_state.ControllerRecoveryState.ARMED)):
+                outcome['events'].add('recovery_started')
+            if (updated_state
+                    == system_recovery_state.ControllerRecoveryState.EXHAUSTED
+                    and previous_state != updated_state):
+                outcome['events'].add('recovery_exhausted')
+            if (outcome['valid_present'] and
+                    fresh.system_recovery is not None and
+                    fresh.system_recovery.status_barrier_started_at
+                    is not None):
+                fresh.system_recovery = dataclasses.replace(
+                    fresh.system_recovery, status_barrier_started_at=None)
+            outcome['off_route'] = reduction.force_off_route
+            outcome['clear_probe'] = reduction.clear_probe_failure_window
+            outcome['teardown'] = (outcome['teardown'] or
+                                   reduction.schedule_legacy_teardown)
+            return True
+
+        updated = self._patch_system_recovery_with_latest(
+            snapshot.replica_id, _reduce)
+        if updated is None:
+            outcome['teardown'] = True
+            updated = serve_state.get_replica_info_from_id(
+                self._service_name, snapshot.replica_id)
+        if updated is None:
+            return True
+        if (updated.system_recovery_disposition
+                != system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+            deadlines = getattr(self, '_candidate_release_monotonic_deadlines',
+                                None)
+            if deadlines is not None:
+                deadlines.pop(updated.replica_id, None)
+        status_changed = False
+        if outcome['off_route'] and updated.status_property.service_ready_now:
+            updated.status_property.service_ready_now = False
+            status_changed = True
+        if (outcome['clear_probe'] and
+                updated.first_consecutive_failure_time is not None):
+            updated.first_consecutive_failure_time = None
+            status_changed = True
+        if (outcome['valid_present'] and not outcome['teardown'] and
+                updated.system_recovery_disposition
+                == system_recovery_state.SystemRecoveryDisposition.CAPABLE and
+                updated.system_recovery is not None and
+                updated.system_recovery.state
+                != system_recovery_state.ControllerRecoveryState.EXHAUSTED):
+            self._system_recovery_status_initialized_ids().add(
+                updated.replica_id)
+        elif outcome['teardown']:
+            self._system_recovery_status_initialized_ids().discard(
+                updated.replica_id)
+        for event in outcome['events']:
+            system_oom_recovery_observability.record_for_replica(event, updated)
+        if status_changed:
+            self._persist_replica(updated.replica_id, updated)
+        if outcome['teardown']:
+            logger.warning(
+                f'System recovery for replica {updated.replica_id} cannot '
+                'continue safely; scheduling legacy teardown.')
+            self._terminate_replica(updated.replica_id,
+                                    sync_down_logs=True,
+                                    replica_drain_delay_seconds=0)
+            return True
+        return False
 
     def _fetch_job_status(self) -> None:
         """Fetch the service job status of all replicas.
@@ -7428,7 +8434,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # sdk.job_status. The backend object is stateless; construct it
         # once for the whole walk.
         backend = backends.CloudVmRayBackend()
-        to_fetch: list[tuple[ReplicaInfo, Any]] = []
+        to_fetch: list[tuple[ReplicaInfo, Any, list[int] | None, bool]] = []
+        invalid_recovery_ids: list[int] = []
         for info in infos:
             if not info.status_property.should_track_service_status():
                 continue
@@ -7440,17 +8447,53 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # vanish mid-walk (a scale-down or preemption cleanup
                 # completing after the snapshot was taken). Skip it; the next
                 # round re-snapshots.
+                if (not self._is_pool and info.system_recovery_disposition in
+                    (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+                     system_recovery_state.SystemRecoveryDisposition.CAPABLE)):
+                    invalid_recovery_ids.append(info.replica_id)
                 continue
-            to_fetch.append((info, handle))
+            with_recovery = (
+                not self._is_pool and info.system_recovery_disposition
+                in (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE))
+            if with_recovery:
+                service_job_id = info.service_job_id
+                if (isinstance(service_job_id, bool) or
+                        not isinstance(service_job_id, int) or
+                        service_job_id < 1):
+                    invalid_recovery_ids.append(info.replica_id)
+                    continue
+                job_ids: list[int] | None = [service_job_id]
+            else:
+                job_ids = [1] if self._is_pool else None
+            to_fetch.append((info, handle, job_ids, with_recovery))
+        for replica_id in invalid_recovery_ids:
+            with self.lock:
+                fresh = serve_state.get_replica_info_from_id(
+                    self._service_name, replica_id)
+                if (fresh is None or
+                        not fresh.status_property.should_track_service_status()
+                        or fresh.system_recovery_disposition not in
+                    (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+                     system_recovery_state.SystemRecoveryDisposition.CAPABLE)):
+                    continue
+                logger.warning(
+                    f'Recovery candidate/capable replica {replica_id} lacks '
+                    'its exact cluster handle or service job association.')
+                self._terminate_replica(replica_id,
+                                        sync_down_logs=True,
+                                        replica_drain_delay_seconds=0)
         if not to_fetch:
             return
-        # Use None to fetch latest job, which stands for user task job
-        job_ids = [1] if self._is_pool else None
 
-        def _get_job_status(handle):
+        def _get_job_status(handle, job_ids, with_recovery):
             # SSH into the replica's head node -- intentionally OUTSIDE
             # self.lock so an unreachable replica cannot wedge the round.
-            return backend.get_job_status(handle, job_ids, stream_logs=False)
+            if with_recovery:
+                return backend.get_job_status_with_system_recovery(
+                    handle, job_ids, stream_logs=False)
+            return (backend.get_job_status(handle, job_ids,
+                                           stream_logs=False), {}, {})
 
         # The fetches are pure I/O; run them in parallel so one hung SSH
         # (preempted spot) delays only its own replica's result, not the
@@ -7458,9 +8501,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         num_fetch_threads = min(len(to_fetch),
                                 self._PROBE_ROUND_MAX_PARALLELISM)
         with mp_pool.ThreadPool(num_fetch_threads) as pool:
-            fetch_results = [(info, pool.apply_async(_get_job_status,
-                                                     (handle,)))
-                             for info, handle in to_fetch]
+            fetch_results = [
+                (info,
+                 pool.apply_async(_get_job_status,
+                                  (handle, job_ids, with_recovery)))
+                for info, handle, job_ids, with_recovery in to_fetch
+            ]
             self._handle_job_status_results(fetch_results)
 
     def _handle_job_status_results(
@@ -7468,7 +8514,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Consume the parallel job-status fetches, in submission order."""
         for info, result in fetch_results:
             try:
-                job_statuses = result.get()
+                result_payload = result.get()
+                if (isinstance(result_payload, tuple) and
+                        len(result_payload) == 3):
+                    (job_statuses, recovery_infos,
+                     recovery_detail_statuses) = result_payload
+                else:
+                    # Compatibility for focused tests and old backend shims.
+                    job_statuses = result_payload
+                    recovery_infos = {}
+                    recovery_detail_statuses = {}
             except exceptions.CommandError:
                 # If the job status fetch failed, it is likely that the
                 # cluster is preempted.
@@ -7484,6 +8539,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if not fresh.status_property.should_track_service_status():
                         continue
                     is_preempted = self._handle_preemption(fresh)
+                    if (not is_preempted and fresh.system_recovery_disposition
+                            == system_recovery_state.SystemRecoveryDisposition.
+                            CAPABLE and
+                            self._system_recovery_status_barrier_expired(fresh)
+                       ):
+                        self._terminate_replica(fresh.replica_id,
+                                                sync_down_logs=True,
+                                                replica_drain_delay_seconds=0)
+                        is_preempted = True
                 # Whether preempted or not, move on to the next replica: a
                 # replica whose job status cannot be fetched (e.g. a
                 # persistently broken but reachable node) must not abort the
@@ -7498,6 +8562,28 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
             if self._is_pool:
                 job_status = job_statuses.get(1)
+            elif info.system_recovery_disposition in (
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+                service_job_id = info.service_job_id
+                if (isinstance(service_job_id, bool) or
+                        not isinstance(service_job_id, int) or
+                        service_job_id < 1):
+                    job_status = None
+                    recovery_detail = None
+                    recovery_detail_status = (
+                        job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+                else:
+                    job_status = job_statuses.get(service_job_id)
+                    recovery_detail = recovery_infos.get(service_job_id)
+                    recovery_detail_status = recovery_detail_statuses.get(
+                        service_job_id,
+                        job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED)
+                with self.lock:
+                    if self._reconcile_system_recovery_status(
+                            info, job_status, recovery_detail,
+                            recovery_detail_status):
+                        continue
             else:
                 job_status = next(iter(job_statuses.values()), None)
             if job_status is None:
@@ -7527,7 +8613,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _job_status_fetcher(self) -> None:
         """Periodically fetch the service job status of all replicas."""
-        while True:
+        while not self._ownership_lost.is_set():
             logger.debug('Refreshing job status.')
             try:
                 self._fetch_job_status()
@@ -7538,7 +8624,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            time.sleep(_JOB_STATUS_FETCH_INTERVAL)
+            if self._ownership_lost.wait(_JOB_STATUS_FETCH_INTERVAL):
+                return
 
     def _resolve_probe_urls(self,
                             infos: list[ReplicaInfo]) -> dict[int, str | None]:
@@ -7582,6 +8669,183 @@ class SkyPilotReplicaManager(ReplicaManager):
             )
         return urls
 
+    def _reduce_candidate_probe(
+        self,
+        info: ReplicaInfo,
+        *,
+        succeeded: bool,
+        probe_started_at: float,
+        probe_monotonic_started_at: float,
+        exact_job_nonterminal: bool,
+        exact_detail_absent: bool,
+    ) -> tuple[ReplicaInfo, bool, bool]:
+        """Apply the candidate readiness/ABSENT release protocol."""
+        outcome = {'off_route': True, 'teardown': False, 'released': False}
+        deadlines = getattr(self, '_candidate_release_monotonic_deadlines',
+                            None)
+        if deadlines is None:
+            deadlines = {}
+            self._candidate_release_monotonic_deadlines = deadlines
+
+        def _reduce(fresh: ReplicaInfo) -> bool:
+            outcome.update({
+                'off_route': True,
+                'teardown': False,
+                'released': False,
+            })
+            if (fresh.system_recovery_quarantine is not None or
+                    self._has_system_recovery_teardown_intent(fresh)):
+                outcome['teardown'] = True
+                return False
+            if (fresh.system_recovery_disposition !=
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+                outcome['off_route'] = (
+                    fresh.system_recovery_disposition ==
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+                return False
+            deadline = deadlines.get(fresh.replica_id)
+            if deadline is None and (
+                    succeeded or fresh.candidate_ready_observed_at is not None):
+                deadline = (
+                    time.monotonic() +
+                    system_recovery_state.CANDIDATE_RELEASE_GUARD_SECONDS)
+                deadlines[fresh.replica_id] = deadline
+            reduction = system_recovery_state.reduce_candidate_readiness(
+                fresh.system_recovery_disposition,
+                fresh.candidate_ready_observed_at,
+                fresh.ordinary_release_not_before,
+                succeeded=succeeded,
+                probe_started_at=probe_started_at,
+                now=time.time(),
+                monotonic_guard_satisfied=(deadline is not None and
+                                           probe_monotonic_started_at
+                                           > deadline),
+                exact_job_nonterminal=exact_job_nonterminal,
+                exact_detail_absent=exact_detail_absent,
+                teardown_intent=self._has_system_recovery_teardown_intent(
+                    fresh),
+                quarantined=False)
+            fresh.system_recovery_disposition = reduction.disposition
+            fresh.candidate_ready_observed_at = (
+                reduction.candidate_ready_observed_at)
+            fresh.ordinary_release_not_before = (
+                reduction.ordinary_release_not_before)
+            outcome['off_route'] = reduction.force_off_route
+            outcome['teardown'] = reduction.schedule_legacy_teardown
+            outcome['released'] = (
+                reduction.disposition ==
+                system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+            return reduction.changed
+
+        updated = self._patch_system_recovery_with_latest(
+            info.replica_id, _reduce)
+        if updated is None:
+            outcome['teardown'] = True
+            return info, True, True
+        if (updated.system_recovery_disposition
+                != system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+            deadlines.pop(updated.replica_id, None)
+        if (updated.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.ORDINARY):
+            if outcome['released']:
+                system_oom_recovery_observability.record_for_replica(
+                    'authorization_v3_ordinary', updated)
+        return updated, bool(outcome['off_route']), bool(outcome['teardown'])
+
+    def _reduce_capable_probe(
+        self,
+        info: ReplicaInfo,
+        *,
+        succeeded: bool,
+        probe_started_at: float,
+    ) -> tuple[ReplicaInfo, system_recovery_state.RecoveryReduction | None]:
+        """Reduce a capable replica probe against the latest revision."""
+        outcome: dict[str, system_recovery_state.RecoveryReduction | None] = {
+            'reduction': None
+        }
+        recovery_events: set[str] = set()
+
+        def _reduce(fresh: ReplicaInfo) -> bool:
+            outcome['reduction'] = None
+            recovery_events.clear()
+            if (fresh.system_recovery_disposition
+                    != system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+                return False
+            recovery = fresh.system_recovery
+            if recovery is None:
+                return False
+            reduction = system_recovery_state.reduce_probe_result(
+                recovery,
+                succeeded=succeeded,
+                probe_started_at=probe_started_at,
+                now=time.time(),
+                was_ready=(fresh.status_property.first_ready_time is not None
+                           and fresh.status_property.first_ready_time >= 0),
+                detection_window_seconds=(
+                    system_recovery_state.CANDIDATE_RELEASE_GUARD_SECONDS),
+                teardown_intent=(
+                    self._has_system_recovery_teardown_intent(fresh) or
+                    self._system_recovery_status_barrier_expired(fresh)),
+                quarantined=(fresh.system_recovery_quarantine is not None))
+            previous_state = recovery.state
+            updated_state = (None if reduction.state is None else
+                             reduction.state.state)
+            if (updated_state
+                    == system_recovery_state.ControllerRecoveryState.RECOVERED
+                    and previous_state != updated_state):
+                recovery_events.add('recovery_succeeded')
+            if (updated_state
+                    == system_recovery_state.ControllerRecoveryState.EXHAUSTED
+                    and previous_state != updated_state):
+                recovery_events.add('recovery_exhausted')
+            fresh.system_recovery = reduction.state
+            outcome['reduction'] = reduction
+            return reduction.changed
+
+        updated = self._patch_system_recovery_with_latest(
+            info.replica_id, _reduce)
+        if updated is None:
+            return info, system_recovery_state.RecoveryReduction(
+                state=info.system_recovery,
+                changed=False,
+                force_off_route=True,
+                clear_probe_failure_window=False,
+                mark_ready=False,
+                schedule_legacy_teardown=True)
+        for event in recovery_events:
+            system_oom_recovery_observability.record_for_replica(event, updated)
+        reduction = outcome['reduction']
+        if (reduction is None or reduction.schedule_legacy_teardown or
+                updated.system_recovery is None or updated.system_recovery.state
+                == system_recovery_state.ControllerRecoveryState.EXHAUSTED):
+            self._system_recovery_status_initialized_ids().discard(
+                updated.replica_id)
+        if (reduction is not None and updated.replica_id
+                not in self._system_recovery_status_initialized_ids()):
+            reduction = dataclasses.replace(reduction,
+                                            force_off_route=True,
+                                            mark_ready=False)
+        return updated, reduction
+
+    @staticmethod
+    def _readiness_persistence_fingerprint(
+        info: ReplicaInfo,
+    ) -> tuple[bool, float | None, float | None, float | None]:
+        """Return exactly the probe-mutated ordinary readiness fields."""
+        return (info.status_property.service_ready_now,
+                info.status_property.first_ready_time,
+                getattr(info, 'first_not_ready_time', None),
+                getattr(info, 'first_consecutive_failure_time', None))
+
+    @staticmethod
+    def _is_changed_only_readiness_persistence_eligible(
+            info: ReplicaInfo) -> bool:
+        """Whether recovery state permits readiness-only write filtering."""
+        return (getattr(info, 'system_recovery_disposition', None)
+                == system_recovery_state.SystemRecoveryDisposition.ORDINARY and
+                getattr(info, 'system_recovery', None) is None and
+                getattr(info, 'system_recovery_quarantine', None) is None)
+
     @with_lock
     def _probe_all_replicas(self) -> list[ReplicaInfo]:
         """Readiness probe replicas.
@@ -7604,6 +8868,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         probe_futures = []
         replica_to_probe = []
         infos = serve_state.get_replica_infos(self._service_name)
+        self._prune_system_recovery_process_guards(infos)
+        self._route_lease_registry().prune({
+            info.replica_id: info.replica_record_id
+            for info in infos
+            if (info.system_recovery_quarantine is None and
+                info.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE and
+                info.system_recovery is not None and info.system_recovery.state
+                != system_recovery_state.ControllerRecoveryState.EXHAUSTED and
+                not self._has_system_recovery_teardown_intent(info))
+        })
         infos_to_probe = [
             info for info in infos
             if info.status_property.should_track_service_status()
@@ -7630,43 +8905,348 @@ class SkyPilotReplicaManager(ReplicaManager):
             probe_urls = self._resolve_probe_urls(infos_to_probe)
         else:
             probe_urls = {}
+        candidate_status_inputs: list[tuple[ReplicaInfo, Any]] = []
+        route_issue_inputs: dict[
+            int, tuple[Any, system_recovery_route_lease.RouteGeneration, bool,
+                       float | None, str, str, dict[str, Any] | None,
+                       dict[str, str] | None, int]] = {}
+        if not self._is_pool:
+            candidates = [
+                info for info in infos_to_probe
+                if info.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.CANDIDATE
+            ]
+            initialized_ids = set(
+                self._system_recovery_status_initialized_ids())
+            route_issue_candidates: dict[int, tuple[
+                ReplicaInfo, system_recovery_route_lease.RouteGeneration, bool,
+                float | None, str, str, dict[str, Any] | None,
+                dict[str, str] | None, int]] = {}
+            for info in infos_to_probe:
+                route_url = probe_urls.get(info.replica_id)
+                if (route_url is None or
+                        info.replica_id not in initialized_ids):
+                    continue
+                exact_generation = self._system_recovery_route_generation(info)
+                status_generation = exact_generation
+                if status_generation is None:
+                    status_generation = self._system_recovery_route_generation(
+                        info, allow_retry_submitted=True)
+                if status_generation is None:
+                    continue
+                try:
+                    needs_issuance = self._route_lease_registry(
+                    ).needs_issuance(info.replica_id, status_generation,
+                                     route_url)
+                except system_recovery_route_lease.RouteLeaseError:
+                    needs_issuance = True
+                if not needs_issuance:
+                    continue
+                job_id = info.service_job_id
+                if (not isinstance(job_id, int) or isinstance(job_id, bool) or
+                        job_id < 1):
+                    # Preserve a closed MALFORMED result below so the parent
+                    # reducer cannot treat missing exact-job identity as an
+                    # ordinary readiness success.
+                    job_id = -1
+                recovery = info.system_recovery
+                retry_submitted_adopted_at = (
+                    None if recovery is None else
+                    recovery.retry_submitted_adopted_at)
+                route_issue_candidates[info.replica_id] = (
+                    info, status_generation, exact_generation
+                    is None, retry_submitted_adopted_at, route_url,
+                    self._get_readiness_path(info.version),
+                    self._get_post_data(info.version),
+                    self._get_readiness_headers(info.version), job_id)
+
+            # Resolve every handle before scheduling the workers.  Besides
+            # avoiding per-thread database reads, this freezes the exact
+            # row/job/URL/spec inputs used by the ordered evidence chain.
+            status_infos = candidates + [
+                candidate[0] for candidate in route_issue_candidates.values()
+            ]
+            status_cluster_records = (global_user_state.get_clusters_from_names(
+                [info.cluster_name for info in status_infos])
+                                      if status_infos else {})
+            for info in candidates:
+                record = status_cluster_records.get(info.cluster_name)
+                handle = None if record is None else info.handle(record)
+                candidate_status_inputs.append((info, handle))
+            for replica_id, candidate in route_issue_candidates.items():
+                (info, generation, predicted_generation,
+                 retry_submitted_adopted_at, route_url, readiness_path,
+                 post_data, readiness_headers, job_id) = candidate
+                record = status_cluster_records.get(info.cluster_name)
+                handle = None if record is None else info.handle(record)
+                route_issue_inputs[replica_id] = (handle, generation,
+                                                  predicted_generation,
+                                                  retry_submitted_adopted_at,
+                                                  route_url, readiness_path,
+                                                  post_data, readiness_headers,
+                                                  job_id)
+
+        recovery_backend = backends.CloudVmRayBackend()
         # Probes are pure I/O (HTTP GET/POST with a several-second timeout):
         # the default ThreadPool size (cpu_count) turns a large fleet into
         # dozens of sequential probe waves and the round overruns its 10s
         # period. Size the pool to the fleet, capped to bound thread cost.
         num_probe_threads = min(len(infos_to_probe),
                                 self._PROBE_ROUND_MAX_PARALLELISM)
-        with mp_pool.ThreadPool(num_probe_threads) as pool:
+        with mp_pool.ThreadPool(num_probe_threads) as pool, \
+             contextlib.ExitStack() as route_suspension_rollback:
+            pending_route_suspensions: list[
+                system_recovery_route_lease.RouteSuspension] = []
+
+            def _rollback_pending_route_suspensions() -> None:
+                for suspension in pending_route_suspensions:
+                    self._route_lease_registry().rollback_suspension(suspension)
+
+            # Any exception before the batch helper takes ownership must
+            # restore exact unchanged/unexpired routes.  Ownership is
+            # transferred below by copying and then clearing this list.
+            route_suspension_rollback.callback(
+                _rollback_pending_route_suspensions)
+
+            def _ordered_route_status(
+                handle: Any,
+                job_id: int,
+            ) -> tuple[job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
+                       None, job_lib.JobSystemRecoveryDetailStatus]:
+                if handle is None or job_id < 1:
+                    return (None, None,
+                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+                try:
+                    status_payload = (
+                        recovery_backend.get_job_status_with_system_recovery(
+                            handle, [job_id], stream_logs=False))
+                    if status_payload is None:
+                        raise ValueError('exact status payload is missing')
+                    statuses, recovery_infos, detail_statuses = status_payload
+                    return (
+                        statuses.get(job_id), recovery_infos.get(job_id),
+                        detail_statuses.get(
+                            job_id,
+                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED))
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        f'Ordered route-issuance status fetch failed for '
+                        f'exact job {job_id}: '
+                        f'{common_utils.format_exception(e)}')
+                    return (None, None,
+                            job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+
+            def _probe_nonpool(
+                info: ReplicaInfo,
+                readiness_path: str,
+                post_data: dict[str, Any] | None,
+                timeout: int,
+                readiness_headers: dict[str, str] | None,
+                route_url: str | None,
+            ) -> tuple[ReplicaInfo, bool, float, float, tuple[
+                    job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
+                    None, job_lib.JobSystemRecoveryDetailStatus] | None, bool]:
+                # The fallback timestamp is used only for ordinary candidate
+                # guard bookkeeping. Route issuance fails closed unless the
+                # production HTTP probe invokes the exact-start callback.
+                worker_started_at = time.monotonic()
+                request_started_at: float | None = None
+
+                def _capture_request_start(started_at: float) -> None:
+                    nonlocal request_started_at
+                    if request_started_at is None:
+                        request_started_at = started_at
+
+                result_info, succeeded, probe_time = info.probe(
+                    readiness_path,
+                    post_data,
+                    timeout,
+                    readiness_headers,
+                    route_url,
+                    request_started_callback=_capture_request_start)
+                route_input = route_issue_inputs.get(info.replica_id)
+                if (not succeeded or request_started_at is None or
+                        route_input is None):
+                    return (result_info, succeeded, probe_time,
+                            (worker_started_at if request_started_at is None
+                             else request_started_at), None, False)
+
+                (handle, generation, predicted_generation,
+                 retry_submitted_adopted_at, exact_route_url,
+                 exact_readiness_path, exact_post_data, exact_headers,
+                 job_id) = route_input
+                evidence = _ordered_route_status(handle, job_id)
+                # A RETRY_SUBMITTED row may already carry a durable adoption
+                # fence from an earlier round. A probe that starts after that
+                # fence can register the predicted RECOVERED target here;
+                # only the parent can complete the durable READY reduction.
+                # A probe at or before the adoption fence requires a later
+                # readiness request.
+                probe_started_after_adoption = (
+                    isinstance(retry_submitted_adopted_at, (int, float)) and
+                    not isinstance(retry_submitted_adopted_at, bool) and
+                    probe_time > float(retry_submitted_adopted_at))
+                requires_next_probe = (predicted_generation and
+                                       not probe_started_after_adoption)
+                if (not requires_next_probe and
+                        self._system_recovery_route_evidence_matches(
+                            result_info,
+                            *evidence,
+                            allow_retry_submitted=predicted_generation)):
+                    try:
+                        # Process-local issuance is intentionally the sole
+                        # worker side effect. Persistence/teardown remains in
+                        # the parent thread after it revalidates current state.
+                        self._route_lease_registry().issue(
+                            result_info.replica_id, generation, exact_route_url,
+                            exact_readiness_path, exact_post_data,
+                            exact_headers, request_started_at)
+                    except system_recovery_route_lease.RouteLeaseError:
+                        pass
+                return (result_info, succeeded, probe_time, request_started_at,
+                        evidence, requires_next_probe)
+
+            def _probe_pool(
+                info: ReplicaInfo,
+            ) -> tuple[ReplicaInfo, bool, float, float, tuple[
+                    job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
+                    None, job_lib.JobSystemRecoveryDetailStatus] | None, bool]:
+                request_started_at = time.monotonic()
+                result_info, succeeded, probe_time = info.probe_pool()
+                return (result_info, succeeded, probe_time, request_started_at,
+                        None, False)
+
             for info in infos_to_probe:
                 if self._is_pool:
                     replica_to_probe.append(f'replica_{info.replica_id}(cluster'
                                             f'_name={info.cluster_name})')
-                    probe_futures.append(pool.apply_async(info.probe_pool))
+                    probe_futures.append(pool.apply_async(_probe_pool, (info,)))
                 else:
                     resolved_url = probe_urls[info.replica_id]
+                    readiness_path = self._get_readiness_path(info.version)
+                    post_data = self._get_post_data(info.version)
+                    timeout = self._get_readiness_timeout_seconds(info.version)
+                    readiness_headers = self._get_readiness_headers(
+                        info.version)
                     replica_to_probe.append(
                         f'replica_{info.replica_id}(url={resolved_url})')
                     probe_futures.append(
                         pool.apply_async(
-                            info.probe,
+                            _probe_nonpool,
                             (
-                                self._get_readiness_path(info.version),
-                                self._get_post_data(info.version),
-                                self._get_readiness_timeout_seconds(
-                                    info.version),
-                                self._get_readiness_headers(info.version),
+                                info,
+                                readiness_path,
+                                post_data,
+                                timeout,
+                                readiness_headers,
                                 resolved_url,
                             ),
                         ),)
             logger.info(f'Replicas to probe: {", ".join(replica_to_probe)}')
 
-            # Since futures.as_completed will return futures in the order of
-            # completion, we need the info.probe function to return the info
-            # object as well, so that we could update the info object in the
-            # same order.
-            probe_results: list[tuple[ReplicaInfo, bool, float]] = [
-                future.get() for future in probe_futures
-            ]
+            # Draining in submission order is safe because first issuance is
+            # completed by the composite worker itself. A slow earlier future
+            # cannot delay a later worker's readiness -> exact-status -> token
+            # chain or consume the later worker's lease lifetime.
+            probe_results: list[tuple[
+                ReplicaInfo, bool, float, float,
+                tuple[job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
+                      None, job_lib.JobSystemRecoveryDetailStatus] | None,
+                bool]] = [future.get() for future in probe_futures]
+
+            # Candidate release requires ABSENT + nonterminal status from the
+            # exact job in the same reconciliation cycle as the fresh probe.
+            # These few short-lived candidates share the probe pool; capable
+            # steady-state replicas remain on the normal job-status cadence.
+            def _candidate_status(info: ReplicaInfo, handle: Any) -> Any:
+                if (handle is None or isinstance(info.service_job_id, bool) or
+                        not isinstance(info.service_job_id, int) or
+                        info.service_job_id < 1):
+                    return None
+                return recovery_backend.get_job_status_with_system_recovery(
+                    handle, [info.service_job_id], stream_logs=False)
+
+            candidate_status_futures = {
+                info.replica_id:
+                    (info, pool.apply_async(_candidate_status, (info, handle)))
+                for info, handle in candidate_status_inputs
+            }
+            candidate_cycle_evidence: dict[int, tuple[bool, bool]] = {}
+            candidate_refreshed: dict[int, ReplicaInfo] = {}
+            terminal_candidate_ids: set[int] = set()
+            for replica_id, (candidate_info,
+                             status_future) in candidate_status_futures.items():
+                try:
+                    status_payload = status_future.get()
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        f'Exact candidate status fetch failed for replica '
+                        f'{replica_id}: {common_utils.format_exception(e)}')
+                    status_payload = None
+                if status_payload is None:
+                    statuses: dict[int | None, job_lib.JobStatus | None] = {}
+                    recovery_infos: dict[int,
+                                         job_lib.JobSystemRecoveryInfo] = {}
+                    detail_statuses: dict[
+                        int, job_lib.JobSystemRecoveryDetailStatus] = {}
+                else:
+                    statuses, recovery_infos, detail_statuses = status_payload
+                job_id = candidate_info.service_job_id
+                valid_job_id = (isinstance(job_id, int) and
+                                not isinstance(job_id, bool) and job_id > 0)
+                if valid_job_id:
+                    assert isinstance(job_id, int)
+                    job_status = statuses.get(job_id)
+                    detail = recovery_infos.get(job_id)
+                    detail_status = detail_statuses.get(
+                        job_id,
+                        job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED)
+                else:
+                    job_status = None
+                    detail = None
+                    detail_status = (
+                        job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
+                if self._reconcile_system_recovery_status(
+                        candidate_info, job_status, detail, detail_status):
+                    # Status reconciliation already scheduled (or completed)
+                    # the absorbing legacy teardown.  The readiness probe was
+                    # launched from an older snapshot; never let its result
+                    # reduce or whole-row-upsert this replica afterward.
+                    terminal_candidate_ids.add(replica_id)
+                fresh_candidate = serve_state.get_replica_info_from_id(
+                    self._service_name, replica_id)
+                if fresh_candidate is not None:
+                    candidate_refreshed[replica_id] = fresh_candidate
+                candidate_cycle_evidence[replica_id] = (
+                    isinstance(job_status, job_lib.JobStatus) and
+                    not job_status.is_terminal(), detail_status
+                    == job_lib.JobSystemRecoveryDetailStatus.ABSENT and
+                    detail is None)
+
+            if candidate_refreshed:
+                probe_results = [
+                    (candidate_refreshed.get(info.replica_id,
+                                             info), succeeded, probe_time,
+                     monotonic_started_at, route_evidence, requires_next_probe)
+                    for info, succeeded, probe_time, monotonic_started_at,
+                    route_evidence, requires_next_probe in probe_results
+                ]
+            if terminal_candidate_ids:
+                probe_results = [
+                    result for result in probe_results
+                    if result[0].replica_id not in terminal_candidate_ids
+                ]
+
+            ordered_route_evidence: dict[int, tuple[
+                job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo | None,
+                job_lib.JobSystemRecoveryDetailStatus]] = {}
+            route_requires_next_probe_ids: set[int] = set()
+            for (route_info, _, _, _, evidence,
+                 requires_next_probe) in probe_results:
+                if evidence is not None:
+                    ordered_route_evidence[route_info.replica_id] = evidence
+                if requires_next_probe:
+                    route_requires_next_probe_ids.add(route_info.replica_id)
 
             # Parallel cloud-only pre-filter for interruption handling. The
             # full _handle_preemption does a forced cluster refresh (cloud
@@ -7683,7 +9263,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # latency is unchanged: every failed probe is still checked
             # against the cloud every round.
             failed_interruptible_infos = [
-                info for info, probe_succeeded, _ in probe_results
+                info for info, probe_succeeded, _, _, _, _ in probe_results
                 if (not probe_succeeded and self._is_interruptible_replica(info)
                    )
             ]
@@ -7700,15 +9280,111 @@ class SkyPilotReplicaManager(ReplicaManager):
                         failed_interruptible_infos, alive_flags) if not alive
                 }
 
+            changed_only_readiness_persistence = getattr(
+                self, '_changed_only_readiness_persistence', False)
             pending_writes: list[tuple[int, ReplicaInfo]] = []
             replicas_to_teardown: list[int] = []
             preempted_replica_ids: set[int] = set()
+            terminal_route_ids: set[int] = set()
             for future_result in probe_results:
-                info, probe_succeeded, probe_time = future_result
-                info.status_property.service_ready_now = probe_succeeded
+                (info, probe_succeeded, probe_time, probe_monotonic_started_at,
+                 _, _) = future_result
+                readiness_fingerprint_before = None
+                changed_only_eligible_before = False
+                if changed_only_readiness_persistence:
+                    readiness_fingerprint_before = (
+                        self._readiness_persistence_fingerprint(info))
+                    changed_only_eligible_before = (
+                        self._is_changed_only_readiness_persistence_eligible(
+                            info))
                 should_teardown = False
+                if (not probe_succeeded and
+                        info.replica_id in possibly_preempted_ids):
+                    # Durable legacy interruption/down intent wins before any
+                    # OOM observation or probe reduction can revive routing.
+                    is_preempted = self._handle_preemption(info)
+                    if is_preempted:
+                        preempted_replica_ids.add(info.replica_id)
+                        continue
+
+                force_off_route = False
+                recovery_holds_failure = False
+                if info.system_recovery_quarantine is not None:
+                    force_off_route = True
+                    should_teardown = True
+                elif (info.system_recovery_disposition == system_recovery_state.
+                      SystemRecoveryDisposition.CANDIDATE):
+                    exact_nonterminal, exact_absent = (
+                        candidate_cycle_evidence.get(info.replica_id,
+                                                     (False, False)))
+                    info, force_off_route, candidate_teardown = (
+                        self._reduce_candidate_probe(
+                            info,
+                            succeeded=probe_succeeded,
+                            probe_started_at=probe_time,
+                            probe_monotonic_started_at=(
+                                probe_monotonic_started_at),
+                            exact_job_nonterminal=exact_nonterminal,
+                            exact_detail_absent=exact_absent))
+                    should_teardown = (should_teardown or candidate_teardown)
+
+                route_evidence = ordered_route_evidence.get(info.replica_id)
+                if route_evidence is not None:
+                    if self._reconcile_system_recovery_status(
+                            info, *route_evidence):
+                        terminal_route_ids.add(info.replica_id)
+                        self._route_lease_registry().deactivate(info.replica_id)
+                        continue
+                    fresh_route_info = serve_state.get_replica_info_from_id(
+                        self._service_name, info.replica_id)
+                    if fresh_route_info is None:
+                        terminal_route_ids.add(info.replica_id)
+                        self._route_lease_registry().deactivate(info.replica_id)
+                        continue
+                    info = fresh_route_info
+
+                recovery_reduction = None
+                if (info.system_recovery_disposition == system_recovery_state.
+                        SystemRecoveryDisposition.CAPABLE):
+                    info, recovery_reduction = self._reduce_capable_probe(
+                        info,
+                        succeeded=probe_succeeded,
+                        probe_started_at=probe_time)
+                    if recovery_reduction is None:
+                        force_off_route = True
+                        should_teardown = True
+                    else:
+                        force_off_route = (force_off_route or
+                                           recovery_reduction.force_off_route)
+                        should_teardown = (
+                            should_teardown or
+                            recovery_reduction.schedule_legacy_teardown)
+                        if recovery_reduction.clear_probe_failure_window:
+                            info.first_consecutive_failure_time = None
+                        recovery = info.system_recovery
+                        has_served = (info.status_property.first_ready_time
+                                      is not None and
+                                      info.status_property.first_ready_time
+                                      >= 0)
+                        recovery_holds_failure = has_served and (
+                            recovery is None or recovery.state
+                            in (system_recovery_state.ControllerRecoveryState.
+                                ARMED, system_recovery_state.
+                                ControllerRecoveryState.RECOVERING,
+                                system_recovery_state.ControllerRecoveryState.
+                                RETRY_SUBMITTED) or info.replica_id not in
+                            self._system_recovery_status_initialized_ids())
+
+                info.status_property.service_ready_now = (probe_succeeded and
+                                                          not force_off_route)
+                if not info.status_property.service_ready_now:
+                    suspension = (
+                        self._suspend_system_recovery_route_if_unroutable(info))
+                    if suspension is not None:
+                        pending_route_suspensions.append(suspension)
                 if probe_succeeded:
-                    if self._uptime is None:
+                    if (self._uptime is None and
+                            info.status_property.service_ready_now):
                         self._uptime = probe_time
                         logger.info(
                             f'Replica {info.replica_id} is the first ready '
@@ -7724,20 +9400,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if info.status_property.first_ready_time is None:
                         info.status_property.first_ready_time = probe_time
                 else:
-                    is_preempted = False
-                    if info.replica_id in possibly_preempted_ids:
-                        # Cloud pre-filter above says the instance is gone:
-                        # run the full preemption path (forced refresh with
-                        # its record-cleanup side effects + spot placer
-                        # preemptive marking + teardown).
-                        is_preempted = self._handle_preemption(info)
-                    if is_preempted:
-                        preempted_replica_ids.add(info.replica_id)
-                        continue
-
                     if info.first_not_ready_time is None:
                         info.first_not_ready_time = probe_time
-                    if info.status_property.first_ready_time is not None:
+                    if recovery_holds_failure:
+                        logger.info(
+                            f'Replica {info.replica_id} is held off-route by '
+                            'bounded system recovery; ordinary probe-failure '
+                            'teardown is deferred to its recovery deadline.')
+                    elif info.status_property.first_ready_time is not None:
                         if info.first_consecutive_failure_time is None:
                             info.first_consecutive_failure_time = probe_time
                         consecutive_failure_time = (
@@ -7775,7 +9445,61 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         f'seconds ({current_delay_seconds}s '
                                         f'/ {initial_delay_seconds}s). '
                                         'Skipping.')
-                pending_writes.append((info.replica_id, info))
+
+                if (info.status_property.service_ready_now and
+                        info.system_recovery_disposition
+                        == system_recovery_state.SystemRecoveryDisposition.
+                        CAPABLE):
+                    route_url = probe_urls.get(info.replica_id)
+                    route_generation = (
+                        self._system_recovery_route_generation(info))
+                    route_ready = False
+                    if (route_url is not None and route_generation is not None):
+                        try:
+                            needs_issuance = self._route_lease_registry(
+                            ).needs_issuance(info.replica_id, route_generation,
+                                             route_url)
+                        except system_recovery_route_lease.RouteLeaseError:
+                            needs_issuance = True
+                        route_ready = (
+                            not needs_issuance or
+                            info.replica_id not in route_requires_next_probe_ids
+                            and self._issue_system_recovery_route(
+                                info, route_url, probe_monotonic_started_at,
+                                route_evidence))
+                    if not route_ready:
+                        info.status_property.service_ready_now = False
+                        force_off_route = True
+                        fresh_after_issue = (
+                            serve_state.get_replica_info_from_id(
+                                self._service_name, info.replica_id))
+                        if (fresh_after_issue is None or
+                                fresh_after_issue.system_recovery is not None
+                                and fresh_after_issue.system_recovery.state
+                                == system_recovery_state.
+                                ControllerRecoveryState.EXHAUSTED):
+                            terminal_route_ids.add(info.replica_id)
+                            continue
+                        suspension = (
+                            self._suspend_system_recovery_route_if_unroutable(
+                                info))
+                        if suspension is not None:
+                            pending_route_suspensions.append(suspension)
+                should_persist_readiness = (
+                    not changed_only_readiness_persistence)
+                if changed_only_readiness_persistence:
+                    changed_only_eligible_after = (
+                        self._is_changed_only_readiness_persistence_eligible(
+                            info))
+                    readiness_fingerprint_after = (
+                        self._readiness_persistence_fingerprint(info))
+                    should_persist_readiness = (
+                        not changed_only_eligible_before or
+                        not changed_only_eligible_after or
+                        readiness_fingerprint_before
+                        != readiness_fingerprint_after)
+                if should_persist_readiness:
+                    pending_writes.append((info.replica_id, info))
                 if should_teardown:
                     replicas_to_teardown.append(info.replica_id)
 
@@ -7786,7 +9510,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             # the teardowns: _terminate_replica re-reads the replica row,
             # and the probe mutations (e.g. first_ready_time=-1.0, which
             # drives the failure classification) must be visible to it.
-            self._persist_replicas(pending_writes)
+            if pending_route_suspensions:
+                transferred_route_suspensions = list(pending_route_suspensions)
+                pending_route_suspensions.clear()
+                self._persist_replicas(
+                    pending_writes,
+                    route_suspensions=transferred_route_suspensions)
+            elif pending_writes or not changed_only_readiness_persistence:
+                # Preserve the ordinary call shape for paths that do not
+                # participate in the route-lease protocol.
+                self._persist_replicas(pending_writes)
             for replica_id in replicas_to_teardown:
                 self._terminate_replica(replica_id,
                                         sync_down_logs=True,
@@ -7799,7 +9532,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # snapshot matches a post-round full read without re-deserializing
         # the whole fleet (a second full unpickle per 10s round is a real
         # cost at ~1k replicas).
-        mutated_ids = set(replicas_to_teardown) | preempted_replica_ids
+        mutated_ids = (set(replicas_to_teardown) | preempted_replica_ids |
+                       terminal_candidate_ids | terminal_route_ids)
         if not mutated_ids:
             return infos
         refreshed = serve_state.get_replica_infos_from_ids(
@@ -7816,11 +9550,102 @@ class SkyPilotReplicaManager(ReplicaManager):
                 snapshot.append(refreshed_info)
         return snapshot
 
+    def _set_service_status_from_replica_infos(
+            self,
+            replica_infos: list[ReplicaInfo],
+            expected_status_epoch: int | None = None) -> None:
+        """Write status from a stable target snapshot without blocking scale."""
+        with self._get_status_epoch_lock():
+            if (expected_status_epoch is not None and
+                    expected_status_epoch != getattr(
+                        self, '_status_epoch_generation', 0)):
+                return
+            for _ in range(2):
+                with self._get_target_num_replicas_lock():
+                    target_num_replicas = getattr(self, '_target_num_replicas',
+                                                  None)
+                    update_mode = self._update_mode
+                    target_generation = getattr(
+                        self, '_target_num_replicas_generation', 0)
+                serve_utils.set_service_status_and_active_versions_from_replica(
+                    self._service_name,
+                    replica_infos,
+                    update_mode,
+                    target_num_replicas=target_num_replicas,
+                    **self._db_fence_kwargs())
+                with self._get_target_num_replicas_lock():
+                    if target_generation == getattr(
+                            self, '_target_num_replicas_generation', 0):
+                        return
+                ownership_lost = getattr(self, '_ownership_lost', None)
+                if ownership_lost is not None and ownership_lost.is_set():
+                    return
+
+    async def _probe_system_recovery_route_target(
+            self, session: aiohttp.ClientSession,
+            target: system_recovery_route_lease.RouteProbeTarget) -> None:
+        """Publish one dedicated route-probe result immediately."""
+        request_started_at = time.monotonic()
+        succeeded = False
+        try:
+            request_kwargs: dict[str, Any] = {
+                'headers': target.headers,
+                'timeout': aiohttp.ClientTimeout(
+                    total=serve_constants.
+                    SYSTEM_RECOVERY_ROUTE_PROBE_TIMEOUT_SECONDS),
+                'ssl': replica_tls.aiohttp_ssl_setting(),
+            }
+            if target.method == 'POST':
+                request_kwargs['json'] = target.post_data
+            async with session.request(target.method, target.probe_url,
+                                       **request_kwargs) as response:
+                succeeded = response.status == 200
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            succeeded = False
+        finally:
+            self._route_lease_registry().record_probe_result(
+                target,
+                request_started_at=request_started_at,
+                succeeded=succeeded)
+
+    async def _system_recovery_route_probe_loop(self) -> None:
+        """Run nonoverlapping route-probe rounds on a fixed monotonic grid."""
+        loop = asyncio.get_running_loop()
+        interval = float(
+            serve_constants.SYSTEM_RECOVERY_ROUTE_PROBE_INTERVAL_SECONDS)
+        next_start = loop.time()
+        connector = aiohttp.TCPConnector(
+            limit=serve_constants.SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while not self._ownership_lost.is_set():
+                delay = next_start - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                    if self._ownership_lost.is_set():
+                        return
+                targets = self._route_lease_registry().probe_targets()
+                if targets:
+                    await asyncio.gather(
+                        *(self._probe_system_recovery_route_target(
+                            session, target) for target in targets))
+                next_start += interval
+                # A 15-second hard timeout can intentionally skip 5-second
+                # grid slots.  Never overlap rounds or drift the grid.
+                now = loop.time()
+                while next_start <= now:
+                    next_start += interval
+
+    def _system_recovery_route_prober(self) -> None:
+        """Supervised-thread entry point for the independent async prober."""
+        asyncio.run(self._system_recovery_route_probe_loop())
+
     def _replica_prober(self) -> None:
         """Periodically probe replicas."""
-        while True:
+        while not self._ownership_lost.is_set():
             logger.debug('Running replica prober.')
             try:
+                with self._get_status_epoch_lock():
+                    status_epoch = getattr(self, '_status_epoch_generation', 0)
                 # Reuse the probe round's end-of-round snapshot instead of
                 # re-reading (and re-deserializing) the whole fleet from the
                 # DB a second time per tick.
@@ -7828,9 +9653,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # TODO(zhwu): when there are multiple load balancers, we need
                 # to make sure the active_versions are the union of all
                 # versions of all load balancers.
-                serve_utils.set_service_status_and_active_versions_from_replica(
-                    self._service_name, replica_infos, self._update_mode,
-                    **self._db_fence_kwargs())
+                self._set_service_status_from_replica_infos(
+                    replica_infos, expected_status_epoch=status_epoch)
 
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the
@@ -7846,7 +9670,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # one across ticks.
                 self._tick_version_spec_cache = {}
             # TODO(MaoZiming): Probe cloud for early preemption warning.
-            time.sleep(self._get_endpoint_probe_interval_seconds())
+            if self._ownership_lost.wait(
+                    self._get_endpoint_probe_interval_seconds()):
+                return
 
     def get_active_replica_urls(self) -> list[str]:
         """Get the urls of all active replicas."""
@@ -7857,10 +9683,211 @@ class SkyPilotReplicaManager(ReplicaManager):
         active_versions = set(record['active_versions'])
         for info in serve_state.get_replica_infos(self._service_name):
             if (info.status == serve_state.ReplicaStatus.READY and
-                    info.version in active_versions):
+                    info.version in active_versions and
+                    self.system_recovery_allows_routing(info)):
                 assert info.url is not None, info
                 ready_replica_urls.append(info.url)
         return ready_replica_urls
+
+    def _route_lease_registry(
+            self) -> system_recovery_route_lease.ManagerRouteLeaseRegistry:
+        registry = getattr(self, '_system_recovery_route_registry', None)
+        if registry is None:
+            registry = (system_recovery_route_lease.ManagerRouteLeaseRegistry())
+            self._system_recovery_route_registry = registry
+        return registry
+
+    def _system_recovery_route_generation(
+        self,
+        info: ReplicaInfo,
+        *,
+        allow_retry_submitted: bool = False,
+    ) -> system_recovery_route_lease.RouteGeneration | None:
+        """Build the exact routable process/row/attempt generation."""
+        if (info.system_recovery_disposition
+                != system_recovery_state.SystemRecoveryDisposition.CAPABLE or
+                info.system_recovery is None):
+            return None
+        recovery = info.system_recovery
+        state = recovery.state
+        attempt_id: str | None
+        event_id: str | None
+        if state == system_recovery_state.ControllerRecoveryState.ARMED:
+            attempt_id = recovery.original_attempt_id
+            event_id = None
+            state_value = 'ARMED'
+        elif state == system_recovery_state.ControllerRecoveryState.RECOVERED:
+            attempt_id = recovery.replacement_attempt_id
+            event_id = recovery.event_id
+            state_value = 'RECOVERED'
+        elif (allow_retry_submitted and state
+              == system_recovery_state.ControllerRecoveryState.RETRY_SUBMITTED):
+            # This predicts only the identity that a later post-adoption probe
+            # may make RECOVERED.  It is used to decide whether an ordered
+            # post-probe remote read is needed; it never grants routing.
+            attempt_id = recovery.replacement_attempt_id
+            event_id = recovery.event_id
+            state_value = 'RECOVERED'
+        else:
+            return None
+        if not isinstance(attempt_id, str):
+            return None
+        epoch = getattr(self, '_system_recovery_route_epoch', None)
+        if not isinstance(epoch, str):
+            epoch = str(uuid.uuid4())
+            self._system_recovery_route_epoch = epoch
+        try:
+            return system_recovery_route_lease.RouteGeneration(
+                controller_epoch=epoch,
+                replica_record_id=info.replica_record_id,
+                event_id=event_id,
+                attempt_id=attempt_id,
+                recovery_state=state_value)
+        except system_recovery_route_lease.RouteLeaseError:
+            return None
+
+    def _system_recovery_route_evidence_matches(
+        self,
+        info: ReplicaInfo,
+        job_status: job_lib.JobStatus | None,
+        detail: job_lib.JobSystemRecoveryInfo | None,
+        detail_status: job_lib.JobSystemRecoveryDetailStatus,
+        *,
+        allow_retry_submitted: bool = False,
+    ) -> bool:
+        """Whether ordered post-probe evidence names the routable attempt."""
+        generation = self._system_recovery_route_generation(
+            info, allow_retry_submitted=allow_retry_submitted)
+        recovery = info.system_recovery
+        if (generation is None or recovery is None or
+                not isinstance(job_status, job_lib.JobStatus) or
+                job_status.is_terminal() or
+                detail_status != job_lib.JobSystemRecoveryDetailStatus.PRESENT):
+            return False
+        try:
+            if detail is None:
+                raise system_recovery_state.RecoveryStateError(
+                    'Recovery detail is missing.')
+            observation = (system_recovery_state.RecoveryObservation.
+                           from_job_system_recovery_info(
+                               recovery.job_id, detail))
+        except system_recovery_state.RecoveryStateError:
+            return False
+        if (observation.job_id != info.service_job_id or
+                observation.capability != recovery.capability or
+                observation.node_boot_id != recovery.node_boot_id or
+                observation.original_attempt_id
+                != recovery.original_attempt_id):
+            return False
+        if generation.recovery_state == 'ARMED':
+            return (observation.phase
+                    == system_recovery_state.RemoteRecoveryPhase.ARMED and
+                    observation.event_id is None and
+                    observation.replacement_attempt_id is None and
+                    observation.original_attempt_id == generation.attempt_id)
+        return (observation.phase
+                == system_recovery_state.RemoteRecoveryPhase.RETRY_SUBMITTED and
+                observation.event_id == generation.event_id and
+                observation.replacement_attempt_id == generation.attempt_id)
+
+    def _exhaust_retired_route_generation(self, info: ReplicaInfo) -> None:
+        """Persist the conservative legacy outcome for a stale generation."""
+
+        def _terminalize(fresh: ReplicaInfo) -> bool:
+            generation = self._system_recovery_route_generation(fresh)
+            if (generation is None or
+                    not self._route_lease_registry().is_retired(
+                        fresh.replica_id, generation) or
+                    fresh.system_recovery is None):
+                return False
+            terminal = system_recovery_state.terminalize_for_teardown(
+                fresh.system_recovery, now=time.time())
+            if terminal == fresh.system_recovery:
+                return False
+            fresh.system_recovery = terminal
+            return True
+
+        updated = self._patch_system_recovery_with_latest(
+            info.replica_id, _terminalize)
+        if (updated is None or updated.system_recovery is None or
+                updated.system_recovery.state
+                != system_recovery_state.ControllerRecoveryState.EXHAUSTED):
+            return
+        self._system_recovery_status_initialized_ids().discard(info.replica_id)
+        system_oom_recovery_observability.record_for_replica(
+            'recovery_exhausted', updated)
+        self._terminate_replica(updated.replica_id,
+                                sync_down_logs=True,
+                                replica_drain_delay_seconds=0)
+
+    def _issue_system_recovery_route(
+        self,
+        info: ReplicaInfo,
+        route_url: str,
+        normal_probe_started_at: float,
+        evidence: tuple[job_lib.JobStatus | None,
+                        job_lib.JobSystemRecoveryInfo | None,
+                        job_lib.JobSystemRecoveryDetailStatus] | None,
+    ) -> bool:
+        """Issue only after an ordered exact post-readiness remote read."""
+        generation = self._system_recovery_route_generation(info)
+        if (generation is None or evidence is None or
+                not self._system_recovery_route_evidence_matches(
+                    info, *evidence)):
+            return False
+        spec = self._get_version_spec(info.version)
+        try:
+            issued = self._route_lease_registry().issue(
+                info.replica_id, generation, route_url, spec.readiness_path,
+                spec.post_data, spec.readiness_headers, normal_probe_started_at)
+        except system_recovery_route_lease.RouteLeaseError:
+            issued = False
+        if not issued and self._route_lease_registry().is_retired(
+                info.replica_id, generation):
+            self._exhaust_retired_route_generation(info)
+        return issued
+
+    def system_recovery_route_marker(
+            self, info: ReplicaInfo,
+            route_url: str) -> system_recovery_route_lease.RouteMarker | None:
+        if not self.system_recovery_allows_routing(info):
+            return None
+        generation = self._system_recovery_route_generation(info)
+        if generation is None:
+            return None
+        try:
+            return self._route_lease_registry().marker(info.replica_id,
+                                                       generation, route_url)
+        except system_recovery_route_lease.RouteLeaseError:
+            return None
+
+    def system_recovery_route_lease_snapshot(self) -> dict[str, Any]:
+        return self._route_lease_registry().heartbeat_payload()
+
+    def retire_system_recovery_route(self, info: ReplicaInfo) -> None:
+        self._route_lease_registry().deactivate_record(info.replica_id,
+                                                       info.replica_record_id)
+
+    def system_recovery_allows_routing(self, info: ReplicaInfo) -> bool:
+        """Whether durable recovery state permits this READY row to route."""
+        if info.system_recovery_quarantine is not None:
+            return False
+        disposition = info.system_recovery_disposition
+        if (disposition ==
+                system_recovery_state.SystemRecoveryDisposition.ORDINARY):
+            return True
+        if (disposition
+                != system_recovery_state.SystemRecoveryDisposition.CAPABLE or
+                info.replica_id
+                not in self._system_recovery_status_initialized_ids()):
+            return False
+        recovery = info.system_recovery
+        if recovery is None:
+            return False
+        if recovery.state == system_recovery_state.ControllerRecoveryState.ARMED:
+            return recovery.detection_deadline is None
+        return (recovery.state ==
+                system_recovery_state.ControllerRecoveryState.RECOVERED)
 
     ###########################################
     # SkyServe Update and replica versioning. #
@@ -7940,9 +9967,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._handoff_logical_retirements_for_version_update(
                     replica_infos))
 
-        self.latest_version = version
+        # The previous version's target is not authoritative for the new
+        # policy. Keep status derivation conservative until the new autoscaler
+        # completes a decision tick and publishes its version-fenced target.
+        self._transition_status_epoch_for_version(version, update_mode)
         self.yaml_content = new_yaml_content
-        self._update_mode = update_mode
         self._uses_logical_replicas = new_uses_logical_replicas
         version_specs = getattr(self, '_version_specs', None)
         if version_specs is None:
@@ -8033,6 +10062,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # create new buckets if they are not empty.
                 if (old_config == new_config and
                         old_config.get('file_mounts', None) == {}):
+                    if (info.system_recovery_disposition ==
+                            system_recovery_state.SystemRecoveryDisposition.
+                            CAPABLE):
+                        # A route target binds the prior version's closed
+                        # readiness request. Keep this row on that version
+                        # until the ordinary rolling-update lifecycle replaces
+                        # it; relabeling would let the old request renew a token
+                        # projected as the new version.
+                        logger.info(
+                            'Recovery-capable replica %s remains on version '
+                            '%s; launching version %s replacement capacity '
+                            'instead of reusing its backend row.',
+                            info.replica_id, info.version, version)
+                        continue
                     logger.info(
                         'Updating replica %s from version %s to version %s '
                         'because its runtime config is unchanged.',

@@ -16,10 +16,13 @@ import hashlib
 import pickle
 import re
 import socket
+import subprocess
+import sys
 
 import pytest
 
 from sky.provision import instance_setup
+from sky.provision import ray_commands
 from sky.provision.kubernetes import host_network_probe
 from sky.skylet import constants
 
@@ -184,6 +187,34 @@ class TestRayStartCommands:
         assert 'def _run_head' in decoded
         assert 'def _run_worker' in decoded
         compile(decoded, '<probe>', 'exec')
+
+    def test_probe_payload_is_portable_and_cache_independent(self):
+        instance_setup._host_network_probe_b64.cache_clear()
+        first = instance_setup._host_network_probe_b64()
+        instance_setup._host_network_probe_b64.cache_clear()
+        second = instance_setup._host_network_probe_b64()
+
+        assert first == second
+        assert first.isascii()
+        compressed = base64.b64decode(first, validate=True)
+        assert compressed[:10].hex() == '1f8b08000000000002ff'
+        assert hashlib.sha256(compressed).hexdigest() == (
+            '75aa9fefe49fe72bd89bcf70158467754871fa19c9541fd5fcbe5181ae285895')
+        source = gzip.decompress(compressed).decode('utf-8')
+        compile(source, '<host-network-probe>', 'exec')
+
+    def test_probe_payload_is_identical_in_separate_processes(self):
+        script = ('from sky.provision import ray_commands; '
+                  'print(ray_commands.host_network_probe_b64())')
+        outputs = []
+        for _ in range(2):
+            result = subprocess.run([sys.executable, '-c', script],
+                                    check=True,
+                                    capture_output=True,
+                                    text=True)
+            outputs.append(result.stdout.splitlines()[-1])
+
+        assert outputs == [ray_commands.host_network_probe_b64()] * 2
 
     def test_worker_keeps_existing_object_manager_default(self):
         cmd = instance_setup.ray_worker_start_command(custom_resource=None,

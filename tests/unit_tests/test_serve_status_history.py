@@ -115,6 +115,94 @@ def test_history_hours_are_bounded_before_database_access(hours):
         serve_history.get_status_history('svc', hours=hours)
 
 
+@pytest.mark.parametrize('sections', [[], {'unknown'}, 'requests', {1}])
+def test_history_sections_are_validated_before_database_access(sections):
+    with pytest.raises(ValueError, match='sections must'):
+        serve_history.get_status_history('svc', sections=sections)
+
+
+def test_selected_history_sections_skip_unrequested_queries(monkeypatch):
+    engine = mock.MagicMock()
+    monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
+    service_result = mock.MagicMock()
+    service_result.scalar_one_or_none.return_value = 'hash-a'
+    request_result = mock.MagicMock()
+    request_result.all.return_value = []
+    session = mock.MagicMock()
+    session.__enter__.return_value = session
+    session.execute.side_effect = [service_result, request_result]
+    monkeypatch.setattr(serve_history.orm, 'Session', lambda unused: session)
+
+    history = serve_history.get_status_history('svc',
+                                               timestamp=120,
+                                               sections={'requests'})
+
+    assert session.execute.call_count == 2
+    assert set(history) == {
+        'available',
+        'service_hash',
+        'bucket_seconds',
+        'retention_hours',
+        'window_start',
+        'window_end',
+        'request_samples',
+        'rejection_history_available',
+        'request_window_seconds',
+        'requests_last_hour',
+    }
+
+
+def test_default_history_sections_keep_all_queries_and_fields(monkeypatch):
+    engine = mock.MagicMock()
+    monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
+    service_result = mock.MagicMock()
+    service_result.scalar_one_or_none.return_value = 'hash-a'
+
+    def empty_mapped_result():
+        result = mock.MagicMock()
+        result.mappings.return_value.all.return_value = []
+        return result
+
+    request_result = mock.MagicMock()
+    request_result.all.return_value = []
+    session = mock.MagicMock()
+    session.__enter__.return_value = session
+    session.execute.side_effect = [
+        service_result,
+        empty_mapped_result(),
+        request_result,
+        empty_mapped_result(),
+        empty_mapped_result(),
+    ]
+    monkeypatch.setattr(serve_history.orm, 'Session', lambda unused: session)
+
+    history = serve_history.get_status_history('svc', timestamp=120)
+
+    assert session.execute.call_count == 5
+    assert {
+        'samples',
+        'request_samples',
+        'prediction_time_samples',
+        'autoscaler_samples',
+    }.issubset(history)
+
+
+def test_expected_service_hash_mismatch_is_distinct(monkeypatch):
+    engine = mock.MagicMock()
+    monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
+    session = mock.MagicMock()
+    session.__enter__.return_value = session
+    session.execute.return_value.scalar_one_or_none.return_value = 'hash-new'
+    monkeypatch.setattr(serve_history.orm, 'Session', lambda unused: session)
+
+    history = serve_history.get_status_history('svc',
+                                               expected_service_hash='hash-old')
+
+    assert history['available'] is False
+    assert history['reason'] == 'service_hash_mismatch'
+    assert session.execute.call_count == 1
+
+
 def test_missing_central_service_is_unavailable(monkeypatch):
     engine = mock_engine = mock.MagicMock()
     engine.dialect.name = 'postgresql'
@@ -129,6 +217,7 @@ def test_missing_central_service_is_unavailable(monkeypatch):
 
     assert history == {
         'available': False,
+        'reason': 'service_not_found',
         'bucket_seconds': 60,
         'retention_hours': 72,
         'samples': [],

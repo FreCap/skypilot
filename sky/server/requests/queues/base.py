@@ -1,7 +1,9 @@
 """Abstract interfaces for request queue backends."""
 
 import abc
+import dataclasses
 import multiprocessing
+import os
 import queue as queue_lib
 
 from sky import sky_logging
@@ -13,22 +15,44 @@ from sky.utils import common_utils
 logger = sky_logging.init_logger(__name__)
 
 
+@dataclasses.dataclass(frozen=True)
+class QueueItem:
+    """One queue delivery plus an optional durable execution claim."""
+
+    request_id: str
+    ignore_return_value: bool
+    retryable: bool
+    execution_generation: int = 0
+    claim_token: str | None = None
+
+
+QueueItemLike = QueueItem | tuple[str, bool, bool]
+
+
+def normalize_queue_item(item: QueueItemLike) -> QueueItem:
+    """Adapt legacy plugin tuples to the durable queue-item contract."""
+    if isinstance(item, QueueItem):
+        return item
+    request_id, ignore_return_value, retryable = item
+    return QueueItem(request_id, ignore_return_value, retryable)
+
+
 class QueueBackend(abc.ABC):
     """Abstract queue backend."""
 
     @abc.abstractmethod
-    def put(self, item: tuple[str, bool, bool]) -> None:
+    def put(self, item: QueueItemLike) -> None:
         """Put a (request_id, ignore_return_value, retryable) tuple."""
         raise NotImplementedError
 
-    async def put_async(self, item: tuple[str, bool, bool]) -> None:
+    async def put_async(self, item: QueueItemLike) -> None:
         """Async version of put."""
         # By default we assume put is not blocking and can be
         # called directly in event loop
         self.put(item)
 
     @abc.abstractmethod
-    def get(self) -> tuple[str, bool, bool] | None:
+    def get(self) -> QueueItemLike | None:
         """Non-blocking get. Returns None if queue is empty."""
         raise NotImplementedError
 
@@ -72,10 +96,12 @@ class LocalQueueBackend(QueueBackend):
         super().__init__()
         self._queue = local_queue.get_queue(queue_name)
 
-    def put(self, item: tuple[str, bool, bool]) -> None:
-        self._queue.put(item)
+    def put(self, item: QueueItemLike) -> None:
+        normalized = normalize_queue_item(item)
+        self._queue.put((normalized.request_id, normalized.ignore_return_value,
+                         normalized.retryable))
 
-    def get(self) -> tuple[str, bool, bool] | None:
+    def get(self) -> QueueItemLike | None:
         try:
             return self._queue.get(block=False)
         except queue_lib.Empty:
@@ -94,10 +120,12 @@ class MultiprocessingQueueBackend(QueueBackend):
         super().__init__()
         self._queue = mp_queue.get_queue(queue_name, port)
 
-    def put(self, item: tuple[str, bool, bool]) -> None:
-        self._queue.put(item)
+    def put(self, item: QueueItemLike) -> None:
+        normalized = normalize_queue_item(item)
+        self._queue.put((normalized.request_id, normalized.ignore_return_value,
+                         normalized.retryable))
 
-    def get(self) -> tuple[str, bool, bool] | None:
+    def get(self) -> QueueItemLike | None:
         try:
             return self._queue.get(block=False)
         except queue_lib.Empty:
@@ -155,10 +183,19 @@ def get_registered_queue_backend_factory() -> QueueBackendFactory | None:
 
 
 def get_queue_backend_factory() -> QueueBackendFactory:
-    """Get the registered factory, or the default multiprocessing factory."""
+    """Resolve the queue factory independently in every server process."""
     registered_factory = get_registered_queue_backend_factory()
     if registered_factory is not None:
         return registered_factory
+    if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
+        # Uvicorn workers are spawned processes and do not inherit the
+        # supervisor's module-level ``_queue_factory`` selection.  Resolve the
+        # durable backend from the deployment environment so lifespan
+        # submissions never fall back to the multiprocessing manager.
+        # Runtime import avoids a module cycle: postgres imports this interface.
+        # pylint: disable=import-outside-toplevel
+        from sky.server.requests import postgres
+        return postgres.PostgresQueueFactory()
     return MultiprocessingQueueFactory()
 
 

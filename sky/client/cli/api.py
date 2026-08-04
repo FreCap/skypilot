@@ -85,18 +85,30 @@ def api():
               'to manage the process lifecycle and collect logs directly. '
               'This is useful when the API server is managed by systems '
               'like systemd and Kubernetes.')
+@click.option('--metrics',
+              is_flag=True,
+              default=False,
+              required=False,
+              help='Expose API server metrics.')
+@click.option('--metrics-port',
+              type=click.IntRange(1, 65535),
+              default=None,
+              required=False,
+              help='Port used by the API server metrics endpoint.')
 @click.option('--enable-basic-auth',
               is_flag=True,
               default=False,
               required=False,
               help='Enable basic authentication in the SkyPilot API server.')
 @usage_lib.entrypoint
-def api_start(deploy: bool, host: str, foreground: bool,
-              enable_basic_auth: bool):
+def api_start(deploy: bool, host: str, foreground: bool, metrics: bool,
+              metrics_port: int | None, enable_basic_auth: bool):
     """Starts the SkyPilot API server locally."""
     sdk.api_start(deploy=deploy,
                   host=host,
                   foreground=foreground,
+                  metrics=metrics,
+                  metrics_port=metrics_port,
                   enable_basic_auth=enable_basic_auth)
     api_server_url = server_common.get_server_url(host)
     api_server_info = server_common.get_api_server_status(api_server_url)

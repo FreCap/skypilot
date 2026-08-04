@@ -3,8 +3,6 @@ import bisect
 from collections.abc import Iterable
 from collections.abc import Sequence
 import copy
-import dataclasses
-import enum
 import math
 import threading
 import time
@@ -14,6 +12,8 @@ from typing import Any
 from sky import global_user_state
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
+from sky.serve import autoscaler_compatibility
+from sky.serve import autoscaler_decisions
 from sky.serve import constants
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
@@ -27,6 +27,35 @@ if typing.TYPE_CHECKING:
     from sky.serve import service_spec
 
 logger = sky_logging.init_logger(__name__)
+
+AutoscalerDecisionOperator = (autoscaler_decisions.AutoscalerDecisionOperator)
+AutoscalerDecisionReason = autoscaler_decisions.AutoscalerDecisionReason
+LogicalScaleTarget = autoscaler_decisions.LogicalScaleTarget
+LogicalScaleDownTarget = autoscaler_decisions.LogicalScaleDownTarget
+UnrecoverableRolloutFailure = (autoscaler_decisions.UnrecoverableRolloutFailure)
+FillDemandSample = autoscaler_decisions.FillDemandSample
+AutoscalerDecision = autoscaler_decisions.AutoscalerDecision
+
+# Preserve historical private import and pickle identities while the pure
+# compatibility policy lives behind this module's facade. Internal call sites
+# intentionally continue resolving these globals so facade monkeypatches keep
+# controlling every strategy.
+_allocate_compatibility_target = (
+    autoscaler_compatibility._allocate_compatibility_target)  # pylint: disable=protected-access
+_replica_is_retiring_card_supply = (
+    autoscaler_compatibility._replica_is_retiring_card_supply)  # pylint: disable=protected-access
+_merge_fresh_target_into_downscale_hold = (
+    autoscaler_compatibility._merge_fresh_target_into_downscale_hold)  # pylint: disable=protected-access
+_revalidate_actuation_target = (
+    autoscaler_compatibility._revalidate_actuation_target)  # pylint: disable=protected-access
+for _compatibility_helper in (
+        _allocate_compatibility_target,
+        _replica_is_retiring_card_supply,
+        _merge_fresh_target_into_downscale_hold,
+        _revalidate_actuation_target,
+):
+    _compatibility_helper.__module__ = __name__
+del _compatibility_helper
 
 _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK = 20
 # Maximum consecutive downscale pressure vetoes per downscale episode.
@@ -55,127 +84,6 @@ def _work_to_slots(work: float, capacity: float) -> int:
     if capacity <= 0:
         return 0
     return math.ceil(work / capacity - _SLOT_CONVERSION_EPSILON)
-
-
-class AutoscalerDecisionOperator(enum.Enum):
-    SCALE_UP = 'scale_up'
-    SCALE_DOWN = 'scale_down'
-
-
-class AutoscalerDecisionReason(enum.Enum):
-    COST_REBALANCE = 'cost_rebalance'
-
-
-@dataclasses.dataclass(frozen=True)
-class LogicalScaleTarget:
-    """One capacity target derived from an immutable LB generation."""
-
-    version: int
-    reconcile_generation: int
-    target_capacity: int
-    target_capacity_by_accelerator: tuple[tuple[str, int], ...] = ()
-    accelerator_shapes: tuple[tuple[str, int], ...] = ()
-    replace_unknown_replica_ids: tuple[int, ...] = ()
-    launch_budget: int | None = None
-    launch_priority: int = constants.LB_REQUEST_PRIORITY_MIN
-    launch_priority_by_accelerator: tuple[tuple[str, int], ...] = ()
-
-
-@dataclasses.dataclass(frozen=True)
-class LogicalScaleDownTarget:
-    """One backend retirement selected against a logical target."""
-
-    version: int
-    reconcile_generation: int
-    target_capacity: int
-    replica_id: int
-    target_capacity_by_accelerator: tuple[tuple[str, int], ...] = ()
-    accelerator_shapes: tuple[tuple[str, int], ...] = ()
-
-
-@dataclasses.dataclass(frozen=True)
-class UnrecoverableRolloutFailure:
-    """Typed evidence that a candidate version never became serviceable."""
-
-    version: int
-    reason: str
-
-
-@dataclasses.dataclass(frozen=True)
-class FillDemandSample:
-    """Work a service can demonstrate, for the reserved-fill gate.
-
-    Sampled by the poller thread once per poll interval, published on the
-    broker claim, and consumed by the release governor. Every term is a
-    RETAIN signal: any of them being non-zero keeps the claimant's
-    entitlement, and only the conjunction of all of them being zero starts
-    a release. That asymmetry is deliberate, because the cost of a false
-    "idle" (culling a fleet that is working) is far higher than the cost of
-    a false "busy" (holding capacity one dwell longer).
-    """
-
-    outstanding_work: float
-    # Fill replicas individually reporting work. Per-replica on purpose: a
-    # service-level "any unknown occupancy" boolean would let three flapping
-    # replicas out of seventy-seven pin the whole fleet as busy forever, and
-    # the gate would be silently inert on exactly the service it is for.
-    busy_fill_holdings: int
-    # Fill replicas in PENDING / PROVISIONING / STARTING. Boot protection:
-    # these are the FIRST scale-down victims, so without this term the gate
-    # would order a fleet, hold it through a 20-minute readiness delay, and
-    # cull it before it served a request.
-    pre_ready_fill_holdings: int
-    upscale_pending: bool
-    work_per_replica: float
-
-    def demonstrated_need(self) -> int:
-        """Replicas this claimant can prove it is using right now."""
-        per_replica = max(1e-9, float(self.work_per_replica))
-        return max(
-            self.busy_fill_holdings + self.pre_ready_fill_holdings,
-            math.ceil(max(0.0, self.outstanding_work) / per_replica),
-        )
-
-    def boot_hold(self) -> bool:
-        """Whether a step must be deferred: authorized fleet still booting."""
-        return self.pre_ready_fill_holdings > 0 or self.upscale_pending
-
-
-@dataclasses.dataclass
-class AutoscalerDecision:
-    """Autoscaling decisions.
-
-    |------------------------------------------------------------------------|
-    | Operator   | TargetType                | Meaning                       |
-    |------------|---------------------------|-------------------------------|
-    | SCALE_UP   | Optional[Dict[str, Any]   | Resource override to add      |
-    |------------|---------------------------|-------------------------------|
-    | SCALE_DOWN | int                       | Replica id to remove          |
-    |------------------------------------------------------------------------|
-    """
-    operator: AutoscalerDecisionOperator
-    target: (dict[str, Any] | None | int | LogicalScaleTarget |
-             LogicalScaleDownTarget)
-    reason: AutoscalerDecisionReason | None
-
-    # TODO(MaoZiming): Add a doc to elaborate on autoscaling policies.
-    def __init__(self,
-                 operator: AutoscalerDecisionOperator,
-                 target: (dict[str, Any] | None | int | LogicalScaleTarget |
-                          LogicalScaleDownTarget),
-                 reason: AutoscalerDecisionReason | None = None):
-        if operator == AutoscalerDecisionOperator.SCALE_UP:
-            assert (target is None or isinstance(target,
-                                                 (dict, LogicalScaleTarget)))
-        else:
-            assert isinstance(target, (int, LogicalScaleDownTarget))
-        self.operator = operator
-        self.target = target
-        self.reason = reason
-
-    def __repr__(self) -> str:
-        return (f'AutoscalerDecision({self.operator}, {self.target}, '
-                f'reason={self.reason})')
 
 
 def _scale_down_replica_id(target: int | LogicalScaleDownTarget) -> int:
@@ -439,8 +347,8 @@ class Autoscaler:
             getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
         self.reserved_fill_weight: float = float(
             getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
-        # Whether this service releases its above-floor entitlement while
-        # it demonstrates no work (see reserved_capacity_broker).
+        # Whether this service releases its whole fill entitlement while it
+        # demonstrates no work (see reserved_capacity_broker).
         self.reserved_fill_utilization_gate: bool = bool(
             getattr(spec, 'reserved_fill_utilization_gate', False))
         # Damped free-slot value the fill target acts on (see
@@ -762,12 +670,13 @@ class Autoscaler:
 
         Read-only projection for the reserved-fill poller thread, which
         calls it once per poll from _broker_cycle. None means "no usable
-        telemetry", and the utilization gate treats that as blind: it
-        freezes rather than releasing, so an autoscaler class without
-        occupancy telemetry is never gated at all.
+        telemetry". For an armed utilization gate, the poller publishes that
+        as fresh NULL need: the broker freezes for its 900s blind grace and
+        then resumes bounded decay if blindness persists.
 
         The base class has no per-replica occupancy signal, so it returns
-        None and every subclass that does not override this stays ungated.
+        None. A service that needs static reservation behavior must explicitly
+        set utilization_gate: false.
         """
         del replica_infos  # Unused: no occupancy telemetry on the base.
         return None
@@ -2466,336 +2375,6 @@ class _GpuShapeResolverMixin:
                 candidate_count == configured_count)
 
 
-def _allocate_compatibility_target(
-    *,
-    configured_cards: list[str],
-    capacities: dict[str, float],
-    floors: dict[str, int],
-    min_replicas: int,
-    max_replicas: int,
-    demand_profiles: list[tuple[int, tuple[str, ...], float]],
-    fixed_work_by_accelerator: dict[str, float],
-    ready_zero_cost: dict[str, int],
-    ready: dict[str, int],
-    provisioning: dict[str, int],
-    free_reserved: dict[str, int],
-    cold_order: list[str],
-    use_existing_supply: bool,
-) -> dict[str, int]:
-    """Allocate exact-card work into one bounded per-card target.
-
-    `fixed_work_by_accelerator` is already-running or conservatively unknown
-    work. It cannot move without preemption, so it consumes capacity only on
-    its current card before flexible queued/rejected profiles are considered.
-    `demand_profiles` contains work units, not request counts, which lets the
-    same scarcity/supply allocator serve both QPS and concurrency policies.
-    """
-    demand_epsilon = 1e-9
-    # A logical scale-up wave can deliberately place a ceiling below the
-    # eventual hard floors. Admit those floors incrementally instead of
-    # returning a map whose sum exceeds the actuation fence. The configured
-    # order is the stable tie-break until later waves complete every floor.
-    target: dict[str, int] = {}
-    remaining_floor_budget = max(0, max_replicas)
-    for card in configured_cards:
-        floor = min(max(0, int(floors.get(card.casefold(), 0))),
-                    remaining_floor_budget)
-        target[card] = floor
-        remaining_floor_budget -= floor
-    unused_capacity = {
-        card: target[card] * max(0.0, capacities.get(card, 0.0))
-        for card in configured_cards
-    }
-
-    # Running work is non-preemptive. Pin its target to the card already
-    # serving it before assigning any flexible backlog.
-    for card in configured_cards:
-        remaining = max(0.0, fixed_work_by_accelerator.get(card, 0.0))
-        consumed = min(remaining, unused_capacity.get(card, 0.0))
-        remaining -= consumed
-        unused_capacity[card] = max(0.0,
-                                    unused_capacity.get(card, 0.0) - consumed)
-        capacity = capacities.get(card, 0.0)
-        if capacity <= 0:
-            continue
-        while (remaining > demand_epsilon and
-               sum(target.values()) < max_replicas):
-            target[card] = target.get(card, 0) + 1
-            if capacity > remaining:
-                unused_capacity[card] = (unused_capacity.get(card, 0.0) +
-                                         capacity - remaining)
-                remaining = 0.0
-            else:
-                remaining -= capacity
-
-    cold_rank = {card: index for index, card in enumerate(cold_order)}
-    canonical_by_name = {card.casefold(): card for card in configured_cards}
-    grouped: dict[tuple[int, tuple[str, ...]], float] = {}
-    for priority, raw_compatible, work in demand_profiles:
-        requested = {
-            canonical_by_name[card.casefold()]
-            for card in raw_compatible
-            if card.casefold() in canonical_by_name
-        }
-        # Compatibility is a set. Canonicalize by live paid-card order so
-        # caller list order never becomes a hardware preference.
-        compatible = tuple(card for card in cold_order
-                           if card in requested and card in capacities)
-        if not compatible or work <= demand_epsilon:
-            continue
-        key = (priority, compatible)
-        grouped[key] = grouped.get(key, 0.0) + float(work)
-
-    # Demand attribution and actuation use the same compatibility allocator
-    # with different supply semantics. The durable/displayed demand map skips
-    # these tiers and assigns flexible work to the cheapest compatible cold
-    # card. A second actuation pass enables the tiers so compatible warm or
-    # committed supply suppresses duplicate launches without reattributing the
-    # traffic target.
-    planned_by_tier: list[dict[str, int]] = []
-    if use_existing_supply:
-        planned_by_tier = [dict(ready_zero_cost), dict(ready)]
-        planned_by_tier.append({
-            card: ready.get(card, 0) + provisioning.get(card, 0)
-            for card in configured_cards
-        })
-        planned_by_tier.append({
-            card: (ready.get(card, 0) + provisioning.get(card, 0) +
-                   free_reserved.get(card, 0)) for card in configured_cards
-        })
-
-    def fallback_after_next_assignment(
-            compatible: tuple[str, ...]) -> tuple[int, int]:
-        """Return the second-best marginal supply tier for one profile."""
-        options: list[tuple[int, int]] = []
-        for card in compatible:
-            if unused_capacity.get(card, 0.0) > 0:
-                options.append((0, cold_rank[card]))
-            previous_count = target.get(card, 0)
-            for tier_index, tier in enumerate(planned_by_tier, start=1):
-                tier_count = max(previous_count, tier.get(card, 0))
-                # Two copies are sufficient: only the best option is consumed
-                # before the profile's fallback is compared.
-                options.extend([(tier_index, cold_rank[card])] *
-                               min(2, max(0, tier_count - previous_count)))
-                previous_count = tier_count
-            options.append((len(planned_by_tier) + 1, cold_rank[card]))
-        options.sort()
-        if len(options) > 1:
-            return options[1]
-        if options:
-            return options[0]
-        return len(planned_by_tier) + 2, len(cold_order)
-
-    groups_by_priority: dict[int, list[tuple[tuple[str, ...], float]]] = {}
-    for (priority, compatible), work in grouped.items():
-        groups_by_priority.setdefault(priority, []).append((compatible, work))
-    for priority in sorted(groups_by_priority, reverse=True):
-        pending = groups_by_priority[priority]
-        while pending:
-            # Protect the profile whose best non-selected fallback is worse.
-            # Stable list order preserves report/FIFO order on a true tie.
-            fallback_keys = [
-                tuple(-value
-                      for value in fallback_after_next_assignment(compatible))
-                for compatible, _ in pending
-            ]
-            selected_index = min(range(len(pending)),
-                                 key=fallback_keys.__getitem__)
-            compatible, remaining = pending.pop(selected_index)
-            if sum(target.values()) >= max_replicas:
-                continue
-            for card in compatible:
-                consumed = min(remaining, unused_capacity.get(card, 0.0))
-                remaining -= consumed
-                unused_capacity[card] = max(
-                    0.0,
-                    unused_capacity.get(card, 0.0) - consumed)
-                if remaining <= demand_epsilon:
-                    break
-            while (remaining > demand_epsilon and
-                   sum(target.values()) < max_replicas):
-                selected: str | None = None
-                for tier in planned_by_tier:
-                    selected = next(
-                        (card for card in compatible
-                         if tier.get(card, 0) > target.get(card, 0)), None)
-                    if selected is not None:
-                        break
-                if selected is None:
-                    selected = next(
-                        card for card in cold_order if card in compatible)
-                capacity = capacities.get(selected, 0.0)
-                if capacity <= 0:
-                    break
-                target[selected] = target.get(selected, 0) + 1
-                if capacity > remaining:
-                    unused_capacity[selected] = (
-                        unused_capacity.get(selected, 0.0) + capacity -
-                        remaining)
-                    remaining = 0.0
-                else:
-                    remaining -= capacity
-
-    # The aggregate floor is independent from per-card floors. The demand pass
-    # attributes its remainder to the cheapest card. The actuation pass may
-    # instead reuse already materialized compatible supply.
-    while sum(target.values()) < min_replicas and configured_cards:
-        selected = None
-        for tier in planned_by_tier:
-            selected = next((card for card in configured_cards
-                             if tier.get(card, 0) > target.get(card, 0)), None)
-            if selected is not None:
-                break
-        if selected is None:
-            selected = cold_order[0]
-        target[selected] = target.get(selected, 0) + 1
-    return {card: count for card, count in target.items() if count > 0}
-
-
-def _replica_is_retiring_card_supply(
-        replica_info: 'replica_managers.ReplicaInfo') -> bool:
-    """Whether a row must not authorize replacement on its current card."""
-    status = replica_info.status_property
-    return (getattr(status, 'is_scale_down', False) is True or
-            getattr(status, 'preempted', False) is True)
-
-
-def _merge_fresh_target_into_downscale_hold(
-    *,
-    adopted_target: dict[str, int],
-    fresh_target: dict[str, int],
-    configured_cards: list[str],
-    replacement_order: list[str],
-    target_total: int,
-) -> dict[str, int]:
-    """Replace only the held slots required by current exact-card demand."""
-    fresh_total = sum(fresh_target.values())
-    if fresh_total > target_total:
-        return {}
-    if (set(adopted_target) - set(configured_cards) or
-            set(fresh_target) - set(configured_cards)):
-        return {}
-    target = {
-        card: max(0, int(adopted_target.get(card, 0)))
-        for card in configured_cards
-    }
-    for card in configured_cards:
-        target[card] = max(target[card], int(fresh_target.get(card, 0)))
-    excess = sum(target.values()) - target_total
-    removal_order = list(dict.fromkeys(replacement_order + configured_cards))
-    for card in removal_order:
-        removable = max(0, target.get(card, 0) - fresh_target.get(card, 0))
-        removed = min(excess, removable)
-        target[card] -= removed
-        excess -= removed
-        if excess == 0:
-            break
-    if excess != 0:
-        return {}
-    result = {card: count for card, count in target.items() if count > 0}
-    if (sum(result.values()) != target_total or any(
-            result.get(card, 0) < count
-            for card, count in fresh_target.items())):
-        return {}
-    return result
-
-
-def _revalidate_actuation_target(
-    *,
-    adopted_target: dict[str, int],
-    desired_target: dict[str, int],
-    nonretiring_supply: dict[str, int],
-    configured_cards: list[str],
-    final_target: int,
-    allow_adopted_reassignment: bool = True,
-    allow_unbacked_adopted_reassignment: bool = True,
-) -> dict[str, int]:
-    """Build a supply-aware actuator without bypassing target adoption.
-
-    The adopted map owns compatibility changes, hysteresis, and logical-card
-    wave limits. Actuation may immediately move an adopted unit when its card
-    is no longer backed, or when the fresh placement can move that unit onto
-    compatible supply that already exists. It must not cold-launch additional
-    units for a not-yet-adopted compatibility migration. During an aggregate
-    downscale hold, unbacked adopted units remain on their exact cards, while
-    materialized compatible supply may still replace them.
-    """
-    if sum(desired_target.values()) != final_target:
-        return {}
-    target = {
-        card: max(0, int(adopted_target.get(card, 0)))
-        for card in configured_cards
-    }
-
-    def fill_toward_desired(count: int, *, require_backing: bool) -> int:
-        for card in configured_cards:
-            if count <= 0:
-                break
-            deficit = max(0, desired_target.get(card, 0) - target[card])
-            if require_backing:
-                deficit = min(
-                    deficit,
-                    max(0,
-                        int(nonretiring_supply.get(card, 0)) - target[card]))
-            added = min(count, deficit)
-            target[card] += added
-            count -= added
-        return count
-
-    # Generic overprovision is already part of final_target and can follow the
-    # fresh supply-aware placement without changing adopted demand.
-    remaining = final_target - sum(target.values())
-    if remaining < 0 or fill_toward_desired(remaining,
-                                            require_backing=False) != 0:
-        return {}
-    if not allow_adopted_reassignment:
-        # A mixed-version rollout must preserve the compatibility-owned card
-        # map. Old-version supply cannot prove that a cross-card replacement is
-        # compatible, and moving an adopted unit here can turn a warm
-        # zero-cost card into paid same-card launch authority. Generic
-        # overprovision was assigned above without changing adopted demand.
-        return {card: count for card, count in target.items() if count > 0}
-
-    # First replace adopted capacity that is disappearing. This is allowed to
-    # create a cold shortage, because retaining the old card would otherwise
-    # turn a retirement or preemption into an accidental same-card relaunch.
-    if allow_unbacked_adopted_reassignment:
-        reassigned = 0
-        for card in configured_cards:
-            unbacked = max(
-                0, target[card] - max(0, int(nonretiring_supply.get(card, 0))))
-            removable = min(unbacked,
-                            max(0, target[card] - desired_target.get(card, 0)))
-            target[card] -= removable
-            reassigned += removable
-        if fill_toward_desired(reassigned, require_backing=False) != 0:
-            return {}
-
-    # Then let already-existing compatible supply replace backed capacity.
-    # This lets reserved A100s serve flexible L4-attributed demand and retire
-    # redundant paid L4s, without permitting a new A100 cold launch.
-    movable = 0
-    for card in configured_cards:
-        removable = max(0, target[card] - desired_target.get(card, 0))
-        target[card] -= removable
-        movable += removable
-    unplaced = fill_toward_desired(movable, require_backing=True)
-    if unplaced > 0:
-        # Restore units with no already-existing destination. Preserve service
-        # order for a stable actuator across identical snapshots.
-        for card in configured_cards:
-            deficit = max(0, adopted_target.get(card, 0) - target.get(card, 0))
-            restored = min(unplaced, deficit)
-            target[card] += restored
-            unplaced -= restored
-            if unplaced == 0:
-                break
-    if unplaced != 0:
-        return {}
-    return {card: count for card, count in target.items() if count > 0}
-
-
 class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                                          RequestRateAutoscaler):
     """Instance-aware RequestRateAutoscaler:
@@ -2860,6 +2439,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         self._qps_dict_by_version: dict[int, dict[str, float]] = {
             version: spec.target_qps_per_replica
         }
+        # Missing or failed historical-spec reads fall back for one decision
+        # tick. Keep that fallback out of the durable live-version cache so a
+        # later tick retries and can heal.
+        self._qps_dict_unavailable_versions_for_tick: set[int] | None = None
         self.compatibility_profiles: list[dict[str, Any]] = []
         # Outstanding queue demand is a last-writer-wins gauge. Unlike arrival
         # profiles, it must be replaced on every authoritative LB report rather
@@ -3114,10 +2697,12 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         shape_handles = self._resolve_gpu_shape_handles(replica_infos)
         with self._instance_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
+            self._qps_dict_unavailable_versions_for_tick = set()
             try:
                 return self._generate_scaling_decisions_locked(
                     replica_infos, active_versions)
             finally:
+                self._qps_dict_unavailable_versions_for_tick = None
                 self._gpu_shape_handles_for_tick = None
 
     def _generate_scaling_decisions_locked(
@@ -3666,6 +3251,12 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 ready_old.append((capacity, info))
             else:
                 nonready_old.append((capacity, info))
+        unavailable_versions = self._qps_dict_unavailable_versions_for_tick
+        if unavailable_versions:
+            logger.info(
+                'Instance-aware rolling drain waiting for historical '
+                'capacity for versions: %s.', sorted(unavailable_versions))
+            return []
         # Largest capacity first: fewest old replicas kept, fastest
         # rollout. Replica id tie-break keeps the selection stable
         # across ticks.
@@ -3701,20 +3292,34 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         rehydrate from the durable per-version spec so old-version
         replicas keep their real capacity. Falls back to the latest dict
         when the version's spec is unavailable; misses are not memoized
-        so a transient DB error can heal on the next tick.
+        across ticks so a transient DB error can heal on the next tick.
         """
         cached = self._qps_dict_by_version.get(version)
         if cached is not None:
             return cached
+        unavailable_versions = self._qps_dict_unavailable_versions_for_tick
+        if (unavailable_versions is not None and
+                version in unavailable_versions):
+            assert isinstance(self.target_qps_per_replica, dict), \
+                'Expected dict for instance-aware logic'
+            return self.target_qps_per_replica
         qps_dict = None
+        load_failed = False
         try:
             spec = serve_state.get_spec(self._service_name, version)
             if spec is not None:
                 qps_dict = spec.target_qps_per_replica
         except Exception as e:  # pylint: disable=broad-except
+            load_failed = True
             logger.warning('Failed to load spec for version '
                            f'{version}: {common_utils.format_exception(e)}')
         if not isinstance(qps_dict, dict):
+            if not load_failed:
+                logger.warning(
+                    'No usable target QPS spec for historical version %s; '
+                    'using the latest-version fallback.', version)
+            if unavailable_versions is not None:
+                unavailable_versions.add(version)
             assert isinstance(self.target_qps_per_replica, dict), \
                 'Expected dict for instance-aware logic'
             return self.target_qps_per_replica
@@ -3763,10 +3368,16 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             return resolved
 
         # Fallback to minimum QPS
-        logger.warning(f'No matching QPS found for GPU shape: '
-                       f'{gpu_type}:{gpu_count}. '
-                       f'Available types: {list(target_qps_dict.keys())}. '
-                       f'Using minimum QPS as fallback.')
+        unavailable_versions = self._qps_dict_unavailable_versions_for_tick
+        using_historical_fallback = (version is not None and
+                                     version != self.latest_version and
+                                     unavailable_versions is not None and
+                                     version in unavailable_versions)
+        if not using_historical_fallback:
+            logger.warning(f'No matching QPS found for GPU shape: '
+                           f'{gpu_type}:{gpu_count}. '
+                           f'Available types: {list(target_qps_dict.keys())}. '
+                           f'Using minimum QPS as fallback.')
         return min(target_qps_dict.values())
 
     def _cost_rebalance_replica_capacity(
@@ -4120,6 +3731,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._knob_by_version: dict[int, float] = {
             version: float(target_concurrency)
         }
+        # See the request-rate autoscaler's matching tick-local memo. A failed
+        # historical knob read is shared only within one decision tick.
+        self._knob_unavailable_versions_for_tick: set[int] | None = None
         # One-shot hysteresis bypass, armed by update_version AND at
         # construction, same as the instance-aware autoscaler: the target
         # can only be recomputed on a tick (it needs replica shapes), and
@@ -4348,11 +3962,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         must not mutate decision-owned state: it uses the pure
         _outstanding_work_parts rather than _outstanding_work.
 
-        Returns None (blind, and therefore ungated) whenever the demand
-        report is not fresh. That is the fail-safe direction: without a
-        current report we cannot distinguish idle from unobservable, and
-        releasing on an unobservable fleet is the one outcome this design
-        must never produce.
+        Returns None whenever the demand report is not fresh. The poller
+        publishes this as armed-but-blind (fresh activity_ts, NULL need), so
+        the broker freezes for the blind grace before it resumes bounded
+        decay; it does not mistake telemetry loss for confirmed idle.
         """
         with self._logical_state_lock:
             if not self.has_fresh_demand_report():
@@ -4704,11 +4317,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         rehydrate from the durable per-version spec so old-version
         replicas keep their real capacity. Falls back to the latest knob
         when the version's spec is unavailable; misses are not memoized
-        so a transient DB error can heal on the next tick.
+        across ticks so a transient DB error can heal on the next tick.
         """
         cached = self._knob_by_version.get(version)
         if cached is not None:
             return cached
+        unavailable_versions = self._knob_unavailable_versions_for_tick
+        if (unavailable_versions is not None and
+                version in unavailable_versions):
+            return self.target_concurrency_per_replica
         knob = None
         try:
             spec = serve_state.get_spec(self._service_name, version)
@@ -4718,6 +4335,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             logger.warning('Failed to load spec for version '
                            f'{version}: {common_utils.format_exception(e)}')
         if knob is None:
+            if unavailable_versions is not None:
+                unavailable_versions.add(version)
             return self.target_concurrency_per_replica
         self._knob_by_version[version] = float(knob)
         return float(knob)
@@ -6303,10 +5922,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         shape_handles = self._resolve_gpu_shape_handles(replica_infos)
         with self._logical_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
+            self._knob_unavailable_versions_for_tick = set()
             try:
                 return self._generate_scaling_decisions_locked(
                     replica_infos, active_versions)
             finally:
+                self._knob_unavailable_versions_for_tick = None
                 self._gpu_shape_handles_for_tick = None
 
     def _generate_scaling_decisions_locked(
@@ -6683,6 +6304,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 ready_old.append((capacity, info))
             else:
                 nonready_old.append((capacity, info))
+        unavailable_versions = self._knob_unavailable_versions_for_tick
+        if unavailable_versions:
+            logger.info(
+                'Concurrency rolling drain waiting for historical capacity '
+                'for versions: %s.', sorted(unavailable_versions))
+            return []
         # Keep-preference order: busy replicas first (retiring them kills
         # jobs; keeping them retains capacity that is provably serving),
         # then largest capacity (fewest old replicas kept, fastest

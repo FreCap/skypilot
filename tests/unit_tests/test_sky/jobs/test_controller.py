@@ -12,7 +12,11 @@ and file mount cleanup in task_cleanup().
 # pylint: disable=protected-access,redefined-outer-name,reimported
 # pylint: disable=unused-argument,unused-variable
 import asyncio
+import os
 import pathlib
+import signal
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
@@ -33,6 +37,34 @@ from sky.skylet import job_lib
 from sky.utils import asyncio_utils
 from sky.utils import common
 from sky.utils import status_lib
+
+
+@pytest.mark.asyncio
+async def test_main_sets_connection_metric_role_before_initialization():
+
+    class StopInitialization(Exception):
+        pass
+
+    initialization_order = []
+
+    def _set_metrics_role(role):
+        initialization_order.append(('metrics-role', role))
+
+    def _hijack_context():
+        initialization_order.append(('context', None))
+        raise StopInitialization
+
+    with patch.object(
+            controller_lib.db_utils,
+            'set_postgres_connection_metrics_process_role',
+            side_effect=_set_metrics_role), patch.object(
+                controller_lib.context_utils,
+                'hijack_sys_attrs',
+                side_effect=_hijack_context), pytest.raises(StopInitialization):
+        await controller_lib.main('controller-uuid')
+
+    assert initialization_order == [('metrics-role', 'managed-job-controller'),
+                                    ('context', None)]
 
 
 class TestFileMountsBlobIdSnapshot:
@@ -325,6 +357,57 @@ class TestNormalJobRecovery:
         assert should_skip is False
         # Terminal status still triggers resume logic path
         assert is_resume is True
+
+    @pytest.mark.asyncio
+    async def test_running_resume_restores_alive_before_monitoring(
+            self, mock_task):
+        controller = JobController.__new__(JobController)
+        controller._job_id = 42
+        controller._pool = None
+        controller._backend = MagicMock()
+        controller._backend.run_timestamp = '2026-07-30-00-00-00-000000'
+        controller.starting = {42}
+        controller.starting_lock = asyncio.Lock()
+        controller.starting_signal = asyncio.Condition(controller.starting_lock)
+        mock_task.metadata = {}
+        mock_task.resources = []
+        mock_task.envs = {
+            constants.TASK_ID_ENV_VAR: 'managed-task-id',
+        }
+
+        call_order = []
+        executor = MagicMock()
+        executor.on_resume = AsyncMock(
+            side_effect=lambda _name: call_order.append('on-resume'))
+        executor.monitor_task = AsyncMock(
+            side_effect=lambda **_kwargs: call_order.append('monitor') or True)
+        mark_resumed = AsyncMock(
+            side_effect=lambda _job_id: call_order.append('mark-alive'))
+
+        with patch('sky.jobs.controller._add_k8s_annotations'), \
+             patch('sky.jobs.controller.usage_lib.messages.usage.'
+                   'update_task_id'), \
+             patch.object(controller,
+                          '_get_file_mounts_blob_id',
+                          new=AsyncMock(return_value=None)), \
+             patch('sky.jobs.state.get_latest_task_id_status_async',
+                   new=AsyncMock(return_value=(
+                       0, managed_job_state.ManagedJobStatus.RUNNING))), \
+             patch('sky.jobs.state.get_job_status_with_task_id_async',
+                   new=AsyncMock(return_value=(
+                       managed_job_state.ManagedJobStatus.RUNNING))), \
+             patch('sky.jobs.controller.scheduler.job_resumed',
+                   new=mark_resumed), \
+             patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
+                   return_value=executor):
+            result = await controller._run_one_task(0, mock_task)
+
+        assert result is True
+        mark_resumed.assert_awaited_once_with(42)
+        executor.launch.assert_not_called()
+        executor.on_resume.assert_awaited_once_with('test-task-42')
+        assert call_order == ['mark-alive', 'on-resume', 'monitor']
+        assert controller.starting == set()
 
 
 class TestPoolStartingRestartRecovery:
@@ -957,6 +1040,50 @@ class TestJobGroupRecovery:
         job_controller._monitor_job_group_task.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_job_group_launch_failure_cleanup_preserves_original_error(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:1]
+        mock_dag.primary_tasks = []
+        executor = MagicMock()
+        executor.launch = AsyncMock(side_effect=RuntimeError('launch failed'))
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            return_value=('cluster-0', executor))
+        job_controller._monitor_job_group_task = AsyncMock(return_value=True)
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+
+        async def cleanup(cluster_names):
+            assert cluster_names == ['cluster-0']
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            cleanup_finished.set()
+
+        job_controller._cleanup_job_group_clusters = AsyncMock(
+            side_effect=cleanup)
+        statuses = AsyncMock(return_value=[])
+
+        with patch.object(controller_lib.managed_job_runtime,
+                          'is_registered',
+                          return_value=False), patch.object(
+                              controller_lib.managed_job_state,
+                              'get_all_task_ids_statuses_async', statuses):
+            run_task = asyncio.create_task(job_controller._run_job_group())
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            run_task.cancel()
+            await asyncio.sleep(0)
+            assert not run_task.done()
+            allow_cleanup.set()
+            with pytest.raises(RuntimeError, match='launch failed'):
+                await run_task
+
+        assert cleanup_finished.is_set()
+        job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
+            ['cluster-0'])
+        job_controller._monitor_job_group_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_job_group_barrier_reads_one_ordered_handle_snapshot(
             self, mock_dag):
         job_controller = self._make_controller(mock_dag)
@@ -1288,6 +1415,87 @@ class TestJobGroupRecovery:
                                  match='monitor coordinator failed'):
             await job_controller._run_job_group()
 
+        job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
+            ['cluster-0', 'cluster-1'])
+
+    @pytest.mark.asyncio
+    async def test_job_group_monitor_failure_cleanup_preserves_original_error(
+            self, mock_dag):
+        job_controller = self._make_controller(mock_dag)
+        mock_dag.tasks = mock_dag.tasks[:2]
+        mock_dag.primary_tasks = []
+        executors = [MagicMock(), MagicMock()]
+        job_controller._prepare_job_group_task_for_launch = AsyncMock(
+            side_effect=[('cluster-0', executors[0]), ('cluster-1',
+                                                       executors[1])])
+
+        all_started = asyncio.Event()
+        child_cleanup_started = asyncio.Event()
+        allow_child_cleanup = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        started = set()
+        child_cleanup = set()
+        cancelled = set()
+
+        async def monitor(task_id, *_args):
+            started.add(task_id)
+            if len(started) == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                child_cleanup.add(task_id)
+                if len(child_cleanup) == 2:
+                    child_cleanup_started.set()
+                await allow_child_cleanup.wait()
+                cancelled.add(task_id)
+                raise
+
+        async def fail_wait(*_args, **_kwargs):
+            await all_started.wait()
+            raise RuntimeError('monitor coordinator failed')
+
+        async def cleanup(cluster_names):
+            assert cluster_names == ['cluster-0', 'cluster-1']
+            assert cancelled == {0, 1}
+            cleanup_started.set()
+            await allow_cleanup.wait()
+
+        job_controller._monitor_job_group_task = monitor
+        job_controller._cleanup_job_group_clusters = AsyncMock(
+            side_effect=cleanup)
+        statuses = AsyncMock(return_value=[
+            (0, managed_job_state.ManagedJobStatus.RUNNING),
+            (1, managed_job_state.ManagedJobStatus.RUNNING),
+        ])
+
+        with patch.object(
+                controller_lib.managed_job_state,
+                'get_all_task_ids_statuses_async', statuses), patch.object(
+                    controller_lib.global_user_state,
+                    'get_handles_from_cluster_names', return_value={
+                        'cluster-0': MagicMock(),
+                        'cluster-1': MagicMock(),
+                    }), \
+                patch.object(
+                    controller_lib.job_group_networking,
+                    'dns_addresses_for_task', return_value=['127.0.0.1']), \
+                patch.object(controller_lib.asyncio, 'wait', side_effect=fail_wait):
+            run_task = asyncio.create_task(job_controller._run_job_group())
+            await asyncio.wait_for(child_cleanup_started.wait(), timeout=1)
+            run_task.cancel()
+            await asyncio.sleep(0)
+            assert not run_task.done()
+            allow_child_cleanup.set()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            assert not run_task.done()
+            allow_cleanup.set()
+            with pytest.raises(RuntimeError,
+                               match='monitor coordinator failed'):
+                await run_task
+
+        assert cancelled == {0, 1}
         job_controller._cleanup_job_group_clusters.assert_awaited_once_with(
             ['cluster-0', 'cluster-1'])
 
@@ -2475,6 +2683,75 @@ class TestCancelSignalScan:
                 await scan
 
     @pytest.mark.asyncio
+    async def test_blocked_owned_cancel_does_not_delay_another(
+            self, signal_dir):
+        """Independent owned signals must not form one serial lock convoy."""
+        manager = self._make_manager()
+        first_task = MagicMock()
+        second_task = MagicMock()
+        second_delivered = asyncio.Event()
+        second_task.cancel.side_effect = second_delivered.set
+        manager.job_tasks.update({1: first_task, 2: second_task})
+        for job_id in (1, 2):
+            (signal_dir / str(job_id)).touch()
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def consume_signal(job_id):
+            if job_id == 1:
+                first_started.set()
+                await release_first.wait()
+            return ''
+
+        list_signals = patch('sky.jobs.controller.os.listdir',
+                             return_value=['1', '2'])
+        consume_signals = patch.object(manager,
+                                       '_consume_signal_file',
+                                       side_effect=consume_signal)
+        with list_signals, consume_signals:
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            try:
+                await asyncio.wait_for(second_delivered.wait(), timeout=2)
+            finally:
+                release_first.set()
+                await scan
+
+        first_task.cancel.assert_called_once_with()
+        second_task.cancel.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_owned_cancel_failure_does_not_abort_other_delivery(
+            self, signal_dir):
+        """A per-job failure is isolated so later signals progress now."""
+        manager = self._make_manager()
+        failed_task = MagicMock()
+        delivered_task = MagicMock()
+        manager.job_tasks.update({1: failed_task, 2: delivered_task})
+        for job_id in (1, 2):
+            (signal_dir / str(job_id)).touch()
+
+        async def consume_signal(job_id):
+            if job_id == 1:
+                raise OSError('lock unavailable')
+            return ''
+
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1', '2']), patch.object(
+                       manager,
+                       '_consume_signal_file',
+                       side_effect=consume_signal), patch(
+                           'sky.jobs.controller.logger.error') as log_error:
+            await manager._process_cancel_signals()
+
+        failed_task.cancel.assert_not_called()
+        delivered_task.cancel.assert_called_once_with()
+        log_error.assert_called_once()
+        assert 'job 1' in log_error.call_args.args[0]
+        assert 'lock unavailable' in log_error.call_args.args[0]
+
+    @pytest.mark.asyncio
     async def test_orphan_statuses_use_one_batch_snapshot(self, signal_dir):
         manager = self._make_manager()
         task = MagicMock()
@@ -2506,6 +2783,163 @@ class TestCancelSignalScan:
         assert not (signal_dir / '6').exists()
         assert not (signal_dir / '7').exists()
         assert (signal_dir / '8').exists()
+
+    @pytest.mark.asyncio
+    async def test_blocked_orphan_reap_does_not_delay_another(self, signal_dir):
+        """Independent orphan locks must not form one serial convoy."""
+        manager = self._make_manager()
+        for job_id in (1, 2):
+            (signal_dir / str(job_id)).touch()
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_reaped = asyncio.Event()
+
+        async def remove_signal(job_id):
+            if job_id == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_reaped.set()
+
+        statuses = {
+            job_id: managed_job_state.ManagedJobStatus.SUCCEEDED
+            for job_id in (1, 2)
+        }
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1', '2']), patch.object(
+                       managed_job_state,
+                       'get_statuses_async',
+                       new=AsyncMock(return_value=statuses)), patch.object(
+                           manager,
+                           '_remove_signal_file',
+                           side_effect=remove_signal):
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+            try:
+                await asyncio.wait_for(second_reaped.wait(), timeout=2)
+            finally:
+                release_first.set()
+                await scan
+
+    @pytest.mark.asyncio
+    async def test_orphan_reap_failure_does_not_abort_sibling(self, signal_dir):
+        manager = self._make_manager()
+        for job_id in (1, 2):
+            (signal_dir / str(job_id)).touch()
+
+        removed_job_ids = []
+
+        async def remove_signal(job_id):
+            if job_id == 1:
+                raise RuntimeError('lock backend unavailable')
+            removed_job_ids.append(job_id)
+
+        statuses = {
+            job_id: managed_job_state.ManagedJobStatus.SUCCEEDED
+            for job_id in (1, 2)
+        }
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1', '2']), patch.object(
+                       managed_job_state,
+                       'get_statuses_async',
+                       new=AsyncMock(return_value=statuses)), patch.object(
+                           manager,
+                           '_remove_signal_file',
+                           side_effect=remove_signal), patch(
+                               'sky.jobs.controller.logger.debug') as log_debug:
+            await manager._process_cancel_signals()
+
+        assert removed_job_ids == [2]
+        log_debug.assert_called_once()
+        assert 'job 1' in log_debug.call_args.args[0]
+        assert 'lock backend unavailable' in log_debug.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_scan_finishes_started_orphan_reap(
+            self, signal_dir):
+        manager = self._make_manager()
+        manager._cancel_info[1] = (False, None)
+        (signal_dir / '1').touch()
+
+        removal_started = asyncio.Event()
+        release_removal = asyncio.Event()
+        removal_finished = asyncio.Event()
+
+        async def remove_signal(_job_id):
+            removal_started.set()
+            await release_removal.wait()
+            removal_finished.set()
+
+        statuses = {1: managed_job_state.ManagedJobStatus.SUCCEEDED}
+        with patch('sky.jobs.controller.os.listdir',
+                   return_value=['1']), patch.object(
+                       managed_job_state,
+                       'get_statuses_async',
+                       new=AsyncMock(return_value=statuses)), patch.object(
+                           manager,
+                           '_remove_signal_file',
+                           side_effect=remove_signal):
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(removal_started.wait(), timeout=2)
+            scan.cancel()
+            result = await asyncio.gather(scan, return_exceptions=True)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert not removal_finished.is_set()
+
+            release_removal.set()
+            await asyncio.wait_for(removal_finished.wait(), timeout=2)
+            for _ in range(10):
+                if 1 not in manager._cancel_info:
+                    break
+                await asyncio.sleep(0)
+
+        assert 1 not in manager._cancel_info
+
+    @pytest.mark.asyncio
+    async def test_orphan_reap_fanout_uses_controller_worker_bound(
+            self, signal_dir):
+        manager = self._make_manager()
+        limit = controller_lib.controller_utils.LAUNCHES_PER_WORKER
+        job_ids = list(range(limit + 1))
+
+        started_job_ids = []
+        limit_reached = asyncio.Event()
+        release_removals = asyncio.Event()
+
+        async def remove_signal(job_id):
+            started_job_ids.append(job_id)
+            if len(started_job_ids) == limit:
+                limit_reached.set()
+            await release_removals.wait()
+
+        statuses = {
+            job_id: managed_job_state.ManagedJobStatus.SUCCEEDED
+            for job_id in job_ids
+        }
+        with patch(
+                'sky.jobs.controller.os.listdir',
+                return_value=[str(job_id) for job_id in job_ids]), patch.object(
+                    managed_job_state,
+                    'get_statuses_async',
+                    new=AsyncMock(
+                        return_value=statuses)) as batch_status, patch.object(
+                            manager,
+                            '_remove_signal_file',
+                            side_effect=remove_signal) as remove:
+            scan = asyncio.create_task(manager._process_cancel_signals())
+            await asyncio.wait_for(limit_reached.wait(), timeout=2)
+            try:
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert len(started_job_ids) == limit
+            finally:
+                release_removals.set()
+                await scan
+
+        assert sorted(started_job_ids) == job_ids
+        assert remove.await_count == len(job_ids)
+        batch_status.assert_awaited_once_with(job_ids)
 
     @pytest.mark.asyncio
     async def test_signal_lock_contention_does_not_block_event_loop(
@@ -3009,6 +3443,69 @@ class TestRunJobLoopOwnershipCleanup:
     """
 
     @pytest.mark.asyncio
+    async def test_repeated_cancellation_waits_for_inner_finalization(self):
+        manager = ControllerManager('test-uuid')
+        inner_started = asyncio.Event()
+        inner_finalizing = asyncio.Event()
+        finish_finalization = asyncio.Event()
+        events = []
+        cancellation_deliveries = 0
+        created_tasks = []
+
+        async def inner_job_loop(*_args):
+            nonlocal cancellation_deliveries
+            events.append('started')
+            inner_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_deliveries += 1
+                events.append('finalizing')
+                inner_finalizing.set()
+                await finish_finalization.wait()
+                events.append('finalized')
+                raise
+
+        async def release_ownership(_job_id):
+            assert events[-1] == 'finalized'
+            events.append('released')
+
+        original_create_task = asyncio.create_task
+
+        def track_create_task(coro):
+            task = original_create_task(coro)
+            created_tasks.append(task)
+            return task
+
+        manager._run_job_loop = inner_job_loop
+        manager._release_job_loop_ownership = AsyncMock(
+            side_effect=release_ownership)
+        loop = asyncio.get_running_loop()
+        with patch('sky.jobs.controller.asyncio.create_task',
+                   side_effect=track_create_task):
+            owner = loop.create_task(
+                ControllerManager.run_job_loop.__wrapped__(
+                    manager, 3, '/dev/null'))
+            await inner_started.wait()
+            owner.cancel()
+            await inner_finalizing.wait()
+            owner.cancel()
+            owner.cancel()
+            await asyncio.sleep(0)
+
+            assert not owner.done()
+            assert events == ['started', 'finalizing']
+
+            finish_finalization.set()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+
+        assert events == ['started', 'finalizing', 'finalized', 'released']
+        assert cancellation_deliveries == 1
+        assert len(created_tasks) == 1
+        manager._release_job_loop_ownership.assert_awaited_once_with(3)
+
+    @pytest.mark.asyncio
     async def test_start_job_hands_off_slot_without_cancellation_gap(
             self, tmp_path):
         manager = ControllerManager('test-uuid')
@@ -3287,3 +3784,83 @@ class TestApiAccessTokenCleanup:
             manager._cleanup_api_server_access_token(9)
 
         delete.assert_called_once_with('shared-token')
+
+
+class TestOuterControllerGenerationWatchdog:
+    """Detached scheduler processes fail closed after outer handoff."""
+
+    @pytest.mark.asyncio
+    async def test_generation_mismatch_exits_controller(self):
+        owner = ('73ebc1a8-d2ae-4ca4-b9a5-53d0b10990af', 13)
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new=AsyncMock()), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'controller_owner_is_current',
+                      return_value=False), \
+                patch(
+                    'sky.jobs.controller.'
+                    '_fail_stop_outer_controller_process_group',
+                    side_effect=managed_job_state.ControllerLeadershipLostError(
+                        'fail-stop')) as fail_stop:
+            with pytest.raises(managed_job_state.ControllerLeadershipLostError,
+                               match='fail-stop'):
+                await controller_lib._watch_outer_controller_generation(owner)
+        assert 'no longer current' in fail_stop.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_database_proof_error_exits_controller(self):
+        owner = ('4c0382a3-5905-4d3b-b696-a05e43063c30', 14)
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new=AsyncMock()), \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'controller_owner_is_current',
+                      side_effect=OSError('database unavailable')), \
+                patch(
+                    'sky.jobs.controller.'
+                    '_fail_stop_outer_controller_process_group',
+                    side_effect=managed_job_state.ControllerLeadershipLostError(
+                        'fail-stop')) as fail_stop:
+            with pytest.raises(managed_job_state.ControllerLeadershipLostError,
+                               match='fail-stop'):
+                await controller_lib._watch_outer_controller_generation(owner)
+        assert 'Could not prove' in fail_stop.call_args.args[0]
+
+    def test_fail_stop_uses_noncatchable_process_group_signal(self):
+        with patch.object(controller_lib.os, 'getpgrp', return_value=321), \
+                patch.object(controller_lib.os, 'killpg') as kill_group, \
+                patch.object(
+                    controller_lib.os,
+                    '_exit',
+                    side_effect=SystemExit(1)) as exit_process:
+            with pytest.raises(SystemExit):
+                controller_lib._fail_stop_outer_controller_process_group(
+                    'generation fenced')
+
+        kill_group.assert_called_once_with(321, signal.SIGKILL)
+        exit_process.assert_called_once_with(1)
+
+    @pytest.mark.skipif(not hasattr(os, 'killpg'),
+                        reason='requires POSIX process groups')
+    def test_fail_stop_does_not_run_coroutine_finalizers(self, tmp_path):
+        sentinel = tmp_path / 'finalizer-ran'
+        script = f"""
+import asyncio
+import pathlib
+from sky.jobs import controller
+
+async def main():
+    try:
+        controller._fail_stop_outer_controller_process_group('test fence')
+    finally:
+        pathlib.Path({str(sentinel)!r}).write_text('unsafe', encoding='utf-8')
+
+asyncio.run(main())
+"""
+        result = subprocess.run([sys.executable, '-c', script],
+                                capture_output=True,
+                                text=True,
+                                start_new_session=True,
+                                check=False)
+
+        assert result.returncode == -signal.SIGKILL, result.stderr
+        assert not sentinel.exists()

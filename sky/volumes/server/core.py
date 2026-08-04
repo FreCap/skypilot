@@ -19,6 +19,7 @@ from sky.utils import registry
 from sky.utils import rich_utils
 from sky.utils import status_lib
 from sky.utils import ux_utils
+from sky.volumes import refresh_projection
 
 logger = sky_logging.init_logger(__name__)
 
@@ -39,6 +40,14 @@ def volume_refresh() -> None:
     - READY: Volume is healthy and not in use
     """
     volumes = global_user_state.get_volumes(is_ephemeral=False)
+    capture_budget = refresh_projection.DeferredCaptureBudget()
+    deferred_comparisons: list[
+        tuple[str, refresh_projection.VolumeRefreshSnapshot,
+              refresh_projection.VolumeRefreshProjection]] = []
+    shadow_counts = {
+        outcome: 0 for outcome in refresh_projection.VolumeRefreshShadowOutcome
+    }
+    anomaly_volume_names: list[str] = []
 
     # Group volumes by cloud for batch API calls
     cloud_to_configs: dict[str, list[models.VolumeConfig]] = {}
@@ -99,6 +108,16 @@ def volume_refresh() -> None:
         if volume_name in cloud_to_failed_volume_names.get(cloud, set()):
             logger.debug(f'Skipping status update for volume {volume_name} '
                          f'due to failed usedby fetch')
+            failed_snapshot = refresh_projection.capture_usedby_fetch_failed(
+                capture_budget)
+            if failed_snapshot is None:
+                shadow_counts[refresh_projection.VolumeRefreshShadowOutcome.
+                              NOT_SAMPLED_BUDGET] += 1
+                if len(anomaly_volume_names) < 3:
+                    anomaly_volume_names.append(volume_name)
+            else:
+                deferred_comparisons.append(
+                    (volume_name, failed_snapshot, refresh_projection.Skip()))
             continue
 
         # Check for volume errors first
@@ -152,20 +171,83 @@ def volume_refresh() -> None:
                     usedby_pods=usedby_pods,
                     usedby_clusters=usedby_clusters)
             volume_config = latest_volume.get('handle')
-            if volume_config is None:
-                continue
-            # For in-cluster volumes created without setting the region
-            # explicitly before PR
-            # https://github.com/skypilot-org/skypilot/pull/8386, the region
-            # will be None. In this case, when the user enables the external
-            # kubeconfig, the region will be shown as the default context in
-            # the kubeconfig file. We need to refresh the volume config to set
-            # the region to the in-cluster context name for these volumes.
-            need_refresh, volume_config = provision.refresh_volume_config(
-                volume_config.cloud, volume_config)
-            if need_refresh:
-                global_user_state.update_volume_config(volume_name,
-                                                       volume_config)
+            if volume_config is not None:
+                # For in-cluster volumes created without setting the region
+                # explicitly before PR
+                # https://github.com/skypilot-org/skypilot/pull/8386, the region
+                # will be None. In this case, when the user enables the external
+                # kubeconfig, the region will be shown as the default context in
+                # the kubeconfig file. We need to refresh the volume config to set
+                # the region to the in-cluster context name for these volumes.
+                need_refresh, volume_config = provision.refresh_volume_config(
+                    volume_config.cloud, volume_config)
+                if need_refresh:
+                    global_user_state.update_volume_config(
+                        volume_name, volume_config)
+
+            observed_snapshot = refresh_projection.capture_observed_refresh(
+                capture_budget,
+                current_status=current_status,
+                current_error=current_error,
+                current_usedby_pods=current_usedby_pods,
+                current_usedby_clusters=current_usedby_clusters,
+                observed_error=volume_error,
+                observed_usedby_pods=usedby_pods,
+                observed_usedby_clusters=usedby_clusters)
+            if observed_snapshot is None:
+                shadow_counts[refresh_projection.VolumeRefreshShadowOutcome.
+                              NOT_SAMPLED_BUDGET] += 1
+                if len(anomaly_volume_names) < 3:
+                    anomaly_volume_names.append(volume_name)
+            else:
+                authoritative_projection: (
+                    refresh_projection.VolumeRefreshProjection)
+                if status_changed or error_changed or usedby_changed:
+                    authoritative_projection = refresh_projection.Write(
+                        status=new_status,
+                        error_message=new_error,
+                        usedby_pods=observed_snapshot.observed_usedby_pods,
+                        usedby_clusters=(
+                            observed_snapshot.observed_usedby_clusters))
+                else:
+                    authoritative_projection = refresh_projection.NoWrite()
+                deferred_comparisons.append(
+                    (volume_name, observed_snapshot, authoritative_projection))
+
+    for (volume_name, deferred_snapshot,
+         authoritative_projection) in deferred_comparisons:
+        outcome = refresh_projection.compare_volume_refresh_projection(
+            deferred_snapshot, authoritative_projection)
+        shadow_counts[outcome] += 1
+        if (outcome is not refresh_projection.VolumeRefreshShadowOutcome.MATCH
+                and len(anomaly_volume_names) < 3):
+            anomaly_volume_names.append(volume_name)
+
+    non_match_count = sum(
+        count for outcome, count in shadow_counts.items()
+        if outcome is not refresh_projection.VolumeRefreshShadowOutcome.MATCH)
+    if non_match_count:
+        compared_count = sum(count for outcome, count in shadow_counts.items()
+                             if outcome is not refresh_projection.
+                             VolumeRefreshShadowOutcome.NOT_SAMPLED_BUDGET)
+        try:
+            logger.warning(
+                'Volume refresh shadow anomalies: compared=%d match=%d '
+                'mismatch=%d projector_error=%d comparison_error=%d '
+                'not_sampled_budget=%d sample_volume_names=%s', compared_count,
+                shadow_counts[
+                    refresh_projection.VolumeRefreshShadowOutcome.MATCH],
+                shadow_counts[
+                    refresh_projection.VolumeRefreshShadowOutcome.MISMATCH],
+                shadow_counts[refresh_projection.VolumeRefreshShadowOutcome.
+                              PROJECTOR_ERROR],
+                shadow_counts[refresh_projection.VolumeRefreshShadowOutcome.
+                              COMPARISON_ERROR],
+                shadow_counts[refresh_projection.VolumeRefreshShadowOutcome.
+                              NOT_SAMPLED_BUDGET],
+                ','.join(anomaly_volume_names))
+        except Exception:  # pylint: disable=broad-except
+            pass
 
 
 def volume_list(
