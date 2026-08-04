@@ -115,3 +115,59 @@ export function hasAccelerator(accelerators) {
   }
   return false;
 }
+
+/**
+ * Zero-valued preemptible accounting for a fresh per-GPU-type aggregate.
+ *
+ * "Preemptible" accelerators are those held by pods below the cluster's top
+ * scheduling priority tier, i.e. reclaimable by a higher-priority workload.
+ * The Infra page aggregates GPU rows at three levels (per node into a context,
+ * per context into a workspace view, and per GPU type across contexts); every
+ * one of them must carry these two fields or the split silently collapses back
+ * into a single "used" block.
+ */
+export function emptyPreemptible() {
+  return { gpu_preemptible: 0, gpu_preemptible_breakdown: {} };
+}
+
+/**
+ * Fold one per-GPU-type aggregate's preemptible accounting into another.
+ */
+export function mergePreemptible(target, source) {
+  target.gpu_preemptible += source?.gpu_preemptible || 0;
+  for (const [label, qty] of Object.entries(
+    source?.gpu_preemptible_breakdown || {}
+  )) {
+    target.gpu_preemptible_breakdown[label] =
+      (target.gpu_preemptible_breakdown[label] || 0) + qty;
+  }
+}
+
+/**
+ * Aggregate per-context GPU rows into one row per canonical GPU type.
+ *
+ * This is what feeds the top-level Kubernetes utilization bars, so it must
+ * carry every field the bar reads. Exported (rather than inlined in the
+ * component effect that consumes it) so the aggregation is unit-testable
+ * without rendering the page.
+ */
+export function summarizeGpusByType(perContextGPUs) {
+  const gpuSummary = {};
+  (perContextGPUs || []).forEach((gpu) => {
+    const gpuName = canonicalizeGpuName(gpu.gpu_name);
+    if (!(gpuName in gpuSummary)) {
+      gpuSummary[gpuName] = {
+        gpu_name: gpuName,
+        gpu_total: 0,
+        gpu_free: 0,
+        gpu_not_ready: 0,
+        ...emptyPreemptible(),
+      };
+    }
+    gpuSummary[gpuName].gpu_total += gpu.gpu_total || 0;
+    gpuSummary[gpuName].gpu_free += gpu.gpu_free || 0;
+    gpuSummary[gpuName].gpu_not_ready += gpu.gpu_not_ready || 0;
+    mergePreemptible(gpuSummary[gpuName], gpu);
+  });
+  return Object.values(gpuSummary);
+}
