@@ -566,10 +566,11 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
             waiter_ttl_seconds=60.0,
             expected_controller_owner=None)
 
+    fill_pool_key = '["test-context","a100"]'
     with orm.Session(engine) as session:
         session.execute(serve_state.reserved_fill_claims_table.insert().values(
             service_name='svc',
-            pool_key='test-fill-pool',
+            pool_key=fill_pool_key,
             weight=1,
             floor_replicas=1,
             gpus_per_replica=1,
@@ -578,11 +579,14 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
         session.execute(serve_state.reserved_fill_lease_table.insert().values(
             id=1, epoch=1))
         session.commit()
+    duplicate_fill_replica = _replica(4, version=2)
+    duplicate_fill_replica.reserved_fill = True
+    duplicate_fill_replica.reserved_fill_pool_key = fill_pool_key
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         serve_state.add_replica_if_round_epoch('svc',
                                                4,
-                                               _replica(4, version=2),
-                                               pool_key='test-fill-pool',
+                                               duplicate_fill_replica,
+                                               pool_key=fill_pool_key,
                                                expected_epoch=1,
                                                expected_lease_token=1)
 

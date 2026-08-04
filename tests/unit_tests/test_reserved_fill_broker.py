@@ -2084,17 +2084,34 @@ class TestRoundPersistExclusion:
                     serve_state.replicas_table)).scalar()
 
     def test_persist_skips_while_round_holds_the_lock(self, monkeypatch):
-        # Real file locks (the fixture's inert lock cannot contend); the
-        # lock file resolves under SKY_LOCKS_DIR, unique per test run.
+        # Use the real lock for the active database backend (the fixture's
+        # inert lock cannot contend).  PostgreSQL persists must mint their
+        # fencing token on the exact advisory-lock session, so substituting a
+        # FileLock there would correctly fail closed even after its release.
         lock_id = f'test-broker-round-{id(self)}'
-        monkeypatch.setattr(
-            broker.locks, 'get_lock',
-            lambda *args, **kwargs: locks.FileLock(lock_id, timeout=0.0))
+        engine = serve_state._db_manager.get_engine()
+        if engine.dialect.name == 'postgresql':
+            monkeypatch.setattr(locks.global_user_state,
+                                'initialize_and_get_db', lambda: engine)
+
+            def lock_factory(*args, **kwargs):
+                del args
+                return locks.PostgresLock(lock_id,
+                                          timeout=kwargs.get('timeout'))
+
+            round_lock = locks.PostgresLock(lock_id)
+        else:
+
+            def lock_factory(*args, **kwargs):
+                del args
+                return locks.FileLock(lock_id, timeout=kwargs.get('timeout'))
+
+            round_lock = locks.FileLock(lock_id)
+        monkeypatch.setattr(broker.locks, 'get_lock', lock_factory)
         _upsert('svc-a')
         _upsert('svc-b')
         alloc = _run('svc-a', free=4)
         assert alloc is not None
-        round_lock = locks.FileLock(lock_id)
         with round_lock.acquire():  # a round is in flight
             assert not broker.persist_fill_replica('svc-a',
                                                    1,
