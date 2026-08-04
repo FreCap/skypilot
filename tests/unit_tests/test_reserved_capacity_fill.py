@@ -25,6 +25,7 @@ from sky import exceptions
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
@@ -238,6 +239,36 @@ class TestProtocolV2CleanupFence(unittest.TestCase):
 
         uid_fence.assert_called_once_with('research-ctx', 'physical-a')
 
+    def test_provider_fence_enters_matching_phase_and_streaming_can_opt_out(
+            self):
+        info = _protocol_v2_cleanup_info()
+        handle = self._handle()
+        entered_modes = []
+
+        @contextlib.contextmanager
+        def _phase(mode):
+            entered_modes.append(mode)
+            yield types.SimpleNamespace(mode=mode)
+
+        with mock.patch.object(reserved_capacity.provider_phase,
+                               'provider_phase', side_effect=_phase), \
+             mock.patch.object(kubernetes_adaptor,
+                               'physical_cluster_uid_fence',
+                               return_value=contextlib.nullcontext()):
+            with reserved_capacity.protocol_v2_provider_fence(info, handle):
+                pass
+            with reserved_capacity.protocol_v2_provider_fence(
+                    info, handle, include_provider_phase=False):
+                pass
+            with reserved_capacity.protocol_v2_provider_fence(
+                    types.SimpleNamespace(reserved_fill=False), None):
+                pass
+
+        self.assertEqual(entered_modes, [
+            provider_phase.ProviderPhaseMode.V2_FENCED,
+            provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+        ])
+
     def test_provider_fence_rejects_replaced_handle_without_provider_call(self):
         info = _protocol_v2_cleanup_info()
         handles = (
@@ -292,6 +323,39 @@ class TestProtocolV2CleanupFence(unittest.TestCase):
                     pass
 
         self.assertEqual(uid_reads, 1)
+
+    def test_provider_batch_owner_explicitly_joins_root_admission(self):
+        info = _protocol_v2_cleanup_info()
+        handle = self._handle()
+        key = ('research-ctx', 'physical-a')
+        admission = types.SimpleNamespace(
+            mode=provider_phase.ProviderPhaseMode.V2_FENCED)
+        root_thread_id = threading.get_ident()
+        join_thread_ids = []
+
+        @contextlib.contextmanager
+        def _phase(_mode):
+            yield admission
+
+        @contextlib.contextmanager
+        def _join(candidate):
+            self.assertIs(candidate, admission)
+            join_thread_ids.append(threading.get_ident())
+            yield candidate
+
+        with mock.patch.object(reserved_capacity.provider_phase,
+                               'provider_phase', side_effect=_phase), \
+             mock.patch.object(reserved_capacity.provider_phase,
+                               'join_provider_phase', side_effect=_join), \
+             mock.patch.object(kubernetes_adaptor,
+                               'physical_cluster_uid_fence',
+                               return_value=contextlib.nullcontext()):
+            with reserved_capacity.protocol_v2_provider_batch_fences(
+                {key: (info, handle)}) as failures:
+                self.assertEqual(failures, {})
+
+        self.assertEqual(len(join_thread_ids), 1)
+        self.assertNotEqual(join_thread_ids[0], root_thread_id)
 
 
 class TestFlagOff(unittest.TestCase):
@@ -1156,6 +1220,24 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
                 observed_free_by_accelerator={'h200': 7},
                 observed_at=time.time()),
         ]
+        pending_allocations = iter(allocations)
+        active_phase = []
+
+        @contextlib.contextmanager
+        def _phase(mode):
+            self.assertFalse(active_phase)
+            active_phase.append(mode)
+            try:
+                yield types.SimpleNamespace(mode=mode)
+            finally:
+                active_phase.pop()
+
+        def _run_round(*_args, **_kwargs):
+            # Provider admission must precede the broker's round lock/callback.
+            self.assertEqual(active_phase,
+                             [provider_phase.ProviderPhaseMode.V2_FENCED])
+            return next(pending_allocations)
+
         with mock.patch.object(
                 reserved_capacity,
                 'get_kubernetes_physical_cluster_uid',
@@ -1174,7 +1256,9 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
                                return_value=1) as replace, \
              mock.patch.object(reserved_capacity_broker,
                                'run_round_if_stale',
-                               side_effect=allocations) as run_round, \
+                               side_effect=_run_round) as run_round, \
+             mock.patch.object(reserved_capacity.provider_phase,
+                               'provider_phase', side_effect=_phase), \
              mock.patch.object(
                  reserved_capacity,
                  '_record_allocation_observation') as record_observation:
@@ -2625,6 +2709,55 @@ class TestQueryFreeSlots(unittest.TestCase):
                 reserved_capacity.get_kubernetes_physical_cluster_uid(
                     'ctx', force_refresh=True), 'uid-b')
         self.assertEqual(core_api.read_namespace.call_count, 2)
+
+    def test_physical_uid_busy_waits_once_deadline_then_rereads_ambient(self):
+        busy = exceptions.KubernetesPhysicalClusterFenceBusyError(
+            'captured', 'ctx', 7)
+        core_api = mock.Mock()
+        core_api.read_namespace.side_effect = [
+            busy,
+            types.SimpleNamespace(metadata=types.SimpleNamespace(
+                uid='uid-new')),
+        ]
+        with mock.patch.object(reserved_capacity.kubernetes,
+                               'core_api',
+                               return_value=core_api), \
+             mock.patch.object(
+                 reserved_capacity.kubernetes,
+                 'wait_for_physical_cluster_uid_fence_retirement',
+                 return_value=True) as wait_for_retirement, \
+             mock.patch.object(reserved_capacity,
+                               'poll_interval_seconds',
+                               return_value=10), \
+             mock.patch.object(reserved_capacity.time,
+                               'monotonic',
+                               side_effect=[100, 101, 102]):
+            uid = reserved_capacity.get_kubernetes_physical_cluster_uid('ctx')
+
+        self.assertEqual(uid, 'uid-new')
+        self.assertEqual(core_api.read_namespace.call_count, 2)
+        wait_for_retirement.assert_called_once_with('ctx', 131, 7)
+
+    def test_physical_uid_busy_timeout_fails_closed_without_reread(self):
+        busy = exceptions.KubernetesPhysicalClusterFenceBusyError(
+            'captured', 'ctx', 11)
+        core_api = mock.Mock()
+        core_api.read_namespace.side_effect = busy
+        with mock.patch.object(reserved_capacity.kubernetes,
+                               'core_api',
+                               return_value=core_api), \
+             mock.patch.object(
+                 reserved_capacity.kubernetes,
+                 'wait_for_physical_cluster_uid_fence_retirement',
+                 return_value=False) as wait_for_retirement, \
+             mock.patch.object(reserved_capacity.time,
+                               'monotonic',
+                               side_effect=[100, 101]):
+            uid = reserved_capacity.get_kubernetes_physical_cluster_uid('ctx')
+
+        self.assertIsNone(uid)
+        self.assertEqual(core_api.read_namespace.call_count, 1)
+        wait_for_retirement.assert_called_once_with('ctx', 131, 11)
 
     def test_stale_forced_uid_lookup_returns_newer_cached_identity(self):
         first_started = threading.Event()
