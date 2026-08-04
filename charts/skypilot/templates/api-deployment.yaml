@@ -1,6 +1,10 @@
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $haEnabled := get $haConfig "enabled" | default false -}}
+{{- if and (not .Values.storage.enabled) (not (empty (get .Values.storage "existingClaim"))) -}}
+{{- fail "storage.existingClaim requires storage.enabled=true" -}}
+{{- end -}}
 {{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
 {{- $apiTopologySpreadTopologyKey := get .Values.apiService "topologySpreadTopologyKey" -}}
 {{- if and $haEnabled (not (hasKey .Values.apiService "topologySpreadTopologyKey")) -}}
@@ -1187,7 +1191,7 @@ spec:
       {{- if .Values.storage.enabled }}
       - name: state-volume
         persistentVolumeClaim:
-          claimName: {{ $fullName }}-state
+          claimName: {{ $stateClaimName }}
       {{- if and (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
       # When using RollingUpdate with storage enabled, use a separate emptyDir
       # for ~/.sky to avoid running SQLite on NFS. Only specific subdirectories

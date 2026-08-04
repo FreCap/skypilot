@@ -3,6 +3,26 @@ suite: controller_deployment_test
 templates:
   - templates/controller-deployment.yaml
 tests:
+  - it: should mount a pre-existing state claim
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      storage.existingClaim: production-rwx-state
+      executorService.replicas: 2
+      controllerService.replicas: 2
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: production-rwx-state
+
   - it: should not render an controller deployment in compatibility mode
     asserts:
       - hasDocuments:

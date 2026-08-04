@@ -1,5 +1,6 @@
 {{- if .Values.apiService.highAvailability.enabled }}
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
 {{- $controllerService := .Values.controllerService | default (dict) -}}
@@ -733,7 +734,7 @@ spec:
         emptyDir: {}
       - name: state-volume
         persistentVolumeClaim:
-          claimName: {{ $fullName }}-state
+          claimName: {{ $stateClaimName }}
       - name: skypilot-config
         configMap:
           name: {{ $fullName }}-config

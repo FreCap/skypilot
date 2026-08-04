@@ -3,6 +3,36 @@ suite: server_deployment_test
 templates:
   - templates/api-deployment.yaml
 tests:
+  - it: should keep mounting the release-owned state claim by default
+    set:
+      storage.existingClaim: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: RELEASE-NAME-state
+
+  - it: should mount a pre-existing state claim
+    set:
+      storage.existingClaim: production-rwx-state
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: production-rwx-state
+
+  - it: should reject an existing claim when persistence is disabled
+    set:
+      storage.enabled: false
+      storage.existingClaim: production-rwx-state
+    asserts:
+      - failedTemplate:
+          errorMessage: "storage.existingClaim requires storage.enabled=true"
+
   - it: should run as the externally managed API service account
     set:
       rbac.create: false
@@ -370,6 +400,7 @@ tests:
       apiService.dbConnectionSecretName: external-db
       storage.enabled: true
       storage.accessMode: ReadWriteOnce
+      storage.existingClaim: production-rwx-state
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires storage.accessMode=ReadWriteMany"

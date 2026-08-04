@@ -1,11 +1,12 @@
 # Production-Grade Multi-Replica API Server
 
 Status: M0-M4 merged in PR #1070 and live-accepted on the isolated deployment;
-the split-role metrics-completeness correction is implemented with live scrape
-acceptance pending; production fleet rollout and M5 compatibility cleanup
-remain fleet-gated
+the split-role metrics-completeness correction is merged; the Rainier
+production storage/request-store cutover and live scrape acceptance are
+pending; production fleet rollout and M5 compatibility cleanup remain
+fleet-gated
 
-Last updated: 2026-08-03
+Last updated: 2026-08-04
 
 Canonical owner: this file. External plans and pull request descriptions must
 link here rather than restating a divergent contract.
@@ -38,6 +39,24 @@ The test deployment targets Kubernetes context `boltz-test`, which is an alias
 of `boltz-platform-test-eks-cluster`. It uses a dedicated namespace and Helm
 release named `skypilot-ha`; it must not modify the existing `test` namespace or
 the shared `gitops-hub-rainier` SkyPilot release.
+
+The 2026-08-04 Rainier production preflight found that the live 1.1.1084 image
+already contains M0-M4 and the split-role metrics correction, but the release
+still has one API replica, `apiService.highAvailability.enabled=false`,
+`apiService.upgradeStrategy=Recreate`, `requestStore.backend=sqlite`, and a
+200-Gi `gp2` `ReadWriteOnce` claim. The hub infrastructure declares only the
+EBS CSI driver and no RWX storage class. Production activation therefore
+requires an infrastructure and data migration; changing only the Deployment
+strategy is invalid and the chart correctly rejects it.
+
+That preflight also records the operational reason to complete the migration.
+One Recreate upgrade produced a 94-second interval with no Ready API pod, and a
+later redundant Recreate produced an 88-second interval. An atomic rollback to
+a pre-guarded SQLite revision also failed after that revision's regular
+migration Job had been removed. The isolated HA rollback result remains valid:
+its source and target revisions both use PostgreSQL, additive schemas, and the
+blocking revision-scoped hook. Production must never interpret native rollback
+to a pre-M1 SQLite revision as a supported recovery mechanism.
 
 ## Why the Existing RollingUpdate Path Is Insufficient
 
@@ -504,6 +523,8 @@ controllerService:
 storage:
   enabled: true
   accessMode: ReadWriteMany
+  # Optional when infrastructure owns and pre-populates the RWX claim.
+  existingClaim: ""
 
 databaseMigration:
   enabled: true
@@ -519,6 +540,11 @@ The chart enforces:
 - Executor and controller replicas are at least two.
 - Storage is enabled with `ReadWriteMany`, unless non-local blob and log
   providers are explicitly declared.
+- `storage.existingClaim`, when nonempty, selects a claim that infrastructure
+  created and populated before the rollout. The chart does not render its
+  default claim in that mode. The declared `storage.accessMode` remains part of
+  the HA guard, and rollout preflight must separately prove the live referenced
+  claim is bound and actually advertises `ReadWriteMany`.
 - RollingUpdate uses `maxUnavailable: 0`.
 - API Deployments set `minReadySeconds`, a bounded progress deadline, pre-stop
   drain, and a termination grace period longer than the drain budget.
@@ -623,6 +649,35 @@ Deployment:
 5. Exercise the explicit cutover importer with seeded legacy SQLite rows.
 6. Roll back configuration before cutover, and after cutover roll back only to
    the M1 compatibility image that understands PostgreSQL.
+
+Rainier production uses the same logical boundary with independently managed
+storage:
+
+1. Provision the EFS driver, encrypted filesystem, mount targets, RWX storage
+   class, and replacement claim through reviewed Terragrunt plans. Protect the
+   filesystem and claim from accidental destroy.
+2. Add `helm.sh/resource-policy: keep` to the legacy release-owned claim in a
+   no-pod-change Helm revision and prove the API Deployment and pod identities
+   did not change. Platform IaC must assume durable ownership of the kept claim
+   before the chart stops rendering it; the annotation alone only orphans the
+   object. This protects the audit source when the chart later stops rendering
+   that claim.
+3. Populate the replacement claim and verify ownership, modes, hashes, and
+   usable capacity before selecting it. `storage.existingClaim` only selects a
+   claim; it deliberately does not copy data or infer that copying was safe.
+4. Block legacy submissions, drain or explicitly interrupt active requests,
+   stop every SQLite writer, perform the final file synchronization, and run
+   the explicit cutover importer. Do not start a PostgreSQL writer until the
+   importer has verified counts and hashes and committed its marker.
+5. Apply a one-API-pod compatibility revision with the replacement claim and
+   PostgreSQL request store, but without split-role HA. Accept this revision as
+   the fix-forward rollback target on the far side of the one-way cutover.
+6. After the compatibility revision is healthy, apply a new guarded Helm
+   upgrade with explicit API/executor/controller roles and RollingUpdate. Keep
+   the legacy claim and SQLite source read-only through the rollback window.
+7. Author the legacy-claim deletion as a stacked cleanup PR during this
+   transition. Keep it draft behind the exact rollback-window, backup, and
+   checksum evidence; do not leave deletion as an operator TODO.
 
 ### M2: Split API and executor roles
 
@@ -1386,6 +1441,10 @@ prove request continuity.
 - Rolling back does not delete request, queue, or controller ownership rows.
 - A failed migration hook blocks the rollout and leaves the previous
   Deployments serving.
+- Production rollback is a new Terraform-owned Helm upgrade revision pinned to
+  the last accepted M1-or-newer image and values. Native `helm rollback` to a
+  stored pre-M1 revision is not a supported recovery path: it can select the
+  SQLite backend, the legacy claim, and the old non-hook migration resource.
 - Disabling `apiService.metrics.enabled` removes all role metrics ports and
   scrape annotations together; it is an observability rollback and cannot be
   used to claim a metrics-dependent rollout gate.
@@ -1404,6 +1463,9 @@ The storage cutover is a deliberate rollback boundary:
    to a pre-M1 image that can only read SQLite.
 4. The legacy SQLite database is retained read-only through the rollback window
    for audit, not used as a second writer.
+5. The independently managed RWX claim remains the mounted claim for every
+   post-cutover rollback; selecting the retained legacy claim would reintroduce
+   a stale writer and is forbidden.
 
 This avoids an unsafe dual-write protocol and makes the irreversible boundary
 explicit.
