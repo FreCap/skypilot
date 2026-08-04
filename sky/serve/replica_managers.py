@@ -1165,52 +1165,6 @@ def terminate_cluster(
     else:
         time.sleep(replica_drain_delay_seconds)
 
-    # Controller-side teardown runs in the API server's workspace context,
-    # which may differ from the replica cluster's recorded workspace. Pin each
-    # down request to the durable cluster identity so failed-service purge can
-    # clean up replicas after their controller is gone.
-    cluster_record = global_user_state.get_cluster_from_name(cluster_name)
-    if cluster_record is None and cleanup_fence is not None:
-        raise exceptions.KubernetesPhysicalClusterIdentityError(
-            f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: its '
-            'durable cluster record is absent.')
-    if cleanup_fence is not None:
-        assert cluster_record is not None
-        handle = cluster_record.get('handle')
-        launched_resources = getattr(handle, 'launched_resources', None)
-        if (not isinstance(handle,
-                           cloud_vm_ray_backend.CloudVmRayResourceHandle) or
-                getattr(handle, 'cluster_name', None) != cluster_name or
-                launched_resources is None or
-                not isinstance(getattr(launched_resources, 'cloud', None),
-                               clouds.Kubernetes) or
-                getattr(launched_resources, 'region',
-                        None) != cleanup_fence.kubernetes_context):
-            raise exceptions.KubernetesPhysicalClusterIdentityError(
-                f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: its '
-                'durable cluster handle does not match the fenced Kubernetes '
-                'context.')
-        expected_cluster_hash = cluster_record.get('cluster_hash')
-        if (not isinstance(expected_cluster_hash, str) or
-                not expected_cluster_hash):
-            raise exceptions.KubernetesPhysicalClusterIdentityError(
-                f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: its '
-                'durable cluster generation hash is absent.')
-        if expected_cluster_record_uuid is not None:
-            # Validate an action UUID before entering the physical provider
-            # fence. It remains the authoritative generation fence under the
-            # cluster locks; the ordinary hash is only the legacy fallback.
-            exact_snapshot = (
-                global_user_state.get_cluster_record_identity_snapshot(
-                    cluster_name, expected_cluster_record_uuid))
-            if exact_snapshot is None:
-                raise global_user_state.ClusterRecordIdentityConflictError(
-                    f'Cluster {cluster_name!r} disappeared before protocol-v2 '
-                    'cleanup could validate its exact record UUID.')
-    else:
-        expected_cluster_hash = None
-    cluster_workspace = (cluster_record.get('workspace')
-                         if cluster_record is not None else None)
     # TODO(fcapponi): DEPRECATED resource-action retry owner. Remove at M5
     # after action-only down proves its rollback gate; never use this loop for
     # an eligible authoritative service.
@@ -1225,38 +1179,83 @@ def terminate_cluster(
         try:
             usage_lib.messages.usage.set_internal()
             logger.info(f'Sending down request to cluster {cluster_name}')
-            workspace_ctx: contextlib.AbstractContextManager = (
-                skypilot_config.local_active_workspace_ctx(cluster_workspace)
-                if cluster_workspace else contextlib.nullcontext())
-            provider_fence: contextlib.AbstractContextManager[None] = (
-                contextlib.nullcontext() if cleanup_fence is None else
-                kubernetes_adaptor.physical_cluster_uid_fence(
-                    cleanup_fence.kubernetes_context,
-                    cleanup_fence.physical_cluster_uid))
             phase_mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
                           if cleanup_fence is None else
                           provider_phase.ProviderPhaseMode.V2_FENCED)
-            # Workspace selection owns kubeconfig/environment resolution, so
-            # enter the process phase first, then select the workspace before
-            # capturing the immutable provider target. Each retry constructs
-            # all three contexts afresh and releases them before backoff.
-            with provider_phase.provider_phase(
-                    phase_mode), workspace_ctx, provider_fence:
+            with provider_phase.provider_phase(phase_mode):
+                # Every retry re-reads the durable handle, generation, and
+                # workspace only after phase admission. A transient failure
+                # cannot reuse authority captured by an earlier attempt.
+                cluster_record = global_user_state.get_cluster_from_name(
+                    cluster_name)
+                if cluster_record is None and cleanup_fence is not None:
+                    raise exceptions.KubernetesPhysicalClusterIdentityError(
+                        f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: '
+                        'its durable cluster record is absent.')
+                expected_cluster_hash = None
                 if cleanup_fence is not None:
+                    assert cluster_record is not None
+                    handle = cluster_record.get('handle')
+                    launched_resources = getattr(handle, 'launched_resources',
+                                                 None)
+                    if (not isinstance(
+                            handle,
+                            cloud_vm_ray_backend.CloudVmRayResourceHandle) or
+                            getattr(handle, 'cluster_name',
+                                    None) != cluster_name or
+                            launched_resources is None or not isinstance(
+                                getattr(launched_resources, 'cloud', None),
+                                clouds.Kubernetes) or
+                            getattr(launched_resources, 'region',
+                                    None) != cleanup_fence.kubernetes_context):
+                        raise exceptions.KubernetesPhysicalClusterIdentityError(
+                            f'Cannot prove protocol-v2 cleanup for '
+                            f'{cluster_name!r}: its durable cluster handle '
+                            'does not match the fenced Kubernetes context.')
+                    expected_cluster_hash = cluster_record.get('cluster_hash')
+                    if (not isinstance(expected_cluster_hash, str) or
+                            not expected_cluster_hash):
+                        raise exceptions.KubernetesPhysicalClusterIdentityError(
+                            f'Cannot prove protocol-v2 cleanup for '
+                            f'{cluster_name!r}: its durable cluster generation '
+                            'hash is absent.')
                     if expected_cluster_record_uuid is not None:
+                        exact_snapshot = (global_user_state.
+                                          get_cluster_record_identity_snapshot(
+                                              cluster_name,
+                                              expected_cluster_record_uuid))
+                        if exact_snapshot is None:
+                            raise global_user_state.ClusterRecordIdentityConflictError(
+                                f'Cluster {cluster_name!r} disappeared before '
+                                'protocol-v2 cleanup could validate its exact '
+                                'record UUID.')
+                cluster_workspace = (cluster_record.get('workspace')
+                                     if cluster_record is not None else None)
+                workspace_ctx: contextlib.AbstractContextManager = (
+                    skypilot_config.local_active_workspace_ctx(
+                        cluster_workspace)
+                    if cluster_workspace else contextlib.nullcontext())
+                physical_fence: contextlib.AbstractContextManager[None] = (
+                    contextlib.nullcontext() if cleanup_fence is None else
+                    kubernetes_adaptor.physical_cluster_uid_fence(
+                        cleanup_fence.kubernetes_context,
+                        cleanup_fence.physical_cluster_uid))
+                # Workspace selection owns kubeconfig/environment resolution;
+                # enter it before creating this attempt's immutable capture.
+                with workspace_ctx, physical_fence:
+                    if cleanup_fence is None:
+                        core.down(cluster_name,
+                                  _expected_cluster_record_uuid=(
+                                      expected_cluster_record_uuid))
+                    elif expected_cluster_record_uuid is not None:
                         core.down(cluster_name,
                                   _expected_cluster_record_uuid=(
                                       expected_cluster_record_uuid),
                                   _continue_guard=continue_guard)
                     else:
-                        core.down(
-                            cluster_name,
-                            _expected_cluster_hash=(expected_cluster_hash),
-                            _continue_guard=continue_guard)
-                else:
-                    core.down(cluster_name,
-                              _expected_cluster_record_uuid=(
-                                  expected_cluster_record_uuid))
+                        core.down(cluster_name,
+                                  _expected_cluster_hash=expected_cluster_hash,
+                                  _continue_guard=continue_guard)
             logger.info(f'Replica cluster {cluster_name} terminated.')
             return
         except exceptions.ClusterDoesNotExist as error:
