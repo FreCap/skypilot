@@ -2157,6 +2157,94 @@ class TestFillLaunchPath(unittest.TestCase):
             override['accelerators'] = exact_shape
         return override
 
+    @staticmethod
+    def _launch_v2(manager, override):
+        with provider_phase.provider_phase(
+                provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
+            return manager._launch_replica(7,
+                                           override,
+                                           provider_phase_admission=admission)
+
+    def test_v2_batch_phase_precedes_manager_lock(self):
+        manager = _make_manager(None)
+        events = []
+        admission = mock.Mock(mode=provider_phase.ProviderPhaseMode.V2_FENCED)
+
+        @contextlib.contextmanager
+        def _phase(mode):
+            self.assertEqual(mode, provider_phase.ProviderPhaseMode.V2_FENCED)
+            events.append('phase-enter')
+            try:
+                yield admission
+            finally:
+                events.append('phase-exit')
+
+        class _Lock:
+
+            def __enter__(self):
+                events.append('lock-enter')
+
+            def __exit__(self, *_args):
+                events.append('lock-exit')
+
+        manager.lock = _Lock()
+        manager._batch_needs_placement_snapshot = mock.Mock(return_value=False)
+        manager._scale_up_batch_locked = mock.Mock(
+            side_effect=lambda *_args, **_kwargs: events.append('scale'))
+        override = {
+            _FILL_KEY: True,
+            _PROTOCOL_KEY: reserved_capacity_broker.PROTOCOL_V2,
+        }
+
+        with mock.patch.object(provider_phase,
+                               'provider_phase',
+                               side_effect=_phase):
+            manager.scale_up_batch([override])
+
+        self.assertEqual(
+            events,
+            ['phase-enter', 'lock-enter', 'scale', 'lock-exit', 'phase-exit'])
+        self.assertIs(
+            manager._scale_up_batch_locked.call_args.
+            kwargs['provider_phase_admission'], admission)
+
+    def test_v2_batch_drops_conflicting_uids_and_preserves_unrelated(self):
+        phx = make_location('phx-context',
+                            accelerators={'H200': 1},
+                            cloud_name='Kubernetes',
+                            use_spot=False)
+        east = make_location('east-context',
+                             accelerators={'H200': 1},
+                             cloud_name='Kubernetes',
+                             use_spot=False)
+        phx_a = self._v2_override(phx)
+        phx_b = self._v2_override(phx)
+        phx_b[constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY] = (
+            'physical-uid-b')
+        phx_b[_POOL_KEY] = reserved_capacity_broker.make_pool_key(
+            phx.region,
+            'H200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-uid-b')
+        ordinary = {'use_spot': True}
+        east_v2 = self._v2_override(east)
+        overrides = [phx_a, ordinary, phx_b, east_v2]
+
+        manager = _make_manager(None)
+        manager.lock = threading.RLock()
+        manager._batch_needs_placement_snapshot = mock.Mock(return_value=False)
+        manager._scale_up_batch_locked = mock.Mock()
+        manager._log_fill_skip = mock.Mock()
+
+        manager.scale_up_batch(overrides)
+
+        manager._scale_up_batch_locked.assert_called_once()
+        self.assertEqual(manager._scale_up_batch_locked.call_args.args[0],
+                         [ordinary, east_v2])
+        self.assertEqual(manager._log_fill_skip.call_count, 2)
+        # Batch filtering never mutates the caller-owned decision list.
+        self.assertEqual(overrides, [phx_a, ordinary, phx_b, east_v2])
+
     def test_v2_missing_epoch_fails_before_persist(self):
         location = make_location('phx-context',
                                  accelerators={'H200': 1},
@@ -2170,9 +2258,12 @@ class TestFillLaunchPath(unittest.TestCase):
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
              mock.patch.object(reserved_capacity_broker,
                                'persist_fill_replica') as persist:
-            self.assertFalse(manager._launch_replica(7, override))
+            self.assertFalse(self._launch_v2(manager, override))
         persist.assert_not_called()
 
     def test_v2_pool_key_rejects_selected_accelerator_mismatch(self):
@@ -2193,9 +2284,8 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(reserved_capacity_broker,
                                'persist_fill_replica') as persist:
             self.assertFalse(
-                manager._launch_replica(7,
-                                        self._v2_override(location,
-                                                          gpu='H200')))
+                self._launch_v2(manager, self._v2_override(location,
+                                                           gpu='H200')))
         persist.assert_not_called()
         placer.release_retry.assert_called_once_with(location)
 
@@ -2211,17 +2301,21 @@ class TestFillLaunchPath(unittest.TestCase):
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
              mock.patch.object(reserved_capacity_broker,
                                'current_epoch',
                                return_value=3), \
              mock.patch.object(
-                 reserved_capacity,
-                 'get_kubernetes_physical_cluster_uid',
-                 return_value='replacement-uid'), \
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 side_effect=exceptions.
+                 KubernetesPhysicalClusterIdentityError('retargeted')), \
              mock.patch.object(reserved_capacity_broker,
                                'persist_fill_replica') as persist:
             self.assertFalse(
-                manager._launch_replica(7, self._v2_override(location)))
+                self._launch_v2(manager, self._v2_override(location)))
         persist.assert_not_called()
         placer.release_retry.assert_called_once_with(location)
 
@@ -2253,7 +2347,7 @@ class TestFillLaunchPath(unittest.TestCase):
                                return_value=3), \
              mock.patch.object(reserved_capacity_broker,
                                'persist_fill_replica') as persist:
-            self.assertFalse(manager._launch_replica(7, override))
+            self.assertFalse(self._launch_v2(manager, override))
         persist.assert_not_called()
         placer.release_retry.assert_called_once_with(l4)
 
@@ -2276,15 +2370,49 @@ class TestFillLaunchPath(unittest.TestCase):
                                'current_epoch',
                                return_value=3), \
              mock.patch.object(
-                 reserved_capacity,
-                 'get_kubernetes_physical_cluster_uid',
-                 return_value='physical-uid'), \
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
              mock.patch.object(reserved_capacity_broker,
                                'persist_fill_replica',
                                return_value=False):
             self.assertFalse(
-                manager._launch_replica(7, self._v2_override(location)))
+                self._launch_v2(manager, self._v2_override(location)))
         placer.release_retry.assert_called_once_with(location)
+
+    def test_v2_thread_construction_failure_persists_nothing(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist, \
+             mock.patch.object(replica_managers,
+                               '_ReplicaLaunchThread',
+                               side_effect=RuntimeError('cannot freeze')):
+            with self.assertRaisesRegex(RuntimeError, 'cannot freeze'):
+                self._launch_v2(manager, self._v2_override(location))
+
+        persist.assert_not_called()
+        placer.release_retry.assert_called_once_with(location)
+        self.assertNotIn(7, manager._launch_thread_pool)
 
     def test_v2_launch_persists_every_authority_field(self):
         location = make_location('phx-context',
@@ -2306,13 +2434,13 @@ class TestFillLaunchPath(unittest.TestCase):
                                'current_epoch',
                                return_value=3), \
              mock.patch.object(
-                 reserved_capacity,
-                 'get_kubernetes_physical_cluster_uid',
-                 return_value='physical-uid'), \
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
              mock.patch.object(reserved_capacity_broker,
                                'persist_fill_replica',
                                return_value=True) as persist:
-            self.assertTrue(manager._launch_replica(7, override))
+            self.assertTrue(self._launch_v2(manager, override))
         info = persist.call_args.args[2]
         self.assertEqual(info.reserved_fill_pool_key, override[_POOL_KEY])
         self.assertEqual(info.reserved_fill_service_generation, 7)
@@ -2323,7 +2451,7 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertEqual(
             persist.call_args.kwargs['expected_service_generation'], 7)
 
-    def test_v2_queued_launch_guard_rechecks_uid_and_exact_pin(self):
+    def test_v2_launch_capture_and_queued_static_pin_guard(self):
         location = make_location('phx-context',
                                  accelerators={'H200': 1.0},
                                  cloud_name='Kubernetes',
@@ -2336,6 +2464,28 @@ class TestFillLaunchPath(unittest.TestCase):
         # The immutable expected pin canonicalizes it while still comparing
         # against the actual queued override below.
         override = self._v2_override(location)
+        events = []
+
+        @contextlib.contextmanager
+        def _physical_fence(context, physical_uid):
+            self.assertEqual((context, physical_uid),
+                             ('phx-context', 'physical-uid'))
+            events.append('physical-enter')
+            try:
+                yield
+            finally:
+                events.append('physical-exit')
+
+        def _persist(*_args, **_kwargs):
+            self.assertEqual(events, ['physical-enter', 'thread'])
+            events.append('persist')
+            return True
+
+        def _thread(*_args, **_kwargs):
+            self.assertEqual(events, ['physical-enter'])
+            events.append('thread')
+            return mock.Mock()
+
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
@@ -2346,15 +2496,19 @@ class TestFillLaunchPath(unittest.TestCase):
                                'current_epoch',
                                return_value=3), \
              mock.patch.object(
-                 reserved_capacity,
-                 'get_kubernetes_physical_cluster_uid',
-                 side_effect=['physical-uid', 'replacement-uid']) as get_uid, \
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 side_effect=_physical_fence) as physical_fence, \
              mock.patch.object(reserved_capacity_broker,
                                'persist_fill_replica',
-                               return_value=True), \
+                               side_effect=_persist), \
              mock.patch.object(replica_managers,
-                               '_ReplicaLaunchThread') as launch_thread:
-            self.assertTrue(manager._launch_replica(7, override))
+                               '_ReplicaLaunchThread',
+                               side_effect=_thread) as launch_thread, \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid') as ambient_uid:
+            self.assertTrue(self._launch_v2(manager, override))
 
             thread_call = launch_thread.call_args.kwargs
             durable_fence = thread_call['kwargs']['launch_fence']
@@ -2370,24 +2524,23 @@ class TestFillLaunchPath(unittest.TestCase):
             self.assertEqual(parsed_fence.accelerator_count, 1)
             cloud_guard = thread_call['kwargs']['cloud_launch_guard']
             self.assertIsNotNone(cloud_guard)
-            self.assertEqual(cloud_guard(),
-                             (False, 'fill-physical-cluster-uid-mismatch'))
-            self.assertEqual(get_uid.call_args_list, [
-                mock.call('phx-context', force_refresh=True),
-                mock.call('phx-context', force_refresh=True),
-            ])
+            self.assertEqual(cloud_guard(), (True, 'authorized'))
+            physical_fence.assert_called_once_with('phx-context',
+                                                   'physical-uid')
+            self.assertEqual(
+                events,
+                ['physical-enter', 'thread', 'persist', 'physical-exit'])
+            ambient_uid.assert_not_called()
 
             # The guard reads the same override mapping launch_cluster will
             # build its Task from, while retaining an immutable expected pin.
-            # A queued mutation must fail before another Kubernetes API read.
+            # A queued mutation fails provider-free. The executor later proves
+            # the immutable durable tuple for every provider attempt.
             queued_override = thread_call['args'][6]
             queued_override['accelerators'] = {'H200': 2}
-            get_uid.reset_mock()
-            get_uid.side_effect = None
-            get_uid.return_value = 'physical-uid'
             self.assertEqual(cloud_guard(),
                              (False, 'fill-accelerator-shape-mismatch'))
-            get_uid.assert_not_called()
+            physical_fence.assert_called_once()
 
     def test_abort_creates_no_record_and_keeps_id(self):
         placer = mock.Mock()

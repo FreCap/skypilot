@@ -1392,6 +1392,64 @@ def _whole_gpu_capacity(
     return int(count)
 
 
+def _is_protocol_v2_fill_override(
+        resources_override: Mapping[str, Any] | None) -> bool:
+    """Classify a carried v2 fill override without provider access."""
+    if resources_override is None:
+        return False
+    protocol = resources_override.get(
+        serve_constants.RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY)
+    return (serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
+            in resources_override and type(protocol) is int and
+            protocol == reserved_capacity_broker.PROTOCOL_V2)
+
+
+def _conflicting_protocol_v2_fill_override_indexes(
+    resources_overrides: typing.Sequence[Mapping[str, Any] | None],
+) -> set[int]:
+    """Return every v2 batch entry in a conflicting context/UID group."""
+    targets: list[tuple[int, set[str], str]] = []
+    uids_by_context: dict[str, set[str]] = {}
+    for index, resources_override in enumerate(resources_overrides):
+        if not _is_protocol_v2_fill_override(resources_override):
+            continue
+        assert resources_override is not None
+        physical_uid = resources_override.get(
+            serve_constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY)
+        raw_locations = resources_override.get(
+            serve_constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY)
+        if (not isinstance(physical_uid, str) or not physical_uid or
+                not isinstance(raw_locations, list)):
+            # The per-launch validator rejects malformed entries. Only
+            # complete provider-free identities participate in batch conflict
+            # detection, so unrelated valid entries remain launchable.
+            continue
+        contexts: set[str] = set()
+        malformed = False
+        for raw_location in raw_locations:
+            if not isinstance(raw_location, Mapping):
+                malformed = True
+                break
+            kube_context = raw_location.get('region')
+            if not isinstance(kube_context, str) or not kube_context:
+                malformed = True
+                break
+            contexts.add(kube_context)
+        if malformed or not contexts:
+            continue
+        targets.append((index, contexts, physical_uid))
+        for kube_context in contexts:
+            uids_by_context.setdefault(kube_context, set()).add(physical_uid)
+    conflicting_contexts = {
+        context for context, physical_uids in uids_by_context.items()
+        if len(physical_uids) > 1
+    }
+    return {
+        index for index, contexts, _ in targets
+        if contexts & conflicting_contexts
+    }
+
+
 def _protocol_v2_fill_cloud_launch_guard(
     pool_key: str,
     service_generation: int,
@@ -1401,7 +1459,13 @@ def _protocol_v2_fill_cloud_launch_guard(
     accelerator_count: int,
     resources_override: Mapping[str, Any],
 ) -> tuple[bool, str]:
-    """Revalidate one protocol-v2 queued pin before a cloud mutation."""
+    """Validate one protocol-v2 queued pin without provider access.
+
+    The durable request tuple is the asynchronous launch's authority. Every
+    executor attempt proves its physical UID under a fresh provider phase and
+    physical fence; this early guard only rejects an in-memory queued tuple
+    whose exact context or shape was mutated before request submission.
+    """
     if (isinstance(service_generation, bool) or
             not isinstance(service_generation, int) or service_generation < 1):
         return False, 'invalid-fill-service-generation'
@@ -1434,16 +1498,6 @@ def _protocol_v2_fill_cloud_launch_guard(
             queued_count != accelerator_count or
             _whole_gpu_capacity(queued_accelerators) is None):
         return False, 'fill-accelerator-shape-mismatch'
-    try:
-        observed_uid = (reserved_capacity.get_kubernetes_physical_cluster_uid(
-            kube_context, force_refresh=True))
-    except Exception as e:  # pylint: disable=broad-except
-        logger.warning('Failed to refresh the Kubernetes identity for a '
-                       'reserved-fill launch; failing closed: '
-                       f'{common_utils.format_exception(e)}')
-        return False, 'fill-physical-cluster-uid-refresh-failed'
-    if observed_uid != physical_cluster_uid:
-        return False, 'fill-physical-cluster-uid-mismatch'
     return True, 'authorized'
 
 
@@ -1456,6 +1510,21 @@ def _interrupted_reserved_fill_protocol(info: 'ReplicaInfo') -> int:
             'partial or contradictory protocol-v2 fill identity') from error
     return (reserved_capacity_broker.PROTOCOL_V1
             if cleanup_fence is None else reserved_capacity_broker.PROTOCOL_V2)
+
+
+def _provider_cleanup_phase_order(info: 'ReplicaInfo') -> int:
+    """Order provider cleanup without consulting mutable provider state.
+
+    Protocol-v2 authority (including a malformed v2-shaped row that must fail
+    closed) always precedes ambient/legacy work.  This prevents an ordinary
+    provider call from reacquiring the ambient phase between v2 owners in a
+    recovery or refresher wave.
+    """
+    try:
+        cleanup_fence = reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+    except exceptions.KubernetesPhysicalClusterIdentityError:
+        return 0
+    return 0 if cleanup_fence is not None else 1
 
 
 def _zero_cost_pool_key(
@@ -3550,6 +3619,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             info for info in to_up_replicas
             if getattr(info, 'reserved_fill', False) is True
         ]
+        interrupted_fill_replicas.sort(key=_provider_cleanup_phase_order)
         if interrupted_fill_replicas:
             # The old controller may have submitted sdk.launch before it died
             # without receiving the durable request ID or before the cluster
@@ -3832,6 +3902,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.status_property.preempted or
                 info.cluster_name in orphaned_interruptible_clusters)
         ]
+        to_down_replicas.sort(key=_provider_cleanup_phase_order)
         waiting_replicas = [
             info for info in to_down_replicas
             if (not self._is_legacy_uncertain_logical_retirement(info) and
@@ -3841,8 +3912,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         ]
         recovery_wait_urls: dict[int, str | None] = {}
         malformed_waiting_rows: dict[int, str] = {}
+        ordinary_waiting_replicas: list[ReplicaInfo] = []
         if waiting_replicas and not self._is_pool:
-            ordinary_waiting_replicas = []
             for info in waiting_replicas:
                 try:
                     cleanup_fence = (
@@ -3859,21 +3930,42 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # bounded deadline without any provider lookup here; exact
                     # UID validation remains mandatory before teardown.
                     recovery_wait_urls[info.replica_id] = None
-            if ordinary_waiting_replicas:
-                try:
-                    # One cluster/config snapshot for the whole recovery wave.
-                    # Resolving ``info.url`` independently repeats cluster-record
-                    # and provider-config reads around each endpoint lookup while
-                    # the manager lock blocks every probe and autoscaler tick.
+
+        def _resolve_ordinary_recovery_wait_urls() -> None:
+            if not ordinary_waiting_replicas:
+                return
+            try:
+                # One cluster/config snapshot for the whole recovery wave.
+                # Resolving ``info.url`` independently repeats cluster-record
+                # and provider-config reads around each endpoint lookup while
+                # the manager lock blocks every probe and autoscaler tick.
+                # Recovery already owns self.lock, so it must never queue
+                # behind an opposite provider phase. A busy phase merely
+                # removes the early-drain optimization; the durable bounded
+                # drain deadline remains authoritative and is retried by the
+                # refresher on its next pass.
+                with provider_phase.try_provider_phase(
+                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                ) as phase_admission:
                     recovery_wait_urls.update(
-                        self._resolve_probe_urls(ordinary_waiting_replicas))
-                except Exception as e:  # pylint: disable=broad-except
-                    # URL resolution only enables early drain completion. Keep the
-                    # bounded per-replica fallback rather than failing recovery.
-                    logger.warning(
-                        'Failed to batch-resolve recovered drain endpoints; '
-                        'falling back to per-replica resolution: '
-                        f'{common_utils.format_exception(e)}')
+                        self._resolve_probe_urls(
+                            ordinary_waiting_replicas,
+                            phase_admission=phase_admission))
+            except exceptions.ProviderPhaseBusyError:
+                recovery_wait_urls.update({
+                    info.replica_id: None for info in ordinary_waiting_replicas
+                })
+                logger.debug(
+                    'Deferring recovered drain endpoint resolution because '
+                    'the ambient provider phase is busy.')
+            except Exception as e:  # pylint: disable=broad-except
+                # URL resolution only enables early drain completion. Keep the
+                # bounded per-replica fallback rather than failing recovery.
+                logger.warning(
+                    'Failed to batch-resolve recovered drain endpoints; '
+                    'falling back to per-replica resolution: '
+                    f'{common_utils.format_exception(e)}')
+
         legacy_uncertain_ids = getattr(
             self, '_legacy_uncertain_logical_retirement_ids', None)
         if legacy_uncertain_ids is None:
@@ -3886,7 +3978,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         if recovering_logical_ids is None:
             recovering_logical_ids = set()
             self._recovering_logical_retirement_ids = recovering_logical_ids
+        ordinary_wait_urls_resolved = False
         for replica_info in to_down_replicas:
+            if (_provider_cleanup_phase_order(replica_info) == 1 and
+                    not ordinary_wait_urls_resolved):
+                # The wave is v2-first. Do not perform even the ordinary URL
+                # optimization until every preceding fenced teardown/wait has
+                # completed its inline provider work.
+                ordinary_wait_urls_resolved = True
+                _resolve_ordinary_recovery_wait_urls()
             try:
                 malformed_identity = malformed_waiting_rows.get(
                     replica_info.replica_id)
@@ -4023,6 +4123,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         recovering_existing_replica: bool = False,
         logical_reconcile_fence: LogicalTargetState | None = None,
         logical_reconcile_fence_requires_exact_generation: bool = False,
+        provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
+                                   None) = None,
     ) -> bool:
         """Enqueue one replica launch.
 
@@ -4070,7 +4172,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_priority: highest queued demand priority represented by this
         fresh launch. It gates new global claims only and never preempts an
         existing launch.
+
+        provider_phase_admission: blocking v2 admission acquired by the public
+        scale entrypoint before it takes ``self.lock``. It is required for a
+        protocol-v2 fill and ignored by provider-free ordinary launches.
         """
+        if (_is_protocol_v2_fill_override(resources_override) and
+            (provider_phase_admission is None or provider_phase_admission.mode
+             != provider_phase.ProviderPhaseMode.V2_FENCED)):
+            raise exceptions.ProviderPhaseMisuseError(
+                'A protocol-v2 fill launch requires fenced admission acquired '
+                'before the replica-manager lock.')
         legacy_runtime = self._legacy_mutation_runtime_state()
         if replica_id in legacy_runtime.launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -4823,6 +4935,111 @@ class SkyPilotReplicaManager(ReplicaManager):
         info.is_zero_cost = is_zero_cost
         info.cost_rebalance_for_replica_id = (cost_rebalance_for_replica_id)
         info.paid_capacity_pool_key = prior_paid_capacity_pool_key
+
+        def _make_launch_thread(
+            recovery_launch_kwargs: dict[str, Any],) -> _ReplicaLaunchThread:
+            completion_queue, completion_event = self._launch_completion_state()
+            return _ReplicaLaunchThread(
+                target=launch_cluster,
+                replica_id=replica_id,
+                completion_queue=completion_queue,
+                completion_event=completion_event,
+                args=(replica_id, launch_yaml_content, cluster_name,
+                      log_file_name, legacy_runtime.replica_to_request_id,
+                      legacy_runtime.replica_to_launch_cancelled,
+                      resources_override, retry_until_up),
+                kwargs={
+                    'availability_max_retry': availability_max_retry,
+                    'exact_resources_override': location is not None,
+                    'pre_launch_guard': self._service_is_launch_authorized,
+                    'cloud_launch_guard': cloud_launch_guard,
+                    'continue_guard':
+                        self._launch_owner_watchdog_allows_continue,
+                    'cleanup_continue_guard':
+                        self._service_is_cleanup_authorized,
+                    'launch_fence': launch_fence,
+                    'service_spec': launch_spec,
+                    'service_name': self._service_name,
+                    'workspace': getattr(
+                        self, '_workspace',
+                        skypilot_config.get_active_workspace() or
+                        constants.SKYPILOT_DEFAULT_WORKSPACE),
+                    **recovery_launch_kwargs,
+                },
+            )
+
+        if fill_protocol_version == reserved_capacity_broker.PROTOCOL_V2:
+            # The caller acquired blocking admission before self.lock. Join it
+            # here to validate the capability, then prove the exact selected
+            # context/UID and retain both authorities continuously through the
+            # atomic broker persist and launch-thread argument freeze. The
+            # asynchronous request starts later with no phase held and proves
+            # its durable tuple afresh in the executor.
+            assert provider_phase_admission is not None
+            assert fill_launch_context is not None
+            assert isinstance(fill_physical_cluster_uid, str)
+            assert isinstance(fill_service_generation, int)
+            assert fill_grant_epoch is not None
+            assert fill_pool_key is not None
+            try:
+                with provider_phase.join_provider_phase(
+                        provider_phase_admission):
+                    with kubernetes_adaptor.physical_cluster_uid_fence(
+                            fill_launch_context, fill_physical_cluster_uid):
+                        # Freeze the complete request tuple before its durable
+                        # reservation. Construction is side-effect free; doing
+                        # it first prevents an allocation row from being left
+                        # without local worker ownership if construction raises.
+                        try:
+                            launch_thread = _make_launch_thread({})
+                        except BaseException:
+                            self._release_unstarted_location_retry(location)
+                            raise
+                        logical_state_guard = (
+                            self._logical_state_lock if logical_reconcile_fence
+                            is not None else contextlib.nullcontext())
+                        with logical_state_guard:
+                            if (logical_reconcile_fence is not None and
+                                    not self._logical_reconcile_fence_holds(
+                                        logical_reconcile_fence,
+                                        require_exact_generation=
+                                        (logical_reconcile_fence_requires_exact_generation
+                                        ))):
+                                logger.info(
+                                    'Logical launch was superseded at its final '
+                                    'row-persistence fence.')
+                                self._release_unstarted_location_retry(location)
+                                return False
+                            if not reserved_capacity_broker.persist_fill_replica(
+                                    self._service_name,
+                                    replica_id,
+                                    info,
+                                    pool_key=fill_pool_key,
+                                    expected_epoch=fill_grant_epoch,
+                                    expected_protocol_version=(
+                                        reserved_capacity_broker.PROTOCOL_V2),
+                                    expected_service_generation=(
+                                        fill_service_generation),
+                                    expected_physical_cluster_uid=(
+                                        fill_physical_cluster_uid),
+                                    **self._db_fence_kwargs()):
+                                self._release_unstarted_location_retry(location)
+                                self._log_fill_skip(
+                                    f'grant epoch {fill_grant_epoch} '
+                                    'superseded or round in flight at persist')
+                                return False
+                        legacy_runtime.launch_thread_pool[
+                            replica_id] = launch_thread
+                        if existing_replica_infos is not None:
+                            existing_replica_infos.append(info)
+                return True
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                self._release_unstarted_location_retry(location)
+                self._log_fill_skip(
+                    'selected protocol-v2 pool physical identity could not be '
+                    f'proved: {common_utils.format_exception(error)}')
+                return False
+
         logical_state_guard = (self._logical_state_lock
                                if logical_reconcile_fence is not None else
                                contextlib.nullcontext())
@@ -4963,33 +5180,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._demote_system_recovery_candidate, replica_id,
                     recovery_intent),
             }
-        completion_queue, completion_event = self._launch_completion_state()
-        t = _ReplicaLaunchThread(
-            target=launch_cluster,
-            replica_id=replica_id,
-            completion_queue=completion_queue,
-            completion_event=completion_event,
-            args=(replica_id, launch_yaml_content, cluster_name, log_file_name,
-                  legacy_runtime.replica_to_request_id,
-                  legacy_runtime.replica_to_launch_cancelled,
-                  resources_override, retry_until_up),
-            kwargs={
-                'availability_max_retry': availability_max_retry,
-                'exact_resources_override': location is not None,
-                'pre_launch_guard': self._service_is_launch_authorized,
-                'cloud_launch_guard': cloud_launch_guard,
-                'continue_guard': self._launch_owner_watchdog_allows_continue,
-                'cleanup_continue_guard': (self._service_is_cleanup_authorized),
-                'launch_fence': launch_fence,
-                'service_spec': launch_spec,
-                'service_name': self._service_name,
-                'workspace': getattr(
-                    self, '_workspace',
-                    skypilot_config.get_active_workspace() or
-                    constants.SKYPILOT_DEFAULT_WORKSPACE),
-                **recovery_launch_kwargs,
-            },
-        )
+        t = _make_launch_thread(recovery_launch_kwargs)
         if existing_replica_infos is not None:
             # Bulk callers (recovery re-drive) reuse one snapshot across a
             # whole wave of launches. Append each accepted replica so shared
@@ -5358,6 +5549,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         logical_reconcile_fence_requires_exact_generation: bool = False,
         unknown_capacity_replacement: bool = False,
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
+        provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
+                                   None) = None,
     ) -> bool:
         """Allocate an id and enqueue one replica launch. Lock must be held.
 
@@ -5385,6 +5578,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             direct_launch_kwargs: dict[str, Any] = {}
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 direct_launch_kwargs['launch_priority'] = launch_priority
+            if provider_phase_admission is not None:
+                direct_launch_kwargs['provider_phase_admission'] = (
+                    provider_phase_admission)
             launched = self._launch_replica(self._next_replica_id,
                                             resources_override,
                                             **direct_launch_kwargs)
@@ -5408,21 +5604,39 @@ class SkyPilotReplicaManager(ReplicaManager):
                 launch_kwargs['prior_unknown_capacity_replacement'] = True
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 launch_kwargs['launch_priority'] = launch_priority
+            if provider_phase_admission is not None:
+                launch_kwargs['provider_phase_admission'] = (
+                    provider_phase_admission)
             launched = self._launch_replica(self._next_replica_id,
                                             resources_override, **launch_kwargs)
         if launched:
             self._next_replica_id += 1
         return launched
 
-    @with_lock
     def scale_up(self,
                  resources_override: dict[str, Any] | None = None) -> None:
-        if self._spot_placer is not None:
-            self._spot_placer.refresh_workspace_policy()
-        self._scale_up_one_locked(
-            resources_override, serve_state.get_replica_ids(self._service_name))
+        phase_context: contextlib.AbstractContextManager[
+            provider_phase.ProviderPhaseAdmission | None]
+        if _is_protocol_v2_fill_override(resources_override):
+            phase_context = provider_phase.provider_phase(
+                provider_phase.ProviderPhaseMode.V2_FENCED)
+        else:
+            phase_context = contextlib.nullcontext(None)
+        # Blocking provider admission must precede the manager mutex. The
+        # selected exact physical capture is lower in this hierarchy and is
+        # acquired only after the v2 location has been chosen.
+        with phase_context as phase_admission:
+            with self.lock:
+                if self._spot_placer is not None:
+                    self._spot_placer.refresh_workspace_policy()
+                launch_kwargs: dict[str, Any] = {}
+                if phase_admission is not None:
+                    launch_kwargs['provider_phase_admission'] = phase_admission
+                self._scale_up_one_locked(
+                    resources_override,
+                    serve_state.get_replica_ids(self._service_name),
+                    **launch_kwargs)
 
-    @with_lock
     def scale_up_batch(
         self,
         resources_overrides: list[dict[str, Any] | None],
@@ -5446,33 +5660,66 @@ class SkyPilotReplicaManager(ReplicaManager):
         later decisions observe in-wave reservations without querying and
         unpickling all existing rows once per launch.
         """
-        if self._spot_placer is not None:
-            self._spot_placer.refresh_workspace_policy()
-        needs_reservation = (
-            self._batch_needs_placement_snapshot(resources_overrides) and
-            self._uses_shared_zero_cost_demand_budget())
-        batch_kwargs: dict[str, Any] = {}
-        if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
-            batch_kwargs['launch_priority'] = launch_priority
-        if not needs_reservation:
-            self._scale_up_batch_locked(resources_overrides, expected_version,
-                                        **batch_kwargs)
-            return
-        try:
-            lock = locks.get_lock(
-                serve_constants.DEMAND_CAPACITY_RESERVATION_LOCK_ID)
-            with lock.acquire(blocking=False):
-                self._scale_up_batch_locked(resources_overrides,
-                                            expected_version, **batch_kwargs)
-        except locks.LockTimeout:
-            logger.info('Deferring demand scale-up because another service '
-                        'is reserving shared zero-cost capacity.')
+        conflicting_v2_indexes = (
+            _conflicting_protocol_v2_fill_override_indexes(resources_overrides))
+        if conflicting_v2_indexes:
+            for _ in sorted(conflicting_v2_indexes):
+                self._log_fill_skip(
+                    'one batch carries conflicting physical-cluster UIDs for '
+                    'the same Kubernetes context')
+            resources_overrides = [
+                resources_override
+                for index, resources_override in enumerate(resources_overrides)
+                if index not in conflicting_v2_indexes
+            ]
+            if not resources_overrides:
+                return
+        needs_v2_phase = any(
+            _is_protocol_v2_fill_override(resources_override)
+            for resources_override in resources_overrides)
+        phase_context: contextlib.AbstractContextManager[
+            provider_phase.ProviderPhaseAdmission | None]
+        if needs_v2_phase:
+            phase_context = provider_phase.provider_phase(
+                provider_phase.ProviderPhaseMode.V2_FENCED)
+        else:
+            phase_context = contextlib.nullcontext(None)
+        with phase_context as phase_admission:
+            with self.lock:
+                if self._spot_placer is not None:
+                    self._spot_placer.refresh_workspace_policy()
+                needs_reservation = (
+                    self._batch_needs_placement_snapshot(resources_overrides)
+                    and self._uses_shared_zero_cost_demand_budget())
+                batch_kwargs: dict[str, Any] = {}
+                if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
+                    batch_kwargs['launch_priority'] = launch_priority
+                if phase_admission is not None:
+                    batch_kwargs['provider_phase_admission'] = phase_admission
+                if not needs_reservation:
+                    self._scale_up_batch_locked(resources_overrides,
+                                                expected_version,
+                                                **batch_kwargs)
+                    return
+                try:
+                    lock = locks.get_lock(
+                        serve_constants.DEMAND_CAPACITY_RESERVATION_LOCK_ID)
+                    with lock.acquire(blocking=False):
+                        self._scale_up_batch_locked(resources_overrides,
+                                                    expected_version,
+                                                    **batch_kwargs)
+                except locks.LockTimeout:
+                    logger.info(
+                        'Deferring demand scale-up because another service is '
+                        'reserving shared zero-cost capacity.')
 
     def _scale_up_batch_locked(
         self,
         resources_overrides: list[dict[str, Any] | None],
         expected_version: int | None = None,
-        launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN)
+        launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN),
+        provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
+                                   None) = None,
     ) -> None:
         """Persist one physical batch while any shared demand lock is held."""
         batch_version = self.latest_version
@@ -5545,6 +5792,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     paid_location_launch_budget)
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 scale_up_kwargs['launch_priority'] = launch_priority
+            if provider_phase_admission is not None:
+                scale_up_kwargs['provider_phase_admission'] = (
+                    provider_phase_admission)
             stop_sequence_before = (paid_location_launch_budget.stop_sequence
                                     if paid_location_launch_budget is not None
                                     else 0)
@@ -6163,7 +6413,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._service_name, replica_id,
             getattr(self, '_resource_scope', None))
 
-        def _download_and_stream_logs(info: ReplicaInfo):
+        def _download_and_stream_logs(
+                info: ReplicaInfo,
+                phase_admission: provider_phase.ProviderPhaseAdmission) -> None:
             launch_log_file_name = (
                 serve_utils.generate_replica_launch_log_file_name(
                     self._service_name, replica_id,
@@ -6192,7 +6444,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             handle = global_user_state.get_handle_from_cluster_name(
                 info.cluster_name)
             provider_fence = reserved_capacity.protocol_v2_provider_fence(
-                info, handle)
+                info,
+                handle,
+                phase_admission=phase_admission,
+                wait_for_initializer=False)
             if handle is None:
                 logger.error(f'Cannot find cluster {info.cluster_name} for '
                              f'replica {replica_id} in the cluster table. '
@@ -6308,13 +6563,19 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         if sync_down_logs:
             try:
-                provider_fence: contextlib.AbstractContextManager[None] = (
-                    contextlib.nullcontext() if cleanup_fence is None else
-                    kubernetes_adaptor.physical_cluster_uid_fence(
-                        cleanup_fence.kubernetes_context,
-                        cleanup_fence.physical_cluster_uid))
-                with provider_fence:
-                    _download_and_stream_logs(info)
+                mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                        if cleanup_fence is None else
+                        provider_phase.ProviderPhaseMode.V2_FENCED)
+                with provider_phase.try_provider_phase(mode) as admission:
+                    _download_and_stream_logs(info, admission)
+            except (exceptions.ProviderPhaseBusyError,
+                    exceptions.KubernetesPhysicalClusterFenceBusyError):
+                # Log sync is best-effort. A locked refresher never waits for a
+                # phase or physical initializer and cleanup remains independently
+                # retryable under the down worker's blocking fence.
+                logger.info(
+                    f'Deferring log sync for replica {replica_id}: provider '
+                    'authority is busy; continuing with fenced cleanup.')
             except exceptions.KubernetesPhysicalClusterIdentityError:
                 # Log sync is credential delivery through KubernetesCommandRunner.
                 # Never downgrade an identity mismatch to the historical
@@ -6372,13 +6633,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # Live endpoint resolution (one DB/provider lookup); a
                 # failure must never block the teardown -- it only costs
                 # the early-exit (bounded sleep to the deadline instead).
-                provider_fence = (contextlib.nullcontext()
-                                  if cleanup_fence is None else
-                                  kubernetes_adaptor.physical_cluster_uid_fence(
-                                      cleanup_fence.kubernetes_context,
-                                      cleanup_fence.physical_cluster_uid))
-                with provider_fence:
-                    replica_url = info.url
+                mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                        if cleanup_fence is None else
+                        provider_phase.ProviderPhaseMode.V2_FENCED)
+                with provider_phase.try_provider_phase(mode) as admission:
+                    replica_url = self._resolve_probe_urls(
+                        [info], phase_admission=admission).get(replica_id)
+            except (exceptions.ProviderPhaseBusyError,
+                    exceptions.KubernetesPhysicalClusterFenceBusyError):
+                # URL evidence only shortens a bounded drain. Never wait while
+                # holding self.lock and never turn contention into absence.
+                replica_url = None
             except exceptions.KubernetesPhysicalClusterIdentityError:
                 self._record_cleanup_uncertain(
                     info, 'the physical Kubernetes identity could not be '
@@ -6418,7 +6683,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         legacy_runtime = self._legacy_mutation_runtime_state()
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
-        for info in replica_infos:
+        for info in sorted(replica_infos, key=_provider_cleanup_phase_order):
             down_failed = (info.status_property.sky_down_status ==
                            common_utils.ProcessStatus.FAILED)
             retry_pending = info.replica_id in retry_at_by_replica
@@ -6550,7 +6815,26 @@ class SkyPilotReplicaManager(ReplicaManager):
         tracker = None
         if replica_url is _REPLICA_URL_NOT_PROVIDED:
             try:
-                replica_url = info.url
+                cleanup_fence = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                        if cleanup_fence is None else
+                        provider_phase.ProviderPhaseMode.V2_FENCED)
+                deferred_ids: set[int] = set()
+                with provider_phase.try_provider_phase(mode) as admission:
+                    replica_url = self._resolve_probe_urls(
+                        [info],
+                        phase_admission=admission,
+                        deferred_replica_ids=deferred_ids).get(info.replica_id)
+                if info.replica_id in deferred_ids:
+                    self._wait_for_idle_trackers[info.replica_id] = (None,
+                                                                     deadline)
+                    return
+            except exceptions.ProviderPhaseBusyError:
+                # Registration remains retryable; contention is not endpoint
+                # absence or physical-identity evidence.
+                self._wait_for_idle_trackers[info.replica_id] = (None, deadline)
+                return
             except exceptions.KubernetesPhysicalClusterIdentityError as error:
                 self._record_provider_identity_uncertain(
                     info, 'the physical Kubernetes identity could not be '
@@ -7487,17 +7771,66 @@ class SkyPilotReplicaManager(ReplicaManager):
             if (tracker is None and replica_id in tracked_infos and
                 tracked_infos[replica_id].cluster_name in cluster_status_fields)
         ]
-        retry_urls = (self._resolve_probe_urls(retry_url_infos)
-                      if retry_url_infos else {})
+        retry_urls: dict[int, str | None] = {}
+        deferred_url_ids: set[int] = set()
+        fenced_retry_infos: list[ReplicaInfo] = []
+        ordinary_retry_infos: list[ReplicaInfo] = []
+        for info in retry_url_infos:
+            try:
+                cleanup_fence = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+            except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                self._record_provider_identity_uncertain(
+                    info, 'strict-drain endpoint identity is malformed: '
+                    f'{common_utils.format_exception(error)}')
+                deferred_url_ids.add(info.replica_id)
+                continue
+            if cleanup_fence is None:
+                ordinary_retry_infos.append(info)
+            else:
+                fenced_retry_infos.append(info)
+
+        def _try_resolve_urls(partition: list[ReplicaInfo],
+                              mode: provider_phase.ProviderPhaseMode) -> None:
+            if not partition:
+                return
+            try:
+                with provider_phase.try_provider_phase(mode) as admission:
+                    retry_urls.update(
+                        self._resolve_probe_urls(
+                            partition,
+                            phase_admission=admission,
+                            deferred_replica_ids=deferred_url_ids))
+            except exceptions.ProviderPhaseBusyError:
+                deferred_url_ids.update(info.replica_id for info in partition)
+
+        # Resolve and reduce the complete fenced subset before attempting any
+        # ambient work. A raw tracker order of ordinary then v2 must not let an
+        # ordinary URL lookup or teardown run before a later fenced owner.
+        _try_resolve_urls(fenced_retry_infos,
+                          provider_phase.ProviderPhaseMode.V2_FENCED)
+        tracker_items.sort(key=lambda item: (_provider_cleanup_phase_order(
+            tracked_infos[item[0]]) if item[0] in tracked_infos else 0))
+        ordinary_urls_resolved = False
         for replica_id, tracked in tracker_items:
             tracker, deadline = tracked
             info = tracked_infos.get(replica_id)
             if info is None:
                 continue
+            if (_provider_cleanup_phase_order(info) == 1 and
+                    not ordinary_urls_resolved):
+                ordinary_urls_resolved = True
+                _try_resolve_urls(
+                    ordinary_retry_infos,
+                    provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
             if info.cluster_name not in cluster_status_fields:
                 drained = True
             else:
                 if tracker is None:
+                    if replica_id in deferred_url_ids:
+                        # A busy phase/initializer contributes no endpoint or
+                        # drain evidence and leaves the tracker untouched.
+                        continue
                     # Endpoint discovery can fail transiently during recovery.
                     self._wait_for_idle_trackers.pop(replica_id, None)
                     self._register_wait_for_idle(
@@ -7815,6 +8148,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
             accepted = 0
             absent_finished_launch_infos: list[ReplicaInfo] = []
+            immediate_teardown_infos: list[ReplicaInfo] = []
             logical_drain_infos: list[ReplicaInfo] = []
             seen_ids: set[int] = set()
             for replica_id in replica_ids:
@@ -7847,11 +8181,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if replica_id in bulk_absent_replica_ids:
                         absent_finished_launch_infos.append(info)
                     else:
-                        self._terminate_replica(replica_id,
-                                                sync_down_logs=False,
-                                                replica_drain_delay_seconds=0,
-                                                is_scale_down=True,
-                                                in_flight_drain_cap_seconds=0)
+                        immediate_teardown_infos.append(info)
                 else:
                     if (replica_id in snapshot.unknown_replica_ids or
                             snapshot.in_flight_by_replica_id.get(replica_id)
@@ -7874,9 +8204,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                         continue
                     logical_drain_infos.append(info)
 
-                # Only mutate the in-memory proof after durable acceptance.
-                # If persistence raises, the exception aborts the remainder and
-                # the next autoscaler tick retries under a fresh fence.
+                # Mutate the in-memory proof only after accepting this victim
+                # into the provider-free wave. Cleanup scheduling below is
+                # v2-first; if it raises, the remainder aborts and the next
+                # autoscaler tick retries under a fresh fence.
                 committed_capacity -= committed_width
                 ready_capacity -= ready_width
                 if card is not None:
@@ -7889,38 +8220,82 @@ class SkyPilotReplicaManager(ReplicaManager):
             # per-victim UID proof. A failed group remains durably off-route
             # and retries identity; it never commits teardown through a
             # replacement alias.
-            if logical_drain_infos:
-                ordinary_drain_infos: list[ReplicaInfo] = []
-                identity_fenced_drain_infos: list[ReplicaInfo] = []
-                for info in logical_drain_infos:
-                    try:
-                        cleanup_fence = (reserved_capacity.
-                                         parse_protocol_v2_cleanup_fence(info))
-                    except exceptions.KubernetesPhysicalClusterIdentityError:
-                        # Let the grouped resolver retain malformed authority
-                        # as provider uncertainty without a teardown attempt.
-                        identity_fenced_drain_infos.append(info)
+            ordinary_immediate_infos: list[ReplicaInfo] = []
+            identity_fenced_immediate_infos: list[ReplicaInfo] = []
+            ordinary_drain_infos: list[ReplicaInfo] = []
+            identity_fenced_drain_infos: list[ReplicaInfo] = []
+            for info in immediate_teardown_infos:
+                destination = (identity_fenced_immediate_infos
+                               if _provider_cleanup_phase_order(info) == 0 else
+                               ordinary_immediate_infos)
+                destination.append(info)
+            for info in logical_drain_infos:
+                destination = (identity_fenced_drain_infos
+                               if _provider_cleanup_phase_order(info) == 0 else
+                               ordinary_drain_infos)
+                destination.append(info)
+
+            # Every provider-bearing v2 action in the accepted wave completes
+            # before the first ambient action, including never-served victims
+            # that skip endpoint draining altogether.
+            for info in identity_fenced_immediate_infos:
+                self._terminate_replica(info.replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+            if identity_fenced_drain_infos:
+                deferred_drain_ids: set[int] = set()
+                try:
+                    with provider_phase.try_provider_phase(
+                            provider_phase.ProviderPhaseMode.V2_FENCED
+                    ) as admission:
+                        logical_drain_urls = self._resolve_probe_urls(
+                            identity_fenced_drain_infos,
+                            phase_admission=admission,
+                            deferred_replica_ids=deferred_drain_ids)
+                except exceptions.ProviderPhaseBusyError:
+                    logical_drain_urls = {}
+                    deferred_drain_ids.update(
+                        info.replica_id for info in identity_fenced_drain_infos)
+                for info in identity_fenced_drain_infos:
+                    if info.replica_id in deferred_drain_ids:
                         continue
-                    if cleanup_fence is None:
-                        ordinary_drain_infos.append(info)
-                    else:
-                        identity_fenced_drain_infos.append(info)
-                for info in ordinary_drain_infos:
                     self._defer_scale_down_until_idle(
                         info.replica_id,
                         logical_retirement=(version, reconcile_generation,
                                             target_capacity),
-                        replica_info=info)
-                if identity_fenced_drain_infos:
-                    logical_drain_urls = self._resolve_probe_urls(
-                        identity_fenced_drain_infos)
-                    for info in identity_fenced_drain_infos:
+                        replica_info=info,
+                        replica_url=logical_drain_urls.get(info.replica_id))
+
+            for info in ordinary_immediate_infos:
+                self._terminate_replica(info.replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+            # Genuine ordinary rows may use ambient authority only after every
+            # v2 physical owner above has retired. Keep the endpoint wave in
+            # one try-admitted ambient phase so a waiting v2 caller cannot
+            # interleave between individual victims.
+            if ordinary_drain_infos:
+                try:
+                    with provider_phase.try_provider_phase(
+                            provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                    ) as admission:
+                        ordinary_drain_urls_by_id = self._resolve_probe_urls(
+                            ordinary_drain_infos, phase_admission=admission)
+                except exceptions.ProviderPhaseBusyError:
+                    ordinary_drain_urls_by_id = None
+                if ordinary_drain_urls_by_id is not None:
+                    for info in ordinary_drain_infos:
                         self._defer_scale_down_until_idle(
                             info.replica_id,
                             logical_retirement=(version, reconcile_generation,
                                                 target_capacity),
                             replica_info=info,
-                            replica_url=logical_drain_urls.get(info.replica_id))
+                            replica_url=ordinary_drain_urls_by_id.get(
+                                info.replica_id))
 
             if absent_finished_launch_infos:
                 self._remove_replicas(absent_finished_launch_infos)
@@ -7956,7 +8331,12 @@ class SkyPilotReplicaManager(ReplicaManager):
     _PREEMPTION_PREFILTER_PARALLELISM = 16
     _PROBE_ROUND_MAX_PARALLELISM = 256
 
-    def _cloud_instance_looks_alive(self, info: ReplicaInfo) -> bool | None:
+    def _cloud_instance_looks_alive(
+        self,
+        info: ReplicaInfo,
+        *,
+        phase_admission: provider_phase.ProviderPhaseAdmission | None = None,
+    ) -> bool | None:
         """Whether the cloud still reports this replica's instance(s) as UP.
 
         Cloud-API-only (one provider call, no SSH probe, no status lock, no
@@ -7984,7 +8364,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             handle = global_user_state.get_handle_from_cluster_name(
                 info.cluster_name)
             provider_fence = reserved_capacity.protocol_v2_provider_fence(
-                info, handle)
+                info,
+                handle,
+                phase_admission=phase_admission,
+                wait_for_initializer=phase_admission is None)
             if handle is None:
                 return False
             assert isinstance(handle, backends.CloudVmRayResourceHandle)
@@ -8470,6 +8853,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._persist_spot_placement_state_if_dirty()
 
         completed_launches: list[tuple[int, ReplicaInfo, bool]] = []
+        superseded_launch_infos: list[tuple[int, ReplicaInfo]] = []
         capacity_launch_failures: set[int] = set()
         quota_launch_failures: set[int] = set()
         for replica_id, t in finished_launches:
@@ -8479,16 +8863,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 pending_launches.append((replica_id, t, info))
                 continue
             if replica_id in superseded_launches:
-                rejection = getattr(t, 'exception', None)
-                logger.info(
-                    f'Cleaning up replica {replica_id}: its cloud launch '
-                    'authority was superseded before the next cloud mutation '
-                    f'({rejection}).')
-                self._terminate_replica(replica_id,
-                                        sync_down_logs=False,
-                                        replica_drain_delay_seconds=0,
-                                        is_scale_down=True,
-                                        in_flight_drain_cap_seconds=0)
+                superseded_launch_infos.append((replica_id, info))
                 continue
             # sky.launch finished
             # TODO(tian): Try-catch in thread, and have an enum return
@@ -8595,7 +8970,37 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                None)
                 if reconciliation_event is not None:
                     reconciliation_event.set()
-        for replica_id, info, error_in_sky_launch in completed_launches:
+
+        # Retire v2 failures before any ordinary log/drain provider work. The
+        # worker remains registered until its row outcome has been persisted;
+        # _terminate_replica consumes try-only phase contention and always
+        # preserves independently retryable cleanup ownership.
+        cleanup_launches = [
+            (replica_id, info, error_in_sky_launch, False)
+            for replica_id, info, error_in_sky_launch in completed_launches
+        ]
+        cleanup_launches.extend((replica_id, info, False, True)
+                                for replica_id, info in superseded_launch_infos)
+        for replica_id, info, error_in_sky_launch, superseded in sorted(
+                cleanup_launches,
+                key=lambda item: _provider_cleanup_phase_order(item[1])):
+            if superseded:
+                launch_thread = legacy_runtime.launch_thread_pool[replica_id]
+                rejection = getattr(launch_thread, 'exception', None)
+                logger.info(
+                    f'Cleaning up replica {replica_id}: its cloud launch '
+                    'authority was superseded before the next cloud mutation '
+                    f'({rejection}).')
+                # Keep the completed worker registered until termination so
+                # _terminate_replica durably marks the interrupted launch and
+                # clears all of its launch bookkeeping atomically with the
+                # teardown intent.
+                self._terminate_replica(replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+                continue
             legacy_runtime.launch_thread_pool.pop(replica_id)
             legacy_runtime.replica_to_request_id.pop(replica_id)
             legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
@@ -9227,8 +9632,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         # sdk.job_status. The backend object is stateless; construct it
         # once for the whole walk.
         backend = backends.CloudVmRayBackend()
-        to_fetch: list[tuple[ReplicaInfo, Any, list[int] | None, bool]] = []
-        invalid_recovery_ids: list[int] = []
+        ordinary_fetches: list[tuple[ReplicaInfo, Any, list[int] | None,
+                                     bool]] = []
+        fenced_fetches: list[tuple[ReplicaInfo, Any, list[int] | None,
+                                   bool]] = []
+        invalid_recovery_ids: dict[
+            provider_phase.ProviderPhaseMode, list[int]] = {
+                provider_phase.ProviderPhaseMode.V2_FENCED: [],
+                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY: [],
+            }
         identity_uncertainties: list[tuple[int, str]] = []
         fence_representatives: dict[tuple[str, str], tuple[ReplicaInfo,
                                                            Any]] = {}
@@ -9259,8 +9671,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if (not self._is_pool and info.system_recovery_disposition in
                     (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
                      system_recovery_state.SystemRecoveryDisposition.CAPABLE)):
-                    invalid_recovery_ids.append(info.replica_id)
+                    mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                            if cleanup_fence is None else
+                            provider_phase.ProviderPhaseMode.V2_FENCED)
+                    invalid_recovery_ids[mode].append(info.replica_id)
                 continue
+            if cleanup_fence is not None:
+                # Register every valid-handle v2 row before validating its job
+                # association. Invalid recovery rows may still sync logs and
+                # schedule teardown, so their reduction needs the same batch
+                # physical owner as a normal status result.
+                key = (cleanup_fence.kubernetes_context,
+                       cleanup_fence.physical_cluster_uid)
+                fence_representatives.setdefault(key, (info, handle))
+                fence_group_replica_ids.setdefault(key,
+                                                   set()).add(info.replica_id)
             with_recovery = (
                 not self._is_pool and info.system_recovery_disposition
                 in (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
@@ -9270,18 +9695,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if (isinstance(service_job_id, bool) or
                         not isinstance(service_job_id, int) or
                         service_job_id < 1):
-                    invalid_recovery_ids.append(info.replica_id)
+                    mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                            if cleanup_fence is None else
+                            provider_phase.ProviderPhaseMode.V2_FENCED)
+                    invalid_recovery_ids[mode].append(info.replica_id)
                     continue
                 job_ids: list[int] | None = [service_job_id]
             else:
                 job_ids = [1] if self._is_pool else None
-            to_fetch.append((info, handle, job_ids, with_recovery))
+            fetch = (info, handle, job_ids, with_recovery)
             if cleanup_fence is not None:
-                key = (cleanup_fence.kubernetes_context,
-                       cleanup_fence.physical_cluster_uid)
-                fence_representatives.setdefault(key, (info, handle))
-                fence_group_replica_ids.setdefault(key,
-                                                   set()).add(info.replica_id)
+                fenced_fetches.append(fetch)
+            else:
+                ordinary_fetches.append(fetch)
         for replica_id, message in identity_uncertainties:
             with self.lock:
                 fresh = serve_state.get_replica_info_from_id(
@@ -9292,27 +9718,33 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 self._record_provider_identity_uncertain(
                     fresh, f'job-status lookup was fenced off: {message}')
-        for replica_id in invalid_recovery_ids:
-            with self.lock:
-                fresh = serve_state.get_replica_info_from_id(
-                    self._service_name, replica_id)
-                if (fresh is None or
-                        not fresh.status_property.should_track_service_status()
-                        or fresh.system_recovery_disposition not in
-                    (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
-                     system_recovery_state.SystemRecoveryDisposition.CAPABLE)):
-                    continue
-                logger.warning(
-                    f'Recovery candidate/capable replica {replica_id} lacks '
-                    'its exact cluster handle or service job association.')
-                self._terminate_replica(replica_id,
-                                        sync_down_logs=True,
-                                        replica_drain_delay_seconds=0)
 
-        def _get_job_status(info, handle, job_ids, with_recovery):
+        def _terminate_invalid_recovery_rows(replica_ids: list[int]) -> None:
+            for replica_id in replica_ids:
+                with self.lock:
+                    fresh = serve_state.get_replica_info_from_id(
+                        self._service_name, replica_id)
+                    if (fresh is None or not fresh.status_property.
+                            should_track_service_status() or
+                            fresh.system_recovery_disposition
+                            not in (system_recovery_state.
+                                    SystemRecoveryDisposition.CANDIDATE,
+                                    system_recovery_state.
+                                    SystemRecoveryDisposition.CAPABLE)):
+                        continue
+                    logger.warning(
+                        f'Recovery candidate/capable replica {replica_id} lacks '
+                        'its exact cluster handle or service job association.')
+                    self._terminate_replica(replica_id,
+                                            sync_down_logs=True,
+                                            replica_drain_delay_seconds=0)
+
+        def _get_job_status(info, handle, job_ids, with_recovery,
+                            phase_admission):
             # SSH into the replica's head node -- intentionally OUTSIDE
             # self.lock so an unreachable replica cannot wedge the round.
-            with reserved_capacity.protocol_v2_provider_fence(info, handle):
+            with reserved_capacity.protocol_v2_provider_fence(
+                    info, handle, phase_admission=phase_admission):
                 if with_recovery:
                     return backend.get_job_status_with_system_recovery(
                         handle, job_ids, stream_logs=False)
@@ -9320,45 +9752,75 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                job_ids,
                                                stream_logs=False), {}, {})
 
-        with reserved_capacity.protocol_v2_provider_batch_fences(
-                fence_representatives) as fence_failures:
-            failed_replica_ids: set[int] = set()
-            for key, error in fence_failures.items():
-                if not isinstance(
-                        error,
-                        exceptions.KubernetesPhysicalClusterIdentityError):
-                    raise error
-                failed_replica_ids.update(fence_group_replica_ids[key])
-                for replica_id in fence_group_replica_ids[key]:
-                    with self.lock:
-                        fresh = serve_state.get_replica_info_from_id(
-                            self._service_name, replica_id)
-                        if (fresh is None or not fresh.status_property.
-                                should_track_service_status()):
-                            continue
-                        self._record_provider_identity_uncertain(
-                            fresh, 'job-status batch identity was fenced off: '
-                            f'{common_utils.format_exception(error)}')
-            admitted_fetches = [
-                item for item in to_fetch
-                if item[0].replica_id not in failed_replica_ids
-            ]
-            if not admitted_fetches:
+        def _run_fetches(
+            fetches: list[tuple[ReplicaInfo, Any, list[int] | None, bool]],
+            phase_admission: provider_phase.ProviderPhaseAdmission,
+        ) -> None:
+            if not fetches:
                 return
-            # The fetches are pure I/O; run them in parallel so one hung SSH
-            # (preempted spot) delays only its own replica's result, not the
-            # whole fleet's failure detection. The batch owners remain active
-            # until every nested per-operation fence has completed.
-            num_fetch_threads = min(len(admitted_fetches),
+            # The fetches are pure I/O and explicitly join the caller's phase.
+            # Result classification stays inside that phase as it may perform
+            # preemption refresh, log sync, or teardown provider work.
+            num_fetch_threads = min(len(fetches),
                                     self._PROBE_ROUND_MAX_PARALLELISM)
             with mp_pool.ThreadPool(num_fetch_threads) as pool:
                 fetch_results = [
                     (info,
                      pool.apply_async(_get_job_status,
-                                      (info, handle, job_ids, with_recovery)))
-                    for info, handle, job_ids, with_recovery in admitted_fetches
+                                      (info, handle, job_ids, with_recovery,
+                                       phase_admission)))
+                    for info, handle, job_ids, with_recovery in fetches
                 ]
                 self._handle_job_status_results(fetch_results)
+
+        fenced_invalid_ids = invalid_recovery_ids[
+            provider_phase.ProviderPhaseMode.V2_FENCED]
+        if fenced_fetches or fenced_invalid_ids:
+            # Blocking admission is outside self.lock, so one unreachable SSH
+            # worker does not block probe/refresher admission on the manager
+            # mutex. Every v2 result is fully reduced before owners retire.
+            with provider_phase.provider_phase(provider_phase.ProviderPhaseMode.
+                                               V2_FENCED) as phase_admission:
+                with reserved_capacity.protocol_v2_provider_batch_fences(
+                        fence_representatives,
+                        phase_admission=phase_admission) as fence_failures:
+                    failed_replica_ids: set[int] = set()
+                    for key, error in fence_failures.items():
+                        if not isinstance(
+                                error, exceptions.
+                                KubernetesPhysicalClusterIdentityError):
+                            raise error
+                        failed_replica_ids.update(fence_group_replica_ids[key])
+                        for replica_id in fence_group_replica_ids[key]:
+                            with self.lock:
+                                fresh = serve_state.get_replica_info_from_id(
+                                    self._service_name, replica_id)
+                                if (fresh is None or not fresh.status_property.
+                                        should_track_service_status()):
+                                    continue
+                                self._record_provider_identity_uncertain(
+                                    fresh,
+                                    'job-status batch identity was fenced off: '
+                                    f'{common_utils.format_exception(error)}')
+                    _terminate_invalid_recovery_rows([
+                        replica_id for replica_id in fenced_invalid_ids
+                        if replica_id not in failed_replica_ids
+                    ])
+                    admitted_fetches = [
+                        item for item in fenced_fetches
+                        if item[0].replica_id not in failed_replica_ids
+                    ]
+                    _run_fetches(admitted_fetches, phase_admission)
+
+        ordinary_invalid_ids = invalid_recovery_ids[
+            provider_phase.ProviderPhaseMode.AMBIENT_LEGACY]
+        if ordinary_fetches or ordinary_invalid_ids:
+            # Genuine ordinary rows run only after all physical owners retire.
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+            ) as phase_admission:
+                _terminate_invalid_recovery_rows(ordinary_invalid_ids)
+                _run_fetches(ordinary_fetches, phase_admission)
 
     def _handle_job_status_results(
             self, fetch_results: list[tuple[ReplicaInfo, Any]]) -> None:
@@ -9497,8 +9959,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             if self._ownership_lost.wait(_JOB_STATUS_FETCH_INTERVAL):
                 return
 
-    def _resolve_probe_urls(self,
-                            infos: list[ReplicaInfo]) -> dict[int, str | None]:
+    def _resolve_probe_urls(
+        self,
+        infos: list[ReplicaInfo],
+        *,
+        phase_admission: provider_phase.ProviderPhaseAdmission | None = None,
+        deferred_replica_ids: set[int] | None = None,
+    ) -> dict[int, str | None]:
         """Resolve one endpoint per replica from batched cluster state.
 
         Endpoint resolution normally loads permissions and one cluster record
@@ -9560,6 +10027,27 @@ class SkyPilotReplicaManager(ReplicaManager):
             group_key = (cleanup_fence.kubernetes_context,
                          cleanup_fence.physical_cluster_uid)
             fenced_groups.setdefault(group_key, []).append(info)
+
+        uids_by_context: dict[str, set[str]] = {}
+        for kube_context, physical_cluster_uid in fenced_groups:
+            uids_by_context.setdefault(kube_context,
+                                       set()).add(physical_cluster_uid)
+        conflicting_contexts = {
+            kube_context
+            for kube_context, physical_uids in uids_by_context.items()
+            if len(physical_uids) > 1
+        }
+        if conflicting_contexts:
+            conflict_error = (exceptions.KubernetesPhysicalClusterIdentityError(
+                'One Kubernetes context has conflicting physical-cluster '
+                'UIDs in the same endpoint-resolution batch.'))
+            for key in list(fenced_groups):
+                if key[0] not in conflicting_contexts:
+                    continue
+                group_infos = fenced_groups.pop(key)
+                for info in group_infos:
+                    handles.pop(info.replica_id, None)
+                    _retain_identity_uncertainty(info, conflict_error)
         provider_configs = serve_utils.get_provider_configs_for_handles(handles)
 
         def _resolve(info: ReplicaInfo) -> None:
@@ -9576,18 +10064,63 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._provider_identity_uncertain_replica_ids().discard(
                 info.replica_id)
 
-        for info in ordinary_infos:
-            _resolve(info)
-        for group_infos in fenced_groups.values():
-            representative = group_infos[0]
-            try:
-                with reserved_capacity.protocol_v2_provider_fence(
-                        representative, handles[representative.replica_id]):
+        def _resolve_fenced_groups(
+                admission: provider_phase.ProviderPhaseAdmission, *,
+                wait_for_initializer: bool) -> None:
+            for group_infos in fenced_groups.values():
+                representative = group_infos[0]
+                try:
+                    with reserved_capacity.protocol_v2_provider_fence(
+                            representative,
+                            handles[representative.replica_id],
+                            phase_admission=admission,
+                            wait_for_initializer=wait_for_initializer):
+                        for info in group_infos:
+                            _resolve(info)
+                except exceptions.KubernetesPhysicalClusterFenceBusyError:
+                    # Locked callers must treat initializer contention as a
+                    # zero-evidence deferral, not physical uncertainty.
+                    if deferred_replica_ids is not None:
+                        deferred_replica_ids.update(
+                            info.replica_id for info in group_infos)
+                    continue
+                except exceptions.KubernetesPhysicalClusterIdentityError as error:
                     for info in group_infos:
-                        _resolve(info)
-            except exceptions.KubernetesPhysicalClusterIdentityError as error:
-                for info in group_infos:
-                    _retain_identity_uncertainty(info, error)
+                        _retain_identity_uncertainty(info, error)
+
+        def _resolve_ordinary(
+                admission: provider_phase.ProviderPhaseAdmission) -> None:
+            for info in ordinary_infos:
+                # Joining here also covers provider-bearing URL resolution for
+                # ordinary rows without inventing a physical identity.
+                with reserved_capacity.protocol_v2_provider_fence(
+                        info,
+                        handles.get(info.replica_id),
+                        phase_admission=admission):
+                    _resolve(info)
+
+        if phase_admission is not None:
+            if fenced_groups:
+                if ordinary_infos:
+                    raise exceptions.ProviderPhaseMisuseError(
+                        'A joined URL-resolution partition must be homogeneous.'
+                    )
+                _resolve_fenced_groups(phase_admission,
+                                       wait_for_initializer=False)
+            elif ordinary_infos:
+                _resolve_ordinary(phase_admission)
+            return urls
+
+        # Standalone active-URL reads establish the process phase themselves,
+        # always completing exact v2 groups before ambient rows.
+        if fenced_groups:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
+                _resolve_fenced_groups(admission, wait_for_initializer=True)
+        if ordinary_infos:
+            with provider_phase.provider_phase(provider_phase.ProviderPhaseMode.
+                                               AMBIENT_LEGACY) as admission:
+                _resolve_ordinary(admission)
         return urls
 
     def _reduce_candidate_probe(
@@ -9771,6 +10304,20 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _probe_all_replicas(self) -> list[ReplicaInfo]:
         """Run one probe round under one physical UID proof per pool."""
         infos = serve_state.get_replica_infos(self._service_name)
+        # Provider-free per-tick state is prepared exactly once even though the
+        # provider-bearing work below is split into two authority phases.
+        self._tick_version_spec_cache = {}
+        self._prune_system_recovery_process_guards(infos)
+        self._route_lease_registry().prune({
+            info.replica_id: info.replica_record_id
+            for info in infos
+            if (info.system_recovery_quarantine is None and
+                info.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE and
+                info.system_recovery is not None and info.system_recovery.state
+                != system_recovery_state.ControllerRecoveryState.EXHAUSTED and
+                not self._has_system_recovery_teardown_intent(info))
+        })
         tracked_infos = [
             info for info in infos
             if info.status_property.should_track_service_status()
@@ -9779,6 +10326,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             [info.cluster_name for info in tracked_infos])
         representatives: dict[tuple[str, str], tuple[ReplicaInfo, Any]] = {}
         grouped_infos: dict[tuple[str, str], list[ReplicaInfo]] = {}
+        ordinary_infos: list[ReplicaInfo] = []
         for info in tracked_infos:
             try:
                 cleanup_fence = (
@@ -9786,6 +10334,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if cleanup_fence is None:
                     self._provider_identity_uncertain_replica_ids().discard(
                         info.replica_id)
+                    ordinary_infos.append(info)
                     continue
                 cluster_record = cluster_records.get(info.cluster_name)
                 handle = (cluster_record.get('handle') if isinstance(
@@ -9803,27 +10352,95 @@ class SkyPilotReplicaManager(ReplicaManager):
             representatives.setdefault(key, (info, handle))
             grouped_infos.setdefault(key, []).append(info)
 
-        with reserved_capacity.protocol_v2_provider_batch_fences(
-                representatives) as fence_failures:
-            for key, error in fence_failures.items():
-                if not isinstance(
-                        error,
-                        exceptions.KubernetesPhysicalClusterIdentityError):
-                    raise error
-                for info in grouped_infos[key]:
-                    self._record_provider_identity_uncertain(
-                        info, 'probe-round physical identity was fenced off: '
-                        f'{common_utils.format_exception(error)}')
-            for key, group_infos in grouped_infos.items():
-                if key in fence_failures:
-                    continue
-                for info in group_infos:
-                    self._provider_identity_uncertain_replica_ids().discard(
-                        info.replica_id)
-            return self._probe_all_replicas_with_snapshot(infos)
+        fenced_infos = [
+            info for group_infos in grouped_infos.values()
+            for info in group_infos
+        ]
+        phased_snapshots: list[ReplicaInfo] = []
+        participated_replica_ids: set[int] = set()
+        if fenced_infos:
+            try:
+                with provider_phase.try_provider_phase(
+                        provider_phase.ProviderPhaseMode.V2_FENCED
+                ) as phase_admission:
+                    with reserved_capacity.protocol_v2_provider_batch_fences(
+                            representatives,
+                            phase_admission=phase_admission,
+                            wait_for_initializer=False) as fence_failures:
+                        failed_replica_ids: set[int] = set()
+                        for key, error in fence_failures.items():
+                            group = grouped_infos[key]
+                            failed_replica_ids.update(
+                                info.replica_id for info in group)
+                            if isinstance(
+                                    error, exceptions.
+                                    KubernetesPhysicalClusterFenceBusyError):
+                                # An existing initializer cannot be joined while
+                                # self.lock is held. Preserve every row and retry
+                                # the complete group next tick with no evidence.
+                                continue
+                            if not isinstance(
+                                    error, exceptions.
+                                    KubernetesPhysicalClusterIdentityError):
+                                raise error
+                            for info in group:
+                                self._record_provider_identity_uncertain(
+                                    info,
+                                    'probe-round physical identity was fenced '
+                                    'off: '
+                                    f'{common_utils.format_exception(error)}')
+                        admitted_infos = [
+                            info for info in fenced_infos
+                            if info.replica_id not in failed_replica_ids
+                        ]
+                        for info in admitted_infos:
+                            self._provider_identity_uncertain_replica_ids(
+                            ).discard(info.replica_id)
+                        if admitted_infos:
+                            phased_snapshots.extend(
+                                self._probe_all_replicas_with_snapshot(
+                                    admitted_infos,
+                                    phase_admission=phase_admission))
+                            participated_replica_ids.update(
+                                info.replica_id for info in admitted_infos)
+            except exceptions.ProviderPhaseBusyError:
+                pass
+
+        if ordinary_infos:
+            try:
+                # The continuous manager lock permits only a zero-time try.
+                # Ordinary work begins after every v2 owner above has retired.
+                with provider_phase.try_provider_phase(
+                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                ) as phase_admission:
+                    phased_snapshots.extend(
+                        self._probe_all_replicas_with_snapshot(
+                            ordinary_infos, phase_admission=phase_admission))
+                    participated_replica_ids.update(
+                        info.replica_id for info in ordinary_infos)
+            except exceptions.ProviderPhaseBusyError:
+                pass
+
+        snapshot_by_id = {info.replica_id: info for info in phased_snapshots}
+        snapshot: list[ReplicaInfo] = []
+        for info in infos:
+            if info.replica_id in participated_replica_ids:
+                refreshed = snapshot_by_id.get(info.replica_id)
+                # A participating row missing from its phase snapshot was
+                # durably removed by inline teardown.
+                if refreshed is not None:
+                    snapshot.append(refreshed)
+                continue
+            # Untracked, malformed, and admission-denied rows are unchanged.
+            snapshot.append(info)
+        return snapshot
 
     def _probe_all_replicas_with_snapshot(
-            self, infos: list[ReplicaInfo]) -> list[ReplicaInfo]:
+        self,
+        infos: list[ReplicaInfo],
+        *,
+        phase_admission: provider_phase.ProviderPhaseAdmission,
+    ) -> list[ReplicaInfo]:
         """Readiness probe replicas.
 
         This function will probe all replicas to make sure the service is
@@ -9838,22 +10455,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             re-read from the DB. Callers can derive the service status from
             it without re-deserializing the whole fleet.
         """
-        # Reset the per-tick spec memo so this probe round reads each version's
-        # spec from the DB at most once and never reuses a spec across ticks.
-        self._tick_version_spec_cache = {}
         probe_futures = []
         replica_to_probe = []
-        self._prune_system_recovery_process_guards(infos)
-        self._route_lease_registry().prune({
-            info.replica_id: info.replica_record_id
-            for info in infos
-            if (info.system_recovery_quarantine is None and
-                info.system_recovery_disposition ==
-                system_recovery_state.SystemRecoveryDisposition.CAPABLE and
-                info.system_recovery is not None and info.system_recovery.state
-                != system_recovery_state.ControllerRecoveryState.EXHAUSTED and
-                not self._has_system_recovery_teardown_intent(info))
-        })
         infos_to_probe = [
             info for info in infos
             if (info.status_property.should_track_service_status() and
@@ -9879,7 +10482,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 raise ValueError(
                     f'{version_label} {missing_versions_str} not found.')
             self._tick_version_spec_cache.update(specs)
-            probe_urls = self._resolve_probe_urls(infos_to_probe)
+            probe_urls = self._resolve_probe_urls(
+                infos_to_probe, phase_admission=phase_admission)
         else:
             probe_urls = {}
         candidate_status_inputs: list[tuple[ReplicaInfo, Any]] = []
@@ -10024,7 +10628,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                             job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
                 try:
                     with reserved_capacity.protocol_v2_provider_fence(
-                            info, handle):
+                            info,
+                            handle,
+                            phase_admission=phase_admission,
+                            wait_for_initializer=False):
                         status_payload = (recovery_backend.
                                           get_job_status_with_system_recovery(
                                               handle, [job_id],
@@ -10048,6 +10655,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                             job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
 
             def _probe_nonpool(
+                info: ReplicaInfo,
+                readiness_path: str,
+                post_data: dict[str, Any] | None,
+                timeout: int,
+                readiness_headers: dict[str, str] | None,
+                route_url: str | None,
+            ) -> tuple[ReplicaInfo, bool, float, float, tuple[
+                    job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
+                    None, job_lib.JobSystemRecoveryDetailStatus] | None, bool]:
+                with provider_phase.join_provider_phase(phase_admission):
+                    return _probe_nonpool_admitted(info, readiness_path,
+                                                   post_data, timeout,
+                                                   readiness_headers, route_url)
+
+            def _probe_nonpool_admitted(
                 info: ReplicaInfo,
                 readiness_path: str,
                 post_data: dict[str, Any] | None,
@@ -10133,7 +10755,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     None, job_lib.JobSystemRecoveryDetailStatus] | None, bool]:
                 request_started_at = time.monotonic()
                 try:
-                    result_info, succeeded, probe_time = info.probe_pool()
+                    result_info, succeeded, probe_time = info.probe_pool(
+                        provider_phase_admission=phase_admission)
                     self._provider_identity_uncertain_replica_ids().discard(
                         info.replica_id)
                 except exceptions.KubernetesPhysicalClusterIdentityError as error:
@@ -10201,7 +10824,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                         not isinstance(info.service_job_id, int) or
                         info.service_job_id < 1):
                     return None
-                with reserved_capacity.protocol_v2_provider_fence(info, handle):
+                with reserved_capacity.protocol_v2_provider_fence(
+                        info,
+                        handle,
+                        phase_admission=phase_admission,
+                        wait_for_initializer=False):
                     return (
                         recovery_backend.get_job_status_with_system_recovery(
                             handle, [info.service_job_id], stream_logs=False))
@@ -10320,7 +10947,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                   len(failed_interruptible_infos))
                 with mp_pool.ThreadPool(num_workers) as prefilter_pool:
                     alive_flags = prefilter_pool.map(
-                        self._cloud_instance_looks_alive,
+                        functools.partial(self._cloud_instance_looks_alive,
+                                          phase_admission=phase_admission),
                         failed_interruptible_infos)
                 for failed_info, alive in zip(failed_interruptible_infos,
                                               alive_flags):
