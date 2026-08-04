@@ -299,3 +299,40 @@ class TestPaidTierProbeThrottleIsCorrect:
         # onto a region that may still be dry.
         assert (placer._effective_status(aws_spot) ==
                 spot_placer.LocationStatus.PREEMPTED)
+
+
+class TestSelectionGateBoundsTheBatch:
+    """A fixed feed alone cannot refill: selection re-benches per launch.
+
+    `select_next_zero_cost_location` filters to effectively-ACTIVE zero-cost
+    locations and consumes the TTL probe on the way out, so the second fill
+    launch of the same wave already finds the location benched. The feed can
+    say 218; the batch that actually launches is one per location.
+    """
+
+    def test_a_218_slot_feed_yields_one_launch_per_location(self):
+        placer = _make_zero_cost_placer(benched_at=time.time() - 10_000)
+        placer.location2cost = {_K8S_A100_80GB: 0.0, _K8S_A100: 0.0}
+
+        selected = []
+        # One fill wave sized by a 218-slot feed.
+        for _ in range(218):
+            location = placer.select_next_zero_cost_location()
+            if location is None:
+                break
+            selected.append(location)
+
+        assert len(selected) == 2
+        assert set(selected) == {_K8S_A100_80GB, _K8S_A100}
+        # Everything after is refused for the rest of the TTL window.
+        assert placer.select_next_zero_cost_location() is None
+
+    def test_unbenched_locations_serve_the_whole_wave(self):
+        # Same wave against locations that were never benched: selection is
+        # unbounded, which is what the fill tier is supposed to do.
+        placer = _make_zero_cost_placer(benched_at=None)
+        placer.location2cost = {_K8S_A100_80GB: 0.0, _K8S_A100: 0.0}
+        selected = [
+            placer.select_next_zero_cost_location() for _ in range(218)
+        ]
+        assert all(location is not None for location in selected)

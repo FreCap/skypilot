@@ -19,6 +19,7 @@ standalone behavior exactly.
 import asyncio
 from collections.abc import Callable
 from collections.abc import Mapping
+from collections.abc import Sequence
 import contextlib
 import dataclasses
 import functools
@@ -1120,6 +1121,45 @@ def _placer_can_launch_zero_cost(placer: 'spot_placer_lib.SpotPlacer') -> bool:
     return any(location in active for location in placer.zero_cost_locations())
 
 
+def _record_pool_observation(
+    placer: 'spot_placer_lib.SpotPlacer',
+    locations: Sequence['spot_placer_lib.Location'],
+    observation: 'reserved_capacity_broker.PoolObservation | None',
+    observed_at: float,
+) -> None:
+    """Hand a round's measured free slots to the placer.
+
+    A reserved Kubernetes pool is counted every round, so a bench on it is
+    not standing in for missing information the way a spot region's is. Once
+    the placer holds the count it can keep the pool selectable instead of
+    rationing one probe per TTL window, which is what bounds refill after a
+    full-cluster preemption.
+
+    Prefers the exact per-accelerator split when the provider published one,
+    so a pool whose A100 shape is full and whose A100-80GB shape is free does
+    not advertise the full shape as available.
+    """
+    if observation is None or observation.free_slots is None:
+        # A failed query is a blackout, not a measurement of zero: leave the
+        # existing reading (and its own freshness clock) alone.
+        return
+    by_accelerator = getattr(observation, 'free_slots_by_accelerator', None)
+    free_by_name: dict[str, int] | None = None
+    if by_accelerator:
+        free_by_name = {
+            str(name).lower(): int(count) for name, count in by_accelerator
+        }
+    free_by_location: dict['spot_placer_lib.Location', int] = {}
+    for location in locations:
+        if free_by_name is None:
+            free_by_location[location] = int(observation.free_slots)
+            continue
+        accelerators = location.accelerators or {}
+        free_by_location[location] = sum(
+            free_by_name.get(str(name).lower(), 0) for name in accelerators)
+    placer.observe_zero_cost_capacity(free_by_location, observed_at)
+
+
 def _broker_cycle(
     autoscaler: 'autoscalers.Autoscaler',
     placer: 'spot_placer_lib.SpotPlacer',
@@ -1214,10 +1254,14 @@ def _broker_cycle(
         logger.info('Reserved-fill broker: claim rejected or controller '
                     f'stale for {service_name!r}; feeding 0 slots.')
         return
+
+    def _observe_pool() -> 'reserved_capacity_broker.PoolObservation':
+        observation = query_pool_group_observation(context, grouped_shapes)
+        _record_pool_observation(placer, zero_cost, observation, time.time())
+        return observation
+
     allocation = reserved_capacity_broker.run_round_if_stale(
-        service_name, pool_key,
-        lambda: query_pool_group_observation(context, grouped_shapes),
-        poll_interval_seconds())
+        service_name, pool_key, _observe_pool, poll_interval_seconds())
     if allocation is None:
         # No allocation this cycle (claim rejected/expired, round lock
         # timeout, or the fresh round predates our claim): feed zero free
@@ -1426,15 +1470,26 @@ def _broker_cycle_v2(
 
     snapshots: dict[str, dict[str, Any]] = {}
     for spec, budget in zip(specs, budgets):
+
+        def _observe_pool(
+            spec: FillPoolSpec = spec
+        ) -> 'reserved_capacity_broker.PoolObservation':
+            # Each pool's reading is recorded against that pool's own
+            # locations only, so a cluster with free capacity never marks a
+            # peer cluster launchable.
+            observation = query_pool_group_observation(
+                spec.context,
+                dict(spec.shapes),
+                expected_physical_cluster_uid=spec.physical_cluster_uid)
+            _record_pool_observation(placer, spec.locations, observation,
+                                     time.time())
+            return observation
+
         try:
             allocation = reserved_capacity_broker.run_round_if_stale(
                 service_name,
                 spec.pool_key,
-                functools.partial(
-                    query_pool_group_observation,
-                    spec.context,
-                    dict(spec.shapes),
-                    expected_physical_cluster_uid=(spec.physical_cluster_uid)),
+                _observe_pool,
                 poll_interval_seconds(),
                 expected_protocol_version=reserved_capacity_broker.PROTOCOL_V2,
                 expected_service_generation=generation)
