@@ -1149,7 +1149,7 @@ def _record_pool_observation(
         free_by_name = {
             str(name).lower(): int(count) for name, count in by_accelerator
         }
-    free_by_location: dict['spot_placer_lib.Location', int] = {}
+    free_by_location: dict[spot_placer_lib.Location, int] = {}
     for location in locations:
         if free_by_name is None:
             free_by_location[location] = int(observation.free_slots)
