@@ -135,23 +135,30 @@ identity. The protocol-v2 broker also runs its realtime availability listing
 inside a capture pinned to that edge's expected UID. A context retarget during
 measurement is therefore a blackout, never capacity evidence that can grant
 or drain holdings belonging to the prior physical cluster. Every fill launch
-first selects an exact carried location and then
-performs a forced UID refresh through that location's context before
-persistence. Its durable API launch context then carries seven fields: protocol,
-pool key, service generation, physical UID, Kubernetes context, and exact
-accelerator name/count. Presence of any one requires all seven, a complete
-normal Serve owner fence, and a controller-originated request. Protocol must
-be exact integer `2`; generation and count must be positive exact integers
-(not booleans); strings must be nonempty; and the parsed v2 pool key must
-encode the same UID and contain the canonical accelerator. API ingress rejects
-every partial, malformed, contradictory, or non-Serve tuple before scheduling
-a request. Absence of all seven is ordinary demand or protocol v1 and performs no
-physical-identity read. The tuple is copied into the immutable PostgreSQL
-request body and must survive request/executor restart without consulting
-controller memory. It is bound to the same service incarnation as the normal
-owner fence. Round epoch is intentionally absent: the epoch is consumed by the
-atomic `persist_fill_replica` transaction, after which that durable pending row
-is the reservation carried into launch.
+first selects an exact carried location, takes blocking `V2_FENCED` admission
+before the manager lock, and activates the exact `(context, UID)` physical
+capture. It retains both authorities through the atomic
+`persist_fill_replica` transaction and construction/freeze of the queued
+launch tuple and thread arguments, then releases them before starting or
+submitting the asynchronous launch thread; it never performs an ambient forced
+UID refresh. Its durable API launch context then carries seven fields:
+protocol, pool key, service generation, physical UID, Kubernetes context, and
+exact accelerator name/count. Presence of any one requires all seven, a
+complete normal Serve owner fence, and a controller-originated request.
+Protocol must be exact integer `2`; generation and count must be positive
+exact integers (not booleans); strings must be nonempty; and the parsed v2 pool
+key must encode the same UID and contain the canonical accelerator. API ingress
+rejects every partial, malformed, contradictory, or non-Serve tuple before
+scheduling a request. Absence of all seven is ordinary demand or protocol v1
+and performs no physical-identity read. The tuple is copied into the immutable
+PostgreSQL request body and must survive request/executor restart without
+consulting controller memory. API ingress independently validates and
+atomically commits the carried tuple to that immutable request body without
+relying on the earlier controller authority, and the executor reacquires phase
+and physical fence for each provider attempt. The tuple is bound to the same
+service incarnation as the normal owner fence. Round epoch is intentionally
+absent: the epoch is consumed by the atomic `persist_fill_replica` transaction,
+after which that durable pending row is the reservation carried into launch.
 
 After request recovery, admin policy, and optimization, the executor requires
 the final selected resources to retain the exact Kubernetes context and shape.
@@ -211,35 +218,102 @@ Malformed protocol-v2 rows remain identity-uncertain and are never downgraded
 into the legacy phase. One round continues to perform one UID proof per
 physical v2 pool.
 
-Each service controller owns one exclusive provider-reconciliation
-coordinator. Recovery, job-status reconciliation, complete readiness-probe
-rounds, load-balancer route synchronization and standalone active-URL reads,
-the launch/down mutation refresher, autoscaler scale-down and logical-drain
-reconciliation, route-prober-triggered teardown, and the provider portion of
-each deferred down worker all enroll in that coordinator. Any path that also
-needs the replica manager's state lock acquires the coordinator first and
-`self.lock` second. This order is invariant: a lock-holding reconciliation may
-not wait for an opposite provider phase while another reconciliation holds
-that phase and waits for `self.lock`.
+Each OS process that can issue provider work (API, controller, or executor)
+has a provider-phase gate with exact modes `V2_FENCED` and `AMBIENT_LEGACY`.
+Same-mode callers may overlap. Fresh callers
+receive FIFO tickets: after an opposite-mode ticket queues, later same-mode
+callers cannot barge, and the next maximal same-mode prefix becomes one cohort
+when the active cohort drains. A root admission may explicitly authorize
+already-planned child workers to join its exact process/PID/boot/epoch-bound
+cohort; an ordinary thread or copied/stale admission cannot. The root closes
+child admission before exit and already-admitted children drain first.
+Same-mode nesting on one thread is reentrant, cross-mode nesting is rejected,
+and cancellation or timeout removes the waiter and wakes the next turn. Every
+blocking acquisition has one 30-second absolute monotonic deadline and fails
+closed with a typed phase-timeout error. An `after_in_child` fork hook replaces
+the condition, queue, active phase, admissions, and thread-local state without
+touching a possibly inherited locked mutex. The composed physical-fence
+registry performs the same child reset for its lock, condition, active and
+initializer maps, failure generations, and `ContextVar`; it never unlinks a
+parent-owned captured kubeconfig from the child.
 
-The per-controller coordinator serializes complete mixed rounds; the
-process-global same-mode phase gate still prevents an enrolled v2 provider
-phase from overlapping an enrolled ordinary/tokenless phase in another
-controller or a no-manager worker. The v2 reserved-capacity poller enrolls its
-actual observation in that process phase before entering the broker's
-round-lock callback. It does not acquire the process phase while already
-holding the broker lock. Provider-bearing worker futures inherit their exact
-per-row lease explicitly and are fully joined before their round and phase are
-released. One batch owner proves each physical v2 pool once per phase.
+Blocking acquisition order is provider phase, `self.lock`, then lower-level
+resources, physical-UID-cache, and broker locks.
+There is one deliberate exception for the existing probe/refresher atomic
+read-modify-write cycles: while continuously holding `self.lock`, they may use
+only a zero-time `try_enter`. A try never queues, sleeps, joins an initializing
+physical fence, or barges past a queued opposite phase. Failure skips that
+provider sub-operation or partition immediately. It cannot publish readiness,
+absence, preemption, identity-mismatch, or cleanup evidence and is not recorded
+as physical-identity uncertainty; the unchanged row is retried next round.
 
-Coordinator ownership covers provider reconciliation, not unrelated latency.
-It is never held across a deferred drain sleep or across the asynchronous
-launch HTTP request. A down worker waits for its drain first, then acquires the
-coordinator around the actual provider operation and reconstructs its durable
-v2 fence (or enters the ordinary phase). A launch failure follows the same
-rule for its immediate cleanup. Thus long user-visible drains and remote
-launches do not stop status/scaling progress, while every local Kubernetes
-operation remains ordered with mixed lifecycle phases.
+There is deliberately no exclusive manager-wide reconciliation round: one
+unreachable job-status SSH call must not block readiness or the refresher that
+admits already-enqueued launches and downs. Job status takes its blocking phase
+outside `self.lock`, partitions strict v2 rows before genuine ordinary rows,
+passes the admission explicitly to every worker, and re-reads each row under
+`self.lock` before reducing the materialized result. Probe and refresher retain
+one continuous `self.lock` acquisition for their whole round, preserving their
+existing atomicity against scale, update, and other pickled-row writers. They
+therefore use only try admission while that lock is held.
+
+One probe performs its provider-free fleet/cluster snapshot, durable handle
+shape checks, tick-spec reset, process-guard prune, and route-registry prune
+exactly once. It then runs the complete v2 subset under try-`V2_FENCED` and one
+physical owner per `(context, UID)`, joins every readiness/status/liveness
+future, finishes preemption classification, reduction, persistence, and inline
+teardown, and retires all owners. Only then does the complete ordinary subset
+run under try-`AMBIENT_LEGACY`. A denied subset contributes its original,
+unchanged rows to the provider-free ordered final merge. One-time state is not
+reset, pruned, persisted, or finalized once per subset.
+
+The refresher similarly tries v2 work before ordinary work while retaining its
+one lock acquisition. Wait-for-idle URL resolution leaves its tracker
+untouched when admission is busy. Inline log sync and drain-URL lookup are
+best-effort: phase busy skips log sync or uses the existing bounded drain wait,
+then still schedules the separately fenced down. A phase-busy result must not
+be handled after a completed launch/down worker has been removed from its
+runtime registry, so it cannot strand cleanup. Recovery paths that already
+hold `self.lock` follow the same try-only/no-evidence rule. Boot recovery
+consumes phase busy as an ordinary deferral inside its reconciliation pass; it
+must not raise into the generic 30-second retry sleep while retaining
+`self.lock`.
+
+An asynchronous launch HTTP request never holds a phase. Before persisting a v2 fill
+launch, the carried override is classified provider-free, blocking
+`V2_FENCED` admission is acquired before `self.lock`, and the exact
+`(context, UID)` physical fence proves the pin; ambient force-refresh is not
+used. Failure returns before row persistence or request submission. A deferred
+down worker waits for drain with neither lock, then each retry independently
+enters the row's blocking phase, selects the workspace, creates a fresh v2
+physical proof where required, and performs the provider mutation. It releases
+phase and fence before retry backoff and never reuses the originating round's
+proof.
+
+Paths without manager state use the process phase directly. These include cold
+and warm load-balancer route synchronization, standalone active-URL reads,
+full API service-status serialization (including multi-service fanout), and
+reserved-capacity observations. They run complete v2 groups before ordinary
+rows and never turn a phase timeout into negative evidence. A load-balancer
+route-sync phase timeout aborts that synchronization with 503 and publishes no
+new mapping or warm-cache state; it cannot produce a successful mapping with
+the timed-out rows omitted. Standalone/API status may report identity unknown
+but never physical absence. The v2 poller
+enters `V2_FENCED` before `run_round_if_stale`, so it never waits for the phase
+from inside the broker callback/lock; legacy/shared-demand observations enter
+`AMBIENT_LEGACY` under the same rule. One driven v2 observation creates one
+physical proof for its pool.
+
+Interactive log follow is the bounded-operation exception. It uses a dedicated
+streaming fence which does not acquire or hold a process phase. A v2 row still
+validates its durable handle and holds the immutable physical fence for the
+whole stream; it may join an existing same-UID capture, while conflicting UID
+or initializer admission fails closed. An ordinary follow remains ungated and
+the central adaptor rejects any unleased collision. Streaming bytes cannot
+publish lifecycle evidence. Consequently a long v2 follow can make ordinary
+same-context reconciliation retry until the operator stops it, but it cannot
+monopolize the fair phase gate. Bounded/non-follow tails use their normal phase
+for the complete read.
 
 An independent broker UID discovery that encounters the typed
 owner-or-initializer collision waits at most 30 seconds for that context to
@@ -1132,15 +1206,45 @@ Automated coverage must include:
   futures and exceptional/early-return paths fully join and retire owners,
   malformed v2 rows never enter the legacy phase, shared reduction preserves
   fleet state, and one UID proof is performed per v2 pool per round;
-- coordinator barrier tests overlap recovery, job status, probe, cold/warm LB
-  route sync and active-URL reads, mutation refresh, physical/logical
-  scale-down, route-retirement teardown, and deferred provider cleanup;
-  provider-bearing paths serialize before `self.lock`, while drain sleeps and
-  asynchronous launch HTTP do not hold the coordinator, and exceptional paths
-  release both coordinator and process phase for the next reconciliation;
+- provider-phase tests cover same-mode overlap, FIFO cohort/no-barging order,
+  bounded timeout removal, same-mode reentrancy, cross-mode rejection,
+  explicit child admission and drain, stale/copied admission rejection,
+  cancellation cleanup, phase-gate fork-while-held reset, and physical-registry
+  fork-while-owner/initializer-held reset without deleting the parent's capture;
+- blocking job status acquires phase before `self.lock` yet leaves probe and
+  mutation refresh able to run while an SSH worker hangs. Probe, refresher, and
+  locked recovery use only immediate try admission. An active opposite phase,
+  or a same-mode/same-context physical initializer after successful phase try,
+  makes those locked paths return promptly with unchanged rows, no
+  negative/identity-uncertain evidence, a released manager lock, and a
+  successful next-round retry;
+- one mixed probe resets its tick memo and prunes process/route registries once,
+  runs complete admitted v2 work before ordinary work, joins every future and
+  inline teardown before phase retirement, merges denied partitions unchanged,
+  and never duplicates persistence or finalization;
+- refresher tests partition wait-for-idle URL and optional log/drain reads,
+  leave trackers and completed-worker ownership recoverable on phase busy, and
+  still schedule the independently fenced down without treating phase busy as
+  cleanup or physical-identity uncertainty;
+- boot recovery under an active opposite phase completes its acquired-lock
+  handshake, leaves exact rows retryable, and does not enter the generic
+  30-second exception backoff while holding `self.lock`;
+- a v2 scale-up takes blocking phase admission before the manager lock, proves
+  its exact carried context/UID without ambient lookup, and releases both
+  before asynchronous submission; failure persists no row. Deferred down waits
+  for drain first, takes a fresh phase/workspace/UID proof on every retry, and
+  releases phase/fence during backoff;
+- cold/warm LB route sync, standalone active URLs, API status serialization and
+  fanout partition complete v2 groups before ordinary rows; a phase timeout
+  aborts route sync with 503 and publishes no mapping/cache update, while status
+  yields unknown rather than stale or negative evidence;
+- interactive v2 follow holds its immutable physical fence but no process
+  phase, ordinary colliding follow fails closed, and bounded/non-follow tails
+  hold the normal phase for their complete read;
 - v2 broker observations enter the process phase before the broker callback,
   never while its round lock is already held, and one observation performs one
-  UID proof for each physical pool;
+  UID proof for each physical pool; legacy/shared-demand observations use the
+  ambient phase under the same no-lock-at-admission rule;
 - broker UID discovery waits only for the typed active owner/initializer
   collision, wakes on successful or failed retirement, survives repeated
   capture replacement with one 30-second absolute deadline, rejects a caller
