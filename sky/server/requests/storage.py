@@ -44,7 +44,7 @@ def execution_cancellation_marker_path(pid: int,
     if pid <= 0:
         raise ValueError('Execution cancellation PID must be positive.')
     identity = (f'{pid}\0{claim.request_id}\0{claim.execution_generation}\0'
-                f'{claim.claim_token}').encode('utf-8')
+                f'{claim.claim_token}').encode()
     digest = hashlib.sha256(identity).hexdigest()
     return _EXECUTION_CANCELLATION_DIRECTORY / f'{pid}-{digest}'
 
