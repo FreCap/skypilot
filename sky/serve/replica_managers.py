@@ -35,6 +35,7 @@ from sky.client import sdk
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
 from sky.serve import paid_capacity
+from sky.serve import provider_phase
 from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_tls
 from sky.serve import reserved_capacity
@@ -1232,9 +1233,15 @@ def terminate_cluster(
                 kubernetes_adaptor.physical_cluster_uid_fence(
                     cleanup_fence.kubernetes_context,
                     cleanup_fence.physical_cluster_uid))
+            phase_mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                          if cleanup_fence is None else
+                          provider_phase.ProviderPhaseMode.V2_FENCED)
             # Workspace selection owns kubeconfig/environment resolution, so
-            # establish it before capturing the immutable provider target.
-            with workspace_ctx, provider_fence:
+            # enter the process phase first, then select the workspace before
+            # capturing the immutable provider target. Each retry constructs
+            # all three contexts afresh and releases them before backoff.
+            with provider_phase.provider_phase(
+                    phase_mode), workspace_ctx, provider_fence:
                 if cleanup_fence is not None:
                     if expected_cluster_record_uuid is not None:
                         core.down(cluster_name,

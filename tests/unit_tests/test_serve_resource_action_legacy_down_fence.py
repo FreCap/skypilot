@@ -178,6 +178,77 @@ def test_protocol_v2_action_cleanup_keeps_uuid_authoritative(tmp_path):
                                  _continue_guard=guard)
 
 
+def test_protocol_v2_cleanup_reacquires_phase_workspace_and_uid_per_retry(
+        tmp_path):
+    cleanup_fence = replica_managers.reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+    events = []
+
+    @contextlib.contextmanager
+    def phase(mode):
+        events.append(('phase-enter', mode))
+        try:
+            yield mock.sentinel.admission
+        finally:
+            events.append(('phase-exit', mode))
+
+    @contextlib.contextmanager
+    def workspace(_name):
+        events.append(('workspace-enter', None))
+        try:
+            yield
+        finally:
+            events.append(('workspace-exit', None))
+
+    @contextlib.contextmanager
+    def physical_fence(_context, _uid):
+        events.append(('fence-enter', None))
+        try:
+            yield
+        finally:
+            events.append(('fence-exit', None))
+
+    def down(*_args, **_kwargs):
+        events.append(('down', None))
+        if sum(event == ('down', None) for event in events) == 1:
+            raise RuntimeError('transient provider failure')
+
+    with mock.patch.object(replica_managers.context,
+                           'get',
+                           return_value=mock.MagicMock()), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=_protocol_v2_cluster_record()), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           side_effect=phase), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'local_active_workspace_ctx',
+                           side_effect=workspace), \
+         mock.patch.object(replica_managers.kubernetes_adaptor,
+                           'physical_cluster_uid_fence',
+                           side_effect=physical_fence), \
+         mock.patch('sky.core.down', side_effect=down), \
+         mock.patch.object(replica_managers.common_utils.Backoff,
+                           'current_backoff',
+                           return_value=0), \
+         mock.patch.object(replica_managers.time, 'sleep'):
+        replica_managers.terminate_cluster.__wrapped__(
+            'svc-1',
+            str(tmp_path / 'down.log'),
+            cleanup_fence=cleanup_fence,
+            max_retry=2)
+
+    mode = replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED
+    assert events == [('phase-enter', mode), ('workspace-enter', None),
+                      ('fence-enter', None), ('down', None),
+                      ('fence-exit', None), ('workspace-exit', None),
+                      ('phase-exit', mode), ('phase-enter', mode),
+                      ('workspace-enter', None), ('fence-enter', None),
+                      ('down', None), ('fence-exit', None),
+                      ('workspace-exit', None), ('phase-exit', mode)]
+
+
 def test_protocol_v2_rotated_uuid_rejects_before_provider_capture(tmp_path):
     cleanup_fence = replica_managers.reserved_capacity.ProtocolV2CleanupFence(
         kubernetes_context='phx-context', physical_cluster_uid='physical-a')
