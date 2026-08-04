@@ -120,6 +120,22 @@ class ReconcileApiServerTest(unittest.TestCase):
         self.assertNotIn(proxy_url, result.stdout)
         self.assertNotIn(proxy_url, result.stderr)
 
+    def test_state_migration_suppression_invokes_no_cluster_tools(self) -> None:
+        env = self._env.copy()
+        env['SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION'] = 'true'
+
+        result = subprocess.run(
+            ['bash', '-c', _reconcile_command()],
+            check=False,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('reconcile suppressed', result.stdout)
+        self.assertFalse(self._aws_args_path.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -103,8 +103,18 @@ The module therefore runs a Kubernetes Job that locks and updates the
 - `prune_retired_serve_controller_keys` performs an opt-in, one-way removal.
 
 Any script, desired configuration, pruning-mode, or helper-image change creates
-a new seed generation. After a successful seed, a bounded local-exec restarts
-and waits for `<release_name>-api-server`.
+a new immutable seed Job. Only script, configuration, or pruning-mode changes
+advance `config_generation`; after a successful seed, a bounded local-exec
+restarts and waits for `<release_name>-api-server`. Helper-image-only changes
+therefore update the Job and any enabled login init containers without causing
+a second API rollout after Helm has already rolled the pod template.
+
+Existing state created before this split has an image-coupled
+`config_generation`. If the API server has already rolled to the desired image,
+set `suppress_api_server_reconcile_for_migration = true` for exactly one apply,
+then remove it. The apply advances the Terraform trigger without restarting the
+already-current API server. Never suppress reconciliation while changing the
+desired DB-backed config.
 
 ## Security and lifecycle notes
 
@@ -218,6 +228,7 @@ No modules.
 | <a name="input_prune_retired_serve_controller_keys"></a> [prune\_retired\_serve\_controller\_keys](#input\_prune\_retired\_serve\_controller\_keys) | Remove the retired serve.controller.consolidation\_mode and<br/>serve.controller.external\_load\_balancer keys from the DB-backed config during<br/>seeding. This is a one-way cutover aid and is disabled by default so public-chart<br/>consumers retain their existing config behavior. | `bool` | `false` | no |
 | <a name="input_rbac_default_role"></a> [rbac\_default\_role](#input\_rbac\_default\_role) | Default role for newly auto-provisioned SSO users. SkyPilot ships this as<br/>`admin` to ease setup; we default to `user` for least privilege. NOTE: verify<br/>it actually takes effect on your chart version (see skypilot issue #9271). | `string` | `"user"` | no |
 | <a name="input_release_name"></a> [release\_name](#input\_release\_name) | Helm release name. The chart derives the API service account as <release\_name>-api-sa. | `string` | `"skypilot"` | no |
+| <a name="input_suppress_api_server_reconcile_for_migration"></a> [suppress\_api\_server\_reconcile\_for\_migration](#input\_suppress\_api\_server\_reconcile\_for\_migration) | Temporary one-apply migration switch for callers whose existing<br/>config\_generation included the helper image. Set true only when the running<br/>API server has already rolled to the desired image: the seed Job still runs<br/>and Terraform advances to the image-independent generation, but the<br/>post-seed API restart is suppressed. Remove the override immediately after<br/>that apply; while true, real config changes are not loaded into API-server<br/>memory. Deprecated and scheduled for removal after migration. | `bool` | `false` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to AWS resources created by this module. | `map(string)` | `{}` | no |
 | <a name="input_workspace_email_domain"></a> [workspace\_email\_domain](#input\_workspace\_email\_domain) | Restrict logins to this email domain (auth.oauth.email-domain). Null relies on the OIDC client's audience restriction. | `string` | `null` | no |
 

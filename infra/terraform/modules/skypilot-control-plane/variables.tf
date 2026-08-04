@@ -148,6 +148,22 @@ variable "operations_helper_image" {
   }
 }
 
+# Deprecated transition input. Remove after every existing caller has adopted
+# the image-independent config generation in config_seed.tf.
+variable "suppress_api_server_reconcile_for_migration" {
+  description = <<-EOT
+    Temporary one-apply migration switch for callers whose existing
+    config_generation included the helper image. Set true only when the running
+    API server has already rolled to the desired image: the seed Job still runs
+    and Terraform advances to the image-independent generation, but the
+    post-seed API restart is suppressed. Remove the override immediately after
+    that apply; while true, real config changes are not loaded into API-server
+    memory. Deprecated and scheduled for removal after migration.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "api_server_extra_envs" {
   description = <<-EOT
     Non-secret extra environment variables set on the API-server pod. Values are

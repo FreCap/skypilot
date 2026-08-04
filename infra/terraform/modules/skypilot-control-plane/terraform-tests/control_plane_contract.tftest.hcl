@@ -153,3 +153,35 @@ run "custom_role_and_boundary_are_additive" {
     error_message = "The caller must be able to select a safe role name and active-account boundary."
   }
 }
+
+run "helper_image_does_not_advance_config_generation" {
+  command = plan
+
+  variables {
+    operations_helper_image = "registry.example/skypilot-ops@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+
+  assert {
+    condition = (
+      output.config_generation ==
+      run.default_contract_is_provider_neutral_and_stable.config_generation
+    )
+    error_message = "A helper-image-only change must not trigger an API-server config reconcile."
+  }
+}
+
+run "config_change_advances_config_generation" {
+  command = plan
+
+  variables {
+    config_extra = { jobs = { controller = { consolidation_mode = true } } }
+  }
+
+  assert {
+    condition = (
+      output.config_generation !=
+      run.default_contract_is_provider_neutral_and_stable.config_generation
+    )
+    error_message = "A DB-backed config change must still trigger an API-server config reconcile."
+  }
+}

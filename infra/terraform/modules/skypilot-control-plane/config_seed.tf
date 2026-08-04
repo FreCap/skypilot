@@ -17,11 +17,19 @@ locals {
   seed_image = var.operations_helper_image != null ? var.operations_helper_image : (
     var.api_server_image != null ? var.api_server_image : ""
   )
-  # Identifies a (script + config + behavior + image) generation. Drives the seed Job name
-  # (forces a fresh Job per change) and the post-seed api-server restart (below). The image
-  # must participate because a completed Job has an immutable pod template and cannot adopt a
-  # newly pinned api-server image in place.
+  # The API server only needs a post-seed restart when the desired DB-backed
+  # configuration changes. Keep its generation independent from the helper
+  # image so a normal runtime image rollout is not followed by a second,
+  # redundant rollout during Terraform reconciliation.
   config_hash = substr(sha256(jsonencode({
+    script                              = local.seed_config_script
+    config                              = local.inline_config
+    prune_retired_serve_controller_keys = var.prune_retired_serve_controller_keys
+  })), 0, 12)
+  # The completed Job has an immutable pod template, so its generation still
+  # includes the helper image. Preserve the legacy object shape to avoid
+  # replacing Jobs whose script, config, behavior, and image are unchanged.
+  seed_job_hash = substr(sha256(jsonencode({
     script                              = local.seed_config_script
     config                              = local.inline_config
     prune_retired_serve_controller_keys = var.prune_retired_serve_controller_keys
@@ -47,7 +55,7 @@ resource "kubernetes_config_map_v1" "seed_config" {
 # provider treats as replace (destroy old, create new), so the seed actually re-runs on change.
 resource "kubernetes_job_v1" "seed_config" {
   metadata {
-    name      = "skypilot-seed-config-${local.config_hash}"
+    name      = "skypilot-seed-config-${local.seed_job_hash}"
     namespace = var.namespace
     labels    = { "app.kubernetes.io/managed-by" = "terraform" }
   }
@@ -127,9 +135,15 @@ resource "terraform_data" "reconcile_api_server" {
 
   provisioner "local-exec" {
     interpreter = ["bash", "-c"]
-    environment = local.provider_exec_env
-    command     = <<-EOT
+    environment = merge(local.provider_exec_env, {
+      SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION = tostring(var.suppress_api_server_reconcile_for_migration)
+    })
+    command = <<-EOT
       set -euo pipefail
+      if [[ "$${SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION:-false}" == "true" ]]; then
+        echo "SkyPilot API-server reconcile suppressed for config-generation state migration"
+        exit 0
+      fi
       KUBECONFIG_TMP="$(mktemp)"
       trap 'rm -f "$KUBECONFIG_TMP"' EXIT
       proxy_args=()
