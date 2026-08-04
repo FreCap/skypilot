@@ -1,9 +1,11 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: feature PR merged; the production PostgreSQL cutover and protocol-v2
-activation are complete; the durable executor/provider fence hotfix is locally
-complete and adversarially reviewed; its merge/deployment, pool-identity RBAC,
-the PHX canary, and the compatibility-cleanup merge gates remain open
+Status: feature and durable executor/provider-fence PRs are merged and deployed;
+the production PostgreSQL cutover, protocol-v2 activation, and pool-identity
+RBAC are complete; live acceptance exposed a mixed legacy/v2 provider-phase
+collision and an inherited workspace-context eligibility gap, whose corrective
+hotfix, redeployment, PHX canary, and compatibility-cleanup merge gates remain
+open
 
 Last updated: 2026-08-04
 
@@ -195,6 +197,18 @@ An unrelated ordinary request that overlaps this short scope may therefore
 retry after the scope retires; outside an active scope its historical ambient
 behavior is unchanged.
 
+Provider-bearing fleet work must make that retry boundary explicit. A mixed
+legacy/protocol-v2 status or probe batch is partitioned into phases: all v2
+rows run with their exact propagated leases while the batch owners are live,
+the owners retire, and only then may legacy or ordinary tokenless provider
+calls run. The phases may remain internally parallel, but must never overlap.
+An independent broker UID discovery that encounters another active capture
+waits only for a bounded owner-retirement interval and retries from ambient
+credentials after retirement; timeout, context mismatch, or owner failure
+still withdraws that pool and never borrows the capture. This prevents a
+valid pool from flapping merely because legacy reconciliation overlapped a v2
+batch without weakening the process-global fail-closed rule.
+
 The durable physical fence continues after launch for every alias-sensitive
 replica lifecycle read. Endpoint discovery, readiness routing, job-status SSH,
 candidate/recovery status, interruption detection, drain registration, status
@@ -269,6 +283,15 @@ silently retain the old incomplete list. The reusable spoke workspace-pool
 RBAC module owns the same grant for remote pool identities alongside its
 existing cluster-wide read contract. Externally managed kubeconfig identities
 must receive an equivalent grant from their operator.
+
+Workspace eligibility is evaluated on the effective merged configuration. If
+a workspace inherits global `kubernetes.allowed_contexts`, materializing an
+explicit workspace list that retains every inherited context and adds another
+context is an additive change. It is safe in the presence of active resources
+for the same reason as an already-explicit list growth: no running context is
+removed. Validation must compare the effective current and proposed context
+sets; it must not reject this safe materialization merely because the current
+workspace-local field is absent.
 
 An operator must verify both
 `kubectl auth can-i get namespace/kube-system` and a nonempty `.metadata.uid`
