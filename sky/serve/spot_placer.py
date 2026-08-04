@@ -50,6 +50,12 @@ _LIVE_ACCELERATOR_CATALOG_CLOUDS = frozenset({'kubernetes', 'slurm', 'ssh'})
 # location with one probe launch per TTL window.
 _PREEMPTION_RETRY_SECONDS_DEFAULT = 600
 _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
+# How long a measured free-slot count stays authoritative for a zero-cost
+# location. The broker re-counts every poll interval, so this only has to
+# outlive a few missed rounds; past it the location falls back to the blind
+# probe path rather than launching on a reading nobody has refreshed.
+_MEASURED_CAPACITY_TTL_SECONDS_DEFAULT = 180
+_MEASURED_CAPACITY_TTL_ENV_VAR = 'SKYPILOT_MEASURED_CAPACITY_TTL_SECONDS'
 _PLACEMENT_SNAPSHOT_MAX_LOCATIONS = 500
 _PLACEMENT_CATALOG_SCHEMA_VERSION = 1
 # Public reader contract for bounded consumers such as the dashboard.  The
@@ -99,6 +105,18 @@ def _preemption_retry_seconds() -> float:
                            f'{override!r}, using default '
                            f'{_PREEMPTION_RETRY_SECONDS_DEFAULT}s.')
     return _PREEMPTION_RETRY_SECONDS_DEFAULT
+
+
+def _measured_capacity_ttl_seconds() -> float:
+    override = os.environ.get(_MEASURED_CAPACITY_TTL_ENV_VAR)
+    if override is not None:
+        try:
+            return max(0.0, float(override))
+        except ValueError:
+            logger.warning(f'Invalid {_MEASURED_CAPACITY_TTL_ENV_VAR} value '
+                           f'{override!r}, using default '
+                           f'{_MEASURED_CAPACITY_TTL_SECONDS_DEFAULT}s.')
+    return _MEASURED_CAPACITY_TTL_SECONDS_DEFAULT
 
 
 @dataclasses.dataclass
@@ -925,6 +943,10 @@ class SpotPlacer:
         # launch failures can release this reservation and leave the location
         # immediately eligible; typed failures replace the observation.
         self.location2retry_reserved_at: dict[Location, float] = {}
+        # Last measured free slots per zero-cost location, as (slots, when).
+        # Only pools the broker counts every round appear here; a paid spot
+        # region is never measured.
+        self.location2observed_free: dict[Location, tuple[int, float]] = {}
         self._retry_state_dirty = False
         # Complete by construction. Runtime paths must never resolve provider
         # feasibility or pricing because a location cost is missing.
@@ -948,8 +970,61 @@ class SpotPlacer:
             self.location2preempted_reason = {}
         if not hasattr(self, 'location2retry_reserved_at'):
             self.location2retry_reserved_at = {}
+        if not hasattr(self, 'location2observed_free'):
+            self.location2observed_free = {}
         if not hasattr(self, '_retry_state_dirty'):
             self._retry_state_dirty = False
+
+    def observe_zero_cost_capacity(self, free_by_location: dict[Location, int],
+                                   observed_at: float) -> None:
+        """Record a broker round's measured free slots per zero-cost location.
+
+        A reserved Kubernetes pool is counted every round, so its bench is not
+        carrying information the way a spot region's is: there is nothing left
+        to discover by spending a probe. Recording the count lets
+        `_effective_status` prefer the measurement over the probe clock.
+
+        Only zero-cost locations are accepted. A paid region is never measured,
+        so a caller naming one must not buy it a bench bypass.
+        """
+        self._ensure_retry_state_fields()
+        if not math.isfinite(observed_at):
+            return
+        for location, free in free_by_location.items():
+            resolved = self.resolve_location(location,
+                                             allow_ambiguous_legacy_shape=True)
+            if resolved is None or self.location2cost.get(resolved) != 0:
+                continue
+            previous = self.location2observed_free.get(resolved)
+            # Rounds can complete out of order; a late arrival must not
+            # overwrite a fresher count.
+            if previous is not None and previous[1] >= observed_at:
+                continue
+            self.location2observed_free[resolved] = (max(0, int(free)),
+                                                     float(observed_at))
+            self._retry_state_dirty = True
+
+    def _measured_available(self, location: Location) -> bool:
+        """Whether a fresh count says this location can take a launch now.
+
+        The count must also be NEWER than the bench it would override.
+        Otherwise a pool that measures free but refuses launches (taints,
+        affinity, admission webhooks) would spin: every failure re-benches,
+        and a single stale reading would clear it again forever.
+        """
+        self._ensure_retry_state_fields()
+        entry = self.location2observed_free.get(location)
+        if entry is None:
+            return False
+        free, observed_at = entry
+        if free <= 0:
+            return False
+        if time.time() - observed_at > _measured_capacity_ttl_seconds():
+            return False
+        benched_at = self.location2preempted_at.get(location)
+        if benched_at is not None and benched_at >= observed_at:
+            return False
+        return True
 
     def __init_subclass__(cls, name: str, default: bool = False):
         SPOT_PLACERS[name] = cls
@@ -1135,6 +1210,12 @@ class SpotPlacer:
                 location)
             if retry_reserved_at is not None:
                 self.location2retry_reserved_at[location] = retry_reserved_at
+            # The free-slot count belongs to the pool, not to the service
+            # version being replaced; dropping it would re-bench a measured
+            # pool for a whole TTL on every service update.
+            observed = old_placer.location2observed_free.get(location)
+            if observed is not None:
+                self.location2observed_free[location] = observed
             self._retry_state_dirty = True
 
     def dump_retry_state(self) -> dict[str, Any]:
@@ -1158,6 +1239,10 @@ class SpotPlacer:
             if (retry_reserved_at is not None and
                     math.isfinite(retry_reserved_at)):
                 bench['retry_reserved_at'] = retry_reserved_at
+            measured = self.location2observed_free.get(location)
+            if measured is not None and math.isfinite(measured[1]):
+                bench['measured_free'] = int(measured[0])
+                bench['measured_at'] = float(measured[1])
             benches.append(bench)
         return {'version': self._RETRY_STATE_VERSION, 'benches': benches}
 
@@ -1206,6 +1291,15 @@ class SpotPlacer:
             if retry_reserved_at is not None:
                 self.location2retry_reserved_at[resolved] = min(
                     float(retry_reserved_at), now)
+            measured_free = raw.get('measured_free')
+            measured_at = raw.get('measured_at')
+            if (isinstance(measured_free, int) and
+                    not isinstance(measured_free, bool) and
+                    isinstance(measured_at, (int, float)) and
+                    not isinstance(measured_at, bool) and
+                    math.isfinite(measured_at)):
+                self.location2observed_free[resolved] = (max(
+                    0, measured_free), min(float(measured_at), now))
         self._retry_state_dirty = False
 
     @property
@@ -1226,10 +1320,16 @@ class SpotPlacer:
         The stored status is left untouched — if the retry launch fails,
         set_preemptive refreshes the timestamp (benched for another TTL);
         if it succeeds, set_active clears the mark entirely.
+
+        A zero-cost location whose free slots were counted more recently than
+        its bench is ACTIVE on that count instead of on the probe clock: the
+        bench was standing in for an observation that has since arrived.
         """
         self._ensure_retry_state_fields()
         status = self.location2status[location]
         if status == LocationStatus.PREEMPTED:
+            if self._measured_available(location):
+                return LocationStatus.ACTIVE
             retry_from = self.location2retry_reserved_at.get(
                 location, self.location2preempted_at.get(location))
             if (retry_from is not None and
@@ -1317,6 +1417,11 @@ class SpotPlacer:
         set_active; a generic failure releases only the reservation.
         """
         self._ensure_retry_state_fields()
+        if self._measured_available(location):
+            # Selection is riding a live count, not a probe. Charging it to the
+            # probe budget would re-bench the location after one launch and cap
+            # a measured pool's refill at one replica per TTL window.
+            return
         if self.location2status.get(location) == LocationStatus.PREEMPTED:
             self.location2retry_reserved_at[location] = time.time()
             self._retry_state_dirty = True
