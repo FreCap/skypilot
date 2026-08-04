@@ -848,6 +848,22 @@ class KubernetesPhysicalClusterIdentityError(RequestCancelled):
     """
 
 
+class ProviderPhaseError(RuntimeError):
+    """A process-local provider phase could not be entered safely."""
+
+
+class ProviderPhaseBusyError(ProviderPhaseError):
+    """A zero-time provider phase try could not be admitted safely."""
+
+
+class ProviderPhaseTimeoutError(ProviderPhaseError):
+    """A provider phase was not admitted before its bounded deadline."""
+
+
+class ProviderPhaseMisuseError(ProviderPhaseError):
+    """A provider phase admission was stale, copied, or used incorrectly."""
+
+
 class ReservedFillLaunchFenceError(RequestCancelled):
     """A durable reserved-fill launch no longer matches its exact pin."""
 
