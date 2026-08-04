@@ -3,10 +3,10 @@
 Status: feature and durable executor/provider-fence PRs are merged and deployed;
 the production PostgreSQL cutover, protocol-v2 activation, and pool-identity
 RBAC are complete; measured-capacity PR #1269 and UID-race PR #1271 are merged
-and deployed, but live acceptance exposed a shared-round-reader bench gap, a
-mixed legacy/v2 provider-phase collision, and an inherited workspace-context
-eligibility gap, whose corrective hotfix, redeployment, PHX canary, and
-compatibility-cleanup merge gates remain open
+and deployed, and shared-round replay PR #1272 is merged but not yet deployed;
+live acceptance also exposed exact-card replay, mixed legacy/v2 provider-phase,
+and inherited workspace-context eligibility gaps, whose corrective hotfix,
+redeployment, PHX canary, and compatibility-cleanup merge gates remain open
 
 Last updated: 2026-08-04
 
@@ -1418,6 +1418,15 @@ Terraform formatting, and `git diff --check` also passed. Independent
 adversarial review found no remaining release blocker in the lifecycle-wide
 physical-cluster or cluster-generation fence.
 
+Corrective pre-PR validation on 2026-08-04 passed 570 focused broker,
+reserved-capacity, workspace, physical-fence, executor, and replica-contract
+tests plus 62 subtests. After updating three stale provider-phase test doubles,
+the broad affected Serve suite passed all 922 tests plus 9 subtests. Repository
+mypy completed with no issues across 884 source files, YAPF and isort completed,
+Python compilation and `git diff --check` passed, and an independent exact-head
+adversarial review found no release-blocking concurrency or identity issue.
+Required GitHub CI on the final rebased head remains a merge gate.
+
 Production diagnosis on 2026-08-04 separated three independent refill
 failures. Merged PR #1269 lets a successfully observed zero-cost location
 override an older placement bench, and merged PR #1271 keeps concurrent
@@ -1430,6 +1439,13 @@ shared round without driving its query callback did not receive #1269's local
 placer observation. The committed-round observation metadata and reader-side
 application in this corrective change close that owner/peer asymmetry without
 cross-pool or cross-card leakage.
+
+PR #1272 subsequently merged an aggregate reader-side replay of that shared
+round. This branch retains #1272's owner/peer repair but carries the committed
+observation through the ordinary `Allocation` result with a validated exact-
+card map. That prevents aggregate A100-family capacity from releasing a full
+peer card in the same context, rejects malformed or CAS-lost evidence, and
+keeps v1 one-context and v2 exact-pool behavior aligned.
 
 Required feature CI on the preceding code-bearing head `1357dec79` completed
 all 32 checks successfully. The mandatory unit job ran with
@@ -1448,6 +1464,7 @@ fleet no larger than the configured `max_replicas`.
 - Required feature and durable provider-fence CI passed. Helm revision 333
   currently runs release `1.1.1095` (merge
   `912555e6ee160aff404aca0db89337d2981493a1`) with merged PRs #1269 and #1271.
+  PR #1272 is merged upstream but is not present in that deployed image.
   The production request store completed its one-way PostgreSQL cutover, Serve
   is at schema head 035, token-bound protocol v2 is active, and the exact
   `kube-system` Namespace read is present on east and PHX. The corrective
