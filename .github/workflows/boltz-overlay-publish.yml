@@ -38,7 +38,7 @@ jobs:
     # Manual retries may only publish the integration branch; selecting a
     # feature branch must not reserve one of its deterministic versions.
     if: github.event_name == 'push' || github.ref == 'refs/heads/improvements'
-    runs-on: namespace-profile-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-1x2
     steps:
       - uses: actions/checkout@v4
         with:

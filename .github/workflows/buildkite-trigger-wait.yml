@@ -59,7 +59,7 @@ on:
 
 jobs:
   trigger-buildkite:
-    runs-on: namespace-profile-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-1x2
     outputs:
       json: ${{ steps.trigger_buildkite.outputs.json }}
     steps:

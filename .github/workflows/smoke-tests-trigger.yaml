@@ -13,7 +13,7 @@ on:
 
 jobs:
   smoke-tests:
-    runs-on: namespace-profile-ci-1x2
+    runs-on: namespace-profile-skypilot-ci-1x2
     steps:
       - name: Trigger Smoke Tests
         uses: buildkite/trigger-pipeline-action@3b5d98081fffc1a90e7eaa739f05e6106585a11a # v2.3.0

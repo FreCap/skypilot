@@ -17,7 +17,7 @@ on:
 
 jobs:
   dashboard:
-    runs-on: namespace-profile-ci-2x4
+    runs-on: namespace-profile-skypilot-ci-2x4
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies and check
