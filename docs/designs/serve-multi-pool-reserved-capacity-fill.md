@@ -202,12 +202,26 @@ legacy/protocol-v2 status or probe batch is partitioned into phases: all v2
 rows run with their exact propagated leases while the batch owners are live,
 the owners retire, and only then may legacy or ordinary tokenless provider
 calls run. The phases may remain internally parallel, but must never overlap.
-An independent broker UID discovery that encounters another active capture
-waits only for a bounded owner-retirement interval and retries from ambient
-credentials after retirement; timeout, context mismatch, or owner failure
-still withdraws that pool and never borrows the capture. This prevents a
-valid pool from flapping merely because legacy reconciliation overlapped a v2
-batch without weakening the process-global fail-closed rule.
+The v2 phase includes provider-bearing result classification, preemption
+refresh, and teardown: merely joining the initial status or readiness futures
+is insufficient. Shared provider-free reduction and persistence may run after
+the phase results are materialized, but no deferred v2 provider call may escape
+its lease and no tokenless call may begin before every owner has retired.
+Malformed protocol-v2 rows remain identity-uncertain and are never downgraded
+into the legacy phase. One round continues to perform one UID proof per
+physical v2 pool.
+
+An independent broker UID discovery that encounters the typed
+owner-or-initializer collision waits at most 30 seconds for that context to
+become ambient again, using one absolute monotonic deadline across capture
+replacement races, and then re-reads the UID from fresh ambient credentials.
+It performs this wait without a broker/cache lock and only when the caller has
+no fence token, so it cannot deadlock its own scope. Owner and initializer
+retirement wake waiters. Other identity errors, a timeout, a context mismatch,
+or an owner failure still withdraw that pool and never borrow the expected UID,
+capture target, client, or token. This prevents a valid pool from flapping
+merely because legacy reconciliation overlapped a v2 batch without weakening
+the process-global fail-closed rule.
 
 The durable physical fence continues after launch for every alias-sensitive
 replica lifecycle read. Endpoint discovery, readiness routing, job-status SSH,
@@ -286,12 +300,26 @@ must receive an equivalent grant from their operator.
 
 Workspace eligibility is evaluated on the effective merged configuration. If
 a workspace inherits global `kubernetes.allowed_contexts`, materializing an
-explicit workspace list that retains every inherited context and adds another
-context is an additive change. It is safe in the presence of active resources
-for the same reason as an already-explicit list growth: no running context is
-removed. Validation must compare the effective current and proposed context
-sets; it must not reject this safe materialization merely because the current
-workspace-local field is absent.
+explicit workspace list that equals the inherited set, or retains every
+inherited context and adds another context, is an equivalent or additive
+change. It is safe in the presence of active resources for the same reason as
+an already-explicit list growth: no running context is removed. A finite list
+may also broaden to `all`. Conversely, inherited `all` or legacy unrestricted
+behavior may not materialize a finite list around active resources, and a
+finite effective set may not lose a context. Other Kubernetes fields and all
+other workspace fields remain part of the ordinary active-resource guard; an
+empty `kubernetes: {}` produced only by extracting `allowed_contexts` is
+normalized away for comparison and never persisted as a semantic change.
+
+Validation resolves the effective current and proposed values from one
+immutable request snapshot: a workspace-only update uses the same snapshotted
+top-level default on both sides, while a whole-config update uses the current
+snapshot for the current side and the submitted configuration for the proposed
+side. The write must reject or revalidate if the snapshotted workspace or
+top-level default changed before the file-lock-protected commit. User-access
+validation still runs when an equivalent/additive context change is combined
+with a private/allowed-user change. The comparison must not reject safe
+materialization merely because the current workspace-local field is absent.
 
 An operator must verify both
 `kubectl auth can-i get namespace/kube-system` and a nonempty `.metadata.uid`
@@ -922,9 +950,19 @@ shelter them.
 5. Let every live fill controller atomically adopt an authoritative v2 claim
    set. Verify generation/edge-count integrity, integer grants, and fresh 035
    resource-action evidence before separately re-enabling any authority mode.
-6. Update `boltz-l4-fleet` to append the PHX H200 context. Confirm two claims,
-   independent rounds, an exact-context/UID H200 canary, and the global cap.
-7. Keep the stacked cleanup PR blocked until the observation window and
+6. Before materializing PHX eligibility, deploy the mixed-phase corrective
+   image to every API/controller/executor process. Observe at least three
+   complete mixed legacy/v2 job-status, readiness-probe, and 60-second broker
+   intervals with no unpropagated-fence error, broker edge withdrawal, or
+   physical-identity uncertainty for a healthy pool. Every process must report
+   the same immutable corrective digest throughout that observation.
+7. Update the inference workspace from its inherited east context to an
+   explicit east-plus-PHX list through the validated workspace API, restart the
+   long-lived API/controller processes so they load that committed snapshot,
+   and submit a fresh immutable `boltz-l4-fleet` version. Confirm two claims,
+   independent rounds, exact-context/UID east and PHX canaries, and the global
+   cap.
+8. Keep the stacked cleanup PR blocked until the observation window and
    rollback gate below pass.
 
 Normal rollback must happen while the v2 image still runs: disable fill (or
@@ -953,6 +991,13 @@ only that the old controller emits no new multi-context fill. It cannot delete
 normalized claims and zero/stale feed may continue sheltering existing rows;
 it is not a supported drain procedure. Operators must restore the v2 image and
 perform the explicit disable/demote sequence above.
+
+Rolling back only the mixed-phase corrective image while legacy and v2 rows
+coexist is also unsupported: it restores the provider-call collision that can
+withdraw a healthy edge. Fix forward, or first disable fill and drain every
+legacy row under the corrective image before reverting. The explicit
+east-plus-PHX workspace superset itself may remain on a code rollback because
+it removes no previously eligible context.
 
 Revision 035 advances resource-action activation evidence to exact revision
 035. Evidence from revision 034 is invalid for new code and is not silently
@@ -1051,6 +1096,17 @@ Automated coverage must include:
   Pod-creation thread-pool calls without serialization, the normalized
   in-cluster context, capture-pinned `kubectl` exec/rsync, and simultaneous
   conflicting UIDs for one context;
+- mixed same-context legacy/protocol-v2 job-status and complete probe rounds
+  run all v2 status, endpoint, candidate/route-status, liveness, preemption,
+  and teardown provider work before every tokenless legacy provider call;
+  futures and exceptional/early-return paths fully join and retire owners,
+  malformed v2 rows never enter the legacy phase, shared reduction preserves
+  fleet state, and one UID proof is performed per v2 pool per round;
+- broker UID discovery waits only for the typed active owner/initializer
+  collision, wakes on successful or failed retirement, survives repeated
+  capture replacement with one 30-second absolute deadline, rejects a caller
+  carrying a fence token, rereads fresh ambient credentials, and fails closed
+  without cache fallback on timeout or non-collision identity errors;
 - retargeting during restart drain, ordinary drain registration, endpoint
   discovery, status serialization, warm and cold load-balancer route sync,
   job-status SSH, candidate status, and interruption detection yields no
@@ -1086,6 +1142,11 @@ Automated coverage must include:
   unchanged, plus delayed same-PID delivery cannot cancel the next invocation
   and a broken pool cannot create a masking execution generation;
 - no row/thread on malformed, removed, benched, or superseded pool launches;
+- workspace allowed-context validation covers inherited finite-list equality
+  materialization and supersets, explicit finite-list supersets, list-to-`all`,
+  empty-block normalization, and combined user-access checks; removals,
+  inherited `all`/unrestricted-to-list, unrelated field changes, and a changed
+  current snapshot before commit remain blocked around active resources;
 - pool-local demand saturation and scale-down shelter;
 - legacy dynamic-state load and new per-pool dump/load; and
 - unchanged aggregate status plus additive per-pool status; and
@@ -1099,6 +1160,8 @@ Focused validation commands:
 ```bash
 pytest -q tests/unit_tests/test_reserved_fill_broker.py
 pytest -q tests/unit_tests/test_reserved_capacity_fill.py
+pytest -q tests/unit_tests/test_serve_replica_managers.py
+pytest -q tests/unit_tests/test_sky/workspaces/test_workspace_management.py
 pytest -q tests/unit_tests/test_spot_placer_hybrid.py
 pytest -q tests/unit_tests/test_concurrency_autoscaler.py
 pytest -q tests/unit_tests/test_reserved_fill_broker_pg.py
@@ -1157,23 +1220,19 @@ fleet no larger than the configured `max_replicas`.
 
 ## Open gates
 
-- Required feature CI passed, release `1.1.1089` was deployed, the production
-  request store completed its one-way PostgreSQL cutover, and token-bound
-  protocol-v2 activation persisted the expected release identity on
-  2026-08-04.
-- Release `1.1.1089` has only the controller-side pre-enqueue UID check. Keep
-  the remote pool-identity RBAC denied while the durable tuple and
-  provider-fenced executor hotfix is reviewed, merged, built, and deployed.
-  Attest every API/controller/executor Pod at the one hotfix digest before
-  applying either research-cluster bridge grant.
-- The first live v2 poll proved that the east pool identity lacks the required
-  `kube-system` Namespace read; an exact read with the same running API
-  principal through the mounted PHX context proved PHX lacks it too. The live
-  east edge withdrew as designed while ordinary east demand serving remained
-  healthy. This rollout activated v2 before completing the intended RBAC
-  prerequisite and is fixing forward under that designed pool-local blackout.
-  Merge and apply the reusable RBAC correction before treating either pool
-  claim as authoritative.
+- Required feature and durable provider-fence CI passed. Release `1.1.1091`
+  (merge `663a7ab2cc93fde36f4d8b0119051307679d94bc`) is deployed at one
+  attested image digest. The production request store completed its one-way
+  PostgreSQL cutover, Serve is at schema head 035, token-bound protocol v2 is
+  active, and the exact `kube-system` Namespace read is present on east and PHX.
+- Live version 51 acceptance retained east serving health and brought up its
+  paid fallback, but correctly omitted PHX from the immutable placement
+  catalog because the inference workspace still inherited the global east-only
+  context. The same run exposed tokenless legacy version-50 provider calls
+  overlapping a protocol-v2 batch owner, plus transient broker UID discovery
+  withdrawal during that overlap. The corrective mixed-phase/wait and
+  effective-workspace-validation release must merge, deploy, and pass the
+  observation in deployment step 6 before PHX eligibility is materialized.
 - The no-platform-PR production bridge is a separately named ClusterRole and
   ClusterRoleBinding, `skypilot-physical-cluster-identity-reader`, on east and
   PHX, bound to EKS group
@@ -1181,7 +1240,9 @@ fleet no larger than the configured `max_replicas`.
   drift item until both platform pool roots consume the fixed module. At that
   point remove the bridge binding, prove both exact UID reads still pass, and
   then remove the bridge role.
-- The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`, and the
-  exact-context H200 canary plus east regression check remain open.
+- The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`. After
+  the corrective rollout, the workspace update, fresh service version, exact
+  two-edge zero-cost claim/replica canary, H200 model endpoint check, and east
+  regression check remain open.
 - Draft compatibility cleanup PR #1263 is authored in stack #1264 and must
   remain blocked until the rollout gates above pass.
