@@ -3,6 +3,7 @@ import bisect
 from collections.abc import Iterable
 from collections.abc import Sequence
 import copy
+import dataclasses
 import math
 import threading
 import time
@@ -16,6 +17,7 @@ from sky.serve import autoscaler_compatibility
 from sky.serve import autoscaler_decisions
 from sky.serve import constants
 from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -77,6 +79,42 @@ _COST_REBALANCE_STATE_MAX_ENTRIES = 256
 # sub-epsilon remainder here exactly as the compatibility allocator's
 # demand_epsilon already does.
 _SLOT_CONVERSION_EPSILON = 1e-9
+
+
+@dataclasses.dataclass
+class _PoolFillState:
+    """One protocol-v2 reserved-fill pool's independently mutable gauges."""
+
+    protocol_version: int
+    pool_key: str
+    physical_cluster_uid: str
+    service_generation: int
+    edge_cap: int
+    free_slots: int = 0
+    last_raw_free_slots: int | None = None
+    # None means the broker round had no exact-card measurement. A present map
+    # is this service's already-arbitrated portion of the aggregate pool feed.
+    free_slots_by_accelerator: dict[str, int] | None = None
+    zero_cost_locations: list[spot_placer.Location] = dataclasses.field(
+        default_factory=list)
+    snapshot_time: float | None = None
+    # Scale-down protection is deliberately separate from live launch
+    # authority.  A transient broker-round failure may carry the last real
+    # same-generation grant here while clearing grant/feed/epoch, so existing
+    # pool-local fill is not culled and no new launch can replay stale
+    # authority.
+    shelter_grant: int = 0
+    grant: int = 0
+    grant_epoch: int | None = None
+    fill_target: int = 0
+
+    def detached_copy(self) -> '_PoolFillState':
+        return dataclasses.replace(
+            self,
+            zero_cost_locations=list(self.zero_cost_locations),
+            free_slots_by_accelerator=(None if self.free_slots_by_accelerator
+                                       is None else dict(
+                                           self.free_slots_by_accelerator)))
 
 
 def _work_to_slots(work: float, capacity: float) -> int:
@@ -371,6 +409,14 @@ class Autoscaler:
         self._fill_grant: int | None = None
         self._fill_grant_epoch: int | None = None
         self._fill_grant_pool_key: str | None = None
+        self._fill_protocol_version: int = 1
+        self._fill_service_generation: int = 0
+        self._fill_physical_cluster_uid: str | None = None
+        # Protocol-v2 state is a complete map published atomically by one
+        # service poll cycle. The legacy scalar fields above remain the exact
+        # protocol-v1 implementation and compatibility/status projection.
+        self._fill_pool_state_lock = threading.RLock()
+        self._fill_pool_states: dict[str, _PoolFillState] = {}
         # Opt-in economic replacement.  The placer reference is injected by
         # the controller each tick because ReplicaManager owns placement state.
         self.cost_rebalance: bool = bool(getattr(spec, 'cost_rebalance', False))
@@ -528,6 +574,24 @@ class Autoscaler:
             getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
         self.reserved_fill_utilization_gate = bool(
             getattr(spec, 'reserved_fill_utilization_gate', False))
+        with self._fill_pool_state_lock:
+            # A service update may add/remove/reorder pool edges and therefore
+            # advance the authoritative service generation. Preserve location
+            # identity for scale-down shelter, but invalidate all old feed
+            # until the poller publishes the new complete generation.
+            for pool_state in self._fill_pool_states.values():
+                pool_state.free_slots = 0
+                pool_state.last_raw_free_slots = None
+                # Shelter-only until the next exact-generation heartbeat:
+                # preserve only the last real broker entitlement. Zero feed
+                # cannot authorize a launch under it, while widening the grant
+                # to edge_cap would let an update shelter holdings that a peer
+                # had already been granted.
+                pool_state.shelter_grant = min(pool_state.shelter_grant,
+                                               pool_state.edge_cap)
+                pool_state.grant = 0
+                pool_state.grant_epoch = None
+            self._refresh_legacy_fill_projection_locked()
         self.cost_rebalance = bool(getattr(spec, 'cost_rebalance', False))
         self.cost_rebalance_min_savings_fraction = float(
             getattr(spec, 'cost_rebalance_min_savings_fraction', 0.3))
@@ -617,13 +681,17 @@ class Autoscaler:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
 
-    def collect_reserved_capacity(self,
-                                  free_slots: int,
-                                  zero_cost_location_keys: list[dict[str, Any]],
-                                  timestamp: float,
-                                  grant: int | None = None,
-                                  grant_epoch: int | None = None,
-                                  grant_pool_key: str | None = None) -> None:
+    def collect_reserved_capacity(
+            self,
+            free_slots: int,
+            zero_cost_location_keys: list[dict[str, Any]],
+            timestamp: float,
+            grant: int | None = None,
+            grant_epoch: int | None = None,
+            grant_pool_key: str | None = None,
+            protocol_version: int = 1,
+            service_generation: int = 0,
+            physical_cluster_uid: str | None = None) -> None:
         """Ingest a free-capacity snapshot from the reserved-capacity poller.
 
         `zero_cost_location_keys` are Location.to_pickleable() dicts of
@@ -645,6 +713,12 @@ class Autoscaler:
         grant_pool_key the pool the epoch belongs to (epochs are per-pool
         round counters; the fence compares against that pool's round).
         """
+        if int(protocol_version) == 1:
+            # Explicit protocol demotion: scalar state becomes authoritative.
+            # A retained v2 map would otherwise make the overlay ignore every
+            # subsequent v1 heartbeat forever.
+            with self._fill_pool_state_lock:
+                self._fill_pool_states = {}
         free_slots = max(0, int(free_slots))
         prev_raw = self._fill_last_raw_free_slots
         self._fill_last_raw_free_slots = free_slots
@@ -661,6 +735,285 @@ class Autoscaler:
         self._fill_grant = grant
         self._fill_grant_epoch = grant_epoch
         self._fill_grant_pool_key = grant_pool_key
+        self._fill_protocol_version = int(protocol_version)
+        self._fill_service_generation = int(service_generation)
+        self._fill_physical_cluster_uid = physical_cluster_uid
+
+    def collect_reserved_capacity_pools(
+        self,
+        pool_snapshots: dict[str, dict[str, Any]],
+    ) -> None:
+        """Atomically ingest one complete protocol-v2 pool snapshot map.
+
+        Every entry must describe the same authoritative service generation.
+        A pool without an exact-generation round is still present, but carries
+        ``free_slots=0`` and ``grant=0``. A generation change starts damping
+        from zero, so feed from the old cross-pool budget cannot survive the
+        atomic map swap.
+        """
+        parsed: dict[str, _PoolFillState] = {}
+        generations: set[int] = set()
+        for map_key, snapshot in pool_snapshots.items():
+            pool_key = str(snapshot.get('pool_key', map_key))
+            if pool_key != map_key:
+                raise ValueError('Reserved-fill pool snapshot key mismatch: '
+                                 f'{map_key!r} != {pool_key!r}.')
+            protocol_version = int(snapshot.get('protocol_version', 0))
+            if protocol_version != 2:
+                raise ValueError('Multi-pool snapshots require reserved-fill '
+                                 f'protocol 2, got {protocol_version!r}.')
+            generation = int(snapshot['service_generation'])
+            if generation < 1:
+                raise ValueError('Reserved-fill service generation must be '
+                                 'positive under protocol 2.')
+            generations.add(generation)
+            edge_cap = max(0, int(snapshot['edge_cap']))
+            raw_free = max(0, int(snapshot.get('free_slots', 0)))
+            raw_free_by_accelerator = snapshot.get('free_slots_by_accelerator')
+            free_by_accelerator: dict[str, int] | None = None
+            if raw_free_by_accelerator is not None:
+                if not isinstance(raw_free_by_accelerator, dict):
+                    raise ValueError('Protocol-v2 exact-card feed must be a '
+                                     'mapping when present.')
+                free_by_accelerator = {}
+                for raw_card, raw_count in raw_free_by_accelerator.items():
+                    if (not isinstance(raw_card, str) or not raw_card or
+                            isinstance(raw_count, bool) or
+                            not isinstance(raw_count, int) or raw_count < 0):
+                        raise ValueError('Protocol-v2 exact-card feed contains '
+                                         'an invalid card/count entry.')
+                    card = raw_card.casefold()
+                    if card in free_by_accelerator:
+                        raise ValueError('Protocol-v2 exact-card feed contains '
+                                         'duplicate card identities.')
+                    if raw_count > 0:
+                        free_by_accelerator[card] = raw_count
+                if sum(free_by_accelerator.values()) != raw_free:
+                    raise ValueError('Protocol-v2 exact-card feed must sum to '
+                                     'its aggregate free-slot feed.')
+            grant = max(0, min(edge_cap, int(snapshot.get('grant', 0))))
+            shelter_grant = max(
+                0, min(edge_cap, int(snapshot.get('shelter_grant', grant))))
+            locations = [
+                location for location in (
+                    spot_placer.Location.from_pickleable(key)
+                    for key in snapshot.get('zero_cost_location_keys', []))
+                if location is not None
+            ]
+            physical_uid = snapshot.get('physical_cluster_uid')
+            if not isinstance(physical_uid, str) or not physical_uid:
+                raise ValueError('Protocol-v2 pool snapshot requires a '
+                                 'physical Kubernetes cluster UID.')
+            parsed[pool_key] = _PoolFillState(
+                protocol_version=protocol_version,
+                pool_key=pool_key,
+                physical_cluster_uid=physical_uid,
+                service_generation=generation,
+                edge_cap=edge_cap,
+                free_slots_by_accelerator=free_by_accelerator,
+                zero_cost_locations=locations,
+                snapshot_time=float(snapshot['timestamp']),
+                shelter_grant=shelter_grant,
+                grant=grant,
+                grant_epoch=(None if snapshot.get('grant_epoch') is None else
+                             int(snapshot['grant_epoch'])),
+            )
+            # Damping is filled under the lock from the prior exact-generation
+            # state; raw_free remains local so no half-updated map is visible.
+            parsed[pool_key].last_raw_free_slots = raw_free
+
+        if len(generations) > 1:
+            raise ValueError('A complete reserved-fill pool map must carry '
+                             f'one service generation, got {generations}.')
+
+        with self._fill_pool_state_lock:
+            previous = self._fill_pool_states
+            for pool_key, state in parsed.items():
+                raw_free = state.last_raw_free_slots or 0
+                prior = previous.get(pool_key)
+                if (prior is None or
+                        prior.service_generation != state.service_generation or
+                        prior.physical_cluster_uid
+                        != state.physical_cluster_uid):
+                    # A newly authorized generation gets no feed on its first
+                    # sample. The next exact-generation sample confirms the
+                    # increase, mirroring protocol-v1 two-poll damping.
+                    state.free_slots = 0
+                    state.last_raw_free_slots = raw_free
+                else:
+                    state.free_slots = prior.free_slots
+                    previous_raw = prior.last_raw_free_slots
+                    state.last_raw_free_slots = raw_free
+                    if raw_free <= state.free_slots:
+                        state.free_slots = raw_free
+                    elif (previous_raw is not None and
+                          previous_raw > state.free_slots):
+                        state.free_slots = min(previous_raw, raw_free)
+                state.free_slots = min(state.free_slots, state.edge_cap)
+            self._fill_pool_states = parsed
+            self._refresh_legacy_fill_projection_locked()
+
+    def seed_zero_cost_pools(
+        self,
+        pool_location_keys: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Seed protocol-v2 location identity without authorizing feed."""
+        with self._fill_pool_state_lock:
+            if self._fill_pool_states:
+                return
+            # A seed intentionally lacks protocol/generation/UID authority.
+            # Keep it only in the aggregate legacy location projection for
+            # restart-time scale-down protection; it cannot launch.
+            self._fill_zero_cost_locations = [
+                location for keys in pool_location_keys.values()
+                for location in (
+                    spot_placer.Location.from_pickleable(key) for key in keys)
+                if location is not None
+            ]
+
+    def _refresh_legacy_fill_projection_locked(self) -> None:
+        """Refresh scalar compatibility/status fields from the v2 map."""
+        states = list(self._fill_pool_states.values())
+        self._fill_free_slots = sum(state.free_slots for state in states)
+        raw_values = [
+            state.last_raw_free_slots
+            for state in states
+            if state.last_raw_free_slots is not None
+        ]
+        self._fill_last_raw_free_slots = (sum(raw_values)
+                                          if raw_values else None)
+        self._fill_zero_cost_locations = [
+            location for state in states
+            for location in state.zero_cost_locations
+        ]
+        timestamps = [
+            state.snapshot_time
+            for state in states
+            if state.snapshot_time is not None
+        ]
+        # The oldest component controls aggregate freshness.
+        self._fill_snapshot_time = min(timestamps) if timestamps else None
+        self._fill_grant = sum(state.grant for state in states)
+        self._fill_grant_epoch = None
+        self._fill_grant_pool_key = None
+
+    def _pool_fill_states_snapshot(self) -> dict[str, _PoolFillState]:
+        with self._fill_pool_state_lock:
+            return {
+                key: state.detached_copy()
+                for key, state in self._fill_pool_states.items()
+            }
+
+    def get_reserved_capacity_pool_shelter_grant(self, pool_key: str, *,
+                                                 service_generation: int,
+                                                 physical_cluster_uid: str,
+                                                 edge_cap: int) -> int:
+        """Return clipped, non-launching shelter from an exact prior edge.
+
+        The broker poller uses this only after a protocol-v2 round failed to
+        return an allocation.  Pool identity and service generation are both
+        fenced so neither a removed/re-added edge nor a same-name physical
+        cluster replacement can inherit stale shelter.
+        """
+        with self._fill_pool_state_lock:
+            prior = self._fill_pool_states.get(pool_key)
+            if (prior is None or prior.protocol_version != 2 or
+                    prior.service_generation != service_generation or
+                    prior.physical_cluster_uid != physical_cluster_uid):
+                return 0
+            return max(0, min(int(edge_cap), prior.shelter_grant))
+
+    @staticmethod
+    def _location_in_pool(location: spot_placer.Location,
+                          state: _PoolFillState) -> bool:
+        return any(
+            spot_placer.locations_match_placement(location, candidate)
+            for candidate in state.zero_cost_locations)
+
+    def _fill_pool_key_for_replica(
+        self,
+        info: 'replica_managers.ReplicaInfo',
+        states: dict[str, _PoolFillState],
+    ) -> str | None:
+        # Read persisted fields without triggering unittest.mock.Mock's dynamic
+        # attribute synthesis: only actual row state is provenance authority.
+        try:
+            persisted = vars(info)
+        except TypeError:
+            persisted = {}
+        persisted_key = persisted.get('reserved_fill_pool_key')
+        persisted_generation = persisted.get('reserved_fill_service_generation')
+        persisted_uid = persisted.get('reserved_fill_physical_cluster_uid')
+        provenance = (persisted_key, persisted_generation, persisted_uid)
+        if any(value is not None for value in provenance):
+            # Once any v2 origin field exists, the trio is authoritative.  A
+            # partial, malformed, retargeted, or future-generation row must not
+            # be re-attributed by a coincidentally matching context/location.
+            if (not isinstance(persisted_key, str) or not persisted_key or
+                    isinstance(persisted_generation, bool) or
+                    not isinstance(persisted_generation, int) or
+                    persisted_generation < 1 or
+                    not isinstance(persisted_uid, str) or not persisted_uid):
+                return None
+            state = states.get(persisted_key)
+            if (state is None or persisted_uid != state.physical_cluster_uid or
+                    persisted_generation > state.service_generation):
+                return None
+            location = info.get_spot_location()
+            if (location is None or
+                    not self._location_in_pool(location, state)):
+                # Explicit origin and persisted placement are one authority
+                # tuple.  A retargeted/corrupt row must not consume shelter
+                # from either its claimed pool or a coincidentally matching
+                # replacement pool.
+                return None
+            # Older positive generations remain valid for existing holdings:
+            # the generation is the immutable launch fence and is expected to
+            # trail the service set after later cap/policy heartbeats.
+            return persisted_key
+
+        # Only genuinely legacy rows (and ordinary demand rows), for which all
+        # three origin fields are absent, may use exact location attribution.
+        location = info.get_spot_location()
+        if location is None:
+            return None
+        matches = [
+            pool_key for pool_key, state in states.items()
+            if self._location_in_pool(location, state)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _exact_launch_shapes_for_pool(
+        state: _PoolFillState,) -> dict[str, tuple[str, int]] | None:
+        """Return normalized card -> exact launch shape in location order."""
+        try:
+            identity = reserved_capacity_broker.parse_pool_identity(
+                state.pool_key)
+        except (TypeError, ValueError):
+            return None
+        if identity.protocol_version != 2:
+            return None
+        shapes: dict[str, tuple[str, int]] = {}
+        for location in state.zero_cost_locations:
+            accelerators = location.accelerators
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                return None
+            raw_card, raw_count = next(iter(accelerators.items()))
+            if (not isinstance(raw_card, str) or not raw_card or
+                    isinstance(raw_count, bool) or
+                    not isinstance(raw_count, (int, float)) or
+                    not float(raw_count).is_integer() or raw_count <= 0):
+                return None
+            card = raw_card.casefold()
+            if card not in identity.gpu_names:
+                return None
+            shape = (raw_card, int(raw_count))
+            prior = shapes.get(card)
+            if prior is not None and prior[1] != shape[1]:
+                return None
+            shapes.setdefault(card, shape)
+        return shapes or None
 
     def fill_demand_sample(
         self,
@@ -705,6 +1058,54 @@ class Autoscaler:
             else:
                 demand += 1
         return fill, demand
+
+    def count_zero_cost_holdings_by_pool(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        pool_location_keys: dict[str, list[dict[str, Any]]] | None = None,
+        pool_authority: dict[str, tuple[str, int]] | None = None,
+    ) -> dict[str, tuple[int, int]]:
+        """Return the fill/demand holdings split for every v2 pool.
+
+        ``pool_authority`` supplies the durable UID/current generation during
+        controller restart, before an in-memory pool snapshot exists. It is
+        required to validate explicit v2 provenance; location-only fallback is
+        reserved for rows whose entire provenance trio predates protocol v2.
+        """
+        states = self._pool_fill_states_snapshot()
+        if pool_location_keys is not None:
+            for pool_key, keys in pool_location_keys.items():
+                if pool_key in states:
+                    continue
+                locations = [
+                    location
+                    for location in (spot_placer.Location.from_pickleable(key)
+                                     for key in keys)
+                    if location is not None
+                ]
+                authority = (pool_authority or {}).get(pool_key)
+                physical_uid, generation = (authority if authority is not None
+                                            else ('', 0))
+                states[pool_key] = _PoolFillState(
+                    protocol_version=2,
+                    pool_key=pool_key,
+                    physical_cluster_uid=(physical_uid),
+                    service_generation=generation,
+                    edge_cap=0,
+                    zero_cost_locations=locations)
+        counts = {pool_key: [0, 0] for pool_key in states}
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            replica_pool_key = self._fill_pool_key_for_replica(info, states)
+            if replica_pool_key is None:
+                continue
+            index = 0 if getattr(info, 'reserved_fill', False) else 1
+            counts[replica_pool_key][index] += self._fill_capacity_units(info)
+        return {
+            pool_key: (values[0], values[1])
+            for pool_key, values in counts.items()
+        }
 
     def seed_zero_cost_locations(
             self, zero_cost_location_keys: list[dict[str, Any]]) -> None:
@@ -894,7 +1295,7 @@ class Autoscaler:
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
         decisions: list[AutoscalerDecision],
-    ) -> tuple[int, dict[str, int] | None]:
+    ) -> tuple[int, dict[str, int] | None, dict[str, int] | None]:
         """Count free exact-card slots already claimed by demand decisions.
 
         Reserved fill is overlaid after ordinary demand scaling. A shaped
@@ -902,7 +1303,10 @@ class Autoscaler:
         slots, so emitting the full fill delta as well would create two rows
         for one physical slot. Count only claims that match a currently free
         exact card. Unknown or aggregate decisions retain the legacy fill
-        behavior because they cannot be reconciled safely by card here.
+        behavior because they cannot be reconciled safely by card here.  The
+        third return value preserves the exact-card split so protocol v2 can
+        debit only compatible physical pools instead of assigning an H200
+        demand claim to (for example) an unrelated L4 pool.
         """
         raw_free = getattr(self, 'free_reserved_slots_by_accelerator', None)
         configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
@@ -910,7 +1314,7 @@ class Autoscaler:
         if (not isinstance(raw_free, dict) or not raw_free or
                 not isinstance(configured_shapes, dict) or
                 not configured_shapes or not callable(shape_resolver)):
-            return 0, None
+            return 0, None, None
         shape_resolver_fn = typing.cast(
             typing.Callable[['replica_managers.ReplicaInfo'], tuple[str, int]],
             shape_resolver)
@@ -939,6 +1343,7 @@ class Autoscaler:
                     info)
 
         claimed = 0
+        claimed_by_card: dict[str, int] = {}
 
         def claim(card: str, count: int) -> None:
             nonlocal claimed
@@ -946,6 +1351,9 @@ class Autoscaler:
             consumed = min(available, max(0, count))
             remaining_free[card] = available - consumed
             claimed += consumed
+            if consumed > 0:
+                claimed_by_card[card] = (claimed_by_card.get(card, 0) +
+                                         consumed)
 
         for decision in decisions:
             if decision.operator != AutoscalerDecisionOperator.SCALE_UP:
@@ -981,7 +1389,411 @@ class Autoscaler:
                     0,
                     int(raw_target) - current_capacity_by_card.get(card, 0))
                 claim(card, math.ceil(shortfall / gpu_count))
-        return claimed, remaining_free
+        return claimed, remaining_free, claimed_by_card
+
+    def _fresh_pool_fill_free_slots(self, state: _PoolFillState) -> int:
+        if state.snapshot_time is None:
+            return 0
+        max_age = (reserved_capacity.poll_interval_seconds() *
+                   constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
+        if time.time() - state.snapshot_time > max_age:
+            return 0
+        return min(state.edge_cap, state.free_slots)
+
+    def _exact_card_pool_shelter(
+        self,
+        data: dict[str, dict[str, Any]],
+        targets: dict[str, int],
+        ordered_keys: list[str],
+    ) -> tuple[dict[str, dict[str, int]], dict[int, str]] | None:
+        """Partition exact-card demand coverage independently by pool."""
+        demand_target = getattr(self, 'target_num_replicas_by_accelerator', {})
+        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        if (not isinstance(demand_target, dict) or
+                not isinstance(configured_shapes, dict) or
+                not configured_shapes or
+                not getattr(self, '_compatibility_demand_complete', False)):
+            return None
+        canonical_by_name = {
+            str(card).casefold(): str(card) for card in configured_shapes
+        }
+        demand_by_card: dict[str, int] = {}
+        for raw_card, raw_target in demand_target.items():
+            card = canonical_by_name.get(str(raw_card).casefold())
+            if card is None:
+                return None
+            demand_by_card[card] = max(0, int(raw_target))
+        if sum(demand_by_card.values()) != self.get_final_target_num_replicas():
+            return None
+
+        replica_cards: dict[int, str] = {}
+        targets_by_pool_card: dict[str, dict[str, int]] = {}
+        for pool_key in ordered_keys:
+            current_by_card: dict[str, int] = {}
+            for info in data[pool_key]['infos']:
+                location = info.get_spot_location()
+                accelerators = (location.accelerators
+                                if location is not None else None)
+                if not accelerators or len(accelerators) != 1:
+                    return None
+                raw_card = next(iter(accelerators))
+                card = canonical_by_name.get(str(raw_card).casefold())
+                if card is None:
+                    return None
+                replica_cards[info.replica_id] = card
+                current_by_card[card] = (current_by_card.get(card, 0) +
+                                         self._fill_capacity_units(info))
+            remaining = targets[pool_key]
+            pool_targets: dict[str, int] = {}
+            for configured_card in configured_shapes:
+                card = canonical_by_name[str(configured_card).casefold()]
+                assigned = min(remaining, current_by_card.get(card, 0))
+                if assigned > 0:
+                    pool_targets[card] = assigned
+                    remaining -= assigned
+                if remaining <= 0:
+                    break
+            targets_by_pool_card[pool_key] = pool_targets
+
+        shelter: dict[str, dict[str, int]] = {
+            pool_key: {} for pool_key in ordered_keys
+        }
+        for configured_card in configured_shapes:
+            card = canonical_by_name[str(configured_card).casefold()]
+            remaining_demand = demand_by_card.get(card, 0)
+            for pool_key in ordered_keys:
+                target = targets_by_pool_card[pool_key].get(card, 0)
+                covered = min(target, remaining_demand)
+                remaining_demand -= covered
+                quota = target - covered
+                if quota > 0:
+                    shelter[pool_key][card] = quota
+        return shelter, replica_cards
+
+    def _apply_reserved_capacity_fill_v2(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        decisions: list[AutoscalerDecision],
+        states: dict[str, _PoolFillState],
+    ) -> list[AutoscalerDecision]:
+        """Apply independently fenced pool feeds under one service ceiling."""
+        if not states:
+            return decisions
+        ordered_keys = list(states)
+        generations = {state.service_generation for state in states.values()}
+        if len(generations) != 1:
+            # A complete poll publication may never mix budgets. Fail closed
+            # if corrupted in-memory state reaches a decision tick.
+            logger.error('Reserved-fill protocol-v2 state mixes service '
+                         f'generations {generations}; feeding zero.')
+            return decisions
+
+        data: dict[str, dict[str, Any]] = {
+            key: {
+                'count': 0,
+                'latest': 0,
+                'occupying': 0,
+                'demand': 0,
+                'demand_latest': 0,
+                'infos': [],
+            } for key in ordered_keys
+        }
+        num_nonterminal = 0
+        num_latest_nonterminal = 0
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            units = self._fill_capacity_units(info)
+            num_nonterminal += units
+            is_latest = info.version == self.latest_version
+            if is_latest:
+                num_latest_nonterminal += units
+            pool_key = self._fill_pool_key_for_replica(info, states)
+            if pool_key is None:
+                continue
+            entry = data[pool_key]
+            entry['infos'].append(info)
+            entry['count'] += units
+            if is_latest:
+                entry['latest'] += units
+            state = states[pool_key]
+            created_at = getattr(info, 'created_at', None)
+            if (not info.is_ready or
+                (state.snapshot_time is not None and created_at is not None and
+                 created_at > state.snapshot_time)):
+                entry['occupying'] += units
+            if not getattr(info, 'reserved_fill', False):
+                entry['demand'] += units
+                if is_latest:
+                    entry['demand_latest'] += units
+
+        spendable: dict[str, int] = {
+            key: max(
+                0,
+                self._fresh_pool_fill_free_slots(states[key]) -
+                int(data[key]['occupying'])) for key in ordered_keys
+        }
+        # Ordinary decisions are emitted before this overlay and may consume
+        # a just-observed reserved slot. Debit each exact-card claim only from
+        # pools that can serve that card. If several contexts expose the same
+        # card, the ordinary decision does not yet carry its eventual context;
+        # debit the claim from every compatible pool. This intentionally
+        # withholds some fill while placement is ambiguous, but guarantees that
+        # whichever context demand selects cannot receive both the demand launch
+        # and fill for the same physical slot.
+        (_, remaining_global_free_by_card, demand_reserved_claims_by_card) = (
+            self._reserved_slots_claimed_by_demand(replica_infos, decisions))
+        pool_cards: dict[str, frozenset[str]] = {}
+        pool_shapes: dict[str, dict[str, tuple[str, int]] | None] = {}
+        pool_exact_slots: dict[str, dict[str, int] | None] = {}
+        for key in ordered_keys:
+            try:
+                identity = reserved_capacity_broker.parse_pool_identity(key)
+            except (TypeError, ValueError):
+                logger.error('Reserved-fill protocol-v2 state has a malformed '
+                             f'pool key {key!r}; feeding it zero.')
+                spendable[key] = 0
+                pool_shapes[key] = None
+                pool_exact_slots[key] = {}
+                continue
+            if identity.protocol_version != 2:
+                logger.error('Reserved-fill protocol-v2 state has a non-v2 '
+                             f'pool key {key!r}; feeding it zero.')
+                spendable[key] = 0
+                pool_shapes[key] = None
+                pool_exact_slots[key] = {}
+                continue
+            pool_cards[key] = frozenset(identity.gpu_names)
+            shapes = self._exact_launch_shapes_for_pool(states[key])
+            pool_shapes[key] = shapes
+            exact_slots = states[key].free_slots_by_accelerator
+            if exact_slots is None:
+                pool_exact_slots[key] = None
+            elif (shapes is None or
+                  any(card not in shapes for card in exact_slots)):
+                # A present per-card feed is authoritative. If it cannot be
+                # translated back to an exact task shape, never degrade it to
+                # an aggregate launch.
+                logger.error('Reserved-fill protocol-v2 exact-card feed does '
+                             f'not match pool locations for {key!r}; '
+                             'withholding its launches.')
+                pool_exact_slots[key] = {}
+                spendable[key] = 0
+            else:
+                pool_exact_slots[key] = dict(exact_slots)
+        if demand_reserved_claims_by_card:
+            for card, claimed_slots in demand_reserved_claims_by_card.items():
+                canonical_card = str(card).casefold()
+                for key in ordered_keys:
+                    if canonical_card not in pool_cards.get(key, frozenset()):
+                        continue
+                    spendable[key] = max(0, spendable[key] - claimed_slots)
+                    exact_slots = pool_exact_slots[key]
+                    if exact_slots is not None:
+                        exact_slots[canonical_card] = max(
+                            0,
+                            exact_slots.get(canonical_card, 0) - claimed_slots)
+
+        targets: dict[str, int] = {}
+        launch_targets: dict[str, int] = {}
+        for key in ordered_keys:
+            state = states[key]
+            entry = data[key]
+            ceiling = state.shelter_grant + int(entry['demand'])
+            launch_ceiling = state.grant + int(entry['demand_latest'])
+            targets[key] = min(
+                int(entry['count']) + spendable[key], ceiling,
+                self.max_replicas)
+            launch_targets[key] = min(
+                int(entry['latest']) + spendable[key], launch_ceiling,
+                self.max_replicas)
+            state.fill_target = targets[key]
+
+        remaining_target_budget = self.max_replicas
+        for key in ordered_keys:
+            targets[key] = min(targets[key], remaining_target_budget)
+            remaining_target_budget -= targets[key]
+
+        total_target = sum(targets.values())
+        self._fill_target = total_target
+        with self._fill_pool_state_lock:
+            for key, target in targets.items():
+                live = self._fill_pool_states.get(key)
+                if (live is not None and live.service_generation
+                        == states[key].service_generation):
+                    live.fill_target = target
+        result = list(decisions)
+
+        # Partition the exact v1 shelter equation over pools. When complete
+        # exact-card demand telemetry exists, run the same coverage equation
+        # independently per card before the stable pool pass.
+        exact_shelter = self._exact_card_pool_shelter(data, targets,
+                                                      ordered_keys)
+        shelter_quota: dict[str, int] = {}
+        if exact_shelter is None:
+            remaining_demand = min(self.get_final_target_num_replicas(),
+                                   sum(targets.values()))
+            for key in ordered_keys:
+                covered = min(targets[key], remaining_demand)
+                remaining_demand -= covered
+                shelter_quota[key] = max(0, targets[key] - covered)
+
+        id_to_info = {info.replica_id: info for info in replica_infos}
+        victims_by_pool: dict[str, list[int]] = {key: [] for key in ordered_keys}
+        for index, decision in enumerate(decisions):
+            if decision.operator != AutoscalerDecisionOperator.SCALE_DOWN:
+                continue
+            assert isinstance(decision.target, (int, LogicalScaleDownTarget))
+            victim = id_to_info.get(_scale_down_replica_id(decision.target))
+            if victim is None:
+                continue
+            pool_key = self._fill_pool_key_for_replica(victim, states)
+            if pool_key is not None:
+                victims_by_pool[pool_key].append(index)
+        suppressed: set[int] = set()
+        for key in ordered_keys:
+            if exact_shelter is not None:
+                quotas_by_card, replica_cards = exact_shelter
+                remaining_by_card = dict(quotas_by_card[key])
+                for index in reversed(victims_by_pool[key]):
+                    victim_target = decisions[index].target
+                    assert isinstance(victim_target,
+                                      (int, LogicalScaleDownTarget))
+                    victim = id_to_info[_scale_down_replica_id(victim_target)]
+                    card = replica_cards[victim.replica_id]
+                    if remaining_by_card.get(card, 0) <= 0:
+                        continue
+                    suppressed.add(index)
+                    remaining_by_card[card] = max(
+                        0, remaining_by_card[card] -
+                        self._fill_capacity_units(victim))
+            else:
+                remaining = shelter_quota[key]
+                for index in reversed(victims_by_pool[key]):
+                    if remaining <= 0:
+                        break
+                    victim_target = decisions[index].target
+                    assert isinstance(victim_target,
+                                      (int, LogicalScaleDownTarget))
+                    victim = id_to_info[_scale_down_replica_id(victim_target)]
+                    suppressed.add(index)
+                    remaining -= self._fill_capacity_units(victim)
+        if suppressed:
+            result = [
+                decision for index, decision in enumerate(decisions)
+                if index not in suppressed
+            ]
+
+        num_old_nonterminal = num_nonterminal - num_latest_nonterminal
+        demand_target = self.get_final_target_num_replicas()
+        planned_total = (num_old_nonterminal +
+                         max(num_latest_nonterminal, demand_target))
+        hard_headroom = max(0, self.max_replicas - planned_total)
+        emitted_by_pool: dict[str, int] = {key: 0 for key in ordered_keys}
+        emitted_by_pool_card: dict[str, dict[str, int]] = {
+            key: {} for key in ordered_keys
+        }
+        # Additive round compatibility: a round written before the broker
+        # persisted its exact-card split still carries valid aggregate
+        # authority.  If this autoscaler independently has exact-card
+        # telemetry, use one shared, debit-aware budget across every legacy
+        # pool instead of multiplying it once per pool.  With no exact
+        # telemetry at all, retain the old unshaped launch behavior.
+        global_exact_slots: dict[str, int] | None = None
+        if remaining_global_free_by_card is not None:
+            global_exact_slots = {}
+            for raw_card, raw_count in remaining_global_free_by_card.items():
+                if (isinstance(raw_card, str) and raw_card and
+                        not isinstance(raw_count, bool) and
+                        isinstance(raw_count, int) and raw_count >= 0):
+                    card = raw_card.casefold()
+                    global_exact_slots[card] = (
+                        global_exact_slots.get(card, 0) + raw_count)
+        for key in ordered_keys:
+            if hard_headroom <= 0:
+                break
+            entry = data[key]
+            desired = max(0, launch_targets[key] - int(entry['latest']))
+            count = min(desired, hard_headroom)
+            if count <= 0:
+                continue
+            state = states[key]
+            override: dict[str, Any] = {
+                constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True,
+                constants.RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY:
+                    state.protocol_version,
+                constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY: key,
+                constants.RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY:
+                    state.service_generation,
+                constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY:
+                    state.physical_cluster_uid,
+                constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY: [
+                    location.to_pickleable()
+                    for location in state.zero_cost_locations
+                ],
+            }
+            if state.grant_epoch is not None:
+                override[constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY] = (
+                    state.grant_epoch)
+            exact_slots = pool_exact_slots[key]
+            if exact_slots is None and global_exact_slots is not None:
+                exact_slots = global_exact_slots
+            if exact_slots is None:
+                # No exact-card measurement exists in either authority path.
+                # This is the compatibility behavior for an old v2 round.
+                result.extend(_generate_scale_up_decisions(count, override))
+                emitted_by_pool[key] = count
+                hard_headroom -= count
+                continue
+
+            shapes = pool_shapes[key]
+            if shapes is None:
+                # A present exact-card budget is authoritative.  If it cannot
+                # be expressed as one of this pool's exact location shapes,
+                # never silently fall back to an aggregate launch.
+                continue
+            remaining = count
+            for card, (display_card, gpu_count) in shapes.items():
+                if remaining <= 0 or hard_headroom <= 0:
+                    break
+                available = max(0, int(exact_slots.get(card, 0)))
+                shaped_count = min(remaining, hard_headroom, available)
+                if shaped_count <= 0:
+                    continue
+                shaped_override = dict(override)
+                shaped_override['accelerators'] = {display_card: gpu_count}
+                result.extend(
+                    _generate_scale_up_decisions(shaped_count, shaped_override))
+                exact_slots[card] = available - shaped_count
+                emitted_by_pool_card[key][card] = (
+                    emitted_by_pool_card[key].get(card, 0) + shaped_count)
+                emitted_by_pool[key] += shaped_count
+                remaining -= shaped_count
+                hard_headroom -= shaped_count
+
+        if any(emitted_by_pool.values()):
+            with self._fill_pool_state_lock:
+                for key, emitted in emitted_by_pool.items():
+                    if emitted <= 0:
+                        continue
+                    live = self._fill_pool_states.get(key)
+                    source = states[key]
+                    if (live is None or live.service_generation
+                            != source.service_generation):
+                        continue
+                    live.free_slots = max(0, live.free_slots - emitted)
+                    if live.last_raw_free_slots is not None:
+                        live.last_raw_free_slots = max(
+                            0, live.last_raw_free_slots - emitted)
+                    if live.free_slots_by_accelerator is not None:
+                        for card, card_emitted in emitted_by_pool_card[
+                                key].items():
+                            live.free_slots_by_accelerator[card] = max(
+                                0,
+                                live.free_slots_by_accelerator.get(card, 0) -
+                                card_emitted)
+                self._refresh_legacy_fill_projection_locked()
+        return result
 
     def _apply_reserved_capacity_fill(
         self,
@@ -1018,6 +1830,10 @@ class Autoscaler:
         """
         if not self.reserved_capacity_fill:
             return decisions
+        pool_states = self._pool_fill_states_snapshot()
+        if pool_states:
+            return self._apply_reserved_capacity_fill_v2(
+                replica_infos, decisions, pool_states)
         # Zero-cost accounting is version-asymmetric by design; the
         # four roles use different version scopes:
         # - LAUNCH TARGET: latest-version zero-cost rows only. Old-version
@@ -1192,9 +2008,8 @@ class Autoscaler:
             # rolling update.
             fill_target_launch = min(fill_target_launch, fill_ceiling_launch)
         desired_fill_up = max(0, fill_target_launch - zero_cost_latest)
-        (demand_reserved_claims,
-         remaining_free_by_card) = self._reserved_slots_claimed_by_demand(
-             replica_infos, decisions)
+        (demand_reserved_claims, remaining_free_by_card,
+         _) = self._reserved_slots_claimed_by_demand(replica_infos, decisions)
         desired_fill_up = max(0, desired_fill_up - demand_reserved_claims)
         if remaining_free_by_card is not None:
             desired_fill_up = min(desired_fill_up,
@@ -1231,6 +2046,19 @@ class Autoscaler:
                     fill_override[
                         constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY] = (
                             self._fill_grant_pool_key)
+                    fill_override[
+                        constants.
+                        RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY] = (
+                            self._fill_protocol_version)
+                    fill_override[
+                        constants.
+                        RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY] = (
+                            self._fill_service_generation)
+                    if self._fill_physical_cluster_uid is not None:
+                        fill_override[
+                            constants.
+                            RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY] = (
+                                self._fill_physical_cluster_uid)
             if remaining_free_by_card is None:
                 result.extend(
                     _generate_scale_up_decisions(num_fill_up, fill_override))
@@ -1340,6 +2168,23 @@ class Autoscaler:
                 'fill_snapshot_age': snapshot_age,
                 'fill_target': self._fill_target,
             })
+            pool_states = self._pool_fill_states_snapshot()
+            if pool_states:
+                now = time.time()
+                info['fill_by_pool'] = {
+                    pool_key: {
+                        'free_slots': state.free_slots,
+                        'snapshot_age':
+                            (None if state.snapshot_time is None else now -
+                             state.snapshot_time),
+                        'fill_target': state.fill_target,
+                        'edge_cap': state.edge_cap,
+                        'grant': state.grant,
+                        'shelter_grant': state.shelter_grant,
+                        'service_generation': state.service_generation,
+                        'physical_cluster_uid': state.physical_cluster_uid,
+                    } for pool_key, state in pool_states.items()
+                }
         return info
 
     def get_ready_replica_capacity(self,
@@ -1882,7 +2727,37 @@ class Autoscaler:
         # one decision tick with suppression off could terminate the whole
         # fill fleet. Nested under a single key (in pickleable form) so
         # subclass _load_dynamic_states leftover-logging never sees it.
+        with self._fill_pool_state_lock:
+            fill_state_version = 2 if self._fill_pool_states else 1
+            # Capture the version discriminator and complete v2 pool map from
+            # one critical section. A poller map swap between two independent
+            # reads must not produce a v1 discriminator with v2 contents (or
+            # vice versa).
+            dumped_pools = {
+                key: {
+                    'protocol_version': pool.protocol_version,
+                    'physical_cluster_uid': pool.physical_cluster_uid,
+                    'service_generation': pool.service_generation,
+                    'edge_cap': pool.edge_cap,
+                    # This is non-launching restart shelter only. Feed is never
+                    # restored and the epoch remains DB-authoritative.
+                    'shelter_grant': max(0,
+                                         min(pool.edge_cap,
+                                             pool.shelter_grant)),
+                    'zero_cost_location_keys': [
+                        location.to_pickleable()
+                        for location in pool.zero_cost_locations
+                    ],
+                    'snapshot_time': pool.snapshot_time,
+                } for key, pool in self._fill_pool_states.items()
+            }
         states['reserved_capacity_fill_state'] = {
+            'version': fill_state_version,
+            # A brokered feed is round authority, not durable autoscaler
+            # state. Preserve standalone pre-broker behavior, but make every
+            # brokered v1 swap fail closed until its poller republishes.
+            'broker_authority': (self._fill_grant_pool_key is not None or
+                                 self._fill_grant_epoch is not None),
             'fill_free_slots': self._fill_free_slots,
             'fill_last_raw_free_slots': self._fill_last_raw_free_slots,
             'fill_zero_cost_location_keys': [
@@ -1890,6 +2765,11 @@ class Autoscaler:
                 for location in self._fill_zero_cost_locations
             ],
             'fill_snapshot_time': self._fill_snapshot_time,
+            # Grants/epochs remain DB-authoritative and are deliberately not
+            # restored. Locations and identity are enough to protect existing
+            # replicas during an in-process autoscaler swap; feed resumes only
+            # after the poller publishes an exact-generation round.
+            'pools': dumped_pools,
         }
         states.update(self._dump_dynamic_states())
         return states
@@ -1902,9 +2782,12 @@ class Autoscaler:
         # the constructor defaults (empty snapshot).
         fill_state = dynamic_states.pop('reserved_capacity_fill_state', None)
         if fill_state is not None:
-            self._fill_free_slots = fill_state.get('fill_free_slots', 0)
-            self._fill_last_raw_free_slots = fill_state.get(
-                'fill_last_raw_free_slots')
+            broker_authority = bool(fill_state.get('broker_authority', True))
+            self._fill_free_slots = (0 if broker_authority else max(
+                0, int(fill_state.get('fill_free_slots', 0))))
+            self._fill_last_raw_free_slots = (
+                None if broker_authority else
+                fill_state.get('fill_last_raw_free_slots'))
             self._fill_zero_cost_locations = [
                 location for location in
                 (spot_placer.Location.from_pickleable(key)
@@ -1912,6 +2795,53 @@ class Autoscaler:
                 if location is not None
             ]
             self._fill_snapshot_time = fill_state.get('fill_snapshot_time')
+            if fill_state.get('version') == 2:
+                restored: dict[str, _PoolFillState] = {}
+                for pool_key, raw_pool in fill_state.get('pools', {}).items():
+                    try:
+                        locations = [
+                            location for location in (
+                                spot_placer.Location.from_pickleable(key)
+                                for key in raw_pool.get(
+                                    'zero_cost_location_keys', []))
+                            if location is not None
+                        ]
+                        restored_edge_cap = max(0, int(raw_pool['edge_cap']))
+                        raw_shelter_grant = raw_pool.get('shelter_grant')
+                        if (isinstance(raw_shelter_grant, bool) or
+                                not isinstance(raw_shelter_grant, int) or
+                                raw_shelter_grant < 0):
+                            # Protocol v2 did not exist before this dump field.
+                            # Missing/malformed authority is corruption, not a
+                            # compatibility shape: retain location identity but
+                            # fail closed to zero shelter.
+                            restored_shelter_grant = 0
+                        else:
+                            restored_shelter_grant = min(
+                                restored_edge_cap, raw_shelter_grant)
+                        restored[str(pool_key)] = _PoolFillState(
+                            protocol_version=int(raw_pool['protocol_version']),
+                            pool_key=str(pool_key),
+                            physical_cluster_uid=str(
+                                raw_pool['physical_cluster_uid']),
+                            service_generation=int(
+                                raw_pool['service_generation']),
+                            edge_cap=restored_edge_cap,
+                            # Feed and epoch fail closed across the swap. The
+                            # prior real grant remains a shelter-only ceiling;
+                            # with zero feed it authorizes no launch.
+                            free_slots=0,
+                            last_raw_free_slots=None,
+                            zero_cost_locations=locations,
+                            snapshot_time=raw_pool.get('snapshot_time'),
+                            shelter_grant=restored_shelter_grant,
+                            grant=0,
+                            grant_epoch=None)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                with self._fill_pool_state_lock:
+                    self._fill_pool_states = restored
+                    self._refresh_legacy_fill_projection_locked()
         self._load_dynamic_states(dynamic_states)
 
 

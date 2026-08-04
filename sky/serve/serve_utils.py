@@ -1075,13 +1075,13 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                                  f'{sys_name} will replenish preempted spot '
                                  f'with {policy_description} instances.')
 
-    # Reserved fill supports one Kubernetes context per service. Multiple
-    # accelerator names in that context form one brokered capacity group,
-    # provided they use the same GPU count per backend. Zero-cost-ness is not
-    # fully knowable client-side, so all Kubernetes entries are the safe
-    # conservative candidate set.
+    # Every Kubernetes context is one reserved-fill pool edge.  Accelerator
+    # names in that context share one brokered capacity group and therefore
+    # must use the same physical GPU width.  Different physical contexts may
+    # use different widths.  Zero-cost-ness is not fully knowable client-side,
+    # so all Kubernetes entries are the safe conservative candidate set.
     if task.service.reserved_capacity_fill:
-        pool_shapes: dict[tuple[str | None, str], int] = {}
+        pool_widths: dict[str | None, set[int]] = {}
         for requested_resources in task.resources:
             if str(requested_resources.cloud).lower() != 'kubernetes':
                 continue
@@ -1107,19 +1107,22 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                         'reserved_capacity_fill requires each Kubernetes GPU '
                         'count to be a positive whole number. '
                         f'Got {gpu_name}:{gpu_count!r}.')
-            key = (requested_resources.region, gpu_name.lower())
-            pool_shapes[key] = max(pool_shapes.get(key, 1), int(gpu_count))
-        contexts = {context for context, _ in pool_shapes}
-        gpu_counts = set(pool_shapes.values())
-        if len(contexts) > 1 or len(gpu_counts) > 1:
-            shapes = sorted(pool_shapes.items(), key=repr)
+            context = requested_resources.region
+            exact_gpu_count = int(gpu_count)
+            pool_widths.setdefault(context, set()).add(exact_gpu_count)
+        inconsistent_contexts = {
+            context: sorted(widths)
+            for context, widths in pool_widths.items()
+            if len(widths) > 1
+        }
+        if inconsistent_contexts:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
-                    'reserved_capacity_fill requires one Kubernetes context '
-                    'and one GPU count per backend; the resources span '
-                    f'{shapes}.')
-        if (task.service.uses_logical_replicas and gpu_counts and
-                gpu_counts != {1}):
+                    'reserved_capacity_fill requires one GPU count within '
+                    'each Kubernetes context; got context widths '
+                    f'{inconsistent_contexts}.')
+        if (task.service.uses_logical_replicas and pool_widths and
+                any(widths != {1} for widths in pool_widths.values())):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
                     'dynamic_fallback_per_gpu with reserved_capacity_fill '

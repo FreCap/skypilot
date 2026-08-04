@@ -1,0 +1,645 @@
+# Multi-pool SkyServe reserved-capacity fill
+
+Status: implementation and local focused validation complete after adversarial
+review; PostgreSQL CI validation, rollout, and compatibility cleanup remain
+open
+
+Last updated: 2026-08-04
+
+Canonical owner: this file. The implementation, rollout evidence, and the
+stacked compatibility-removal change must stay synchronized with this
+contract.
+
+## Summary
+
+`reserved_capacity_fill` currently accepts only one Kubernetes context per
+service. Its durable claim, controller cache, autoscaler snapshot, demand
+gate, and launch override also each hold only one pool. Removing the validator
+alone would overwrite one context with another, multiply service-wide policy,
+and allow a grant measured in one cluster to launch or shelter a replica in a
+different cluster.
+
+This change partitions a service's zero-cost Kubernetes locations into one
+broker pool per context. Each `(service, pool)` edge has an independent claim,
+round, feed, grant, snapshot, damping state, and launch fence. The service's
+existing floor, utilization policy, demand target, `max_replicas`, and fill
+headroom remain global. A deterministic allocator divides that one global
+budget among its pool edges before the existing cross-service broker allocates
+capacity within each pool.
+
+The public YAML is unchanged. Adding a second Kubernetes context to a service
+that already enables `reserved_capacity_fill` opts that service into the new
+behavior.
+
+## Goals
+
+- Let one SkyServe service borrow idle reserved GPUs from multiple Kubernetes
+  clusters at the same time.
+- Keep `floor_replicas`, utilization gating, and `max_replicas` service-wide;
+  adding a context must not multiply any of them.
+- Preserve the existing one-pool behavior and YAML contract.
+- Isolate pool observation, staleness, grant damping, demand admission,
+  scale-down shelter, and epoch fencing.
+- Pin every fill launch to the exact pool whose feed authorized it, including
+  when two contexts expose the same accelerator name.
+- Roll out with an additive PostgreSQL schema and a fail-closed path back to a
+  one-pool binary.
+
+## Non-goals
+
+- User-configurable per-context floors, weights, or preferences. Stable task
+  resource order is the initial pool order; an optional policy can be designed
+  later without changing this contract.
+- Combining disjoint accelerator groups inside one Kubernetes context. All
+  zero-cost accelerator names in a context remain one physical pool group.
+- Parallel Kubernetes observations in the first release. Protocol v2 retains
+  the existing global broker lock and lease. A later cleanup may shard them
+  after protocol v1 is removed.
+- Treating two kubeconfig aliases as independent capacity. The new pool claim
+  records a Kubernetes cluster UID and rejects overlapping aliases when that
+  identity is available. A context whose physical identity cannot be verified
+  does not participate in multi-pool fill; ordinary demand placement remains
+  available.
+
+## Public contract
+
+The existing forms remain valid:
+
+```yaml
+service:
+  replica_policy:
+    reserved_capacity_fill: true
+```
+
+and:
+
+```yaml
+service:
+  replica_policy:
+    reserved_capacity_fill:
+      floor_replicas: 10
+      weight: 100
+      utilization_gate: true
+```
+
+For fill-enabled services, zero-cost Kubernetes candidates are grouped by
+context. Within each context:
+
+- all configured accelerator names form one broker pool;
+- every physical-backend candidate must use the same positive whole GPU count;
+- logical-replica candidates must continue to use exactly one GPU.
+
+Independent physical-backend contexts may use different per-replica GPU
+counts. Non-Kubernetes and paid candidates are unaffected.
+
+The policy fields retain these meanings:
+
+- `floor_replicas` is one total floor across all of the service's pools;
+- `weight` is the service's relative weight on every pool edge;
+- `utilization_gate` observes the service once and governs the same global
+  fill budget;
+- fill headroom is `max(0, max_replicas - demand_target)` across all pools;
+- the final number of nonterminal replicas across every version and location
+  never exceeds `max_replicas` because of fill.
+
+## Architecture and invariants
+
+### Pool discovery and identity
+
+The poller builds an ordered `FillPoolSpec` for each Kubernetes context. It
+contains the context, canonical accelerator shapes, matching zero-cost
+locations, broker key, and the Kubernetes `kube-system` namespace UID used as
+a non-secret physical-cluster identity.
+
+Protocol-v2 pool keys are versioned and use the physical UID plus canonical
+accelerator set. They never share a round with protocol-v1 context keys. The
+access context remains a separate claim field used only to query and launch.
+An overlapping live claim reached through a second context alias therefore
+joins the same physical pool instead of being counted twice. If one service
+configures two aliases of the same physical pool, the first task-resource
+position is the deterministic survivor and the duplicate edge is rejected.
+
+Physical identity is cached for at most one poll interval. Lookup uses a
+bounded read of the `kube-system` namespace UID. A failed lookup withdraws only
+that edge and feeds it zero; it never substitutes the context string as
+identity. Every fill launch first selects an exact carried location and then
+performs a forced UID refresh through that location's context before
+persistence or provider actuation. It compares the result with the carried
+identity, so retargeting a kubeconfig context between observation and
+actuation fails closed with no row or launch thread. A stale concurrent UID
+lookup may return only a newer live cache generation or failure, never its
+older observation. Ordinary demand placement remains available.
+
+There is at most one pool edge for a service in a context. Overlapping but
+non-identical accelerator groups remain invalid across services and are also
+invalid for two edges of one service.
+
+Claimants sharing one physical pool must also use one replica-slot width. The
+width used by the most claimants wins deterministically, with the smaller
+width winning a tie. Protocol v1 retains its historical behavior of deleting
+losing claims. Under protocol v2, a losing edge remains in its authoritative
+complete service set at the same generation but receives round-local zero
+grant/feed authority. Its differently-scaled poller cannot drive the shared
+capacity query; a matching-width poller publishes the durable round with the
+complete generation map and explicit zero entries for every loser. Thus a
+width conflict blackouts only that pool edge and cannot generation-fence a
+healthy sibling pool or create a delete/re-add heartbeat loop.
+
+### Durable claims and compatibility
+
+Serve schema revision 035 adds three PostgreSQL tables:
+
+- `reserved_fill_protocol_state`, a singleton durable activation gate whose
+  initial protocol is v1 and whose audit evidence records the common writer
+  image digest, canonical API/controller Deployment generation/UID
+  inventories, and the combined pod/process inventory count/SHA-256;
+- `reserved_fill_service_claim_sets`, one authoritative set marker and global
+  budget/governor row per service; and
+- `reserved_fill_pool_claims`, primary-keyed by `(service_name, pool_key)`,
+  carrying the current edge fields, access context, physical UID, and service
+  generation.
+
+Revision 035 also adds `claim_generations`, `protocol_version`, and nullable
+`feed_by_accelerator` to each pool round. The latter is a JSON map from service
+to its exact-card portion of the already-arbitrated feed. `NULL` means an old
+writer/round had no exact-card metadata; a present empty service map is
+authoritative zero shaped feed. Migration copies legacy claims into
+generation-zero normalized rows and
+marks their service sets `migration_shadow`. Shadows are never authoritative:
+while the protocol is v1, every new binary runs the behaviorally identical
+legacy one-pool path and reads only `reserved_fill_claims`. Its only additive
+decision field is the internal carried protocol used by the activation fence.
+
+Protocol v2 cannot be activated merely by submitting a multi-context spec or
+setting an environment variable. A separate zero-argument operator action runs
+inside an API pod and accepts no rollout identity or proof. Under the global
+broker lock it requires exact Serve schema head 035 and protocol v1, reads the
+fixed mounted in-cluster service-account token, and rejects malformed, legacy,
+or otherwise unbound tokens without complete nested namespace, Pod name, and
+Pod UID claims. It loads an explicit in-cluster API client, requires that
+client's installed bearer credential to equal those exact token bytes, disables
+credential refresh, and shares that client across all Core and Apps reads. A
+token rotation between identity parsing and client binding therefore fails
+closed instead of decoupling identity from Kubernetes authentication.
+
+The action reads the token-bound Pod by claimed namespace/name, requires its
+live UID to match, and follows the immutable controller-owner chain
+Pod -> ReplicaSet -> Deployment, checking every name and UID. From that
+authenticated API Deployment's chart-owned literal `SKYPILOT_RELEASE_NAME`,
+literal `SKYPILOT_API_SERVER_ROLE`, fixed name, and Helm instance label it
+mechanically discovers the complete writer topology. Compatibility mode
+requires exactly the API Deployment with role `all` and rejects a separate
+controller Deployment. HA mode requires the same API Deployment with role
+`api` plus the exact sibling controller Deployment with role `controller`.
+The controller image may be independently configured, but its live immutable
+digest must equal the API digest before activation.
+
+The action reads every discovered Deployment, every Pod in the release
+namespace, and every recent `all`/`controller` server-instance lease in the
+shared PostgreSQL database twice. Each Deployment must retain the same
+generation/resourceVersion/UID and exact pod UID/resourceVersion cohort. Every
+Deployment controller must have observed its generation; desired replicas
+must be positive; current, updated, ready, and available counts must all equal
+desired; and unavailable must be zero. Every selected Pod must be
+non-terminating, Running, Ready, carry the same chart/release/role identity,
+and have its fixed `skypilot-api` or `skypilot-controller` container ready at
+one common immutable imageID digest. A nonterminal same-release database
+migration Pod or an unattested same-release writer Pod blocks activation.
+
+The database inventory closes the independently deployed and cross-namespace
+writer hole: every recent `all` or `controller` lease, including unready or
+draining leases until the request backend's full stale horizon expires, must
+map one-to-one by role, Pod name, and Pod UID to the attested writer Pods. The
+server instance ID must itself equal that Downward-API Pod UID. Thus an old
+writer in another release or namespace blocks activation even though the
+token-bound Kubernetes Role cannot enumerate it. Both complete reads include
+the Deployment, Pod, and database-process identities and must be identical.
+All Kubernetes reads use the bounded timeout and the one no-refresh client.
+The exact token-bound Pod name and UID must be present in both verified API
+cohorts; caller arguments, Downward API environment, and generic `HOSTNAME`
+never supply activation identity.
+
+The singleton has dialect-portable database checks requiring proof fields to
+be all-null or all-present and requiring every v2 row to carry a structurally
+valid complete proof. The action records the common digest, canonical
+API/controller Deployment generation/UID inventories, and deterministic
+combined pod/process inventory count/SHA-256 while atomically advancing
+`reserved_fill_protocol_state`. Until that durable gate is v2, a multi-context
+poller withdraws normalized claims, feeds zero fill, and reports the exact
+activation error. This mechanically separates the complete writer rollout
+from feature activation.
+
+On its first protocol-v2 heartbeat, a new controller atomically adopts its
+shadow. Under the exact existing global broker lock, and only after acquiring
+that lock (never while holding a database transaction), one owner-fenced
+transaction:
+
+1. locks the service owner and service claim-set row;
+2. retains the existing generation for an identical semantic heartbeat, or
+   allocates a new globally monotonic generation from the protocol singleton
+   for every semantic change (including edge removal and disable/re-enable);
+3. writes the authoritative complete edge set for that generation;
+4. deletes normalized edges absent from the new set;
+5. writes the service-global budget and utilization state; and
+6. writes the stable first edge as the legacy projection.
+
+Readers select by the durable protocol gate, never by opportunistic fallback:
+v1 reads only legacy rows; v2 reads only complete, unexpired
+`authoritative_v2` sets whose normalized rows match the declared generation
+and edge count. A missing, shadow, corrupt, or expired set under v2 contributes
+no claim and feeds zero. The two representations are never unioned. Legacy
+heartbeat, move, or delete activity therefore cannot invent a second edge
+after v2 adoption, and a migration shadow cannot mask a fresher legacy
+heartbeat. The compatibility projection always retains the protocol-v1
+context-plus-accelerator pool key; it never copies the normalized
+physical-UID key.
+
+Disable and teardown delete the set, all normalized edges, and the legacy row
+in the same owner-fenced transaction. Reconciliation of a removed pool deletes
+that normalized pair and advances the complete set generation. Prune, overlap
+rejection, and deletion take the same global broker lock before their
+transaction and preserve the representation invariant. A confirmed
+protocol-v2 phantom retains its edge and generation while publishing zero
+authority, as described below. The lock order is always broker lock, then
+database transaction/row locks; no path reverses it or holds the lock during a
+caller-owned transaction.
+
+The compatibility projection is transitional. A stacked cleanup PR removes
+the legacy read/write path only after every production process uses revision
+035, every live fill service has normalized claims, multi-pool canaries pass,
+and the old-image rollback window is explicitly closed.
+
+### Service-global budget partition
+
+Before publishing claims, the poller reads replica rows once and attributes
+fill holdings to pools by their complete persisted origin tuple (pool key,
+immutable launch generation, and physical UID). An older positive launch
+generation remains valid while it is no newer than the service's current
+generation. If any origin field is present, a partial tuple, unknown pool,
+future generation, UID mismatch, or placement outside the claimed pool fails
+closed and receives no holding or scale-down shelter. Exact location matching
+is used only when all three fields are absent on a genuinely legacy row.
+
+Let `H = max(0, max_replicas - demand_target)`. Utilization gating is advanced
+exactly once per service heartbeat and persisted on the service claim-set row,
+using the existing dwell, bounded-step, boot-hold, blindness, and actuation
+rules. It produces one global utilization ceiling `U`; with the gate disabled,
+`U = H`. The allocatable budget is `G = min(H, U)`. Edge broker rows carry no
+independent utilization governor. A deterministic pure allocator produces
+edge caps and floors with these invariants:
+
+```text
+sum(edge_cap) <= G <= H
+sum(edge_floor) <= min(service_floor, G)
+edge_floor <= edge_cap
+sum(edge utilization entitlement) <= U
+```
+
+The exact allocation algorithm is:
+
+1. Iterate pools in stable task-resource order. Give each pool
+   `min(holdings, remaining G)` first. If holdings exceed `G`, later pools lose
+   cap first; the global max/headroom reduction always wins over blackout
+   stickiness.
+2. Define a pool's capacity hint as follows. A successful round no older than
+   the configured staleness limit contributes `holdings + last_observed_free`.
+   A never-observed, launchable pool contributes `holdings + 1`, permitting a
+   one-slot discovery probe. A stale/blackout pool contributes
+   `max(holdings, previous_edge_cap)`, clipped by remaining `G`. A benched pool
+   contributes holdings only.
+3. Distribute residual `G` by equal-weight capped water filling up to
+   `max(0, hint - assigned)`. Integer remainder goes to stable pool order.
+   Capacity beyond all hints remains unallocated; it is not guessed. After a
+   successful probe, the next heartbeat may expand that pool from its measured
+   hint.
+4. Set `F = min(service_floor, G)`. In stable order assign
+   `edge_floor = min(edge_cap, remaining F)` until `F` is exhausted. Thus the
+   existing/first context remains the primary floor holder and overflow moves
+   only when that edge cannot carry it.
+
+The utilization sample and release clock exist only on the service-set row.
+Measurement blackout never creates feed, and it cannot preserve authority
+above a reduced `H` or `U`: the new service generation immediately invalidates
+old grants. A global release step may be computed while a pool is blind, but
+the actuation gate prevents another step until the prior cap is reflected in
+aggregate holdings; there is no banked multi-step drop on recovery.
+
+The semantic input hash covers protocol, ordered pool identities and shapes,
+physical UIDs, edge cap/floor, global `H`/`U`, and policy. An identical
+heartbeat retains its generation; any semantic change draws the next value
+from the singleton's global counter. Disable does not reset that counter, and
+same-name service recreation therefore cannot reuse an old generation.
+Heartbeat-only or round-local holdings/feed changes do not advance it.
+
+### Broker isolation
+
+Claims, allocation lookups, grant cache entries, reconciliation removal, and
+prune reports use `(service_name, pool_key)` identities. Pool rounds remain
+keyed by `pool_key`, and their JSON grants/feeds remain service-keyed because a
+service has at most one edge in a pool. Each published service entry also
+carries the exact authoritative service generation used to compute it.
+
+For every pool `p`:
+
+```text
+sum(feed[p, service]) <= observed_free[p]
+sum(feed_by_accelerator[p, service].values()) <= feed[p, service]
+grant[p, service] <= edge_cap[p, service]
+```
+
+When the provider reports an exact-card split, the broker validates that it
+sums to the aggregate observation and contains only cards in the physical pool
+identity. It deterministically partitions the service feeds over that split
+and fences an exact-card-only redistribution by advancing the pool epoch. A
+malformed present split is a measurement blackout; malformed persisted shaped
+feed authorizes zero launches. Rounds written before the nullable field exists
+retain their aggregate compatibility behavior.
+
+A failed, stale, benched, or phantom pool feeds zero only for that pool. It
+does not erase another healthy edge of the same service. A pool epoch change
+fences only launches stamped for that pool.
+
+After the existing consecutive-observation threshold confirms a protocol-v2
+phantom, the broker publishes explicit zero grant/feed authority for that pool
+but retains the complete normalized claim set and its service generation. It
+must not remove the edge mid service poll: doing so would advance the global
+service fence, invalidate sibling rounds already driven in that poll, and let
+the next configured heartbeat re-add the edge in an endless generation-churn
+loop. Protocol v1 retains its legacy claim-removal behavior.
+
+If driving one protocol-v2 round raises or times out, that edge publishes
+feed zero, launch grant zero, and no epoch. It may retain only its prior
+same-generation, same-physical-UID grant, clipped to the current edge cap, as
+non-launching `shelter_grant`; a peer pool's successful round remains usable.
+
+Round freshness is conditional on generation equality. If the caller's claim
+generation is absent or differs from `claim_generations` in an otherwise fresh
+round, the broker must drive a new round; it may not return the old grant. A
+protocol-v2 pool always publishes an integer grant capped by its edge cap,
+including the one-claimant case. The historical `grant=None` fast path exists
+only in protocol v1.
+
+### Autoscaler state and actuation
+
+The autoscaler stores immutable per-pool snapshots in a map keyed by
+`pool_key`. Each `PoolFillState` owns its locations, physical UID,
+authoritative service generation, partitioned edge cap, raw and damped feed,
+optional service-specific exact-card feed, timestamp, grant, and epoch. The
+poller publishes a complete map atomically;
+free-slot increase damping, staleness, occupancy debit, and emission-time
+spending run independently per pool. A service-generation change atomically
+invalidates every old pool feed. A pool remains at feed zero until a round
+carrying that exact generation arrives, and its local grant is always clamped
+to its edge cap.
+
+Existing aggregate `fill_free_slots`, `fill_snapshot_age`, and `fill_target`
+status fields remain compatibility projections. Additive per-pool status is
+reported separately. A legacy dynamic-state dump is admitted as one anonymous
+pool only when it represents a single context; ambiguous state restores
+locations for scale-down protection but grants no launchable feed.
+
+Protocol-v2 dynamic state persists only each pool's last real grant as a
+`shelter_grant`. Loading it restores conservative scale-down shelter but always
+sets feed to zero and epoch to absent, so a controller restart cannot replay a
+launch entitlement. A fresh generation-matching broker round is required
+before scale-up resumes.
+
+Scale-down shelter is pool-local. A pool may shelter only zero-cost rows
+attributed to that pool, up to its live target or restored `shelter_grant` and
+after the global demand coverage attribution described below. Demand-placed
+rows remain ordinary demand first, but may become opportunistic shelter when
+demand falls, matching protocol-v1 behavior. Aggregate `max_replicas` remains
+the last launch guard.
+
+Every brokered fill scale-up carries:
+
+- its protocol version;
+- its pool key;
+- its pool round epoch; and
+- the exact pickleable location set belonging to that pool.
+
+Protocol-v2 decisions additionally carry the authoritative service generation,
+physical-cluster UID, and an exact accelerator shape when exact-card telemetry
+is available. Protocol v1 retains its legacy context-key authority and does not
+claim normalized generation or physical-UID provenance.
+
+The replica manager consumes those internal fields before constructing
+`Resources`, intersects them with current active zero-cost locations, and
+skips with no row or thread if the intersection is empty or does not match the
+pool. When exact-card metadata is present, every emitted override carries the
+measured card and its exact per-replica GPU count; the manager independently
+requires both the selected location and final persisted resource override to
+match that shape. It then re-reads the physical UID through that context. It
+never falls through to a different zero-cost context or paid capacity. The
+selected replica persists `reserved_fill_pool_key`,
+`reserved_fill_service_generation`, and
+`reserved_fill_physical_cluster_uid`; the final transaction verifies that
+the carried and round protocol equal the durable gate, plus the authoritative
+service generation, matching live composite claim, round generation, pool
+epoch, and selected physical identity. A protocol-v1 decision queued
+immediately before v2 activation (or a v2 decision queued before demotion)
+therefore cannot persist afterward.
+
+The advisory lock is not itself treated as a durable fence: PostgreSQL may
+drop its dedicated session while the process still believes the lock is held.
+Before a fill-row persist uses its ordinary ORM connection, it advances the
+existing global lease epoch on the exact advisory-lock session and carries that
+token into the replica transaction. The transaction locks and validates that
+epoch before inserting. Every replacement round advances the same epoch before
+its replica scan. If the persist transaction locks the token first, the
+replacement blocks and subsequently scans the committed row; if the replacement
+advances first, the stale persist writes nothing. The persist token does not
+refresh lease expiry, which remains evidence of a completed broker round.
+The local SQLite/FileLock path retains its historical mutex-only behavior and
+does not touch the PostgreSQL lease token. The replica transaction determines
+this exception from its database dialect: every PostgreSQL persist rejects a
+missing or non-positive token even if distributed-lock auto-detection
+transiently returned a FileLock.
+
+This service-generation predicate is the cross-pool fence. Repartitioning
+budget from pool A to B invalidates every queued A and B decision from the old
+generation before either can persist, even when one pool's previous round is
+otherwise fresh.
+
+Demand placement reads a `(service, pool)` grant cache. Saturation excludes
+only that pool's zero-cost locations. One saturated context cannot close an
+unrelated context that still has entitlement.
+
+Scale-down shelter preserves protocol-v1 behavior unchanged. Under protocol
+v2, let `T_i` be each pool target after ordinary decisions reserve their free
+slots, and `D` the demand target. Attribute `min(D, sum(T_i))` units of demand
+coverage across `T_i` in stable pool order. Pool `i` receives shelter quota
+`Q_i = T_i - coverage_i`, proving
+`sum(Q_i) = max(0, sum(T_i) - D)`, the existing aggregate v1 surplus. Victim
+suppression is performed independently per pool, from the tail of that pool's
+ordered zero-cost victims, while preserving the original global output order.
+
+When the existing exact-card demand map is complete, the same equation is
+applied independently per exact card before stable pool allocation. When it is
+incomplete, the aggregate equation above is used, exactly as v1 falls back to
+aggregate shelter. With one pool both paths produce the identical v1 quota and
+victim suffix for every origin and victim order; paid rows, fill-origin rows
+currently serving demand, and demand-origin zero-cost rows neither add nor
+subtract a second copy of demand. With several pools, every `Q_i` can shelter
+only victims physically attributed to `i`, so another pool's grant cannot
+shelter them.
+
+## Deployment and rollback
+
+1. Merge revision 035, normalized claims, pool-aware runtime, and tests while
+   the durable protocol gate remains v1. Protocol-v1 one-pool behavior is
+   unchanged and multi-context fill remains mechanically inactive.
+2. Run the migration Job, wait for its Pod to become terminal, then replace
+   every API/controller process. Resource
+   action authority remains explicitly disabled during the 034-to-035 mixed
+   rollout: old code recognizes only 034 evidence, new code recognizes only
+   freshly produced 035 evidence, and neither may promote from evidence
+   produced for the other schema head.
+3. Verify healthy legacy rounds, then run the zero-argument explicit activation
+   action inside an API pod. The action takes the global broker lock,
+   mechanically verifies exact schema head 035 plus stable all-ready API and,
+   in HA mode, controller Deployment/pod cohorts at one immutable digest. It
+   also requires the database-wide recent writer leases to equal those Pods;
+   wait at least the server-instance stale horizon after retiring an old or
+   draining release before retrying. The action derives its proof and performs
+   the one-row gate transaction. Verify the durable protocol gate reads v2 and
+   contains the common digest, canonical Deployment generation/UID
+   inventories, and combined pod/process inventory count/hash.
+4. Let every live fill controller atomically adopt an authoritative v2 claim
+   set. Verify generation/edge-count integrity, integer grants, and fresh 035
+   resource-action evidence before separately re-enabling any authority mode.
+5. Update `boltz-l4-fleet` to append the PHX H200 context. Confirm two claims,
+   independent rounds, an exact-context/UID H200 canary, and the global cap.
+6. Keep the stacked cleanup PR blocked until the observation window and
+   rollback gate below pass.
+
+Normal rollback must happen while the v2 image still runs: disable fill (or
+remove every secondary context), wait for pending v2 launches to be fenced and
+for secondary normalized claims to disappear, then run the zero-argument
+`python -m sky.serve.reserved_capacity_demotion` action inside an API pod. The
+action takes the same global broker lock, requires exact schema head 035, and
+uses its mounted pod-bound token to double-read and attest the complete stable
+API/controller writer rollout. It accepts no operator-supplied rollout identity.
+
+Under that lock, demotion takes PostgreSQL table locks that also exclude an old
+v1 writer unaware of the protocol singleton. In one transaction it inventories
+every authoritative set, refuses any multi-edge, malformed, stale-generation,
+or incomplete set, and refuses every legacy-only row. It rebuilds the complete
+legacy row for each valid single edge (including missing or divergent
+projections), rereads the exact projection inventory, and only then flips the
+durable gate to v1. A projection write or final validation failure rolls back
+both the rebuild and gate. Verify the command reports protocol v1 before rolling
+back the image. Demotion need not discover in-memory pending launches: the
+atomic carried-protocol predicate fences every queued v2 persist as soon as the
+gate changes. The additive tables remain.
+
+An emergency old-image rollback against an active multi-context spec promises
+only that the old controller emits no new multi-context fill. It cannot delete
+normalized claims and zero/stale feed may continue sheltering existing rows;
+it is not a supported drain procedure. Operators must restore the v2 image and
+perform the explicit disable/demote sequence above.
+
+Revision 035 advances resource-action activation evidence to exact revision
+035. Evidence from revision 034 is invalid for new code and is not silently
+re-labeled. Authority stays disabled for the entire mixed-image rollout and
+is re-enabled only from fresh 035 evidence. Rolling back the image while the
+database remains at 035 likewise requires authority to remain disabled,
+because the old validator cannot recognize current evidence.
+
+The cleanup PR may merge only after:
+
+- all production API and controller processes have run the new image for the
+  documented rollback window;
+- every live legacy claim has an equivalent normalized edge;
+- east-only and east-plus-PHX services have completed update and restart
+  canaries;
+- same-accelerator cross-context launch fencing has been observed; and
+- operators explicitly accept that rollback to a pre-035 image requires
+  removing multi-context fill first.
+
+## Verification
+
+Automated coverage must include:
+
+- bool/object/old-pickle configuration compatibility;
+- multi-context validation with per-context physical widths and logical
+  one-GPU enforcement;
+- populated PostgreSQL 034-to-035 upgrade, retained legacy rows, composite
+  edge upserts, old-style legacy upserts after migration, and re-upgrade;
+- one-to-two-to-one edge replacement and disable cleanup;
+- same-service claims in two pools without overwrite;
+- migration-shadow versus legacy-heartbeat races, legacy move/delete versus
+  v2 adoption, owner rotation, and atomic set-plus-projection failure;
+- protocol-v2 activation rejection for schema mismatch, an incomplete or
+  mixed-image API/controller rollout, a missing or independently overridden
+  controller, a changing double-read cohort, an active migration Pod, an
+  unattested same-release writer Pod, an extra/unready/draining database
+  writer lease, an invalid Pod -> ReplicaSet -> Deployment UID chain,
+  malformed/unbound or swapped in-cluster tokens, spoofed caller/environment
+  identity, or an already-active gate, plus successful compatibility and HA
+  persisted derived evidence;
+- zero-argument v2-to-v1 demotion with token-bound stable-writer attestation,
+  exact projection rebuild, multi-edge/malformed/legacy-only rejection, and
+  atomic projection-failure rollback;
+- overlap rejection, including kube-context aliases sharing one physical UID;
+- mixed-width protocol-v1 claim deletion plus protocol-v2 pool-local zero
+  authority without edge deletion, generation churn, or sibling invalidation;
+- per-pool grant, feed, damping, staleness, phantom, bench, epoch, cache, and
+  removal isolation;
+- service-global floor/cap conservation and deterministic over-cap drain;
+- global utilization-cap conservation, including need=1 across two pools;
+- headroom shrink during a pool blackout and a stale-round cap-repartition
+  race with concurrent replica persistence;
+- real-PostgreSQL protocol-v2 advisory-session termination after a persist
+  token is minted, with the replacement paused after its replica scan and
+  before publish while the stale persist proves it cannot land inside that
+  window;
+- one replica-table read and one utilization sample per service poll cycle;
+- identical H200 names in two contexts with exact-context launch selection;
+- context retargeting between decision and actuation with UID mismatch;
+- no row/thread on malformed, removed, benched, or superseded pool launches;
+- pool-local demand saturation and scale-down shelter;
+- legacy dynamic-state load and new per-pool dump/load; and
+- unchanged aggregate status plus additive per-pool status.
+
+Focused validation commands:
+
+```bash
+pytest -q tests/unit_tests/test_reserved_fill_broker.py
+pytest -q tests/unit_tests/test_reserved_capacity_fill.py
+pytest -q tests/unit_tests/test_spot_placer_hybrid.py
+pytest -q tests/unit_tests/test_concurrency_autoscaler.py
+pytest -q tests/unit_tests/test_reserved_fill_broker_pg.py
+bash format.sh --files <changed-python-files>
+git diff --check
+```
+
+Local pre-PR evidence on 2026-08-04: the feature-focused suite completed with
+1,547 passed, 54 environment-dependent skips (including PostgreSQL/Docker),
+and 28 passing subtests using the supported Kubernetes client 35.0.0; all 133
+affected Helm unit tests passed;
+repository mypy completed with no issues across 881 files; pylint scored
+10.00/10; dashboard lint completed with no warnings; and `git diff --check`
+passed. The skipped PostgreSQL cases remain a required CI merge gate.
+
+Production acceptance requires two live pool claims for `boltz-l4-fleet`, a
+successful PHX H200 replica canary whose persisted location is PHX, unchanged
+east serving health, no paid spill from a fill decision, and an observed total
+fleet no larger than the configured `max_replicas`.
+
+## Open gates
+
+- Implementation, deterministic concurrency coverage, and the focused local
+  SQLite/unit suites are complete. PostgreSQL-only modules skip during
+  collection on this development host because `testcontainers.postgres` is
+  unavailable and there is no usable Docker daemon; they must collect and pass
+  under the required PostgreSQL CI job before merge.
+- Revision 035 has not yet been exercised against a populated production-like
+  PostgreSQL database. The test includes a legacy writer held concurrently
+  with migration and verifies committed pre-migration state plus idempotent
+  re-upgrade.
+- The SkyPilot image has not yet been built or deployed.
+- The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
+- The compatibility cleanup PR must be authored in the implementation stack
+  before the feature PR is merge-ready and must remain blocked until the
+  rollout gates above pass.

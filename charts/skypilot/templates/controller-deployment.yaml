@@ -167,6 +167,8 @@ kind: Deployment
 metadata:
   name: {{ $fullName }}-controller
   namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ $controllerReplicas }}
   strategy:
@@ -193,6 +195,7 @@ spec:
         {{- end }}
       labels:
         app: {{ $fullName }}-controller
+        app.kubernetes.io/instance: {{ .Release.Name }}
         skypilot.co/role: controller
     spec:
       automountServiceAccountToken: {{ or .Values.kubernetesCredentials.useApiServerCluster $externalLBEnabled }}

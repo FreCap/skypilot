@@ -742,11 +742,17 @@ tests:
           path: metadata.name
           value: custom-fullname-api-server
       - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+      - equal:
           path: spec.selector.matchLabels.app
           value: custom-fullname-api
       - equal:
           path: spec.template.metadata.labels.app
           value: custom-fullname-api
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
       - contains:
           path: spec.template.spec.containers[0].env
           content:

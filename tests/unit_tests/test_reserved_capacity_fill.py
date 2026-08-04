@@ -8,6 +8,8 @@ that the launch path pins to zero-cost ACTIVE locations (skipping entirely
 when none is available -- fill must never spill to paid capacity).
 """
 # pylint: disable=protected-access
+import dataclasses
+import threading
 import time
 import types
 import unittest
@@ -22,13 +24,17 @@ from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
+from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import spot_placer
+from sky.utils import locks
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
 _SCALE_DOWN = autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
 _FILL_KEY = constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
 _EPOCH_KEY = constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY
+_PROTOCOL_KEY = constants.RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY
+_GENERATION_KEY = constants.RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY
 _POOL_KEY = constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY
 
 # Pickleable form of the zero-cost k8s location, as handed to
@@ -833,6 +839,24 @@ class TestPollerClaimLifecycle(unittest.TestCase):
     class _Stop(Exception):
         pass
 
+    def test_protocol_v2_dispatches_complete_set_cycle(self):
+        autoscaler = _make_autoscaler(fill=True)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        with mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'get_protocol_version',
+                               return_value=2), \
+             mock.patch.object(reserved_capacity,
+                               '_broker_cycle_v2') as cycle_v2, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer,
+                                              service_name='svc')
+        cycle_v2.assert_called_once()
+
     def test_disable_transition_removes_claim_once(self):
         autoscaler = _make_autoscaler(fill=True)
         placer = mock.Mock()
@@ -849,6 +873,9 @@ class TestPollerClaimLifecycle(unittest.TestCase):
 
         with mock.patch.object(reserved_capacity,
                                '_broker_cycle') as broker_cycle, \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'get_protocol_version',
+                               return_value=1), \
              mock.patch.object(reserved_capacity.reserved_capacity_broker,
                                'remove_claim') as remove_claim, \
              mock.patch.object(reserved_capacity.time,
@@ -891,6 +918,9 @@ class TestPollerClaimLifecycle(unittest.TestCase):
                 '_broker_cycle',
                 side_effect=RuntimeError('cycle died')) as broker_cycle, \
              mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'get_protocol_version',
+                               return_value=1), \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
                                'remove_claim') as remove_claim, \
              mock.patch.object(reserved_capacity.time,
                                'sleep',
@@ -905,6 +935,197 @@ class TestPollerClaimLifecycle(unittest.TestCase):
         # instead of ghosting until the TTL.
         self.assertEqual(remove_claim.call_count, 2)
         remove_claim.assert_called_with('svc')
+
+
+class TestMultiPoolBrokerCycle(unittest.TestCase):
+    """One v2 poll publishes a complete service generation."""
+
+    def test_cycle_reads_replicas_and_utilization_once_and_partitions_budget(
+            self):
+        east = spot_placer.Location.from_pickleable(
+            dict(_K8S_KEY, region='east-context'))
+        phx_key = dict(_K8S_KEY, region='phx-context')
+        phx_key['accelerators'] = {'H200': 1}
+        phx = spot_placer.Location.from_pickleable(phx_key)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [east, phx]
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=10)
+        autoscaler.reserved_fill_utilization_gate = True
+        demand_sample = mock.Mock()
+        demand_sample.demonstrated_need.return_value = 4
+        demand_sample.boot_hold.return_value = False
+        autoscaler.fill_demand_sample = mock.Mock(return_value=demand_sample)
+
+        allocations = [
+            reserved_capacity_broker.Allocation(grant=1,
+                                                feed=1,
+                                                round_id=1,
+                                                epoch=3,
+                                                snapshot_time=time.time(),
+                                                protocol_version=2,
+                                                service_generation=1),
+            reserved_capacity_broker.Allocation(grant=1,
+                                                feed=1,
+                                                round_id=1,
+                                                epoch=5,
+                                                snapshot_time=time.time(),
+                                                protocol_version=2,
+                                                service_generation=1),
+        ]
+        with mock.patch.object(
+                reserved_capacity,
+                'get_kubernetes_physical_cluster_uid',
+                side_effect=['east-uid', 'phx-uid']), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_replica_infos',
+                               return_value=[]) as get_replicas, \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_service_claim_set',
+                               return_value=None), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_round',
+                               return_value=None), \
+             mock.patch.object(reserved_capacity_broker,
+                               'replace_claim_set',
+                               return_value=1) as replace, \
+             mock.patch.object(reserved_capacity_broker,
+                               'run_round_if_stale',
+                               side_effect=allocations) as run_round:
+            reserved_capacity._broker_cycle_v2(autoscaler, placer, 'svc',
+                                               [east, phx], 'service-hash',
+                                               (123, 'controller-ip'))
+
+        get_replicas.assert_called_once_with('svc')
+        autoscaler.fill_demand_sample.assert_called_once_with([])
+        replace.assert_called_once()
+        edges = replace.call_args.kwargs['edges']
+        self.assertEqual([edge['access_context'] for edge in edges],
+                         ['east-context', 'phx-context'])
+        # Both never-observed, launchable pools get exactly one discovery
+        # slot; no pool independently receives the service's full headroom.
+        self.assertEqual([edge['effective_cap'] for edge in edges], [1, 1])
+        self.assertEqual(run_round.call_count, 2)
+        for call in run_round.call_args_list:
+            self.assertEqual(call.kwargs['expected_protocol_version'], 2)
+            self.assertEqual(call.kwargs['expected_service_generation'], 1)
+        self.assertEqual(set(autoscaler.info()['fill_by_pool']),
+                         {edges[0]['pool_key'], edges[1]['pool_key']})
+
+    def _assert_one_pool_round_failure_isolated(self, *, lock_timeout: bool):
+        east = spot_placer.Location.from_pickleable(
+            dict(_K8S_KEY, region='east-context'))
+        phx_key = dict(_K8S_KEY, region='phx-context')
+        phx_key['accelerators'] = {'H200': 1}
+        phx = spot_placer.Location.from_pickleable(phx_key)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [east, phx]
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=10)
+        now = time.time()
+        east_allocation = reserved_capacity_broker.Allocation(
+            grant=1,
+            feed=1,
+            round_id=1,
+            epoch=3,
+            snapshot_time=now,
+            protocol_version=2,
+            service_generation=1)
+        phx_allocation = reserved_capacity_broker.Allocation(
+            grant=1,
+            feed=1,
+            round_id=1,
+            epoch=5,
+            snapshot_time=now,
+            protocol_version=2,
+            service_generation=1)
+        phx_next = dataclasses.replace(phx_allocation,
+                                       round_id=2,
+                                       epoch=6,
+                                       snapshot_time=now + 1)
+        outcomes = iter((east_allocation, phx_allocation, 'fail', phx_next))
+        real_run_round = reserved_capacity_broker.run_round_if_stale
+
+        def _run_round(*args, **kwargs):
+            outcome = next(outcomes)
+            if outcome != 'fail':
+                return outcome
+            if not lock_timeout:
+                raise RuntimeError('deterministic transient round failure')
+            timeout_lock = mock.MagicMock()
+            timeout_lock.__enter__.side_effect = locks.LockTimeout(
+                'deterministic test timeout')
+            with mock.patch.object(reserved_capacity_broker.locks,
+                                   'get_lock',
+                                   return_value=timeout_lock):
+                return real_run_round(*args, **kwargs)
+
+        with mock.patch.object(
+                reserved_capacity,
+                'get_kubernetes_physical_cluster_uid',
+                side_effect=['east-uid', 'phx-uid', 'east-uid', 'phx-uid']), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_service_claim_set',
+                               return_value=None), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_round',
+                               return_value=None), \
+             mock.patch.object(reserved_capacity_broker,
+                               'replace_claim_set',
+                               return_value=1), \
+             mock.patch.object(reserved_capacity_broker,
+                               'run_round_if_stale',
+                               side_effect=_run_round):
+            for _ in range(2):
+                reserved_capacity._broker_cycle_v2(autoscaler, placer, 'svc',
+                                                   [east, phx], 'service-hash',
+                                                   (123, 'controller-ip'))
+
+        east_pool = reserved_capacity_broker.make_pool_key(
+            'east-context',
+            'a100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='east-uid')
+        phx_pool = reserved_capacity_broker.make_pool_key(
+            'phx-context',
+            'h200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='phx-uid')
+        east_state = autoscaler._fill_pool_states[east_pool]
+        phx_state = autoscaler._fill_pool_states[phx_pool]
+        # The failed edge keeps only non-launching shelter from the prior
+        # exact generation.  The healthy peer independently advances.
+        self.assertEqual(east_state.shelter_grant, 1)
+        self.assertEqual(east_state.grant, 0)
+        self.assertEqual(east_state.free_slots, 0)
+        self.assertIsNone(east_state.grant_epoch)
+        self.assertEqual(phx_state.shelter_grant, 1)
+        self.assertEqual(phx_state.grant, 1)
+        self.assertEqual(phx_state.free_slots, 1)
+        self.assertEqual(phx_state.grant_epoch, 6)
+
+        east_row = _replica(1, east.to_pickleable())
+        east_row.reserved_fill = True
+        east_row.reserved_fill_pool_key = east_pool
+        east_row.reserved_fill_service_generation = 1
+        east_row.reserved_fill_physical_cluster_uid = 'east-uid'
+        decisions = autoscaler._apply_reserved_capacity_fill(
+            [east_row], [autoscalers.AutoscalerDecision(_SCALE_DOWN, 1)])
+        # The failed pool's existing row remains sheltered, while only the
+        # healthy pool may emit a fresh launch.
+        self.assertEqual(_downs(decisions), [])
+        fill_pools = [
+            decision.target[_POOL_KEY] for decision in _ups(decisions) if
+            isinstance(decision.target, dict) and decision.target.get(_FILL_KEY)
+        ]
+        self.assertEqual(fill_pools, [phx_pool])
+
+    def test_failed_round_preserves_only_pool_local_shelter(self):
+        self._assert_one_pool_round_failure_isolated(lock_timeout=False)
+
+    def test_round_lock_timeout_preserves_only_pool_local_shelter(self):
+        self._assert_one_pool_round_failure_isolated(lock_timeout=True)
 
 
 class TestStaleSnapshot(unittest.TestCase):
@@ -958,6 +1179,526 @@ class TestIncreaseDamping(unittest.TestCase):
         _feed(autoscaler, 10, polls=1)
         _feed(autoscaler, 0, polls=1)
         self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+
+
+class TestMultiPoolAutoscaler(unittest.TestCase):
+    """Protocol-v2 feed and launch authority stays pool-local."""
+
+    def setUp(self):
+        self.east = make_location('east-context',
+                                  accelerators={'L4': 1},
+                                  cloud_name='Kubernetes',
+                                  use_spot=False)
+        self.phx = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        self.east_pool = reserved_capacity_broker.make_pool_key(
+            'east-context',
+            'l4',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='east-uid')
+        self.phx_pool = reserved_capacity_broker.make_pool_key(
+            'phx-context',
+            'h200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='phx-uid')
+
+    @staticmethod
+    def _exact_card_autoscaler(shapes):
+        spec = service_spec.SkyServiceSpec(readiness_path='/health',
+                                           initial_delay_seconds=60,
+                                           readiness_timeout_seconds=30,
+                                           endpoint_probe_interval_seconds=10,
+                                           lb_stream_timeout_seconds=60,
+                                           min_replicas=1,
+                                           max_replicas=5,
+                                           target_concurrency_per_replica=1,
+                                           reserved_capacity_fill=True)
+        autoscaler = autoscalers.ConcurrencyAutoscaler('svc', spec)
+        autoscaler.set_configured_accelerator_shapes(shapes)
+        return autoscaler
+
+    def _snapshots(self, generation=1, east_feed=2, phx_feed=2):
+        timestamp = time.time()
+        return {
+            self.east_pool: {
+                'protocol_version': 2,
+                'pool_key': self.east_pool,
+                'physical_cluster_uid': 'east-uid',
+                'service_generation': generation,
+                'edge_cap': 2,
+                'zero_cost_location_keys': [self.east.to_pickleable()],
+                'free_slots': east_feed,
+                'free_slots_by_accelerator': {
+                    'l4': east_feed
+                },
+                'grant': 2,
+                'grant_epoch': 11,
+                'timestamp': timestamp,
+            },
+            self.phx_pool: {
+                'protocol_version': 2,
+                'pool_key': self.phx_pool,
+                'physical_cluster_uid': 'phx-uid',
+                'service_generation': generation,
+                'edge_cap': 2,
+                'zero_cost_location_keys': [self.phx.to_pickleable()],
+                'free_slots': phx_feed,
+                'free_slots_by_accelerator': {
+                    'h200': phx_feed
+                },
+                'grant': 2,
+                'grant_epoch': 17,
+                'timestamp': timestamp,
+            },
+        }
+
+    def test_launches_carry_exact_pool_generation_uid_and_locations(self):
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=5)
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+
+        fill_ups = [
+            decision for decision in _ups(_decisions(autoscaler, []))
+            if decision.target is not None
+        ]
+        self.assertEqual(len(fill_ups), 4)
+        by_pool = {self.east_pool: 0, self.phx_pool: 0}
+        for decision in fill_ups:
+            override = decision.target
+            pool_key = override[_POOL_KEY]
+            by_pool[pool_key] += 1
+            self.assertEqual(override[_PROTOCOL_KEY], 2)
+            self.assertEqual(override[_GENERATION_KEY], 1)
+            expected_uid = ('east-uid'
+                            if pool_key == self.east_pool else 'phx-uid')
+            self.assertEqual(
+                override[
+                    constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY],
+                expected_uid)
+            self.assertEqual(
+                len(override[
+                    constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY]), 1)
+            expected_card = ('L4' if pool_key == self.east_pool else 'H200')
+            self.assertEqual(override['accelerators'], {expected_card: 1})
+        self.assertEqual(by_pool, {self.east_pool: 2, self.phx_pool: 2})
+
+    def test_exact_measurement_selects_available_card_in_mixed_pool(self):
+        mixed_l4 = make_location('phx-context',
+                                 accelerators={'L4': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        mixed_h200 = make_location('phx-context',
+                                   accelerators={'H200': 1},
+                                   cloud_name='Kubernetes',
+                                   use_spot=False)
+        mixed_pool = reserved_capacity_broker.make_pool_key(
+            'phx-context', ('L4', 'H200'),
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='mixed-uid')
+        snapshots = {
+            mixed_pool: {
+                'protocol_version': 2,
+                'pool_key': mixed_pool,
+                'physical_cluster_uid': 'mixed-uid',
+                'service_generation': 1,
+                'edge_cap': 2,
+                'zero_cost_location_keys': [
+                    mixed_l4.to_pickleable(),
+                    mixed_h200.to_pickleable(),
+                ],
+                'free_slots': 1,
+                # L4 is the first stable location, but only H200 is measured
+                # free.  Aggregate-only emission used to pick L4 here.
+                'free_slots_by_accelerator': {
+                    'h200': 1
+                },
+                'grant': 2,
+                'grant_epoch': 19,
+                'timestamp': time.time(),
+            }
+        }
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=3)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+
+        fill_ups = [
+            decision for decision in _ups(_decisions(autoscaler, [])) if
+            isinstance(decision.target, dict) and decision.target.get(_FILL_KEY)
+        ]
+        self.assertEqual(len(fill_ups), 1)
+        self.assertEqual(fill_ups[0].target['accelerators'], {'H200': 1})
+
+    def test_old_v2_round_without_exact_split_remains_compatible(self):
+        snapshots = self._snapshots(east_feed=1, phx_feed=0)
+        for snapshot in snapshots.values():
+            snapshot.pop('free_slots_by_accelerator')
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=3)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+
+        fill_ups = [
+            decision for decision in _ups(_decisions(autoscaler, [])) if
+            isinstance(decision.target, dict) and decision.target.get(_FILL_KEY)
+        ]
+        self.assertEqual(len(fill_ups), 1)
+        self.assertNotIn('accelerators', fill_ups[0].target)
+
+    def test_malformed_exact_card_feed_fails_snapshot_ingestion(self):
+        snapshots = self._snapshots(east_feed=2, phx_feed=0)
+        snapshots[self.east_pool]['free_slots_by_accelerator'] = {'l4': 1}
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=3)
+        with self.assertRaisesRegex(ValueError, 'must sum'):
+            autoscaler.collect_reserved_capacity_pools(snapshots)
+
+    def test_demand_debits_only_the_compatible_accelerator_pool(self):
+        autoscaler = self._exact_card_autoscaler({'L4': 1, 'H200': 1})
+        autoscaler.set_free_reserved_slots_by_accelerator({'H200': 1})
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        demand = autoscalers.AutoscalerDecision(_SCALE_UP,
+                                                {'accelerators': {
+                                                    'H200': 1
+                                                }})
+
+        decisions = autoscaler._apply_reserved_capacity_fill([], [demand])
+
+        fill_by_pool = {self.east_pool: 0, self.phx_pool: 0}
+        for decision in decisions:
+            if (not isinstance(decision.target, dict) or
+                    not decision.target.get(_FILL_KEY)):
+                continue
+            fill_by_pool[decision.target[_POOL_KEY]] += 1
+        # The H200 demand launch may consume PHX's reported slot. It must not
+        # debit the earlier L4 pool and then authorize duplicate H200 fill.
+        self.assertEqual(fill_by_pool, {self.east_pool: 2, self.phx_pool: 1})
+
+    def test_same_card_demand_conservatively_debits_every_possible_pool(self):
+        east_h200 = make_location('east-context',
+                                  accelerators={'H200': 1},
+                                  cloud_name='Kubernetes',
+                                  use_spot=False)
+        east_h200_pool = reserved_capacity_broker.make_pool_key(
+            'east-context',
+            'h200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='east-uid')
+        timestamp = time.time()
+        snapshots = {
+            east_h200_pool: {
+                'protocol_version': 2,
+                'pool_key': east_h200_pool,
+                'physical_cluster_uid': 'east-uid',
+                'service_generation': 1,
+                'edge_cap': 2,
+                'zero_cost_location_keys': [east_h200.to_pickleable()],
+                'free_slots': 2,
+                'free_slots_by_accelerator': {
+                    'h200': 2
+                },
+                'grant': 2,
+                'grant_epoch': 11,
+                'timestamp': timestamp,
+            },
+            self.phx_pool: {
+                'protocol_version': 2,
+                'pool_key': self.phx_pool,
+                'physical_cluster_uid': 'phx-uid',
+                'service_generation': 1,
+                'edge_cap': 2,
+                'zero_cost_location_keys': [self.phx.to_pickleable()],
+                'free_slots': 2,
+                'free_slots_by_accelerator': {
+                    'h200': 2
+                },
+                'grant': 2,
+                'grant_epoch': 17,
+                'timestamp': timestamp,
+            },
+        }
+        autoscaler = self._exact_card_autoscaler({'H200': 1})
+        autoscaler.set_free_reserved_slots_by_accelerator({'H200': 1})
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        demand = autoscalers.AutoscalerDecision(_SCALE_UP,
+                                                {'accelerators': {
+                                                    'H200': 1
+                                                }})
+
+        decisions = autoscaler._apply_reserved_capacity_fill([], [demand])
+
+        fill_by_pool = {east_h200_pool: 0, self.phx_pool: 0}
+        for decision in decisions:
+            if (not isinstance(decision.target, dict) or
+                    not decision.target.get(_FILL_KEY)):
+                continue
+            fill_by_pool[decision.target[_POOL_KEY]] += 1
+        # The ordinary decision has no context yet. Withholding one slot from
+        # both compatible pools is conservative, but prevents over-issuing no
+        # matter which context placement eventually selects.
+        self.assertEqual(fill_by_pool, {east_h200_pool: 1, self.phx_pool: 1})
+
+    def test_generation_change_invalidates_old_feed_and_restarts_damping(self):
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=5)
+        snapshots = self._snapshots(generation=1)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        self.assertEqual(
+            len([
+                decision for decision in _ups(_decisions(autoscaler, []))
+                if decision.target is not None
+            ]), 4)
+
+        autoscaler.collect_reserved_capacity_pools(
+            self._snapshots(generation=2))
+        self.assertEqual([
+            decision for decision in _ups(_decisions(autoscaler, []))
+            if decision.target is not None
+        ], [])
+        self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+
+    def test_shelter_carry_requires_exact_generation_and_uid_and_clips(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        autoscaler.collect_reserved_capacity_pools(self._snapshots())
+
+        self.assertEqual(
+            autoscaler.get_reserved_capacity_pool_shelter_grant(
+                self.east_pool,
+                service_generation=1,
+                physical_cluster_uid='east-uid',
+                edge_cap=1), 1)
+        self.assertEqual(
+            autoscaler.get_reserved_capacity_pool_shelter_grant(
+                self.east_pool,
+                service_generation=2,
+                physical_cluster_uid='east-uid',
+                edge_cap=2), 0)
+        self.assertEqual(
+            autoscaler.get_reserved_capacity_pool_shelter_grant(
+                self.east_pool,
+                service_generation=1,
+                physical_cluster_uid='replacement-uid',
+                edge_cap=2), 0)
+
+    def test_dynamic_restore_shelters_holdings_but_authorizes_no_feed(self):
+        old = _make_autoscaler(min_replicas=1, max_replicas=5)
+        snapshots = self._snapshots()
+        old.collect_reserved_capacity_pools(snapshots)
+        old.collect_reserved_capacity_pools(snapshots)
+        restored = _make_autoscaler(min_replicas=1, max_replicas=5)
+        restored.load_dynamic_states(old.dump_dynamic_states())
+        east_row = _replica(1, self.east.to_pickleable())
+        east_row.reserved_fill = True
+        phx_row = _replica(2, self.phx.to_pickleable())
+        phx_row.reserved_fill = True
+
+        decisions = _decisions(restored, [east_row, phx_row])
+        self.assertEqual(_ups(decisions), [])
+        self.assertEqual(_downs(decisions), [])
+        self.assertEqual(restored.info()['fill_free_slots'], 0)
+
+    def test_update_preserves_only_the_last_real_grant_for_shelter(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        snapshots = self._snapshots(east_feed=2, phx_feed=0)
+        snapshots[self.east_pool]['grant'] = 1
+        snapshots[self.phx_pool]['grant'] = 0
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+
+        autoscaler.update_version(2, _spec(min_replicas=0, max_replicas=5),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+
+        state = autoscaler._fill_pool_states[self.east_pool]
+        self.assertEqual(state.edge_cap, 2)
+        self.assertEqual(state.shelter_grant, 1)
+        self.assertEqual(state.grant, 0)
+        self.assertEqual(state.free_slots, 0)
+        self.assertIsNone(state.grant_epoch)
+        rows = [
+            _replica(1, self.east.to_pickleable()),
+            _replica(2, self.east.to_pickleable())
+        ]
+        for row in rows:
+            row.reserved_fill = True
+            row.reserved_fill_pool_key = self.east_pool
+            row.reserved_fill_service_generation = 1
+            row.reserved_fill_physical_cluster_uid = 'east-uid'
+        ordinary = [
+            autoscalers.AutoscalerDecision(_SCALE_DOWN, row.replica_id)
+            for row in rows
+        ]
+        decisions = autoscaler._apply_reserved_capacity_fill(rows, ordinary)
+        # One holding remains sheltered by the real grant. Expanding shelter to
+        # edge_cap would incorrectly suppress both scale-downs.
+        self.assertEqual(len(_downs(decisions)), 1)
+        self.assertEqual(_ups(decisions), [])
+
+    def test_dynamic_restore_uses_real_grant_as_nonlaunching_shelter(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=5)
+        snapshots = self._snapshots(east_feed=2, phx_feed=0)
+        snapshots[self.east_pool]['grant'] = 1
+        snapshots[self.phx_pool]['grant'] = 0
+        old.collect_reserved_capacity_pools(snapshots)
+        old.collect_reserved_capacity_pools(snapshots)
+        dumped = old.dump_dynamic_states()
+        self.assertEqual(
+            dumped['reserved_capacity_fill_state']['pools'][self.east_pool]
+            ['shelter_grant'], 1)
+
+        restored = _make_autoscaler(min_replicas=0, max_replicas=5)
+        restored.load_dynamic_states(dumped)
+
+        state = restored._fill_pool_states[self.east_pool]
+        self.assertEqual(state.shelter_grant, 1)
+        self.assertEqual(state.grant, 0)
+        self.assertEqual(state.free_slots, 0)
+        self.assertIsNone(state.grant_epoch)
+        rows = [
+            _replica(1, self.east.to_pickleable()),
+            _replica(2, self.east.to_pickleable())
+        ]
+        for row in rows:
+            row.reserved_fill = True
+            row.reserved_fill_pool_key = self.east_pool
+            row.reserved_fill_service_generation = 1
+            row.reserved_fill_physical_cluster_uid = 'east-uid'
+        ordinary = [
+            autoscalers.AutoscalerDecision(_SCALE_DOWN, row.replica_id)
+            for row in rows
+        ]
+        decisions = restored._apply_reserved_capacity_fill(rows, ordinary)
+        self.assertEqual(len(_downs(decisions)), 1)
+        self.assertEqual(_ups(decisions), [])
+
+    def test_dynamic_restore_invalid_shelter_grant_fails_closed(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=5)
+        snapshots = self._snapshots(east_feed=2, phx_feed=0)
+        old.collect_reserved_capacity_pools(snapshots)
+        old.collect_reserved_capacity_pools(snapshots)
+        for malformed in ('missing', None, True, -1, '2'):
+            with self.subTest(malformed=malformed):
+                dumped = old.dump_dynamic_states()
+                raw_pool = dumped['reserved_capacity_fill_state']['pools'][
+                    self.east_pool]
+                if malformed == 'missing':
+                    raw_pool.pop('shelter_grant')
+                else:
+                    raw_pool['shelter_grant'] = malformed
+                restored = _make_autoscaler(min_replicas=0, max_replicas=5)
+                restored.load_dynamic_states(dumped)
+                state = restored._fill_pool_states[self.east_pool]
+                self.assertEqual(state.shelter_grant, 0)
+                self.assertEqual(state.grant, 0)
+                self.assertEqual(state.free_slots, 0)
+                self.assertIsNone(state.grant_epoch)
+
+    def test_explicit_contradictory_provenance_gets_no_holding_or_shelter(self):
+        cases = {
+            'partial': {
+                'reserved_fill_pool_key': self.east_pool,
+            },
+            'unknown-pool': {
+                'reserved_fill_pool_key': 'retired-pool',
+                'reserved_fill_service_generation': 1,
+                'reserved_fill_physical_cluster_uid': 'east-uid',
+            },
+            'future-generation': {
+                'reserved_fill_pool_key': self.east_pool,
+                'reserved_fill_service_generation': 3,
+                'reserved_fill_physical_cluster_uid': 'east-uid',
+            },
+            'uid-mismatch': {
+                'reserved_fill_pool_key': self.east_pool,
+                'reserved_fill_service_generation': 1,
+                'reserved_fill_physical_cluster_uid': 'replacement-uid',
+            },
+        }
+        for name, provenance in cases.items():
+            with self.subTest(name=name):
+                autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+                autoscaler.collect_reserved_capacity_pools(
+                    self._snapshots(generation=2, east_feed=0, phx_feed=0))
+                row = _replica(1, self.east.to_pickleable())
+                row.reserved_fill = True
+                for field, value in provenance.items():
+                    setattr(row, field, value)
+
+                holdings = autoscaler.count_zero_cost_holdings_by_pool([row])
+                self.assertEqual(holdings[self.east_pool], (0, 0))
+                decisions = autoscaler._apply_reserved_capacity_fill(
+                    [row], [autoscalers.AutoscalerDecision(_SCALE_DOWN, 1)])
+                self.assertEqual(len(_downs(decisions)), 1)
+
+    def test_retargeted_explicit_row_does_not_fall_back_by_location(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        autoscaler.collect_reserved_capacity_pools(
+            self._snapshots(generation=2, east_feed=0, phx_feed=0))
+        # The row claims PHX provenance but its persisted placement is east.
+        # Neither the claimed pool nor the coincidentally matching east pool
+        # may adopt it.
+        row = _replica(1, self.east.to_pickleable())
+        row.reserved_fill = True
+        row.reserved_fill_pool_key = self.phx_pool
+        row.reserved_fill_service_generation = 1
+        row.reserved_fill_physical_cluster_uid = 'phx-uid'
+
+        holdings = autoscaler.count_zero_cost_holdings_by_pool([row])
+        self.assertEqual(holdings[self.east_pool], (0, 0))
+        self.assertEqual(holdings[self.phx_pool], (0, 0))
+        decisions = autoscaler._apply_reserved_capacity_fill(
+            [row], [autoscalers.AutoscalerDecision(_SCALE_DOWN, 1)])
+        self.assertEqual(len(_downs(decisions)), 1)
+
+    def test_older_launch_generation_remains_valid_pool_provenance(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        autoscaler.collect_reserved_capacity_pools(
+            self._snapshots(generation=2, east_feed=0, phx_feed=0))
+        row = _replica(1, self.east.to_pickleable())
+        row.reserved_fill = True
+        row.reserved_fill_pool_key = self.east_pool
+        row.reserved_fill_service_generation = 1
+        row.reserved_fill_physical_cluster_uid = 'east-uid'
+
+        holdings = autoscaler.count_zero_cost_holdings_by_pool([row])
+        self.assertEqual(holdings[self.east_pool], (1, 0))
+        decisions = autoscaler._apply_reserved_capacity_fill(
+            [row], [autoscalers.AutoscalerDecision(_SCALE_DOWN, 1)])
+        self.assertEqual(_downs(decisions), [])
+
+    def test_provenance_free_legacy_row_keeps_location_fallback(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        autoscaler.collect_reserved_capacity_pools(
+            self._snapshots(generation=2, east_feed=0, phx_feed=0))
+        row = _replica(1, self.east.to_pickleable())
+        row.reserved_fill = True
+
+        holdings = autoscaler.count_zero_cost_holdings_by_pool([row])
+        self.assertEqual(holdings[self.east_pool], (1, 0))
+        decisions = autoscaler._apply_reserved_capacity_fill(
+            [row], [autoscalers.AutoscalerDecision(_SCALE_DOWN, 1)])
+        self.assertEqual(_downs(decisions), [])
+
+    def test_protocol_demotion_clears_v2_map_and_accepts_v1_snapshots(self):
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=5)
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        self.assertIn('fill_by_pool', autoscaler.info())
+
+        autoscaler.collect_reserved_capacity(0, [_K8S_KEY],
+                                             time.time(),
+                                             protocol_version=1)
+        autoscaler.collect_reserved_capacity(2, [_K8S_KEY],
+                                             time.time(),
+                                             protocol_version=1)
+        autoscaler.collect_reserved_capacity(2, [_K8S_KEY],
+                                             time.time(),
+                                             protocol_version=1)
+        self.assertNotIn('fill_by_pool', autoscaler.info())
+        self.assertEqual(autoscaler.info()['fill_free_slots'], 2)
 
 
 class TestCapacityHintDemandOnly(unittest.TestCase):
@@ -1037,6 +1778,194 @@ class TestZeroCostSelection(unittest.TestCase):
 
 class TestFillLaunchPath(unittest.TestCase):
     """Sentinel launches pin zero-cost-only; aborts leak nothing."""
+
+    @staticmethod
+    def _v2_override(location, *, epoch=3, gpu='H200', exact_shape=None):
+        pool = reserved_capacity_broker.make_pool_key(
+            location.region,
+            gpu,
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-uid')
+        override = {
+            _FILL_KEY: True,
+            _PROTOCOL_KEY: 2,
+            _GENERATION_KEY: 7,
+            _POOL_KEY: pool,
+            _EPOCH_KEY: epoch,
+            constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY: 'physical-uid',
+            constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY: [
+                location.to_pickleable()
+            ],
+        }
+        if exact_shape is not None:
+            override['accelerators'] = exact_shape
+        return override
+
+    def test_v2_missing_epoch_fails_before_persist(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        manager = _make_manager(placer)
+        override = self._v2_override(location)
+        override.pop(_EPOCH_KEY)
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist:
+            self.assertFalse(manager._launch_replica(7, override))
+        persist.assert_not_called()
+
+    def test_v2_pool_key_rejects_selected_accelerator_mismatch(self):
+        location = make_location('phx-context',
+                                 accelerators={'A100': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist:
+            self.assertFalse(
+                manager._launch_replica(7,
+                                        self._v2_override(location,
+                                                          gpu='H200')))
+        persist.assert_not_called()
+        placer.release_retry.assert_called_once_with(location)
+
+    def test_v2_uid_retarget_releases_consumed_retry(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid',
+                 return_value='replacement-uid'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist:
+            self.assertFalse(
+                manager._launch_replica(7, self._v2_override(location)))
+        persist.assert_not_called()
+        placer.release_retry.assert_called_once_with(location)
+
+    def test_v2_exact_shape_rejects_placer_returning_other_card(self):
+        l4 = make_location('phx-context',
+                           accelerators={'L4': 1},
+                           cloud_name='Kubernetes',
+                           use_spot=False)
+        h200 = make_location('phx-context',
+                             accelerators={'H200': 1},
+                             cloud_name='Kubernetes',
+                             use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [l4, h200]
+        # Deliberately violate the allowed-location contract: the launch path
+        # must independently enforce the exact shape before persistence.
+        placer.select_next_zero_cost_location.return_value = l4
+        manager = _make_manager(placer)
+        override = self._v2_override(h200, exact_shape={'H200': 1})
+        override[constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY] = [
+            l4.to_pickleable(),
+            h200.to_pickleable(),
+        ]
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist:
+            self.assertFalse(manager._launch_replica(7, override))
+        persist.assert_not_called()
+        placer.release_retry.assert_called_once_with(l4)
+
+    def test_v2_persist_fence_releases_consumed_retry(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid',
+                 return_value='physical-uid'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica',
+                               return_value=False):
+            self.assertFalse(
+                manager._launch_replica(7, self._v2_override(location)))
+        placer.release_retry.assert_called_once_with(location)
+
+    def test_v2_launch_persists_every_authority_field(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        override = self._v2_override(location, exact_shape={'H200': 1})
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid',
+                 return_value='physical-uid'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica',
+                               return_value=True) as persist:
+            self.assertTrue(manager._launch_replica(7, override))
+        info = persist.call_args.args[2]
+        self.assertEqual(info.reserved_fill_pool_key, override[_POOL_KEY])
+        self.assertEqual(info.reserved_fill_service_generation, 7)
+        self.assertEqual(info.reserved_fill_physical_cluster_uid,
+                         'physical-uid')
+        self.assertEqual(info.resources_override['accelerators'], {'H200': 1})
+        self.assertEqual(persist.call_args.kwargs['expected_epoch'], 3)
+        self.assertEqual(
+            persist.call_args.kwargs['expected_service_generation'], 7)
 
     def test_abort_creates_no_record_and_keeps_id(self):
         placer = mock.Mock()
@@ -1172,6 +2101,40 @@ class TestFillLaunchPath(unittest.TestCase):
 class TestDemandLaunchBudget(unittest.TestCase):
     """Demand launches obey measured free-GPU capacity."""
 
+    def test_v2_grant_saturates_only_its_physical_pool(self):
+        east = make_location('east-context',
+                             accelerators={'A100': 1},
+                             cloud_name='Kubernetes',
+                             use_spot=False)
+        phx = make_location('phx-context',
+                            accelerators={'A100': 1},
+                            cloud_name='Kubernetes',
+                            use_spot=False)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [east, phx]
+        manager = _make_manager(placer)
+        east_replica = _replica(1, east.to_pickleable())
+        grants = {
+            'east-pool': reserved_capacity_broker.CachedPoolGrant(
+                grant=1,
+                access_context='east-context',
+                accelerator_names=('a100',),
+                physical_cluster_uid='east-uid',
+                service_generation=1),
+            'phx-pool': reserved_capacity_broker.CachedPoolGrant(
+                grant=2,
+                access_context='phx-context',
+                accelerator_names=('a100',),
+                physical_cluster_uid='phx-uid',
+                service_generation=1),
+        }
+        with mock.patch.object(reserved_capacity_broker,
+                               'get_cached_pool_grants',
+                               return_value=grants):
+            saturated = manager._demand_saturated_zero_cost_locations(
+                [east_replica])
+        self.assertEqual(saturated, {east})
+
     def test_exhausted_zero_cost_only_budget_persists_no_replica(self):
         location = _make_location('research-ctx', 'free')
         placer = mock.Mock()
@@ -1212,6 +2175,218 @@ class TestQueryFreeSlots(unittest.TestCase):
             },
             'use_spot': False,
         })
+
+    def setUp(self):
+        with reserved_capacity._PHYSICAL_CLUSTER_UID_CACHE_LOCK:
+            reserved_capacity._PHYSICAL_CLUSTER_UID_CACHE.clear()
+            reserved_capacity._PHYSICAL_CLUSTER_UID_LOOKUP_GENERATIONS.clear()
+
+    def test_global_pool_budget_retains_holdings_before_water_filling(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            3, 3, (reserved_capacity.FillPoolBudgetInput(
+                2, 10), reserved_capacity.FillPoolBudgetInput(2, 10)))
+        self.assertEqual(
+            [(budget.edge_cap, budget.edge_floor) for budget in budgets],
+            [(2, 2), (1, 1)])
+
+    def test_global_pool_budget_water_fills_with_stable_remainder(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            7, 2, (reserved_capacity.FillPoolBudgetInput(
+                0, 1), reserved_capacity.FillPoolBudgetInput(
+                    0, 10), reserved_capacity.FillPoolBudgetInput(0, 10)))
+        self.assertEqual([budget.edge_cap for budget in budgets], [1, 3, 3])
+        self.assertEqual([budget.edge_floor for budget in budgets], [1, 1, 0])
+
+    def test_global_pool_budget_does_not_invent_capacity(self):
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            10, 10, (reserved_capacity.FillPoolBudgetInput(
+                0, 2), reserved_capacity.FillPoolBudgetInput(0, 1)))
+        self.assertEqual([budget.edge_cap for budget in budgets], [2, 1])
+        self.assertEqual(sum(budget.edge_cap for budget in budgets), 3)
+
+    def test_context_groups_keep_first_position_and_canonical_shapes(self):
+        locations = [
+            self._k8s_location(region='ctx-b', gpu='h200', count=8),
+            self._k8s_location(region='ctx-a', gpu='H100', count=2),
+            self._k8s_location(region='ctx-b', gpu='H200', count=8),
+            self._k8s_location(region='ctx-a', gpu='A100', count=2),
+        ]
+        groups = reserved_capacity.group_zero_cost_fill_pools(locations)
+        self.assertEqual([group.context for group in groups],
+                         ['ctx-b', 'ctx-a'])
+        self.assertEqual(groups[0].position, 0)
+        self.assertEqual(groups[0].shapes, (('h200', 8),))
+        self.assertEqual(groups[0].locations, (locations[0], locations[2]))
+        self.assertEqual(groups[1].position, 1)
+        self.assertEqual(groups[1].shapes, (('a100', 2), ('h100', 2)))
+        self.assertEqual(groups[1].gpus_per_replica, 2)
+
+    def test_context_groups_allow_different_physical_widths(self):
+        groups = reserved_capacity.group_zero_cost_fill_pools([
+            self._k8s_location(region='ctx-a', gpu='A100', count=1),
+            self._k8s_location(region='ctx-b', gpu='H200', count=8),
+        ])
+        self.assertEqual([group.gpus_per_replica for group in groups], [1, 8])
+
+    def test_context_group_rejects_mixed_widths(self):
+        with self.assertRaisesRegex(ValueError,
+                                    'one GPU count within each Kubernetes'):
+            reserved_capacity.group_zero_cost_fill_pools([
+                self._k8s_location(region='ctx-a', gpu='A100', count=1),
+                self._k8s_location(region='ctx-a', gpu='H100', count=2),
+            ])
+
+    def test_physical_uid_is_cached_for_at_most_one_poll_interval(self):
+        core_api = mock.Mock()
+        core_api.read_namespace.side_effect = [
+            types.SimpleNamespace(metadata=types.SimpleNamespace(
+                uid='uid-first')),
+            types.SimpleNamespace(metadata=types.SimpleNamespace(
+                uid='uid-second')),
+        ]
+        with mock.patch.object(reserved_capacity.kubernetes,
+                               'core_api',
+                               return_value=core_api), \
+             mock.patch.object(reserved_capacity,
+                               'poll_interval_seconds',
+                               return_value=10), \
+             mock.patch.object(reserved_capacity.time,
+                               'monotonic',
+                               side_effect=[100, 101, 105, 111, 112]):
+            first = reserved_capacity.get_kubernetes_physical_cluster_uid('ctx')
+            cached = reserved_capacity.get_kubernetes_physical_cluster_uid(
+                'ctx')
+            refreshed = reserved_capacity.get_kubernetes_physical_cluster_uid(
+                'ctx')
+        self.assertEqual((first, cached, refreshed),
+                         ('uid-first', 'uid-first', 'uid-second'))
+        self.assertEqual(core_api.read_namespace.call_count, 2)
+        core_api.read_namespace.assert_called_with(
+            'kube-system',
+            _request_timeout=reserved_capacity.kubernetes.API_TIMEOUT)
+
+    def test_force_refresh_bypasses_physical_uid_cache(self):
+        core_api = mock.Mock()
+        core_api.read_namespace.side_effect = [
+            types.SimpleNamespace(metadata=types.SimpleNamespace(uid='uid-a')),
+            types.SimpleNamespace(metadata=types.SimpleNamespace(uid='uid-b')),
+        ]
+        with mock.patch.object(reserved_capacity.kubernetes,
+                               'core_api',
+                               return_value=core_api), \
+             mock.patch.object(reserved_capacity,
+                               'poll_interval_seconds',
+                               return_value=10), \
+             mock.patch.object(reserved_capacity.time,
+                               'monotonic',
+                               side_effect=[100, 101, 102, 103]):
+            self.assertEqual(
+                reserved_capacity.get_kubernetes_physical_cluster_uid('ctx'),
+                'uid-a')
+            self.assertEqual(
+                reserved_capacity.get_kubernetes_physical_cluster_uid(
+                    'ctx', force_refresh=True), 'uid-b')
+        self.assertEqual(core_api.read_namespace.call_count, 2)
+
+    def test_stale_forced_uid_lookup_returns_newer_cached_identity(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        call_lock = threading.Lock()
+        call_count = 0
+
+        def read_namespace(*_args, **_kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                ordinal = call_count
+            if ordinal == 1:
+                first_started.set()
+                self.assertTrue(release_first.wait(timeout=5))
+                uid = 'uid-before-retarget'
+            else:
+                uid = 'uid-after-retarget'
+            return types.SimpleNamespace(metadata=types.SimpleNamespace(
+                uid=uid))
+
+        core_api = mock.Mock()
+        core_api.read_namespace.side_effect = read_namespace
+        stale_result = []
+
+        def stale_forced_lookup():
+            stale_result.append(
+                reserved_capacity.get_kubernetes_physical_cluster_uid(
+                    'ctx', force_refresh=True))
+
+        with mock.patch.object(reserved_capacity.kubernetes,
+                               'core_api',
+                               return_value=core_api), \
+             mock.patch.object(reserved_capacity,
+                               'poll_interval_seconds',
+                               return_value=10):
+            stale_thread = threading.Thread(target=stale_forced_lookup)
+            stale_thread.start()
+            self.assertTrue(first_started.wait(timeout=5))
+            current = reserved_capacity.get_kubernetes_physical_cluster_uid(
+                'ctx', force_refresh=True)
+            release_first.set()
+            stale_thread.join(timeout=5)
+
+        self.assertFalse(stale_thread.is_alive())
+        self.assertEqual(current, 'uid-after-retarget')
+        # The older network response must not let a launch compare against
+        # uid-before-retarget after a newer forced observation completed.
+        self.assertEqual(stale_result, ['uid-after-retarget'])
+
+    def test_expired_physical_uid_is_not_used_after_lookup_failure(self):
+        core_api = mock.Mock()
+        core_api.read_namespace.side_effect = [
+            types.SimpleNamespace(metadata=types.SimpleNamespace(uid='uid-a')),
+            RuntimeError('unreachable'),
+        ]
+        with mock.patch.object(reserved_capacity.kubernetes,
+                               'core_api',
+                               return_value=core_api), \
+             mock.patch.object(reserved_capacity,
+                               'poll_interval_seconds',
+                               return_value=10), \
+             mock.patch.object(reserved_capacity.time,
+                               'monotonic',
+                               side_effect=[100, 101, 111]):
+            self.assertEqual(
+                reserved_capacity.get_kubernetes_physical_cluster_uid('ctx'),
+                'uid-a')
+            self.assertIsNone(
+                reserved_capacity.get_kubernetes_physical_cluster_uid('ctx'))
+
+    def test_pool_discovery_deduplicates_context_aliases_by_physical_uid(self):
+        locations = [
+            self._k8s_location(region='ctx-first', gpu='H200'),
+            self._k8s_location(region='ctx-alias', gpu='h200'),
+        ]
+        with mock.patch.object(reserved_capacity,
+                               'get_kubernetes_physical_cluster_uid',
+                               side_effect=['physical-uid', 'physical-uid']):
+            pools = reserved_capacity.discover_fill_pool_specs(locations)
+        self.assertEqual(len(pools), 1)
+        self.assertEqual(pools[0].context, 'ctx-first')
+        self.assertEqual(
+            pools[0].pool_key,
+            reserved_capacity_broker.make_pool_key(
+                'ctx-first',
+                'h200',
+                protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                physical_cluster_uid='physical-uid'))
+
+    def test_pool_discovery_isolates_failed_identity_lookup(self):
+        locations = [
+            self._k8s_location(region='ctx-failed', gpu='A100'),
+            self._k8s_location(region='ctx-healthy', gpu='H200'),
+        ]
+        with mock.patch.object(reserved_capacity,
+                               'get_kubernetes_physical_cluster_uid',
+                               side_effect=[None, 'healthy-uid']):
+            pools = reserved_capacity.discover_fill_pool_specs(locations)
+        self.assertEqual([pool.context for pool in pools], ['ctx-healthy'])
 
     def test_free_gpus_divided_by_replica_size(self):
         with mock.patch.object(reserved_capacity.kubernetes_catalog,
@@ -1297,6 +2472,8 @@ class TestQueryFreeSlots(unittest.TestCase):
                 })
         self.assertEqual(observation.free_slots, 5)
         self.assertEqual(set(observation.gpu_names), {'A100', 'A100-80GB'})
+        self.assertEqual(observation.free_slots_by_accelerator,
+                         (('a100', 3), ('a100-80gb', 2)))
         query.assert_called_once()
 
     def test_same_shape_different_counts_use_largest_deterministically(self):
@@ -1786,11 +2963,14 @@ class TestGrantEpochPlumbing(unittest.TestCase):
         ]
         self.assertTrue(sentinel)
         for decision in sentinel:
-            self.assertEqual(decision.target, {
-                _FILL_KEY: True,
-                _EPOCH_KEY: 7,
-                _POOL_KEY: pool
-            })
+            self.assertEqual(
+                decision.target, {
+                    _FILL_KEY: True,
+                    _EPOCH_KEY: 7,
+                    _POOL_KEY: pool,
+                    _PROTOCOL_KEY: reserved_capacity_broker.PROTOCOL_V1,
+                    _GENERATION_KEY: 0,
+                })
 
     def test_no_epoch_means_pre_broker_decision_shape(self):
         autoscaler = _make_autoscaler(min_replicas=1)
@@ -1812,6 +2992,12 @@ class TestGrantEpochPlumbing(unittest.TestCase):
         self.assertNotIn('fill_grant', fill_state)
         self.assertNotIn('fill_grant_epoch', fill_state)
         self.assertNotIn('fill_grant_pool_key', fill_state)
+        restored = _make_autoscaler(min_replicas=1)
+        restored.load_dynamic_states(dump)
+        self.assertEqual(restored.info()['fill_free_slots'], 0)
+        # Location identity still shelters live pool rows during the swap.
+        self.assertEqual(restored._fill_zero_cost_locations,
+                         [spot_placer.Location.from_pickleable(_K8S_KEY)])
 
 
 class TestEpochFencedLaunch(unittest.TestCase):

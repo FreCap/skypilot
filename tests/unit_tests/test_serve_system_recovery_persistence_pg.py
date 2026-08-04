@@ -685,6 +685,9 @@ def test_initial_replica_paths_are_insert_only_on_key_conflict(
                 gpus_per_replica=1,
                 holdings_fill=1,
                 heartbeat_ts=100.0))
+        connection.execute(
+            serve_state.reserved_fill_lease_table.insert().values(id=1,
+                                                                  epoch=1))
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         serve_state.add_replica_if_round_epoch(
             _SERVICE_NAME,
@@ -693,7 +696,8 @@ def test_initial_replica_paths_are_insert_only_on_key_conflict(
             pool_key='fill-pool',
             expected_epoch=1,
             expected_service_hash=_SERVICE_HASH,
-            expected_controller_owner=_OWNER)
+            expected_controller_owner=_OWNER,
+            expected_lease_token=1)
 
     persisted = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
     assert persisted is not None

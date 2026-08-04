@@ -298,7 +298,7 @@ def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
                                          migration_utils.SERVE_VERSION)
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '034'
+        engine, migration_utils.SERVE_DB_NAME) == '035'
 
     inspector = sqlalchemy.inspect(engine)
     assert {
@@ -451,7 +451,7 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
     with pytest.raises(RuntimeError, match='additive and cannot be downgraded'):
         alembic_command.downgrade(config, '031')
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '034'
+        engine, migration_utils.SERVE_DB_NAME) == '035'
 
 
 def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
@@ -487,7 +487,7 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
                            match='additive and cannot be downgraded'):
             alembic_command.downgrade(config, '031')
         assert migration_utils.get_current_alembic_revision(
-            engine, migration_utils.SERVE_DB_NAME) == '034'
+            engine, migration_utils.SERVE_DB_NAME) == '035'
     finally:
         engine.dispose()
 
@@ -575,13 +575,16 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
             gpus_per_replica=1,
             holdings_fill=1,
             heartbeat_ts=100.0))
+        session.execute(serve_state.reserved_fill_lease_table.insert().values(
+            id=1, epoch=1))
         session.commit()
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         serve_state.add_replica_if_round_epoch('svc',
                                                4,
                                                _replica(4, version=2),
                                                pool_key='test-fill-pool',
-                                               expected_epoch=1)
+                                               expected_epoch=1,
+                                               expected_lease_token=1)
 
     with orm.Session(engine) as session:
         rows = session.execute(

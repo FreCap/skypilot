@@ -635,6 +635,12 @@ class ReplicaInfo:
         # (prior_reserved_fill) -- otherwise the replacement row would
         # read as demand-placed and stay ceiling-exempt for its lifetime.
         self.reserved_fill: bool = False
+        # Protocol-v2 origin fences for reserved fill. These are additive JSON
+        # fields rather than a ReplicaInfo version bump: old readers already
+        # preserve the v13 envelope and safely ignore unknown state keys.
+        self.reserved_fill_pool_key: str | None = None
+        self.reserved_fill_service_generation: int | None = None
+        self.reserved_fill_physical_cluster_uid: str | None = None
         # Placement-cost provenance, not launch intent. True means the
         # replica occupies capacity the placer classifies as zero cost.
         self.is_zero_cost: bool = False
@@ -730,6 +736,12 @@ class ReplicaInfo:
             'logical_bridge_capacity_verified': bool(
                 getattr(self, 'logical_bridge_capacity_verified', False)),
             'reserved_fill': bool(getattr(self, 'reserved_fill', False)),
+            'reserved_fill_pool_key': getattr(self, 'reserved_fill_pool_key',
+                                              None),
+            'reserved_fill_service_generation': getattr(
+                self, 'reserved_fill_service_generation', None),
+            'reserved_fill_physical_cluster_uid': getattr(
+                self, 'reserved_fill_physical_cluster_uid', None),
             'is_zero_cost': bool(getattr(self, 'is_zero_cost', False)),
             'cost_rebalance_for_replica_id': getattr(
                 self, 'cost_rebalance_for_replica_id', None),
@@ -824,6 +836,11 @@ class ReplicaInfo:
         replica.logical_bridge_capacity_verified = bool(
             state.get('logical_bridge_capacity_verified', False))
         replica.reserved_fill = bool(state.get('reserved_fill', False))
+        replica.reserved_fill_pool_key = state.get('reserved_fill_pool_key')
+        replica.reserved_fill_service_generation = state.get(
+            'reserved_fill_service_generation')
+        replica.reserved_fill_physical_cluster_uid = state.get(
+            'reserved_fill_physical_cluster_uid')
         replica.is_zero_cost = bool(state.get('is_zero_cost', False))
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
@@ -1326,6 +1343,9 @@ class ReplicaInfo:
 
         state.setdefault('cost_rebalance_for_replica_id', None)
         state.setdefault('paid_capacity_pool_key', None)
+        state.setdefault('reserved_fill_pool_key', None)
+        state.setdefault('reserved_fill_service_generation', None)
+        state.setdefault('reserved_fill_physical_cluster_uid', None)
 
         if version < 7:
             # Rows written before version 7 carry the full list of failed

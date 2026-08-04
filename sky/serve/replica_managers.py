@@ -2166,6 +2166,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'while persisting placement retry state.')
         placer.mark_retry_state_persisted()
 
+    def _release_unstarted_location_retry(
+            self, location: 'spot_placer.Location | None') -> None:
+        """Return a consumed bench probe when no provider launch will start."""
+        placer = getattr(self, '_spot_placer', None)
+        if placer is None or location is None:
+            return
+        placer.release_retry(location)
+        self._persist_spot_placement_state_if_dirty()
+
     def _launch_completion_state(
         self,) -> tuple['queue.SimpleQueue[int]', threading.Event]:
         """Return lazily compatible completion state for launch workers."""
@@ -3420,6 +3429,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'recovering_existing_replica': True,
                     'prior_reserved_fill': bool(
                         getattr(replica_info, 'reserved_fill', False)),
+                    'prior_reserved_fill_pool_key': getattr(
+                        replica_info, 'reserved_fill_pool_key', None),
+                    'prior_reserved_fill_service_generation': getattr(
+                        replica_info, 'reserved_fill_service_generation', None),
+                    'prior_reserved_fill_physical_cluster_uid': getattr(
+                        replica_info, 'reserved_fill_physical_cluster_uid',
+                        None),
                     'prior_is_zero_cost': bool(
                         getattr(replica_info, 'is_zero_cost', False)),
                     'prior_planned_capacity': prior_planned_capacity,
@@ -3646,6 +3662,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         resources_override: dict[str, Any] | None = None,
         existing_replica_infos: list['ReplicaInfo'] | None = None,
         prior_reserved_fill: bool = False,
+        prior_reserved_fill_pool_key: str | None = None,
+        prior_reserved_fill_service_generation: int | None = None,
+        prior_reserved_fill_physical_cluster_uid: str | None = None,
         prior_is_zero_cost: bool = False,
         prior_cost_rebalance_for_replica_id: int | None = None,
         prior_paid_capacity_pool_key: str | None = None,
@@ -3674,6 +3693,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         from the persisted override; OR-ing the prior flag in keeps a
         recovered fill replica counted as arbitrated (ceiling-governed)
         capacity instead of silently converting it to demand.
+
+        prior_reserved_fill_pool_key/prior_reserved_fill_service_generation/
+        prior_reserved_fill_physical_cluster_uid: additive protocol-v2 origin
+        attribution preserved by a recovery re-drive. Recovery reuses the
+        already-persisted exact location and does not reacquire a new grant.
 
         prior_is_zero_cost: placement-cost provenance of a recovery row. The
         recovered exact pin remains on the same capacity, so preserve it even
@@ -3733,6 +3757,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         zero_cost_only = False
         fill_grant_epoch: int | None = None
         fill_pool_key: str | None = None
+        fill_protocol_version: int | None = None
+        fill_service_generation: int | None = None
+        fill_physical_cluster_uid: str | None = None
+        fill_allowed_location_keys: list[dict[str, Any]] | None = None
+        fill_pool_identity: reserved_capacity_broker.PoolIdentity | None = None
+        fill_exact_accelerator_shape: tuple[str, int] | None = None
         cost_rebalance_for_replica_id = (prior_cost_rebalance_for_replica_id)
         if (resources_override is not None and
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
@@ -3744,6 +3774,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 serve_constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY, None)
             fill_pool_key = resources_override.pop(
                 serve_constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY, None)
+            fill_protocol_version = resources_override.pop(
+                serve_constants.RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY,
+                None)
+            fill_service_generation = resources_override.pop(
+                serve_constants.RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY,
+                None)
+            fill_physical_cluster_uid = resources_override.pop(
+                serve_constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY,
+                None)
+            raw_allowed_locations = resources_override.pop(
+                serve_constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY,
+                None)
+            if raw_allowed_locations is not None:
+                if not isinstance(raw_allowed_locations, list):
+                    self._log_fill_skip('malformed pool location fence')
+                    return False
+                fill_allowed_location_keys = raw_allowed_locations
             zero_cost_only = True
         if (resources_override is not None and
                 serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY
@@ -3881,19 +3928,126 @@ class SkyPilotReplicaManager(ReplicaManager):
                 resources_override = dict(resources_override)
             allowed_locations = self._locations_for_accelerator_override(
                 resources_override)
+            if fill_allowed_location_keys is not None:
+                try:
+                    carried_locations = [
+                        location for location in (
+                            spot_placer.Location.from_pickleable(key)
+                            for key in fill_allowed_location_keys)
+                        if location is not None
+                    ]
+                except (AssertionError, KeyError, TypeError, ValueError):
+                    self._log_fill_skip('malformed pool location fence')
+                    return False
+                if len(carried_locations) != len(fill_allowed_location_keys):
+                    self._log_fill_skip('malformed pool location fence')
+                    return False
+                active = set(self._spot_placer.active_locations())
+                pool_allowed = {
+                    candidate for candidate in active if any(
+                        spot_placer.locations_match_placement(
+                            candidate, carried)
+                        for carried in carried_locations)
+                }
+                allowed_locations = (
+                    pool_allowed if allowed_locations is None else
+                    allowed_locations.intersection(pool_allowed))
             allowed_location_kwargs: dict[str, Any] = (
                 {} if allowed_locations is None else {
                     'allowed_locations': allowed_locations
                 })
             if (resources_override.get('accelerators') and
                     not allowed_locations):
+                if zero_cost_only:
+                    self._log_fill_skip(
+                        'no pool location matches the carried exact '
+                        f'accelerator shape '
+                        f'{resources_override["accelerators"]!r}')
+                    return False
                 raise ValueError(
                     'No active placement location matches exact accelerator '
                     f'override {resources_override["accelerators"]!r}.')
             if existing_replica_infos is None:
                 existing_replica_infos = serve_state.get_replica_infos(
                     self._service_name)
+            if not zero_cost_only:
+                saturated_locations = (
+                    self._demand_saturated_zero_cost_locations(
+                        existing_replica_infos))
+                if saturated_locations:
+                    candidate_locations = (
+                        set(self._spot_placer.active_locations()) if
+                        allowed_locations is None else set(allowed_locations))
+                    allowed_locations = (candidate_locations -
+                                         saturated_locations)
+                    allowed_location_kwargs = {
+                        'allowed_locations': allowed_locations
+                    }
+                    if not allowed_locations:
+                        logger.info(
+                            'Deferring demand launch because every active '
+                            'location belongs to a saturated reserved-fill '
+                            'pool.')
+                        return False
             if zero_cost_only:
+                if fill_protocol_version is not None:
+                    if (isinstance(fill_protocol_version, bool) or
+                            not isinstance(fill_protocol_version, int) or
+                            fill_protocol_version not in (1, 2)):
+                        self._log_fill_skip('invalid reserved-fill protocol '
+                                            'version')
+                        return False
+                    if (not isinstance(fill_pool_key, str) or
+                            not fill_pool_key or
+                            isinstance(fill_grant_epoch, bool) or
+                            not isinstance(fill_grant_epoch, int) or
+                            fill_grant_epoch < 1):
+                        self._log_fill_skip('incomplete broker epoch/pool '
+                                            'fence')
+                        return False
+                if fill_protocol_version == 2:
+                    if (isinstance(fill_service_generation, bool) or
+                            not isinstance(fill_service_generation, int) or
+                            fill_service_generation < 1 or
+                            not isinstance(fill_physical_cluster_uid, str) or
+                            not fill_physical_cluster_uid or
+                            fill_allowed_location_keys is None):
+                        self._log_fill_skip('incomplete protocol-v2 pool '
+                                            'fence')
+                        return False
+                    assert isinstance(fill_pool_key, str)
+                    try:
+                        fill_pool_identity = (
+                            reserved_capacity_broker.parse_pool_identity(
+                                fill_pool_key))
+                    except (TypeError, ValueError):
+                        self._log_fill_skip('malformed protocol-v2 pool key')
+                        return False
+                    if (fill_pool_identity.protocol_version != 2 or
+                            fill_pool_identity.physical_cluster_uid
+                            != fill_physical_cluster_uid):
+                        self._log_fill_skip('protocol-v2 pool identity does '
+                                            'not match its physical UID')
+                        return False
+                    raw_exact_shape = resources_override.get('accelerators')
+                    if raw_exact_shape is not None:
+                        if (not isinstance(raw_exact_shape, dict) or
+                                len(raw_exact_shape) != 1):
+                            self._log_fill_skip('malformed protocol-v2 exact '
+                                                'accelerator shape')
+                            return False
+                        raw_card, raw_count = next(iter(
+                            raw_exact_shape.items()))
+                        if (not isinstance(raw_card, str) or not raw_card or
+                                isinstance(raw_count, bool) or
+                                not isinstance(raw_count, int) or
+                                raw_count < 1 or raw_card.casefold()
+                                not in fill_pool_identity.gpu_names):
+                            self._log_fill_skip('protocol-v2 exact accelerator '
+                                                'shape is outside its pool')
+                            return False
+                        fill_exact_accelerator_shape = (raw_card.casefold(),
+                                                        raw_count)
                 # Broker epoch fence: a fill decision computed from a
                 # superseded allocation round (the pool's epoch moved
                 # because its grants changed, or after a lease-dead gap)
@@ -3939,6 +4093,49 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'no ACTIVE zero-cost location available')
                     return False
                 location = zero_cost_location
+                if fill_protocol_version == 2:
+                    assert fill_pool_identity is not None
+                    kube_context = location.region
+                    selected_accelerators = {
+                        str(accelerator).lower()
+                        for accelerator in (location.accelerators or {})
+                    }
+                    if (str(location.cloud).lower() != 'kubernetes' or
+                            not isinstance(kube_context, str) or
+                            not kube_context or not selected_accelerators or
+                            not selected_accelerators.issubset(
+                                fill_pool_identity.gpu_names)):
+                        self._release_unstarted_location_retry(location)
+                        self._log_fill_skip('selected pool location has no '
+                                            'matching Kubernetes accelerator '
+                                            'identity')
+                        return False
+                    if fill_exact_accelerator_shape is not None:
+                        selected_shape = location.accelerators
+                        if (not isinstance(selected_shape, dict) or
+                                len(selected_shape) != 1):
+                            self._release_unstarted_location_retry(location)
+                            self._log_fill_skip('selected pool location has no '
+                                                'exact accelerator shape')
+                            return False
+                        selected_card, selected_count = next(
+                            iter(selected_shape.items()))
+                        if ((str(selected_card).casefold(), selected_count)
+                                != fill_exact_accelerator_shape):
+                            self._release_unstarted_location_retry(location)
+                            self._log_fill_skip(
+                                'selected pool location changed the carried '
+                                'exact accelerator shape')
+                            return False
+                    observed_uid = (
+                        reserved_capacity.get_kubernetes_physical_cluster_uid(
+                            kube_context, force_refresh=True))
+                    if observed_uid != fill_physical_cluster_uid:
+                        self._release_unstarted_location_retry(location)
+                        self._log_fill_skip(
+                            'physical Kubernetes cluster identity changed '
+                            f'for context {kube_context!r}')
+                        return False
             else:
                 if paid_location_launch_budget is None:
                     paid_location_launch_budget = (
@@ -4028,6 +4225,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 paid_location_launch_budget is not None and
                 location in paid_location_launch_budget.remaining_by_location)
             resources_override.update(location.to_dict())
+            if fill_exact_accelerator_shape is not None:
+                persisted_shape = resources_override.get('accelerators')
+                assert isinstance(persisted_shape, dict)
+                persisted_card, persisted_count = next(
+                    iter(persisted_shape.items()))
+                if ((str(persisted_card).casefold(), persisted_count)
+                        != fill_exact_accelerator_shape):
+                    self._release_unstarted_location_retry(location)
+                    self._log_fill_skip('persisted pool location changed the '
+                                        'carried exact accelerator shape')
+                    return False
             # The location dictates the actual spot-ness of THIS launch
             # (a zero-cost reserved location is non-spot even though the
             # task as a whole is spot-managed).
@@ -4218,6 +4426,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         # replaced row's attribution on recovery re-drives (the sentinel
         # only exists at original emission).
         info.reserved_fill = bool(zero_cost_only or prior_reserved_fill)
+        info.reserved_fill_pool_key = (fill_pool_key if zero_cost_only else
+                                       prior_reserved_fill_pool_key)
+        info.reserved_fill_service_generation = (
+            fill_service_generation
+            if zero_cost_only else prior_reserved_fill_service_generation)
+        info.reserved_fill_physical_cluster_uid = (
+            fill_physical_cluster_uid
+            if zero_cost_only else prior_reserved_fill_physical_cluster_uid)
         is_zero_cost = bool(prior_is_zero_cost or zero_cost_only)
         if not is_zero_cost and self._spot_placer is not None:
             candidates = self._spot_placer.zero_cost_locations()
@@ -4250,10 +4466,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                         info,
                         pool_key=fill_pool_key,
                         expected_epoch=fill_grant_epoch,
+                        expected_protocol_version=(1 if fill_protocol_version
+                                                   is None else
+                                                   fill_protocol_version),
+                        expected_service_generation=(
+                            0 if fill_service_generation is None else
+                            fill_service_generation),
+                        expected_physical_cluster_uid=(
+                            fill_physical_cluster_uid),
                         **self._db_fence_kwargs()):
                     # No row was written and the launch thread was never
                     # registered/started: same leak-nothing contract as the
                     # pre-check fence.
+                    self._release_unstarted_location_retry(location)
                     self._log_fill_skip(
                         f'grant epoch {fill_grant_epoch} superseded or round '
                         'in flight at persist')
@@ -4407,6 +4632,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         prevents new squatting only; existing rows are demand-protected
         until their traffic recedes (v1 semantics per the design doc).
         """
+        # Protocol v2 is filtered pool-by-pool by
+        # _demand_saturated_zero_cost_locations(). Do not collapse those
+        # independent grants back into this protocol-v1 global switch.
+        if reserved_capacity_broker.get_cached_pool_grants(
+                self._service_name,
+                max_age_seconds=2 * reserved_capacity.poll_interval_seconds()):
+            return False
         grant = reserved_capacity_broker.get_cached_grant(
             self._service_name,
             # The poller refreshes the cache every poll interval; 2x
@@ -4435,6 +4667,42 @@ class SkyPilotReplicaManager(ReplicaManager):
                     for zc in zero_cost):
                 holdings += 1
         return holdings >= grant
+
+    def _demand_saturated_zero_cost_locations(
+        self,
+        existing_replica_infos: list['ReplicaInfo'] | None,
+    ) -> set[spot_placer.Location]:
+        """Return only protocol-v2 pools whose fresh grant is occupied."""
+        if self._spot_placer is None:
+            return set()
+        grants = reserved_capacity_broker.get_cached_pool_grants(
+            self._service_name,
+            max_age_seconds=2 * reserved_capacity.poll_interval_seconds())
+        if not grants:
+            return set()
+        zero_cost_locations = self._spot_placer.zero_cost_locations()
+        saturated: set[spot_placer.Location] = set()
+        for grant in grants.values():
+            pool_locations = [
+                location for location in zero_cost_locations
+                if (location.region == grant.access_context and
+                    location.accelerators and any(
+                        str(accelerator).lower() in grant.accelerator_names
+                        for accelerator in location.accelerators))
+            ]
+            holdings = 0
+            for info in existing_replica_infos or []:
+                if info.is_terminal:
+                    continue
+                replica_location = info.get_spot_location()
+                if (replica_location is not None and any(
+                        spot_placer.locations_match_placement(
+                            replica_location, candidate)
+                        for candidate in pool_locations)):
+                    holdings += 1
+            if holdings >= grant.grant:
+                saturated.update(pool_locations)
+        return saturated
 
     def _select_budgeted_zero_cost_location(
         self,

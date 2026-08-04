@@ -666,21 +666,25 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
 
     # Reserved-fill admission is also INSERT-only. This exercises SQLite's
     # conditional INSERT ... SELECT path against a conflicting key.
+    fill_pool_key = json.dumps(['test-context', 'a100'])
     with orm.Session(_mock_serve_db) as session:
         session.execute(serve_state.reserved_fill_claims_table.insert().values(
             service_name='svc',
-            pool_key='test-fill-pool',
+            pool_key=fill_pool_key,
             weight=1,
             floor_replicas=1,
             gpus_per_replica=1,
             holdings_fill=1,
             heartbeat_ts=100.0))
         session.commit()
+    fill_replica = _replica(4, version=2)
+    fill_replica.reserved_fill = True
+    fill_replica.reserved_fill_pool_key = fill_pool_key
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         serve_state.add_replica_if_round_epoch('svc',
                                                4,
-                                               _replica(4, version=2),
-                                               pool_key='test-fill-pool',
+                                               fill_replica,
+                                               pool_key=fill_pool_key,
                                                expected_epoch=1)
 
     with orm.Session(_mock_serve_db) as session:

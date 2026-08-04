@@ -1,10 +1,13 @@
 """Migration contracts for the combined SkyServe revision 033."""
 # pylint: disable=not-callable,redefined-outer-name
 
+import concurrent.futures
 import datetime
 import os
 from pathlib import Path
 import shutil
+import threading
+import time
 import uuid
 
 from alembic import command as alembic_command
@@ -13,6 +16,7 @@ import pytest
 import sqlalchemy
 
 from sky.serve import resource_action_state_schema as action_schema
+from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
 _POSTGRES_URL = os.environ.get('SKYPILOT_TEST_POSTGRES_URL')
@@ -329,6 +333,34 @@ def _ordinary_rows(engine: sqlalchemy.engine.Engine) -> tuple:
     return tuple(service), tuple(replica)
 
 
+def _install_legacy_reserved_fill_tables(
+    engine: sqlalchemy.engine.Engine,
+) -> tuple[sqlalchemy.Table, sqlalchemy.Table]:
+    """Install the populated protocol-v1 tables present at revision 034."""
+    metadata = sqlalchemy.MetaData()
+    claims = sqlalchemy.Table(
+        'reserved_fill_claims', metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('pool_key', sqlalchemy.Text),
+        sqlalchemy.Column('weight', sqlalchemy.Float),
+        sqlalchemy.Column('floor_replicas', sqlalchemy.Integer),
+        sqlalchemy.Column('gpus_per_replica', sqlalchemy.Integer),
+        sqlalchemy.Column('holdings_fill', sqlalchemy.Integer),
+        sqlalchemy.Column('effective_cap', sqlalchemy.Integer),
+        sqlalchemy.Column('launchable', sqlalchemy.Integer),
+        sqlalchemy.Column('demonstrated_need', sqlalchemy.Integer),
+        sqlalchemy.Column('boot_hold', sqlalchemy.Integer),
+        sqlalchemy.Column('activity_ts', sqlalchemy.Float),
+        sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float))
+    rounds = sqlalchemy.Table(
+        'reserved_fill_rounds', metadata,
+        sqlalchemy.Column('pool_key', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('round_id', sqlalchemy.Integer),
+        sqlalchemy.Column('epoch', sqlalchemy.Integer))
+    metadata.create_all(engine)
+    return claims, rounds
+
+
 def _classification_rows(engine: sqlalchemy.engine.Engine) -> tuple:
     with engine.connect() as connection:
         raw = connection.execute(
@@ -603,7 +635,7 @@ def _install_old_feature_draft(engine: sqlalchemy.engine.Engine) -> None:
                                                           checkfirst=True)
 
 
-def test_serve_alembic_lineage_has_033_then_release_ledger_034() -> None:
+def test_serve_alembic_lineage_has_033_034_then_reserved_fill_035() -> None:
     engine = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
@@ -611,10 +643,11 @@ def test_serve_alembic_lineage_has_033_then_release_ledger_034() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [revision.revision for revision in revisions]
     assert len(revision_ids) == len(set(revision_ids))
-    assert scripts.get_heads() == ['034']
+    assert scripts.get_heads() == ['035']
     revision_032 = scripts.get_revision('032')
     revision_033 = scripts.get_revision('033')
     revision_034 = scripts.get_revision('034')
+    revision_035 = scripts.get_revision('035')
     assert Path(revision_032.path).name == (
         '032_serve_request_rejection_classification.py')
     assert revision_032.down_revision == '031'
@@ -623,7 +656,9 @@ def test_serve_alembic_lineage_has_033_then_release_ledger_034() -> None:
     assert revision_033.down_revision == '032'
     assert Path(revision_034.path).name == ('034_authority_release_ledger.py')
     assert revision_034.down_revision == '033'
-    assert migration_utils.SERVE_VERSION == '034'
+    assert Path(revision_035.path).name == ('035_multi_pool_reserved_fill.py')
+    assert revision_035.down_revision == '034'
+    assert migration_utils.SERVE_VERSION == '035'
 
 
 def test_staged_and_head_schema_aliases_are_disjoint_and_complete() -> None:
@@ -736,6 +771,181 @@ def test_postgres_revision_034_adds_only_exact_release_ledger(
         ['constrained_columns']) == ('namespace', 'helm_release_name',
                                      'cohort_suffix')
     assert _ordinary_rows(engine) == ordinary_rows
+
+
+def test_postgres_revision_035_copies_legacy_claim_as_inert_shadow(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '034')
+    claims, rounds = _install_legacy_reserved_fill_tables(engine)
+    with engine.begin() as connection:
+        connection.execute(claims.insert().values(service_name='svc',
+                                                  pool_key='["ctx","h200"]',
+                                                  weight=2.0,
+                                                  floor_replicas=3,
+                                                  gpus_per_replica=8,
+                                                  holdings_fill=1,
+                                                  effective_cap=7,
+                                                  launchable=1,
+                                                  demonstrated_need=2,
+                                                  boot_hold=0,
+                                                  activity_ts=99.0,
+                                                  heartbeat_ts=100.0))
+        connection.execute(rounds.insert().values(pool_key='["ctx","h200"]',
+                                                  round_id=4,
+                                                  epoch=5))
+
+    _upgrade(engine, '035')
+
+    assert _revision(engine) == '035'
+    inspector = sqlalchemy.inspect(engine)
+    assert {
+        serve_state_schema.reserved_fill_protocol_state_table.name,
+        serve_state_schema.reserved_fill_service_claim_sets_table.name,
+        serve_state_schema.reserved_fill_pool_claims_table.name,
+    } <= set(inspector.get_table_names())
+    round_columns = {
+        column['name']: column
+        for column in inspector.get_columns('reserved_fill_rounds')
+    }
+    assert round_columns['protocol_version']['nullable'] is False
+    assert round_columns['claim_generations']['nullable'] is False
+    protocol_columns = {
+        column['name']: column
+        for column in inspector.get_columns('reserved_fill_protocol_state')
+    }
+    assert protocol_columns['claim_generation']['nullable'] is False
+    with engine.connect() as connection:
+        protocol = connection.execute(
+            sqlalchemy.text('SELECT protocol_version, claim_generation FROM '
+                            'reserved_fill_protocol_state WHERE id = 1')).one()
+        claim_set = connection.execute(
+            sqlalchemy.text('SELECT claim_set_state, generation, edge_count, '
+                            'global_headroom FROM '
+                            'reserved_fill_service_claim_sets WHERE '
+                            "service_name = 'svc'")).one()
+        edge = connection.execute(
+            sqlalchemy.text('SELECT pool_key, legacy_pool_key, '
+                            'service_generation, physical_cluster_uid, '
+                            'demonstrated_need FROM reserved_fill_pool_claims '
+                            "WHERE service_name = 'svc'")).one()
+        migrated_round = connection.execute(
+            sqlalchemy.text('SELECT protocol_version, claim_generations FROM '
+                            'reserved_fill_rounds WHERE pool_key = '
+                            "'[\"ctx\",\"h200\"]'")).one()
+        retained_legacy = connection.execute(
+            sqlalchemy.text('SELECT pool_key, weight, floor_replicas, '
+                            'gpus_per_replica, holdings_fill, effective_cap, '
+                            'launchable, demonstrated_need, boot_hold, '
+                            'activity_ts, heartbeat_ts FROM '
+                            'reserved_fill_claims WHERE '
+                            "service_name = 'svc'")).one()
+    assert protocol == (1, 0)
+    assert claim_set == ('migration_shadow', 0, 1, 7)
+    assert edge == ('["ctx","h200"]', '["ctx","h200"]', 0, None, 2)
+    assert migrated_round == (1, '{}')
+    assert retained_legacy == ('["ctx","h200"]', 2.0, 3, 8, 1, 7, 1, 2, 0, 99.0,
+                               100.0)
+
+
+def test_postgres_revision_035_serializes_concurrent_legacy_writer_and_reupgrade(
+        postgres_engine) -> None:
+    """A v1 heartbeat committed during upgrade is copied, never half-read."""
+    engine = postgres_engine
+    _reset_to_revision_031(engine)
+    _upgrade(engine, '034')
+    claims, _ = _install_legacy_reserved_fill_tables(engine)
+    with engine.begin() as connection:
+        connection.execute(claims.insert().values(service_name='svc',
+                                                  pool_key='["ctx","h200"]',
+                                                  weight=1.0,
+                                                  floor_replicas=0,
+                                                  gpus_per_replica=8,
+                                                  holdings_fill=1,
+                                                  effective_cap=4,
+                                                  launchable=1,
+                                                  heartbeat_ts=100.0))
+
+    writer = engine.connect()
+    transaction = writer.begin()
+    try:
+        # Revision 035's shadow copy must wait for a writer that already owns
+        # the legacy table, then observe the writer's committed heartbeat.
+        writer.exec_driver_sql(
+            'LOCK TABLE reserved_fill_claims IN ACCESS EXCLUSIVE MODE')
+        started = threading.Event()
+
+        def upgrade() -> None:
+            started.set()
+            _upgrade(engine, '035')
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(upgrade)
+            assert started.wait(timeout=5)
+            time.sleep(0.1)
+            assert not future.done()
+            writer.execute(
+                sqlalchemy.update(claims).where(
+                    claims.c.service_name == 'svc').values(effective_cap=7,
+                                                           heartbeat_ts=222.0))
+            transaction.commit()
+            future.result(timeout=30)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        writer.close()
+
+    with engine.connect() as connection:
+        migrated = connection.execute(
+            sqlalchemy.text(
+                'SELECT normalized.effective_cap, normalized.heartbeat_ts, '
+                'claim_set.claim_set_state, claim_set.generation '
+                'FROM reserved_fill_pool_claims AS normalized JOIN '
+                'reserved_fill_service_claim_sets AS claim_set USING '
+                '(service_name) WHERE normalized.service_name = :service'), {
+                    'service': 'svc'
+                }).one()
+    assert migrated == (7, 222.0, 'migration_shadow', 0)
+
+    # An old image can continue issuing its original-column heartbeat after
+    # the additive migration.  A later new-image startup re-running Alembic at
+    # head must preserve that legacy write, and must not silently refresh the
+    # inert migration shadow into apparent v2 authority.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(claims).where(
+                claims.c.service_name == 'svc').values(
+                    pool_key='["moved-ctx","h200"]',
+                    effective_cap=9,
+                    heartbeat_ts=333.0))
+        connection.execute(claims.insert().values(service_name='late-v1',
+                                                  pool_key='["late-ctx","l4"]',
+                                                  weight=2.0,
+                                                  floor_replicas=1,
+                                                  gpus_per_replica=1,
+                                                  holdings_fill=0,
+                                                  effective_cap=2,
+                                                  launchable=1,
+                                                  heartbeat_ts=444.0))
+    before = _catalog_signature(engine)
+    _upgrade(engine, '035')
+    assert _revision(engine) == '035'
+    assert _catalog_signature(engine) == before
+    with engine.connect() as connection:
+        legacy_rows = connection.execute(
+            sqlalchemy.text('SELECT service_name, pool_key, effective_cap, '
+                            'heartbeat_ts FROM reserved_fill_claims ORDER BY '
+                            'service_name')).all()
+        shadow_rows = connection.execute(
+            sqlalchemy.text('SELECT service_name, pool_key, effective_cap, '
+                            'heartbeat_ts FROM reserved_fill_pool_claims '
+                            'ORDER BY service_name')).all()
+    assert [tuple(row) for row in legacy_rows
+           ] == [('late-v1', '["late-ctx","l4"]', 2, 444.0),
+                 ('svc', '["moved-ctx","h200"]', 9, 333.0)]
+    assert [tuple(row) for row in shadow_rows] == [('svc', '["ctx","h200"]', 7,
+                                                    222.0)]
 
 
 def test_postgres_revision_034_rejects_same_name_hostile_check(

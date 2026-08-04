@@ -1104,9 +1104,8 @@ class TestMixedValidation:
 
 
 class TestReservedFillPoolValidation:
-    """validate_service_task groups accelerators in one k8s context.
+    """validate_service_task groups accelerators per k8s context.
 
-    Multiple contexts remain ambiguous broker pools and fail at submit time.
     All Kubernetes entries are treated as candidate pool shapes because
     zero-cost-ness is not knowable client-side.
     """
@@ -1147,11 +1146,18 @@ run: echo hi
 """
         return sky.Task.from_yaml_str(yaml_str)
 
-    def test_multiple_contexts_rejected(self):
+    def test_multiple_physical_contexts_with_independent_widths_accepted(self):
         # pylint: disable=import-outside-toplevel
         from sky.serve import serve_utils
-        entries = [('ctx-a', 'A100'), ('ctx-b', 'A100')]
-        with pytest.raises(ValueError, match='one Kubernetes context'):
+        entries = [('ctx-a', 'A100', 1), ('ctx-b', 'H200', 8)]
+        serve_utils.validate_service_task(self._task(entries), pool=False)
+
+    def test_same_context_mixed_widths_rejected(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        entries = [('ctx-a', 'A100', 1), ('ctx-a', 'H100', 2)]
+        with pytest.raises(ValueError,
+                           match='one GPU count within each Kubernetes'):
             serve_utils.validate_service_task(self._task(entries), pool=False)
 
     def test_single_pool_accepted(self):
@@ -1171,6 +1177,13 @@ run: echo hi
         # pylint: disable=import-outside-toplevel
         from sky.serve import serve_utils
         task = self._task([('ctx-a', 'A100', 1), ('ctx-a', 'H100', 1.0)],
+                          logical=True)
+        serve_utils.validate_service_task(task, pool=False)
+
+    def test_logical_multiple_contexts_exact_one_gpu_accepted(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        task = self._task([('ctx-a', 'A100', 1), ('ctx-b', 'H200', 1)],
                           logical=True)
         serve_utils.validate_service_task(task, pool=False)
 

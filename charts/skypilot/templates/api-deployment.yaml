@@ -246,6 +246,8 @@ kind: Deployment
 metadata:
   name: {{ $fullName }}-api-server
   namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.apiService.replicas }}
   {{- if eq .Values.apiService.upgradeStrategy "RollingUpdate" }}
@@ -290,6 +292,7 @@ spec:
         {{- end }}
       labels:
         app: {{ $fullName }}-api
+        app.kubernetes.io/instance: {{ .Release.Name }}
         # This label indicates that the API server is ready to serve requests.
         skypilot.co/ready: "true"
     spec:
