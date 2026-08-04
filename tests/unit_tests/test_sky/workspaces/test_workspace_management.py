@@ -386,12 +386,78 @@ class TestWorkspaceManagement(unittest.TestCase):
         mock_lock_path.return_value = self.config_path + '.lock'
 
         with self.assertRaisesRegex(RuntimeError, 'Please retry'):
-            core.update_config(new_config)
+            # Bypass usage logging's independent config snapshot so the two
+            # mocked reads are precisely validation-time and commit-time.
+            core.update_config.__wrapped__(new_config)
 
         mock_validate_changes.assert_called_once()
         mock_update_no_lock.assert_not_called()
         mock_permission.update_workspace_policy.assert_not_called()
         mock_sky_check.assert_not_called()
+
+    def test_update_config_guards_materialized_default_context_narrowing(self):
+        """The implicit default workspace is not a newly empty workspace."""
+        current_config = {
+            'kubernetes': {
+                'allowed_contexts': ['ctx-east', 'ctx-phx']
+            }
+        }
+        cases = [
+            ({
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east', 'ctx-phx']
+                },
+                'workspaces': {
+                    'default': {
+                        'kubernetes': {
+                            'allowed_contexts': ['ctx-east']
+                        }
+                    }
+                }
+            }, 'local narrowing'),
+            ({
+                'kubernetes': {
+                    'allowed_contexts': ['ctx-east']
+                },
+                'workspaces': {
+                    'default': {}
+                }
+            }, 'global narrowing'),
+        ]
+
+        for new_config, description in cases:
+            with self.subTest(description=description), \
+                    mock.patch(
+                        'sky.utils.common_utils.validate_schema'), \
+                    mock.patch(
+                        'sky.workspaces.core._validate_workspace_config'), \
+                    mock.patch('sky.skypilot_config.to_dict',
+                               return_value=current_config), \
+                    mock.patch('sky.utils.locks.get_lock') as mock_get_lock, \
+                    mock.patch('sky.global_user_state.get_all_users',
+                               return_value=[]), \
+                    mock.patch(
+                        'sky.users.permission.permission_service.'
+                        'get_users_for_role', return_value=[]), \
+                    mock.patch(
+                        'sky.utils.resource_checker.'
+                        'check_no_active_resources_for_workspaces'
+                    ) as mock_check_resources, \
+                    mock.patch(
+                        'sky.skypilot_config.'
+                        'update_api_server_config_no_lock'
+                    ) as mock_update_no_lock:
+                mock_get_lock.return_value.__enter__.return_value = None
+                mock_check_resources.side_effect = ValueError(
+                    'workspace has active resources')
+
+                with self.assertRaisesRegex(ValueError, 'active resources'):
+                    core.update_config.__wrapped__(new_config)
+
+                mock_check_resources.assert_called_once_with([
+                    (constants.SKYPILOT_DEFAULT_WORKSPACE, 'update')
+                ])
+                mock_update_no_lock.assert_not_called()
 
     @mock.patch('sky.workspaces.core.get_workspaces')
     @mock.patch('sky.utils.schemas.get_config_schema')

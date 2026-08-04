@@ -797,9 +797,18 @@ def update_config(config: dict[str, Any]) -> dict[str, Any]:
         'delete': {}
     }
 
+    default_workspace = constants.SKYPILOT_DEFAULT_WORKSPACE
+
     # Check each workspace that is being modified
     for workspace_name, new_workspace_config in new_workspaces.items():
-        if workspace_name not in current_workspaces:
+        is_new_workspace = workspace_name not in current_workspaces
+        # ``default`` exists semantically even when it is omitted from the
+        # persisted mapping. Materializing it must therefore follow the update
+        # path so active resources are validated against its previous effective
+        # configuration and its existing access policy is replaced.
+        is_implicit_default = (is_new_workspace and
+                               workspace_name == default_workspace)
+        if is_new_workspace and not is_implicit_default:
             # Validate names for newly added workspaces only (not existing
             # ones, for backward compatibility with pre-validation names).
             common_utils.check_workspace_name_is_valid(workspace_name)
@@ -835,7 +844,6 @@ def update_config(config: dict[str, Any]) -> dict[str, Any]:
     # The default workspace exists implicitly even when it is not persisted in
     # either workspaces mapping. It still inherits a changed top-level context
     # default and may have active resources that need the same validation.
-    default_workspace = constants.SKYPILOT_DEFAULT_WORKSPACE
     if (default_workspace not in current_workspaces and
             default_workspace not in new_workspaces and
             inherited_allowed_contexts != new_inherited_allowed_contexts):
