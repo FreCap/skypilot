@@ -1722,9 +1722,20 @@ def _make_location(region, cost_marker, use_spot=False):
 
 def _make_manager(placer):
     """Bare SkyPilotReplicaManager wired for the launch-path tests."""
+    if placer is not None:
+        # Mock placers do not implement SpotPlacer's retry-state transitions;
+        # start them clean so unrelated durable-state persistence does not
+        # turn a consumed/released retry assertion into a database fixture.
+        placer.retry_state_dirty = False
     manager = replica_managers.SkyPilotReplicaManager.__new__(
         replica_managers.SkyPilotReplicaManager)
     manager._service_name = 'svc'
+    # Production managers persist protocol-v2 fills only under an immutable
+    # service-incarnation scope.  Keep this synthetic launch-path manager
+    # faithful to that invariant so the tests reach the pool/UID/epoch fences
+    # they are intended to exercise.
+    manager._service_hash = 'service-hash'
+    manager._resource_scope = 'service-hash'
     manager.yaml_content = 'unused: patched helpers below'
     manager._spot_placer = placer
     manager._launch_thread_pool = {}

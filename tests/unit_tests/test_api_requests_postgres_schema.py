@@ -85,3 +85,10 @@ def test_postgres_schema_objects_keep_historical_facade_identity() -> None:
     assert (postgres.CONTROLLER_ACTION_RESERVATIONS
             is postgres_schema.CONTROLLER_ACTION_RESERVATIONS)
     assert postgres._PG_LOCKS is postgres_schema.PG_LOCKS
+
+
+def test_execution_quiescence_required_keeps_api007_insert_default() -> None:
+    column = postgres_schema.REQUESTS.c.execution_quiescence_required
+
+    assert column.server_default is not None
+    assert str(column.server_default.arg) == 'false'

@@ -506,9 +506,12 @@ quiescence: PostgreSQL cancellation publishes `CANCELLED` before the remote
 executor necessarily observes its heartbeat and stops the handler. Revision
 008 therefore adds `execution_quiescence_required` plus nullable
 `execution_quiesced_generation` and `execution_quiesced_at` request columns.
-Old rows default to not required; every version-70 queue claim sets required
-and clears the prior receipt. This avoids treating legacy signal delivery as
-proof without retaining all pre-version-70 request history forever. The
+Old rows and inserts from API007 writers default to not required at the
+PostgreSQL server; the canonical SQLAlchemy schema retains that server default
+so schema-created compatibility tables and raw inserts have the same contract.
+Every version-70 queue claim sets required and clears the prior receipt. This
+avoids treating legacy signal delivery as proof without retaining all
+pre-version-70 request history forever. The
 generation field is the durable proof that one exact request execution has
 stopped running effect-bearing handler code; the existing legacy
 `cancel_acknowledged_at` signal-delivery timestamp is explicitly insufficient.

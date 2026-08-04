@@ -506,8 +506,8 @@ def test_corrupt_v2_set_fails_closed_without_legacy_fallback(state_engine):
 def test_owner_loss_rejects_complete_set_without_mutation(state_engine):
     assert _activate_v2()
     with mock.patch.object(serve_state,
-                           '_lock_service_owner_in_session',
-                           return_value=False):
+                           '_lock_service_owner_row_in_session',
+                           return_value=None):
         assert _replace([_edge('east', 0)]) is None
     assert serve_state.get_reserved_fill_service_claim_set('svc') is None
 

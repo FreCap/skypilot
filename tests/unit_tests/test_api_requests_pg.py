@@ -22,6 +22,7 @@ import sqlalchemy
 from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 from sky import core
+from sky import execution
 from sky import global_user_state
 from sky.events import api_models as event_api_models
 from sky.jobs.server import core as managed_jobs_core
@@ -2302,16 +2303,16 @@ def test_execution_quiescence_candidates_use_cluster_and_required_predicate(
     engine, backend = request_database
     active = _request('candidate-active')
     active.cluster_name = 'target-cluster'
-    required_terminal = _request('candidate-required-terminal',
-                                 should_enqueue=False)
+    required_terminal = _request('candidate-required-terminal')
     required_terminal.cluster_name = 'target-cluster'
     legacy_terminal = _request('candidate-legacy-terminal',
                                should_enqueue=False)
     legacy_terminal.cluster_name = 'target-cluster'
     other = _request('candidate-other')
     other.cluster_name = 'other-cluster'
-    for request in (active, required_terminal, legacy_terminal, other):
+    for request in (required_terminal, active, legacy_terminal, other):
         assert asyncio.run(backend.create_if_not_exists_async(request))
+    _claim(backend, required_terminal.request_id)
     assert backend.kill_requests([required_terminal.request_id
                                  ]) == [required_terminal.request_id]
     assert backend.set_request_finished(legacy_terminal.request_id,
@@ -2364,7 +2365,7 @@ def test_scalar_status_projection_does_not_decode_large_payload(
     request = requests.Request(
         request_id=request_id,
         name='sky.launch',
-        entrypoint=core.launch,
+        entrypoint=execution.launch,
         request_body=payloads.LaunchBody(task='resources:\n  cpus: 2\n' +
                                          '# large-payload\n' * 10000,
                                          cluster_name='projection-cluster'),
