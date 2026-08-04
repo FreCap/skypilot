@@ -1969,14 +1969,17 @@ class TestFillLaunchPath(unittest.TestCase):
 
     def test_v2_queued_launch_guard_rechecks_uid_and_exact_pin(self):
         location = make_location('phx-context',
-                                 accelerators={'H200': 1},
+                                 accelerators={'H200': 1.0},
                                  cloud_name='Kubernetes',
                                  use_spot=False)
         placer = mock.Mock()
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
-        override = self._v2_override(location, exact_shape={'H200': 1})
+        # Catalog shapes may represent a whole count as an integral float.
+        # The immutable expected pin canonicalizes it while still comparing
+        # against the actual queued override below.
+        override = self._v2_override(location)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \

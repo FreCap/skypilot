@@ -442,9 +442,12 @@ requires the exact pinned Kubernetes context/card/count and force-refreshes
 the context's physical UID; a mismatch fails closed before the cloud mutation.
 This closes context retargeting between row persistence and provider launch.
 An interrupted `PENDING` or `PROVISIONING` fill row is never recovery-re-driven:
-the new controller schedules immediate teardown and lets the broker refill the
-opportunistic slot under fresh authority. Ordinary demand recovery is
-unchanged.
+the new controller first cancels and awaits every active API launch request
+for that exact replica cluster. Any cancellation/status uncertainty retains
+the durable row and retries the recovery pass. Only after the request barrier
+proves terminal does recovery recheck provider inventory, schedule immediate
+teardown, and let the broker refill the opportunistic slot under fresh
+authority. Ordinary demand recovery is unchanged.
 
 The selected replica persists `reserved_fill_pool_key`,
 `reserved_fill_service_generation`, and
@@ -618,7 +621,9 @@ Automated coverage must include:
 - context retargeting both before persistence and after launch-pool queuing,
   with the latter rejected by the per-attempt pre-cloud UID/shape guard;
 - recovery of interrupted fill rows schedules teardown without a second launch,
-  while ordinary demand recovery remains unchanged;
+  including an already-accepted launch whose cluster record is initially
+  absent: teardown waits for request quiescence, while uncertainty retains the
+  row and ordinary demand recovery remains unchanged;
 - no row/thread on malformed, removed, benched, or superseded pool launches;
 - pool-local demand saturation and scale-down shelter;
 - legacy dynamic-state load and new per-pool dump/load; and

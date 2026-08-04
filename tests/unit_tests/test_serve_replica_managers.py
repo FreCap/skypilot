@@ -11300,17 +11300,29 @@ class TestRecoveryRetryAndIsolation:
         fill_row.resources_override = None
         fill_row.reserved_fill = True
         demand_row = _fake_replica_info(2, status=status)
-        demand_row.resources_override = None
+        demand_row.resources_override = {
+            'region': 'us-east-1',
+            'accelerators': {
+                'A100': 1,
+            },
+        }
         demand_row.reserved_fill = False
+        demand_row.paid_capacity_pool_key = 'exact-paid-pool'
 
         with mock.patch.object(
                 replica_managers.serve_state,
                 'get_replica_infos',
                 return_value=[fill_row, demand_row]), \
+             mock.patch.object(
+                 replica_managers.serve_utils,
+                 'quiesce_service_replica_launch_requests',
+                 return_value=True) as quiesce, \
              mock.patch.object(mgr, '_launch_replica') as launch, \
              mock.patch.object(mgr, '_terminate_replica') as terminate:
             mgr._recover_replica_operations()
 
+        quiesce.assert_called_once_with(
+            'svc', [fill_row], continue_guard=mgr._service_is_launch_authorized)
         terminate.assert_called_once_with(1,
                                           sync_down_logs=False,
                                           replica_drain_delay_seconds=0,
@@ -11319,6 +11331,90 @@ class TestRecoveryRetryAndIsolation:
         launch.assert_called_once()
         assert launch.call_args.args[0] == 2
         assert launch.call_args.kwargs['recovering_existing_replica'] is True
+        assert (launch.call_args.kwargs['resources_override'] ==
+                demand_row.resources_override)
+        assert (launch.call_args.kwargs['prior_paid_capacity_pool_key'] ==
+                'exact-paid-pool')
+
+    def test_recovery_quiesces_accepted_fill_launch_before_teardown(self):
+        mgr = _make_manager()
+        fill_row = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        fill_row.cluster_name = 'svc-1-incarnation'
+        fill_row.resources_override = None
+        fill_row.reserved_fill = True
+        launch_request = types.SimpleNamespace(
+            request_id='launch-request',
+            name='sky.launch',
+            cluster_name=fill_row.cluster_name,
+        )
+        request_terminal = False
+        events = []
+
+        def _status(*, all_status, fields):
+            assert all_status is False
+            assert fields == ['request_id', 'name', 'cluster_name']
+            events.append('status')
+            return [] if request_terminal else [launch_request]
+
+        def _cancel(request_ids, *, all_users, silent):
+            assert request_ids == ['launch-request']
+            assert all_users and silent
+            events.append('cancel')
+            return 'cancel-request'
+
+        def _await(request_id):
+            nonlocal request_terminal
+            assert request_id == 'cancel-request'
+            events.append('await')
+            request_terminal = True
+
+        def _terminate(*_args, **_kwargs):
+            assert request_terminal
+            events.append('terminate')
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[fill_row]), \
+             mock.patch.object(replica_managers.serve_utils.sdk,
+                               'api_status',
+                               side_effect=_status), \
+             mock.patch.object(replica_managers.serve_utils.sdk,
+                               'api_cancel',
+                               side_effect=_cancel), \
+             mock.patch.object(replica_managers.serve_utils.sdk,
+                               'stream_and_get',
+                               side_effect=_await), \
+             mock.patch.object(mgr,
+                               '_terminate_replica',
+                               side_effect=_terminate):
+            mgr._recover_replica_operations()
+
+        assert events == ['status', 'cancel', 'await', 'status', 'terminate']
+
+    def test_recovery_retains_fill_when_launch_quiescence_is_uncertain(self):
+        mgr = _make_manager()
+        fill_row = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PENDING)
+        fill_row.resources_override = None
+        fill_row.reserved_fill = True
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[fill_row]), \
+             mock.patch.object(replica_managers.serve_utils.sdk,
+                               'api_status',
+                               side_effect=RuntimeError('status unavailable')), \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             pytest.raises(RuntimeError,
+                           match='Could not quiesce an interrupted'):
+            mgr._recover_replica_operations()
+
+        launch.assert_not_called()
+        terminate.assert_not_called()
 
     def test_provisioning_redrive_reenters_current_exact_card_budget(self):
         """Recovery cannot turn stale PROVISIONING intent into a new launch."""

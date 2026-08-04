@@ -3353,6 +3353,20 @@ class SkyPilotReplicaManager(ReplicaManager):
             if getattr(info, 'reserved_fill', False) is True
         ]
         for info in interrupted_fill_replicas:
+            # The old controller may have submitted sdk.launch before it died
+            # without receiving the durable request ID or before the cluster
+            # table row appeared.  This recovery pass holds the new manager's
+            # lock, so no current producer can enqueue the same replica; first
+            # cancel and await every API request for its incarnation-scoped
+            # cluster name.  On uncertainty, retain the row and retry the
+            # whole recovery pass instead of creating an unowned cluster.
+            if not serve_utils.quiesce_service_replica_launch_requests(
+                    self._service_name, [info],
+                    continue_guard=self._service_is_launch_authorized):
+                raise RuntimeError(
+                    'Could not quiesce an interrupted reserved-fill launch '
+                    f'for replica {info.replica_id}; retaining its durable '
+                    'row for recovery retry.')
             logger.warning(
                 f'Replica {info.replica_id} is an interrupted reserved-fill '
                 'launch; scheduling immediate teardown instead of recovery '
@@ -4166,9 +4180,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         return False
                     selected_card, selected_count = next(
                         iter(selected_shape.items()))
+                    selected_capacity = _whole_gpu_capacity(selected_shape)
                     if (not isinstance(selected_card, str) or
-                            not selected_card or
-                            _whole_gpu_capacity(selected_shape) is None or
+                            not selected_card or selected_capacity is None or
                             selected_card.casefold()
                             not in fill_pool_identity.gpu_names):
                         self._release_unstarted_location_retry(location)
@@ -4186,7 +4200,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             return False
                     fill_launch_context = kube_context
                     fill_launch_accelerator_shape = (selected_card.casefold(),
-                                                     selected_count)
+                                                     selected_capacity)
             else:
                 if paid_location_launch_budget is None:
                     paid_location_launch_budget = (
