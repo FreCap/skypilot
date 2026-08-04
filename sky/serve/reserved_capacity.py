@@ -22,7 +22,6 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 import contextlib
 import dataclasses
-import functools
 import hashlib
 import json
 import math
