@@ -237,7 +237,6 @@ class TestRetargetIsStillFenced:
                 _CONTEXT, force_refresh=True) == 'new-uid'
 
 
-
 class TestLaunchFenceIsNotStarved:
     """The pre-launch guard reads this value; None refuses every fill launch.
 
