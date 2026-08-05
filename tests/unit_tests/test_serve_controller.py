@@ -8,6 +8,7 @@ pruned when a replica leaves the ready set.
 """
 # pylint: disable=missing-class-docstring,protected-access
 import asyncio
+import contextlib
 import json
 import os
 import threading
@@ -1985,6 +1986,103 @@ class TestGetLbReplicaInfo:
         assert fence_entries == 1
         assert active_fence_depth == 0
 
+    def test_mixed_sync_completes_v2_phase_before_ambient(self):
+        ctrl = _make_controller()
+        ordinary = _FakeReplicaInfo(1,
+                                    serve_state.ReplicaStatus.READY,
+                                    url='http://1.1.1.1:8080',
+                                    accelerators={'L4': 1})
+        fenced = _FakeReplicaInfo(2,
+                                  serve_state.ReplicaStatus.READY,
+                                  url='http://2.2.2.2:8080',
+                                  accelerators={'H200': 8})
+        cleanup_fence = controller.reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='research-usw2-h200',
+            physical_cluster_uid='uid-a')
+        active_mode = None
+        phase_entries = []
+
+        @contextlib.contextmanager
+        def _phase(mode):
+            nonlocal active_mode
+            assert active_mode is None
+            active_mode = mode
+            phase_entries.append(mode)
+            try:
+                yield mock.sentinel.admission
+            finally:
+                active_mode = None
+
+        @contextlib.contextmanager
+        def _physical_fence():
+            assert (active_mode ==
+                    controller.provider_phase.ProviderPhaseMode.V2_FENCED)
+            yield
+
+        def _parse(info):
+            return cleanup_fence if info is fenced else None
+
+        def _ordinary_resolve(**_kwargs):
+            assert (active_mode ==
+                    controller.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
+            return ordinary._url
+
+        ordinary._resolve_url = mock.Mock(  # type: ignore[method-assign]
+            side_effect=_ordinary_resolve)
+        with mock.patch.object(controller.reserved_capacity,
+                               'parse_protocol_v2_cleanup_fence',
+                               side_effect=_parse), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'protocol_v2_provider_fence',
+                                   return_value=_physical_fence()), \
+             mock.patch.object(controller.provider_phase,
+                               'provider_phase', side_effect=_phase):
+            replica_info, num_ready = _sync_full(ctrl, [ordinary, fenced])
+
+        assert phase_entries == [
+            controller.provider_phase.ProviderPhaseMode.V2_FENCED,
+            controller.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY,
+        ]
+        assert set(replica_info) == {
+            'http://1.1.1.1:8080', 'http://2.2.2.2:8080'
+        }
+        assert num_ready == 2
+
+    def test_phase_timeout_does_not_publish_partial_route_caches(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'H200': 8})
+        cleanup_fence = controller.reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='research-usw2-h200',
+            physical_cluster_uid='uid-a')
+        old_replica_cache = {9: ('http://old:8080', 'L4', 1)}
+        old_record_ids = {9: '00000000-0000-0000-0000-000000000009'}
+        ctrl._lb_replica_cache = dict(old_replica_cache)
+        ctrl._lb_replica_cache_record_ids = dict(old_record_ids)
+        ctrl._lb_translation_cache = dict(old_replica_cache)
+        ctrl._lb_translation_cache_record_ids = dict(old_record_ids)
+        timed_out = mock.MagicMock()
+        timed_out.__enter__.side_effect = exceptions.ProviderPhaseTimeoutError(
+            'busy')
+
+        with mock.patch.object(controller.reserved_capacity,
+                               'parse_protocol_v2_cleanup_fence',
+                               return_value=cleanup_fence), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'protocol_v2_provider_fence',
+                                   return_value=contextlib.nullcontext()), \
+             mock.patch.object(controller.provider_phase,
+                               'provider_phase', return_value=timed_out), \
+             pytest.raises(exceptions.ProviderPhaseTimeoutError):
+            _sync_full(ctrl, [info])
+
+        assert ctrl._lb_replica_cache == old_replica_cache
+        assert ctrl._lb_replica_cache_record_ids == old_record_ids
+        assert ctrl._lb_translation_cache == old_replica_cache
+        assert ctrl._lb_translation_cache_record_ids == old_record_ids
+
     @pytest.mark.parametrize('warm_cache', [False, True])
     def test_v2_retarget_clears_cold_or_warm_route_authoritatively(
             self, warm_cache):
@@ -3485,6 +3583,37 @@ class TestAuthoritativeLbReportIngestion:
         assert response.status_code == 200
         assert (json.loads(response.body)['request_history_accepted']
                 is history_accepted)
+
+    def test_provider_phase_timeout_aborts_lb_sync_before_publication(self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        persist_history = mock.Mock()
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 controller.lb_k8s,
+                 'get_lb_pod_authority',
+                 return_value=controller.lb_k8s.LbPodAuthority(
+                     {'lb-a'}, {'lb-a'})), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl,
+                 '_get_lb_replica_info',
+                 side_effect=exceptions.ProviderPhaseTimeoutError('busy')), \
+             mock.patch.object(ctrl,
+                               '_persist_request_histories', persist_history):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 503
+        persist_history.assert_not_called()
 
     def test_v1_classification_failure_retains_both_history_snapshots(self):
         ctrl, info, report = self._controller_and_report()

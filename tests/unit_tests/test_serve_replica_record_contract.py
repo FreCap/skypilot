@@ -250,6 +250,38 @@ def test_protocol_v2_endpoint_rejects_retargeted_handle_before_uid_lookup():
     endpoint.assert_not_called()
 
 
+def test_pool_probe_propagates_explicit_provider_phase_admission():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle()
+    backend = mock.Mock()
+    backend.get_job_status.return_value = {
+        1: replica_info.job_lib.JobStatus.SUCCEEDED
+    }
+    provider_fence = mock.MagicMock()
+    provider_fence.return_value.__enter__.return_value = None
+    admission = mock.sentinel.provider_phase_admission
+
+    with mock.patch.object(replica_info.global_user_state,
+                           'get_handle_from_cluster_name',
+                           return_value=handle), \
+         mock.patch.object(replica_info.backend_utils,
+                           'check_cluster_available',
+                           return_value=handle), \
+         mock.patch.object(replica_info.backend_utils,
+                           'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(reserved_capacity,
+                           'protocol_v2_provider_fence',
+                           provider_fence):
+        _, ready, _ = replica.probe_pool(provider_phase_admission=admission)
+
+    assert ready
+    assert provider_fence.call_args_list == [
+        mock.call(replica, handle, phase_admission=admission),
+        mock.call(replica, handle, phase_admission=admission),
+    ]
+
+
 def test_legacy_null_image_key_and_missing_fields_remain_compatible():
     state = _replica().to_storage_dict()
     state['resources_override']['image_id'] = {

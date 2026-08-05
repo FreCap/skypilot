@@ -502,6 +502,12 @@ class TestGetServiceStatusPickledParallel:
             'replica_info': [],
         }
 
+    def _fake_prepared(self, name):
+        return serve_utils._PreparedServiceStatus(
+            record=self._fake_status(name),
+            pool=False,
+            include_replica_info=False)
+
     def test_returns_sorted_by_name(self):
         # Vary lengths because pickle/base64 metadata otherwise happens to
         # preserve lexical order for these ASCII names.
@@ -513,9 +519,9 @@ class TestGetServiceStatusPickledParallel:
             assert with_replica_info is True
             assert with_replica_counts is False
             assert with_target_num_replicas is True
-            return self._fake_status(name)
+            return self._fake_prepared(name)
 
-        with mock.patch('sky.serve.serve_utils._get_service_status',
+        with mock.patch('sky.serve.serve_utils._prepare_service_status',
                         side_effect=status):
             out = serve_utils.get_service_status_pickled(names, pool=False)
         # Decode the pickled 'name' fields to verify the final order.
@@ -533,9 +539,9 @@ class TestGetServiceStatusPickledParallel:
                  with_target_num_replicas):
             del (pool, with_replica_info, with_replica_counts,
                  with_target_num_replicas)
-            return None if name == 'svc-gone' else self._fake_status(name)
+            return None if name == 'svc-gone' else self._fake_prepared(name)
 
-        with mock.patch('sky.serve.serve_utils._get_service_status',
+        with mock.patch('sky.serve.serve_utils._prepare_service_status',
                         side_effect=side):
             out = serve_utils.get_service_status_pickled(
                 ['svc-a', 'svc-gone', 'svc-b'], pool=False)
@@ -555,9 +561,9 @@ class TestGetServiceStatusPickledParallel:
                  with_target_num_replicas)
             if name == 'svc-boom':
                 raise Boom('controller went away')
-            return self._fake_status(name)
+            return self._fake_prepared(name)
 
-        with mock.patch('sky.serve.serve_utils._get_service_status',
+        with mock.patch('sky.serve.serve_utils._prepare_service_status',
                         side_effect=side):
             with pytest.raises(Boom):
                 serve_utils.get_service_status_pickled(
@@ -566,7 +572,7 @@ class TestGetServiceStatusPickledParallel:
     def test_empty_input_short_circuits(self):
         """Empty `service_names` must NOT spawn an executor (cheap path
         for the very common empty-cluster case)."""
-        with mock.patch('sky.serve.serve_utils._get_service_status') as m:
+        with mock.patch('sky.serve.serve_utils._prepare_service_status') as m:
             out = serve_utils.get_service_status_pickled([], pool=False)
         assert out == []
         m.assert_not_called()
@@ -590,9 +596,9 @@ class TestGetServiceStatusPickledParallel:
             except threading.BrokenBarrierError as e:
                 raise AssertionError('expected parallel execution') from e
             time.sleep(0.1)
-            return self._fake_status(name)
+            return self._fake_prepared(name)
 
-        with mock.patch('sky.serve.serve_utils._get_service_status',
+        with mock.patch('sky.serve.serve_utils._prepare_service_status',
                         side_effect=slow):
             out = serve_utils.get_service_status_pickled(
                 ['s1', 's2', 's3', 's4'], pool=False)
@@ -611,10 +617,10 @@ class TestGetServiceStatusPickledParallel:
             del (pool, with_replica_info, with_replica_counts,
                  with_target_num_replicas)
             seen_in_worker.append(marker.get())
-            return self._fake_status(name)
+            return self._fake_prepared(name)
 
         marker.set('caller-tag')
-        with mock.patch('sky.serve.serve_utils._get_service_status',
+        with mock.patch('sky.serve.serve_utils._prepare_service_status',
                         side_effect=capture):
             serve_utils.get_service_status_pickled(['s1', 's2', 's3'],
                                                    pool=False)

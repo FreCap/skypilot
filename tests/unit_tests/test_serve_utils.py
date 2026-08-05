@@ -2321,6 +2321,52 @@ class TestServiceStatusEndpointSnapshot:
         assert 'hourly_cost' not in replica
         endpoint.assert_not_called()
 
+    def test_malformed_v2_status_is_unknown_without_provider_admission(self):
+        info, handle = self._v2_replica('r-1')
+        info.reserved_fill_kubernetes_context = 'contradictory-context'
+        cluster_record = {
+            'name': info.cluster_name,
+            'launched_at': 9,
+            'handle': handle,
+        }
+        record = {'name': 'svc-a', 'pool': False, 'version': 1}
+
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(
+                 serve_utils.global_user_state,
+                 'get_clusters_from_names',
+                 return_value={info.cluster_name: cluster_record}), \
+             mock.patch.object(serve_utils.provider_phase,
+                               'provider_phase') as phase, \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence') as uid, \
+             mock.patch('sky.backends.backend_utils.get_endpoints') as endpoint:
+            status = serve_utils._get_service_status(
+                'svc-a',
+                pool=False,
+                with_yaml=False,
+                with_target_num_replicas=False)
+
+        assert status is not None
+        replica = status['replica_info'][0]
+        assert replica['status'] is serve_state.ReplicaStatus.UNKNOWN
+        assert replica['provider_identity_uncertain'] is True
+        assert replica['endpoint'] is None
+        assert replica['handle'] is None
+        assert replica['launched_at'] is None
+        # Durable placement remains useful and is not replacement-provider
+        # evidence; live endpoint/handle/cost metadata stays absent.
+        assert replica['cloud'] == 'Kubernetes'
+        assert 'hourly_cost' not in replica
+        phase.assert_not_called()
+        uid.assert_not_called()
+        endpoint.assert_not_called()
+
 
 class TestTerminalStatuses:
     """`terminal_statuses` includes SHUTTING_DOWN so that callers like
@@ -2470,10 +2516,21 @@ class TestStreamReplicaLogsPhysicalIdentityFence:
                                      status=serve_state.ReplicaStatus.READY)
         handle = _FakeHandle()
         entered = False
+        phase_entered = False
+
+        @contextlib.contextmanager
+        def _phase():
+            nonlocal phase_entered
+            phase_entered = True
+            try:
+                yield mock.sentinel.admission
+            finally:
+                phase_entered = False
 
         @contextlib.contextmanager
         def _fence():
             nonlocal entered
+            assert phase_entered
             entered = True
             try:
                 yield
@@ -2513,15 +2570,25 @@ class TestStreamReplicaLogsPhysicalIdentityFence:
              mock.patch.object(serve_utils.backends,
                                'CloudVmRayBackend', return_value=backend), \
              mock.patch(
+                 'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+                 return_value=mock.sentinel.cleanup_fence), \
+             mock.patch(
                  'sky.serve.reserved_capacity.protocol_v2_provider_fence',
-                 return_value=_fence()) as provider_fence:
+                 return_value=_fence()) as provider_fence, \
+             mock.patch.object(
+                 serve_utils.provider_phase,
+                 'provider_phase', return_value=_phase()) as phase:
             serve_utils.stream_replica_logs('svc',
                                             replica_id=1,
                                             follow=False,
                                             tail=1,
                                             pool=True)
 
-        provider_fence.assert_called_once_with(info, handle)
+        provider_fence.assert_called_once_with(info,
+                                               handle,
+                                               include_provider_phase=False)
+        phase.assert_called_once_with(
+            serve_utils.provider_phase.ProviderPhaseMode.V2_FENCED)
         backend.tail_logs.assert_called_once_with(handle,
                                                   job_id=None,
                                                   follow=False,
@@ -2529,6 +2596,84 @@ class TestStreamReplicaLogsPhysicalIdentityFence:
                                                   stream_logs=False,
                                                   require_outputs=True,
                                                   process_stream=True)
+
+    def test_interactive_v2_follow_holds_fence_without_provider_phase(
+            self, tmp_path):
+
+        class _FakeHandle:
+            pass
+
+        main_log = tmp_path / 'replica_1.log'
+        launch_log = tmp_path / 'replica_1_launch.log'
+        launch_log.write_text('launch complete\n')
+        info = types.SimpleNamespace(replica_id=1,
+                                     cluster_name='replica-cluster',
+                                     status=serve_state.ReplicaStatus.READY)
+        handle = _FakeHandle()
+        fence_entered = False
+
+        @contextlib.contextmanager
+        def _fence():
+            nonlocal fence_entered
+            fence_entered = True
+            try:
+                yield
+            finally:
+                fence_entered = False
+
+        backend = mock.Mock()
+
+        def _tail_logs(*_args, **_kwargs):
+            assert fence_entered
+            return 0
+
+        backend.tail_logs.side_effect = _tail_logs
+        with mock.patch(
+                'sky.serve.serve_utils._get_healthy_service_log_owner_record',
+                return_value=({
+                    'pool': True,
+                    'resource_scope': None,
+                    'status': serve_state.ServiceStatus.READY,
+                }, None)), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_replica_log_file_name',
+                 return_value=str(main_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_replica_launch_log_file_name',
+                 return_value=str(launch_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils._follow_logs_with_provision_expanding',
+                 return_value=iter(())), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_replica_info_from_id',
+                 return_value=info), \
+             mock.patch(
+                 'sky.serve.serve_utils.global_user_state.'
+                 'get_handle_from_cluster_name',
+                 return_value=handle), \
+             mock.patch.object(serve_utils.backends,
+                               'CloudVmRayResourceHandle', _FakeHandle), \
+             mock.patch.object(serve_utils.backends,
+                               'CloudVmRayBackend', return_value=backend), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+                 return_value=mock.sentinel.cleanup_fence), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.protocol_v2_provider_fence',
+                 return_value=_fence()), \
+             mock.patch.object(serve_utils.provider_phase,
+                               'provider_phase') as phase:
+            result = serve_utils.stream_replica_logs('svc',
+                                                     replica_id=1,
+                                                     follow=True,
+                                                     tail=None,
+                                                     pool=True)
+
+        assert result == ''
+        phase.assert_not_called()
+        backend.tail_logs.assert_called_once_with(handle,
+                                                  job_id=None,
+                                                  follow=True)
 
 
 class TestStartInFlight:

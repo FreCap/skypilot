@@ -35,6 +35,7 @@ from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
 from sky.serve import paid_capacity
+from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
@@ -720,28 +721,38 @@ class SkyServeController:
                    cleanup_fence.physical_cluster_uid)
             v2_groups.setdefault(key, []).append((info, provider_fence))
 
-        for info in legacy_infos:
-            verified_ready_count += 1
-            _resolve_route_candidate(info)
+        if v2_groups:
+            # Resolve every physically fenced group before opening an ambient
+            # provider phase.  A timeout escapes before the local candidate
+            # maps below are published to any warm routing cache.
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED):
+                for grouped_infos in v2_groups.values():
+                    try:
+                        # Every row in this group has already validated its
+                        # own durable handle. Keeping the representative fence
+                        # open makes all endpoint reads use the same captured
+                        # physical target.
+                        with grouped_infos[0][1]:
+                            for info, _ in grouped_infos:
+                                _resolve_route_candidate(info)
+                    except exceptions.KubernetesPhysicalClusterIdentityError as e:
+                        # Treat the group as one coherent snapshot: a provider
+                        # fence failure invalidates candidates resolved earlier
+                        # in the same scope as well as any warm cached routes.
+                        for info, _ in grouped_infos:
+                            route_candidates.pop(id(info), None)
+                            identity_rejected_ids.add(id(info))
+                            _retire_unverified_route(info, e)
+                        continue
+                    verified_ready_count += len(grouped_infos)
 
-        for grouped_infos in v2_groups.values():
-            try:
-                # Every row in this group has already validated its own
-                # durable handle. Keeping the representative fence open makes
-                # all endpoint reads use the same captured physical target.
-                with grouped_infos[0][1]:
-                    for info, _ in grouped_infos:
-                        _resolve_route_candidate(info)
-            except exceptions.KubernetesPhysicalClusterIdentityError as e:
-                # Treat the group as one coherent snapshot: a provider fence
-                # failure invalidates candidates resolved earlier in the same
-                # scope as well as any warm cached routes.
-                for info, _ in grouped_infos:
-                    route_candidates.pop(id(info), None)
-                    identity_rejected_ids.add(id(info))
-                    _retire_unverified_route(info, e)
-                continue
-            verified_ready_count += len(grouped_infos)
+        if legacy_infos:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+                for info in legacy_infos:
+                    verified_ready_count += 1
+                    _resolve_route_candidate(info)
 
         for info in ready_infos:
             cached = route_candidates.get(id(info))
@@ -1425,9 +1436,20 @@ class SkyServeController:
             # Cold endpoint resolution is proportional to the READY fleet and
             # may take tens of seconds. Keep it off the FastAPI event loop so
             # controller liveness and ownership probes remain responsive.
-            lb_replica_info, num_ready = await loop.run_in_executor(
-                None, self._get_lb_replica_info, replica_infos,
-                async_occupancy_by_version)
+            try:
+                lb_replica_info, num_ready = await loop.run_in_executor(
+                    None, self._get_lb_replica_info, replica_infos,
+                    async_occupancy_by_version)
+            except exceptions.ProviderPhaseTimeoutError as error:
+                # No routing/cache state is published until
+                # _get_lb_replica_info completes both provider phases.  A
+                # timeout therefore fails the whole sync closed instead of
+                # returning a successful partial map.
+                logger.warning(
+                    'Load balancer route synchronization timed '
+                    'out waiting for provider authority: %s',
+                    common_utils.format_exception(error))
+                return fastapi.Response(status_code=503)
             if isinstance(lb_replica_info, dict):
                 self._lb_expected_occupancy_urls = {
                     url for url, info in lb_replica_info.items()

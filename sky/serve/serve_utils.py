@@ -42,6 +42,7 @@ from sky.jobs import state as managed_job_state
 from sky.serve import auth_tokens
 from sky.serve import constants
 from sky.serve import controller_transport
+from sky.serve import provider_phase
 from sky.serve import request_aggregator
 from sky.serve import serve_state
 from sky.serve import serve_status_formatter
@@ -1682,15 +1683,51 @@ def _set_replica_status_aggregates(record: dict[str, Any],
     })
 
 
-def _get_service_status(
+_PROVIDER_STATUS_FIELDS = (
+    'cloud',
+    'region',
+    'hourly_cost',
+    'hourly_cost_exclusion_reason',
+    'resources_str',
+    'resources_str_full',
+    'infra',
+)
+
+
+@dataclasses.dataclass
+class _PreparedServiceStatus:
+    """Provider-free inputs and mutable outputs for one status snapshot."""
+
+    record: dict[str, Any]
+    pool: bool
+    include_replica_info: bool
+    replica_infos: list[Any] = dataclasses.field(default_factory=list)
+    cluster_records: dict[str, Any] = dataclasses.field(default_factory=dict)
+    ordinary_infos: list[Any] = dataclasses.field(default_factory=list)
+    fenced_groups: dict[tuple[str, str],
+                        list[Any]] = dataclasses.field(default_factory=dict)
+    validated_handles: dict[int, Any] = dataclasses.field(default_factory=dict)
+    identity_uncertain_infos: list[Any] = dataclasses.field(
+        default_factory=list)
+    serialized_by_id: dict[int,
+                           dict[str,
+                                Any]] = dataclasses.field(default_factory=dict)
+    rate_cache: dict[str, float] = dataclasses.field(default_factory=dict)
+    rate_cache_lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock)
+    job_status_counts: dict[str, int] | None = None
+    jobs_by_cluster: dict[str | None, list[int]] | None = None
+
+
+def _prepare_service_status(
         service_name: str,
         pool: bool,
         with_replica_info: bool = True,
         with_replica_counts: bool = False,
         with_yaml: bool = True,
         with_target_num_replicas: bool = False,
-        status_snapshot_only: bool = False) -> dict[str, Any] | None:
-    """Get the status dict of the service.
+        status_snapshot_only: bool = False) -> _PreparedServiceStatus | None:
+    """Build one complete status snapshot without contacting providers.
 
     Args:
         service_name: The name of the service.
@@ -1716,8 +1753,7 @@ def _get_service_status(
             YAML-free lifecycle paths still inspect latest-version metadata.
 
     Returns:
-        A dictionary describing the status of the service if the service exists.
-        Otherwise, return None.
+        Provider-free state for the service if it exists, otherwise None.
     """
     if status_snapshot_only:
         if (with_replica_info or with_replica_counts or with_yaml or
@@ -1864,100 +1900,53 @@ def _get_service_status(
         record['replica_status_counts'] = status_counts
         _set_replica_status_aggregates(record, status_counts, capacity_counts)
 
+    prepared = _PreparedServiceStatus(record=record,
+                                      pool=pool,
+                                      include_replica_info=with_replica_info)
     if with_replica_info:
-        replica_infos = serve_state.get_replica_infos(service_name)
-        logical = bool(record.get('logical_replica_semantics'))
+        prepared.replica_infos = serve_state.get_replica_infos(service_name)
         # Pre-fetch cluster records in one batched DB query instead of
         # letting each to_info_dict() do its own. With a long failure
         # history this was an N+1.
-        cluster_names = [info.cluster_name for info in replica_infos]
-        cluster_records = global_user_state.get_clusters_from_names(
+        cluster_names = [info.cluster_name for info in prepared.replica_infos]
+        prepared.cluster_records = global_user_state.get_clusters_from_names(
             cluster_names)
-        rate_cache: dict[str, float] = {}
         # Local import avoids the serve_utils -> reserved_capacity ->
         # serve_state cycle. Group protocol-v2 rows by physical target so a
-        # large status response performs one UID proof per pool, while each
-        # nested endpoint lookup reuses that exact active fence.
+        # later global provider phase can perform one UID proof per pool even
+        # when several services share it. Merely constructing the context
+        # manager below validates durable row/handle agreement; it performs no
+        # provider I/O until entered by the phased serializer.
         # pylint: disable-next=import-outside-toplevel
         from sky.serve import reserved_capacity
 
-        serialized_by_id: dict[int, dict[str, Any]] = {}
-        ordinary_infos: list[Any] = []
-        fenced_groups: dict[tuple[str, str], list[Any]] = {}
-        identity_uncertain_infos: list[Any] = []
-        validated_handles: dict[int, Any] = {}
-        for info in replica_infos:
-            cluster_record = cluster_records.get(info.cluster_name)
+        for info in prepared.replica_infos:
+            cluster_record = prepared.cluster_records.get(info.cluster_name)
             try:
                 cleanup_fence = (
                     reserved_capacity.parse_protocol_v2_cleanup_fence(info))
                 if cleanup_fence is None:
-                    ordinary_infos.append(info)
+                    prepared.ordinary_infos.append(info)
                     continue
                 handle = (cluster_record.get('handle') if isinstance(
                     cluster_record, dict) else None)
                 reserved_capacity.protocol_v2_provider_fence(info, handle)
             except exceptions.KubernetesPhysicalClusterIdentityError:
-                identity_uncertain_infos.append(info)
+                prepared.identity_uncertain_infos.append(info)
                 continue
-            validated_handles[info.replica_id] = handle
+            prepared.validated_handles[info.replica_id] = handle
             group_key = (cleanup_fence.kubernetes_context,
                          cleanup_fence.physical_cluster_uid)
-            fenced_groups.setdefault(group_key, []).append(info)
+            prepared.fenced_groups.setdefault(group_key, []).append(info)
 
-        def _serialize(info: Any, cluster_record: Any) -> None:
-            serialized_by_id[info.replica_id] = info.to_info_dict(
-                with_handle=True,
-                with_url=not pool,
-                cluster_record=cluster_record,
-                rate_cache=rate_cache,
-            )
-
-        for info in ordinary_infos:
-            _serialize(info, cluster_records[info.cluster_name])
-        for info in identity_uncertain_infos:
-            _serialize(info, None)
-        for group_infos in fenced_groups.values():
-            representative = group_infos[0]
-            try:
-                with reserved_capacity.protocol_v2_provider_fence(
-                        representative,
-                        validated_handles[representative.replica_id]):
-                    for info in group_infos:
-                        _serialize(info, cluster_records[info.cluster_name])
-            except exceptions.KubernetesPhysicalClusterIdentityError:
-                for info in group_infos:
-                    _serialize(info, None)
-
-        replica_records = [
-            serialized_by_id[info.replica_id] for info in replica_infos
-        ]
-        record['replica_info'] = replica_records
-        full_status_counts: collections.defaultdict[str, int] = (
-            collections.defaultdict(int))
-        full_capacity_counts: collections.defaultdict[str, int] = (
-            collections.defaultdict(int))
-        for info, replica_record in zip(replica_infos, replica_records):
-            status = replica_record['status'].value
-            full_status_counts[status] += 1
-            planned_capacity = getattr(info, 'planned_capacity', 1)
-            if (not isinstance(planned_capacity, int) or
-                    isinstance(planned_capacity, bool) or planned_capacity < 1):
-                planned_capacity = 1
-            full_capacity_counts[status] += planned_capacity if logical else 1
-        _set_replica_status_aggregates(record, dict(full_status_counts),
-                                       dict(full_capacity_counts))
         if pool:
-            record['job_status_counts'] = (
+            prepared.job_status_counts = (
                 managed_job_state.get_nonterminal_job_status_counts_by_pool(
                     service_name))
             # Fetch all nonterminal job ids in the pool in a single query,
             # grouped by current_cluster_name. Avoids the N+1 pattern of
             # (1 + len(replicas)) per-pool queries against a job_info table
             # that may contain tens of thousands of finished rows.
-            jobs_by_cluster = (
-                managed_job_state.get_nonterminal_job_ids_by_pool_grouped(
-                    service_name))
             # Pool-level jobs (e.g. batch coordinators) span every worker.
             # They have pool set but no cluster_name, so they live under the
             # None bucket of the grouped result. Note: the prior per-call
@@ -1967,19 +1956,340 @@ def _get_service_status(
             # surfaced unrelated replicas' jobs as `used_by` on each READY
             # worker. The grouped query lets us implement the intended
             # semantic exactly.
+            prepared.jobs_by_cluster = (
+                managed_job_state.get_nonterminal_job_ids_by_pool_grouped(
+                    service_name))
+    return prepared
+
+
+_PreparedReplicaStatus = tuple[_PreparedServiceStatus, Any]
+
+
+def _sanitize_provider_uncertain_status(
+        replica_record: dict[str, Any],
+        *,
+        strip_placement_metadata: bool = False) -> dict[str, Any]:
+    """Fail a provider partition closed without dropping its durable row."""
+    replica_record['status'] = serve_state.ReplicaStatus.UNKNOWN
+    replica_record['endpoint'] = None
+    replica_record['handle'] = None
+    replica_record['launched_at'] = None
+    replica_record['provider_identity_uncertain'] = True
+    if strip_placement_metadata:
+        for field in _PROVIDER_STATUS_FIELDS:
+            replica_record.pop(field, None)
+    return replica_record
+
+
+def _provider_uncertain_replica_status(info: Any,
+                                       *,
+                                       strip_placement_metadata: bool = False
+                                      ) -> dict[str, Any]:
+    """Serialize durable fields only; no provider or replacement metadata."""
+    replica_record = info.to_info_dict(with_handle=True,
+                                       with_url=False,
+                                       cluster_record=None,
+                                       rate_cache=None)
+    return _sanitize_provider_uncertain_status(
+        replica_record, strip_placement_metadata=strip_placement_metadata)
+
+
+def _serialize_prepared_replica(prepared: _PreparedServiceStatus,
+                                info: Any) -> dict[str, Any]:
+    """Serialize one admitted replica from the prepared cluster snapshot."""
+    # Separate physical groups of one service can run concurrently. Protect
+    # its pricing memo while retaining provider fanout across services.
+    with prepared.rate_cache_lock:
+        replica_record = info.to_info_dict(
+            with_handle=True,
+            with_url=not prepared.pool,
+            cluster_record=prepared.cluster_records[info.cluster_name],
+            rate_cache=prepared.rate_cache,
+        )
+    if replica_record.get('provider_identity_uncertain'):
+        return _sanitize_provider_uncertain_status(replica_record)
+    return replica_record
+
+
+def _store_serialized_results(
+        results: list[tuple[_PreparedServiceStatus, int, dict[str,
+                                                              Any]]]) -> None:
+    for prepared, replica_id, replica_record in results:
+        prepared.serialized_by_id[replica_id] = replica_record
+
+
+def _uncertain_results(
+    entries: list[_PreparedReplicaStatus],
+    *,
+    strip_placement_metadata: bool = False,
+) -> list[tuple[_PreparedServiceStatus, int, dict[str, Any]]]:
+    return [(prepared, info.replica_id,
+             _provider_uncertain_replica_status(
+                 info, strip_placement_metadata=strip_placement_metadata))
+            for prepared, info in entries]
+
+
+def _serialize_v2_status_group(
+    entries: list[_PreparedReplicaStatus],
+    admission: provider_phase.ProviderPhaseAdmission | None = None,
+) -> list[tuple[_PreparedServiceStatus, int, dict[str, Any]]]:
+    """Serialize one physical v2 pool under one UID proof."""
+    assert entries
+    join_context: contextlib.AbstractContextManager[Any] = (
+        contextlib.nullcontext()
+        if admission is None else provider_phase.join_provider_phase(admission))
+    representative_prepared, representative = entries[0]
+    # Local import avoids the serve_utils -> reserved_capacity -> serve_state
+    # initialization cycle.
+    # pylint: disable-next=import-outside-toplevel
+    from sky.serve import reserved_capacity
+    try:
+        with join_context:
+            with reserved_capacity.protocol_v2_provider_fence(
+                    representative, representative_prepared.validated_handles[
+                        representative.replica_id]):
+                return [(prepared, info.replica_id,
+                         _serialize_prepared_replica(prepared, info))
+                        for prepared, info in entries]
+    except exceptions.KubernetesPhysicalClusterIdentityError as error:
+        logger.warning(
+            'Service status fenced off a protocol-v2 provider partition: %s',
+            common_utils.format_exception(error))
+        return _uncertain_results(entries)
+    except exceptions.ProviderPhaseTimeoutError as error:
+        logger.warning(
+            'Service status timed out joining a protocol-v2 provider phase: '
+            '%s', common_utils.format_exception(error))
+        return _uncertain_results(entries, strip_placement_metadata=True)
+
+
+def _serialize_ordinary_status_partition(
+    entries: list[_PreparedReplicaStatus],
+    admission: provider_phase.ProviderPhaseAdmission | None = None,
+) -> list[tuple[_PreparedServiceStatus, int, dict[str, Any]]]:
+    """Serialize one service's ordinary replicas in the ambient phase."""
+    assert entries
+    join_context: contextlib.AbstractContextManager[Any] = (
+        contextlib.nullcontext()
+        if admission is None else provider_phase.join_provider_phase(admission))
+    try:
+        with join_context:
+            return [(prepared, info.replica_id,
+                     _serialize_prepared_replica(prepared, info))
+                    for prepared, info in entries]
+    except exceptions.ProviderPhaseTimeoutError as error:
+        logger.warning(
+            'Service status fenced off an ambient provider partition: %s',
+            common_utils.format_exception(error))
+        return _uncertain_results(entries, strip_placement_metadata=True)
+
+
+def _seed_identity_uncertain_statuses(
+        prepared_statuses: list[_PreparedServiceStatus]) -> None:
+    for prepared in prepared_statuses:
+        _store_serialized_results(
+            _uncertain_results([
+                (prepared, info) for info in prepared.identity_uncertain_infos
+            ]))
+
+
+def _global_v2_status_groups(
+    prepared_statuses: list[_PreparedServiceStatus],
+) -> dict[tuple[str, str], list[_PreparedReplicaStatus]]:
+    groups: dict[tuple[str, str], list[_PreparedReplicaStatus]] = {}
+    for prepared in prepared_statuses:
+        for key, infos in prepared.fenced_groups.items():
+            groups.setdefault(key, []).extend(
+                (prepared, info) for info in infos)
+    return groups
+
+
+def _reject_conflicting_v2_status_groups(
+    groups: dict[tuple[str, str], list[_PreparedReplicaStatus]],) -> None:
+    """Fail every contradictory UID for one mutable context closed."""
+    keys_by_context: dict[str, list[tuple[str, str]]] = {}
+    for key in groups:
+        keys_by_context.setdefault(key[0], []).append(key)
+    conflicted_keys = [
+        key for keys in keys_by_context.values()
+        if len({candidate[1] for candidate in keys}) > 1 for key in keys
+    ]
+    for key in conflicted_keys:
+        entries = groups.pop(key)
+        logger.warning(
+            'Service status rejected conflicting physical-cluster '
+            'UIDs for Kubernetes context %r.', key[0])
+        _store_serialized_results(_uncertain_results(entries))
+
+
+def _ordinary_status_partitions(
+    prepared_statuses: list[_PreparedServiceStatus],
+) -> list[list[_PreparedReplicaStatus]]:
+    return [[(prepared, info)
+             for info in prepared.ordinary_infos]
+            for prepared in prepared_statuses
+            if prepared.ordinary_infos]
+
+
+def _mark_phase_timeout(partitions: typing.Iterable[
+    list[_PreparedReplicaStatus]], mode: provider_phase.ProviderPhaseMode,
+                        error: exceptions.ProviderPhaseTimeoutError) -> None:
+    logger.warning('Service status timed out waiting for provider phase %s: %s',
+                   mode.value, common_utils.format_exception(error))
+    for entries in partitions:
+        _store_serialized_results(
+            _uncertain_results(entries, strip_placement_metadata=True))
+
+
+def _serialize_prepared_statuses_synchronously(
+        prepared_statuses: list[_PreparedServiceStatus]) -> None:
+    """Run v2 then ambient serialization without child-thread admission."""
+    _seed_identity_uncertain_statuses(prepared_statuses)
+    v2_groups = _global_v2_status_groups(prepared_statuses)
+    _reject_conflicting_v2_status_groups(v2_groups)
+    if v2_groups:
+        try:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED):
+                for entries in v2_groups.values():
+                    _store_serialized_results(
+                        _serialize_v2_status_group(entries))
+        except exceptions.ProviderPhaseTimeoutError as error:
+            _mark_phase_timeout(v2_groups.values(),
+                                provider_phase.ProviderPhaseMode.V2_FENCED,
+                                error)
+
+    ordinary_partitions = _ordinary_status_partitions(prepared_statuses)
+    if ordinary_partitions:
+        try:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+                for entries in ordinary_partitions:
+                    _store_serialized_results(
+                        _serialize_ordinary_status_partition(entries))
+        except exceptions.ProviderPhaseTimeoutError as error:
+            _mark_phase_timeout(ordinary_partitions,
+                                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY,
+                                error)
+
+
+def _run_status_phase_fanout(
+    work: list[list[_PreparedReplicaStatus]],
+    worker: Callable[
+        [list[_PreparedReplicaStatus], provider_phase.ProviderPhaseAdmission],
+        list[tuple[_PreparedServiceStatus, int, dict[str, Any]]],
+    ],
+    admission: provider_phase.ProviderPhaseAdmission,
+    parent_ctx: contextvars.Context,
+) -> None:
+    """Run and fully join one admitted status-provider fanout."""
+    max_workers = min(len(work), _STATUS_FANOUT_MAX_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(parent_ctx.copy().run, worker, entries, admission)
+            for entries in work
+        ]
+        for future in futures:
+            _store_serialized_results(future.result())
+
+
+def _serialize_prepared_statuses_with_fanout(
+        prepared_statuses: list[_PreparedServiceStatus],
+        parent_ctx: contextvars.Context) -> None:
+    """Serialize a batch under one fully joined v2 and ambient root each."""
+    _seed_identity_uncertain_statuses(prepared_statuses)
+    v2_groups = _global_v2_status_groups(prepared_statuses)
+    _reject_conflicting_v2_status_groups(v2_groups)
+    if v2_groups:
+        v2_work = list(v2_groups.values())
+        try:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
+                _run_status_phase_fanout(v2_work, _serialize_v2_status_group,
+                                         admission, parent_ctx)
+        except exceptions.ProviderPhaseTimeoutError as error:
+            _mark_phase_timeout(v2_work,
+                                provider_phase.ProviderPhaseMode.V2_FENCED,
+                                error)
+
+    ordinary_work = _ordinary_status_partitions(prepared_statuses)
+    if ordinary_work:
+        try:
+            with provider_phase.provider_phase(provider_phase.ProviderPhaseMode.
+                                               AMBIENT_LEGACY) as admission:
+                _run_status_phase_fanout(ordinary_work,
+                                         _serialize_ordinary_status_partition,
+                                         admission, parent_ctx)
+        except exceptions.ProviderPhaseTimeoutError as error:
+            _mark_phase_timeout(ordinary_work,
+                                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY,
+                                error)
+
+
+def _finalize_prepared_service_status(
+        prepared: _PreparedServiceStatus) -> dict[str, Any]:
+    """Attach provider results and aggregates without further I/O."""
+    record = prepared.record
+    if prepared.include_replica_info:
+        replica_records = [
+            prepared.serialized_by_id[info.replica_id]
+            for info in prepared.replica_infos
+        ]
+        record['replica_info'] = replica_records
+        full_status_counts: collections.defaultdict[str, int] = (
+            collections.defaultdict(int))
+        full_capacity_counts: collections.defaultdict[str, int] = (
+            collections.defaultdict(int))
+        logical = bool(record.get('logical_replica_semantics'))
+        for info, replica_record in zip(prepared.replica_infos,
+                                        replica_records):
+            status = replica_record['status'].value
+            full_status_counts[status] += 1
+            planned_capacity = getattr(info, 'planned_capacity', 1)
+            if (not isinstance(planned_capacity, int) or
+                    isinstance(planned_capacity, bool) or planned_capacity < 1):
+                planned_capacity = 1
+            full_capacity_counts[status] += planned_capacity if logical else 1
+        _set_replica_status_aggregates(record, dict(full_status_counts),
+                                       dict(full_capacity_counts))
+        if prepared.pool:
+            record['job_status_counts'] = prepared.job_status_counts
+            jobs_by_cluster = prepared.jobs_by_cluster or {}
             pool_level_job_ids = list(jobs_by_cluster.get(None, []))
-            for replica_info in record['replica_info']:
-                job_ids = list(jobs_by_cluster.get(replica_info['name'], []))
-                # Show pool-level jobs on READY workers only.
-                if (replica_info.get('status') ==
+            for replica_record in replica_records:
+                job_ids = list(jobs_by_cluster.get(replica_record['name'], []))
+                if (replica_record.get('status') ==
                         serve_state.ReplicaStatus.READY):
                     job_ids = list(dict.fromkeys(pool_level_job_ids + job_ids))
-                replica_info['used_by'] = job_ids
+                replica_record['used_by'] = job_ids
     observed_ready = record.get('observed_ready_replicas')
     if ('ready_replicas' in record and isinstance(observed_ready, int) and
             not isinstance(observed_ready, bool) and observed_ready >= 0):
         record['ready_replicas'] = observed_ready
     return record
+
+
+def _get_service_status(
+        service_name: str,
+        pool: bool,
+        with_replica_info: bool = True,
+        with_replica_counts: bool = False,
+        with_yaml: bool = True,
+        with_target_num_replicas: bool = False,
+        status_snapshot_only: bool = False) -> dict[str, Any] | None:
+    """Get one service status using synchronous v2-before-ambient phases."""
+    prepared = _prepare_service_status(
+        service_name,
+        pool,
+        with_replica_info=with_replica_info,
+        with_replica_counts=with_replica_counts,
+        with_yaml=with_yaml,
+        with_target_num_replicas=with_target_num_replicas,
+        status_snapshot_only=status_snapshot_only)
+    if prepared is None:
+        return None
+    _serialize_prepared_statuses_synchronously([prepared])
+    return _finalize_prepared_service_status(prepared)
 
 
 def resolve_target_qps_for_gpu_shape(
@@ -2032,9 +2342,10 @@ def get_service_status_pickled(
         return []
     if include_target_num_replicas is None:
         include_target_num_replicas = not summary_only and not metadata_only
-    # Fan out across services. Each `_get_service_status` is dominated by
-    # I/O (controller HTTP + DB reads) so threads parallelize well; the
-    # cap on max_workers keeps memory and DB-connection pressure bounded.
+    # Fan out the provider-free service/replica/cluster snapshots first. The
+    # resulting immutable work set is then serialized under one process-wide
+    # v2 phase followed by one ambient phase; no worker can independently
+    # interleave the two authority modes.
     # Each task gets a fresh `Context.copy()` because the same Context
     # can't be entered from multiple threads (Context.run raises
     # RuntimeError otherwise) — but the values (request_id / user_id)
@@ -2043,7 +2354,7 @@ def get_service_status_pickled(
     # aborts the whole call).
     parent_ctx = contextvars.copy_context()
 
-    def _run_in_context(name: str) -> dict[str, Any] | None:
+    def _run_in_context(name: str) -> _PreparedServiceStatus | None:
         kwargs = {
             'pool': pool,
             'with_replica_info': not summary_only and not metadata_only,
@@ -2058,17 +2369,22 @@ def get_service_status_pickled(
         # lifecycle consumers parse it back into a launchable task.
         if (summary_only and not pool) or metadata_only:
             kwargs['with_yaml'] = False
-        status = parent_ctx.copy().run(_get_service_status, name, **kwargs)
-        if status is not None and metadata_only:
-            status['metadata_only'] = True
-        return status
+        prepared = parent_ctx.copy().run(_prepare_service_status, name,
+                                         **kwargs)
+        if prepared is not None and metadata_only:
+            prepared.record['metadata_only'] = True
+        return prepared
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        statuses = list(ex.map(_run_in_context, service_names))
-    live_statuses = sorted(
-        (status for status in statuses if status is not None),
-        key=lambda status: status['name'])
+        prepared_statuses = list(ex.map(_run_in_context, service_names))
+    live_prepared = [
+        prepared for prepared in prepared_statuses if prepared is not None
+    ]
+    _serialize_prepared_statuses_with_fanout(live_prepared, parent_ctx)
+    live_statuses = sorted((_finalize_prepared_service_status(prepared)
+                            for prepared in live_prepared),
+                           key=lambda status: status['name'])
     for status in live_statuses:
         # The rendered YAML carries plaintext secrets (replicas need it
         # launchable), so it never leaves the controller for services:
@@ -3878,6 +4194,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
         replica_cluster_name)
     provider_fence: contextlib.AbstractContextManager[None] = (
         contextlib.nullcontext())
+    provider_mode = provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
     if matching_info is not None:
         # Imported lazily to avoid the serve_utils -> reserved_capacity ->
         # serve_state import cycle during module initialization.  Log tailing
@@ -3886,8 +4203,12 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
         # the same physical Kubernetes cluster before any output is read.
         # pylint: disable-next=import-outside-toplevel
         from sky.serve import reserved_capacity
+        cleanup_fence = reserved_capacity.parse_protocol_v2_cleanup_fence(
+            matching_info)
         provider_fence = reserved_capacity.protocol_v2_provider_fence(
-            matching_info, handle)
+            matching_info, handle, include_provider_phase=False)
+        if cleanup_fence is not None:
+            provider_mode = provider_phase.ProviderPhaseMode.V2_FENCED
     if handle is None:
         if tail is not None:
             for line in final_lines_to_print:
@@ -3901,15 +4222,22 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     print(f'{colorama.Fore.YELLOW}Start streaming logs for task job '
           f'of {repnoun} {replica_id}...{colorama.Style.RESET_ALL}')
 
-    # Always tail the latest logs, which represent user setup & run.
+    # Always tail the latest logs, which represent user setup & run. A
+    # bounded read participates in the normal provider phases. Interactive
+    # follow deliberately holds only its immutable physical fence: keeping a
+    # process-wide phase open for an unbounded stream would starve every
+    # opposite-mode operation in the API process.
+    phase_context: contextlib.AbstractContextManager = (
+        contextlib.nullcontext()
+        if follow else provider_phase.provider_phase(provider_mode))
     if tail is None:
-        with provider_fence:
+        with phase_context, provider_fence:
             returncode = backend.tail_logs(handle, job_id=None, follow=follow)
         if returncode != 0:
             return (f'{colorama.Fore.RED}Failed to stream logs for {repnoun} '
                     f'{replica_id}.{colorama.Style.RESET_ALL}')
     elif not follow and tail > 0:
-        with provider_fence:
+        with phase_context, provider_fence:
             final = backend.tail_logs(handle,
                                       job_id=None,
                                       follow=follow,

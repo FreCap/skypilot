@@ -86,7 +86,7 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager._cloud_instance_looks_alive = mock.Mock(return_value=True)
         manager._terminate_replica = mock.Mock()
         manager._resolve_probe_urls = mock.Mock(
-            side_effect=lambda infos:
+            side_effect=lambda infos, *, phase_admission:
             {info.replica_id: info.url for info in infos})
         return manager
 
@@ -621,7 +621,8 @@ class TestProbeRoundBatching(unittest.TestCase):
             manager._probe_all_replicas()
 
         mock_get_specs.assert_not_called()
-        info.probe_pool.assert_called_once_with()
+        info.probe_pool.assert_called_once_with(
+            provider_phase_admission=mock.ANY)
 
     def test_probe_round_returns_fleet_snapshot_without_second_full_read(self):
         manager = self._make_manager()

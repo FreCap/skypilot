@@ -19,6 +19,7 @@ import functools
 import hmac
 import json
 import logging
+import math
 import os
 import platform
 import signal
@@ -91,6 +92,8 @@ logger = sky_logging.init_logger(__name__)
 
 KubernetesPhysicalClusterIdentityError = (
     exceptions.KubernetesPhysicalClusterIdentityError)
+KubernetesPhysicalClusterFenceBusyError = (
+    exceptions.KubernetesPhysicalClusterFenceBusyError)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -125,8 +128,44 @@ _PHYSICAL_CLUSTER_UID_FENCE_TOKENS: contextvars.ContextVar[dict[
 # Canonical context -> capture target and active scope count.
 _PHYSICAL_CLUSTER_UID_FENCES: dict[str, _PhysicalClusterUidFenceEntry] = {}
 _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS: dict[str, str] = {}
+_PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS: dict[str, int] = {}
+_PHYSICAL_CLUSTER_UID_FENCE_PID = os.getpid()
 _MAX_FENCED_KUBECONFIG_BYTES = 16 * 1024 * 1024
 _FENCED_KUBECONFIG_CAPTURE_TIMEOUT_SECONDS = 30
+
+
+def _reset_physical_cluster_uid_fences_after_fork() -> None:
+    """Replace inherited synchronization and authority in a forked child."""
+    global _PHYSICAL_CLUSTER_UID_FENCES_LOCK  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCES_CONDITION  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCE_TOKENS  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCES  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS  # pylint: disable=global-statement
+    global _PHYSICAL_CLUSTER_UID_FENCE_PID  # pylint: disable=global-statement
+    # A vanished parent thread may own the old mutex.  Never acquire it and do
+    # not unlink capture paths: those files remain owned by the parent scope.
+    lock = threading.Lock()
+    _PHYSICAL_CLUSTER_UID_FENCES_LOCK = lock
+    _PHYSICAL_CLUSTER_UID_FENCES_CONDITION = threading.Condition(lock)
+    _PHYSICAL_CLUSTER_UID_FENCE_TOKENS = contextvars.ContextVar(
+        'physical_cluster_uid_fence_tokens', default=None)
+    _PHYSICAL_CLUSTER_UID_FENCES = {}
+    _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS = {}
+    _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS = {}
+    _PHYSICAL_CLUSTER_UID_FENCE_PID = os.getpid()
+
+
+def _ensure_physical_cluster_uid_fence_process() -> None:
+    if os.getpid() != _PHYSICAL_CLUSTER_UID_FENCE_PID:
+        # Defensive fallback for an embedding that did not run at-fork hooks.
+        # This check must precede every access to the possibly inherited lock.
+        _reset_physical_cluster_uid_fences_after_fork()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(
+        after_in_child=_reset_physical_cluster_uid_fences_after_fork)
 
 
 def _canonical_physical_cluster_fence_context(context: str | None) -> str:
@@ -137,6 +176,7 @@ def _canonical_physical_cluster_fence_context(context: str | None) -> str:
 def active_physical_cluster_command_target(
         context: str | None) -> PhysicalClusterUidFenceTarget | None:
     """Return the capture-pinned command target for an active UID fence."""
+    _ensure_physical_cluster_uid_fence_process()
     canonical_context = _canonical_physical_cluster_fence_context(context)
     caller_tokens = _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.get() or {}
     caller_token = caller_tokens.get(canonical_context)
@@ -154,19 +194,70 @@ def active_physical_cluster_command_target(
                 # Capture and the first UID proof happen before the active
                 # entry is published.  Do not let an unrelated caller use the
                 # mutable ambient target during that initialization window.
-                raise KubernetesPhysicalClusterIdentityError(
+                raise KubernetesPhysicalClusterFenceBusyError(
                     'A Kubernetes physical-cluster fence is being '
-                    'initialized for this context.')
+                    'initialized for this context.', canonical_context,
+                    _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.get(
+                        canonical_context, 0))
             return None
         if caller_token is None:
-            raise KubernetesPhysicalClusterIdentityError(
+            raise KubernetesPhysicalClusterFenceBusyError(
                 'Kubernetes physical-cluster fence context was not propagated '
-                'to this provider call.')
+                'to this provider call.', canonical_context,
+                _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.get(
+                    canonical_context, 0))
         if not hmac.compare_digest(caller_token, entry.target.token):
             raise KubernetesPhysicalClusterIdentityError(
                 'Kubernetes physical-cluster fence token does not match its '
                 'capture target.')
         return entry.target
+
+
+def wait_for_physical_cluster_uid_fence_retirement(
+    context: str | None,
+    deadline: float,
+    failure_generation: int,
+) -> bool:
+    """Wait for one unrelated owner/initializer to retire successfully.
+
+    This is a retry boundary for an ordinary tokenless caller that already
+    failed closed with ``KubernetesPhysicalClusterFenceBusyError``.  It never
+    lends the caller an active capture.  One absolute monotonic deadline must
+    be reused across all capture replacement races.
+
+    Returns:
+        True when the context is ambient. False if the deadline expires first.
+    """
+    if (isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or
+            not math.isfinite(deadline)):
+        raise ValueError('Fence-retirement deadline must be finite.')
+    if (isinstance(failure_generation, bool) or
+            not isinstance(failure_generation, int) or failure_generation < 0):
+        raise ValueError('Fence failure generation must be nonnegative.')
+    _ensure_physical_cluster_uid_fence_process()
+    if _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.get():
+        raise KubernetesPhysicalClusterIdentityError(
+            'A physical-cluster-fenced caller cannot wait for ambient '
+            'Kubernetes authority.')
+    canonical_context = _canonical_physical_cluster_fence_context(context)
+    with _PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+        if (_PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.get(
+                canonical_context, 0) != failure_generation):
+            raise KubernetesPhysicalClusterIdentityError(
+                'The active Kubernetes physical-cluster fence failed before '
+                'ambient retry.')
+        while (canonical_context in _PHYSICAL_CLUSTER_UID_FENCES or
+               canonical_context in _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS):
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                return False
+            _PHYSICAL_CLUSTER_UID_FENCES_CONDITION.wait(timeout=remaining)
+            if (_PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.get(
+                    canonical_context, 0) != failure_generation):
+                raise KubernetesPhysicalClusterIdentityError(
+                    'The active Kubernetes physical-cluster fence failed '
+                    'before ambient retry.')
+        return True
 
 
 def _active_physical_cluster_uid_fence(context: str | None) -> str | None:
@@ -260,6 +351,8 @@ def _read_physical_cluster_uid_from_api_client(client: Any) -> str:
 def physical_cluster_uid_fence(
     context: str,
     expected_uid: str,
+    *,
+    wait_for_initializer: bool = True,
 ) -> typing.Iterator[None]:
     """Fence every Kubernetes API client used in this provisioning scope.
 
@@ -271,6 +364,10 @@ def physical_cluster_uid_fence(
         raise ValueError('Kubernetes physical-cluster fence needs a context.')
     if not isinstance(expected_uid, str) or not expected_uid:
         raise ValueError('Kubernetes physical-cluster fence needs a UID.')
+    if not isinstance(wait_for_initializer, bool):
+        raise ValueError('wait_for_initializer must be a bool.')
+    _ensure_physical_cluster_uid_fence_process()
+    scope_pid = _PHYSICAL_CLUSTER_UID_FENCE_PID
     canonical_context = _canonical_physical_cluster_fence_context(context)
     inherited_tokens = _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.get() or {}
     inherited_token = inherited_tokens.get(canonical_context)
@@ -311,6 +408,12 @@ def physical_cluster_uid_fence(
                     raise KubernetesPhysicalClusterIdentityError(
                         'Conflicting Kubernetes physical-cluster provisioning '
                         'fences are active for one context.')
+                if not wait_for_initializer:
+                    raise KubernetesPhysicalClusterFenceBusyError(
+                        'A Kubernetes physical-cluster fence is being '
+                        'initialized for this context.', canonical_context,
+                        _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.get(
+                            canonical_context, 0))
                 _PHYSICAL_CLUSTER_UID_FENCES_CONDITION.wait()
                 continue
             _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS[
@@ -362,6 +465,10 @@ def physical_cluster_uid_fence(
                         canonical_context) == expected_uid):
                     _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS.pop(
                         canonical_context)
+                    _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS[
+                        canonical_context] = (
+                            _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.get(
+                                canonical_context, 0) + 1)
                 _PHYSICAL_CLUSTER_UID_FENCES_CONDITION.notify_all()
             raise
     if target is None:
@@ -373,22 +480,28 @@ def physical_cluster_uid_fence(
     try:
         yield
     finally:
-        _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.reset(token_reset)
-        retired_path: str | None = None
-        with _PHYSICAL_CLUSTER_UID_FENCES_LOCK:
-            current = _PHYSICAL_CLUSTER_UID_FENCES.get(canonical_context)
-            if (current is None or current.target.expected_uid != expected_uid):
-                # The registry is private and every mutation is lock-guarded;
-                # this is a defensive fail-closed assertion against corruption.
-                raise RuntimeError(
-                    'Kubernetes physical-cluster fence registry changed '
-                    'unexpectedly.')
-            if current.count == 1:
-                retired = _PHYSICAL_CLUSTER_UID_FENCES.pop(canonical_context)
-                retired_path = retired.target.kubeconfig_path
-            else:
-                current.count -= 1
-        _remove_capture_file(retired_path)
+        if (os.getpid() == scope_pid and
+                _PHYSICAL_CLUSTER_UID_FENCE_PID == scope_pid):
+            _PHYSICAL_CLUSTER_UID_FENCE_TOKENS.reset(token_reset)
+            retired_path: str | None = None
+            with _PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+                current = _PHYSICAL_CLUSTER_UID_FENCES.get(canonical_context)
+                if (current is None or
+                        current.target.expected_uid != expected_uid):
+                    # The registry is private and every mutation is
+                    # lock-guarded; this is a defensive fail-closed assertion
+                    # against corruption.
+                    raise RuntimeError(
+                        'Kubernetes physical-cluster fence registry changed '
+                        'unexpectedly.')
+                if current.count == 1:
+                    retired = _PHYSICAL_CLUSTER_UID_FENCES.pop(
+                        canonical_context)
+                    retired_path = retired.target.kubeconfig_path
+                    _PHYSICAL_CLUSTER_UID_FENCES_CONDITION.notify_all()
+                else:
+                    current.count -= 1
+            _remove_capture_file(retired_path)
 
 
 @dataclasses.dataclass(frozen=True)

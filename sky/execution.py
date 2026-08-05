@@ -33,6 +33,7 @@ from sky.execution_autostop import (
 from sky.execution_autostop import apply_launch_autostop
 from sky.execution_autostop import autostop_requested_features
 from sky.serve import constants as serve_constants
+from sky.serve import provider_phase
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -687,6 +688,15 @@ def _execute_dag_under_provider_fence(
     # loses that concrete plan must fail closed, rather than re-optimize after
     # the physical-identity read and rely on the later actuation-boundary
     # check to reject a drifted result.
+
+    phase_mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                  if reserved_fill_launch_fence is None else
+                  provider_phase.ProviderPhaseMode.V2_FENCED)
+    # API/executor processes can run ordinary and v2 requests concurrently.
+    # Admit the complete provider-bearing tail before constructing a physical
+    # capture so ambient requests can never overlap that immutable authority.
+    _provider_fence_stack.enter_context(
+        provider_phase.provider_phase(phase_mode))
 
     if reserved_fill_launch_fence is not None:
         # Optimization is allowed to rewrite best_resources. Reject any drift

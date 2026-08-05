@@ -59,7 +59,8 @@ def _make_manager(failure_threshold):
     manager._terminate_replica = mock.Mock()
     manager._db_fence_kwargs = mock.Mock(return_value={})
     manager._resolve_probe_urls = mock.Mock(
-        side_effect=lambda infos: {info.replica_id: info.url for info in infos})
+        side_effect=lambda infos, **_kwargs:
+        {info.replica_id: info.url for info in infos})
     return manager
 
 

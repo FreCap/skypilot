@@ -15,6 +15,7 @@ from sky import global_user_state
 from sky import sky_logging
 from sky.backends import backend_utils
 from sky.serve import constants as serve_constants
+from sky.serve import provider_phase
 from sky.serve import replica_tls
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -1262,7 +1263,12 @@ class ReplicaInfo:
                 f'launched_at={info_dict["launched_at"]}{handle_str})')
         return info
 
-    def probe_pool(self) -> tuple['ReplicaInfo', bool, float]:
+    def probe_pool(
+        self,
+        *,
+        provider_phase_admission: provider_phase.ProviderPhaseAdmission |
+        None = None,
+    ) -> tuple['ReplicaInfo', bool, float]:
         """Probe the replica for pool management.
 
         This function will check the first job status of the cluster, which is a
@@ -1281,12 +1287,14 @@ class ReplicaInfo:
             durable_handle = global_user_state.get_handle_from_cluster_name(
                 self.cluster_name)
             with reserved_capacity.protocol_v2_provider_fence(
-                    self, durable_handle):
+                    self, durable_handle,
+                    phase_admission=provider_phase_admission):
                 handle = backend_utils.check_cluster_available(
                     self.cluster_name, operation='probing pool')
                 if handle is None:
                     return self, False, probe_time
-                with reserved_capacity.protocol_v2_provider_fence(self, handle):
+                with reserved_capacity.protocol_v2_provider_fence(
+                        self, handle, phase_admission=provider_phase_admission):
                     backend = backend_utils.get_backend_from_handle(handle)
                     statuses = backend.get_job_status(handle, [1],
                                                       stream_logs=False)

@@ -18,6 +18,7 @@ import concurrent.futures
 import threading
 from unittest import mock
 
+from sky import exceptions
 from sky.serve import reserved_capacity
 
 _CONTEXT = 'prod_research_cluster_eks'
@@ -46,6 +47,7 @@ def _core_api(uid=_UID, barrier=None):
 
 
 class TestSerialLookupsSucceed:
+    """Uncontended observations and forced refreshes keep normal behavior."""
 
     def test_a_single_lookup_resolves(self):
         _reset_cache()
@@ -128,6 +130,62 @@ class TestConcurrentObservationLookups:
                         get_kubernetes_physical_cluster_uid(_CONTEXT),
                         range(workers)))
         assert results == [_UID] * workers
+
+    def test_busy_retry_losing_generation_reports_its_successful_read(self):
+        """Retirement waiting must not reintroduce observation starvation."""
+        _reset_cache()
+        first_waiting = threading.Event()
+        allow_first_retry = threading.Event()
+        second_read_started = threading.Event()
+        allow_second_finish = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+        busy = exceptions.KubernetesPhysicalClusterFenceBusyError(
+            'captured', _CONTEXT, 7)
+
+        def _read_namespace(_name, **_kwargs):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                nth = calls
+            if nth == 1:
+                raise busy
+            if nth == 2:
+                # The newer lookup owns generation 2 but has not published.
+                second_read_started.set()
+                assert allow_second_finish.wait(timeout=10)
+            return mock.MagicMock(metadata=mock.MagicMock(uid=_UID))
+
+        def _wait_for_retirement(*_args):
+            first_waiting.set()
+            assert allow_first_retry.wait(timeout=10)
+            return True
+
+        api = mock.MagicMock()
+        api.read_namespace.side_effect = _read_namespace
+        with mock.patch.object(reserved_capacity.kubernetes, 'core_api',
+                               mock.MagicMock(return_value=api)), \
+             mock.patch.object(
+                 reserved_capacity.kubernetes,
+                 'wait_for_physical_cluster_uid_fence_retirement',
+                 side_effect=_wait_for_retirement) as wait_for_retirement:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                first = pool.submit(
+                    reserved_capacity.get_kubernetes_physical_cluster_uid,
+                    _CONTEXT)
+                assert first_waiting.wait(timeout=10)
+                second = pool.submit(
+                    reserved_capacity.get_kubernetes_physical_cluster_uid,
+                    _CONTEXT)
+                assert second_read_started.wait(timeout=10)
+                allow_first_retry.set()
+                first_result = first.result(timeout=10)
+                allow_second_finish.set()
+                second_result = second.result(timeout=10)
+
+        assert first_result == _UID
+        assert second_result == _UID
+        wait_for_retirement.assert_called_once()
 
 
 class TestFailuresStillFailClosed:
@@ -249,3 +307,60 @@ class TestLaunchFenceIsNotStarved:
             observed = reserved_capacity.get_kubernetes_physical_cluster_uid(
                 _CONTEXT, force_refresh=True)
         assert observed != _UID  # guard returns the mismatch verdict
+
+    def test_superseded_forced_busy_retry_reports_its_successful_read(self):
+        """A successful post-retirement read must not starve the guard."""
+        _reset_cache()
+        first_waiting = threading.Event()
+        allow_first_retry = threading.Event()
+        second_read_started = threading.Event()
+        allow_second_finish = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+        busy = exceptions.KubernetesPhysicalClusterFenceBusyError(
+            'captured', _CONTEXT, 11)
+
+        def _read_namespace(_name, **_kwargs):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                nth = calls
+            if nth == 1:
+                raise busy
+            if nth == 2:
+                second_read_started.set()
+                assert allow_second_finish.wait(timeout=10)
+            return mock.MagicMock(metadata=mock.MagicMock(uid=_UID))
+
+        def _wait_for_retirement(*_args):
+            first_waiting.set()
+            assert allow_first_retry.wait(timeout=10)
+            return True
+
+        api = mock.MagicMock()
+        api.read_namespace.side_effect = _read_namespace
+        with mock.patch.object(reserved_capacity.kubernetes, 'core_api',
+                               mock.MagicMock(return_value=api)), \
+             mock.patch.object(
+                 reserved_capacity.kubernetes,
+                 'wait_for_physical_cluster_uid_fence_retirement',
+                 side_effect=_wait_for_retirement) as wait_for_retirement:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                first = pool.submit(
+                    reserved_capacity.get_kubernetes_physical_cluster_uid,
+                    _CONTEXT,
+                    force_refresh=True)
+                assert first_waiting.wait(timeout=10)
+                second = pool.submit(
+                    reserved_capacity.get_kubernetes_physical_cluster_uid,
+                    _CONTEXT,
+                    force_refresh=True)
+                assert second_read_started.wait(timeout=10)
+                allow_first_retry.set()
+                first_result = first.result(timeout=10)
+                allow_second_finish.set()
+                second_result = second.result(timeout=10)
+
+        assert first_result == _UID
+        assert second_result == _UID
+        wait_for_retirement.assert_called_once()

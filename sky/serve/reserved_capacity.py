@@ -39,6 +39,7 @@ from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.catalog import kubernetes_catalog
 from sky.serve import constants
+from sky.serve import provider_phase
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import spot_placer as spot_placer_lib
@@ -145,20 +146,91 @@ class ProtocolV2CleanupFence:
     physical_cluster_uid: str
 
 
+@contextlib.contextmanager
+def _provider_phase_scope(
+    mode: provider_phase.ProviderPhaseMode,
+    admission: provider_phase.ProviderPhaseAdmission | None,
+) -> typing.Iterator[None]:
+    phase_context = (provider_phase.provider_phase(mode) if admission is None
+                     else provider_phase.join_provider_phase(admission))
+    with phase_context:
+        yield
+
+
+@contextlib.contextmanager
+def _protocol_v2_provider_fence_scope(
+    cleanup_fence: ProtocolV2CleanupFence,
+    *,
+    phase_admission: provider_phase.ProviderPhaseAdmission | None,
+    include_provider_phase: bool,
+    wait_for_initializer: bool,
+) -> typing.Iterator[None]:
+    phase_context: contextlib.AbstractContextManager[Any]
+    if include_provider_phase:
+        phase_context = _provider_phase_scope(
+            provider_phase.ProviderPhaseMode.V2_FENCED, phase_admission)
+    else:
+        if phase_admission is not None:
+            raise exceptions.ProviderPhaseMisuseError(
+                'A physical-only provider fence cannot consume a phase '
+                'admission.')
+        phase_context = contextlib.nullcontext()
+
+    with phase_context:
+        if wait_for_initializer:
+            physical_context = kubernetes.physical_cluster_uid_fence(
+                cleanup_fence.kubernetes_context,
+                cleanup_fence.physical_cluster_uid)
+        else:
+            physical_context = kubernetes.physical_cluster_uid_fence(
+                cleanup_fence.kubernetes_context,
+                cleanup_fence.physical_cluster_uid,
+                wait_for_initializer=False)
+        with physical_context:
+            yield
+
+
 def protocol_v2_provider_fence(
     replica_info: Any,
     handle: 'backends.CloudVmRayResourceHandle | None' = None,
+    *,
+    phase_admission: provider_phase.ProviderPhaseAdmission | None = None,
+    include_provider_phase: bool = True,
+    wait_for_initializer: bool = True,
 ) -> contextlib.AbstractContextManager[None]:
     """Return the exact provider fence for one durable replica row.
 
-    Genuine ordinary and protocol-v1 rows need no physical identity fence.
+    Genuine ordinary and protocol-v1 rows enter the ambient provider phase.
     A protocol-v2 row must also prove that the supplied durable handle still
     names the same Kubernetes cluster/context before any provider operation is
-    allowed.  Malformed rows and missing/replaced handles fail closed.
+    allowed.  Child workers must receive their root's explicit admission.
+    Malformed rows and missing/replaced handles fail closed.
+
+    ``include_provider_phase=False`` is reserved for interactive log follow:
+    it keeps a v2 physical target immutable without monopolizing the bounded
+    process phase. Ordinary rows are ungated in that mode.
     """
     cleanup_fence = parse_protocol_v2_cleanup_fence(replica_info)
     if cleanup_fence is None:
-        return contextlib.nullcontext()
+        if not include_provider_phase:
+            if phase_admission is not None:
+                raise exceptions.ProviderPhaseMisuseError(
+                    'A physical-only provider fence cannot consume a phase '
+                    'admission.')
+            return contextlib.nullcontext()
+        if (phase_admission is not None and phase_admission.mode
+                != provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+            raise exceptions.ProviderPhaseMisuseError(
+                'An ordinary provider operation requires ambient admission.')
+        if phase_admission is None:
+            return _provider_phase_scope(
+                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY, None)
+        return _provider_phase_scope(
+            provider_phase.ProviderPhaseMode.AMBIENT_LEGACY, phase_admission)
+    if (phase_admission is not None and
+            phase_admission.mode != provider_phase.ProviderPhaseMode.V2_FENCED):
+        raise exceptions.ProviderPhaseMisuseError(
+            'A protocol-v2 provider operation requires fenced admission.')
     cluster_name = getattr(replica_info, 'cluster_name', None)
     launched_resources = getattr(handle, 'launched_resources', None)
     if (not isinstance(cluster_name, str) or not cluster_name or
@@ -172,8 +244,11 @@ def protocol_v2_provider_fence(
         raise exceptions.KubernetesPhysicalClusterIdentityError(
             'The durable replica handle does not match its fenced Kubernetes '
             'context.')
-    return kubernetes.physical_cluster_uid_fence(
-        cleanup_fence.kubernetes_context, cleanup_fence.physical_cluster_uid)
+    return _protocol_v2_provider_fence_scope(
+        cleanup_fence,
+        phase_admission=phase_admission,
+        include_provider_phase=include_provider_phase,
+        wait_for_initializer=wait_for_initializer)
 
 
 @dataclasses.dataclass
@@ -189,6 +264,9 @@ class _ProtocolV2BatchFenceHolder:
 @contextlib.contextmanager
 def protocol_v2_provider_batch_fences(
     representatives: Mapping[tuple[str, str], tuple[Any, Any]],
+    *,
+    phase_admission: provider_phase.ProviderPhaseAdmission | None = None,
+    wait_for_initializer: bool = True,
 ) -> typing.Iterator[dict[tuple[str, str], BaseException]]:
     """Pin each physical target once for a complete provider batch.
 
@@ -202,6 +280,31 @@ def protocol_v2_provider_batch_fences(
     whose provider identity is uncertain. Unexpected failures remain typed in
     the result and must be re-raised by callers.
     """
+    if phase_admission is None:
+        phase_context = provider_phase.provider_phase(
+            provider_phase.ProviderPhaseMode.V2_FENCED)
+    else:
+        if phase_admission.mode != provider_phase.ProviderPhaseMode.V2_FENCED:
+            raise exceptions.ProviderPhaseMisuseError(
+                'A protocol-v2 provider batch requires fenced admission.')
+        phase_context = provider_phase.join_provider_phase(phase_admission)
+
+    with phase_context as active_admission:
+        with _protocol_v2_provider_batch_fences(
+                representatives,
+                active_admission,
+                wait_for_initializer=wait_for_initializer) as failures:
+            yield failures
+
+
+@contextlib.contextmanager
+def _protocol_v2_provider_batch_fences(
+    representatives: Mapping[tuple[str, str], tuple[Any, Any]],
+    phase_admission: provider_phase.ProviderPhaseAdmission,
+    *,
+    wait_for_initializer: bool,
+) -> typing.Iterator[dict[tuple[str, str], BaseException]]:
+    """Hold one physical owner per target inside an admitted v2 phase."""
     holders: dict[tuple[str, str], _ProtocolV2BatchFenceHolder] = {}
     failures: dict[tuple[str, str], BaseException] = {}
 
@@ -223,7 +326,11 @@ def protocol_v2_provider_batch_fences(
     def _hold(replica_info: Any, handle: Any,
               holder: _ProtocolV2BatchFenceHolder) -> None:
         try:
-            with protocol_v2_provider_fence(replica_info, handle):
+            with protocol_v2_provider_fence(
+                    replica_info,
+                    handle,
+                    phase_admission=phase_admission,
+                    wait_for_initializer=wait_for_initializer):
                 holder.ready.set()
                 holder.release.wait()
         except asyncio.CancelledError as error:
@@ -567,6 +674,9 @@ _PHYSICAL_CLUSTER_UID_CACHE_LOCK = threading.Lock()
 _PHYSICAL_CLUSTER_UID_CACHE: dict[str, tuple[str, float, int]] = {}
 # A slow older request must not overwrite the cache result of a newer request.
 _PHYSICAL_CLUSTER_UID_LOOKUP_GENERATIONS: dict[str, int] = {}
+# Independent UID discovery may briefly collide with an exact physical owner.
+# One absolute deadline bounds every owner/initializer replacement race.
+_PHYSICAL_CLUSTER_UID_FENCE_RETIREMENT_TIMEOUT_SECONDS = 30.0
 
 
 def poll_interval_seconds() -> float:
@@ -604,22 +714,53 @@ def get_kubernetes_physical_cluster_uid(
             _PHYSICAL_CLUSTER_UID_LOOKUP_GENERATIONS.get(context, 0) + 1)
         _PHYSICAL_CLUSTER_UID_LOOKUP_GENERATIONS[context] = lookup_generation
 
-    try:
-        namespace = kubernetes.core_api(context).read_namespace(
-            'kube-system', _request_timeout=kubernetes.API_TIMEOUT)
-        metadata = getattr(namespace, 'metadata', None)
-        raw_uid = getattr(metadata, 'uid', None)
-        uid = raw_uid.strip() if isinstance(raw_uid, str) else ''
-        if not uid:
-            raise ValueError('kube-system namespace has no UID')
-    except Exception as e:  # pylint: disable=broad-except
+    lookup_error: Exception | None = None
+    retirement_deadline: float | None = None
+    uid = ''
+    while True:
+        try:
+            namespace = kubernetes.core_api(context).read_namespace(
+                'kube-system', _request_timeout=kubernetes.API_TIMEOUT)
+            metadata = getattr(namespace, 'metadata', None)
+            raw_uid = getattr(metadata, 'uid', None)
+            uid = raw_uid.strip() if isinstance(raw_uid, str) else ''
+            if not uid:
+                raise ValueError('kube-system namespace has no UID')
+            break
+        except exceptions.KubernetesPhysicalClusterFenceBusyError as busy_error:
+            # This typed tokenless collision alone is retryable. Never borrow
+            # an unrelated capture; wait for retirement and read again from
+            # fresh ambient credentials.
+            if retirement_deadline is None:
+                retirement_deadline = (
+                    time.monotonic() +
+                    _PHYSICAL_CLUSTER_UID_FENCE_RETIREMENT_TIMEOUT_SECONDS)
+            if busy_error.context != context:
+                lookup_error = busy_error
+                break
+            try:
+                retired = (
+                    kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                        context, retirement_deadline,
+                        busy_error.failure_generation))
+            except exceptions.KubernetesPhysicalClusterIdentityError as wait_error:
+                lookup_error = wait_error
+                break
+            if not retired:
+                lookup_error = busy_error
+                break
+        except Exception as error:  # pylint: disable=broad-except
+            lookup_error = error
+            break
+
+    if lookup_error is not None:
         with _PHYSICAL_CLUSTER_UID_CACHE_LOCK:
             if (_PHYSICAL_CLUSTER_UID_LOOKUP_GENERATIONS.get(context) ==
                     lookup_generation):
                 _PHYSICAL_CLUSTER_UID_CACHE.pop(context, None)
         logger.warning('Reserved-capacity physical-cluster identity lookup '
                        f'failed for context {context!r}: '
-                       f'{common_utils.format_exception(e)}')
+                       f'{common_utils.format_exception(lookup_error)}')
         return None
 
     expires_at = time.monotonic() + poll_interval_seconds()
@@ -643,9 +784,6 @@ def get_kubernetes_physical_cluster_uid(
                 return current_uid
             if current_generation > lookup_generation:
                 _PHYSICAL_CLUSTER_UID_CACHE.pop(context, None)
-        # No newer entry to defer to. A forced caller is fencing a launch, so
-        # it keeps failing closed: it asked for an identity read strictly
-        # after its own decision point and cannot prove this one is it.
         # No newer entry to defer to, because the newer lookup has not
         # finished yet. This caller did complete its own successful read of
         # this very context, and that read happened after its own request, so
@@ -999,37 +1137,42 @@ def _observation_is_fresh(row: dict[str, Any] | None, now: float) -> bool:
 def _refresh_demand_capacity_contexts(contexts: set[str]) -> None:
     """Refresh stale context rows under one cross-controller query lock."""
     try:
-        lock = locks.get_lock(constants.DEMAND_CAPACITY_REFRESH_LOCK_ID)
-        with lock.acquire(blocking=False):
-            now = time.time()
-            rows = serve_state.get_demand_capacity_observations(contexts)
-            for context in sorted(contexts):
-                if _observation_is_fresh(rows.get(context), now):
-                    continue
-                # Capture before the expensive query. A replica row created
-                # during it is debited from the cached result by the planner.
-                snapshot_time = time.time()
-                availability: dict[str, int] | None
-                try:
-                    _, _, available = (
-                        kubernetes_catalog.list_accelerators_realtime(
-                            gpus_only=True,
-                            name_filter=None,
-                            region_filter=context,
-                            quantity_filter=None,
-                            case_sensitive=False,
-                            require_price=False))
-                    availability = {
-                        str(gpu_name).lower(): int(count)
-                        for gpu_name, count in available.items()
-                    }
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.warning(
-                        'Shared demand-capacity query failed for context '
-                        f'{context!r}: {common_utils.format_exception(e)}')
-                    availability = None
-                serve_state.upsert_demand_capacity_observation(
-                    context, snapshot_time, time.time(), availability)
+        # Provider admission precedes the distributed query lock. The callback
+        # below must never discover that a v2 round started after it already
+        # owns a lower-level broker resource.
+        with provider_phase.provider_phase(
+                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+            lock = locks.get_lock(constants.DEMAND_CAPACITY_REFRESH_LOCK_ID)
+            with lock.acquire(blocking=False):
+                now = time.time()
+                rows = serve_state.get_demand_capacity_observations(contexts)
+                for context in sorted(contexts):
+                    if _observation_is_fresh(rows.get(context), now):
+                        continue
+                    # Capture before the expensive query. A replica row created
+                    # during it is debited from the cached result by the planner.
+                    snapshot_time = time.time()
+                    availability: dict[str, int] | None
+                    try:
+                        _, _, available = (
+                            kubernetes_catalog.list_accelerators_realtime(
+                                gpus_only=True,
+                                name_filter=None,
+                                region_filter=context,
+                                quantity_filter=None,
+                                case_sensitive=False,
+                                require_price=False))
+                        availability = {
+                            str(gpu_name).lower(): int(count)
+                            for gpu_name, count in available.items()
+                        }
+                    except Exception as e:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Shared demand-capacity query failed for context '
+                            f'{context!r}: {common_utils.format_exception(e)}')
+                        availability = None
+                    serve_state.upsert_demand_capacity_observation(
+                        context, snapshot_time, time.time(), availability)
     except locks.LockTimeout:
         # Another controller is already producing the shared observation.
         # The next reconciliation tick will consume its durable result.
@@ -1124,7 +1267,9 @@ def _standalone_cycle(autoscaler: 'autoscalers.Autoscaler',
     # and the post-snapshot debit (created_at > snapshot_time) only
     # catches it if the snapshot predates the row.
     snapshot_time = time.time()
-    free_slots = query_free_slots(zero_cost)
+    with provider_phase.provider_phase(
+            provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+        free_slots = query_free_slots(zero_cost)
     autoscaler.collect_reserved_capacity(free_slots, keys, snapshot_time)
     logger.info(f'Reserved-capacity poll: {free_slots} free '
                 f'slot(s) across {len(keys)} zero-cost '
@@ -1174,6 +1319,25 @@ def _record_pool_observation(
         free_by_location[location] = sum(
             free_by_name.get(str(name).lower(), 0) for name in accelerators)
     placer.observe_zero_cost_capacity(free_by_location, observed_at)
+
+
+def _record_allocation_observation(
+    placer: 'spot_placer_lib.SpotPlacer',
+    locations: Sequence['spot_placer_lib.Location'],
+    allocation: 'reserved_capacity_broker.Allocation',
+) -> None:
+    """Record only capacity carried by a successfully published round."""
+    if (allocation.observed_free is None or
+            allocation.observed_free_by_accelerator is None or
+            allocation.observed_at is None):
+        return
+    observation = reserved_capacity_broker.PoolObservation(
+        free_slots=allocation.observed_free,
+        gpu_names=tuple(allocation.observed_free_by_accelerator),
+        free_slots_by_accelerator=tuple(
+            allocation.observed_free_by_accelerator.items()))
+    _record_pool_observation(placer, locations, observation,
+                             allocation.observed_at)
 
 
 def _broker_cycle(
@@ -1271,15 +1435,14 @@ def _broker_cycle(
                     f'stale for {service_name!r}; feeding 0 slots.')
         return
 
-    def _observe_pool() -> 'reserved_capacity_broker.PoolObservation':
-        observation = query_pool_group_observation(context, grouped_shapes)
-        _record_pool_observation(placer, zero_cost, observation, time.time())
-        return observation
-
-    allocation = reserved_capacity_broker.run_round_if_stale(
-        service_name, pool_key, _observe_pool, poll_interval_seconds())
-    # Whoever drove the round, adopt its published count.
-    _record_round_observation(placer, zero_cost, pool_key, time.time())
+    # Admission is deliberately outside the broker. The round callback may
+    # issue provider work while holding its cross-controller lock.
+    with provider_phase.provider_phase(
+            provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+        allocation = reserved_capacity_broker.run_round_if_stale(
+            service_name, pool_key,
+            lambda: query_pool_group_observation(context, grouped_shapes),
+            poll_interval_seconds())
     if allocation is None:
         # No allocation this cycle (claim rejected/expired, round lock
         # timeout, or the fresh round predates our claim): feed zero free
@@ -1289,6 +1452,7 @@ def _broker_cycle(
         logger.info('Reserved-fill broker: no allocation for '
                     f'{service_name!r} this cycle; feeding 0 free slots.')
         return
+    _record_allocation_observation(placer, zero_cost, allocation)
     autoscaler.collect_reserved_capacity(allocation.feed,
                                          keys,
                                          allocation.snapshot_time,
@@ -1298,39 +1462,6 @@ def _broker_cycle(
     logger.info(f'Reserved-fill broker: {service_name!r} feed='
                 f'{allocation.feed} grant={allocation.grant} '
                 f'(round {allocation.round_id}, epoch {allocation.epoch}).')
-
-
-def _record_round_observation(
-    placer: 'spot_placer_lib.SpotPlacer',
-    locations: Sequence['spot_placer_lib.Location'],
-    pool_key: str,
-    now: float,
-) -> None:
-    """Replay the pool's published free-slot count into the placer.
-
-    One poller drives each round; every other service reads the published
-    result. Recording only when we drove the round would leave a service that
-    rarely wins the round without a count, and therefore benched, which is the
-    common case once several services share a pool. This runs every cycle off
-    the same row `_pool_capacity_hint` already trusts.
-    """
-    round_row = serve_state.get_reserved_fill_round(pool_key)
-    if round_row is None:
-        return
-    free = round_row.get('last_observed_free')
-    observed_at = round_row.get('last_observed_free_ts')
-    if free is None or observed_at is None:
-        return
-    try:
-        observed_at = float(observed_at)
-        free = int(free)
-    except (TypeError, ValueError):
-        return
-    if now - observed_at > (poll_interval_seconds() *
-                            constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS):
-        return
-    placer.observe_zero_cost_capacity(
-        {location: free for location in locations}, observed_at)
 
 
 def _pool_capacity_hint(spec: FillPoolSpec, holdings: int, launchable: bool,
@@ -1522,28 +1653,27 @@ def _broker_cycle_v2(
     snapshots: dict[str, dict[str, Any]] = {}
     for spec, budget in zip(specs, budgets):
 
-        def _observe_pool(
+        def _query_pool(
             spec: FillPoolSpec = spec
         ) -> 'reserved_capacity_broker.PoolObservation':
-            # Each pool's reading is recorded against that pool's own
-            # locations only, so a cluster with free capacity never marks a
-            # peer cluster launchable.
-            observation = query_pool_group_observation(
+            return query_pool_group_observation(
                 spec.context,
                 dict(spec.shapes),
                 expected_physical_cluster_uid=spec.physical_cluster_uid)
-            _record_pool_observation(placer, spec.locations, observation,
-                                     time.time())
-            return observation
 
         try:
-            allocation = reserved_capacity_broker.run_round_if_stale(
-                service_name,
-                spec.pool_key,
-                _observe_pool,
-                poll_interval_seconds(),
-                expected_protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-                expected_service_generation=generation)
+            # The phase precedes the broker lock and remains active through the
+            # callback's exact physical proof and allocation materialization.
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED):
+                allocation = reserved_capacity_broker.run_round_if_stale(
+                    service_name,
+                    spec.pool_key,
+                    _query_pool,
+                    poll_interval_seconds(),
+                    expected_protocol_version=(
+                        reserved_capacity_broker.PROTOCOL_V2),
+                    expected_service_generation=generation)
         except Exception as error:  # pylint: disable=broad-except
             # One pool's transient database/lock path must not suppress a
             # healthy peer edge in this same complete-map publication.
@@ -1551,9 +1681,10 @@ def _broker_cycle_v2(
                            f'{service_name!r}/{spec.pool_key}: '
                            f'{common_utils.format_exception(error)}')
             allocation = None
-        # Whoever drove this pool's round, adopt its published count.
-        _record_round_observation(placer, spec.locations, spec.pool_key,
-                                  time.time())
+        if allocation is not None:
+            # Every controller consumes the committed round, including peers
+            # whose fresh-round path deliberately skipped `_query_pool`.
+            _record_allocation_observation(placer, spec.locations, allocation)
         # A lock timeout or other transient round miss must not cull existing
         # fill from this one pool.  Carry only the last real exact-generation
         # grant as scale-down shelter.  Live launch authority still fails
