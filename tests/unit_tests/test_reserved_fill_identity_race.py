@@ -177,3 +177,75 @@ class TestRetargetIsStillFenced:
                                _core_api(uid='new-uid')):
             assert reserved_capacity.get_kubernetes_physical_cluster_uid(
                 _CONTEXT, force_refresh=True) == 'new-uid'
+
+
+class TestLaunchFenceIsNotStarved:
+    """The pre-launch guard reads this value; None refuses every fill launch.
+
+    `_authorize_reserved_fill_launch` calls this with force_refresh=True and
+    compares the result to the pinned pool UID, so a lookup that returns None
+    is reported as `fill-physical-cluster-uid-mismatch`. On the deployed fleet
+    that refused every fill launch while the broker was feeding 74-90 slots.
+    """
+
+    def test_a_forced_early_finisher_reports_its_own_read(self):
+        # Same interleaving as the observation-path case: the earlier lookup
+        # finishes first, while the later one is still inside read_namespace.
+        _reset_cache()
+        first_may_finish = threading.Event()
+        second_started = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+
+        def _read_namespace(_name, **_kwargs):
+            with calls_lock:
+                calls.append(1)
+                nth = len(calls)
+            if nth == 1:
+                second_started.wait(timeout=10)
+            else:
+                second_started.set()
+                first_may_finish.wait(timeout=10)
+            return mock.MagicMock(metadata=mock.MagicMock(uid=_UID))
+
+        api = mock.MagicMock()
+        api.read_namespace.side_effect = _read_namespace
+        with mock.patch.object(reserved_capacity.kubernetes, 'core_api',
+                               mock.MagicMock(return_value=api)):
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                first = pool.submit(
+                    reserved_capacity.get_kubernetes_physical_cluster_uid,
+                    _CONTEXT,
+                    force_refresh=True)
+                second_started.wait(timeout=10)
+                second = pool.submit(
+                    reserved_capacity.get_kubernetes_physical_cluster_uid,
+                    _CONTEXT,
+                    force_refresh=True)
+                first_result = first.result(timeout=10)
+                first_may_finish.set()
+                second_result = second.result(timeout=10)
+
+        # A None here is what the guard turns into
+        # 'fill-physical-cluster-uid-mismatch'.
+        assert first_result == _UID
+        assert second_result == _UID
+
+    def test_the_guard_authorizes_a_matching_pin(self):
+        # End to end through the comparison the guard actually performs.
+        _reset_cache()
+        with mock.patch.object(reserved_capacity.kubernetes, 'core_api',
+                               _core_api()):
+            observed = reserved_capacity.get_kubernetes_physical_cluster_uid(
+                _CONTEXT, force_refresh=True)
+        pinned = _UID
+        assert observed == pinned  # guard returns (True, 'authorized')
+
+    def test_a_real_retarget_is_still_refused(self):
+        # The fence must still catch a context pointed at another cluster.
+        _reset_cache()
+        with mock.patch.object(reserved_capacity.kubernetes, 'core_api',
+                               _core_api(uid='different-cluster-uid')):
+            observed = reserved_capacity.get_kubernetes_physical_cluster_uid(
+                _CONTEXT, force_refresh=True)
+        assert observed != _UID  # guard returns the mismatch verdict
