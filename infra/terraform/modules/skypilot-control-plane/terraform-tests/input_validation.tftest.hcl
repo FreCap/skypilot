@@ -131,3 +131,53 @@ run "rejects_public_ingress_from_escape_hatch" {
 
   expect_failures = [helm_release.skypilot]
 }
+
+run "rejects_unknown_request_store_backend" {
+  command = plan
+
+  variables {
+    request_store = {
+      backend = "memory"
+    }
+  }
+
+  expect_failures = [var.request_store]
+}
+
+run "rejects_empty_request_store_cutover_gate_path" {
+  command = plan
+
+  variables {
+    request_store = {
+      cutover_gate_path = "   "
+    }
+  }
+
+  expect_failures = [var.request_store]
+}
+
+run "rejects_quiescence_enforcement_with_sqlite" {
+  command = plan
+
+  variables {
+    request_store = {
+      backend                                       = "sqlite"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+  }
+
+  expect_failures = [var.request_store]
+}
+
+run "rejects_request_store_from_escape_hatch" {
+  command = plan
+
+  variables {
+    extra_helm_values = <<-EOT
+      requestStore:
+        backend: sqlite
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
