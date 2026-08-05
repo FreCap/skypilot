@@ -2,12 +2,11 @@
 
 Status: feature and durable executor/provider-fence PRs are merged and deployed;
 the production PostgreSQL cutover, protocol-v2 activation, and pool-identity
-RBAC are complete; measured-capacity PR #1269 and UID-race PR #1271 are merged
-and deployed, while shared-round replay PR #1272 and launch-guard race PR #1274
-are merged but not yet deployed; live acceptance also exposed exact-card
-replay, mixed legacy/v2 provider-phase, and inherited workspace-context
-eligibility gaps, whose corrective hotfix, redeployment, PHX canary, and
-compatibility-cleanup merge gates remain open
+RBAC are complete; measured-capacity PR #1269, UID-race PR #1271, shared-round
+replay PR #1272, and launch-guard race PR #1274 are merged and deployed; live
+acceptance also exposed exact-card replay, mixed legacy/v2 provider-phase, and
+inherited workspace-context eligibility gaps, whose corrective hotfix,
+redeployment, PHX canary, and compatibility-cleanup merge gates remain open
 
 Last updated: 2026-08-05
 
@@ -1457,6 +1456,11 @@ reported as a physical-UID mismatch. This branch inherits #1274 and extends its
 same successful-read rule through the bounded physical-fence-retirement retry;
 failures and genuine mismatches remain closed.
 
+Helm revision 335 now runs release `1.1.1097`, which includes both #1272 and
+#1274. This supersedes the revision-333 deployment state above without closing
+the remaining exact-card, provider-phase, or inherited-workspace gates in this
+corrective change.
+
 Required feature CI on the preceding code-bearing head `1357dec79` completed
 all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
@@ -1471,11 +1475,9 @@ fleet no larger than the configured `max_replicas`.
 
 ## Open gates
 
-- Required feature and durable provider-fence CI passed. Helm revision 333
-  currently runs release `1.1.1095` (merge
-  `912555e6ee160aff404aca0db89337d2981493a1`) with merged PRs #1269 and #1271.
-  PRs #1272 and #1274 are merged upstream but are not present in that deployed
-  image.
+- Required feature and durable provider-fence CI passed. Helm revision 335
+  currently runs release `1.1.1097` from `854b9d476`, with merged PRs #1269,
+  #1271, #1272, and #1274.
   The production request store completed its one-way PostgreSQL cutover, Serve
   is at schema head 035, token-bound protocol v2 is active, and the exact
   `kube-system` Namespace read is present on east and PHX. The corrective
