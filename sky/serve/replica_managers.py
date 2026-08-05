@@ -6681,6 +6681,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             removal_reason = 'for purge'
         elif info.status_property.failed_spot_availability:
             removal_reason = 'for spot availability failure'
+        elif info.status == serve_state.ReplicaStatus.UNKNOWN:
+            # Both UNKNOWN arms of `to_replica_status` describe a replica
+            # whose teardown already succeeded and that, in their own words,
+            # "should have been cleaned from the replica table" -- a launch
+            # still marked RUNNING when the teardown landed, or a probe that
+            # never resolved. The record is kept here only because no other
+            # reason matched, and it then reports nothing an operator can act
+            # on: no endpoint, no resources, and a status that names no
+            # failure. Retaining it strands one row per interrupted teardown.
+            removal_reason = 'for a teardown that left no reportable state'
         else:
             logger.info(f'Termination of replica {info.replica_id} '
                         'finished. Replica info is kept since some '
