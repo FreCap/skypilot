@@ -1625,6 +1625,74 @@ class TestWaitForPodsToScheduleAutoscaleTimeout:
         assert raise_errors.called, (
             'Without autoscaler, timeout=5s must trigger the error path.')
 
+    def test_indefinite_wait_skips_karpenter_gpu_fast_fail(self, monkeypatch):
+        """A negative timeout retains a fixed-pool pod until it can schedule."""
+        _, raise_errors, cluster_name_on_cloud = self._setup(
+            monkeypatch, autoscaler_type=None, autoscale_detected=False)
+        pending = self._make_pending_pod('pod-0', cluster_name_on_cloud)
+        pending.metadata.uid = 'pod-uid'
+        scheduled = self._make_pending_pod('pod-0', cluster_name_on_cloud)
+        scheduled.metadata.uid = 'pod-uid'
+        scheduled.spec.node_name = 'gpu-node'
+
+        core_api = mock.MagicMock()
+        core_api.list_namespaced_pod.side_effect = [
+            types.SimpleNamespace(items=[pending]),
+            types.SimpleNamespace(items=[scheduled]),
+        ]
+        monkeypatch.setattr('sky.adaptors.kubernetes.core_api',
+                            lambda *a, **kw: core_api)
+        fast_fail = mock.MagicMock(
+            side_effect=config_lib.KubernetesError('must-not-fast-fail'))
+        monkeypatch.setattr(pod_scheduling,
+                            '_raise_for_karpenter_gpu_incompatibility',
+                            fast_fail)
+
+        node = self._make_node('pod-0', cluster_name_on_cloud)
+        instance._wait_for_pods_to_schedule(
+            namespace='ns',
+            context='test-context',
+            new_nodes=[node],
+            timeout=-1,
+            cluster_name='cn',
+            create_pods_start=datetime.datetime.now(datetime.timezone.utc))
+
+        fast_fail.assert_not_called()
+        raise_errors.assert_not_called()
+        assert core_api.list_namespaced_pod.call_count == 2
+
+    def test_finite_wait_preserves_karpenter_gpu_fast_fail(self, monkeypatch):
+        """A finite timeout retains the existing fast-fallback behavior."""
+        _, raise_errors, cluster_name_on_cloud = self._setup(
+            monkeypatch, autoscaler_type=None, autoscale_detected=False)
+        pending = self._make_pending_pod('pod-0', cluster_name_on_cloud)
+        pending.metadata.uid = 'pod-uid'
+
+        core_api = mock.MagicMock()
+        core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+            items=[pending])
+        monkeypatch.setattr('sky.adaptors.kubernetes.core_api',
+                            lambda *a, **kw: core_api)
+        fast_fail = mock.MagicMock(
+            side_effect=config_lib.KubernetesError('expected-fast-fail'))
+        monkeypatch.setattr(pod_scheduling,
+                            '_raise_for_karpenter_gpu_incompatibility',
+                            fast_fail)
+
+        node = self._make_node('pod-0', cluster_name_on_cloud)
+        with pytest.raises(config_lib.KubernetesError,
+                           match='expected-fast-fail'):
+            instance._wait_for_pods_to_schedule(
+                namespace='ns',
+                context='test-context',
+                new_nodes=[node],
+                timeout=5,
+                cluster_name='cn',
+                create_pods_start=datetime.datetime.now(datetime.timezone.utc))
+
+        fast_fail.assert_called_once()
+        raise_errors.assert_not_called()
+
     def test_autoscale_detection_extends_deadline(self, monkeypatch):
         """When autoscaling is detected, the deadline is extended from the
         detection moment by _AUTOSCALE_DETECTED_TIMEOUT_SECONDS. A short
