@@ -19,6 +19,7 @@ from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve.server import impl
+from sky.utils import config_utils
 
 
 def _backend_mock():
@@ -508,6 +509,69 @@ class TestExternalCapabilityMutationPaths:
                                'get_active_workspace',
                                return_value='research'), \
              mock.patch.object(impl.serve_utils, 'validate_service_task'), \
+             mock.patch.object(impl.admin_policy_utils,
+                               'apply',
+                               return_value=(dag, admitted_config)), \
+             mock.patch.object(
+                 impl,
+                 '_require_supported_service_topology',
+                 side_effect=RuntimeError('capability gate')) as preflight, \
+             pytest.raises(RuntimeError, match='capability gate'):
+            impl._update_impl(task, 'svc', lifecycle_lock=lifecycle_lock)
+        preflight.assert_called_once_with(task, False)
+
+    def test_update_serializes_a_real_config_object(self):
+        """The server's own config type must survive the update path.
+
+        In consolidation mode `_update_impl_body` dumps the controller config
+        snapshot to YAML *before* the topology preflight. The admin policy
+        returns a `config_utils.Config`, a dict subclass that yaml.safe_dump
+        refuses to represent. Measured in production: every `sky serve update`
+        died with
+
+          CloudError: yaml error (RepresenterError):
+            ('cannot represent an object', {...whole config...})
+
+        The sibling test above passes a plain dict literal and so never
+        reached that dump. Here the preflight sentinel is the assertion: if
+        it fires, serialization already succeeded.
+        """
+        task = self._task()
+        dag = mock.MagicMock(tasks=[task])
+        handle = mock.MagicMock(spec=backends.CloudVmRayResourceHandle)
+        backend = _backend_mock()
+        admitted_config = config_utils.Config.from_dict({
+            'active_workspace': 'research',
+            'kubernetes': {
+                'allowed_contexts': ['east', 'phx'],
+            },
+        })
+        service_record = {
+            'status': serve_state.ServiceStatus.READY,
+            'hash': 'incarnation-a',
+            'workspace': 'research',
+        }
+        lifecycle_lock = mock.MagicMock(epoch=1)
+        with mock.patch.object(impl.controller_utils,
+                               'get_controller_for_pool'), \
+             mock.patch.object(impl.backend_utils,
+                               'is_controller_accessible',
+                               return_value=handle), \
+             mock.patch.object(impl.backend_utils,
+                               'get_backend_from_handle',
+                               return_value=backend), \
+             mock.patch.object(impl,
+                               '_get_service_record',
+                               return_value=service_record), \
+             mock.patch.object(impl.skypilot_config,
+                               'get_active_workspace',
+                               return_value='research'), \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=True), \
+             mock.patch.object(impl.serve_utils, 'validate_service_task'), \
+             mock.patch.object(impl.serve_utils,
+                               'snapshot_service_container_images'), \
              mock.patch.object(impl.admin_policy_utils,
                                'apply',
                                return_value=(dag, admitted_config)), \
