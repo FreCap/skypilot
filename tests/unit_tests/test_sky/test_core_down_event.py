@@ -95,6 +95,63 @@ def test_down_reloads_and_propagates_expected_cluster_record_uuid(monkeypatch):
         expected_cluster_record_uuid=record_uuid)
 
 
+def test_down_rejects_changed_handle_after_provider_classification(monkeypatch):
+    cluster_name = 'action-fenced'
+    record_uuid = '11111111-1111-4111-8111-111111111111'
+    snapshot = global_user_state.ClusterRecordIdentitySnapshot(
+        cluster_name=cluster_name,
+        cluster_record_uuid=uuid.UUID(record_uuid),
+        serialized_handle=b'new-handle',
+        handle=mock.MagicMock())
+    monkeypatch.setattr(global_user_state,
+                        'get_cluster_record_identity_snapshot',
+                        mock.MagicMock(return_value=snapshot))
+    backend_lookup = mock.MagicMock()
+    monkeypatch.setattr(core.backend_utils, 'get_backend_from_handle',
+                        backend_lookup)
+
+    try:
+        core.down(cluster_name,
+                  _expected_cluster_record_uuid=record_uuid,
+                  _expected_cluster_record_handle=b'old-handle')
+    except global_user_state.ClusterRecordHandleChangedError:
+        pass
+    else:
+        raise AssertionError('Changed handle fingerprint was accepted.')
+
+    backend_lookup.assert_not_called()
+
+
+def test_down_accepts_matching_provider_classification_handle(monkeypatch):
+    cluster_name = 'action-fenced'
+    record_uuid = '11111111-1111-4111-8111-111111111111'
+    handle = mock.MagicMock()
+    snapshot = global_user_state.ClusterRecordIdentitySnapshot(
+        cluster_name=cluster_name,
+        cluster_record_uuid=uuid.UUID(record_uuid),
+        serialized_handle=b'exact-handle',
+        handle=handle)
+    backend = mock.MagicMock()
+    monkeypatch.setattr(global_user_state,
+                        'get_cluster_record_identity_snapshot',
+                        mock.MagicMock(return_value=snapshot))
+    monkeypatch.setattr(core.backend_utils, 'get_backend_from_handle',
+                        lambda candidate: backend)
+    monkeypatch.setattr(core.usage_lib,
+                        'record_cluster_name_for_current_operation',
+                        lambda name: None)
+
+    core.down(cluster_name,
+              _expected_cluster_record_uuid=record_uuid,
+              _expected_cluster_record_handle=b'exact-handle')
+
+    backend.teardown.assert_called_once_with(
+        handle,
+        terminate=True,
+        purge=False,
+        expected_cluster_record_uuid=record_uuid)
+
+
 def test_down_reloads_and_propagates_expected_cluster_hash_and_guard(
         monkeypatch):
     cluster_name = 'legacy-fenced'

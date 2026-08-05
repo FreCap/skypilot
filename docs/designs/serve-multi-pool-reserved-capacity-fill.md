@@ -3,10 +3,11 @@
 Status: feature and durable executor/provider-fence PRs are merged and deployed;
 the production PostgreSQL cutover, protocol-v2 activation, and pool-identity
 RBAC are complete; measured-capacity PR #1269, UID-race PR #1271, shared-round
-replay PR #1272, and launch-guard race PR #1274 are merged and deployed; live
-acceptance also exposed exact-card replay, mixed legacy/v2 provider-phase, and
-inherited workspace-context eligibility gaps, whose corrective hotfix,
-redeployment, PHX canary, and compatibility-cleanup merge gates remain open
+replay PR #1272, launch-guard race PR #1274, and exact-card/provider-phase/
+workspace corrective PR #1275 are merged and deployed. Live acceptance of
+#1275 exposed bounded provider-phase head-of-line blocking; the phase-scope
+hotfix, redeployment, sustained live verification, PHX canary, and
+compatibility-cleanup merge gates remain open
 
 Last updated: 2026-08-05
 
@@ -22,12 +23,12 @@ in this design pass.
 
 ## Summary
 
-`reserved_capacity_fill` currently accepts only one Kubernetes context per
-service. Its durable claim, controller cache, autoscaler snapshot, demand
-gate, and launch override also each hold only one pool. Removing the validator
-alone would overwrite one context with another, multiply service-wide policy,
-and allow a grant measured in one cluster to launch or shelter a replica in a
-different cluster.
+Before protocol v2, `reserved_capacity_fill` accepted only one Kubernetes
+context per service. Its durable claim, controller cache, autoscaler snapshot,
+demand gate, and launch override also each held only one pool. Removing the
+validator alone would have overwritten one context with another, multiplied
+service-wide policy, and allowed a grant measured in one cluster to launch or
+shelter a replica in a different cluster.
 
 This change partitions a service's zero-cost Kubernetes locations into one
 broker pool per context. Each `(service, pool)` edge has an independent claim,
@@ -135,10 +136,16 @@ that edge and feeds it zero; it never substitutes the context string as
 identity. The protocol-v2 broker also runs its realtime availability listing
 inside a capture pinned to that edge's expected UID. A context retarget during
 measurement is therefore a blackout, never capacity evidence that can grant
-or drain holdings belonging to the prior physical cluster. Every fill launch
-first selects an exact carried location, takes blocking `V2_FENCED` admission
-before the manager lock, and activates the exact `(context, UID)` physical
-capture. It retains both authorities through the atomic
+or drain holdings belonging to the prior physical cluster. A standalone fill
+launch takes blocking `V2_FENCED` admission before the manager lock. A fleet
+batch retains one manager-lock acquisition, selects each exact carried
+location provider-free, and takes a zero-wait `V2_FENCED` admission for each
+item only at its physical-capture/persist seam. FIFO prevents a later item from
+barging once an ambient waiter queues. The batch also refuses to wait for a
+same-context physical-fence initializer while holding the manager lock. Phase
+or initializer contention defers that item before a durable row or launch
+thread exists. An admitted item activates the exact `(context, UID)` physical
+capture and retains both authorities through the atomic
 `persist_fill_replica` transaction and construction/freeze of the queued
 launch tuple and thread arguments, then releases them before starting or
 submitting the asynchronous launch thread; it never performs an ambient forced
@@ -218,22 +225,24 @@ An unrelated ordinary request that overlaps this short scope may therefore
 retry after the scope retires; outside an active scope its historical ambient
 behavior is unchanged.
 
-Provider-bearing fleet work must make that retry boundary explicit. A mixed
-legacy/protocol-v2 status or probe batch is partitioned into phases: all v2
-rows run with their exact propagated leases while the batch owners are live,
-the owners retire, and only then may legacy or ordinary tokenless provider
-calls run. The phases may remain internally parallel, but must never overlap.
-The v2 phase includes provider-bearing result classification, preemption
-refresh, and teardown: merely joining the initial status or readiness futures
-is insufficient. Shared provider-free reduction and persistence may run after
-the phase results are materialized, but no deferred v2 provider call may escape
-its lease and no tokenless call may begin before every owner has retired.
-Malformed protocol-v2 rows remain identity-uncertain and are never downgraded
-into the legacy phase. One round continues to perform one UID proof per
-physical v2 pool.
+Fleet work that can consult mutable Kubernetes authority must make that retry
+boundary explicit. A mixed legacy/protocol-v2 status or probe batch is
+partitioned: all v2 rows run with exact propagated leases while their owners
+are live; only after those owners retire may Kubernetes or unknown ordinary
+work enter `AMBIENT_LEGACY`. The two gated modes may remain internally parallel
+but never overlap. Exact non-Kubernetes operations explicitly enumerated below
+may run outside either mode only when they consume the same prefetched durable
+handle, or an exact UUID-and-handle-predicated record, and cannot re-resolve
+provider identity by name. The v2 phase includes result classification,
+preemption refresh, and teardown that can consult Kubernetes authority;
+joining only the initial futures is insufficient. Shared provider-free
+reduction may run afterward, but no deferred v2 Kubernetes call may escape its
+lease. Malformed v2 rows remain identity-uncertain and are never downgraded.
+One round performs one UID proof per physical v2 pool.
 
-Each OS process that can issue provider work (API, controller, or executor)
-has a provider-phase gate with exact modes `V2_FENCED` and `AMBIENT_LEGACY`.
+Each OS process that can issue Kubernetes-authority-bearing work (API,
+controller, or executor) has a provider-phase gate with exact modes
+`V2_FENCED` and `AMBIENT_LEGACY`.
 Same-mode callers may overlap. Fresh callers
 receive FIFO tickets: after an opposite-mode ticket queues, later same-mode
 callers cannot barge, and the next maximal same-mode prefix becomes one cohort
@@ -242,9 +251,12 @@ already-planned child workers to join its exact process/PID/boot/epoch-bound
 cohort; an ordinary thread or copied/stale admission cannot. The root closes
 child admission before exit and already-admitted children drain first.
 Same-mode nesting on one thread is reentrant, cross-mode nesting is rejected,
-and cancellation or timeout removes the waiter and wakes the next turn. Every
-blocking acquisition has one 30-second absolute monotonic deadline and fails
-closed with a typed phase-timeout error. An `after_in_child` fork hook replaces
+and cancellation or timeout removes the waiter and wakes the next turn. An
+expired opposite-mode FIFO barrier is pruned even while a compatible cohort is
+still active; a now-compatible queue prefix joins that same epoch, while the
+first live opposite waiter remains an absolute barrier. Every blocking
+acquisition has one 30-second absolute monotonic deadline and fails closed with
+a typed phase-timeout error. An `after_in_child` fork hook replaces
 the condition, queue, active phase, admissions, and thread-local state without
 touching a possibly inherited locked mutex. The composed physical-fence
 registry performs the same child reset for its lock, condition, active and
@@ -252,24 +264,34 @@ initializer maps, failure generations, and `ContextVar`; it never unlinks a
 parent-owned captured kubeconfig from the child.
 
 Blocking acquisition order is provider phase, `self.lock`, then lower-level
-resources, physical-UID-cache, and broker locks.
-There is one deliberate exception for the existing probe/refresher atomic
-read-modify-write cycles: while continuously holding `self.lock`, they may use
-only a zero-time `try_enter`. A try never queues, sleeps, joins an initializing
+resources, physical-UID-cache, and broker locks. Existing probe/refresher
+atomic read-modify-write cycles and the batched v2 persist seam are deliberate
+exceptions: while continuously holding `self.lock`, they may use only a
+zero-time `try_enter`. A try never queues, sleeps, joins an initializing
 physical fence, or barges past a queued opposite phase. Failure skips that
-provider sub-operation or partition immediately. It cannot publish readiness,
-absence, preemption, identity-mismatch, or cleanup evidence and is not recorded
-as physical-identity uncertainty; the unchanged row is retried next round.
+provider sub-operation, partition, or one unpersisted launch immediately. It
+cannot publish readiness, absence, preemption, identity-mismatch, cleanup, or
+capacity-reservation evidence and is not recorded as physical-identity
+uncertainty; unchanged work is retried next round. A busy batch item stops the
+entire remaining wave so the manager lock is released to the newly admitted
+opposite root instead of churning later decisions beneath that root.
 
 There is deliberately no exclusive manager-wide reconciliation round: one
 unreachable job-status SSH call must not block readiness or the refresher that
-admits already-enqueued launches and downs. Job status takes its blocking phase
-outside `self.lock`, partitions strict v2 rows before genuine ordinary rows,
-passes the admission explicitly to every worker, and re-reads each row under
-`self.lock` before reducing the materialized result. Probe and refresher retain
-one continuous `self.lock` acquisition for their whole round, preserving their
-existing atomicity against scale, update, and other pickled-row writers. They
-therefore use only try admission while that lock is held.
+admits already-enqueued launches and downs. Job status takes every blocking
+phase outside `self.lock`, partitions strict v2 rows before gated ordinary work,
+and passes admission to every phased worker. An ordinary SSH worker may run
+unphased only when the same prefetched durable record supplies an exact
+`CloudVmRayResourceHandle` with a real non-Kubernetes `Cloud`, and the backend
+consumes that object without a name lookup. Success reduction is provider-free.
+If an unphased fetch raises `CommandError`, fresh provider-backed preemption
+classification acquires `AMBIENT_LEGACY` before the manager lock, then re-reads
+the replica under the lock; a row that changed to v2 is deferred to the next
+strict round.
+Missing, malformed, fake-cloud, or Kubernetes handles stay ambient. Probe and
+refresher retain one continuous `self.lock` acquisition for their whole round,
+preserving their existing atomicity against scale, update, and other pickled-
+row writers. They therefore use only try admission while that lock is held.
 
 One probe performs its provider-free fleet/cluster snapshot, durable handle
 shape checks, tick-spec reset, process-guard prune, and route-registry prune
@@ -293,16 +315,22 @@ consumes phase busy as an ordinary deferral inside its reconciliation pass; it
 must not raise into the generic 30-second retry sleep while retaining
 `self.lock`.
 
-An asynchronous launch HTTP request never holds a phase. Before persisting a v2 fill
-launch, the carried override is classified provider-free, blocking
-`V2_FENCED` admission is acquired before `self.lock`, and the exact
-`(context, UID)` physical fence proves the pin; ambient force-refresh is not
-used. Failure returns before row persistence or request submission. A deferred
-down worker waits for drain with neither lock, then each retry independently
-enters the row's blocking phase, selects the workspace, creates a fresh v2
-physical proof where required, and performs the provider mutation. It releases
-phase and fence before retry backoff and never reuses the originating round's
-proof.
+An asynchronous launch HTTP request never holds a phase. Before persisting a v2
+fill launch, the carried override is classified provider-free and the exact
+`(context, UID)` physical fence proves the pin under the standalone-blocking or
+batch-try admission described above; ambient force-refresh is not used. Failure
+returns before row persistence or request submission. A deferred down worker
+waits for drain with neither lock. Each v2 retry independently enters
+`V2_FENCED`, selects the workspace, creates a fresh physical proof, and performs
+the provider mutation. An ordinary action-aware retry may bypass the Kubernetes
+phase only when its exact UUID-predicated cluster snapshot proves a real non-
+Kubernetes cloud and `core.down` retains both that UUID and the classified raw
+serialized-handle fingerprint. The backend re-proves the same handle under its
+two action locks before provider effects; a same-UUID handle rotation retries
+from fresh classification. Legacy/name-only, missing, malformed, fake-cloud,
+and Kubernetes cleanup remains
+`AMBIENT_LEGACY`. Every retry reclassifies; all paths release phase/fence before
+backoff and never reuse the originating round's proof.
 
 Paths without manager state use the process phase directly. These include cold
 and warm load-balancer route synchronization, standalone active-URL reads,
@@ -312,11 +340,14 @@ rows and never turn a phase timeout into negative evidence. A load-balancer
 route-sync phase timeout aborts that synchronization with 503 and publishes no
 new mapping or warm-cache state; it cannot produce a successful mapping with
 the timed-out rows omitted. Standalone/API status may report identity unknown
-but never physical absence. The v2 poller
-enters `V2_FENCED` before `run_round_if_stale`, so it never waits for the phase
-from inside the broker callback/lock; legacy/shared-demand observations enter
-`AMBIENT_LEGACY` under the same rule. One driven v2 observation creates one
-physical proof for its pool.
+but never physical absence. The v2 poller enters `V2_FENCED` before
+`run_round_if_stale`, so it never waits for the phase from inside the broker
+callback/lock; legacy/shared-demand observations enter `AMBIENT_LEGACY` under
+the same rule. A phase-owning poller makes broker-lock admission zero-wait. If
+another poller/controller owns the lock, this cycle feeds no new capacity and
+retires its process phase immediately; if it acquires the lock, the exact
+observation and publication remain one protected round. One driven v2
+observation creates one physical proof for its pool.
 
 Interactive log follow is the bounded-operation exception. It uses a dedicated
 streaming fence which does not acquire or hold a process phase. A v2 row still
@@ -1112,12 +1143,19 @@ shelter them.
 5. Let every live fill controller atomically adopt an authoritative v2 claim
    set. Verify generation/edge-count integrity, integer grants, and fresh 035
    resource-action evidence before separately re-enabling any authority mode.
-6. Before materializing PHX eligibility, deploy the mixed-phase corrective
-   image to every API/controller/executor process. Observe at least three
-   complete mixed legacy/v2 job-status, readiness-probe, and 60-second broker
-   intervals with no unpropagated-fence error, broker edge withdrawal, or
-   physical-identity uncertainty for a healthy pool. Every process must report
-   the same immutable corrective digest throughout that observation.
+6. Before materializing PHX eligibility, deploy the phase-scope hotfix to every
+   API/controller/executor process and prove one immutable digest. While normal
+   load-balancer sync, job-status, readiness, and broker pollers remain active,
+   exercise both production failure shapes: enqueue a multi-item protocol-v2
+   fill batch (at least ten decisions) and complete at least one exact-UUID
+   ordinary GCP teardown attempt. Observe the GCP operation without an
+   `AMBIENT_LEGACY` owner and observe each v2 admission retire after at most one
+   physical proof/persist seam; a queued ambient waiter must run before a later
+   batch item can barge. Then observe at least three complete 60-second broker
+   intervals with advancing broker generations/refill rows, successful route
+   sync, and no provider-phase timeout, route-sync 503, controller-failed
+   transition, healthy-edge withdrawal, or physical-identity uncertainty.
+   Every process must retain the same hotfix digest throughout.
 7. Update the inference workspace from its inherited east context to an
    explicit east-plus-PHX list through the validated workspace API, restart the
    long-lived API/controller processes so they load that committed snapshot,
@@ -1154,12 +1192,14 @@ normalized claims and zero/stale feed may continue sheltering existing rows;
 it is not a supported drain procedure. Operators must restore the v2 image and
 perform the explicit disable/demote sequence above.
 
-Rolling back only the mixed-phase corrective image while legacy and v2 rows
-coexist is also unsupported: it restores the provider-call collision that can
-withdraw a healthy edge. Fix forward, or first disable fill and drain every
-legacy row under the corrective image before reverting. The explicit
-east-plus-PHX workspace superset itself may remain on a code rollback because
-it removes no previously eligible context.
+Rolling back the phase-scope hotfix while #1275's mixed legacy/v2 behavior
+remains active is unsupported: it restores the multi-item and non-Kubernetes
+cleanup phase convoys that caused 30-second timeouts and transient controller
+failure. Fix forward, or disable fill and drain pending work under the hotfix
+before reverting. Rolling below #1275 while legacy and v2 rows coexist is
+additionally unsupported because it restores the provider-call collision that
+can withdraw a healthy edge. The explicit east-plus-PHX workspace superset may
+remain because it removes no eligible context.
 
 Revision 035 advances resource-action activation evidence to exact revision
 035. Evidence from revision 034 is invalid for new code and is not silently
@@ -1273,20 +1313,28 @@ Automated coverage must include:
   conflicting UIDs for one context;
 - mixed same-context legacy/protocol-v2 job-status and complete probe rounds
   run all v2 status, endpoint, candidate/route-status, liveness, preemption,
-  and teardown provider work before every tokenless legacy provider call;
+  and teardown provider work before every gated Kubernetes or unknown tokenless
+  legacy provider call; the explicitly audited exact non-Kubernetes operations
+  above may overlap without consulting Kubernetes authority;
   futures and exceptional/early-return paths fully join and retire owners,
   malformed v2 rows never enter the legacy phase, shared reduction preserves
   fleet state, and one UID proof is performed per v2 pool per round;
 - provider-phase tests cover same-mode overlap, FIFO cohort/no-barging order,
-  bounded timeout removal, same-mode reentrancy, cross-mode rejection,
-  explicit child admission and drain, stale/copied admission rejection,
-  cancellation cleanup, phase-gate fork-while-held reset, and physical-registry
-  fork-while-owner/initializer-held reset without deleting the parent's capture;
-- blocking job status acquires phase before `self.lock` yet leaves probe and
-  mutation refresh able to run while an SSH worker hangs. Probe, refresher, and
-  locked recovery use only immediate try admission. An active opposite phase,
-  or a same-mode/same-context physical initializer after successful phase try,
-  makes those locked paths return promptly with unchanged rows, no
+  bounded timeout removal, an expired opposite barrier admitting queued
+  active-mode followers into the same epoch without bypassing a live barrier,
+  same-mode reentrancy, cross-mode rejection, explicit child admission and
+  drain, stale/copied admission rejection, cancellation cleanup, phase-gate
+  fork-while-held reset, and physical-registry fork-while-owner/initializer-held
+  reset without deleting the parent's capture;
+- blocking Kubernetes/unknown job status acquires phase before `self.lock` yet
+  leaves probe and mutation refresh able to run while an SSH worker hangs. An
+  exact prefetched GCP handle performs its slow SSH call without excluding a v2
+  Kubernetes phase; a GCP `CommandError` regression proves fresh preemption
+  classification takes ambient admission before `self.lock`. Arbitrary cloud
+  objects remain ambient. Probe, refresher, and locked recovery use only
+  immediate try admission. An active opposite
+  phase, or a same-mode/same-context physical initializer after successful
+  phase try, makes those locked paths return promptly with unchanged rows, no
   negative/identity-uncertain evidence, a released manager lock, and a
   successful next-round retry;
 - one mixed probe resets its tick memo and prunes process/route registries once,
@@ -1300,11 +1348,19 @@ Automated coverage must include:
 - boot recovery under an active opposite phase completes its acquired-lock
   handshake, leaves exact rows retryable, and does not enter the generic
   30-second exception backoff while holding `self.lock`;
-- a v2 scale-up takes blocking phase admission before the manager lock, proves
-  its exact carried context/UID without ambient lookup, and releases both
-  before asynchronous submission; failure persists no row. Deferred down waits
-  for drain first, takes a fresh phase/workspace/UID proof on every retry, and
-  releases phase/fence during backoff;
+- a standalone v2 scale-up takes blocking phase admission before the manager
+  lock. A v2 batch retains one manager-lock acquisition and each item takes a
+  zero-wait phase plus zero-wait physical-initializer admission only at its
+  capture/persist seam. In one real sequence item 1 owns v2, an ambient waiter
+  queues, item 1 retires, ambient enters, and item 2 stops the remaining wave
+  without a row/thread/list/ID leak; it is retried later. Busy/identity failure
+  persists no row and registers no thread.
+  Deferred down waits for drain first, takes a fresh phase/workspace/UID proof
+  on every Kubernetes retry, and exact action-aware GCP cleanup bypasses the
+  Kubernetes phase while retaining its UUID plus raw-handle fingerprint;
+  same-UUID handle change retries provider classification, while name-only,
+  fake, unknown, and Kubernetes cleanup remains ambient. Every path releases
+  phase/fence during backoff;
 - cold/warm LB route sync, standalone active URLs, API status serialization and
   fanout partition complete v2 groups before ordinary rows; a phase timeout
   aborts route sync with 503 and publishes no mapping/cache update, while status
@@ -1313,9 +1369,10 @@ Automated coverage must include:
   phase, ordinary colliding follow fails closed, and bounded/non-follow tails
   hold the normal phase for their complete read;
 - v2 broker observations enter the process phase before the broker callback,
-  never while its round lock is already held, and one observation performs one
-  UID proof for each physical pool; legacy/shared-demand observations use the
-  ambient phase under the same no-lock-at-admission rule;
+  never while its round lock is already held, use zero-wait broker-lock
+  admission while the phase is live, and perform one UID proof for each driven
+  physical pool; legacy/shared-demand observations use the ambient phase under
+  the same rules;
 - broker UID discovery waits only for the typed active owner/initializer
   collision, wakes on successful or failed retirement, survives repeated
   capture replacement with one 30-second absolute deadline, rejects a caller
@@ -1420,14 +1477,15 @@ Terraform formatting, and `git diff --check` also passed. Independent
 adversarial review found no remaining release blocker in the lifecycle-wide
 physical-cluster or cluster-generation fence.
 
-Corrective pre-PR validation on 2026-08-04 passed 555 focused broker,
+#1275 pre-PR validation on 2026-08-04 passed 555 focused broker,
 reserved-capacity, workspace, physical-fence, executor, and replica-contract
 tests plus 62 subtests. After updating three stale provider-phase test doubles,
 the broad affected Serve suite passed all 908 tests plus 23 subtests. Repository
 mypy completed with no issues across 884 source files, YAPF and isort completed,
-Python compilation and `git diff --check` passed, and an independent exact-head
-adversarial review found no release-blocking concurrency or identity issue.
-Required GitHub CI on the final rebased head remains a merge gate.
+Python compilation and `git diff --check` passed. Its exact-head review and
+required CI reported no release blocker. Subsequent production evidence below
+invalidated that concurrency acceptance; these results are historical and do
+not close the phase-scope hotfix gate.
 
 Production diagnosis on 2026-08-04 separated three independent refill
 failures. Merged PR #1269 lets a successfully observed zero-cost location
@@ -1456,41 +1514,72 @@ reported as a physical-UID mismatch. This branch inherits #1274 and extends its
 same successful-read rule through the bounded physical-fence-retirement retry;
 failures and genuine mismatches remain closed.
 
-Helm revision 335 now runs release `1.1.1097`, which includes both #1272 and
+Helm revision 335 deployed release `1.1.1097`, which includes both #1272 and
 #1274. This supersedes the revision-333 deployment state above without closing
 the remaining exact-card, provider-phase, or inherited-workspace gates in this
 corrective change.
 
+Corrective PR #1275 merged as `57a0283ffb4a817d0bebed6f934cdededc726b57`
+after all 30 required checks passed. Release `1.1.1099` was published and
+deployed as Helm revision 336 on 2026-08-05. Runtime inspection confirmed the
+exact commit/version, exact-card A100 versus A100-80GB broker observations, and
+refill progress; `boltz-l4-fleet` returned to READY without an API/controller
+pod restart.
+
+That live run also found a release blocker in #1275's phase scope. Four
+ordinary GCP `core.down` retries held `AMBIENT_LEGACY` across multi-minute cloud
+operations, and one ten-item v2 scale batch held `V2_FENCED` across every UID
+proof and row persist. Controller broker, job-status, and load-balancer callers
+then exceeded the 30-second phase deadline; the service transiently reported
+controller failure before self-healing. Process stack samples confirmed bounded
+head-of-line blocking rather than a leaked mutex. They also exposed a gate
+liveness edge: after an opposite FIFO waiter timed out, a compatible follower
+could remain stranded behind its removed barrier until all original roots
+retired. The phase-scope hotfix in this design addresses those exact findings;
+revision 336 is not final acceptance evidence.
+
+Phase-scope hotfix pre-PR validation on 2026-08-05 passed the complete 803-test
+affected selection covering the provider gate, refill/broker, replica manager,
+action-aware teardown, core fingerprint, and backend handle-change contracts.
+The exact concurrency/fingerprint regression subset also passed after rebasing
+onto merged PR #1277 / release `1.1.1100`. The checked-in formatter completed
+with mypy clean across 884 source files, production pylint at 10.00/10, and
+dashboard lint/format clean. Three independent implementation, test, and
+canonical-design reviews found no remaining release blocker. Required GitHub
+checks on the final PR head remain the merge gate.
+
 Required feature CI on the preceding code-bearing head `1357dec79` completed
 all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
-xfailed, 197 warnings, and 103 subtests passed. The final pre-cloud launch
-guard and execution-quiescence head must retain the same green required checks
-before merge.
+xfailed, 197 warnings, and 103 subtests passed. The phase-scope hotfix must pass
+every required GitHub check on its exact merge head, including the PostgreSQL
+Serve suite. Its local focused/broad test counts, formatter/type/lint results,
+and exact-head adversarial review must be recorded here before merge.
 
-Production acceptance requires two live pool claims for `boltz-l4-fleet`, a
-successful PHX H200 replica canary whose persisted location is PHX, unchanged
-east serving health, no paid spill from a fill decision, and an observed total
-fleet no larger than the configured `max_replicas`.
+Phase-scope acceptance requires both active convoy exercises from deployment
+step 6 and the sustained no-timeout/progress window. Feature acceptance
+additionally requires two live pool claims for `boltz-l4-fleet`, a successful
+PHX H200 replica canary whose persisted location is PHX, unchanged east serving
+health, no paid spill from a fill decision, and an observed total fleet no
+larger than the configured `max_replicas`.
 
 ## Open gates
 
-- Required feature and durable provider-fence CI passed. Helm revision 335
-  currently runs release `1.1.1097` from `854b9d476`, with merged PRs #1269,
-  #1271, #1272, and #1274.
+- Required feature and durable provider-fence CI passed. Helm revision 336
+  currently runs release `1.1.1099` from `57a0283ff`, with merged PRs #1269,
+  #1271, #1272, #1274, and #1275.
   The production request store completed its one-way PostgreSQL cutover, Serve
   is at schema head 035, token-bound protocol v2 is active, and the exact
-  `kube-system` Namespace read is present on east and PHX. The corrective
-  shared-round/provider-phase/workspace release, its required CI, and its
-  mixed-round observation are still open.
-- Live version 51 acceptance retained east serving health and brought up its
-  paid fallback, but correctly omitted PHX from the immutable placement
-  catalog because the inference workspace still inherited the global east-only
-  context. The same run exposed tokenless legacy version-50 provider calls
-  overlapping a protocol-v2 batch owner, plus transient broker UID discovery
-  withdrawal during that overlap. The corrective mixed-phase/wait and
-  effective-workspace-validation release must merge, deploy, and pass the
-  observation in deployment step 6 before PHX eligibility is materialized.
+  `kube-system` Namespace read is present on east and PHX. The phase-scope
+  hotfix, required CI, artifact publication, Helm redeployment, and sustained
+  no-timeout observation are still open.
+- Live version 51 acceptance retained serving health and demonstrated exact-
+  card committed observation/refill behavior, but revision 336 transiently
+  entered controller failure under the phase convoy described above. The
+  hotfix must merge/deploy, actively pass both convoy exercises in deployment
+  step 6, and then complete at least three broker intervals with progressing
+  broker/LB/job-status work and no provider-phase timeout, 503 route sync, or
+  controller-failed transition.
 - The no-platform-PR production bridge is a separately named ClusterRole and
   ClusterRoleBinding, `skypilot-physical-cluster-identity-reader`, on east and
   PHX, bound to EKS group
@@ -1499,8 +1588,8 @@ fleet no larger than the configured `max_replicas`.
   point remove the bridge binding, prove both exact UID reads still pass, and
   then remove the bridge role.
 - The Helm release is declaratively owned by boltz-platform Terragrunt, whose
-  `skypilot-pin.json` remains at `1.1.1084`. Revisions 331 through 333 and this
-  requested corrective Helm rollout are intentional direct-deploy drift; a
+  `skypilot-pin.json` remains at `1.1.1084`. Revisions 331 through 336 and this
+  requested phase-scope Helm rollout are intentional direct-deploy drift; a
   later Terragrunt apply will revert them unless the pin is reconciled. This
   rollout deliberately creates no boltz-platform PR, per operator direction.
 - The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`. After

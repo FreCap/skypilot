@@ -7,6 +7,7 @@ import pickle
 import select
 import signal
 import threading
+import time
 
 import pytest
 
@@ -323,6 +324,73 @@ def test_exception_releases_phase_and_wakes_opposite_mode() -> None:
             raise ExpectedError
     with gate.phase(_LEGACY, timeout_seconds=0):
         pass
+
+
+def test_expired_opposite_barrier_admits_queued_active_mode() -> None:
+    gate = provider_phase._ProviderPhaseGate()
+    legacy_timed_out = threading.Event()
+    unexpected_legacy_entry = threading.Event()
+    later_v2_entered = threading.Event()
+    later_v2_release = threading.Event()
+    live_legacy_entered = threading.Event()
+    later_v2_epochs: list[int] = []
+    threads: list[threading.Thread] = []
+
+    def expiring_legacy() -> None:
+        try:
+            with gate.phase(_LEGACY, timeout_seconds=30):
+                unexpected_legacy_entry.set()
+        except exceptions.ProviderPhaseTimeoutError:
+            legacy_timed_out.set()
+
+    def later_v2() -> None:
+        with gate.phase(_V2, timeout_seconds=30) as admission:
+            later_v2_epochs.append(admission._phase_epoch)
+            later_v2_entered.set()
+            assert later_v2_release.wait(timeout=5)
+
+    def live_legacy() -> None:
+        with gate.phase(_LEGACY, timeout_seconds=30):
+            live_legacy_entered.set()
+
+    try:
+        with gate.phase(_V2) as first_v2:
+            expiring_thread = threading.Thread(target=expiring_legacy)
+            threads.append(expiring_thread)
+            expiring_thread.start()
+            _wait_for_queue(gate, 1)
+
+            later_v2_thread = threading.Thread(target=later_v2)
+            threads.append(later_v2_thread)
+            later_v2_thread.start()
+            _wait_for_queue(gate, 2)
+
+            with gate._condition:
+                assert gate._queue[0].mode == _LEGACY
+                gate._queue[0].deadline = time.monotonic() - 1
+                gate._advance_locked(time.monotonic())
+
+            assert legacy_timed_out.wait(timeout=2)
+            # The compatible follower must join while the original root is
+            # still open, reusing that exact phase epoch.
+            assert later_v2_entered.wait(timeout=2)
+            assert later_v2_epochs == [first_v2._phase_epoch]
+
+            live_legacy_thread = threading.Thread(target=live_legacy)
+            threads.append(live_legacy_thread)
+            live_legacy_thread.start()
+            _wait_for_queue(gate, 1)
+            assert not live_legacy_entered.is_set()
+
+        # One V2 root remains, so the live opposite barrier stays excluded.
+        assert not live_legacy_entered.is_set()
+        later_v2_release.set()
+        assert live_legacy_entered.wait(timeout=2)
+        assert not unexpected_legacy_entry.is_set()
+    finally:
+        later_v2_release.set()
+        for thread in threads:
+            _join(thread)
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='requires os.fork')

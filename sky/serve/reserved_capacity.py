@@ -146,6 +146,27 @@ class ProtocolV2CleanupFence:
     physical_cluster_uid: str
 
 
+def ordinary_provider_phase_mode(
+    handle: Any,
+    cluster_name: str,
+) -> provider_phase.ProviderPhaseMode | None:
+    """Classify ordinary provider work for Kubernetes phase admission.
+
+    Only an exact durable CloudVm handle with a finalized non-Kubernetes cloud
+    may bypass the process gate. Unknown or malformed handles remain ambient
+    because a later provider read could still consult mutable kubeconfig.
+    """
+    launched_resources = getattr(handle, 'launched_resources', None)
+    cloud = getattr(launched_resources, 'cloud', None)
+    if (isinstance(handle, backends.CloudVmRayResourceHandle) and
+            getattr(handle, 'cluster_name', None) == cluster_name and
+            launched_resources is not None and
+            isinstance(cloud, clouds.Cloud) and
+            not isinstance(cloud, clouds.Kubernetes)):
+        return None
+    return provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+
+
 @contextlib.contextmanager
 def _provider_phase_scope(
     mode: provider_phase.ProviderPhaseMode,
@@ -1440,9 +1461,11 @@ def _broker_cycle(
     with provider_phase.provider_phase(
             provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
         allocation = reserved_capacity_broker.run_round_if_stale(
-            service_name, pool_key,
+            service_name,
+            pool_key,
             lambda: query_pool_group_observation(context, grouped_shapes),
-            poll_interval_seconds())
+            poll_interval_seconds(),
+            lock_timeout_seconds=0)
     if allocation is None:
         # No allocation this cycle (claim rejected/expired, round lock
         # timeout, or the fresh round predates our claim): feed zero free
@@ -1673,7 +1696,8 @@ def _broker_cycle_v2(
                     poll_interval_seconds(),
                     expected_protocol_version=(
                         reserved_capacity_broker.PROTOCOL_V2),
-                    expected_service_generation=generation)
+                    expected_service_generation=generation,
+                    lock_timeout_seconds=0)
         except Exception as error:  # pylint: disable=broad-except
             # One pool's transient database/lock path must not suppress a
             # healthy peer edge in this same complete-map publication.
