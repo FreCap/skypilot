@@ -974,7 +974,7 @@ async def launch(launch_body: payloads.LaunchBody,
             launch_precondition = (
                 preconditions.ServiceReplicaLaunchPrecondition(
                     request_id, service_name, service_hash, controller_pid,
-                    controller_ip))
+                    controller_ip, service_version))
     await executor.schedule_request_async(
         request_id,
         request_name=request_names.RequestName.CLUSTER_LAUNCH,

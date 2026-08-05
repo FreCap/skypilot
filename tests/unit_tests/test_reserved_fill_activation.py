@@ -245,7 +245,8 @@ def _install_clients(monkeypatch,
                      *,
                      identity=None,
                      bound_pod=None,
-                     writer_instance_lists=None):
+                     writer_instance_lists=None,
+                     serve_revision='035'):
     deployment_snapshots = []
     for snapshot in deployments:
         if isinstance(snapshot, (list, tuple)):
@@ -284,7 +285,7 @@ def _install_clients(monkeypatch,
     def current_revision(_engine, section):
         assert lock.held
         return {
-            broker.migration_utils.SERVE_DB_NAME: '035',
+            broker.migration_utils.SERVE_DB_NAME: serve_revision,
             broker.migration_utils.API_REQUESTS_DB_NAME: '008',
         }[section]
 
@@ -437,14 +438,17 @@ def test_exact_token_client_shares_frozen_credential_between_apis(monkeypatch):
     raw_client.close.assert_called_once_with()
 
 
-def test_activation_derives_stable_rollout_proof_under_global_lock(monkeypatch):
+@pytest.mark.parametrize('serve_revision', ['035', '036'])
+def test_activation_derives_stable_rollout_proof_under_global_lock(
+        monkeypatch, serve_revision):
     broker.clear_caches()
     lock = _TrackedLock()
     deployment = _deployment()
     pods = _pod_list(_pod(0), _pod(1))
-    apps_api, core_api = _install_clients(monkeypatch, lock,
-                                          [deployment, deployment],
-                                          [pods, pods])
+    apps_api, core_api = _install_clients(monkeypatch,
+                                          lock, [deployment, deployment],
+                                          [pods, pods],
+                                          serve_revision=serve_revision)
     broker._GRANT_CACHE[('service', None)] = broker._GrantCacheEntry(1, 0.0)
 
     def persist_protocol(*args, **kwargs):
@@ -1127,7 +1131,7 @@ def test_activation_rejects_token_claim_that_mismatches_live_pod(monkeypatch):
     setter.assert_not_called()
 
 
-def test_activation_rejects_schema_other_than_exact_035(monkeypatch):
+def test_activation_rejects_schema_outside_compatible_set(monkeypatch):
     lock = _TrackedLock()
     monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
     monkeypatch.setattr(serve_state, 'get_database_engine',
@@ -1141,7 +1145,7 @@ def test_activation_rejects_schema_other_than_exact_035(monkeypatch):
                         setter)
 
     with pytest.raises(broker.ProtocolV2ActivationError,
-                       match='exact Serve schema revision 035'):
+                       match='Serve schema revision 035 or 036'):
         broker.activate_protocol_v2()
     token_reader.assert_not_called()
     setter.assert_not_called()

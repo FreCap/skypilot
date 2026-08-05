@@ -548,6 +548,7 @@ def launch_cluster(
     exact_resources_override: bool = False,
     pre_launch_guard: Callable[[], bool] | None = None,
     cloud_launch_guard: Callable[[], bool | tuple[bool, str]] | None = None,
+    supersession_guard: Callable[[], bool | tuple[bool, str]] | None = None,
     continue_guard: Callable[[], bool] | None = None,
     cleanup_continue_guard: Callable[[], bool] | None = None,
     launch_fence: dict[str, Any] | None = None,
@@ -625,6 +626,9 @@ def launch_cluster(
         return is_cancelled
 
     ownership_lost = threading.Event()
+    launch_superseded = threading.Event()
+    supersession_reason = ['unknown']
+    supersession_cancel_failures = 0
 
     def _guard_allows(guard: Callable[[], bool] | None) -> bool:
         if guard is None:
@@ -658,6 +662,27 @@ def launch_cluster(
                        'failing closed: reason=invalid-guard-result.')
         return False, 'invalid-guard-result'
 
+    def _supersession_guard_decision() -> tuple[bool, str]:
+        """Return whether this worker still belongs to the current version."""
+        if supersession_guard is None:
+            return True, 'not-configured'
+        try:
+            result = supersession_guard()
+        except Exception as e:  # pylint: disable=broad-except
+            reason = f'guard-error-{type(e).__name__}'
+            logger.warning('Failed to verify replica launch generation; '
+                           f'failing closed: reason={reason}.')
+            return False, reason
+        if isinstance(result, bool):
+            return result, 'authorized' if result else 'guard-rejected'
+        if (isinstance(result, tuple) and len(result) == 2 and
+                isinstance(result[0], bool) and isinstance(result[1], str) and
+                result[1] and len(result[1]) <= 128):
+            return result
+        logger.warning('Replica launch generation guard returned an invalid '
+                       'result; failing closed: reason=invalid-guard-result.')
+        return False, 'invalid-guard-result'
+
     def _cancel_request_for_ownership_loss() -> None:
         ownership_lost.set()
         replica_to_launch_cancelled[replica_id] = True
@@ -674,6 +699,37 @@ def launch_cluster(
                            f'launch request {request_id}: '
                            f'{common_utils.format_exception(e)}')
 
+    def _cancel_request_for_supersession(reason: str) -> bool:
+        """Cancel only this worker; a normal update retains manager health."""
+        nonlocal supersession_cancel_failures
+        supersession_reason[0] = reason
+        launch_superseded.set()
+        request_id = replica_to_request_id.get(replica_id)
+        if request_id is None:
+            return True
+        try:
+            sdk.api_cancel(request_id)
+        except Exception as e:  # pylint: disable=broad-except
+            supersession_cancel_failures += 1
+            if (supersession_cancel_failures == 1 or
+                    supersession_cancel_failures % 10 == 0):
+                logger.warning(
+                    f'Failed to cancel superseded replica {replica_id} '
+                    f'launch request {request_id}; retrying '
+                    f'(failure {supersession_cancel_failures}): '
+                    f'{common_utils.format_exception(e)}')
+            return False
+        return True
+
+    def _assert_launch_not_superseded() -> None:
+        allowed, reason = _supersession_guard_decision()
+        if launch_superseded.is_set() or not allowed:
+            if not launch_superseded.is_set():
+                _cancel_request_for_supersession(reason)
+            raise _ReplicaLaunchSupersededError(
+                f'Refusing superseded cloud launch for replica {replica_id}: '
+                f'reason={supersession_reason[0]}.')
+
     def _assert_launch_authorized() -> None:
         if (ownership_lost.is_set() or not _guard_allows(pre_launch_guard) or
                 not _guard_allows(continue_guard)):
@@ -682,13 +738,13 @@ def launch_cluster(
                 f'Refusing to launch replica {replica_id} after service '
                 'controller ownership was lost.')
 
-    def _stream_with_owner_watchdog(request_id: Any) -> Any:
-        """Cancel an async launch promptly when the shared owner fence trips."""
-        if continue_guard is None:
+    def _stream_with_launch_watchdogs(request_id: Any) -> Any:
+        """Cancel an async launch on owner loss or version supersession."""
+        if continue_guard is None and supersession_guard is None:
             return sdk.stream_and_get(request_id)
         stop_watchdog = threading.Event()
 
-        def _watch_ownership() -> None:
+        def _watch_launch_authority() -> None:
             while not stop_watchdog.wait(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS):
                 if not _guard_allows(continue_guard):
                     logger.warning(
@@ -696,16 +752,39 @@ def launch_cluster(
                         'controller ownership loss.')
                     _cancel_request_for_ownership_loss()
                     return
+                allowed, reason = _supersession_guard_decision()
+                if not allowed:
+                    logger.info(
+                        f'Cancelling replica {replica_id} launch after its '
+                        f'generation was superseded: reason={reason}.')
+                    if _cancel_request_for_supersession(reason):
+                        return
 
-        watchdog = threading.Thread(target=_watch_ownership,
+        watchdog = threading.Thread(target=_watch_launch_authority,
                                     name=f'replica-{replica_id}-launch-owner',
                                     daemon=True)
         watchdog.start()
+        result: Any = None
+        stream_error: Exception | None = None
         try:
-            return sdk.stream_and_get(request_id)
+            try:
+                result = sdk.stream_and_get(request_id)
+            except Exception as e:  # pylint: disable=broad-except
+                stream_error = e
         finally:
             stop_watchdog.set()
             watchdog.join(timeout=1)
+        if launch_superseded.is_set():
+            message = (f'Replica {replica_id} launch was cancelled after its '
+                       'generation was superseded' if stream_error is not None
+                       else f'Replica {replica_id} launch completed after its '
+                       'generation was superseded')
+            raise _ReplicaLaunchSupersededError(
+                f'{message}: reason={supersession_reason[0]}.'
+            ) from stream_error
+        if stream_error is not None:
+            raise stream_error
+        return result
 
     recovery_callbacks_configured = all(callback is not None for callback in (
         get_bound_system_recovery_request_id,
@@ -759,6 +838,7 @@ def launch_cluster(
         try:
             if _check_is_cancelled():
                 return
+            _assert_launch_not_superseded()
             cloud_launch_allowed, cloud_launch_reason = (
                 _cloud_guard_decision())
             if not cloud_launch_allowed:
@@ -826,7 +906,8 @@ def launch_cluster(
             logger.info(f'Replica cluster {cluster_name} launch requested '
                         f'with request_id: {request_id}.')
             replica_to_request_id[replica_id] = request_id
-            launch_result = _stream_with_owner_watchdog(request_id)
+            launch_result = _stream_with_launch_watchdogs(request_id)
+            _assert_launch_not_superseded()
             _assert_launch_authorized()
             if recovery_request_attempted:
                 _capture_recovery_result(request_id, launch_result)
@@ -853,6 +934,16 @@ def launch_cluster(
             # Immediate cleanup through a retargeted alias would be the unsafe
             # action.  Preserve the typed result for the manager, whose durable
             # row drives only identity-fenced cleanup retries.
+            raise
+        except exceptions.ServeReplicaLaunchFenceError:
+            # A provider-side durable owner/generation fence is terminal for
+            # this API request. Re-evaluate the local guards so an ordinary
+            # version transition keeps its typed supersession handling. The
+            # exact durable replica row remains available to the current
+            # manager for reconciliation; do not retry or clean up through the
+            # stale request's authority.
+            _assert_launch_not_superseded()
+            _assert_launch_authorized()
             raise
         except (exceptions.InvalidClusterNameError,
                 exceptions.NoCloudAccessError,
@@ -943,6 +1034,24 @@ def launch_cluster(
             if remaining <= 0:
                 break
             time.sleep(min(0.1, remaining))
+
+
+@context.contextual
+def launch_cluster_with_frozen_controller_config(
+        *args: Any, frozen_controller_config: Any,
+        frozen_controller_config_path: str | None, **kwargs: Any) -> None:
+    """Run a launch worker under its construction-time config generation."""
+    ctx = context.get()
+    assert ctx is not None, 'Context is not initialized'
+    if frozen_controller_config_path is None:
+        os.environ.pop(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, None)
+    else:
+        ctx.override_envs({
+            skypilot_config.ENV_VAR_SKYPILOT_CONFIG: frozen_controller_config_path,
+        })
+    with skypilot_config.replace_skypilot_config_in_memory(
+            frozen_controller_config):
+        launch_cluster(*args, **kwargs)
 
 
 def _wait_for_drain(drain_deadline: float,
@@ -1776,7 +1885,8 @@ class ReplicaManager:
                 'target_num_replicas must be a nonnegative integer '
                 'or None.')
         with self._get_target_num_replicas_lock():
-            if expected_version != self.latest_version:
+            if (getattr(self, '_update_recovery_required', False) or
+                    expected_version != self.latest_version):
                 return False
             if target_num_replicas != getattr(self, '_target_num_replicas',
                                               None):
@@ -1859,6 +1969,8 @@ class ReplicaManager:
     ) -> None:
         """Publish the target computed from an exact reconcile generation."""
         with self._logical_state_lock:
+            if getattr(self, '_update_recovery_required', False):
+                return
             candidate: LogicalTargetState
             if target_capacity_by_accelerator or accelerator_shapes:
                 candidate = (version, generation, target_capacity,
@@ -1875,6 +1987,8 @@ class ReplicaManager:
     def invalidate_logical_target(self) -> None:
         """Revoke authority for pending logical-capacity retirements."""
         with self._logical_state_lock:
+            if getattr(self, '_update_recovery_required', False):
+                return
             self._logical_target = None
 
     def _logical_target_fence_holds(
@@ -1913,7 +2027,8 @@ class ReplicaManager:
                               (snapshot.generation == decision_generation
                                if require_exact_generation else
                                snapshot.generation >= decision_generation))
-        return (snapshot is not None and snapshot.version == version and
+        return (not getattr(self, '_update_recovery_required', False) and
+                snapshot is not None and snapshot.version == version and
                 generation_matches and
                 self._logical_snapshot_is_fresh(snapshot) and
                 self.latest_version == version and
@@ -1982,8 +2097,9 @@ class ReplicaManager:
         default just loops over `scale_up`.
         """
         del launch_priority
-        if (expected_version is not None and
-                expected_version != self.latest_version):
+        if (getattr(self, '_update_recovery_required', False) or
+            (expected_version is not None and
+             expected_version != self.latest_version)):
             return
         for resources_override in resources_overrides:
             self.scale_up(resources_override)
@@ -2008,6 +2124,10 @@ class ReplicaManager:
 
     def clear_pending_version(self, version: int) -> None:
         """Clear a previously announced pending version."""
+
+    def fence_launches_for_update_recovery(self) -> None:
+        """Irreversibly stop autoscaler actuation until manager rebuild."""
+        self._update_recovery_required = True
 
     def clear_scale_reconciliation_signal(self) -> None:
         """Prepare an ordinary autoscaler tick to consume prior feedback."""
@@ -2063,6 +2183,7 @@ class ReplicaManager:
         spec: 'service_spec.SkyServiceSpec',
         update_mode: serve_utils.UpdateMode,
         new_spot_placer: 'SpotPlacerType | None' = None,
+        install_config: Callable[[], None] | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -2542,6 +2663,14 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _service_launch_authorization(self) -> bool | None:
         """Return True/False for proven authority/loss, None if unverifiable."""
+        if getattr(self, '_update_recovery_required', False):
+            # A controller-config transition may have published a new policy
+            # before the remaining manager/autoscaler epoch was installed.
+            # Once that happens only a fresh controller reconstruction can
+            # prove a coherent launch generation.  This process-local fence is
+            # deliberately independent of service ownership: the parent keeps
+            # the same durable owner tuple while it respawns this child.
+            return False
         service_hash = getattr(self, '_service_hash', None)
         if service_hash is None:
             # Compatibility for direct/legacy managers without durable owner
@@ -2569,6 +2698,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
         if not authorized and ownership_lost is not None:
             ownership_lost.set()
+            daemon_stop = getattr(self, '_manager_daemon_stop', None)
+            if daemon_stop is not None:
+                daemon_stop.set()
             completion_event = getattr(self, '_launch_completion_event', None)
             if completion_event is not None:
                 completion_event.set()
@@ -2581,7 +2713,8 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _launch_owner_watchdog_allows_continue(self) -> bool:
         """Cheap shared fence polled by every in-flight launch request."""
         ownership_lost = getattr(self, '_ownership_lost', None)
-        return ownership_lost is None or not ownership_lost.is_set()
+        return (not getattr(self, '_update_recovery_required', False) and
+                (ownership_lost is None or not ownership_lost.is_set()))
 
     def _service_is_cleanup_authorized(self) -> bool:
         """Fail cleanup closed unless this exact controller still owns it.
@@ -2642,6 +2775,58 @@ class SkyPilotReplicaManager(ReplicaManager):
                 serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY] = (
                     service_version)
         return fence_context
+
+    def _queued_launch_generation_decision(
+            self, expected_manager_version: int) -> tuple[bool, str]:
+        """Fence every queued worker to its construction-time manager epoch."""
+        if getattr(self, '_update_recovery_required', False):
+            return False, 'controller-update-recovery-required'
+        current_version = self.latest_version
+        if current_version != expected_manager_version:
+            return False, 'manager-version-changed'
+        pending_version = getattr(self, '_pending_version', None)
+        if (pending_version is not None and
+                pending_version > expected_manager_version):
+            return False, 'newer-version-pending'
+        return True, 'authorized'
+
+    def fence_launches_for_update_recovery(self) -> None:
+        """Irreversibly stop all manager actuation until child respawn."""
+        super().fence_launches_for_update_recovery()
+        daemon_stop = getattr(self, '_manager_daemon_stop', None)
+        if daemon_stop is not None:
+            daemon_stop.set()
+        completion_event = getattr(self, '_launch_completion_event', None)
+        if completion_event is not None:
+            completion_event.set()
+
+    def _manager_daemon_should_stop(self) -> bool:
+        """Whether background manager duties must perform no more work."""
+        ownership_lost = getattr(self, '_ownership_lost', None)
+        should_stop = (getattr(self, '_update_recovery_required', False) or
+                       (ownership_lost is not None and ownership_lost.is_set()))
+        daemon_stop = getattr(self, '_manager_daemon_stop', None)
+        if should_stop and daemon_stop is not None:
+            # Propagate direct ownership-event writes used by embedders/tests
+            # so the supervisor observes the same terminal duty state.
+            daemon_stop.set()
+        return should_stop or (daemon_stop is not None and daemon_stop.is_set())
+
+    def _wait_for_manager_daemon_stop(self, timeout_seconds: float) -> bool:
+        """Interrupt one daemon interval on either terminal stop reason."""
+        if self._manager_daemon_should_stop():
+            return True
+        daemon_stop = getattr(self, '_manager_daemon_stop', None)
+        if daemon_stop is not None:
+            if daemon_stop.wait(timeout_seconds):
+                return True
+            return self._manager_daemon_should_stop()
+        # Compatibility for lightweight managers that predate the dedicated
+        # daemon event and construct the object without running ``__init__``.
+        ownership_lost = getattr(self, '_ownership_lost', None)
+        if ownership_lost is None:
+            return bool(getattr(self, '_update_recovery_required', False))
+        return ownership_lost.wait(timeout_seconds)
 
     def _service_owner_watchdog(self) -> None:
         """Trip one shared launch-cancellation fence on ownership loss."""
@@ -2859,7 +3044,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._route_lease_registry().commit_suspension(suspension)
 
     def _persist_replica(self, replica_id: int, info: ReplicaInfo) -> None:
+        if getattr(self, '_update_recovery_required', False):
+            return
         suspension = self._suspend_system_recovery_route_if_unroutable(info)
+        if getattr(self, '_update_recovery_required', False):
+            if suspension is not None:
+                self._route_lease_registry().rollback_suspension(suspension)
+            return
         try:
             persisted = serve_state.add_or_update_replica(
                 self._service_name,
@@ -2912,6 +3103,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         double resolution could consume another concurrent owner's hold.
         """
         suspensions = list(route_suspensions or ())
+        if getattr(self, '_update_recovery_required', False):
+            self._rollback_system_recovery_route_suspensions(suspensions)
+            return
         suspended_replica_ids = {
             suspension.replica_id for suspension in suspensions
         }
@@ -2927,6 +3121,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         except BaseException:
             self._rollback_system_recovery_route_suspensions(suspensions)
             raise
+        if getattr(self, '_update_recovery_required', False):
+            self._rollback_system_recovery_route_suspensions(suspensions)
+            return
         try:
             fence_kwargs = self._db_fence_kwargs()
             if not replica_infos and suspensions:
@@ -2976,16 +3173,25 @@ class SkyPilotReplicaManager(ReplicaManager):
     ) -> ReplicaInfo | None:
         """Refresh and rerun a recovery transition after revision conflicts."""
         for _ in range(8):
+            if getattr(self, '_update_recovery_required', False):
+                return None
             fresh = serve_state.get_replica_info_from_id(
                 self._service_name, replica_id)
             fence = self._system_recovery_mutation_fence()
             if fresh is None or fence is None:
+                return None
+            if getattr(self, '_update_recovery_required', False):
                 return None
             if not transition(fresh):
                 return fresh
             suspension = self._suspend_system_recovery_route_if_unroutable(
                 fresh)
             try:
+                if getattr(self, '_update_recovery_required', False):
+                    if suspension is not None:
+                        self._route_lease_registry().rollback_suspension(
+                            suspension)
+                    return None
                 updated = serve_state.patch_replica_system_recovery(
                     self._service_name,
                     replica_id,
@@ -3395,6 +3601,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         # individual launch watchdogs poll the event rather than multiplying
         # ownership queries by the number of in-flight replicas.
         self._ownership_lost = threading.Event()
+        # Background health/reconciliation duties must also stop after a
+        # partially applied controller-config transition, even though the
+        # parent deliberately retains the same durable owner while replacing
+        # this child.  Keep this lifecycle signal distinct from
+        # ``_ownership_lost``: an update-recovery fence is not evidence that
+        # another controller owns the service.
+        self._manager_daemon_stop = threading.Event()
         self._scale_reconciliation_event = threading.Event()
         self._system_recovery_route_epoch = str(uuid.uuid4())
         self._system_recovery_route_registry = (
@@ -3500,19 +3713,22 @@ class SkyPilotReplicaManager(ReplicaManager):
         # loop returning) does not silently freeze replica reconciliation /
         # job-status reaping / readiness probing while the controller keeps
         # serving HTTP -- they are restarted instead.
-        thread_utils.start_supervised_thread(self._thread_pool_refresher,
-                                             'replica-thread-pool-refresher',
-                                             stop_event=self._ownership_lost)
-        thread_utils.start_supervised_thread(self._job_status_fetcher,
-                                             'replica-job-status-fetcher',
-                                             stop_event=self._ownership_lost)
-        thread_utils.start_supervised_thread(self._replica_prober,
-                                             'replica-prober',
-                                             stop_event=self._ownership_lost)
+        thread_utils.start_supervised_thread(
+            self._thread_pool_refresher,
+            'replica-thread-pool-refresher',
+            stop_event=self._manager_daemon_stop)
+        thread_utils.start_supervised_thread(
+            self._job_status_fetcher,
+            'replica-job-status-fetcher',
+            stop_event=self._manager_daemon_stop)
+        thread_utils.start_supervised_thread(
+            self._replica_prober,
+            'replica-prober',
+            stop_event=self._manager_daemon_stop)
         thread_utils.start_supervised_thread(
             self._system_recovery_route_prober,
             'replica-system-recovery-route-prober',
-            stop_event=self._ownership_lost)
+            stop_event=self._manager_daemon_stop)
 
     def _recover_replica_operations(self):
         """Route restart inference through the removable legacy runtime."""
@@ -4225,6 +4441,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         v2 admission at the exact physical-capture/persist seam. Contention
         defers this one launch without writing a row or registering a thread.
         """
+        if getattr(self, '_update_recovery_required', False):
+            logger.info(
+                'Refusing to enqueue replica %s because the '
+                'controller update requires supervised recovery.', replica_id)
+            return False
         protocol_v2_fill = _is_protocol_v2_fill_override(resources_override)
         if try_provider_phase_admission and (
                 not protocol_v2_fill or provider_phase_admission is not None):
@@ -4816,6 +5037,19 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert cloud_launch_guard is None
             cloud_launch_guard = lambda: (
                 self._queued_logical_launch_fence_decision(replica_id)[:2])
+        expected_manager_version = self.latest_version
+        existing_cloud_launch_guard = cloud_launch_guard
+
+        def _versioned_cloud_launch_guard() -> bool | tuple[bool, str]:
+            generation_decision = self._queued_launch_generation_decision(
+                expected_manager_version)
+            if not generation_decision[0]:
+                return generation_decision
+            if existing_cloud_launch_guard is None:
+                return generation_decision
+            return existing_cloud_launch_guard()
+
+        cloud_launch_guard = _versioned_cloud_launch_guard
         launch_fence = self._replica_launch_fence_context(launch_version)
         if fill_protocol_version == reserved_capacity_broker.PROTOCOL_V2:
             assert isinstance(fill_pool_key, str)
@@ -4992,8 +5226,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         def _make_launch_thread(
             recovery_launch_kwargs: dict[str, Any],) -> _ReplicaLaunchThread:
             completion_queue, completion_event = self._launch_completion_state()
+            frozen_controller_config = skypilot_config.to_dict()
+            frozen_controller_config_path = os.environ.get(
+                skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
             return _ReplicaLaunchThread(
-                target=launch_cluster,
+                target=launch_cluster_with_frozen_controller_config,
                 replica_id=replica_id,
                 completion_queue=completion_queue,
                 completion_event=completion_event,
@@ -5006,6 +5243,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'exact_resources_override': location is not None,
                     'pre_launch_guard': self._service_is_launch_authorized,
                     'cloud_launch_guard': cloud_launch_guard,
+                    'supersession_guard': functools.partial(
+                        self._queued_launch_generation_decision,
+                        expected_manager_version),
                     'continue_guard':
                         self._launch_owner_watchdog_allows_continue,
                     'cleanup_continue_guard':
@@ -5017,6 +5257,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self, '_workspace',
                         skypilot_config.get_active_workspace() or
                         constants.SKYPILOT_DEFAULT_WORKSPACE),
+                    'frozen_controller_config': frozen_controller_config,
+                    'frozen_controller_config_path':
+                        (frozen_controller_config_path),
                     **recovery_launch_kwargs,
                 },
             )
@@ -5721,6 +5964,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # acquired only after the v2 location has been chosen.
         with phase_context as phase_admission:
             with self.lock:
+                if getattr(self, '_update_recovery_required', False):
+                    return
                 if self._spot_placer is not None:
                     self._spot_placer.refresh_workspace_policy()
                 launch_kwargs: dict[str, Any] = {}
@@ -5770,6 +6015,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 return
         try:
             with self.lock:
+                if getattr(self, '_update_recovery_required', False):
+                    return
                 if self._spot_placer is not None:
                     self._spot_placer.refresh_workspace_policy()
                 needs_reservation = (
@@ -5808,6 +6055,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN),
     ) -> None:
         """Persist one physical batch while any shared demand lock is held."""
+        if getattr(self, '_update_recovery_required', False):
+            return
         batch_version = self.latest_version
         if (expected_version is not None and expected_version != batch_version):
             logger.info('Discarding stale physical scale-up batch for '
@@ -5925,6 +6174,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         next placement decision, so a single 8-slot choice removes eight slots
         from the shortfall instead of causing eight physical launches.
         """
+        if getattr(self, '_update_recovery_required', False):
+            return
         if self._spot_placer is not None:
             self._spot_placer.refresh_workspace_policy()
         if not self._uses_logical_replicas:
@@ -6413,6 +6664,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             is_scale_down: bool = False,
             purge: bool = False,
             in_flight_drain_cap_seconds: int | None = None) -> None:
+        # Every caller holds ``self.lock``.  The controller transition owns
+        # that same mutex, so this check is the linearization point that keeps
+        # an in-flight health/probe result from scheduling teardown after a
+        # partial config/runtime transition has been fenced.
+        if getattr(self, '_update_recovery_required', False):
+            logger.info(
+                'Refusing to terminate replica %s because the controller '
+                'update requires supervised recovery.', replica_id)
+            return
         # TODO(fcapponi): DEPRECATED resource-action scheduler. Remove at M5
         # for eligible authoritative services after durable down admission
         # owns scheduling and retry.
@@ -8063,6 +8323,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                    purge: bool = False,
                    wait_for_idle: bool = False,
                    expected_version: int | None = None) -> None:
+        if getattr(self, '_update_recovery_required', False):
+            return
         if (expected_version is not None and
                 expected_version != self.latest_version):
             logger.info('Discarding stale physical scale-down for replica '
@@ -8111,7 +8373,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         accelerator_shapes: LogicalAcceleratorState = ()
     ) -> None:
         """Accept one logical retirement wave from one fleet snapshot."""
-        if not replica_ids:
+        if (getattr(self, '_update_recovery_required', False) or
+                not replica_ids):
             return
         if not self._uses_logical_replicas:
             raise RuntimeError('Logical scale-down sent to a physical '
@@ -8497,7 +8760,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         Returns:
             bool: Whether the replica's capacity was interrupted.
         """
-        if not self._is_interruptible_replica(info):
+        if (getattr(self, '_update_recovery_required', False) or
+                not self._is_interruptible_replica(info)):
             return False
 
         # Get cluster handle first for zone information. The following
@@ -8505,6 +8769,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # cluster record from the cluster table.
         handle = global_user_state.get_handle_from_cluster_name(
             info.cluster_name)
+        if getattr(self, '_update_recovery_required', False):
+            return False
         provider_fence = reserved_capacity.protocol_v2_provider_fence(
             info, handle)
         if handle is None:
@@ -8526,11 +8792,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                         info.cluster_name,
                         force_refresh_statuses=set(status_lib.ClusterStatus)))
 
+            if getattr(self, '_update_recovery_required', False):
+                return False
+
             if cluster_status in (status_lib.ClusterStatus.UP,
                                   status_lib.ClusterStatus.AUTOSTOPPING):
                 return False
         # The cluster is partially or fully interrupted. It can be down, INIT
         # or STOPPED, based on the provider's interruption behavior.
+        if getattr(self, '_update_recovery_required', False):
+            return False
         cluster_status_str = ('' if cluster_status is None else
                               f' (status: {cluster_status.value})')
         interruption = ('spot-preempted'
@@ -8803,6 +9074,8 @@ class SkyPilotReplicaManager(ReplicaManager):
     @with_lock
     def _refresh_thread_pool(self) -> None:
         """Route mutation completion through the removable legacy runtime."""
+        if getattr(self, '_update_recovery_required', False):
+            return
         self._legacy_mutation_runtime_state().refresh(
             self._refresh_legacy_mutation_runtime)
 
@@ -9391,13 +9664,17 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _thread_pool_refresher(self) -> None:
         """Periodically refresh the launch/down thread pool."""
-        while not self._ownership_lost.is_set():
+        while not self._manager_daemon_should_stop():
             _, completion_event = self._launch_completion_state()
             # Clear before draining the durable-in-process queue. A completion
             # racing after this clear is either drained now or leaves the event
             # set so the wait below returns immediately.
             completion_event.clear()
+            if self._manager_daemon_should_stop():
+                return
             self._join_notified_launch_workers()
+            if self._manager_daemon_should_stop():
+                return
             logger.debug('Refreshing thread pool.')
             try:
                 self._refresh_thread_pool()
@@ -9408,7 +9685,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            if self._ownership_lost.is_set():
+            if self._manager_daemon_should_stop():
                 return
             completion_event.wait(_PROCESS_POOL_REFRESH_INTERVAL)
 
@@ -9452,6 +9729,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         detail_status: job_lib.JobSystemRecoveryDetailStatus,
     ) -> bool:
         """Reduce one exact-job observation and schedule legacy teardown."""
+        if getattr(self, '_update_recovery_required', False):
+            return False
         outcome: dict[str, Any] = {
             'off_route': True,
             'clear_probe': False,
@@ -9623,6 +9902,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         updated = self._patch_system_recovery_with_latest(
             snapshot.replica_id, _reduce)
+        if getattr(self, '_update_recovery_required', False):
+            return False
         if updated is None:
             outcome['teardown'] = True
             updated = serve_state.get_replica_info_from_id(
@@ -9696,6 +9977,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         latest-version-first order, and each re-reads fresh state under
         ``self.lock`` before acting.
         """
+        if self._manager_daemon_should_stop():
+            return
         infos = serve_state.get_replica_infos(self._service_name)
         # Snapshot every replica's cluster record in one batched read; the
         # per-replica ``info.handle()`` fallback would issue one cluster-table
@@ -9798,6 +10081,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 ordinary_fetches.append(fetch)
         for replica_id, message in identity_uncertainties:
             with self.lock:
+                if getattr(self, '_update_recovery_required', False):
+                    return
                 fresh = serve_state.get_replica_info_from_id(
                     self._service_name, replica_id)
                 if (fresh is None or
@@ -9810,6 +10095,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         def _terminate_invalid_recovery_rows(replica_ids: list[int]) -> None:
             for replica_id in replica_ids:
                 with self.lock:
+                    if getattr(self, '_update_recovery_required', False):
+                        return
                     fresh = serve_state.get_replica_info_from_id(
                         self._service_name, replica_id)
                     if (fresh is None or not fresh.status_property.
@@ -9862,7 +10149,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             provider_error_phase_mode: (provider_phase.ProviderPhaseMode |
                                         None) = None,
         ) -> None:
-            if not fetches:
+            if not fetches or self._manager_daemon_should_stop():
                 return
             # The fetches are pure I/O and explicitly join the caller's phase.
             # Result classification stays inside that phase as it may perform
@@ -9950,8 +10237,15 @@ class SkyPilotReplicaManager(ReplicaManager):
     ) -> None:
         """Consume the parallel job-status fetches, in submission order."""
         for info, result in fetch_results:
+            if self._manager_daemon_should_stop():
+                return
             try:
                 result_payload = result.get()
+                # The SSH result may arrive after a partial update has fenced
+                # this child.  Never reduce stale health evidence into a
+                # replica write or teardown in that process.
+                if self._manager_daemon_should_stop():
+                    return
                 if (isinstance(result_payload, tuple) and
                         len(result_payload) == 3):
                     (job_statuses, recovery_infos,
@@ -9965,6 +10259,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     info.replica_id)
             except exceptions.KubernetesPhysicalClusterIdentityError as error:
                 with self.lock:
+                    if getattr(self, '_update_recovery_required', False):
+                        return
                     fresh = serve_state.get_replica_info_from_id(
                         self._service_name, info.replica_id)
                     if (fresh is None or not fresh.status_property.
@@ -9983,6 +10279,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     provider_phase.provider_phase(provider_error_phase_mode))
                 with error_phase_context:
                     with self.lock:
+                        if getattr(self, '_update_recovery_required', False):
+                            return
                         # Re-read only after any blocking phase admission:
                         # another thread may have mutated/purged/scheduled-down
                         # this replica while its SSH ran lock-free.
@@ -10006,11 +10304,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 continue
                             is_preempted = self._handle_preemption(fresh)
                         except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                            if getattr(self, '_update_recovery_required',
+                                       False):
+                                return
                             self._record_provider_identity_uncertain(
                                 fresh,
                                 'preemption classification was fenced off: '
                                 f'{common_utils.format_exception(error)}')
                             continue
+                        if getattr(self, '_update_recovery_required', False):
+                            return
                         if (not is_preempted and
                                 fresh.system_recovery_disposition
                                 == system_recovery_state.
@@ -10054,9 +10357,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                         service_job_id,
                         job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED)
                 with self.lock:
-                    if self._reconcile_system_recovery_status(
-                            info, job_status, recovery_detail,
-                            recovery_detail_status):
+                    if getattr(self, '_update_recovery_required', False):
+                        return
+                    reconciled = self._reconcile_system_recovery_status(
+                        info, job_status, recovery_detail,
+                        recovery_detail_status)
+                    if getattr(self, '_update_recovery_required', False):
+                        return
+                    if reconciled:
                         continue
             else:
                 job_status = next(iter(job_statuses.values()), None)
@@ -10067,6 +10375,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
             if job_status in job_lib.JobStatus.user_code_failure_states():
                 with self.lock:
+                    if getattr(self, '_update_recovery_required', False):
+                        return
                     # Re-read under the lock: another thread (e.g. scale_down)
                     # may have terminated or mutated this replica while we
                     # were SSHing without the lock.
@@ -10087,7 +10397,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _job_status_fetcher(self) -> None:
         """Periodically fetch the service job status of all replicas."""
-        while not self._ownership_lost.is_set():
+        while not self._manager_daemon_should_stop():
             logger.debug('Refreshing job status.')
             try:
                 self._fetch_job_status()
@@ -10098,7 +10408,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            if self._ownership_lost.wait(_JOB_STATUS_FETCH_INTERVAL):
+            if self._wait_for_manager_daemon_stop(_JOB_STATUS_FETCH_INTERVAL):
                 return
 
     def _resolve_probe_urls(
@@ -10276,6 +10586,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         exact_detail_absent: bool,
     ) -> tuple[ReplicaInfo, bool, bool]:
         """Apply the candidate readiness/ABSENT release protocol."""
+        if getattr(self, '_update_recovery_required', False):
+            return info, True, False
         outcome = {'off_route': True, 'teardown': False, 'released': False}
         deadlines = getattr(self, '_candidate_release_monotonic_deadlines',
                             None)
@@ -10335,6 +10647,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         updated = self._patch_system_recovery_with_latest(
             info.replica_id, _reduce)
+        if getattr(self, '_update_recovery_required', False):
+            return info, True, False
         if updated is None:
             outcome['teardown'] = True
             return info, True, True
@@ -10356,6 +10670,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         probe_started_at: float,
     ) -> tuple[ReplicaInfo, system_recovery_state.RecoveryReduction | None]:
         """Reduce a capable replica probe against the latest revision."""
+        if getattr(self, '_update_recovery_required', False):
+            return info, None
         outcome: dict[str, system_recovery_state.RecoveryReduction | None] = {
             'reduction': None
         }
@@ -10400,6 +10716,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         updated = self._patch_system_recovery_with_latest(
             info.replica_id, _reduce)
+        if getattr(self, '_update_recovery_required', False):
+            return info, None
         if updated is None:
             return info, system_recovery_state.RecoveryReduction(
                 state=info.system_recovery,
@@ -10446,6 +10764,8 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _probe_all_replicas(self) -> list[ReplicaInfo]:
         """Run one probe round under one physical UID proof per pool."""
         infos = serve_state.get_replica_infos(self._service_name)
+        if getattr(self, '_update_recovery_required', False):
+            return infos
         # Provider-free per-tick state is prepared exactly once even though the
         # provider-bearing work below is split into two authority phases.
         self._tick_version_spec_cache = {}
@@ -10466,6 +10786,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         ]
         cluster_records = global_user_state.get_clusters_from_names(
             [info.cluster_name for info in tracked_infos])
+        if getattr(self, '_update_recovery_required', False):
+            return infos
         representatives: dict[tuple[str, str], tuple[ReplicaInfo, Any]] = {}
         grouped_infos: dict[tuple[str, str], list[ReplicaInfo]] = {}
         ordinary_infos: list[ReplicaInfo] = []
@@ -10485,6 +10807,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # thread is allowed to contact the provider.
                 reserved_capacity.protocol_v2_provider_fence(info, handle)
             except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                if getattr(self, '_update_recovery_required', False):
+                    return infos
                 self._record_provider_identity_uncertain(
                     info, 'probe-round physical identity was fenced off: '
                     f'{common_utils.format_exception(error)}')
@@ -10509,8 +10833,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                             representatives,
                             phase_admission=phase_admission,
                             wait_for_initializer=False) as fence_failures:
+                        if getattr(self, '_update_recovery_required', False):
+                            return infos
                         failed_replica_ids: set[int] = set()
                         for key, error in fence_failures.items():
+                            if getattr(self, '_update_recovery_required',
+                                       False):
+                                return infos
                             group = grouped_infos[key]
                             failed_replica_ids.update(
                                 info.replica_id for info in group)
@@ -10543,6 +10872,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 self._probe_all_replicas_with_snapshot(
                                     admitted_infos,
                                     phase_admission=phase_admission))
+                            if getattr(self, '_update_recovery_required',
+                                       False):
+                                return infos
                             participated_replica_ids.update(
                                 info.replica_id for info in admitted_infos)
             except exceptions.ProviderPhaseBusyError:
@@ -10558,6 +10890,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     phased_snapshots.extend(
                         self._probe_all_replicas_with_snapshot(
                             ordinary_infos, phase_admission=phase_admission))
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                     participated_replica_ids.update(
                         info.replica_id for info in ordinary_infos)
             except exceptions.ProviderPhaseBusyError:
@@ -10597,6 +10931,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             re-read from the DB. Callers can derive the service status from
             it without re-deserializing the whole fleet.
         """
+        if getattr(self, '_update_recovery_required', False):
+            return infos
         probe_futures = []
         replica_to_probe = []
         infos_to_probe = [
@@ -10626,6 +10962,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._tick_version_spec_cache.update(specs)
             probe_urls = self._resolve_probe_urls(
                 infos_to_probe, phase_admission=phase_admission)
+            if getattr(self, '_update_recovery_required', False):
+                return infos
         else:
             probe_urls = {}
         candidate_status_inputs: list[tuple[ReplicaInfo, Any]] = []
@@ -10692,6 +11030,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             status_cluster_records = (global_user_state.get_clusters_from_names(
                 [info.cluster_name for info in status_infos])
                                       if status_infos else {})
+            if getattr(self, '_update_recovery_required', False):
+                return infos
 
             def _status_handle(info: ReplicaInfo, record: Any) -> Any:
                 if (info.replica_id
@@ -10707,6 +11047,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     reserved_capacity.protocol_v2_provider_fence(info, handle)
                     return handle
                 except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                    if getattr(self, '_update_recovery_required', False):
+                        return None
                     self._record_provider_identity_uncertain(
                         info, 'exact status handle was fenced off: '
                         f'{common_utils.format_exception(error)}')
@@ -10873,7 +11215,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 requires_next_probe = (predicted_generation and
                                        not probe_started_after_adoption)
                 if (not requires_next_probe and
-                        self._system_recovery_route_evidence_matches(
+                        not getattr(self, '_update_recovery_required', False)
+                        and self._system_recovery_route_evidence_matches(
                             result_info,
                             *evidence,
                             allow_retry_submitted=predicted_generation)):
@@ -10881,10 +11224,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                         # Process-local issuance is intentionally the sole
                         # worker side effect. Persistence/teardown remains in
                         # the parent thread after it revalidates current state.
-                        self._route_lease_registry().issue(
-                            result_info.replica_id, generation, exact_route_url,
-                            exact_readiness_path, exact_post_data,
-                            exact_headers, request_started_at)
+                        if not getattr(self, '_update_recovery_required',
+                                       False):
+                            registry = self._route_lease_registry()
+                            registry.issue(result_info.replica_id, generation,
+                                           exact_route_url,
+                                           exact_readiness_path,
+                                           exact_post_data, exact_headers,
+                                           request_started_at)
+                            if getattr(self, '_update_recovery_required',
+                                       False):
+                                registry.deactivate(result_info.replica_id)
                     except system_recovery_route_lease.RouteLeaseError:
                         pass
                 return (result_info, succeeded, probe_time, request_started_at,
@@ -10899,8 +11249,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 try:
                     result_info, succeeded, probe_time = info.probe_pool(
                         provider_phase_admission=phase_admission)
-                    self._provider_identity_uncertain_replica_ids().discard(
-                        info.replica_id)
+                    if not getattr(self, '_update_recovery_required', False):
+                        self._provider_identity_uncertain_replica_ids().discard(
+                            info.replica_id)
                 except exceptions.KubernetesPhysicalClusterIdentityError as error:
                     with provider_identity_errors_lock:
                         provider_identity_errors[info.replica_id] = (
@@ -10948,10 +11299,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 tuple[job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
                       None, job_lib.JobSystemRecoveryDetailStatus] | None,
                 bool]] = [future.get() for future in probe_futures]
+            # A config/runtime transition can fail while this locked probe is
+            # waiting on HTTP.  Treat every completed result as stale before
+            # any route, recovery, uptime, replica, or teardown reduction.
+            if getattr(self, '_update_recovery_required', False):
+                return infos
 
             if provider_identity_errors:
                 infos_by_id = {info.replica_id: info for info in infos_to_probe}
                 for replica_id, message in provider_identity_errors.items():
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                     identity_info = infos_by_id.get(replica_id)
                     if identity_info is not None:
                         self._record_provider_identity_uncertain(
@@ -10985,9 +11343,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             terminal_candidate_ids: set[int] = set()
             for replica_id, (candidate_info,
                              status_future) in candidate_status_futures.items():
+                if getattr(self, '_update_recovery_required', False):
+                    return infos
                 try:
                     status_payload = status_future.get()
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                 except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                     self._record_provider_identity_uncertain(
                         candidate_info,
                         'candidate status lookup was fenced off: '
@@ -11029,6 +11393,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # launched from an older snapshot; never let its result
                     # reduce or whole-row-upsert this replica afterward.
                     terminal_candidate_ids.add(replica_id)
+                if getattr(self, '_update_recovery_required', False):
+                    return infos
                 fresh_candidate = serve_state.get_replica_info_from_id(
                     self._service_name, replica_id)
                 if fresh_candidate is not None:
@@ -11092,8 +11458,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                         functools.partial(self._cloud_instance_looks_alive,
                                           phase_admission=phase_admission),
                         failed_interruptible_infos)
+                if getattr(self, '_update_recovery_required', False):
+                    return infos
                 for failed_info, alive in zip(failed_interruptible_infos,
                                               alive_flags):
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                     if alive is None:
                         self._record_provider_identity_uncertain(
                             failed_info,
@@ -11113,6 +11483,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             preempted_replica_ids: set[int] = set()
             terminal_route_ids: set[int] = set()
             for future_result in probe_results:
+                if getattr(self, '_update_recovery_required', False):
+                    return infos
                 (info, probe_succeeded, probe_time, probe_monotonic_started_at,
                  _, _) = future_result
                 if (info.replica_id
@@ -11142,6 +11514,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             info, 'forced preemption refresh was fenced off: '
                             f'{common_utils.format_exception(error)}')
                         continue
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                     if is_preempted:
                         preempted_replica_ids.add(info.replica_id)
                         continue
@@ -11165,6 +11539,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 probe_monotonic_started_at),
                             exact_job_nonterminal=exact_nonterminal,
                             exact_detail_absent=exact_absent))
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                     should_teardown = (should_teardown or candidate_teardown)
 
                 route_evidence = ordered_route_evidence.get(info.replica_id)
@@ -11174,6 +11550,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         terminal_route_ids.add(info.replica_id)
                         self._route_lease_registry().deactivate(info.replica_id)
                         continue
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                     fresh_route_info = serve_state.get_replica_info_from_id(
                         self._service_name, info.replica_id)
                     if fresh_route_info is None:
@@ -11189,6 +11567,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         info,
                         succeeded=probe_succeeded,
                         probe_started_at=probe_time)
+                    if getattr(self, '_update_recovery_required', False):
+                        return infos
                     if recovery_reduction is None:
                         force_off_route = True
                         should_teardown = True
@@ -11224,6 +11604,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if probe_succeeded:
                     if (self._uptime is None and
                             info.status_property.service_ready_now):
+                        if getattr(self, '_update_recovery_required', False):
+                            return infos
                         self._uptime = probe_time
                         logger.info(
                             f'Replica {info.replica_id} is the first ready '
@@ -11303,7 +11685,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         route_ready = (
                             not needs_issuance or
                             info.replica_id not in route_requires_next_probe_ids
-                            and self._issue_system_recovery_route(
+                            and not getattr(self, '_update_recovery_required',
+                                            False) and
+                            self._issue_system_recovery_route(
                                 info, route_url, probe_monotonic_started_at,
                                 route_evidence))
                     if not route_ready:
@@ -11349,6 +11733,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             # the teardowns: _terminate_replica re-reads the replica row,
             # and the probe mutations (e.g. first_ready_time=-1.0, which
             # drives the failure classification) must be visible to it.
+            if getattr(self, '_update_recovery_required', False):
+                return infos
             if pending_route_suspensions:
                 transferred_route_suspensions = list(pending_route_suspensions)
                 pending_route_suspensions.clear()
@@ -11395,6 +11781,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             expected_status_epoch: int | None = None) -> None:
         """Write status from a stable target snapshot without blocking scale."""
         with self._get_status_epoch_lock():
+            if getattr(self, '_update_recovery_required', False):
+                return
             if (expected_status_epoch is not None and
                     expected_status_epoch != getattr(
                         self, '_status_epoch_generation', 0)):
@@ -11406,6 +11794,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     update_mode = self._update_mode
                     target_generation = getattr(
                         self, '_target_num_replicas_generation', 0)
+                if getattr(self, '_update_recovery_required', False):
+                    return
                 serve_utils.set_service_status_and_active_versions_from_replica(
                     self._service_name,
                     replica_infos,
@@ -11442,10 +11832,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             succeeded = False
         finally:
-            self._route_lease_registry().record_probe_result(
-                target,
-                request_started_at=request_started_at,
-                succeeded=succeeded)
+            if not self._manager_daemon_should_stop():
+                self._route_lease_registry().record_probe_result(
+                    target,
+                    request_started_at=request_started_at,
+                    succeeded=succeeded)
 
     async def _system_recovery_route_probe_loop(self) -> None:
         """Run nonoverlapping route-probe rounds on a fixed monotonic grid."""
@@ -11456,11 +11847,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         connector = aiohttp.TCPConnector(
             limit=serve_constants.SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS)
         async with aiohttp.ClientSession(connector=connector) as session:
-            while not self._ownership_lost.is_set():
+            while not self._manager_daemon_should_stop():
                 delay = next_start - loop.time()
                 if delay > 0:
                     await asyncio.sleep(delay)
-                    if self._ownership_lost.is_set():
+                    if self._manager_daemon_should_stop():
                         return
                 targets = self._route_lease_registry().probe_targets()
                 if targets:
@@ -11480,7 +11871,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _replica_prober(self) -> None:
         """Periodically probe replicas."""
-        while not self._ownership_lost.is_set():
+        while not self._manager_daemon_should_stop():
             logger.debug('Running replica prober.')
             try:
                 with self._get_status_epoch_lock():
@@ -11489,6 +11880,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # re-reading (and re-deserializing) the whole fleet from the
                 # DB a second time per tick.
                 replica_infos = self._probe_all_replicas()
+                if self._manager_daemon_should_stop():
+                    return
                 # TODO(zhwu): when there are multiple load balancers, we need
                 # to make sure the active_versions are the union of all
                 # versions of all load balancers.
@@ -11509,7 +11902,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # one across ticks.
                 self._tick_version_spec_cache = {}
             # TODO(MaoZiming): Probe cloud for early preemption warning.
-            if self._ownership_lost.wait(
+            if self._wait_for_manager_daemon_stop(
                     self._get_endpoint_probe_interval_seconds()):
                 return
 
@@ -11672,6 +12065,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         job_lib.JobSystemRecoveryDetailStatus] | None,
     ) -> bool:
         """Issue only after an ordered exact post-readiness remote read."""
+        if getattr(self, '_update_recovery_required', False):
+            return False
         generation = self._system_recovery_route_generation(info)
         if (generation is None or evidence is None or
                 not self._system_recovery_route_evidence_matches(
@@ -11679,9 +12074,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             return False
         spec = self._get_version_spec(info.version)
         try:
-            issued = self._route_lease_registry().issue(
-                info.replica_id, generation, route_url, spec.readiness_path,
-                spec.post_data, spec.readiness_headers, normal_probe_started_at)
+            registry = self._route_lease_registry()
+            issued = registry.issue(info.replica_id, generation, route_url,
+                                    spec.readiness_path, spec.post_data,
+                                    spec.readiness_headers,
+                                    normal_probe_started_at)
+            if getattr(self, '_update_recovery_required', False):
+                registry.deactivate(info.replica_id)
+                return False
         except system_recovery_route_lease.RouteLeaseError:
             issued = False
         if not issued and self._route_lease_registry().is_retired(
@@ -11750,11 +12150,18 @@ class SkyPilotReplicaManager(ReplicaManager):
         spec: 'service_spec.SkyServiceSpec',
         update_mode: serve_utils.UpdateMode,
         new_spot_placer: 'SpotPlacerType | None' = None,
+        install_config: Callable[[], None] | None = None,
     ) -> None:
         if version <= self.latest_version:
             logger.error(f'Invalid version: {version}, '
                          f'latest version: {self.latest_version}')
             return
+        # This callback promotes and publishes the exact immutable config
+        # generation while the same mutex that fences every replica launch is
+        # held. No old-version launch can therefore observe the new policy,
+        # and no newer update can overtake this manager transition.
+        if install_config is not None:
+            install_config()
         new_yaml_content = serve_state.get_yaml_content(self._service_name,
                                                         version)
         assert new_yaml_content is not None, (

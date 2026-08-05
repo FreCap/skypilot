@@ -388,6 +388,12 @@ LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS = 256
 # controllers acknowledge the durable commit before taking that lock, but
 # clients keep this budget during mixed-version rollouts.
 UPDATE_SERVICE_TIMEOUT_SECONDS = 600
+# A raw controller-config stage may still belong to an API request that is
+# waiting for a controller response and then serializing an ambiguity cleanup.
+# The controller GC therefore waits for both full request budgets before it
+# considers a NULL-yaml stage orphaned.
+ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS = 2 * UPDATE_SERVICE_TIMEOUT_SECONDS
+ORPHANED_CONFIG_STAGE_SWEEP_INTERVAL_SECONDS = 60
 
 # Replica termination waits for the fleet-wide replica-manager lock before it
 # durably schedules teardown. Large-fleet recovery and probe rounds can hold
@@ -465,6 +471,19 @@ LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 55
 # and can exceed the parent's tight health-check timeout during launch storms.
 CONTROLLER_HEALTH_ENDPOINT_PATH = '/controller/health'
 CONTROLLER_PLACEMENT_ENDPOINT_PATH = '/controller/placement'
+CONTROLLER_UPDATE_CAPABILITIES_ENDPOINT_PATH = (
+    '/controller/update_capabilities')
+CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH = (
+    '/controller/update_service_with_config')
+CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH = (
+    '/controller/cleanup_staged_update_config')
+SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION = 1
+VERSIONED_HA_CONFIG_RECOVERY_MARKER = (
+    '# SKY_SERVE_VERSIONED_CONFIG_RECOVERY_V1')
+# One invocation-local JSON fence inserted by the HA leader immediately before
+# it spawns `_start`. The child consumes and removes it from its environment so
+# descendants cannot accidentally reuse another recovery attempt's authority.
+HA_RECOVERY_OWNER_FENCE_ENV_VAR = 'SKYPILOT_SERVE_HA_RECOVERY_OWNER_FENCE'
 # A fleet-scale readiness sweep can briefly starve the controller event loop
 # even though the constant-time health handler is healthy.  Keep local connect
 # failure detection tight, but allow the lightweight response enough time to

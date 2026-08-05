@@ -9,6 +9,7 @@ import contextvars
 import dataclasses
 import datetime
 import enum
+import errno
 import hashlib
 import json
 import logging
@@ -19,6 +20,8 @@ import pickle
 import re
 import shlex
 import shutil
+import stat
+import tempfile
 import threading
 import time
 import traceback
@@ -55,6 +58,7 @@ from sky.skylet import job_lib
 from sky.utils import annotations
 from sky.utils import command_runner
 from sky.utils import common_utils
+from sky.utils import context as sky_context
 from sky.utils import controller_utils
 from sky.utils import debug_dump_helpers
 from sky.utils import locks
@@ -83,6 +87,332 @@ else:
 
 logger: logging.Logger = sky_logging.init_logger(__name__)
 controller_transport.logger = logger
+
+_LEGACY_HA_CONFIG_BLOCK_BEGIN = '# SKY_SERVE_CONFIG_SNAPSHOT_BEGIN'
+_LEGACY_HA_CONFIG_BLOCK_END = '# SKY_SERVE_CONFIG_SNAPSHOT_END'
+_VERSIONED_HA_CONFIG_MARKER = constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER
+# This grammar is owned by ``write_config_snapshot_receipt()``. Keep it
+# deliberately exact: recovery and GC must never treat an arbitrary dotfile
+# that merely shares the prefix as one of our receipts.
+_CONFIG_RECEIPT_TEMP_FILE_PATTERN = re.compile(
+    r'\.config-receipt-[0-9a-f]{32}\.tmp\Z')
+_HA_CONFIG_SAFE_TOP_LEVEL_KEYS = frozenset({
+    'active_workspace',
+    'allowed_clouds',
+    'aws',
+    'azure',
+    'container_registries',
+    'data',
+    'gcp',
+    'jobs',
+    'kubernetes',
+    'nebius',
+    'nvidia_gpus',
+    'oci',
+    'provision',
+    'serve',
+    'slurm',
+    'ssh',
+    'vast',
+    'workspaces',
+})
+_HA_CONFIG_RECURSIVE_SENSITIVE_KEYS = frozenset({
+    '_metadata',
+    'additional_labels',
+    'additional_tags',
+    'annotations',
+    'external_id',
+    'create_instance_kwargs',
+    'custom_metadata',
+    'instance_tags',
+    'labels',
+    'pod_config',
+    'post_provision_runcmd',
+    'sbatch_options',
+    'ssh_proxy_command',
+})
+# Plugin-registered Kubernetes properties are intentionally absent. They may
+# have arbitrary schemas and credential semantics, so they cannot be placed in
+# a durable DB script without an explicit safe-persistence contract.
+_HA_CONFIG_SAFE_KUBERNETES_KEYS = frozenset({
+    'allowed_contexts',
+    'allowed_nodes',
+    'apt_mirrors',
+    'auto_mounts',
+    'autoscaler',
+    'context_configs',
+    'dws',
+    'disabled',
+    'enable_docker',
+    'high_availability',
+    'kueue',
+    'namespace',
+    'networking',
+    'ports',
+    'pricing',
+    'provision_timeout',
+    'quota',
+    'remote_identity',
+    'set_pod_resource_limits',
+})
+_HA_CONFIG_SAFE_CONTROLLER_KEYS = frozenset({
+    'autostop',
+    'consolidation_mode',
+    'controller_logs_gc_retention_hours',
+    'high_availability',
+    'task_logs_gc_retention_hours',
+})
+_HA_CONFIG_SAFE_JOBS_KEYS = frozenset({'controller'})
+
+
+def sanitize_ha_recovery_config_bytes(config_bytes: bytes) -> bytes:
+    """Project a controller config onto its safe durable-recovery subset."""
+    if len(config_bytes) > 1024 * 1024:
+        raise ValueError('Controller config snapshot exceeds the 1MiB '
+                         'HA-recovery limit.')
+    try:
+        config = yaml_utils.safe_load_value_free(
+            config_bytes.decode('utf-8')) or {}
+    except (UnicodeDecodeError, ValueError) as e:
+        raise ValueError('Controller config snapshot is not valid YAML.') from e
+
+    if not isinstance(config, dict):
+        raise ValueError('Controller config snapshot must be a YAML mapping.')
+    for key in list(config):
+        if key not in _HA_CONFIG_SAFE_TOP_LEVEL_KEYS:
+            config.pop(key)
+
+    visited: set[int] = set()
+    visiting: set[int] = set()
+
+    def _strip_sensitive(node: Any) -> None:
+        if not isinstance(node, (dict, list)):
+            return
+        node_id = id(node)
+        if node_id in visiting:
+            raise ValueError('Controller config snapshot contains a cyclic '
+                             'YAML alias.')
+        if node_id in visited:
+            return
+        visiting.add(node_id)
+        if isinstance(node, dict):
+            for key, child in list(node.items()):
+                if key in _HA_CONFIG_RECURSIVE_SENSITIVE_KEYS:
+                    node.pop(key)
+                else:
+                    _strip_sensitive(child)
+        else:
+            for child in node:
+                _strip_sensitive(child)
+        visiting.remove(node_id)
+        visited.add(node_id)
+
+    def _project_kubernetes(block: Any) -> None:
+        if not isinstance(block, dict):
+            return
+        for key in list(block):
+            if key not in _HA_CONFIG_SAFE_KUBERNETES_KEYS:
+                block.pop(key)
+        context_configs = block.get('context_configs')
+        if isinstance(context_configs, dict):
+            for context_config in context_configs.values():
+                _project_kubernetes(context_config)
+        quota = block.get('quota')
+        if isinstance(quota, dict):
+            queue = quota.get('queue')
+            quota.clear()
+            if isinstance(queue, str):
+                quota['queue'] = queue
+
+    def _project_controller_block(block: Any) -> None:
+        if not isinstance(block, dict):
+            return
+        for key in list(block):
+            if key not in _HA_CONFIG_SAFE_JOBS_KEYS:
+                block.pop(key)
+        controller = block.get('controller')
+        if isinstance(controller, dict):
+            for key in list(controller):
+                if key not in _HA_CONFIG_SAFE_CONTROLLER_KEYS:
+                    controller.pop(key)
+
+    _strip_sensitive(config)
+    _project_kubernetes(config.get('kubernetes'))
+    _project_controller_block(config.get('jobs'))
+    _project_controller_block(config.get('serve'))
+    # A controller is permanently bound to one durable workspace. Persisting
+    # every workspace would unnecessarily copy other tenants' policy (and
+    # potentially their provider identity metadata) into this service row.
+    active_workspace = config.get('active_workspace')
+    workspaces = config.get('workspaces')
+    if isinstance(active_workspace, str) and isinstance(workspaces, dict):
+        active_workspace_config = workspaces.get(active_workspace)
+        if isinstance(active_workspace_config, dict):
+            active_workspace_config.pop('allowed_users', None)
+            active_workspace_config.pop('private', None)
+            _project_kubernetes(active_workspace_config.get('kubernetes'))
+            config['workspaces'] = {
+                active_workspace: active_workspace_config,
+            }
+        else:
+            config.pop('workspaces', None)
+    else:
+        config.pop('workspaces', None)
+    return yaml_utils.dump_yaml_str(config).encode('utf-8')
+
+
+def strip_legacy_ha_recovery_config_payload(script: str,
+                                            remote_path: str) -> str:
+    """Remove historical config bytes and retain the controller launch.
+
+    Consolidation-mode recovery scripts have only ever embedded the controller
+    config. New binaries restore the per-version safe projection from
+    PostgreSQL before executing this script, so retaining the old one-line
+    base64 restore would both duplicate secrets and risk the operating system
+    command-argument limit.
+    """
+    begin_count = script.count(_LEGACY_HA_CONFIG_BLOCK_BEGIN)
+    end_count = script.count(_LEGACY_HA_CONFIG_BLOCK_END)
+    if begin_count != end_count or begin_count > 1:
+        raise ValueError('Malformed legacy Serve HA config markers.')
+    if begin_count:
+        marked = re.compile(
+            rf'(?m)^{re.escape(_LEGACY_HA_CONFIG_BLOCK_BEGIN)}[^\n]*\n.*?^'
+            rf'{re.escape(_LEGACY_HA_CONFIG_BLOCK_END)}\n?', re.DOTALL)
+        script, count = marked.subn('', script, count=1)
+        if count != 1:
+            raise ValueError('Malformed legacy Serve HA config block.')
+
+    # Match only the exact historical one-line restore primitive. Recovery
+    # scripts may legitimately contain unrelated base64 decoding in an
+    # entrypoint; deleting every such line would silently change user code.
+    # The path is captured once and must be byte-for-byte identical in the
+    # mkdir and redirect positions.
+    legacy_restore = re.compile(
+        r'^mkdir -p -- "\$\(dirname -- (?P<path>.+)\)" && '
+        r'printf %s [A-Za-z0-9+/]+={0,2} \| base64 -d > (?P=path)$')
+    original_lines = script.splitlines()
+    export_prefix = f'export {skypilot_config.ENV_VAR_SKYPILOT_CONFIG}='
+    lines = []
+    for index, line in enumerate(original_lines):
+        # Remove only our generated marker grammar: immediately followed by
+        # the generated config export. An identical line inside arbitrary user
+        # shell text is not a protocol signal and must be preserved.
+        if (line == _VERSIONED_HA_CONFIG_MARKER and
+                index + 1 < len(original_lines) and
+                original_lines[index + 1].startswith(export_prefix)):
+            continue
+        if legacy_restore.fullmatch(line) is not None:
+            continue
+        lines.append(line)
+    config_export = export_prefix + shlex.quote(remote_path)
+    rewritten: list[str] = []
+    wrote_export = False
+    for line in lines:
+        if line.startswith(export_prefix):
+            if not wrote_export:
+                rewritten.append(config_export)
+                wrote_export = True
+            continue
+        rewritten.append(line)
+    if not wrote_export:
+        launch_index = next(
+            (index for index, line in enumerate(rewritten)
+             if 'python' in line and
+             'sky.serve.service' in '\n'.join(rewritten[index:index + 6])),
+            None)
+        if launch_index is None:
+            raise ValueError('Cannot locate the SkyServe controller launch in '
+                             'the HA recovery script.')
+        rewritten.insert(launch_index, config_export)
+    export_index = rewritten.index(config_export)
+    rewritten.insert(export_index, _VERSIONED_HA_CONFIG_MARKER)
+    scrubbed = '\n'.join(rewritten).rstrip() + '\n'
+    if (_LEGACY_HA_CONFIG_BLOCK_BEGIN in scrubbed or
+            _LEGACY_HA_CONFIG_BLOCK_END in scrubbed or
+            f'{_VERSIONED_HA_CONFIG_MARKER}\n{config_export}' not in scrubbed):
+        raise ValueError('Legacy Serve HA config payload was not removed.')
+    return scrubbed
+
+
+def bind_ha_recovery_owner_fence(
+    script: str,
+    *,
+    service_hash: str,
+    lifecycle_epoch: int | None,
+    controller_pid: int | None,
+    controller_ip: str | None,
+    status: serve_state.ServiceStatus,
+    recovery_version: int,
+) -> str:
+    """Bind one HA launch to the exact JIT owner and version snapshot."""
+    payload = {
+        'service_hash': service_hash,
+        'lifecycle_epoch': lifecycle_epoch,
+        'controller_pid': controller_pid,
+        'controller_ip': controller_ip,
+        'status': status.value,
+        'recovery_version': recovery_version,
+    }
+    # Reuse the strict decoder as the single validation contract before the
+    # payload is placed in a shell export.
+    parse_ha_recovery_owner_fence(
+        json.dumps(payload, separators=(',', ':'), sort_keys=True))
+    export_prefix = f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}='
+    lines = script.splitlines()
+    if any(line.startswith(export_prefix) for line in lines):
+        raise ValueError('HA recovery script already contains an owner fence.')
+    launch_index = next(
+        (index for index, line in enumerate(lines) if 'python' in line and
+         'sky.serve.service' in '\n'.join(lines[index:index + 6])), None)
+    if launch_index is None:
+        raise ValueError('Cannot locate the SkyServe controller launch in the '
+                         'HA recovery script.')
+    encoded = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+    lines.insert(launch_index, export_prefix + shlex.quote(encoded))
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def parse_ha_recovery_owner_fence(payload: str) -> dict[str, Any]:
+    """Decode and strictly validate one invocation-local HA owner fence."""
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise ValueError('HA recovery owner fence is not valid JSON.') from e
+    expected_keys = {
+        'service_hash', 'lifecycle_epoch', 'controller_pid', 'controller_ip',
+        'status', 'recovery_version'
+    }
+    if not isinstance(decoded, dict) or set(decoded) != expected_keys:
+        raise ValueError('HA recovery owner fence has an invalid schema.')
+    service_hash = decoded['service_hash']
+    lifecycle_epoch = decoded['lifecycle_epoch']
+    controller_pid = decoded['controller_pid']
+    controller_ip = decoded['controller_ip']
+    recovery_version = decoded['recovery_version']
+    if not isinstance(service_hash, str) or not service_hash:
+        raise ValueError('HA recovery owner fence has an invalid service hash.')
+    if (lifecycle_epoch is not None and
+        (type(lifecycle_epoch) is not int or lifecycle_epoch < 1)):
+        raise ValueError(
+            'HA recovery owner fence has an invalid lifecycle epoch.')
+    if (controller_pid is not None and
+        (type(controller_pid) is not int or controller_pid < 1)):
+        raise ValueError('HA recovery owner fence has an invalid controller '
+                         'PID.')
+    if (controller_ip is not None and
+        (not isinstance(controller_ip, str) or not controller_ip)):
+        raise ValueError('HA recovery owner fence has an invalid controller '
+                         'IP.')
+    if type(recovery_version) is not int or recovery_version < 1:
+        raise ValueError('HA recovery owner fence has an invalid version.')
+    try:
+        decoded['status'] = serve_state.ServiceStatus(decoded['status'])
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            'HA recovery owner fence has an invalid status.') from e
+    return decoded
+
 
 # Keep the established serve_utils import and pickle identities while the
 # presentation-only implementation lives in its own low-state module.
@@ -708,11 +1038,6 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                         f'round.\n')
                 continue
 
-            script = serve_state.get_ha_recovery_script(service_name)
-            if script is None:
-                f.write(f'{capnoun} {service_name}\'s recovery script does '
-                        'not exist. Skipping recovery.\n')
-                continue
             # Fence right before the launch: the leader-lock session may have
             # died since the caller's top-of-iteration probe (this sweep can
             # take a while with many services). Without leadership, another
@@ -724,6 +1049,59 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                 f.write(msg + '\n')
                 logger.error(msg)
                 break
+            # Production liveness records carry the protocol marker. Bind the
+            # current service owner, recovery-version election, exact config
+            # bytes, and recovery script in one just-in-time statement. This
+            # prevents a long fleet sweep from launching a stale same-name
+            # incarnation or pairing a pre-update script with post-update
+            # config. Missing metadata is accepted only for legacy mocked/read
+            # records and uses the historical script lookup.
+            recovery_snapshot = svc
+            recovery_version: int | None = None
+            if 'config_protocol_active' in svc:
+                if not isinstance(service_hash, str) or not service_hash:
+                    f.write(f'{capnoun} {service_name} has no durable '
+                            'incarnation identity. Skipping recovery.\n')
+                    continue
+                try:
+                    current_snapshot = (
+                        serve_state.get_service_ha_recovery_snapshot(
+                            service_name, expected_service_hash=service_hash))
+                except Exception as e:  # pylint: disable=broad-except
+                    f.write(f'Failed to authorize recovery for '
+                            f'{service_name}: {e}. Skipping recovery.\n')
+                    continue
+                if current_snapshot is None:
+                    f.write(f'{capnoun} {service_name} changed incarnation '
+                            'during the recovery sweep. Skipping recovery.\n')
+                    continue
+                owner_fields = ('hash', 'lifecycle_epoch', 'controller_pid',
+                                'controller_ip', 'workspace', 'resource_scope',
+                                'status')
+                changed_fields = [
+                    field for field in owner_fields
+                    if field in svc and svc[field] != current_snapshot[field]
+                ]
+                if changed_fields:
+                    f.write(f'{capnoun} {service_name} changed recovery owner '
+                            f'metadata ({", ".join(changed_fields)}) during '
+                            'the recovery sweep. Skipping recovery.\n')
+                    continue
+                recovery_snapshot = current_snapshot
+                script = current_snapshot['ha_recovery_script']
+                recovery_version = current_snapshot.get('recovery_version')
+                if (isinstance(recovery_version, bool) or
+                        not isinstance(recovery_version, int) or
+                        recovery_version < 1):
+                    f.write(f'{capnoun} {service_name} has no applicable '
+                            'recovery version. Skipping recovery.\n')
+                    continue
+            else:
+                script = serve_state.get_ha_recovery_script(service_name)
+            if script is None:
+                f.write(f'{capnoun} {service_name}\'s recovery script does '
+                        'not exist. Skipping recovery.\n')
+                continue
             # Recreate the service working directory before running the
             # recovery script. It lives on pod-local storage (emptyDir), so a
             # pod REPLACEMENT (rolling update, reschedule) wipes it while the
@@ -738,11 +1116,84 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             try:
                 os.makedirs(os.path.expanduser(
                     generate_remote_service_dir_name(
-                        service_name, svc.get('resource_scope'))),
+                        service_name, recovery_snapshot.get('resource_scope'))),
                             exist_ok=True)
             except OSError as e:
                 f.write(f'Failed to recreate the service dir for '
                         f'{service_name}: {e}\n')
+                continue
+            # The one-statement liveness snapshot carries both protocol
+            # activation and the quarantine-aware elected generation. Avoid
+            # recomputing the election in a later transaction, which could
+            # pair one generation with another snapshot's controller owner.
+            # Missing keys preserve compatibility with legacy mocked/read
+            # records and therefore select the legacy HA script path.
+            uses_versioned_config = bool(
+                recovery_snapshot.get('config_protocol_active', False))
+            if uses_versioned_config:
+                recovery_version = recovery_snapshot.get('recovery_version')
+                assert isinstance(recovery_version, int)
+                config_snapshot = recovery_snapshot.get(
+                    'controller_config_snapshot')
+                if config_snapshot is None:
+                    f.write(f'{capnoun} {service_name} recovery version '
+                            f'{recovery_version} has no complete controller '
+                            'config snapshot. Skipping recovery.\n')
+                    continue
+                live_config_path: str | None = None
+                try:
+                    live_config_path = generate_versioned_config_yaml_file_name(
+                        service_name, recovery_version,
+                        recovery_snapshot.get('resource_scope'))
+                    staged_config_path = (generate_staged_config_yaml_file_name(
+                        service_name,
+                        recovery_version,
+                        recovery_snapshot.get('resource_scope'),
+                        snapshot_id=config_snapshot[2]))
+                    restore_controller_config_snapshot(
+                        config_snapshot,
+                        live_config_path,
+                        staged_config_path,
+                        expected_workspace=recovery_snapshot.get('workspace'))
+                    # Never pass historical embedded config bytes through
+                    # `/bin/sh -c`, argv, or debug logging. The exact selected
+                    # version is already restored above.
+                    script = strip_legacy_ha_recovery_config_payload(
+                        script, live_config_path)
+                except Exception as e:  # pylint: disable=broad-except
+                    if live_config_path is not None:
+                        try:
+                            os.unlink(os.path.expanduser(live_config_path))
+                        except FileNotFoundError:
+                            pass
+                    f.write('Failed to restore committed controller config for '
+                            f'{service_name}: {e}. Skipping recovery.\n')
+                    continue
+            if 'config_protocol_active' in svc:
+                assert isinstance(recovery_version, int)
+                try:
+                    script = bind_ha_recovery_owner_fence(
+                        script,
+                        service_hash=recovery_snapshot['hash'],
+                        lifecycle_epoch=recovery_snapshot['lifecycle_epoch'],
+                        controller_pid=recovery_snapshot['controller_pid'],
+                        controller_ip=recovery_snapshot['controller_ip'],
+                        status=recovery_snapshot['status'],
+                        recovery_version=recovery_version)
+                except (KeyError, TypeError, ValueError) as e:
+                    f.write(f'Failed to bind recovery ownership for '
+                            f'{service_name}: {e}. Skipping recovery.\n')
+                    continue
+            # Config restoration and local filesystem repair can take time.
+            # Recheck the revocable leader session immediately before process
+            # creation for both legacy and versioned recovery paths.
+            if still_leader is not None and not still_leader():
+                msg = ('Consolidation leader lock session lost before '
+                       'recovery launch; aborting the rest of this recovery '
+                       'sweep.')
+                f.write(msg + '\n')
+                logger.error(msg)
+                break
             rc, out, err = runner.run(script, require_outputs=True)
             if rc:
                 f.write(f'Recovery script returned {rc}. '
@@ -1275,6 +1726,559 @@ def generate_remote_config_yaml_file_name(service_name: str,
     return os.path.join(dir_name, 'config.yaml')
 
 
+def generate_versioned_config_yaml_file_name(
+        service_name: str,
+        version: int,
+        resource_scope: str | None = None) -> str:
+    """Immutable config path inherited by one exact controller version."""
+    if type(version) is not int or version <= 0:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Controller config version must be a positive int.')
+    return (
+        generate_remote_config_yaml_file_name(service_name, resource_scope) +
+        f'.v{version}')
+
+
+def generate_staged_config_yaml_file_name(
+        service_name: str,
+        version: int,
+        resource_scope: str | None = None,
+        snapshot_id: str | None = None) -> str:
+    """Path for a complete config snapshot awaiting controller admission."""
+    if snapshot_id is not None and re.fullmatch(r'[0-9a-f]{64}',
+                                                snapshot_id) is None:
+        raise ValueError('Controller config snapshot ID is malformed.')
+    nonce_suffix = '' if snapshot_id is None else f'.{snapshot_id}'
+    return (
+        generate_remote_config_yaml_file_name(service_name, resource_scope) +
+        f'.v{version}{nonce_suffix}.staged')
+
+
+def secure_staged_controller_config(config_path: str,
+                                    expected_digest: str) -> bytes:
+    """Tighten and verify one raw stage without following a symlink."""
+    if re.fullmatch(r'[0-9a-f]{64}', expected_digest) is None:
+        raise ValueError('Expected controller config digest is malformed.')
+    expanded_path = os.path.expanduser(config_path)
+    no_follow_flag = getattr(os, 'O_NOFOLLOW', 0)
+    pre_open_stat = None
+    if no_follow_flag == 0:
+        # O_NOFOLLOW is available on the Linux controller image. Keep the
+        # helper fail-closed on other platforms too, while checking inode
+        # identity below to detect a replacement between lstat() and open().
+        pre_open_stat = os.lstat(expanded_path)
+        if not stat.S_ISREG(pre_open_stat.st_mode):
+            raise RuntimeError('Staged controller config snapshot is not a '
+                               'regular file.')
+    open_flags = (os.O_RDONLY | no_follow_flag | getattr(os, 'O_NONBLOCK', 0))
+    try:
+        config_fd = os.open(expanded_path, open_flags)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise RuntimeError('Staged controller config snapshot is not a '
+                               'regular file.') from None
+        raise
+    try:
+        staged_stat = os.fstat(config_fd)
+        if not stat.S_ISREG(staged_stat.st_mode):
+            raise RuntimeError('Staged controller config snapshot is not a '
+                               'regular file.')
+        if (pre_open_stat is not None and
+            (pre_open_stat.st_dev, pre_open_stat.st_ino)
+                != (staged_stat.st_dev, staged_stat.st_ino)):
+            raise RuntimeError('Staged controller config snapshot changed '
+                               'while it was being opened.')
+        if staged_stat.st_size > 1024 * 1024:
+            raise RuntimeError('Staged controller config snapshot exceeds '
+                               'the 1MiB limit.')
+        os.fchmod(config_fd, 0o600)
+        with os.fdopen(config_fd, 'rb') as config_file:
+            config_fd = -1
+            config_bytes = config_file.read(1024 * 1024 + 1)
+    finally:
+        if config_fd >= 0:
+            os.close(config_fd)
+    if len(config_bytes) > 1024 * 1024:
+        raise RuntimeError('Staged controller config snapshot exceeds the '
+                           '1MiB limit.')
+    if hashlib.sha256(config_bytes).hexdigest() != expected_digest:
+        raise RuntimeError('Staged controller config snapshot digest does '
+                           'not match the API-server submission.')
+    return config_bytes
+
+
+def generate_config_snapshot_receipt_file_name(config_path: str) -> str:
+    return f'{config_path}.receipt'
+
+
+def remove_staged_controller_config(staged_path: str) -> None:
+    """Remove one exact uncommitted raw snapshot and its local receipt."""
+    for path in (staged_path,
+                 generate_config_snapshot_receipt_file_name(staged_path)):
+        try:
+            os.unlink(os.path.expanduser(path))
+        except FileNotFoundError:
+            pass
+
+
+def scrub_obsolete_controller_config_files(
+        service_name: str,
+        elected_version: int,
+        resource_scope: str | None = None) -> list[str]:
+    """Remove raw live config generations after safe DB recovery.
+
+    The elected version must already have been replaced with its sanitized,
+    digest-verified PostgreSQL snapshot while holding the process-wide config
+    lock.  Preserve that safe file and every ``.staged`` candidate, but remove
+    the initial unversioned source, all non-elected live generations, and all
+    live receipts and interrupted receipt-write temporaries (whose source
+    digests are offline credential verifiers).
+    """
+    if type(elected_version) is not int or elected_version <= 0:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Elected controller config version must be positive.')
+    base_path = os.path.expanduser(
+        generate_remote_config_yaml_file_name(service_name, resource_scope))
+    directory = os.path.dirname(base_path)
+    base_name = os.path.basename(base_path)
+    version_pattern = re.compile(
+        rf'{re.escape(base_name)}\.v([1-9][0-9]*)(\.receipt)?\Z')
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return []
+    removed: list[str] = []
+    for entry in entries:
+        should_remove = entry.name in (base_name, f'{base_name}.receipt')
+        is_receipt_temporary = (_CONFIG_RECEIPT_TEMP_FILE_PATTERN.fullmatch(
+            entry.name) is not None and entry.is_file(follow_symlinks=False))
+        should_remove = should_remove or is_receipt_temporary
+        match = version_pattern.fullmatch(entry.name)
+        if match is not None:
+            version = int(match.group(1))
+            is_receipt = match.group(2) is not None
+            should_remove = is_receipt or version != elected_version
+        if not should_remove:
+            continue
+        try:
+            os.unlink(entry.path)
+        except FileNotFoundError:
+            continue
+        removed.append(entry.name)
+    return sorted(removed)
+
+
+def remove_uncommitted_staged_controller_config(
+        service_name: str,
+        version: int,
+        resource_scope: str | None,
+        snapshot_id: str | None = None) -> bool:
+    """Delete one exact staged raw snapshot only while its version is NULL.
+
+    A database read failure deliberately propagates so callers preserve the
+    file. If a controller already wrote a receipt, its nonce must match the
+    cleanup request; a missing receipt is the expected pre-delivery state.
+    """
+    if serve_state.get_yaml_content(service_name, version) is not None:
+        return False
+    staged_path = generate_staged_config_yaml_file_name(service_name,
+                                                        version,
+                                                        resource_scope,
+                                                        snapshot_id=snapshot_id)
+    if snapshot_id is not None:
+        receipt = _read_config_snapshot_receipt(staged_path)
+        if receipt is not None and receipt['snapshot_id'] != snapshot_id:
+            return False
+    remove_staged_controller_config(staged_path)
+    return True
+
+
+def gc_orphaned_staged_controller_configs(
+        service_name: str,
+        resource_scope: str | None,
+        *,
+        now: float | None = None) -> list[int]:
+    """Delete expired raw stages for DB-confirmed uncommitted versions.
+
+    The protocol's nonce-bearing path makes different API requests disjoint.
+    The caller serializes this sweep with controller update handlers; the age
+    gate additionally covers a request that synced bytes but has not POSTed to
+    the controller yet. Missing rows, committed rows, fresh paths, malformed
+    filenames, and every database error are preserved.
+    """
+    config_path = os.path.expanduser(
+        generate_remote_config_yaml_file_name(service_name, resource_scope))
+    config_dir = os.path.dirname(config_path)
+    config_basename = os.path.basename(config_path)
+    stage_pattern = re.compile(
+        rf'^{re.escape(config_basename)}\.v([1-9][0-9]{{0,9}})'
+        r'(?:\.([0-9a-f]{64}))?\.staged(?:\.receipt)?$')
+    try:
+        directory_entries = list(os.scandir(config_dir))
+    except FileNotFoundError:
+        return []
+
+    # Key by both version and nonce. Legacy fixed-name stages are accepted for
+    # cleanup after rollout, but every new writer uses a nonce-bearing path.
+    candidates: dict[tuple[int, str | None], dict[str, tuple[int, int, int,
+                                                             int]]] = {}
+    receipt_temporaries: dict[str, tuple[int, int, int, int, int]] = {}
+    for entry in directory_entries:
+        if (_CONFIG_RECEIPT_TEMP_FILE_PATTERN.fullmatch(entry.name)
+                is not None):
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(entry_stat.st_mode):
+                continue
+            receipt_temporaries[entry.path] = (entry_stat.st_dev,
+                                               entry_stat.st_ino,
+                                               entry_stat.st_mtime_ns,
+                                               entry_stat.st_size,
+                                               entry_stat.st_mode)
+            continue
+        match = stage_pattern.fullmatch(entry.name)
+        if match is None:
+            continue
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        try:
+            version = int(match.group(1))
+        except ValueError:
+            continue
+        fingerprint = (entry_stat.st_dev, entry_stat.st_ino,
+                       entry_stat.st_mtime_ns, entry_stat.st_size)
+        candidates.setdefault((version, match.group(2)),
+                              {})[entry.path] = (fingerprint)
+
+    wall_time = time.time() if now is None else now
+
+    # A hard-killed receipt writer cannot run its exception cleanup. These
+    # temporaries are never durable protocol inputs, so unlike raw stages they
+    # need no database lookup. The same generous age gate protects a paused
+    # writer, and an identity recheck lets a concurrent refresh win.
+    for temporary_path, receipt_observed in receipt_temporaries.items():
+        age_seconds = wall_time - receipt_observed[2] / 1_000_000_000
+        if age_seconds < constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS:
+            continue
+        try:
+            current_stat = os.stat(temporary_path, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        receipt_current = (current_stat.st_dev, current_stat.st_ino,
+                           current_stat.st_mtime_ns, current_stat.st_size,
+                           current_stat.st_mode)
+        if (receipt_current != receipt_observed or
+                not stat.S_ISREG(current_stat.st_mode)):
+            continue
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+    expired: dict[tuple[int, str | None], dict[str, tuple[int, int, int,
+                                                          int]]] = {}
+    for identity, paths in candidates.items():
+        newest_mtime_ns = max(fingerprint[2] for fingerprint in paths.values())
+        age_seconds = wall_time - newest_mtime_ns / 1_000_000_000
+        if age_seconds >= constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS:
+            expired[identity] = paths
+    if not expired:
+        return []
+
+    expired_versions = sorted({version for version, _ in expired})
+    yaml_contents = serve_state.get_yaml_contents(service_name,
+                                                  expired_versions)
+    removed_versions: set[int] = set()
+    for (version, snapshot_id), observed_paths in sorted(expired.items()):
+        if version not in yaml_contents or yaml_contents[version] is not None:
+            continue
+        staged_path = os.path.expanduser(
+            generate_staged_config_yaml_file_name(service_name,
+                                                  version,
+                                                  resource_scope,
+                                                  snapshot_id=snapshot_id))
+        candidate_paths = (
+            staged_path,
+            generate_config_snapshot_receipt_file_name(staged_path))
+        # Re-prove the exact path identities immediately before unlinking. A
+        # sync that refreshed either file after the directory scan wins and is
+        # left for a later sweep.
+        unchanged = True
+        for candidate_path in candidate_paths:
+            observed = observed_paths.get(candidate_path)
+            try:
+                current_stat = os.stat(candidate_path, follow_symlinks=False)
+            except FileNotFoundError:
+                if observed is not None:
+                    unchanged = False
+                continue
+            current = (current_stat.st_dev, current_stat.st_ino,
+                       current_stat.st_mtime_ns, current_stat.st_size)
+            if observed != current:
+                unchanged = False
+        if not unchanged:
+            continue
+        for candidate_path in candidate_paths:
+            try:
+                os.unlink(candidate_path)
+            except FileNotFoundError:
+                pass
+        removed_versions.add(version)
+    return sorted(removed_versions)
+
+
+def write_config_snapshot_receipt(config_path: str, version: int,
+                                  snapshot_id: str, source_digest: str) -> None:
+    """Atomically record a pod-local receipt next to raw config bytes."""
+    if (re.fullmatch(r'[0-9a-f]{64}', snapshot_id) is None or
+            re.fullmatch(r'[0-9a-f]{64}', source_digest) is None):
+        raise ValueError('Config snapshot receipt is malformed.')
+    receipt_path = os.path.expanduser(
+        generate_config_snapshot_receipt_file_name(config_path))
+    receipt_dir = os.path.dirname(receipt_path)
+    os.makedirs(receipt_dir, exist_ok=True)
+    # Own the basename grammar instead of depending on tempfile's private
+    # random-name length. O_EXCL makes a pre-created path lose safely; retries
+    # handle the vanishingly unlikely UUID collision without unlinking it.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_CLOEXEC', 0)
+    fd = -1
+    temporary_path = ''
+    for _ in range(3):
+        temporary_path = os.path.join(
+            receipt_dir, f'.config-receipt-{uuid.uuid4().hex}.tmp')
+        try:
+            fd = os.open(temporary_path, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise RuntimeError('Failed to allocate a config receipt temporary.')
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as receipt_file:
+            json.dump(
+                {
+                    'version': version,
+                    'snapshot_id': snapshot_id,
+                    'source_digest': source_digest,
+                },
+                receipt_file,
+                separators=(',', ':'))
+            receipt_file.flush()
+            os.fsync(receipt_file.fileno())
+        os.replace(temporary_path, receipt_path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_config_snapshot_receipt(config_path: str) -> dict[str, Any] | None:
+    receipt_path = os.path.expanduser(
+        generate_config_snapshot_receipt_file_name(config_path))
+    try:
+        with open(receipt_path, encoding='utf-8') as receipt_file:
+            receipt = json.load(receipt_file)
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+    if (not isinstance(receipt, dict) or
+            not isinstance(receipt.get('version'), int) or
+            isinstance(receipt.get('version'), bool) or
+            not isinstance(receipt.get('snapshot_id'), str) or
+            re.fullmatch(r'[0-9a-f]{64}', receipt['snapshot_id']) is None or
+            not isinstance(receipt.get('source_digest'), str) or
+            re.fullmatch(r'[0-9a-f]{64}', receipt['source_digest']) is None):
+        return None
+    return receipt
+
+
+def get_config_snapshot_receipt(config_path: str) -> dict[str, Any] | None:
+    """Return one validated pod-local config receipt, if present."""
+    return _read_config_snapshot_receipt(config_path)
+
+
+def _read_verified_config_with_receipt(config_path: str, version: int,
+                                       snapshot_id: str) -> bytes | None:
+    receipt = _read_config_snapshot_receipt(config_path)
+    if (receipt is None or receipt['version'] != version or
+            receipt['snapshot_id'] != snapshot_id):
+        return None
+    try:
+        with open(os.path.expanduser(config_path), 'rb') as config_file:
+            config_bytes = config_file.read()
+    except OSError:
+        return None
+    if hashlib.sha256(config_bytes).hexdigest() != receipt['source_digest']:
+        return None
+    return config_bytes
+
+
+def read_verified_controller_config(config_path: str, version: int,
+                                    snapshot_id: str,
+                                    source_digest: str) -> bytes | None:
+    """Read raw bytes only when receipt identity and exact digest agree."""
+    receipt = _read_config_snapshot_receipt(config_path)
+    if receipt is None or receipt['source_digest'] != source_digest:
+        return None
+    return _read_verified_config_with_receipt(config_path, version, snapshot_id)
+
+
+def promote_staged_controller_config(live_path: str, staged_path: str,
+                                     version: int, snapshot_id: str,
+                                     source_digest: str) -> bytes:
+    """Verify and atomically promote one raw staged config and receipt."""
+    config_bytes = _read_verified_config_with_receipt(staged_path, version,
+                                                      snapshot_id)
+    if (config_bytes is None or
+            hashlib.sha256(config_bytes).hexdigest() != source_digest):
+        raise RuntimeError('Staged controller config snapshot or receipt is '
+                           'missing or changed before installation.')
+    expanded_live = os.path.expanduser(live_path)
+    expanded_staged = os.path.expanduser(staged_path)
+    expanded_staged_receipt = os.path.expanduser(
+        generate_config_snapshot_receipt_file_name(staged_path))
+    expanded_live_receipt = os.path.expanduser(
+        generate_config_snapshot_receipt_file_name(live_path))
+    os.makedirs(os.path.dirname(expanded_live), exist_ok=True)
+    # Tighten permissions before either rename. A crash between publication
+    # steps must never leave the raw policy-admitted config world-readable.
+    os.chmod(expanded_staged, 0o600)
+    os.chmod(expanded_staged_receipt, 0o600)
+    os.replace(expanded_staged, expanded_live)
+    os.chmod(expanded_live, 0o600)
+    os.replace(expanded_staged_receipt, expanded_live_receipt)
+    os.chmod(expanded_live_receipt, 0o600)
+    with open(expanded_live, 'rb') as live_file:
+        installed_bytes = live_file.read()
+    if hashlib.sha256(installed_bytes).hexdigest() != source_digest:
+        raise RuntimeError('Installed controller config changed during '
+                           'atomic promotion.')
+    return installed_bytes
+
+
+def _atomic_write_controller_config(live_path: str,
+                                    config_bytes: bytes) -> None:
+    """Write exact DB-verified config bytes atomically with mode 0600."""
+    expanded_live = os.path.expanduser(live_path)
+    os.makedirs(os.path.dirname(expanded_live), exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix='.config-recovery-',
+                                          dir=os.path.dirname(expanded_live))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'wb') as config_file:
+            config_file.write(config_bytes)
+            config_file.flush()
+            os.fsync(config_file.fileno())
+        os.replace(temporary_path, expanded_live)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+    os.chmod(expanded_live, 0o600)
+
+
+def restore_version_controller_config(
+    service_name: str,
+    version: int,
+    live_path: str,
+    staged_path: str | None = None,
+    expected_workspace: str | None = None,
+) -> bytes | None:
+    """Restore the PostgreSQL-bound safe config for an exact version.
+
+    None is the compatibility signal for a pre-protocol version whose legacy
+    HA script still owns config restoration. Corruption raises and recovery
+    fails closed before a controller is spawned.
+    """
+    snapshot = serve_state.get_version_controller_config(service_name, version)
+    if snapshot is None:
+        return None
+    return restore_controller_config_snapshot(snapshot, live_path, staged_path,
+                                              expected_workspace)
+
+
+def restore_controller_config_snapshot(
+    snapshot: tuple[bytes, str, str],
+    live_path: str,
+    staged_path: str | None = None,
+    expected_workspace: str | None = None,
+) -> bytes:
+    """Restore one already-authorized durable controller-config snapshot.
+
+    Callers that authorize a recovery generation and select its exact config
+    in one database statement use this helper so installation cannot re-read
+    and accidentally pair that decision with a later database generation.
+    """
+    config_bytes, durable_digest, _ = snapshot
+    if hashlib.sha256(config_bytes).hexdigest() != durable_digest:
+        raise RuntimeError('Committed controller config snapshot failed its '
+                           'integrity check.')
+    if expected_workspace is not None:
+        parse_and_validate_version_controller_config(
+            config_bytes, expected_workspace,
+            'committed Serve controller recovery config')
+    _atomic_write_controller_config(live_path, config_bytes)
+    obsolete_paths = [
+        generate_config_snapshot_receipt_file_name(live_path),
+    ]
+    if staged_path is not None:
+        obsolete_paths.extend((
+            staged_path,
+            generate_config_snapshot_receipt_file_name(staged_path),
+        ))
+    for obsolete_path in obsolete_paths:
+        try:
+            os.unlink(os.path.expanduser(obsolete_path))
+        except FileNotFoundError:
+            pass
+    return config_bytes
+
+
+def parse_and_validate_version_controller_config(config_bytes: bytes,
+                                                 expected_workspace: str,
+                                                 source: str) -> Any:
+    """Parse a version snapshot in isolation and enforce workspace identity."""
+    if not isinstance(expected_workspace, str) or not expected_workspace:
+        raise RuntimeError('Durable service workspace is unavailable.')
+
+    def _parse() -> Any:
+        sky_context.initialize()
+        parsed = skypilot_config.parse_and_validate_config_bytes(
+            config_bytes, source, log_config=False, apply_db_env=False)
+        actual_workspace = parsed.get_nested(keys=('active_workspace',),
+                                             default_value=None)
+        if actual_workspace != expected_workspace:
+            raise RuntimeError(
+                f'Committed controller config belongs to workspace '
+                f'{actual_workspace!r}, expected {expected_workspace!r}.')
+        if expected_workspace != skylet_constants.SKYPILOT_DEFAULT_WORKSPACE:
+            workspaces = parsed.get_nested(keys=('workspaces',),
+                                           default_value=None)
+            workspace_config = (workspaces.get(expected_workspace)
+                                if isinstance(workspaces, dict) else None)
+            if not isinstance(workspace_config, dict):
+                raise RuntimeError(
+                    f'Committed controller config does not define durable '
+                    f'workspace {expected_workspace!r}.')
+        return parsed
+
+    return contextvars.Context().run(_parse)
+
+
 def generate_remote_controller_log_file_name(service_name: str,
                                              resource_scope: str | None = None
                                             ) -> str:
@@ -1477,13 +2481,63 @@ def update_service_status(pool: bool) -> None:
             expected_status=service_status)
 
 
+def require_update_config_snapshot_capability(service_name: str,
+                                              service_hash: str) -> None:
+    """Fail before version allocation if a live controller is too old."""
+    response = _get_to_controller_with_retry(
+        service_name, service_hash,
+        constants.CONTROLLER_UPDATE_CAPABILITIES_ENDPOINT_PATH)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f'Service {service_name!r} controller does not support atomic '
+            'config refresh. Finish the API-server rollout so its controller '
+            'is recovered on the new image, then retry the update.')
+    try:
+        version = response.json()['config_snapshot_protocol_version']
+    except (KeyError, TypeError, ValueError) as e:
+        raise RuntimeError(
+            f'Service {service_name!r} controller returned an invalid config '
+            'refresh capability response.') from e
+    if (type(version) is not int or  # pylint: disable=unidiomatic-typecheck
+            version != constants.SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION):
+        raise RuntimeError(
+            f'Service {service_name!r} controller config refresh protocol '
+            f'{version!r} is incompatible with this API server.')
+
+
+def cleanup_staged_config_update_encoded(service_name: str, service_hash: str,
+                                         version: int,
+                                         expected_lifecycle_epoch: int,
+                                         config_snapshot_id: str) -> bool:
+    """Serialize cleanup behind any ambiguous controller update attempt."""
+    response = _post_to_controller_with_retry(
+        service_name,
+        service_hash,
+        constants.CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH,
+        json={
+            'version': version,
+            'expected_lifecycle_epoch': expected_lifecycle_epoch,
+            'config_snapshot_id': config_snapshot_id,
+        },
+        timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
+                 constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
+    if response.status_code != 200:
+        raise RuntimeError(
+            f'Controller could not safely clean staged config for service '
+            f'{service_name!r}: {response.text}')
+    return bool(response.json().get('removed', False))
+
+
 def update_service_encoded(service_name: str,
                            version: int,
                            mode: str,
                            pool: bool,
                            expected_service_hash: str | None = None,
                            expected_lifecycle_epoch: int | None = None,
-                           has_submitted_yaml: bool = False) -> str:
+                           has_submitted_yaml: bool = False,
+                           has_config_snapshot: bool = False,
+                           expected_config_snapshot_digest: str | None = None,
+                           config_snapshot_id: str | None = None) -> str:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     # Only existence and the incarnation hash are consumed here; skip the
@@ -1511,10 +2565,24 @@ def update_service_encoded(service_name: str,
         request_body['lifecycle_epoch'] = expected_lifecycle_epoch
     if has_submitted_yaml:
         request_body['has_submitted_yaml'] = True
+    if has_config_snapshot:
+        if (expected_config_snapshot_digest is None or re.fullmatch(
+                r'[0-9a-f]{64}', expected_config_snapshot_digest) is None):
+            raise ValueError('A valid expected config snapshot digest is '
+                             'required for an atomic config refresh.')
+        if (config_snapshot_id is None or
+                re.fullmatch(r'[0-9a-f]{64}', config_snapshot_id) is None):
+            raise ValueError('A valid config snapshot ID is required for an '
+                             'atomic config refresh.')
+        request_body['has_config_snapshot'] = True
+        request_body['config_snapshot_digest'] = (
+            expected_config_snapshot_digest)
+        request_body['config_snapshot_id'] = config_snapshot_id
     resp = _post_to_controller_with_retry(
         service_name,
         service_hash,
-        '/controller/update_service',
+        (constants.CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH
+         if has_config_snapshot else '/controller/update_service'),
         json=request_body,
         # Keep the compatibility timeout for controllers predating the
         # commit-then-reconcile protocol, whose handler may still wait behind
@@ -1523,6 +2591,11 @@ def update_service_encoded(service_name: str,
                  constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
     if resp.status_code == 404:
         with ux_utils.print_exception_no_traceback():
+            if has_config_snapshot:
+                raise RuntimeError(
+                    f'{capnoun} {service_name!r} controller changed during '
+                    'the update and no longer supports atomic config '
+                    'refresh. Finish the API-server rollout and retry.')
             # This only happens for services since pool is added after the
             # update feature is introduced.
             raise ValueError(
@@ -1543,7 +2616,15 @@ def update_service_encoded(service_name: str,
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'Failed to update {noun}: {resp.text}')
 
-    service_msg = resp.json()['message']
+    response_body = resp.json()
+    if has_config_snapshot:
+        activated_snapshot_id = response_body.get('config_snapshot_id')
+        if activated_snapshot_id != config_snapshot_id:
+            raise RuntimeError(
+                f'{capnoun} {service_name!r} controller acknowledged a '
+                'different config snapshot. Inspect controller health before '
+                'retrying.')
+    service_msg = response_body['message']
     return message_utils.encode_payload(service_msg)
 
 
@@ -4382,6 +5463,22 @@ class ServeCodeGen:
         code = [
             f'msg = serve_utils.add_version_encoded({service_name!r})',
             'print(msg, end="", flush=True)'
+        ]
+        return cls._build(code)
+
+    @classmethod
+    def remove_uncommitted_staged_controller_config(
+            cls,
+            service_name: str,
+            version: int,
+            resource_scope: str | None,
+            snapshot_id: str | None = None) -> str:
+        code = [
+            ('removed = serve_utils.'
+             'remove_uncommitted_staged_controller_config('
+             f'{service_name!r}, {version!r}, {resource_scope!r}, '
+             f'{snapshot_id!r})'),
+            'print(str(int(removed)), end="", flush=True)',
         ]
         return cls._build(code)
 

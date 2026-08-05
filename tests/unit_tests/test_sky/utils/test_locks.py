@@ -571,6 +571,24 @@ class TestPostgresLock:
         mock_get_lock_connection.assert_called_once_with(mock_engine)
 
     @mock.patch.object(global_user_state, 'initialize_and_get_db')
+    def test_postgres_lock_uses_explicit_engine(self, mock_init_db):
+        """A subsystem lock must target that subsystem's exact database."""
+        explicit_engine = mock.Mock()
+        explicit_engine.dialect.name = (
+            db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+        connection = mock.Mock()
+
+        with mock.patch.object(db_utils,
+                               'get_postgres_lock_connection',
+                               return_value=connection) as get_connection:
+            lock = locks.PostgresLock('test_lock', engine=explicit_engine)
+            result = lock._get_connection()
+
+        assert result is connection
+        mock_init_db.assert_not_called()
+        get_connection.assert_called_once_with(explicit_engine)
+
+    @mock.patch.object(global_user_state, 'initialize_and_get_db')
     def test_postgres_lock_get_connection_wrong_dialect(self, mock_init_db):
         """Test database connection with wrong dialect."""
         mock_engine = mock.Mock()

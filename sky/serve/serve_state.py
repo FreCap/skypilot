@@ -1,13 +1,17 @@
 """The database for services information."""
 import collections
+import contextlib
 import copy
 import dataclasses
 import datetime
 import enum
 import functools
+import hashlib
 import json
 import math
+import os
 import pickle
+import re
 import time
 import typing
 from typing import Any, Optional
@@ -54,6 +58,7 @@ system_oom_recovery = adaptors_common.LazyImport(
 logger = sky_logging.init_logger(__name__)
 
 _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
+_REPLICA_LAUNCH_AUTHORITY_LOCK_PREFIX = 'skyserve-replica-launch-authority'
 
 Base = serve_state_schema.Base
 services_table = serve_state_schema.services_table
@@ -285,6 +290,117 @@ def _with_reserved_fill_broker_lock(
     return typing.cast(_ReservedFillLockedFunction, wrapped)
 
 
+def _replica_launch_authority_lock_id(
+        service_name: str,
+        engine: sqlalchemy.engine.Engine | None = None) -> str:
+    """Return one stable lock key across service incarnations."""
+    if not isinstance(service_name, str) or not service_name:
+        raise ValueError('Service name must be a non-empty string.')
+    identity = service_name
+    if (engine is not None and
+            engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value):
+        database = engine.url.database
+        if database is None or database == ':memory:':
+            database = f'in-memory-engine-{id(engine)}'
+        else:
+            database = os.path.realpath(
+                os.path.abspath(os.path.expanduser(str(database))))
+        # Test workers and local clients may own independent SQLite files but
+        # use the same logical service name. Namespace by the database path so
+        # only processes that can mutate the same file serialize each other.
+        identity = f'{database}\0{service_name}'
+    digest = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+    return f'{_REPLICA_LAUNCH_AUTHORITY_LOCK_PREFIX}-{digest}'
+
+
+def _get_replica_launch_authority_lock(service_name: str, *,
+                                       shared: bool) -> locks.DistributedLock:
+    """Return the cross-pod session lock for provider authorization.
+
+    Provider calls take the shared side; every mutation that can invalidate
+    ``service_replica_launch_fence_holds`` takes the exclusive side before it
+    opens a SQL transaction.  The key is derived only from the logical service
+    name, so deletion and same-name recreation cannot escape an in-flight
+    predecessor launch by changing an incarnation-scoped path or hash.
+    """
+    engine = _db_manager.get_engine()
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return locks.PostgresLock(_replica_launch_authority_lock_id(
+            service_name, engine),
+                                  shared_lock=shared,
+                                  engine=engine)
+    elif engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        # FileLock has no shared mode, so local SQLite serializes providers.
+        return locks.get_lock(_replica_launch_authority_lock_id(
+            service_name, engine),
+                              lock_type='filelock',
+                              shared_lock=shared)
+    else:
+        raise RuntimeError('Unsupported database dialect for replica launch '
+                           f'authority: {engine.dialect.name!r}.')
+
+
+@contextlib.contextmanager
+def service_replica_launch_authority_guard(
+        service_name: str) -> typing.Iterator[locks.DistributedLock]:
+    """Hold shared launch authority across one opaque provider operation."""
+    lock = _get_replica_launch_authority_lock(service_name, shared=True)
+    with lock.acquire(blocking=True):
+        yield lock
+
+
+def service_replica_launch_authority_guard_is_valid(
+        lock: locks.DistributedLock) -> bool:
+    """Whether a held provider guard still owns its backing lock session."""
+    if isinstance(lock, locks.PostgresLock):
+        return lock.is_session_alive()
+    return lock.is_locked()
+
+
+@contextlib.contextmanager
+def _replica_launch_authority_write_session(
+    service_name: str,
+    *,
+    invalidates_launch_authority: bool = True,
+) -> typing.Iterator[tuple[sqlalchemy.engine.Engine, orm.Session]]:
+    """Open a DB transaction holding the authorization writer guard.
+
+    PostgreSQL uses a transaction advisory lock on the mutation's own ORM
+    connection.  If that connection is lost, PostgreSQL aborts the mutation
+    and releases the lock together; a separate session lock would permit the
+    mutation to commit after its guard silently disappeared.  SQLite has no
+    advisory locks, so its local-file fallback is acquired before opening the
+    ORM session.
+    """
+    engine = _db_manager.get_engine()
+    if not invalidates_launch_authority:
+        with orm.Session(engine) as session:
+            yield engine, session
+        return
+    lock_id = _replica_launch_authority_lock_id(service_name, engine)
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        # Do not block on the ordinary bounded Serve QueuePool: the shared
+        # provider phase may need that pool for its final authorization read.
+        # The dedicated NullPool connection still targets the exact same
+        # PostgreSQL database, and the mutation itself runs on the transaction
+        # that owns the exclusive advisory lock.
+        guard_engine = db_utils.get_postgres_lock_engine(engine)
+        with orm.Session(guard_engine) as session:
+            session.execute(
+                sqlalchemy.text('SELECT pg_advisory_xact_lock(:lock_key)'),
+                {'lock_key': locks.postgres_lock_key(lock_id)})
+            yield engine, session
+        return
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        lock = locks.get_lock(lock_id, lock_type='filelock')
+        with lock.acquire(blocking=True):
+            with orm.Session(engine) as session:
+                yield engine, session
+        return
+    raise RuntimeError('Unsupported database dialect for replica launch '
+                       f'authority: {engine.dialect.name!r}.')
+
+
 @_with_reserved_fill_broker_lock
 def add_service(name: str,
                 controller_job_id: int,
@@ -305,7 +421,10 @@ def add_service(name: str,
                 resource_scope: str | None = None,
                 created_by: str | None = None,
                 submitted_yaml_content: str | None = None,
-                placement_catalog: dict[str, Any] | None = None) -> bool:
+                placement_catalog: dict[str, Any] | None = None,
+                controller_config: bytes | None = None,
+                controller_config_digest: str | None = None,
+                controller_config_snapshot_id: str | None = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -321,6 +440,9 @@ def add_service(name: str,
         True if the service is added successfully, False if the service already
         exists.
     """
+    controller_config_snapshot = _validate_controller_config_snapshot(
+        controller_config, controller_config_digest,
+        controller_config_snapshot_id)
     engine = _db_manager.get_engine()
     lb_ha_enabled = bool(spec is not None and
                          getattr(spec, 'lb_high_availability', False))
@@ -330,7 +452,7 @@ def add_service(name: str,
                            'the central PostgreSQL Serve database.')
     storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
     try:
-        with orm.Session(engine) as session:
+        with _replica_launch_authority_write_session(name) as (_, session):
             _begin_immediate_if_sqlite(session, engine, lifecycle_epoch
                                        is not None)
             if not _lifecycle_epoch_matches_in_session(session, name,
@@ -443,6 +565,7 @@ def add_service(name: str,
                     lb_demand_handoff_snapshot=None,
                     lb_demand_handoff_complete_at=None,
                     lb_last_demand_snapshot=None))
+            initial_version_created_at = time.time()
             version_insert_stmt = insert_func(version_specs_table).values(
                 service_name=name,
                 version=constants.INITIAL_VERSION,
@@ -450,7 +573,19 @@ def add_service(name: str,
                 yaml_content=yaml_content,
                 submitted_yaml_content=submitted_yaml_content,
                 placement_catalog=placement_catalog,
-                created_at=time.time(),
+                controller_config=(None if controller_config_snapshot is None
+                                   else controller_config_snapshot[0]),
+                controller_config_digest=(None
+                                          if controller_config_snapshot is None
+                                          else controller_config_snapshot[1]),
+                controller_config_snapshot_id=(
+                    None if controller_config_snapshot is None else
+                    controller_config_snapshot[2]),
+                created_at=initial_version_created_at,
+                # Fresh registration establishes v1 as the controller's
+                # bootstrap baseline. Persist that fact independently of
+                # replica readiness so it remains available at scale-to-zero.
+                controller_applied_at=initial_version_created_at,
                 created_by=created_by)
             if lifecycle_epoch is None:
                 # Compatibility for legacy callers without the distributed
@@ -466,6 +601,16 @@ def add_service(name: str,
                             version_insert_stmt.excluded.submitted_yaml_content,
                         'placement_catalog':
                             version_insert_stmt.excluded.placement_catalog,
+                        'controller_config':
+                            version_insert_stmt.excluded.controller_config,
+                        'controller_config_digest':
+                            version_insert_stmt.excluded.
+                            controller_config_digest,
+                        'controller_config_snapshot_id':
+                            version_insert_stmt.excluded.
+                            controller_config_snapshot_id,
+                        'controller_applied_at':
+                            version_insert_stmt.excluded.controller_applied_at,
                     })
             session.execute(version_insert_stmt)
             if resource_scope is not None and storage_generation is not None:
@@ -512,12 +657,17 @@ def set_service_workspace_if_owner(service_name: str, workspace: str,
     return count > 0
 
 
-def update_service_controller_pid_if_owner(service_name: str,
-                                           expected_service_hash: str | None,
-                                           expected_controller_pid: int | None,
-                                           expected_controller_ip: str | None,
-                                           controller_pid: int,
-                                           controller_ip: str | None) -> bool:
+def update_service_controller_pid_if_owner(
+        service_name: str,
+        expected_service_hash: str | None,
+        expected_controller_pid: int | None,
+        expected_controller_ip: str | None,
+        controller_pid: int,
+        controller_ip: str | None,
+        *,
+        expected_lifecycle_epoch: int | None = None,
+        expected_status: ServiceStatus | None = None,
+        expected_recovery_version: int | None = None) -> bool:
     """Preclaim recovery only if the incarnation and old owner still match.
 
     A name-only preclaim can overwrite a service that was purged and recreated
@@ -527,17 +677,33 @@ def update_service_controller_pid_if_owner(service_name: str,
     success, publish the new PID+IP and clear the port atomically so the stable
     proxy fails closed with 503 until the new controller is actually ready.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        count = session.query(services_table).filter(
-            services_table.c.name == service_name,
-            services_table.c.hash == expected_service_hash,
-            services_table.c.controller_pid == expected_controller_pid,
-            services_table.c.controller_ip == expected_controller_ip).update({
-                services_table.c.controller_pid: controller_pid,
-                services_table.c.controller_ip: controller_ip,
-                services_table.c.controller_port: None,
-            })
+    filters = [
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+        services_table.c.controller_pid == expected_controller_pid,
+        services_table.c.controller_ip == expected_controller_ip,
+    ]
+    if expected_lifecycle_epoch is not None:
+        filters.append(
+            services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
+    if expected_status is not None:
+        filters.append(services_table.c.status == expected_status.value)
+    if expected_recovery_version is not None:
+        (latest_applicable, latest_quarantined,
+         latest_applied_applicable) = _quarantine_aware_version_aggregates()
+        elected_version = sqlalchemy.select(
+            _quarantine_aware_version_sql_expression(
+                latest_applicable, latest_quarantined,
+                latest_applied_applicable)).where(
+                    version_specs_table.c.service_name ==
+                    service_name).scalar_subquery()
+        filters.append(elected_version == expected_recovery_version)
+    with _replica_launch_authority_write_session(service_name) as (_, session):
+        count = session.query(services_table).filter(*filters).update({
+            services_table.c.controller_pid: controller_pid,
+            services_table.c.controller_ip: controller_ip,
+            services_table.c.controller_port: None,
+        })
         session.commit()
     return count > 0
 
@@ -565,8 +731,7 @@ def update_service_controller_pid_ip_and_port(
         True if the original incarnation and expected owner were updated;
         False if ownership was lost or the row no longer exists.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (_, session):
         count = session.query(services_table).filter(
             services_table.c.name == service_name,
             services_table.c.hash == expected_service_hash,
@@ -583,8 +748,7 @@ def update_service_controller_pid_ip_and_port(
 def set_service_controller_ip(service_name: str,
                               controller_ip: str | None) -> None:
     """Sets the controller IP of a service."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (_, session):
         session.query(services_table).filter(
             services_table.c.name == service_name).update(
                 {services_table.c.controller_ip: controller_ip})
@@ -594,8 +758,7 @@ def set_service_controller_ip(service_name: str,
 @_with_reserved_fill_broker_lock
 def remove_service(service_name: str) -> None:
     """Removes a service from the database."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (_, session):
         session.execute(
             sqlalchemy.delete(reserved_fill_pool_claims_table).where(
                 reserved_fill_pool_claims_table.c.service_name == service_name))
@@ -683,8 +846,8 @@ def remove_service_completely(
     """
     if not expected_service_hash:
         return False
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
         _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
                                    is not None)
         if not _lifecycle_epoch_matches_in_session(session, service_name,
@@ -778,13 +941,16 @@ def set_service_status_and_active_versions(
         status: ServiceStatus,
         active_versions: list[int] | None = None) -> None:
     """Sets the service status."""
-    engine = _db_manager.get_engine()
     update_dict = {services_table.c.status: status.value}
     if active_versions is not None:
         update_dict[services_table.c.active_versions] = json.dumps(
             active_versions)
 
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(
+            service_name,
+            invalidates_launch_authority=status
+            in ServiceStatus.replica_launch_blocking_statuses()) as (_,
+                                                                     session):
         session.query(services_table).filter(
             services_table.c.name == service_name).update(update_dict)
         session.commit()
@@ -815,8 +981,11 @@ def set_service_status_and_active_versions_if_owner(
     if expected_lifecycle_epoch is not None:
         predicates.append(
             services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(
+            service_name,
+            invalidates_launch_authority=status
+            in ServiceStatus.replica_launch_blocking_statuses()) as (engine,
+                                                                     session):
         _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
                                    is not None)
         if not _lifecycle_epoch_matches_in_session(session, service_name,
@@ -850,8 +1019,11 @@ def set_service_status_and_active_versions_if_hash(
     if expected_lifecycle_epoch is not None:
         predicates.append(
             services_table.c.lifecycle_epoch == expected_lifecycle_epoch)
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(
+            service_name,
+            invalidates_launch_authority=status
+            in ServiceStatus.replica_launch_blocking_statuses()) as (engine,
+                                                                     session):
         _begin_immediate_if_sqlite(session, engine, expected_lifecycle_epoch
                                    is not None)
         if not _lifecycle_epoch_matches_in_session(session, service_name,
@@ -914,8 +1086,7 @@ def acknowledge_service_controller_teardown_if_owner(
     the child-teardown sentinel prevents update/apply from starting new work
     while cleanup waits for the lifecycle lock.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (_, session):
         count = session.query(services_table).filter(
             services_table.c.name == service_name,
             services_table.c.hash == expected_service_hash,
@@ -1033,8 +1204,8 @@ def mark_unrecoverable_service_for_cleanup(service_name: str,
     wins atomically; otherwise future recovery sweeps stop launching an
     impossible script and ``down --purge`` can claim the orphan immediately.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
         _begin_immediate_if_sqlite(session, engine, True)
         # Lock the authoritative service row before checking for committed
         # versions.  On PostgreSQL an UPDATE whose WHERE includes NOT EXISTS
@@ -1249,12 +1420,48 @@ def get_service_liveness_snapshots(pool: bool) -> list[dict[str, Any]]:
 
     ``yaml_content`` carries the latest version's raw yaml (possibly NULL for
     a placeholder version row) so liveness callers can detect unbootable
-    placeholder rows without a per-service joined read.
+    placeholder rows without a per-service joined read. ``recovery_version``
+    is elected from that same snapshot using the quarantine-aware controller
+    recovery policy. Only the presence of its immutable controller config is
+    projected here; callers fetch and verify the bytes only when the config
+    protocol is active.
     """
     latest_version = sqlalchemy.select(
         version_specs_table.c.service_name,
         sqlalchemy.func.max(version_specs_table.c.version).label('max_version'),
     ).group_by(version_specs_table.c.service_name).alias('v')
+    (latest_applicable, latest_quarantined,
+     latest_applied_applicable) = _quarantine_aware_version_aggregates()
+    config_protocol_active = sqlalchemy.func.max(
+        sqlalchemy.case((sqlalchemy.or_(
+            version_specs_table.c.controller_config.isnot(None),
+            version_specs_table.c.controller_config_digest.isnot(None),
+            version_specs_table.c.controller_config_snapshot_id.isnot(None),
+        ), 1),
+                        else_=0)).label('config_protocol_active')
+    version_candidates = sqlalchemy.select(
+        version_specs_table.c.service_name,
+        latest_applicable,
+        latest_quarantined,
+        latest_applied_applicable,
+        config_protocol_active,
+    ).group_by(version_specs_table.c.service_name).alias('version_candidates')
+    recovery_versions = sqlalchemy.select(
+        version_candidates.c.service_name,
+        _quarantine_aware_version_sql_expression(
+            version_candidates.c.latest_applicable_version,
+            version_candidates.c.latest_quarantined_version,
+            version_candidates.c.latest_applied_applicable_version,
+        ).label('recovery_version'),
+        version_candidates.c.config_protocol_active,
+    ).alias('recovery_versions')
+    latest_version_spec = version_specs_table.alias('latest_version_spec')
+    recovery_version_spec = version_specs_table.alias('recovery_version_spec')
+    recovery_config_present = sqlalchemy.and_(
+        recovery_version_spec.c.controller_config.isnot(None),
+        recovery_version_spec.c.controller_config_digest.isnot(None),
+        recovery_version_spec.c.controller_config_snapshot_id.isnot(None),
+    ).label('recovery_config_present')
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.execute(
@@ -1266,19 +1473,34 @@ def get_service_liveness_snapshots(pool: bool) -> list[dict[str, Any]]:
                 services_table.c.controller_ip,
                 services_table.c.hash,
                 services_table.c.resource_scope,
-                version_specs_table.c.yaml_content,
+                services_table.c.workspace,
+                latest_version_spec.c.yaml_content,
+                recovery_versions.c.recovery_version,
+                recovery_versions.c.config_protocol_active,
+                recovery_config_present,
             ).select_from(
                 services_table.join(
-                    latest_version, services_table.c.name ==
-                    latest_version.c.service_name).join(
-                        version_specs_table,
-                        sqlalchemy.and_(
-                            version_specs_table.c.service_name ==
-                            services_table.c.name,
-                            version_specs_table.c.version ==
-                            latest_version.c.max_version,
-                        ))).where(services_table.c.pool == int(pool)).order_by(
-                            services_table.c.name)).fetchall()
+                    latest_version,
+                    services_table.c.name == latest_version.c.service_name).
+                join(
+                    latest_version_spec,
+                    sqlalchemy.and_(
+                        latest_version_spec.c.service_name ==
+                        services_table.c.name,
+                        latest_version_spec.c.version ==
+                        latest_version.c.max_version,
+                    )).join(
+                        recovery_versions, recovery_versions.c.service_name ==
+                        services_table.c.name).outerjoin(
+                            recovery_version_spec,
+                            sqlalchemy.and_(
+                                recovery_version_spec.c.service_name ==
+                                services_table.c.name,
+                                recovery_version_spec.c.version ==
+                                recovery_versions.c.recovery_version,
+                            ))).where(
+                                services_table.c.pool == int(pool)).order_by(
+                                    services_table.c.name)).fetchall()
     return [{
         'name': row.name,
         'status': ServiceStatus[row.status],
@@ -1287,7 +1509,11 @@ def get_service_liveness_snapshots(pool: bool) -> list[dict[str, Any]]:
         'controller_ip': row.controller_ip,
         'hash': row.hash,
         'resource_scope': row.resource_scope,
+        'workspace': row.workspace,
         'yaml_content': row.yaml_content,
+        'recovery_version': row.recovery_version,
+        'config_protocol_active': bool(row.config_protocol_active),
+        'recovery_config_present': bool(row.recovery_config_present),
     } for row in rows]
 
 
@@ -1325,41 +1551,205 @@ def get_service_runtime_snapshot(
     }
 
 
+def _select_quarantine_aware_version(
+        latest_applicable_version: int | None,
+        latest_quarantined_version: int | None,
+        latest_applied_applicable_version: int | None) -> int | None:
+    """Choose the same version used to reconstruct a Serve controller."""
+    if (latest_quarantined_version is not None and
+        (latest_applicable_version is None or
+         latest_applicable_version < latest_quarantined_version)):
+        # A committed intermediate generation is not proof that the
+        # controller transitioned to it.  Fall back only to a generation with
+        # a durable applied receipt; None deliberately fails closed.
+        return latest_applied_applicable_version
+    return latest_applicable_version
+
+
+def _quarantine_aware_version_aggregates() -> tuple[Any, Any, Any]:
+    """Build the common SQL candidates for launch/lifecycle election."""
+    committed = version_specs_table.c.yaml_content.isnot(None)
+    applicable = sqlalchemy.and_(committed,
+                                 version_specs_table.c.quarantined_at.is_(None))
+    latest_applicable = sqlalchemy.func.max(
+        sqlalchemy.case(
+            (applicable,
+             version_specs_table.c.version))).label('latest_applicable_version')
+    latest_quarantined = sqlalchemy.func.max(
+        sqlalchemy.case((
+            version_specs_table.c.quarantined_at.isnot(None),
+            version_specs_table.c.version))).label('latest_quarantined_version')
+    latest_applied_applicable = sqlalchemy.func.max(
+        sqlalchemy.case((sqlalchemy.and_(
+            applicable,
+            version_specs_table.c.controller_applied_at.isnot(None)),
+                         version_specs_table.c.version
+                        ))).label('latest_applied_applicable_version')
+    return (latest_applicable, latest_quarantined, latest_applied_applicable)
+
+
+def _quarantine_aware_version_sql_expression(
+        latest_applicable: Any, latest_quarantined: Any,
+        latest_applied_applicable: Any) -> Any:
+    """Build the SQL equivalent of `_select_quarantine_aware_version`."""
+    quarantine_dominates = sqlalchemy.and_(
+        latest_quarantined.isnot(None),
+        sqlalchemy.or_(latest_applicable.is_(None), latest_applicable
+                       < latest_quarantined))
+    return sqlalchemy.case((quarantine_dominates, latest_applied_applicable),
+                           else_=latest_applicable)
+
+
+def get_service_ha_recovery_snapshot(
+    service_name: str,
+    expected_service_hash: str | None = None,
+) -> dict[str, Any] | None:
+    """Read one just-in-time, incarnation-fenced HA recovery snapshot.
+
+    The service owner, quarantine-aware elected version, protocol activation,
+    and exact selected controller-config bytes must come from one PostgreSQL
+    statement.  In particular, a long fleet sweep must not pair an old
+    incarnation or version election with a same-name successor's recovery
+    script.  No pickled service spec is selected or deserialized on this path.
+
+    Args:
+        service_name: Service whose controller may need recovery.
+        expected_service_hash: Optional incarnation observed by an earlier
+            liveness sweep.  A mismatch returns ``None``.
+
+    Returns:
+        A service/owner/election snapshot, or ``None`` if the service (or exact
+        expected incarnation) no longer exists. ``controller_config_snapshot``
+        is the verified ``(bytes, digest, nonce)`` tuple for the selected
+        generation, and is ``None`` for a legacy or unelectable generation.
+
+    Raises:
+        ControllerConfigCorruptionError: If the selected config tuple is
+            partial or fails its digest validation.
+    """
+    if expected_service_hash is not None and (not isinstance(
+            expected_service_hash, str) or not expected_service_hash):
+        raise ValueError('Expected service hash must be a non-empty string.')
+
+    (latest_applicable, latest_quarantined,
+     latest_applied_applicable) = _quarantine_aware_version_aggregates()
+    config_protocol_active = sqlalchemy.func.max(
+        sqlalchemy.case((sqlalchemy.or_(
+            version_specs_table.c.controller_config.isnot(None),
+            version_specs_table.c.controller_config_digest.isnot(None),
+            version_specs_table.c.controller_config_snapshot_id.isnot(None),
+        ), 1),
+                        else_=0)).label('config_protocol_active')
+    candidates = sqlalchemy.select(
+        version_specs_table.c.service_name.label('service_name'),
+        latest_applicable,
+        latest_quarantined,
+        latest_applied_applicable,
+        config_protocol_active,
+    ).where(version_specs_table.c.service_name == service_name).group_by(
+        version_specs_table.c.service_name).subquery('ha_recovery_candidates')
+    recovery_version = _quarantine_aware_version_sql_expression(
+        candidates.c.latest_applicable_version,
+        candidates.c.latest_quarantined_version,
+        candidates.c.latest_applied_applicable_version).label(
+            'recovery_version')
+    election = sqlalchemy.select(
+        candidates.c.service_name,
+        recovery_version,
+        candidates.c.config_protocol_active,
+    ).subquery('ha_recovery_election')
+    selected_config = version_specs_table.alias('ha_recovery_selected_config')
+
+    query = sqlalchemy.select(
+        services_table.c.name,
+        services_table.c.hash,
+        services_table.c.lifecycle_epoch,
+        services_table.c.controller_pid,
+        services_table.c.controller_ip,
+        services_table.c.workspace,
+        services_table.c.resource_scope,
+        services_table.c.status,
+        election.c.recovery_version,
+        election.c.config_protocol_active,
+        selected_config.c.controller_config,
+        selected_config.c.controller_config_digest,
+        selected_config.c.controller_config_snapshot_id,
+        serve_ha_recovery_script_table.c.script.label('ha_recovery_script'),
+    ).select_from(
+        services_table.outerjoin(
+            election,
+            election.c.service_name == services_table.c.name).outerjoin(
+                selected_config,
+                sqlalchemy.and_(
+                    selected_config.c.service_name == services_table.c.name,
+                    selected_config.c.version == election.c.recovery_version,
+                )).outerjoin(
+                    serve_ha_recovery_script_table,
+                    serve_ha_recovery_script_table.c.service_name ==
+                    services_table.c.name)).where(
+                        services_table.c.name == service_name)
+    if expected_service_hash is not None:
+        query = query.where(services_table.c.hash == expected_service_hash)
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(query).fetchone()
+    if row is None:
+        return None
+
+    controller_config = row.controller_config
+    if isinstance(controller_config, memoryview):
+        controller_config = controller_config.tobytes()
+    try:
+        controller_config_snapshot = _validate_controller_config_snapshot(
+            controller_config,
+            row.controller_config_digest,
+            row.controller_config_snapshot_id,
+            argument_name='HA recovery controller config snapshot')
+    except ValueError as e:
+        raise ControllerConfigCorruptionError(
+            f'Controller config snapshot for service {service_name!r}, '
+            f'version {row.recovery_version} failed integrity validation: '
+            f'{e}') from e
+
+    return {
+        'service_name': row.name,
+        'hash': row.hash,
+        'lifecycle_epoch': row.lifecycle_epoch,
+        'controller_pid': row.controller_pid,
+        'controller_ip': row.controller_ip,
+        'workspace': row.workspace,
+        'resource_scope': row.resource_scope,
+        'status': ServiceStatus[row.status],
+        'recovery_version': row.recovery_version,
+        'config_protocol_active': bool(row.config_protocol_active),
+        'controller_config_snapshot': controller_config_snapshot,
+        'ha_recovery_script': row.ha_recovery_script,
+    }
+
+
 def get_service_version_terminal_states(
     identities: list[tuple[str, int,
                            str]],) -> dict[tuple[str, int, str], bool]:
     """Returns authoritative terminal state for bounded service versions.
 
     Missing entries are intentionally unknown. A service version is live while
-    it is current, routed, or owns any replica row. It becomes terminal only
-    after Serve's own rollout/drain state has moved past it, or after its exact
-    service incarnation is gone.
+    it is current, routed, owns any replica row, or has a non-quarantined
+    controller-applied receipt. Applied history is retained for the service
+    lifetime because a later quarantine can legally elect it again. A version
+    otherwise becomes terminal only after Serve's rollout/drain state has moved
+    past it, or after its exact service incarnation is gone.
     """
     if not identities:
         return {}
     if len(identities) > 1000:
         raise ValueError('Service-version terminal-state batch is too large.')
-    names = sorted({identity[0] for identity in identities})
     version_identities = sorted({
         (identity[0], identity[1]) for identity in identities
     })
     engine = _db_manager.get_engine()
-    service_rows = []
-    version_probes = []
+    version_states = []
     with orm.Session(engine) as session:
-        for start in range(0, len(names), _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
-            name_batch = names[start:start +
-                               _TERMINAL_IDENTITY_QUERY_BATCH_SIZE]
-            service_rows.extend(
-                session.execute(
-                    sqlalchemy.select(
-                        services_table.c.name,
-                        services_table.c.hash,
-                        services_table.c.status,
-                        services_table.c.current_version,
-                        services_table.c.active_versions,
-                    ).where(services_table.c.name.in_(
-                        name_batch))).mappings().all())
         for start in range(0, len(version_identities),
                            _TERMINAL_IDENTITY_QUERY_BATCH_SIZE):
             version_batch = version_identities[
@@ -1372,29 +1762,42 @@ def get_service_version_terminal_states(
                 sqlalchemy.select(sqlalchemy.literal(1)).where(
                     version_specs_table.c.service_name == wanted.c.service_name,
                     version_specs_table.c.version == wanted.c.version))
+            applied_nonquarantined_exists = sqlalchemy.exists(
+                sqlalchemy.select(sqlalchemy.literal(1)).where(
+                    version_specs_table.c.service_name == wanted.c.service_name,
+                    version_specs_table.c.version == wanted.c.version,
+                    version_specs_table.c.yaml_content.isnot(None),
+                    version_specs_table.c.controller_applied_at.isnot(None),
+                    version_specs_table.c.quarantined_at.is_(None)))
             replica_exists = sqlalchemy.exists(
                 sqlalchemy.select(sqlalchemy.literal(1)).where(
                     replicas_table.c.service_name == wanted.c.service_name,
                     replicas_table.c.version == wanted.c.version))
-            version_probes.extend(
+            version_states.extend(
                 session.execute(
                     sqlalchemy.select(
                         wanted.c.service_name,
                         wanted.c.version,
+                        services_table.c.hash,
+                        services_table.c.status,
+                        services_table.c.current_version,
+                        services_table.c.active_versions,
                         version_exists.label('version_exists'),
+                        applied_nonquarantined_exists.label(
+                            'applied_nonquarantined_exists'),
                         replica_exists.label('replica_exists'),
-                    ).select_from(wanted)).mappings().all())
-    services = {str(row['name']): row for row in service_rows}
-    versions = {(str(row['service_name']), int(row['version']))
-                for row in version_probes
-                if row['version_exists']}
-    replicas = {(str(row['service_name']), int(row['version']))
-                for row in version_probes
-                if row['replica_exists']}
+                    ).select_from(
+                        wanted.outerjoin(
+                            services_table, services_table.c.name ==
+                            wanted.c.service_name))).mappings().all())
+    states = {
+        (str(row['service_name']), int(row['version'])): row
+        for row in version_states
+    }
     result: dict[tuple[str, int, str], bool] = {}
     for identity in identities:
         name, version, service_hash = identity
-        row = services.get(name)
+        row = states.get((name, version))
         if row is None or row['hash'] != service_hash:
             result[identity] = True
             continue
@@ -1402,7 +1805,7 @@ def get_service_version_terminal_states(
                 row['status'])] in ServiceStatus.terminal_statuses():
             result[identity] = True
             continue
-        if (name, version) not in versions:
+        if not row['version_exists']:
             # A matching live incarnation without the claimed immutable version
             # is inconsistent, not proof that the owner is terminal.
             continue
@@ -1410,7 +1813,7 @@ def get_service_version_terminal_states(
         active_versions = (json.loads(row['active_versions'])
                            if row['active_versions'] else [])
         if (current_version == version or version in active_versions or
-            (name, version) in replicas):
+                row['replica_exists'] or row['applied_nonquarantined_exists']):
             result[identity] = False
         elif current_version is not None and version < int(current_version):
             result[identity] = True
@@ -1489,6 +1892,20 @@ def get_service_status_snapshot(
     }
 
 
+def _controller_owner_record(mapping: Any) -> dict[str, Any]:
+    """Build the common controller-owner identity from one SQL row."""
+    return {
+        'hash': mapping['hash'],
+        'status': ServiceStatus[mapping['status']],
+        'controller_pid': mapping['controller_pid'],
+        'controller_ip': mapping['controller_ip'],
+        'controller_port': mapping['controller_port'],
+        'lifecycle_epoch': mapping['lifecycle_epoch'],
+        'pool': bool(mapping['pool']),
+        'resource_scope': mapping['resource_scope'],
+    }
+
+
 def get_service_controller_owner(
         service_name: str,
         require_version: bool = False,
@@ -1529,16 +1946,7 @@ def get_service_controller_owner(
     if row is None:
         return None
     mapping = row._mapping  # pylint: disable=protected-access
-    record = {
-        'hash': mapping['hash'],
-        'status': ServiceStatus[mapping['status']],
-        'controller_pid': mapping['controller_pid'],
-        'controller_ip': mapping['controller_ip'],
-        'controller_port': mapping['controller_port'],
-        'lifecycle_epoch': mapping['lifecycle_epoch'],
-        'pool': bool(mapping['pool']),
-        'resource_scope': mapping['resource_scope'],
-    }
+    record = _controller_owner_record(mapping)
     if include_lb_state:
         record.update({
             'lb_ha_enabled': bool(mapping['lb_ha_enabled']),
@@ -1548,6 +1956,97 @@ def get_service_controller_owner(
             'lb_cutover_phase': mapping['lb_cutover_phase'],
         })
     return record
+
+
+def get_service_replica_launch_authorization(
+        service_name: str) -> dict[str, Any] | None:
+    """Atomically read a controller owner and its launch-authorized version.
+
+    A newly committed version is normally the only generation authorized to
+    launch.  If that generation is durably quarantined, controller recovery
+    instead elects the newest applied, committed, non-quarantined version. The
+    owner identity and all version candidates are aggregated by one SQL
+    statement so a launch cannot pair one ownership snapshot with another
+    transaction's quarantine decision.
+    """
+    engine = _db_manager.get_engine()
+    (latest_applicable, latest_quarantined,
+     latest_applied_applicable) = _quarantine_aware_version_aggregates()
+    launch_authorized_version = _quarantine_aware_version_sql_expression(
+        latest_applicable, latest_quarantined,
+        latest_applied_applicable).label('launch_authorized_version')
+    config_protocol_active = sqlalchemy.func.max(
+        sqlalchemy.case((sqlalchemy.or_(
+            version_specs_table.c.controller_config.isnot(None),
+            version_specs_table.c.controller_config_digest.isnot(None),
+            version_specs_table.c.controller_config_snapshot_id.isnot(None),
+        ), 1),
+                        else_=0)).label('config_protocol_active')
+    owner_columns = (
+        services_table.c.hash,
+        services_table.c.status,
+        services_table.c.controller_pid,
+        services_table.c.controller_ip,
+        services_table.c.controller_port,
+        services_table.c.lifecycle_epoch,
+        services_table.c.pool,
+        services_table.c.resource_scope,
+    )
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                *owner_columns, launch_authorized_version,
+                config_protocol_active).select_from(
+                    services_table.outerjoin(
+                        version_specs_table, version_specs_table.c.service_name
+                        == services_table.c.name)).where(
+                            services_table.c.name == service_name).group_by(
+                                *owner_columns)).fetchone()
+    if row is None:
+        return None
+    mapping = row._mapping  # pylint: disable=protected-access
+    record = _controller_owner_record(mapping)
+    record['launch_authorized_version'] = mapping['launch_authorized_version']
+    record['launch_version_required'] = bool(mapping['config_protocol_active'])
+    return record
+
+
+def service_replica_launch_fence_holds(launch_context: dict[str, Any]) -> bool:
+    """Check one persisted replica request against its current DB authority.
+
+    The check deliberately performs a fresh, single-snapshot authorization
+    read on every call.  Callers use it at both request admission and the
+    terminal provider boundary so a controller/API crash cannot let an already
+    admitted request provision after a newer config generation is elected.
+    Database failures propagate: a caller that cannot prove current authority
+    must fail closed rather than treating the request as launchable.
+    """
+    service_name = launch_context.get(
+        constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+    service_hash = launch_context.get(
+        constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+    service_version = launch_context.get(
+        constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
+    controller_pid = launch_context.get(
+        constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY)
+    controller_ip = launch_context.get(
+        constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash or
+            not (service_version is None or
+                 type(service_version) is int and service_version > 0) or
+            not (controller_pid is None or isinstance(controller_pid, int)) or
+            not (controller_ip is None or isinstance(controller_ip, str))):
+        return False
+
+    owner = get_service_replica_launch_authorization(service_name)
+    return bool(owner is not None and owner.get('hash') == service_hash and
+                (owner.get('controller_pid'), owner.get('controller_ip'))
+                == (controller_pid, controller_ip) and owner.get('status')
+                not in ServiceStatus.replica_launch_blocking_statuses() and
+                ((service_version is None and
+                  not owner.get('launch_version_required', False)) or
+                 owner.get('launch_authorized_version') == service_version))
 
 
 _require_postgresql_lb_cutover = getattr(lb_cutover_state,
@@ -4418,6 +4917,61 @@ class VersionCommitResult(enum.Enum):
                         VersionCommitResult.IDEMPOTENT_RETRY)
 
 
+ControllerConfigSnapshot = tuple[bytes, str, str]
+
+
+class ControllerConfigCorruptionError(RuntimeError):
+    """A persisted controller-config snapshot failed integrity validation."""
+
+
+def _validate_controller_config_snapshot(
+    controller_config: bytes | None,
+    controller_config_digest: str | None,
+    controller_config_snapshot_id: str | None,
+    *,
+    argument_name: str = 'controller config snapshot',
+) -> ControllerConfigSnapshot | None:
+    """Validate an all-or-none controller config snapshot tuple."""
+    values = (controller_config, controller_config_digest,
+              controller_config_snapshot_id)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError(f'{argument_name} must provide config bytes, digest, '
+                         'and snapshot ID together.')
+    if not isinstance(controller_config, bytes):
+        raise ValueError(f'{argument_name} config must be bytes.')
+    if (not isinstance(controller_config_digest, str) or
+            re.fullmatch(r'[0-9a-f]{64}', controller_config_digest) is None):
+        raise ValueError(f'{argument_name} digest must be a lowercase SHA-256 '
+                         'hex digest.')
+    if hashlib.sha256(
+            controller_config).hexdigest() != controller_config_digest:
+        raise ValueError(
+            f'{argument_name} digest does not match its config bytes.')
+    if (not isinstance(controller_config_snapshot_id, str) or re.fullmatch(
+            r'[0-9a-f]{64}', controller_config_snapshot_id) is None):
+        raise ValueError(f'{argument_name} snapshot ID must be 64 lowercase '
+                         'hex characters.')
+    return (controller_config, controller_config_digest,
+            controller_config_snapshot_id)
+
+
+def _validate_legacy_controller_config_snapshot(
+    snapshot: ControllerConfigSnapshot | None,
+) -> ControllerConfigSnapshot | None:
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, tuple) or len(snapshot) != 3:
+        raise ValueError('legacy controller config snapshot must be a '
+                         '(bytes, digest, snapshot ID) tuple.')
+    return _validate_controller_config_snapshot(
+        snapshot[0],
+        snapshot[1],
+        snapshot[2],
+        argument_name='legacy controller config snapshot')
+
+
 def _lock_service_for_version_mutation(session: orm.Session,
                                        service_name: str) -> bool:
     """Lock the parent row and return whether version writes are allowed.
@@ -4503,7 +5057,13 @@ def add_or_update_version(
     placement_catalog: dict[str, Any] | None = None,
     expected_service_hash: str | None = None,
     expected_lifecycle_epoch: int | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    ha_recovery_script: str | None = None,
+    controller_config: bytes | None = None,
+    controller_config_digest: str | None = None,
+    controller_config_snapshot_id: str | None = None,
+    legacy_controller_config_snapshot: ControllerConfigSnapshot | None = None,
+    legacy_controller_applied_version: int | None = None,
 ) -> VersionCommitResult:
     """Commit a version placeholder once, or accept an identical retry.
 
@@ -4511,10 +5071,31 @@ def add_or_update_version(
     the version number as its identity. Overwriting its content could leave a
     live controller running one spec while a respawn boots another.
     """
-    engine = _db_manager.get_engine()
+    controller_config_snapshot = _validate_controller_config_snapshot(
+        controller_config, controller_config_digest,
+        controller_config_snapshot_id)
+    legacy_controller_config_snapshot = (
+        _validate_legacy_controller_config_snapshot(
+            legacy_controller_config_snapshot))
+    if ((legacy_controller_config_snapshot is None)
+            != (legacy_controller_applied_version is None)):
+        raise ValueError('First protocol activation must provide the legacy '
+                         'controller config and exact applied version '
+                         'together.')
+    if legacy_controller_applied_version is not None:
+        if (isinstance(legacy_controller_applied_version, bool) or
+                not isinstance(legacy_controller_applied_version, int) or
+                legacy_controller_applied_version < 1 or
+                legacy_controller_applied_version >= version):
+            raise ValueError('The legacy applied version must identify an '
+                             'earlier positive service version.')
+        if (not expected_service_hash or expected_controller_owner is None):
+            raise ValueError('First protocol activation requires an exact '
+                             'service incarnation and controller owner fence.')
     storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
     resource_scope: str | None = None
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
         _begin_immediate_if_sqlite(session, engine)
         if not _lock_service_for_version_mutation(session, service_name):
             session.rollback()
@@ -4554,7 +5135,11 @@ def add_or_update_version(
         existing = session.execute(
             sqlalchemy.select(
                 version_specs_table.c.yaml_content,
-                version_specs_table.c.placement_catalog).where(
+                version_specs_table.c.placement_catalog,
+                version_specs_table.c.controller_config,
+                version_specs_table.c.controller_config_digest,
+                version_specs_table.c.controller_config_snapshot_id,
+                version_specs_table.c.submitted_yaml_content).where(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version)).fetchone()
         identical_retry = existing is not None and existing[0] == yaml_content
@@ -4562,6 +5147,70 @@ def add_or_update_version(
                 0] is not None and not identical_retry:
             session.rollback()
             return VersionCommitResult.CONTENT_CONFLICT
+        if identical_retry:
+            stored_controller_config_snapshot = (None if all(
+                value is None for value in existing[2:5]) else tuple(
+                    existing[2:5]))
+            if stored_controller_config_snapshot != controller_config_snapshot:
+                session.rollback()
+                return VersionCommitResult.CONTENT_CONFLICT
+            if (controller_config_snapshot is not None and
+                (existing[1] != placement_catalog or
+                 existing[5] != submitted_yaml_content)):
+                session.rollback()
+                return VersionCommitResult.CONTENT_CONFLICT
+        if not identical_retry and controller_config_snapshot is not None:
+            marker = constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER
+            if (ha_recovery_script is None or
+                    marker not in ha_recovery_script.splitlines() or
+                    '# SKY_SERVE_CONFIG_SNAPSHOT_BEGIN' in ha_recovery_script or
+                    '# SKY_SERVE_CONFIG_SNAPSHOT_END' in ha_recovery_script):
+                raise ValueError('A versioned controller config must commit '
+                                 'with a scrubbed versioned HA recovery '
+                                 'script.')
+        if (not identical_retry and
+                legacy_controller_config_snapshot is not None):
+            # Lock and validate every historical tuple before switching the
+            # service-global recovery script. A partial/corrupt row must not
+            # be hidden by backfilling only all-NULL peers and then failing on
+            # the next pod recovery.
+            historical_rows = session.execute(
+                sqlalchemy.select(
+                    version_specs_table.c.version,
+                    version_specs_table.c.controller_config,
+                    version_specs_table.c.controller_config_digest,
+                    version_specs_table.c.controller_config_snapshot_id).where(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.version < version,
+                        version_specs_table.c.yaml_content.isnot(
+                            None)).with_for_update()).fetchall()
+            for historical_row in historical_rows:
+                historical_values = list(historical_row[1:4])
+                if all(value is None for value in historical_values):
+                    continue
+                if isinstance(historical_values[0], memoryview):
+                    historical_values[0] = historical_values[0].tobytes()
+                try:
+                    _validate_controller_config_snapshot(
+                        historical_values[0],
+                        historical_values[1],
+                        historical_values[2],
+                        argument_name=(
+                            f'historical version {historical_row[0]} '
+                            'controller config snapshot'))
+                except ValueError as e:
+                    raise ControllerConfigCorruptionError(
+                        f'Cannot activate versioned recovery for service '
+                        f'{service_name!r}: {e}') from e
+        if ha_recovery_script is not None and identical_retry:
+            existing_recovery_script = session.execute(
+                sqlalchemy.select(
+                    serve_ha_recovery_script_table.c.script).where(
+                        serve_ha_recovery_script_table.c.service_name ==
+                        service_name).with_for_update()).scalar_one_or_none()
+            if existing_recovery_script != ha_recovery_script:
+                session.rollback()
+                return VersionCommitResult.CONTENT_CONFLICT
         if not identical_retry:
             higher_committed_version = session.execute(
                 sqlalchemy.select(
@@ -4603,6 +5252,14 @@ def add_or_update_version(
                 yaml_content=yaml_content,
                 submitted_yaml_content=submitted_yaml_content,
                 placement_catalog=placement_catalog,
+                controller_config=(None if controller_config_snapshot is None
+                                   else controller_config_snapshot[0]),
+                controller_config_digest=(None
+                                          if controller_config_snapshot is None
+                                          else controller_config_snapshot[1]),
+                controller_config_snapshot_id=(
+                    None if controller_config_snapshot is None else
+                    controller_config_snapshot[2]),
                 created_at=time.time()))
         elif existing[0] is None:
             # `add_version` reserves a NULL-YAML placeholder. The service-row
@@ -4616,6 +5273,15 @@ def add_or_update_version(
                         yaml_content=yaml_content,
                         submitted_yaml_content=submitted_yaml_content,
                         placement_catalog=placement_catalog,
+                        controller_config=(None
+                                           if controller_config_snapshot is None
+                                           else controller_config_snapshot[0]),
+                        controller_config_digest=(
+                            None if controller_config_snapshot is None else
+                            controller_config_snapshot[1]),
+                        controller_config_snapshot_id=(
+                            None if controller_config_snapshot is None else
+                            controller_config_snapshot[2]),
                         created_at=time.time()))
         elif identical_retry and existing[1] is None and placement_catalog:
             # A retry may be the first new binary to touch a version committed
@@ -4627,6 +5293,38 @@ def add_or_update_version(
                     version_specs_table.c.version == version,
                     version_specs_table.c.placement_catalog.is_(None)).values(
                         placement_catalog=placement_catalog))
+        if not identical_retry and legacy_controller_config_snapshot is not None:
+            # A first config-aware update can make historical versions
+            # independently recoverable.  Only committed, older, entirely
+            # NULL snapshots are backfilled; an existing snapshot is immutable.
+            session.execute(
+                sqlalchemy.update(version_specs_table).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version < version,
+                    version_specs_table.c.yaml_content.isnot(None),
+                    version_specs_table.c.controller_config.is_(None),
+                    version_specs_table.c.controller_config_digest.is_(None),
+                    version_specs_table.c.controller_config_snapshot_id.is_(
+                        None)).
+                values(
+                    controller_config=legacy_controller_config_snapshot[0],
+                    controller_config_digest=legacy_controller_config_snapshot[
+                        1],
+                    controller_config_snapshot_id=
+                    legacy_controller_config_snapshot[2]))
+            applied_result = session.execute(
+                sqlalchemy.update(version_specs_table).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version ==
+                    legacy_controller_applied_version,
+                    version_specs_table.c.yaml_content.isnot(None),
+                    version_specs_table.c.quarantined_at.is_(None)).values(
+                        controller_applied_at=sqlalchemy.func.coalesce(
+                            version_specs_table.c.controller_applied_at,
+                            time.time())))
+            if applied_result.rowcount != 1:
+                session.rollback()
+                return VersionCommitResult.REJECTED
         if (not identical_retry and semantics_row is not None and
                 uses_logical_replicas):
             session.execute(
@@ -4641,6 +5339,17 @@ def add_or_update_version(
                 sqlalchemy.update(services_table).where(
                     services_table.c.name == service_name).values(
                         current_version=version))
+        if ha_recovery_script is not None:
+            insert_func = (sqlite.insert if engine.dialect.name
+                           == db_utils.SQLAlchemyDialect.SQLITE.value else
+                           postgresql.insert)
+            recovery_insert = insert_func(
+                serve_ha_recovery_script_table).values(
+                    service_name=service_name, script=ha_recovery_script)
+            session.execute(
+                recovery_insert.on_conflict_do_update(
+                    index_elements=['service_name'],
+                    set_={'script': recovery_insert.excluded.script}))
         # An identical committed YAML is an idempotent retry. Keep both the
         # original YAML and pickled spec bytes untouched.
         if resource_scope is not None and storage_generation is not None:
@@ -4684,6 +5393,59 @@ def get_placement_catalog(service_name: str,
                 version_specs_table.c.service_name == service_name,
                 version_specs_table.c.version == version)).fetchone()
     return result[0] if result is not None else None
+
+
+def get_version_controller_config(
+    service_name: str,
+    version: int,
+) -> ControllerConfigSnapshot | None:
+    """Return and verify one version's sanitized controller config snapshot."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.controller_config,
+                version_specs_table.c.controller_config_digest,
+                version_specs_table.c.controller_config_snapshot_id).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version)).fetchone()
+    if result is None or all(value is None for value in result):
+        return None
+    controller_config = result[0]
+    if isinstance(controller_config, memoryview):
+        controller_config = controller_config.tobytes()
+    try:
+        snapshot = _validate_controller_config_snapshot(
+            controller_config,
+            result[1],
+            result[2],
+            argument_name='persisted controller config snapshot')
+    except ValueError as e:
+        raise ControllerConfigCorruptionError(
+            f'Controller config snapshot for service {service_name!r}, '
+            f'version {version} failed integrity validation: {e}') from e
+    if snapshot is None:
+        # The all-NULL case returned above; reaching this branch would mean
+        # validation accepted an internally inconsistent database row.
+        raise ControllerConfigCorruptionError(
+            f'Controller config snapshot for service {service_name!r}, '
+            f'version {version} is incomplete.')
+    return snapshot
+
+
+def get_service_config_recovery_identity(
+        service_name: str) -> tuple[str, str] | None:
+    """Return the minimal durable incarnation/workspace recovery fence."""
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(
+                services_table.c.hash, services_table.c.workspace).where(
+                    services_table.c.name == service_name)).fetchone()
+    if (result is None or not isinstance(result[0], str) or not result[0] or
+            not isinstance(result[1], str) or not result[1]):
+        return None
+    return result[0], result[1]
 
 
 def set_placement_catalog_if_missing(service_name: str, version: int,
@@ -4777,6 +5539,25 @@ def get_system_recovery_authorization_snapshot(
                          ).select_from(replicas_table).where(
                              replicas_table.c.service_name ==
                              services_table.c.name).scalar_subquery())
+    (latest_applicable, latest_quarantined,
+     latest_applied_applicable) = _quarantine_aware_version_aggregates()
+    election_candidates = sqlalchemy.select(
+        version_specs_table.c.service_name.label('service_name'),
+        latest_applicable,
+        latest_quarantined,
+        latest_applied_applicable,
+    ).where(version_specs_table.c.service_name == service_name).group_by(
+        version_specs_table.c.service_name).subquery(
+            'system_recovery_election_candidates')
+    elected_version = _quarantine_aware_version_sql_expression(
+        election_candidates.c.latest_applicable_version,
+        election_candidates.c.latest_quarantined_version,
+        election_candidates.c.latest_applied_applicable_version).label(
+            'elected_version')
+    election = sqlalchemy.select(
+        election_candidates.c.service_name,
+        elected_version,
+    ).subquery('system_recovery_election')
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.execute(
@@ -4784,7 +5565,7 @@ def get_system_recovery_authorization_snapshot(
                 services_table.c.name,
                 services_table.c.hash,
                 services_table.c.workspace,
-                services_table.c.current_version,
+                election.c.elected_version,
                 services_table.c.status,
                 services_table.c.pool,
                 services_table.c.resource_action_mode,
@@ -4794,14 +5575,16 @@ def get_system_recovery_authorization_snapshot(
                 replica_count.label('replica_count'),
             ).select_from(
                 services_table.join(
-                    version_specs_table,
-                    sqlalchemy.and_(
-                        version_specs_table.c.service_name ==
-                        services_table.c.name,
-                        version_specs_table.c.version ==
-                        services_table.c.current_version,
-                    ))).where(
-                        services_table.c.name == service_name)).fetchone()
+                    election,
+                    election.c.service_name == services_table.c.name).join(
+                        version_specs_table,
+                        sqlalchemy.and_(
+                            version_specs_table.c.service_name ==
+                            services_table.c.name,
+                            version_specs_table.c.version ==
+                            election.c.elected_version,
+                        ))).where(
+                            services_table.c.name == service_name)).fetchone()
     if row is None:
         return None
     spec = pickle.loads(row.spec) if row.spec is not None else None
@@ -4813,7 +5596,7 @@ def get_system_recovery_authorization_snapshot(
         'service_name': row.name,
         'service_hash': row.hash,
         'workspace': row.workspace,
-        'version': row.current_version,
+        'version': row.elected_version,
         'status': status,
         'pool': None if row.pool is None else bool(row.pool),
         'resource_action_mode': row.resource_action_mode,
@@ -4854,6 +5637,53 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
     } for row in rows]
 
 
+def mark_version_controller_applied(
+    service_name: str,
+    version: int,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    applied_at: float | None = None,
+) -> bool:
+    """Record the first owner-fenced application of one committed version.
+
+    Commits and runtime reconciliation intentionally overlap: v2 may finish
+    applying after v3 has committed. The exact committed v2 row can therefore
+    still receive its receipt under the same controller owner. The receipt is
+    idempotent, never overwrites its first timestamp, and cannot revive a
+    quarantined generation.
+    """
+    if not expected_service_hash or expected_controller_owner is None:
+        return False
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        return False
+    if applied_at is None:
+        applied_at = time.time()
+    owner_predicates = [
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+    ]
+    expected_pid, expected_ip = expected_controller_owner
+    owner_predicates.extend([
+        services_table.c.controller_pid == expected_pid,
+        services_table.c.controller_ip == expected_ip,
+    ])
+    with _replica_launch_authority_write_session(service_name) as (_, session):
+        result = session.execute(
+            sqlalchemy.update(version_specs_table).where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.version == version,
+                version_specs_table.c.yaml_content.isnot(None),
+                version_specs_table.c.quarantined_at.is_(None),
+                sqlalchemy.exists().where(*owner_predicates),
+            ).values(controller_applied_at=sqlalchemy.func.coalesce(
+                version_specs_table.c.controller_applied_at, applied_at)))
+        if result.rowcount != 1:
+            session.rollback()
+            return False
+        session.commit()
+    return True
+
+
 def quarantine_version(
     service_name: str,
     version: int,
@@ -4865,8 +5695,7 @@ def quarantine_version(
     """Durably make one committed version ineligible for application."""
     if quarantined_at is None:
         quarantined_at = time.time()
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (_, session):
         predicates = [
             version_specs_table.c.service_name == service_name,
             version_specs_table.c.version == version,
@@ -4967,8 +5796,7 @@ def get_submitted_yaml_content(service_name: str, version: int) -> str | None:
 
 def delete_all_versions(service_name: str) -> None:
     """Deletes all versions from the database."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (_, session):
         session.execute(
             sqlalchemy.delete(version_specs_table).where(
                 version_specs_table.c.service_name == service_name))
@@ -5092,51 +5920,35 @@ def get_recovery_version_spec(
 
     Normally this is the newest non-quarantined commit. If a newer version was
     quarantined after runtime mutation, however, an unproven intermediate
-    commit may sit between it and the version still published to the load
-    balancer. Recovery must prefer the newest active, non-quarantined version
-    in that case. A commit newer than the quarantine still supersedes it.
+    commit may sit between it and the version the controller actually applied.
+    Recovery must prefer the newest durably applied, non-quarantined version in
+    that case. This receipt survives scale-to-zero; active routing versions do
+    not. A commit newer than the quarantine still supersedes it.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        applicable = session.execute(
+        rows = session.execute(
             sqlalchemy.select(
                 version_specs_table.c.version,
-                version_specs_table.c.spec).where(
-                    sqlalchemy.and_(
-                        version_specs_table.c.service_name == service_name,
-                        version_specs_table.c.yaml_content.isnot(None),
-                        version_specs_table.c.quarantined_at.is_(None))).
-            order_by(version_specs_table.c.version.desc()).limit(1)).fetchone()
-        quarantined_version = session.execute(
-            sqlalchemy.select(sqlalchemy.func.max(
-                version_specs_table.c.version)).where(
-                    sqlalchemy.and_(
-                        version_specs_table.c.service_name == service_name,
-                        version_specs_table.c.quarantined_at.isnot(
-                            None)))).scalar_one_or_none()
-        if (quarantined_version is not None and
-            (applicable is None or applicable.version < quarantined_version)):
-            active_versions_json = session.execute(
-                sqlalchemy.select(services_table.c.active_versions).where(
-                    services_table.c.name ==
-                    service_name)).scalar_one_or_none()
-            active_versions = (json.loads(active_versions_json)
-                               if active_versions_json else [])
-            if active_versions:
-                active = session.execute(
-                    sqlalchemy.select(version_specs_table.c.version,
-                                      version_specs_table.c.spec).
-                    where(
-                        sqlalchemy.and_(
-                            version_specs_table.c.service_name == service_name,
-                            version_specs_table.c.version.in_(active_versions),
-                            version_specs_table.c.yaml_content.isnot(None),
-                            version_specs_table.c.quarantined_at.is_(
-                                None))).order_by(
-                                    version_specs_table.c.version.desc()).limit(
-                                        1)).fetchone()
-                if active is not None:
-                    applicable = active
+                version_specs_table.c.spec,
+                version_specs_table.c.quarantined_at,
+                version_specs_table.c.controller_applied_at,
+            ).where(
+                version_specs_table.c.service_name == service_name,
+                version_specs_table.c.yaml_content.isnot(None),
+            ).order_by(version_specs_table.c.version.desc())).fetchall()
+    applicable = next((row for row in rows if row.quarantined_at is None), None)
+    quarantined_version = next(
+        (row.version for row in rows if row.quarantined_at is not None), None)
+    applied = next(
+        (row for row in rows
+         if row.quarantined_at is None and row.controller_applied_at is not None
+        ), None)
+    selected_version = _select_quarantine_aware_version(
+        None if applicable is None else applicable.version, quarantined_version,
+        None if applied is None else applied.version)
+    applicable = next((row for row in rows if row.version == selected_version),
+                      None)
     if applicable is None:
         return None
     spec = pickle.loads(applicable.spec)

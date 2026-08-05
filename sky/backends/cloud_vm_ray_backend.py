@@ -71,6 +71,7 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
 from sky.serve import reserved_capacity
+from sky.serve import serve_state
 from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.serve import system_oom_recovery_observability
 from sky.server import common as server_common
@@ -813,6 +814,88 @@ class RetryingVmProvisioner:
                 'Reserved-fill retry candidate changed its fenced '
                 'Kubernetes context or accelerator shape.') from error
 
+    def _validate_service_replica_launch_fence(self) -> None:
+        """Fail closed if this Serve request lost durable launch authority."""
+        if self._workload_type not in ('service', 'pool'):
+            return
+        launch_context = self._extra_launch_context
+        if not any(key in launch_context
+                   for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
+            # Preserve compatibility for pre-fence persisted requests.  Once a
+            # service activates the config protocol, every new request carries
+            # the fence and legacy requests are rejected at execution entry.
+            return
+        try:
+            authorized = serve_state.service_replica_launch_fence_holds(
+                launch_context)
+        except Exception as error:  # pylint: disable=broad-except
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Unable to prove durable SkyServe replica launch authority.') \
+                from error
+        if not authorized:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Refusing a SkyServe replica launch after its durable '
+                'service generation changed.')
+
+    @contextlib.contextmanager
+    def _service_replica_launch_provider_guard(self) -> typing.Iterator[None]:
+        """Keep one durable Serve fence valid across an opaque cloud call.
+
+        Built-in provisioners and legacy ``ray up`` can perform their own
+        waits and provider-mutating retries.  A check immediately before the
+        call therefore leaves a check/use race.  Shared authorization guards
+        let parallel replicas proceed while making every fence-invalidating
+        database writer wait until the whole provider operation returns.
+        """
+        if self._workload_type not in ('service', 'pool'):
+            yield
+            return
+        launch_context = self._extra_launch_context
+        if not any(key in launch_context
+                   for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
+            yield
+            return
+        service_name = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        if not isinstance(service_name, str) or not service_name:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'SkyServe replica launch is missing its durable service name.')
+
+        acquired = False
+        provider_completed = False
+        try:
+            with serve_state.service_replica_launch_authority_guard(
+                    service_name) as guard:
+                acquired = True
+                # Lock ordering is guard -> authorization read.  Every writer
+                # takes the exclusive guard before opening its SQL transaction,
+                # so this snapshot cannot become stale during the cloud call.
+                if not serve_state.service_replica_launch_authority_guard_is_valid(
+                        guard):
+                    raise exceptions.ServeReplicaLaunchFenceError(
+                        'SkyServe replica launch authority became indeterminate '
+                        'before the provider operation started.')
+                self._validate_service_replica_launch_fence()
+                yield
+                provider_completed = True
+                if not serve_state.service_replica_launch_authority_guard_is_valid(
+                        guard):
+                    raise exceptions.ServeReplicaLaunchFenceError(
+                        'SkyServe replica launch authority became indeterminate '
+                        'while the provider operation was in progress.')
+                self._validate_service_replica_launch_fence()
+        except exceptions.ServeReplicaLaunchFenceError:
+            raise
+        except Exception as error:
+            if acquired and not provider_completed:
+                # Preserve the provider's own failure classification. Its
+                # normal failover/reconciliation path may be required after a
+                # partial provider-side mutation.
+                raise
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Unable to hold durable SkyServe replica launch authority '
+                'across the provider operation.') from error
+
     def _record_fresh_provision_evidence(
         self,
         provision_record: provision_common.ProvisionRecord,
@@ -1232,6 +1315,9 @@ class RetryingVmProvisioner:
 
             for failover_overrides in to_provision.cloud.yield_cloud_specific_failover_overrides(
                     region=to_provision.region):
+                # Do not create even a local INIT record for a request that
+                # lost authority while placement/config generation ran.
+                self._validate_service_replica_launch_fence()
                 try:
                     config_dict = backend_utils.write_cluster_config(
                         to_provision,
@@ -1334,6 +1420,7 @@ class RetryingVmProvisioner:
                 workload_id, workload_task_id = _get_workload_attribution(
                     task, cluster_name, self._workload_type,
                     self._extra_launch_context)
+                self._validate_service_replica_launch_fence()
                 try:
                     self._active_cluster_hash = (
                         global_user_state.add_or_update_cluster(
@@ -1430,11 +1517,12 @@ class RetryingVmProvisioner:
                         # future in-attempt planning changes being inserted
                         # between those layers.
                         self._validate_reserved_fill_candidate(to_provision)
-                        provision_record = bulk_provision_fn(
-                            to_provision.cloud, region, zones,
-                            resources_utils.ClusterName(
-                                cluster_name, handle.cluster_name_on_cloud),
-                            **bulk_provision_kwargs)
+                        with self._service_replica_launch_provider_guard():
+                            provision_record = bulk_provision_fn(
+                                to_provision.cloud, region, zones,
+                                resources_utils.ClusterName(
+                                    cluster_name, handle.cluster_name_on_cloud),
+                                **bulk_provision_kwargs)
                         # NOTE: We will handle the logic of '_ensure_cluster_ray_started'
                         # in 'provision_utils.post_provision_runtime_setup()' in the
                         # caller.
@@ -1525,6 +1613,11 @@ class RetryingVmProvisioner:
                         # Never fail over, retry, or clean up through a context
                         # alias whose physical target no longer matches the
                         # durable reserved-fill request.
+                        raise
+                    except exceptions.RequestCancelled:
+                        # A generation/owner fence is terminal.  In particular,
+                        # do not classify it as capacity, clean up/fail over,
+                        # or retry a provider call under another placement.
                         raise
                     except config_lib.KubernetesError as e:
                         provision_failures.append(e)
@@ -1649,12 +1742,13 @@ class RetryingVmProvisioner:
                     'zone_str': zone_str,
                 }
 
-                status, stdout, stderr, head_internal_ip, head_external_ip = (
-                    self._gang_schedule_ray_up(to_provision.cloud,
-                                               cluster_config_file, handle,
-                                               log_abs_path, stream_logs,
-                                               logging_info,
-                                               to_provision.use_spot))
+                with self._service_replica_launch_provider_guard():
+                    status, stdout, stderr, head_internal_ip, head_external_ip = (
+                        self._gang_schedule_ray_up(to_provision.cloud,
+                                                   cluster_config_file, handle,
+                                                   log_abs_path, stream_logs,
+                                                   logging_info,
+                                                   to_provision.use_spot))
 
                 if status == GangSchedulingStatus.CLUSTER_READY:
                     # We must query the IPs from the cloud provider, when the
@@ -1809,6 +1903,10 @@ class RetryingVmProvisioner:
             # (which may be ok with the semantics of 'sky launch' twice).
             # Tracked in https://github.com/ray-project/ray/issues/20402.
             # Ref: https://github.com/ray-project/ray/blob/releases/2.4.0/python/ray/autoscaler/sdk/sdk.py#L16-L49  # pylint: disable=line-too-long
+            # ``ray up`` has its own retry loop.  Revalidate inside this
+            # function so every provider-mutating retry has a fresh DB fence,
+            # including the final spot upscaling reset call.
+            self._validate_service_replica_launch_fence()
             script_path = write_ray_up_script_with_patched_launch_hash_fn(
                 cluster_config_file, ray_up_kwargs={'no_restart': True})
 
@@ -2089,6 +2187,7 @@ class RetryingVmProvisioner:
                 # exactly one context and accelerator shape, never a general
                 # cross-cloud/cross-pool retry.
                 self._validate_reserved_fill_candidate(to_provision)
+                self._validate_service_replica_launch_fence()
                 # Recheck cluster name as the 'except:' block below may
                 # change the cloud assignment.
                 common_utils.check_cluster_name_is_valid(cluster_name)

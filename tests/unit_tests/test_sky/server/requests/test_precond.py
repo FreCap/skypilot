@@ -264,7 +264,8 @@ class TestClusterStartCompletePrecondition(unittest.IsolatedAsyncioTestCase):
 class TestServiceReplicaLaunchPrecondition(unittest.IsolatedAsyncioTestCase):
     """A persisted launch request must revalidate its Serve owner."""
 
-    @mock.patch('sky.serve.serve_state.get_service_controller_owner')
+    @mock.patch(
+        'sky.serve.serve_state.get_service_replica_launch_authorization')
     async def test_exact_owner_is_authorized(self, mock_get_owner):
         mock_get_owner.return_value = {
             'hash': 'incarnation-a',
@@ -280,7 +281,8 @@ class TestServiceReplicaLaunchPrecondition(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(met)
         self.assertIsNone(message)
 
-    @mock.patch('sky.serve.serve_state.get_service_controller_owner')
+    @mock.patch(
+        'sky.serve.serve_state.get_service_replica_launch_authorization')
     async def test_teardown_owner_is_rejected(self, mock_get_owner):
         mock_get_owner.return_value = {
             'hash': 'incarnation-a',
@@ -294,7 +296,8 @@ class TestServiceReplicaLaunchPrecondition(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(exceptions.RequestCancelled):
             await condition.check()
 
-    @mock.patch('sky.serve.serve_state.get_service_controller_owner')
+    @mock.patch(
+        'sky.serve.serve_state.get_service_replica_launch_authorization')
     async def test_recovering_controller_failed_owner_is_authorized(
             self, mock_get_owner):
         mock_get_owner.return_value = {
@@ -320,8 +323,109 @@ class TestServiceReplicaLaunchPrecondition(unittest.IsolatedAsyncioTestCase):
         execution._validate_service_replica_launch_fence(  # pylint: disable=protected-access
             launch_context)
 
+    @mock.patch(
+        'sky.serve.serve_state.get_service_replica_launch_authorization')
+    async def test_quarantine_aware_version_and_owner_are_both_fenced(
+            self, mock_get_authorization):
+        mock_get_authorization.return_value = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'status': serve_state.ServiceStatus.READY,
+            # Version 2 was committed and quarantined; recovery elected v1.
+            'launch_authorized_version': 1,
+        }
+        version_one = preconditions.ServiceReplicaLaunchPrecondition(
+            'request-v1', 'svc', 'incarnation-a', 123, '10.0.0.1', 1)
+        met, message = await version_one.check()
+        self.assertTrue(met)
+        self.assertIsNone(message)
+
+        version_two = preconditions.ServiceReplicaLaunchPrecondition(
+            'request-v2', 'svc', 'incarnation-a', 123, '10.0.0.1', 2)
+        with self.assertRaises(exceptions.RequestCancelled):
+            await version_two.check()
+
+        stale_owner = preconditions.ServiceReplicaLaunchPrecondition(
+            'request-stale', 'svc', 'incarnation-stale', 123, '10.0.0.1', 1)
+        with self.assertRaises(exceptions.RequestCancelled):
+            await stale_owner.check()
+
+        self.assertEqual(mock_get_authorization.call_count, 3)
+        mock_get_authorization.assert_called_with('svc')
+
+    @mock.patch(
+        'sky.serve.serve_state.get_service_replica_launch_authorization')
+    async def test_legacy_serialized_fence_remains_owner_only(
+            self, mock_get_authorization):
+        """Old persisted v1 payloads omitted the generation field."""
+        mock_get_authorization.return_value = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'status': serve_state.ServiceStatus.READY,
+            'launch_authorized_version': 2,
+            'launch_version_required': False,
+        }
+        condition = preconditions.deserialize(
+            'service-replica-launch.v1', {
+                'check_interval': 1,
+                'service_name': 'svc',
+                'service_hash': 'incarnation-a',
+                'controller_pid': 123,
+                'controller_ip': '10.0.0.1',
+            }, 'legacy-request')
+        self.assertIsInstance(condition,
+                              preconditions.ServiceReplicaLaunchPrecondition)
+        self.assertIsNone(condition.service_version)
+
+        met, message = await condition.check()
+
+        self.assertTrue(met)
+        self.assertIsNone(message)
+
+    @mock.patch(
+        'sky.serve.serve_state.get_service_replica_launch_authorization')
+    async def test_legacy_fence_is_rejected_after_config_protocol_activation(
+            self, mock_get_authorization):
+        mock_get_authorization.return_value = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'status': serve_state.ServiceStatus.READY,
+            'launch_authorized_version': 2,
+            'launch_version_required': True,
+        }
+        condition = preconditions.deserialize(
+            'service-replica-launch.v1', {
+                'check_interval': 1,
+                'service_name': 'svc',
+                'service_hash': 'incarnation-a',
+                'controller_pid': 123,
+                'controller_ip': '10.0.0.1',
+            }, 'legacy-request')
+
+        with self.assertRaises(exceptions.RequestCancelled):
+            await condition.check()
+
+    def test_new_serialized_fence_round_trips_generation(self):
+        condition = preconditions.ServiceReplicaLaunchPrecondition(
+            'request-id', 'svc', 'incarnation-a', 123, '10.0.0.1', 7)
+
+        durable = preconditions.serialize(condition)
+
+        self.assertIsNotNone(durable)
+        assert durable is not None
+        self.assertEqual(durable.payload['service_version'], 7)
+        restored = preconditions.deserialize(durable.type_name, durable.payload,
+                                             'request-id')
+        self.assertIsInstance(restored,
+                              preconditions.ServiceReplicaLaunchPrecondition)
+        self.assertEqual(restored.service_version, 7)
+
     @mock.patch('sky.execution.dag_utils.convert_entrypoint_to_dag')
-    @mock.patch('sky.serve.serve_state.get_service_controller_owner')
+    @mock.patch(
+        'sky.serve.serve_state.get_service_replica_launch_authorization')
     def test_replayed_request_rechecks_fence_before_execution(
             self, mock_get_owner, mock_convert_dag):
         """Restart replay cannot bypass the in-memory precondition."""
@@ -342,6 +446,54 @@ class TestServiceReplicaLaunchPrecondition(unittest.IsolatedAsyncioTestCase):
                 _extra_launch_context=launch_context)
 
         mock_convert_dag.assert_not_called()
+
+    @mock.patch(
+        'sky.serve.serve_state.get_service_replica_launch_authorization')
+    def test_execution_uses_quarantine_aware_generation_and_owner_fence(
+            self, mock_get_authorization):
+        mock_get_authorization.return_value = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'status': serve_state.ServiceStatus.READY,
+            'launch_authorized_version': 1,
+            'launch_version_required': True,
+        }
+
+        def launch_context(version, service_hash='incarnation-a'):
+            return {
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: service_hash,
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: version,
+                serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+                serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+            }
+
+        execution._validate_service_replica_launch_fence(  # pylint: disable=protected-access
+            launch_context(1))
+        with self.assertRaises(exceptions.RequestCancelled):
+            execution._validate_service_replica_launch_fence(  # pylint: disable=protected-access
+                launch_context(2))
+        with self.assertRaises(exceptions.RequestCancelled):
+            execution._validate_service_replica_launch_fence(  # pylint: disable=protected-access
+                launch_context(1, service_hash='incarnation-stale'))
+
+        legacy_context = launch_context(1)
+        legacy_context.pop(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
+        with mock.patch(
+                'sky.execution.dag_utils.convert_entrypoint_to_dag') as convert:
+            with self.assertRaises(exceptions.RequestCancelled):
+                execution._execute(  # pylint: disable=protected-access
+                    mock.MagicMock(),
+                    _request_name=request_names.AdminPolicyRequestName.
+                    CLUSTER_LAUNCH,
+                    _is_launched_by_sky_serve_controller=True,
+                    _extra_launch_context=legacy_context)
+            convert.assert_not_called()
+
+        self.assertEqual(mock_get_authorization.call_count, 4)
+        mock_get_authorization.assert_called_with('svc')
 
     @mock.patch('sky.execution.serve_utils.is_external_load_balancer_mode',
                 return_value=False)

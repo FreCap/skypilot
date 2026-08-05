@@ -30,7 +30,9 @@ class _TrackedLock:
             self.held = False
 
 
-def _install_demotion_preconditions(monkeypatch, lock: _TrackedLock) -> None:
+def _install_demotion_preconditions(monkeypatch,
+                                    lock: _TrackedLock,
+                                    serve_revision: str = '035') -> None:
     monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
     monkeypatch.setattr(serve_state, 'get_database_engine',
                         mock.Mock(return_value=object()))
@@ -38,16 +40,18 @@ def _install_demotion_preconditions(monkeypatch, lock: _TrackedLock) -> None:
         broker.migration_utils, 'get_current_alembic_revision',
         mock.Mock(
             side_effect=lambda _engine, section: {
-                broker.migration_utils.SERVE_DB_NAME: '035',
+                broker.migration_utils.SERVE_DB_NAME: serve_revision,
                 broker.migration_utils.API_REQUESTS_DB_NAME: '008',
             }[section]))
     monkeypatch.setattr(serve_state, 'get_reserved_fill_protocol_state',
                         mock.Mock(return_value={'protocol_version': 2}))
 
 
-def test_demotion_attests_stable_token_bound_rollout_under_lock(monkeypatch):
+@pytest.mark.parametrize('serve_revision', ['035', '036'])
+def test_demotion_attests_stable_token_bound_rollout_under_lock(
+        monkeypatch, serve_revision):
     lock = _TrackedLock()
-    _install_demotion_preconditions(monkeypatch, lock)
+    _install_demotion_preconditions(monkeypatch, lock, serve_revision)
     rollout = mock.Mock()
 
     def attest():
@@ -93,7 +97,7 @@ def test_demotion_rejects_unstable_rollout_before_database_mutation(
     setter.assert_not_called()
 
 
-def test_demotion_rejects_schema_other_than_exact_035(monkeypatch):
+def test_demotion_rejects_schema_outside_compatible_set(monkeypatch):
     lock = _TrackedLock()
     monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
     monkeypatch.setattr(serve_state, 'get_database_engine',
@@ -107,7 +111,7 @@ def test_demotion_rejects_schema_other_than_exact_035(monkeypatch):
                         setter)
 
     with pytest.raises(broker.ProtocolV1DemotionError,
-                       match='exact Serve schema revision 035'):
+                       match='Serve schema revision 035 or 036'):
         broker.demote_protocol_v1()
     attester.assert_not_called()
     setter.assert_not_called()

@@ -635,7 +635,7 @@ def _install_old_feature_draft(engine: sqlalchemy.engine.Engine) -> None:
                                                           checkfirst=True)
 
 
-def test_serve_alembic_lineage_has_033_034_then_reserved_fill_035() -> None:
+def test_serve_alembic_lineage_has_033_through_controller_config_036() -> None:
     engine = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
@@ -643,11 +643,12 @@ def test_serve_alembic_lineage_has_033_034_then_reserved_fill_035() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [revision.revision for revision in revisions]
     assert len(revision_ids) == len(set(revision_ids))
-    assert scripts.get_heads() == ['035']
+    assert scripts.get_heads() == ['036']
     revision_032 = scripts.get_revision('032')
     revision_033 = scripts.get_revision('033')
     revision_034 = scripts.get_revision('034')
     revision_035 = scripts.get_revision('035')
+    revision_036 = scripts.get_revision('036')
     assert Path(revision_032.path).name == (
         '032_serve_request_rejection_classification.py')
     assert revision_032.down_revision == '031'
@@ -658,7 +659,9 @@ def test_serve_alembic_lineage_has_033_034_then_reserved_fill_035() -> None:
     assert revision_034.down_revision == '033'
     assert Path(revision_035.path).name == ('035_multi_pool_reserved_fill.py')
     assert revision_035.down_revision == '034'
-    assert migration_utils.SERVE_VERSION == '035'
+    assert Path(revision_036.path).name == ('036_version_controller_config.py')
+    assert revision_036.down_revision == '035'
+    assert migration_utils.SERVE_VERSION == '036'
 
 
 def test_staged_and_head_schema_aliases_are_disjoint_and_complete() -> None:
@@ -847,6 +850,70 @@ def test_postgres_revision_035_copies_legacy_claim_as_inert_shadow(
     assert migrated_round == (1, '{}')
     assert retained_legacy == ('["ctx","h200"]', 2.0, 3, 8, 1, 7, 1, 2, 0, 99.0,
                                100.0)
+
+
+def test_postgres_revision_036_adds_nullable_version_config_and_applied_receipt(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    with engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    metadata = sqlalchemy.MetaData()
+    versions = sqlalchemy.Table(
+        'version_specs',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
+        sqlalchemy.Column('yaml_content', sqlalchemy.Text),
+    )
+    alembic_version = sqlalchemy.Table(
+        _VERSION_TABLE,
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(versions.insert().values(
+            service_name='svc',
+            version=7,
+            spec=b'opaque-spec',
+            yaml_content='service: preserved'))
+        connection.execute(alembic_version.insert().values(version_num='035'))
+
+    _upgrade(engine, '036')
+
+    assert _revision(engine) == '036'
+    columns = _column_map(sqlalchemy.inspect(engine), 'version_specs')
+    assert columns['controller_config']['nullable'] is True
+    assert columns['controller_config_digest']['nullable'] is True
+    assert columns['controller_config_snapshot_id']['nullable'] is True
+    assert columns['controller_applied_at']['nullable'] is True
+    assert isinstance(columns['controller_config']['type'],
+                      sqlalchemy.LargeBinary)
+    assert isinstance(columns['controller_config_digest']['type'],
+                      sqlalchemy.Text)
+    assert isinstance(columns['controller_config_snapshot_id']['type'],
+                      sqlalchemy.Text)
+    assert isinstance(columns['controller_applied_at']['type'],
+                      sqlalchemy.Float)
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.text(
+                'SELECT service_name, version, spec, yaml_content, '
+                'controller_config, controller_config_digest, '
+                'controller_config_snapshot_id, controller_applied_at '
+                'FROM version_specs')).one()
+    assert row.service_name == 'svc'
+    assert row.version == 7
+    assert bytes(row.spec) == b'opaque-spec'
+    assert row.yaml_content == 'service: preserved'
+    assert row.controller_config is None
+    assert row.controller_config_digest is None
+    assert row.controller_config_snapshot_id is None
+    assert row.controller_applied_at is None
 
 
 def test_postgres_revision_035_serializes_concurrent_legacy_writer_and_reupgrade(

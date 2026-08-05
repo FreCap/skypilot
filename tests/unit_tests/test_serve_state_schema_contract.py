@@ -80,6 +80,19 @@ def test_reserved_fill_round_persists_optional_exact_card_feed():
     assert column.server_default is None
 
 
+def test_version_specs_persists_nullable_controller_recovery_state():
+    columns = serve_state.version_specs_table.c
+    assert isinstance(columns.controller_config.type, sqlalchemy.LargeBinary)
+    assert isinstance(columns.controller_config_digest.type, sqlalchemy.Text)
+    assert isinstance(columns.controller_config_snapshot_id.type,
+                      sqlalchemy.Text)
+    assert columns.controller_config.nullable
+    assert columns.controller_config_digest.nullable
+    assert columns.controller_config_snapshot_id.nullable
+    assert isinstance(columns.controller_applied_at.type, sqlalchemy.Float)
+    assert columns.controller_applied_at.nullable
+
+
 def test_reserved_fill_protocol_persists_rollout_inventory_evidence():
     protocol = serve_state.reserved_fill_protocol_state_table.c
     assert isinstance(protocol.deployment_uid.type, sqlalchemy.Text)

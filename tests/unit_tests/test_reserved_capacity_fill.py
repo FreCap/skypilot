@@ -1044,6 +1044,100 @@ class TestPollerFlagOff(unittest.TestCase):
     class _Stop(Exception):
         pass
 
+    def test_pre_set_stop_event_performs_no_poll(self):
+        autoscaler = _make_autoscaler(fill=True)
+        placer = mock.Mock()
+        stop_event = threading.Event()
+        stop_event.set()
+
+        reserved_capacity.poller_loop(lambda: autoscaler,
+                                      lambda: placer,
+                                      stop_event=stop_event)
+
+        placer.zero_cost_locations.assert_not_called()
+
+    def test_complete_cycle_is_serialized_with_update_epoch(self):
+        autoscaler = _make_autoscaler(fill=True)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        stop_event = threading.Event()
+        actuation_lock = threading.RLock()
+        cycle_started = threading.Event()
+        release_cycle = threading.Event()
+        update_acquired = threading.Event()
+
+        def _slow_cycle(*_args, **_kwargs):
+            cycle_started.set()
+            self.assertTrue(release_cycle.wait(timeout=5))
+
+        with mock.patch.object(
+                reserved_capacity.reserved_capacity_broker,
+                'get_protocol_version',
+                return_value=reserved_capacity_broker.PROTOCOL_V2), \
+             mock.patch.object(reserved_capacity,
+                               '_broker_cycle_v2',
+                               side_effect=_slow_cycle):
+            poller = threading.Thread(
+                target=reserved_capacity.poller_loop,
+                args=(lambda: autoscaler, lambda: placer),
+                kwargs={
+                    'service_name': 'svc',
+                    'stop_event': stop_event,
+                    'actuation_epoch_lock': actuation_lock,
+                })
+            poller.start()
+            self.assertTrue(cycle_started.wait(timeout=5))
+
+            def _update_epoch():
+                with actuation_lock:
+                    update_acquired.set()
+                    stop_event.set()
+
+            updater = threading.Thread(target=_update_epoch)
+            updater.start()
+            self.assertFalse(update_acquired.wait(timeout=0.05))
+            release_cycle.set()
+            self.assertTrue(update_acquired.wait(timeout=5))
+            updater.join(timeout=5)
+            poller.join(timeout=5)
+
+        self.assertFalse(updater.is_alive())
+        self.assertFalse(poller.is_alive())
+
+    def test_stop_while_waiting_for_update_epoch_skips_cycle(self):
+        autoscaler = _make_autoscaler(fill=True)
+        placer = mock.Mock()
+        stop_event = threading.Event()
+        lock_entered = threading.Event()
+        release_lock = threading.Event()
+
+        class _BlockedEpoch:
+
+            def __enter__(self):
+                lock_entered.set()
+                if not release_lock.wait(timeout=5):
+                    raise AssertionError('test did not release epoch lock')
+
+            def __exit__(self, *_args):
+                return False
+
+        blocked_epoch = _BlockedEpoch()
+        poller = threading.Thread(target=reserved_capacity.poller_loop,
+                                  args=(lambda: autoscaler, lambda: placer),
+                                  kwargs={
+                                      'service_name': 'svc',
+                                      'stop_event': stop_event,
+                                      'actuation_epoch_lock': blocked_epoch,
+                                  })
+        poller.start()
+        self.assertTrue(lock_entered.wait(timeout=5))
+        stop_event.set()
+        release_lock.set()
+        poller.join(timeout=5)
+
+        self.assertFalse(poller.is_alive())
+        placer.zero_cost_locations.assert_not_called()
+
     def _run_one_cycle(self, autoscaler):
         placer = mock.Mock()
         placer.zero_cost_locations.return_value = []

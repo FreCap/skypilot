@@ -18,6 +18,7 @@ from typing import Any
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
+from sky.serve import constants as serve_constants
 from sky.serve import serve_state
 from sky.server.requests import requests as api_requests
 from sky.utils import common_utils
@@ -227,6 +228,7 @@ class ServiceReplicaLaunchPrecondition(Precondition):
                  service_hash: str,
                  controller_pid: int | None,
                  controller_ip: str | None,
+                 service_version: int | None = None,
                  check_interval: float = _PRECONDITION_CHECK_INTERVAL) -> None:
         super().__init__(request_id=request_id,
                          timeout=0,
@@ -235,17 +237,25 @@ class ServiceReplicaLaunchPrecondition(Precondition):
         self.service_hash = service_hash
         self.controller_pid = controller_pid
         self.controller_ip = controller_ip
+        self.service_version = service_version
 
     async def check(self) -> tuple[bool, str | None]:
-        owner = await asyncio.to_thread(
-            serve_state.get_service_controller_owner, self.service_name)
-        authorized = (
-            owner is not None and owner.get('hash') == self.service_hash and
-            (owner.get('controller_pid'), owner.get('controller_ip'))
-            == (self.controller_pid, self.controller_ip) and owner.get('status')
-            not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
+        launch_context = {
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY:
+                self.service_name,
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY:
+                self.service_hash,
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY:
+                self.service_version,
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY:
+                self.controller_pid,
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY:
+                self.controller_ip,
+        }
+        authorized = await asyncio.to_thread(
+            serve_state.service_replica_launch_fence_holds, launch_context)
         if not authorized:
-            raise exceptions.RequestCancelled(
+            raise exceptions.ServeReplicaLaunchFenceError(
                 f'Refusing replica launch for stale service owner '
                 f'{self.service_name!r}/{self.service_hash!r}.')
         return True, None
@@ -275,6 +285,7 @@ def serialize(precondition: Precondition | None) -> DurablePrecondition | None:
                 'service_hash': precondition.service_hash,
                 'controller_pid': precondition.controller_pid,
                 'controller_ip': precondition.controller_ip,
+                'service_version': precondition.service_version,
             },
             deadline=deadline)
     raise ValueError(
@@ -299,12 +310,17 @@ def deserialize(type_name: str, payload: dict[str, Any],
         controller_ip = payload.get('controller_ip')
         if controller_ip is not None:
             controller_ip = str(controller_ip)
+        service_version = payload.get('service_version')
+        if (service_version is not None and
+            (type(service_version) is not int or service_version <= 0)):
+            raise ValueError('Service replica launch version is malformed.')
         return ServiceReplicaLaunchPrecondition(
             request_id=request_id,
             service_name=str(payload['service_name']),
             service_hash=str(payload['service_hash']),
             controller_pid=controller_pid,
             controller_ip=controller_ip,
+            service_version=service_version,
             check_interval=float(payload['check_interval']))
     raise ValueError(f'Unknown durable precondition type {type_name!r}.')
 

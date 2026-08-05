@@ -8,11 +8,14 @@ import argparse
 from collections.abc import Callable
 from collections.abc import Iterator
 import contextlib
+import contextvars
 import dataclasses
+import hashlib
 import json
 import multiprocessing
 import os
 import pathlib
+import secrets
 import shutil
 import socket
 import sys
@@ -1123,6 +1126,56 @@ def _respawn_controller(
         return None
     version, service_spec = snapshot
 
+    # A child can die after the version/catalog/recovery transaction commits
+    # but before it promotes the matching config. Reconcile that generation in
+    # the long-lived parent before every respawn, then atomically publish the
+    # already-validated bytes so forked children cannot inherit the old or a
+    # transient empty process config.
+    try:
+        live_path = serve_utils.generate_versioned_config_yaml_file_name(
+            service_name, version, resource_scope)
+        config_snapshot = serve_state.get_version_controller_config(
+            service_name, version)
+        if config_snapshot is not None:
+            staged_path = serve_utils.generate_staged_config_yaml_file_name(
+                service_name,
+                version,
+                resource_scope,
+                snapshot_id=config_snapshot[2])
+            recovery_identity = (
+                serve_state.get_service_config_recovery_identity(service_name))
+            if (recovery_identity is None or
+                    recovery_identity[0] != service_hash):
+                raise RuntimeError('Service incarnation changed before '
+                                   'controller config recovery.')
+            expected_workspace = recovery_identity[1]
+            with filelock.FileLock(
+                    skypilot_config.get_skypilot_config_lock_path()):
+                config_bytes = serve_utils.restore_version_controller_config(
+                    service_name,
+                    version,
+                    live_path,
+                    staged_path,
+                    expected_workspace=expected_workspace)
+                assert config_bytes is not None
+                config = (
+                    serve_utils.parse_and_validate_version_controller_config(
+                        config_bytes, expected_workspace,
+                        'committed Serve controller recovery config'))
+
+                def _publish_config() -> None:
+                    skypilot_config.install_internal_config_snapshot(
+                        config, live_path)
+
+                contextvars.Context().run(_publish_config)
+                serve_utils.scrub_obsolete_controller_config_files(
+                    service_name, version, resource_scope)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error('Failed to reconcile the committed controller config for '
+                     f'{service_name}: {common_utils.format_exception(e)}; '
+                     'will retry on the next tick.')
+        return None
+
     new_controller = None
     try:
         with _spawn_controller_on_reserved_port(
@@ -1179,13 +1232,14 @@ def _respawn_controller(
 
 def _get_latest_committed_lb_termination_grace_seconds(
         service_name: str) -> int | None:
-    """Return LB termination grace seconds from the latest committed spec.
+    """Return LB termination grace seconds from the recovery-elected spec.
 
     The external-LB supervision loop runs for the lifetime of the service, so
-    it should reuse the one-row committed `(version, spec)` snapshot instead of
-    re-issuing separate latest-version and spec reads on every upkeep round.
+    it should reuse the quarantine-aware `(version, spec)` snapshot instead of
+    re-issuing separate latest-version and spec reads on every upkeep round or
+    applying grace from an unproven intermediate generation.
     """
-    snapshot = serve_state.get_latest_applicable_version_spec(service_name)
+    snapshot = serve_state.get_recovery_version_spec(service_name)
     if snapshot is None:
         return None
     _, latest_spec = snapshot
@@ -1497,15 +1551,33 @@ def _start(service_name: str,
            created_by: str | None = None,
            submitted_task_yaml: str | None = None):
     """Start the service controller and reconcile its external LB."""
+    raw_recovery_owner_fence = os.environ.pop(
+        constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR, None)
+    recovery_owner_fence = (
+        serve_utils.parse_ha_recovery_owner_fence(raw_recovery_owner_fence)
+        if raw_recovery_owner_fence is not None else None)
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
     auth_utils.get_or_generate_keys()
 
     service = serve_state.get_service_from_name(service_name)
     is_recovery = service is not None
+    if recovery_owner_fence is not None and not is_recovery:
+        raise RuntimeError(f'Refusing an HA recovery launch for absent service '
+                           f'{service_name!r}.')
     if service is not None:
         _validate_recovery_target(service_name, service, requested_incarnation,
                                   job_id)
+        if recovery_owner_fence is not None:
+            if recovery_owner_fence['service_hash'] != service.get('hash'):
+                raise RuntimeError(
+                    f'Refusing stale HA recovery ownership for '
+                    f'{service_name!r}: its service incarnation changed.')
+            if (recovery_owner_fence['lifecycle_epoch']
+                    != service.get('lifecycle_epoch')):
+                raise RuntimeError(
+                    f'Refusing stale HA recovery ownership for '
+                    f'{service_name!r}: its lifecycle epoch changed.')
         workspace_hint = workspace
         if (workspace_hint is None and
                 skypilot_config.is_active_workspace_set()):
@@ -1534,11 +1606,24 @@ def _start(service_name: str,
     service_incarnation: str | None
     recovery_expected_controller_pid: int | None = None
     recovery_expected_controller_ip: str | None = None
+    recovery_expected_lifecycle_epoch: int | None = None
+    recovery_expected_status: serve_state.ServiceStatus | None = None
+    recovery_expected_version: int | None = None
     if is_recovery:
         assert service is not None
         service_incarnation = service.get('hash')
-        recovery_expected_controller_pid = service.get('controller_pid')
-        recovery_expected_controller_ip = service.get('controller_ip')
+        if recovery_owner_fence is not None:
+            recovery_expected_controller_pid = recovery_owner_fence[
+                'controller_pid']
+            recovery_expected_controller_ip = recovery_owner_fence[
+                'controller_ip']
+            recovery_expected_lifecycle_epoch = recovery_owner_fence[
+                'lifecycle_epoch']
+            recovery_expected_status = recovery_owner_fence['status']
+            recovery_expected_version = recovery_owner_fence['recovery_version']
+        else:
+            recovery_expected_controller_pid = service.get('controller_pid')
+            recovery_expected_controller_ip = service.get('controller_ip')
         resource_scope = service.get('resource_scope')
     else:
         # add_service accepts the caller-generated UUID while preserving its
@@ -1563,6 +1648,51 @@ def _start(service_name: str,
                          if is_recovery else None)
     recovery_version = (recovery_snapshot[0]
                         if recovery_snapshot is not None else None)
+    if (recovery_expected_version is not None and
+            recovery_version != recovery_expected_version):
+        raise RuntimeError(
+            f'Refusing stale HA recovery ownership for {service_name!r}: '
+            f'elected version changed from {recovery_expected_version} to '
+            f'{recovery_version}.')
+
+    # The HA daemon restores before launching this process so imports see a
+    # valid file. Reconcile again after selecting the quarantine-aware version:
+    # an update or quarantine transition may have raced the daemon's snapshot.
+    if is_recovery and recovery_version is not None:
+        live_config_path = (
+            serve_utils.generate_versioned_config_yaml_file_name(
+                service_name, recovery_version, resource_scope))
+        recovery_config_snapshot = serve_state.get_version_controller_config(
+            service_name, recovery_version)
+        if recovery_config_snapshot is not None:
+            staged_config_path = (
+                serve_utils.generate_staged_config_yaml_file_name(
+                    service_name,
+                    recovery_version,
+                    resource_scope,
+                    snapshot_id=recovery_config_snapshot[2]))
+            with filelock.FileLock(
+                    skypilot_config.get_skypilot_config_lock_path()):
+                recovery_config_bytes = (
+                    serve_utils.restore_version_controller_config(
+                        service_name,
+                        recovery_version,
+                        live_config_path,
+                        staged_config_path,
+                        expected_workspace=workspace))
+                assert recovery_config_bytes is not None
+                recovered_config = (
+                    serve_utils.parse_and_validate_version_controller_config(
+                        recovery_config_bytes, workspace,
+                        'committed Serve controller recovery config'))
+
+                def _publish_recovery_config() -> None:
+                    skypilot_config.install_internal_config_snapshot(
+                        recovered_config, live_config_path)
+
+                contextvars.Context().run(_publish_recovery_config)
+                serve_utils.scrub_obsolete_controller_config_files(
+                    service_name, recovery_version, resource_scope)
 
     if is_recovery:
         assert service is not None
@@ -1611,7 +1741,10 @@ def _start(service_name: str,
             expected_controller_pid=recovery_expected_controller_pid,
             expected_controller_ip=recovery_expected_controller_ip,
             controller_pid=os.getpid(),
-            controller_ip=pod_ip)
+            controller_ip=pod_ip,
+            expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
+            expected_status=recovery_expected_status,
+            expected_recovery_version=recovery_expected_version)
         _exit_on_ownership_loss(claimed, service_name,
                                 'claiming teardown recovery', None)
         logger.info(f'Recovering service {service_name} in status '
@@ -1649,6 +1782,30 @@ def _start(service_name: str,
     # service/version write too. This protects direct/older API callers and
     # admin-policy mutations that bypassed an earlier server-side validation.
     serve_utils.validate_logical_replica_task(task, service_spec)
+
+    initial_controller_config: bytes | None = None
+    initial_controller_config_digest: str | None = None
+    initial_controller_config_snapshot_id: str | None = None
+    if not is_recovery and lifecycle_epoch is not None:
+        live_config_path = (serve_utils.generate_remote_config_yaml_file_name(
+            service_name, resource_scope))
+        try:
+            with open(os.path.expanduser(live_config_path),
+                      'rb') as config_file:
+                raw_controller_config = config_file.read()
+        except OSError as e:
+            raise RuntimeError(
+                'Consolidated controller config is unavailable before '
+                'service registration.') from e
+        initial_controller_config = (
+            serve_utils.sanitize_ha_recovery_config_bytes(raw_controller_config)
+        )
+        initial_controller_config_digest = hashlib.sha256(
+            initial_controller_config).hexdigest()
+        initial_controller_config_snapshot_id = secrets.token_hex(32)
+        serve_utils.parse_and_validate_version_controller_config(
+            initial_controller_config, workspace,
+            'initial durable Serve controller config')
 
     placement_catalog = _prepare_placement_catalog(
         service_name,
@@ -1697,7 +1854,11 @@ def _start(service_name: str,
                     resource_scope=resource_scope,
                     created_by=created_by,
                     submitted_yaml_content=submitted_yaml_content,
-                    placement_catalog=placement_catalog)
+                    placement_catalog=placement_catalog,
+                    controller_config=initial_controller_config,
+                    controller_config_digest=(initial_controller_config_digest),
+                    controller_config_snapshot_id=(
+                        initial_controller_config_snapshot_id))
             except (serve_state.OrphanedReplicaRecordsError,
                     serve_state.OrphanedStorageCleanupIntentsError,
                     serve_state.OrphanedVersionRecordsError):
@@ -1762,7 +1923,10 @@ def _start(service_name: str,
             expected_controller_pid=recovery_expected_controller_pid,
             expected_controller_ip=recovery_expected_controller_ip,
             controller_pid=os.getpid(),
-            controller_ip=pod_ip)
+            controller_ip=pod_ip,
+            expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
+            expected_status=recovery_expected_status,
+            expected_recovery_version=recovery_expected_version)
         _exit_on_ownership_loss(claimed, service_name, 'preclaiming recovery',
                                 None)
 

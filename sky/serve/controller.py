@@ -5,11 +5,15 @@ Responsible for autoscaling and replica management.
 import asyncio
 from collections.abc import Callable
 import contextlib
+import contextvars
 import functools
+import hashlib
 import hmac
 import logging
 import math
 import os
+import re
+import signal
 import socket
 import threading
 import time
@@ -20,12 +24,14 @@ import uuid
 import colorama
 import fastapi
 from fastapi import responses
+import filelock
 import uvicorn
 
 from sky import exceptions
 from sky import global_user_state
 from sky import serve
 from sky import sky_logging
+from sky import skypilot_config
 from sky import task as task_lib
 from sky.serve import auth_tokens
 from sky.serve import autoscalers
@@ -45,6 +51,7 @@ from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.skylet import constants
 from sky.utils import common_utils
+from sky.utils import context as sky_context
 from sky.utils import context_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
@@ -118,6 +125,24 @@ class _PreparedLoadBalancerReport(NamedTuple):
     authority: tuple[bool, bool, bool]
     effective_request_data: dict[str, Any]
     ha_enabled: bool
+
+
+class _PreparedControllerConfig(NamedTuple):
+    """Validated, immutable inputs for one config-aware update generation."""
+
+    config: Any
+    service_name: str
+    live_path: str
+    staged_path: str
+    recovery_script: str
+    version: int
+    snapshot_id: str
+    source_digest: str
+    durable_bytes: bytes
+    durable_digest: str
+    source_is_staged: bool
+    source_is_live: bool
+    legacy_snapshot: tuple[bytes, str, str] | None
 
 
 def _make_auth_dependency(*,
@@ -292,6 +317,7 @@ class _PendingServiceUpdate(NamedTuple):
     service: Any
     update_mode: serve_utils.UpdateMode
     committed_at: float
+    prepared_config: _PreparedControllerConfig | None
 
 
 _UPDATE_RETRY_BACKOFF_SECONDS = 5
@@ -299,6 +325,10 @@ _UPDATE_RETRY_BACKOFF_SECONDS = 5
 
 class DeterministicServiceUpdateError(ValueError):
     """An immutable committed spec cannot be applied by this controller."""
+
+
+class ServiceUpdateRequiresRecoveryError(RuntimeError):
+    """A config/runtime transition began and cannot be retried in process."""
 
 
 class SkyServeController:
@@ -343,6 +373,7 @@ class SkyServeController:
         self._update_lock = threading.Lock()
         self._update_condition = threading.Condition()
         self._pending_update: _PendingServiceUpdate | None = None
+        self._applying_update: _PendingServiceUpdate | None = None
         # Recovery boots the latest applicable version. Preserve the highest
         # committed version separately so a quarantined candidate remains
         # visible without becoming runtime authority.
@@ -364,6 +395,15 @@ class SkyServeController:
         self._routing_state_lock = threading.RLock()
         self._update_apply_error: str | None = None
         self._update_apply_failures = 0
+        self._update_recovery_required = False
+        self._update_reconciler_stop = threading.Event()
+        # Serialize every autoscaler actuation epoch with a controller-config
+        # transition. If a transition fails after publishing any new runtime
+        # state, its catch path raises the irreversible stop fence before this
+        # lock is released; an old or partially updated decision can therefore
+        # never resume scaling while the parent prepares a fresh child.
+        self._actuation_epoch_lock = threading.RLock()
+        self._actuation_stop = threading.Event()
         # Serialize LB snapshots while resolving a cold replica cache in the
         # threadpool. Concurrent LB Pods can overlap during a rollout; without
         # this lock they would duplicate the fleet-wide endpoint work and race
@@ -497,6 +537,10 @@ class SkyServeController:
         # replica snapshot. Status polling reads this without new DB/API work.
         self._replica_counts_snapshot: dict[str, int | str] | None = None
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
+        if not self._mark_controller_applied_version(version):
+            raise RuntimeError(
+                f'Could not durably mark recovered service version {version} '
+                'as controller-applied under the current ownership fence.')
 
     @contextlib.asynccontextmanager
     async def lifespan(self, _: fastapi.FastAPI):
@@ -3125,6 +3169,302 @@ class SkyServeController:
             return persisted
         return serve.SkyServiceSpec.from_yaml_str(yaml_content)
 
+    def _prepare_controller_config_update(
+            self, version: int, expected_digest: str,
+            snapshot_id: str) -> _PreparedControllerConfig:
+        """Validate a staged config and bind it to the HA recovery script."""
+        live_path = serve_utils.generate_versioned_config_yaml_file_name(
+            self._service_name, version, self._resource_scope)
+        staged_path = serve_utils.generate_staged_config_yaml_file_name(
+            self._service_name,
+            version,
+            self._resource_scope,
+            snapshot_id=snapshot_id)
+        recovery_script = serve_state.get_ha_recovery_script(self._service_name)
+        if recovery_script is None:
+            raise RuntimeError('Service HA recovery script is missing; '
+                               'refusing a non-durable config refresh.')
+        committed_yaml = serve_state.get_yaml_content(self._service_name,
+                                                      version)
+        committed_snapshot = (serve_state.get_version_controller_config(
+            self._service_name, version)
+                              if committed_yaml is not None else None)
+        try:
+            config_bytes = serve_utils.secure_staged_controller_config(
+                staged_path, expected_digest)
+        except FileNotFoundError:
+            config_bytes = None
+        if config_bytes is not None:
+            if committed_yaml is None:
+                serve_utils.write_config_snapshot_receipt(
+                    staged_path, version, snapshot_id, expected_digest)
+                durable_bytes = serve_utils.sanitize_ha_recovery_config_bytes(
+                    config_bytes)
+                durable_digest = hashlib.sha256(durable_bytes).hexdigest()
+                source_is_staged = True
+                source_is_live = False
+            else:
+                if committed_snapshot is None:
+                    raise RuntimeError('Committed controller config snapshot '
+                                       'is unavailable for retry.')
+                (durable_bytes, durable_digest,
+                 committed_snapshot_id) = committed_snapshot
+                if committed_snapshot_id != snapshot_id:
+                    raise RuntimeError(
+                        'Committed controller config snapshot ID does not '
+                        'match the API-server submission.')
+                # Never mint or overwrite a receipt after the immutable row is
+                # committed. A retry may upload different raw bytes using the
+                # same nonce and safe projection; those bytes must never gain
+                # authority over the committed version. Preserve raw fields
+                # only when the pre-commit receipt still proves exact identity.
+                receipt = serve_utils.get_config_snapshot_receipt(staged_path)
+                receipt_matches = (
+                    receipt is not None and receipt['version'] == version and
+                    receipt['snapshot_id'] == snapshot_id and
+                    receipt['source_digest'] == expected_digest and
+                    hashlib.sha256(config_bytes).hexdigest() == expected_digest)
+                if (receipt_matches and hashlib.sha256(
+                        serve_utils.sanitize_ha_recovery_config_bytes(
+                            config_bytes)).hexdigest() == durable_digest):
+                    source_is_staged = True
+                else:
+                    config_bytes = durable_bytes
+                    source_is_staged = False
+                source_is_live = False
+        else:
+            # os.replace consumes the staged file. A lost 200 response must be
+            # retryable after that point, but absence before the version commit
+            # is never valid and must not silently admit the old live config.
+            if committed_yaml is None:
+                raise RuntimeError('Staged controller config snapshot is '
+                                   'missing before version commit.')
+            if committed_snapshot is None:
+                raise RuntimeError('Committed controller config snapshot is '
+                                   'unavailable for retry.')
+            (durable_bytes, durable_digest,
+             committed_snapshot_id) = committed_snapshot
+            if committed_snapshot_id != snapshot_id:
+                raise RuntimeError(
+                    'Committed controller config snapshot ID does not match '
+                    'the API-server submission.')
+            live_receipt = serve_utils.get_config_snapshot_receipt(live_path)
+            if (live_receipt is not None and
+                    live_receipt['snapshot_id'] == snapshot_id and
+                    live_receipt['source_digest'] != expected_digest):
+                raise RuntimeError(
+                    'Committed raw controller config receipt does not match '
+                    'the retried API-server digest.')
+            live_bytes = serve_utils.read_verified_controller_config(
+                live_path, version, snapshot_id, expected_digest)
+            if (live_bytes is not None and hashlib.sha256(
+                    serve_utils.sanitize_ha_recovery_config_bytes(
+                        live_bytes)).hexdigest() == durable_digest):
+                # Preserve exact raw fields on a same-pod lost-response retry.
+                # Full child/pod recovery removes the receipt and deliberately
+                # falls back to the DB-bound safe projection below.
+                config_bytes = live_bytes
+                source_is_live = True
+            else:
+                # The random nonce identifies the already-committed request
+                # after a pod loss. Do not persist the source digest: stripped
+                # low-entropy secrets would otherwise gain an offline verifier.
+                config_bytes = durable_bytes
+                source_is_live = False
+            source_is_staged = False
+
+        recovery_script = (serve_utils.strip_legacy_ha_recovery_config_payload(
+            recovery_script, live_path))
+
+        expected_workspace = self._replica_manager.workspace
+        try:
+            config = serve_utils.parse_and_validate_version_controller_config(
+                config_bytes, expected_workspace,
+                'staged Serve controller config')
+        except Exception as e:  # pylint: disable=broad-except
+            raise RuntimeError('Staged controller config snapshot is invalid: '
+                               f'{common_utils.format_exception(e)}') from None
+        try:
+            serve_utils.parse_and_validate_version_controller_config(
+                durable_bytes, expected_workspace,
+                'durable Serve controller config')
+        except Exception as e:  # pylint: disable=broad-except
+            raise RuntimeError('Durable controller config snapshot is invalid: '
+                               f'{common_utils.format_exception(e)}') from None
+        legacy_snapshot = None
+        protocol_active = (serve_state.get_version_controller_config(
+            self._service_name, self._applied_version) is not None)
+        if (source_is_staged and committed_yaml is None and
+                not protocol_active):
+            current_config_path = os.environ.get(
+                skypilot_config.ENV_VAR_SKYPILOT_CONFIG,
+                serve_utils.generate_remote_config_yaml_file_name(
+                    self._service_name, self._resource_scope))
+            expanded_current_path = os.path.expanduser(current_config_path)
+            try:
+                with open(expanded_current_path, 'rb') as live_config_file:
+                    legacy_bytes = (
+                        serve_utils.sanitize_ha_recovery_config_bytes(
+                            live_config_file.read()))
+            except OSError:
+                recovery_version = serve_state.get_recovery_version_spec(
+                    self._service_name)
+                committed_legacy = (serve_state.get_version_controller_config(
+                    self._service_name, recovery_version[0])
+                                    if recovery_version is not None else None)
+                if committed_legacy is None:
+                    raise RuntimeError(
+                        'Current controller config is unavailable for '
+                        'legacy-version recovery backfill.') from None
+                legacy_bytes = committed_legacy[0]
+            try:
+                serve_utils.parse_and_validate_version_controller_config(
+                    legacy_bytes, expected_workspace,
+                    'legacy Serve controller config')
+            except Exception as e:  # pylint: disable=broad-except
+                raise RuntimeError(
+                    'Legacy controller config snapshot is invalid: '
+                    f'{common_utils.format_exception(e)}') from None
+            legacy_digest = hashlib.sha256(legacy_bytes).hexdigest()
+            # Historical versions all used the one frozen controller config.
+            # The safe digest is a stable, non-secret migration identity.
+            legacy_snapshot = (legacy_bytes, legacy_digest, legacy_digest)
+        return _PreparedControllerConfig(config, self._service_name, live_path,
+                                         staged_path, recovery_script, version,
+                                         snapshot_id, expected_digest,
+                                         durable_bytes, durable_digest,
+                                         source_is_staged, source_is_live,
+                                         legacy_snapshot)
+
+    @staticmethod
+    def _run_with_prepared_config(prepared: _PreparedControllerConfig,
+                                  callback: Callable[[], Any]) -> Any:
+        """Run admission under a request-local config without publishing it."""
+
+        def _run() -> Any:
+            sky_context.initialize()
+            with skypilot_config.replace_skypilot_config_in_memory(
+                    prepared.config):
+                return callback()
+
+        return contextvars.Context().run(_run)
+
+    @staticmethod
+    def _discard_prepared_controller_config(
+            prepared: _PreparedControllerConfig | None) -> None:
+        if prepared is not None and prepared.source_is_staged:
+            serve_utils.remove_staged_controller_config(prepared.staged_path)
+
+    @staticmethod
+    def _schedule_supervised_recovery() -> None:
+        """Terminate this child after its caller finishes durable writes."""
+
+        def _terminate_for_recovery() -> None:
+            time.sleep(0.1)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=_terminate_for_recovery, daemon=True).start()
+
+    def _get_actuation_epoch_lock(self) -> threading.RLock:
+        lock = getattr(self, '_actuation_epoch_lock', None)
+        if lock is None:
+            # Compatibility for tests and embedders that bypass __init__.
+            lock = threading.RLock()
+            self._actuation_epoch_lock = lock
+        return lock
+
+    def _get_actuation_stop(self) -> threading.Event:
+        stop_event = getattr(self, '_actuation_stop', None)
+        if stop_event is None:
+            # Compatibility for tests and embedders that bypass __init__.
+            stop_event = threading.Event()
+            self._actuation_stop = stop_event
+        return stop_event
+
+    def _get_update_reconciler_stop(self) -> threading.Event:
+        stop_event = getattr(self, '_update_reconciler_stop', None)
+        if stop_event is None:
+            # Compatibility for tests and embedders that bypass __init__.
+            stop_event = threading.Event()
+            self._update_reconciler_stop = stop_event
+        return stop_event
+
+    def _fence_actuation_for_update_recovery(self) -> None:
+        """Irreversibly stop this partial child from changing fleet state."""
+        self._update_recovery_required = True
+        self._get_actuation_stop().set()
+        update_reconciler_stop = getattr(self, '_update_reconciler_stop', None)
+        if update_reconciler_stop is not None:
+            update_reconciler_stop.set()
+        self._replica_manager.fence_launches_for_update_recovery()
+
+    def _mark_controller_applied_version(self, version: int) -> bool:
+        """Persist an exact recovery baseline under this controller owner."""
+        if self._service_hash is None:
+            return True
+        return serve_state.mark_version_controller_applied(
+            self._service_name,
+            version,
+            self._service_hash,
+            expected_controller_owner=self._controller_owner)
+
+    @staticmethod
+    def _install_controller_config(prepared: _PreparedControllerConfig) -> None:
+        """Publish a config only after its version and recovery are durable."""
+        live_path = os.path.expanduser(prepared.live_path)
+
+        def _install_globally() -> None:
+            # An empty Context guarantees the already-validated config is
+            # atomically published to the process-global snapshot.
+            with filelock.FileLock(
+                    skypilot_config.get_skypilot_config_lock_path()):
+                installed_bytes: bytes | None
+                if prepared.source_is_staged:
+                    installed_bytes = (
+                        serve_utils.promote_staged_controller_config(
+                            prepared.live_path, prepared.staged_path,
+                            prepared.version, prepared.snapshot_id,
+                            prepared.source_digest))
+                elif prepared.source_is_live:
+                    installed_bytes = (
+                        serve_utils.read_verified_controller_config(
+                            prepared.live_path, prepared.version,
+                            prepared.snapshot_id, prepared.source_digest))
+                    if installed_bytes is None:
+                        raise RuntimeError('Committed raw controller config '
+                                           'changed before retry install.')
+                else:
+                    installed_bytes = (
+                        serve_utils.restore_version_controller_config(
+                            prepared.service_name,
+                            prepared.version,
+                            prepared.live_path,
+                            prepared.staged_path,
+                            expected_workspace=(prepared.config.get_nested(
+                                keys=('active_workspace',),
+                                default_value=None))))
+                    if installed_bytes is None:
+                        raise RuntimeError('Committed controller config is '
+                                           'unavailable for installation.')
+                expected_installed_digest = (
+                    prepared.source_digest if prepared.source_is_staged or
+                    prepared.source_is_live else prepared.durable_digest)
+                if (hashlib.sha256(installed_bytes).hexdigest()
+                        != expected_installed_digest):
+                    raise RuntimeError(
+                        'Controller config snapshot changed between admission '
+                        'and installation.')
+                skypilot_config.install_internal_config_snapshot(
+                    prepared.config, live_path)
+                expected_workspace = prepared.config.get_nested(
+                    keys=('active_workspace',), default_value=None)
+                if skypilot_config.get_active_workspace() != expected_workspace:
+                    raise RuntimeError(
+                        'Installed controller config changed the durable '
+                        'service workspace.')
+
+        contextvars.Context().run(_install_globally)
+
     def _transition_load_balancer_mode(
             self,
             enable_ha: bool,
@@ -3254,14 +3594,16 @@ class SkyServeController:
             expected_lifecycle_epoch=expected_lifecycle_epoch)
 
     def _commit_service_update(
-            self,
-            version: int,
-            service: Any,
-            yaml_content: str,
-            update_mode: serve_utils.UpdateMode,
-            requested_service_hash: str | None,
-            lifecycle_epoch: int | None,
-            submitted_yaml_content: str | None = None) -> fastapi.Response:
+        self,
+        version: int,
+        service: Any,
+        yaml_content: str,
+        update_mode: serve_utils.UpdateMode,
+        requested_service_hash: str | None,
+        lifecycle_epoch: int | None,
+        submitted_yaml_content: str | None = None,
+        prepared_config: _PreparedControllerConfig | None = None
+    ) -> fastapi.Response:
         """Durably accept one immutable version and schedule its apply."""
         authoritative_retry_service = None
         persisted_yaml = serve_state.get_yaml_content(self._service_name,
@@ -3292,6 +3634,7 @@ class SkyServeController:
                 current_autoscaler, 'replica_unit', None) == 'logical' and
                 getattr(validation_service, 'replica_unit',
                         'physical_backend') != 'logical'):
+            self._discard_prepared_controller_config(prepared_config)
             return responses.JSONResponse(content={
                 'message': 'An existing dynamic_fallback_per_gpu service '
                            'cannot switch in place to physical-backend replica '
@@ -3301,6 +3644,7 @@ class SkyServeController:
         if (getattr(validation_service, 'replica_unit',
                     'physical_backend') == 'logical' and
                 update_mode == serve_utils.UpdateMode.BLUE_GREEN):
+            self._discard_prepared_controller_config(prepared_config)
             return responses.JSONResponse(content={
                 'message': 'dynamic_fallback_per_gpu services currently '
                            'require rolling updates. Blue-green activation is '
@@ -3348,10 +3692,18 @@ class SkyServeController:
                         'single-node services. Multi-node replica routing '
                         'does not yet define a safe logical capacity contract.')
                 if needs_catalog:
-                    built_catalog = spot_placer.SpotPlacer.build_catalog(
-                        validation_service,
-                        update_task,
-                        workspace=self._replica_manager.workspace)
+
+                    def _build_catalog() -> Any:
+                        return spot_placer.SpotPlacer.build_catalog(
+                            validation_service,
+                            update_task,
+                            workspace=self._replica_manager.workspace)
+
+                    if prepared_config is None:
+                        built_catalog = _build_catalog()
+                    else:
+                        built_catalog = self._run_with_prepared_config(
+                            prepared_config, _build_catalog)
                     assert built_catalog is not None
                     placement_catalog = built_catalog.to_dict()
                     # A freshly built catalog that still omits a declared
@@ -3371,11 +3723,26 @@ class SkyServeController:
                             'in workspace '
                             f'{self._replica_manager.workspace!r}.')
             except (ValueError, RuntimeError) as e:
+                self._discard_prepared_controller_config(prepared_config)
                 return responses.JSONResponse(content={'message': str(e)},
                                               status_code=400)
-        catalog_kwargs = ({
+        catalog_kwargs: dict[str, Any] = ({
             'placement_catalog': placement_catalog
         } if placement_catalog is not None else {})
+        recovery_kwargs: dict[str, Any] = ({
+            # The script is service-global and points at the latest committed
+            # generation. A delayed retry of an older immutable version must
+            # compare only that version's snapshot, never rewrite or compare
+            # the newer service-global recovery pointer.
+            **({
+                'ha_recovery_script': prepared_config.recovery_script,
+                'legacy_controller_config_snapshot': (prepared_config.legacy_snapshot),
+                'legacy_controller_applied_version': (self._applied_version if prepared_config.legacy_snapshot is not None else None),
+            } if authoritative_retry_service is None else {}),
+            'controller_config': prepared_config.durable_bytes,
+            'controller_config_digest': prepared_config.durable_digest,
+            'controller_config_snapshot_id': prepared_config.snapshot_id,
+        } if prepared_config is not None else {})
         result = serve_state.add_or_update_version(
             self._service_name,
             version,
@@ -3386,7 +3753,11 @@ class SkyServeController:
                                    self._service_hash),
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=self._controller_owner,
-            **catalog_kwargs)
+            **catalog_kwargs,
+            **recovery_kwargs)
+        if result not in (serve_state.VersionCommitResult.COMMITTED,
+                          serve_state.VersionCommitResult.IDEMPOTENT_RETRY):
+            self._discard_prepared_controller_config(prepared_config)
         if result is serve_state.VersionCommitResult.REJECTED:
             return responses.JSONResponse(content={
                 'message': 'Service lifecycle ownership changed or entered '
@@ -3437,19 +3808,50 @@ class SkyServeController:
                 },
                                               status_code=409)
             service = persisted_service
+            # A committed retry is an acknowledgement only. Reinstalling or
+            # re-enqueueing it can roll the process policy back after a newer
+            # version has applied, or resurrect a quarantined generation.
+            self._discard_retry_stage_if_unused(version, prepared_config)
+            content = {'message': 'Success'}
+            if prepared_config is not None:
+                content['config_snapshot_id'] = prepared_config.snapshot_id
+            content.update(self._get_update_status())
+            return responses.JSONResponse(content=content, status_code=200)
 
         logger.info(f'Committed update to version {version}: {service}')
-        self._record_committed_update(version, service, update_mode)
+        self._record_committed_update(version, service, update_mode,
+                                      prepared_config)
         content = {'message': 'Success'}
+        if prepared_config is not None:
+            content['config_snapshot_id'] = prepared_config.snapshot_id
         content.update(self._get_update_status())
         return responses.JSONResponse(content=content, status_code=200)
 
-    def _record_committed_update(self, version: int, service: Any,
-                                 update_mode: serve_utils.UpdateMode) -> None:
+    def _discard_retry_stage_if_unused(
+            self, version: int,
+            prepared_config: _PreparedControllerConfig | None) -> None:
+        if prepared_config is None:
+            return
+        with self._update_condition:
+            stage_in_use = any(
+                update is not None and update.version == version
+                for update in (self._pending_update,
+                               getattr(self, '_applying_update', None)))
+        if not stage_in_use:
+            serve_utils.remove_staged_controller_config(
+                prepared_config.staged_path)
+
+    def _record_committed_update(
+            self,
+            version: int,
+            service: Any,
+            update_mode: serve_utils.UpdateMode,
+            prepared_config: _PreparedControllerConfig | None = None) -> None:
         """Wake the reconciler after the update's durable commit."""
         update = _PendingServiceUpdate(version, service, update_mode,
-                                       time.time())
+                                       time.time(), prepared_config)
         scheduled = False
+        discarded: _PendingServiceUpdate | None = None
         with self._update_condition:
             self._committed_version = max(self._committed_version, version)
             if version > self._applied_version:
@@ -3459,10 +3861,16 @@ class SkyServeController:
                     # This matches controller recovery, which also boots only
                     # the newest committed version.
                     self._pending_update = update
+                    if pending is not getattr(self, '_applying_update', None):
+                        discarded = pending
                     scheduled = True
                     self._update_apply_error = None
                     self._update_apply_failures = 0
             self._update_condition.notify()
+        if discarded is not None:
+            self._discard_prepared_controller_config(discarded.prepared_config)
+        if not scheduled:
+            self._discard_prepared_controller_config(prepared_config)
         if scheduled:
             # Publish this before the reconciler waits on the manager lock.
             # Large stale scale-up batches use the signal to yield to the newer
@@ -3507,6 +3915,7 @@ class SkyServeController:
             if self._pending_update is update:
                 self._pending_update = None
         self._replica_manager.clear_pending_version(update.version)
+        self._discard_prepared_controller_config(update.prepared_config)
 
     def _record_retryable_update_failure(self,
                                          update: _PendingServiceUpdate,
@@ -3538,6 +3947,8 @@ class SkyServeController:
 
     def _reconcile_pending_update_once(self, wait: bool = False) -> bool:
         """Apply one pending update; optionally wait through retry backoff."""
+        if getattr(self, '_update_recovery_required', False):
+            return True
         with self._update_condition:
             while (self._pending_update is None or
                    self._pending_update.version <= self._applied_version):
@@ -3545,7 +3956,22 @@ class SkyServeController:
                     return True
                 self._update_condition.wait()
             update = self._pending_update
+            self._applying_update = update
 
+        try:
+            return self._reconcile_selected_update(update, wait)
+        finally:
+            with self._update_condition:
+                if self._applying_update is update:
+                    self._applying_update = None
+                discard_prepared = self._pending_update is not update
+                self._update_condition.notify_all()
+            if discard_prepared:
+                self._discard_prepared_controller_config(update.prepared_config)
+
+    def _reconcile_selected_update(self, update: _PendingServiceUpdate,
+                                   wait: bool) -> bool:
+        """Apply one update already fenced as the active reconciliation."""
         try:
             if not self._update_still_authorized():
                 logger.info(
@@ -3554,7 +3980,8 @@ class SkyServeController:
                 self._drop_pending_update(update)
                 return True
             self._apply_service_update(update.version, update.service,
-                                       update.update_mode)
+                                       update.update_mode,
+                                       update.prepared_config)
         except DeterministicServiceUpdateError as e:
             exception_str = common_utils.format_exception(e)
             quarantined_at = time.time()
@@ -3581,8 +4008,8 @@ class SkyServeController:
             with self._update_condition:
                 if self._pending_update is update:
                     self._pending_update = None
-                self._update_apply_error = exception_str
-                self._update_apply_failures = 1
+                    self._update_apply_error = exception_str
+                    self._update_apply_failures = 1
                 self._quarantined_version = update.version
                 self._quarantined_at = quarantined_at
                 self._quarantine_reason = exception_str
@@ -3592,6 +4019,19 @@ class SkyServeController:
                 f'Quarantined committed service version {update.version}; '
                 f'continuing applied version {self._applied_version}: '
                 f'{exception_str}')
+            return True
+        except ServiceUpdateRequiresRecoveryError as e:
+            # Keep the pending-version launch fence asserted until the parent
+            # replaces this child. The raw stage may have been consumed and
+            # manager/autoscaler state may be partial, so an in-process retry
+            # is not an admissible recovery mechanism.
+            exception_str = common_utils.format_exception(e)
+            with self._update_condition:
+                self._update_apply_error = exception_str
+                self._update_apply_failures += 1
+            logger.error(f'Committed service version {update.version} '
+                         'requires supervised controller recovery: '
+                         f'{exception_str}')
             return True
         except Exception as e:  # pylint: disable=broad-except
             return self._record_retryable_update_failure(update, e, wait)
@@ -3608,8 +4048,38 @@ class SkyServeController:
 
     def _run_update_reconciler(self) -> None:
         """Continuously converge runtime state to the newest committed spec."""
-        while True:
+        stop_event = getattr(self, '_update_reconciler_stop', None)
+        while (not getattr(self, '_update_recovery_required', False) and
+               (stop_event is None or not stop_event.is_set())):
             self._reconcile_pending_update_once(wait=True)
+
+    def _run_orphaned_config_stage_sweeper(self) -> None:
+        """Remove expired raw stages that no update handler can reconcile."""
+        stop_event = self._update_reconciler_stop
+        while not stop_event.is_set():
+            try:
+                # The update endpoint holds this same lock from raw-stage
+                # admission through its commit/cleanup finally block. GC can
+                # therefore never unlink a stage being consumed by this child.
+                with self._update_lock:
+                    removed_versions = (
+                        serve_utils.gc_orphaned_staged_controller_configs(
+                            self._service_name, self._resource_scope))
+                if removed_versions:
+                    logger.info(
+                        'Removed expired uncommitted controller config stages '
+                        f'for service {self._service_name!r}, versions '
+                        f'{removed_versions}.')
+            except Exception as e:  # pylint: disable=broad-except
+                # Database uncertainty must preserve the raw stage. Retry on
+                # the next bounded sweep instead of weakening commit safety.
+                logger.warning(
+                    'Could not reconcile orphaned controller config stages '
+                    f'for service {self._service_name!r}: '
+                    f'{common_utils.format_exception(e)}')
+            if stop_event.wait(serve_constants.
+                               ORPHANED_CONFIG_STAGE_SWEEP_INTERVAL_SECONDS):
+                return
 
     def _quarantine_unrecoverable_rollout(
         self,
@@ -3648,28 +4118,40 @@ class SkyServeController:
             self._quarantine_reason = failure.reason
             self._update_apply_error = failure.reason
             self._update_apply_failures = 1
+        self._fence_actuation_for_update_recovery()
         logger.error(
             f'Quarantined never-ready service version {failure.version}; '
             'terminating this controller child so recovery can elect the '
             f'proven active runtime: {failure.reason}')
         return True
 
-    def _apply_service_update(self, version: int, service: Any,
-                              update_mode: serve_utils.UpdateMode) -> None:
+    def _apply_service_update(
+            self,
+            version: int,
+            service: Any,
+            update_mode: serve_utils.UpdateMode,
+            prepared_config: _PreparedControllerConfig | None = None) -> None:
         """Apply a persisted update to the live controller state."""
         try:
-            if (getattr(self._autoscaler, 'replica_unit', None) == 'logical' and
-                    getattr(service, 'uses_logical_replicas',
-                            False) is not True):
-                raise ValueError(
-                    'Refusing to apply a physical-backend version after '
-                    'logical replica semantics were activated.')
-            candidate_spot_placer = (
-                replica_managers.validate_service_update_preflight(
+
+            def _preflight() -> Any:
+                if (getattr(self._autoscaler, 'replica_unit', None) == 'logical'
+                        and getattr(service, 'uses_logical_replicas',
+                                    False) is not True):
+                    raise ValueError(
+                        'Refusing to apply a physical-backend version after '
+                        'logical replica semantics were activated.')
+                return replica_managers.validate_service_update_preflight(
                     self._service_name,
                     version,
                     service,
-                    workspace=self._replica_manager.workspace))
+                    workspace=self._replica_manager.workspace)
+
+            if prepared_config is None:
+                candidate_spot_placer = _preflight()
+            else:
+                candidate_spot_placer = self._run_with_prepared_config(
+                    prepared_config, _preflight)
         except (AssertionError, RuntimeError, TypeError, ValueError) as e:
             raise DeterministicServiceUpdateError(
                 f'Version {version} failed deterministic launch preflight: '
@@ -3681,71 +4163,117 @@ class SkyServeController:
         # signal lets that batch yield promptly so update_version can acquire
         # the lock and make the durable version live.
         self._replica_manager.notify_version_pending(version)
+        config_transition_started = False
+        runtime_transition_started = False
+
+        def _install_matching_config() -> None:
+            nonlocal config_transition_started
+            config_transition_started = True
+            assert prepared_config is not None
+            self._install_controller_config(prepared_config)
+
+        actuation_epoch_lock = self._get_actuation_epoch_lock()
+        actuation_epoch_lock.acquire()
         try:
-            self._replica_manager.update_version(
-                version,
-                service,
-                update_mode=update_mode,
-                new_spot_placer=(candidate_spot_placer))
-        finally:
-            self._replica_manager.clear_pending_version(version)
-        new_autoscaler = autoscalers.Autoscaler.from_spec(
-            self._service_name, service)
-        accelerator_shapes = self._accelerator_shapes_for_compatibility(
-            new_autoscaler, service)
-        replace_autoscaler = not isinstance(self._autoscaler,
-                                            type(new_autoscaler))
-        if replace_autoscaler:
-            logger.info('Autoscaler type changed to '
-                        f'{type(new_autoscaler)}, updating autoscaler.')
-        # Build against the candidate type before mutating the retained live
-        # autoscaler.  Publication below then contains no fallible catalog or
-        # task parsing between the runtime transition and its version fence.
-        new_routing_spec = self._build_routing_spec(service, new_autoscaler)
-        reserved_capacity_fill_enabled = bool(
-            getattr(service, 'reserved_capacity_fill', False))
-        with self._routing_state_lock:
-            if replace_autoscaler:
-                old_autoscaler = self._autoscaler
-                # Snapshot, restore, initialize, and publish while LB demand
-                # ingestion is excluded by this routing-epoch lock. The old
-                # autoscaler's own state lock makes its dump internally
-                # coherent; keeping the controller lock through publication
-                # also prevents a later authoritative report from landing on
-                # the old object and being lost from the replacement.
-                new_autoscaler.load_dynamic_states(
-                    old_autoscaler.dump_dynamic_states())
-                if isinstance(new_autoscaler,
-                              (autoscalers.InstanceAwareRequestRateAutoscaler,
-                               autoscalers.ConcurrencyAutoscaler)):
-                    new_autoscaler.update_version_and_accelerator_shapes(
-                        version, service, update_mode, accelerator_shapes)
-                else:
-                    new_autoscaler.update_version(version,
-                                                  service,
-                                                  update_mode=update_mode)
-                # Seed BEFORE publishing: the replacement cannot take a
-                # decision tick with an empty zero-cost location set.
-                self._seed_fill_zero_cost_locations(new_autoscaler)
-                self._autoscaler = new_autoscaler
+            runtime_transition_started = True
+            if prepared_config is None:
+                self._replica_manager.update_version(
+                    version,
+                    service,
+                    update_mode=update_mode,
+                    new_spot_placer=(candidate_spot_placer))
             else:
-                if isinstance(self._autoscaler,
-                              (autoscalers.InstanceAwareRequestRateAutoscaler,
-                               autoscalers.ConcurrencyAutoscaler)):
-                    self._autoscaler.update_version_and_accelerator_shapes(
-                        version, service, update_mode, accelerator_shapes)
+                self._replica_manager.update_version(
+                    version,
+                    service,
+                    update_mode=update_mode,
+                    new_spot_placer=(candidate_spot_placer),
+                    install_config=_install_matching_config)
+            new_autoscaler = autoscalers.Autoscaler.from_spec(
+                self._service_name, service)
+            accelerator_shapes = self._accelerator_shapes_for_compatibility(
+                new_autoscaler, service)
+            replace_autoscaler = not isinstance(self._autoscaler,
+                                                type(new_autoscaler))
+            if replace_autoscaler:
+                logger.info('Autoscaler type changed to '
+                            f'{type(new_autoscaler)}, updating autoscaler.')
+            # Build against the candidate type before mutating the retained live
+            # autoscaler.  Publication below then contains no fallible catalog or
+            # task parsing between the runtime transition and its version fence.
+            new_routing_spec = self._build_routing_spec(service, new_autoscaler)
+            reserved_capacity_fill_enabled = bool(
+                getattr(service, 'reserved_capacity_fill', False))
+            with self._routing_state_lock:
+                if replace_autoscaler:
+                    old_autoscaler = self._autoscaler
+                    # Snapshot, restore, initialize, and publish while LB demand
+                    # ingestion is excluded by this routing-epoch lock. The old
+                    # autoscaler's own state lock makes its dump internally
+                    # coherent; keeping the controller lock through publication
+                    # also prevents a later authoritative report from landing on
+                    # the old object and being lost from the replacement.
+                    new_autoscaler.load_dynamic_states(
+                        old_autoscaler.dump_dynamic_states())
+                    if isinstance(
+                            new_autoscaler,
+                        (autoscalers.InstanceAwareRequestRateAutoscaler,
+                         autoscalers.ConcurrencyAutoscaler)):
+                        new_autoscaler.update_version_and_accelerator_shapes(
+                            version, service, update_mode, accelerator_shapes)
+                    else:
+                        new_autoscaler.update_version(version,
+                                                      service,
+                                                      update_mode=update_mode)
+                    # Seed BEFORE publishing: the replacement cannot take a
+                    # decision tick with an empty zero-cost location set.
+                    self._seed_fill_zero_cost_locations(new_autoscaler)
+                    self._autoscaler = new_autoscaler
                 else:
-                    self._autoscaler.update_version(version,
-                                                    service,
-                                                    update_mode=update_mode)
-            self._reserved_capacity_fill_enabled = (
-                reserved_capacity_fill_enabled)
-            self._routing_spec = new_routing_spec
-            # This assignment is part of the same critical section as the
-            # exact-card catalog and routing spec.  The sync handler and demand
-            # ingestion take this lock, so no response/report can observe a
-            # mixed epoch.
-            self._applied_version = max(self._applied_version, version)
+                    if isinstance(
+                            self._autoscaler,
+                        (autoscalers.InstanceAwareRequestRateAutoscaler,
+                         autoscalers.ConcurrencyAutoscaler)):
+                        self._autoscaler.update_version_and_accelerator_shapes(
+                            version, service, update_mode, accelerator_shapes)
+                    else:
+                        self._autoscaler.update_version(version,
+                                                        service,
+                                                        update_mode=update_mode)
+                self._reserved_capacity_fill_enabled = (
+                    reserved_capacity_fill_enabled)
+                self._routing_spec = new_routing_spec
+                # This assignment is part of the same critical section as the
+                # exact-card catalog and routing spec.  The sync handler and demand
+                # ingestion take this lock, so no response/report can observe a
+                # mixed epoch.
+                self._applied_version = max(self._applied_version, version)
+            if not self._mark_controller_applied_version(version):
+                raise RuntimeError(
+                    f'Could not durably mark service version {version} as '
+                    'controller-applied under the current ownership fence.')
+        except Exception as e:  # pylint: disable=broad-except
+            if config_transition_started or runtime_transition_started:
+                # The immutable raw stage may already have been consumed and
+                # manager state may have advanced. In-process retry cannot
+                # prove a coherent rollback, so delegate to quarantine-aware
+                # supervised recovery before another launch is admitted.
+                # The parent keeps the same durable owner tuple while it
+                # respawns this child, so ownership checks alone cannot close
+                # this window.  Fence queued, in-flight, and future manager
+                # launches before arranging termination; correctness must not
+                # depend on how quickly SIGTERM is delivered.
+                self._fence_actuation_for_update_recovery()
+                self._schedule_supervised_recovery()
+                raise ServiceUpdateRequiresRecoveryError(
+                    f'Version {version} failed after its controller runtime '
+                    f'transition began: '
+                    f'{common_utils.format_exception(e)}') from e
+            raise
+        finally:
+            if not getattr(self, '_update_recovery_required', False):
+                self._replica_manager.clear_pending_version(version)
+            actuation_epoch_lock.release()
         if reserved_capacity_fill_enabled:
             # An update can enable fill on a live service: give
             # the (retained or replaced) autoscaler the location
@@ -3795,19 +4323,30 @@ class SkyServeController:
             self._reserved_capacity_poller_started = True
         thread_utils.start_supervised_thread(
             lambda: reserved_capacity.poller_loop(
-                lambda: self._autoscaler, lambda: self._replica_manager.
-                spot_placer, self._service_name, self._service_hash, self.
-                _controller_owner), 'reserved-capacity-poller')
+                lambda: self._autoscaler,
+                lambda: self._replica_manager.spot_placer,
+                self._service_name,
+                self._service_hash,
+                self._controller_owner,
+                stop_event=self._get_actuation_stop(),
+                actuation_epoch_lock=self._get_actuation_epoch_lock()),
+            'reserved-capacity-poller',
+            stop_event=self._get_actuation_stop())
 
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
-        while True:
+        stop_event = self._get_actuation_stop()
+        while not stop_event.is_set():
             # Clear before reading durable replica and placement state. Typed
             # feedback that arrived before this point is consumed by this tick;
             # feedback that arrives during the tick leaves the signal set and
             # makes the interval wait below return immediately.
-            self._replica_manager.clear_scale_reconciliation_signal()
+            actuation_epoch_lock = self._get_actuation_epoch_lock()
+            actuation_epoch_lock.acquire()
             try:
+                if stop_event.is_set():
+                    return
+                self._replica_manager.clear_scale_reconciliation_signal()
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
                 self._replica_counts_snapshot = self._get_replica_counts(
@@ -4074,6 +4613,10 @@ class SkyServeController:
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
+            finally:
+                actuation_epoch_lock.release()
+            if stop_event.is_set():
+                return
             self._replica_manager.wait_for_scale_reconciliation(
                 self._autoscaler.get_decision_interval())
 
@@ -4103,6 +4646,17 @@ class SkyServeController:
             # autoscaler.info() serializes every replica and can legitimately
             # exceed the supervisor's one-second read budget at fleet scale.
             return responses.JSONResponse(content={'status': 'ok'},
+                                          status_code=200)
+
+        @self._app.get(
+            serve_constants.CONTROLLER_UPDATE_CAPABILITIES_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        async def get_update_capabilities() -> fastapi.Response:
+            return responses.JSONResponse(content={
+                'config_snapshot_protocol_version':
+                    serve_constants.
+                    SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            },
                                           status_code=200)
 
         @self._app.get(
@@ -4220,15 +4774,44 @@ class SkyServeController:
         @self._app.post(
             '/controller/update_service',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
+        @self._app.post(
+            serve_constants.CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
         @_serialize_update
-        def update_service(request_data: dict[str, Any] = fastapi.Body(
-            ...)) -> fastapi.Response:
+        def update_service(
+            http_request: fastapi.Request,
+            request_data: dict[str, Any] = fastapi.Body(...)
+        ) -> fastapi.Response:
+            version = request_data.get('version', None)
+            snapshot_id = request_data.get('config_snapshot_id')
+            has_config_snapshot = request_data.get('has_config_snapshot', False)
+            is_config_endpoint = (http_request.url.path == serve_constants.
+                                  CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH)
             try:
-                version = request_data.get('version', None)
+                if is_config_endpoint != (has_config_snapshot is True):
+                    return responses.JSONResponse(content={
+                        'message': 'The atomic config-update endpoint and '
+                                   'snapshot body must be used together.'
+                    },
+                                                  status_code=400)
+                if (not is_config_endpoint and
+                        serve_utils.is_consolidation_mode(self._is_pool)):
+                    return responses.JSONResponse(content={
+                        'message': 'Legacy updates are disabled for a '
+                                   'controller running the atomic config '
+                                   'refresh protocol. Quiesce updates until '
+                                   'all API pods and controllers are rolled.'
+                    },
+                                                  status_code=409)
                 if version is None:
                     return responses.JSONResponse(
                         content={'message': 'Error: version is not specified.'},
                         status_code=400)
+                if type(version) is not int or version <= 0:  # pylint: disable=unidiomatic-typecheck
+                    return responses.JSONResponse(content={
+                        'message': 'Version must be a positive integer.'
+                    },
+                                                  status_code=400)
                 update_mode_str = request_data.get(
                     'mode', serve_utils.DEFAULT_UPDATE_MODE.value)
                 update_mode = serve_utils.UpdateMode(update_mode_str)
@@ -4245,7 +4828,6 @@ class SkyServeController:
                 submitted_yaml_content = _read_declared_submitted_yaml(
                     request_data, self._service_name, version,
                     self._resource_scope)
-                service = self._load_service_for_update(version, yaml_content)
                 requested_service_hash = request_data.get('service_hash')
                 lifecycle_epoch = request_data.get('lifecycle_epoch')
                 if (requested_service_hash is not None and
@@ -4255,11 +4837,34 @@ class SkyServeController:
                                    'the update was committed.'
                     },
                                                   status_code=409)
+                prepared_config = None
+                if has_config_snapshot:
+                    if (not isinstance(lifecycle_epoch, int) or
+                            isinstance(lifecycle_epoch, bool)):
+                        return responses.JSONResponse(content={
+                            'message': 'A config refresh requires a fenced '
+                                       'service lifecycle epoch.'
+                        },
+                                                      status_code=409)
+                    expected_digest = request_data.get('config_snapshot_digest')
+                    if (not isinstance(expected_digest, str) or re.fullmatch(
+                            r'[0-9a-f]{64}', expected_digest) is None or
+                            not isinstance(snapshot_id, str) or
+                            re.fullmatch(r'[0-9a-f]{64}', snapshot_id) is None):
+                        return responses.JSONResponse(content={
+                            'message': 'A valid config snapshot digest and '
+                                       'ID are required.'
+                        },
+                                                      status_code=400)
+                    prepared_config = self._prepare_controller_config_update(
+                        version, expected_digest, snapshot_id)
+                service = self._load_service_for_update(version, yaml_content)
                 return self._commit_service_update(version, service,
                                                    yaml_content, update_mode,
                                                    requested_service_hash,
                                                    lifecycle_epoch,
-                                                   submitted_yaml_content)
+                                                   submitted_yaml_content,
+                                                   prepared_config)
             except Exception as e:  # pylint: disable=broad-except
                 exception_str = common_utils.format_exception(e)
                 logger.error(f'Error in update_service: {exception_str}')
@@ -4269,6 +4874,61 @@ class SkyServeController:
                     'traceback': traceback.format_exc()
                 },
                                               status_code=500)
+            finally:
+                if (is_config_endpoint and isinstance(version, int) and
+                        not isinstance(version, bool) and
+                        isinstance(snapshot_id, str) and
+                        re.fullmatch(r'[0-9a-f]{64}', snapshot_id) is not None):
+                    try:
+                        committed = serve_state.get_yaml_content(
+                            self._service_name, version) is not None
+                    except Exception:  # pylint: disable=broad-except
+                        committed = True
+                    if not committed:
+                        staged_path = (
+                            serve_utils.generate_staged_config_yaml_file_name(
+                                self._service_name,
+                                version,
+                                self._resource_scope,
+                                snapshot_id=snapshot_id))
+                        serve_utils.remove_staged_controller_config(staged_path)
+
+        @self._app.post(
+            serve_constants.CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        @_serialize_update
+        def cleanup_staged_update_config(request_data: dict[
+            str, Any] = fastapi.Body(...)) -> fastapi.Response:
+            """Clean an ambiguous raw stage after all update handlers drain."""
+            version = request_data.get('version')
+            lifecycle_epoch = request_data.get('expected_lifecycle_epoch')
+            snapshot_id = request_data.get('config_snapshot_id')
+            if (not isinstance(version, int) or isinstance(version, bool) or
+                    not isinstance(lifecycle_epoch, int) or
+                    isinstance(lifecycle_epoch, bool) or
+                    not isinstance(snapshot_id, str) or
+                    re.fullmatch(r'[0-9a-f]{64}', snapshot_id) is None):
+                return responses.JSONResponse(content={
+                    'message': 'Version, lifecycle epoch, and config snapshot '
+                               'ID are required.'
+                },
+                                              status_code=400)
+            owner = serve_state.get_service_controller_owner(self._service_name)
+            current_owner = ((owner.get('controller_pid'),
+                              owner.get('controller_ip'))
+                             if owner is not None else None)
+            if (owner is None or owner.get('hash') != self._service_hash or
+                    owner.get('lifecycle_epoch') != lifecycle_epoch or
+                    current_owner != self._controller_owner):
+                return responses.JSONResponse(content={
+                    'message': 'Service lifecycle ownership changed before '
+                               'staged config cleanup.'
+                },
+                                              status_code=409)
+            removed = (serve_utils.remove_uncommitted_staged_controller_config(
+                self._service_name, version, self._resource_scope, snapshot_id))
+            return responses.JSONResponse(content={'removed': removed},
+                                          status_code=200)
 
         @self._app.post(
             '/controller/set_load_balancer_high_availability',
@@ -4363,13 +5023,27 @@ class SkyServeController:
         # A committed update is the API success boundary. Apply it on a
         # controller-owned worker so fleet-wide replica locks cannot make the
         # request time out or prevent a later update from committing.
-        thread_utils.start_supervised_thread(self._run_update_reconciler,
-                                             'service-update-reconciler')
+        thread_utils.start_supervised_thread(
+            self._run_update_reconciler,
+            'service-update-reconciler',
+            stop_event=self._get_update_reconciler_stop())
+
+        # Raw policy-admitted snapshots can contain credentials. A pod-local
+        # controller survives API-request crashes, so it owns periodic cleanup
+        # of expired NULL-yaml stages in addition to endpoint-local finally
+        # cleanup. The first sweep runs immediately on every child start.
+        thread_utils.start_supervised_thread(
+            self._run_orphaned_config_stage_sweeper,
+            'controller-config-stage-sweeper',
+            stop_event=self._get_update_reconciler_stop())
 
         # Supervised so a BaseException escaping the autoscaler loop (or the
         # loop returning) does not silently stop all scaling decisions while
         # the controller keeps serving HTTP -- it is restarted instead.
-        thread_utils.start_supervised_thread(self._run_autoscaler, 'autoscaler')
+        thread_utils.start_supervised_thread(
+            self._run_autoscaler,
+            'autoscaler',
+            stop_event=self._get_actuation_stop())
 
         if self._reserved_capacity_fill_enabled:
             self._start_reserved_capacity_poller_if_needed()

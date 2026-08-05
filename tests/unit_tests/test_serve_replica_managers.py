@@ -16,8 +16,11 @@ Covers:
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
+import os
+import queue
 import threading
 import time
 import types
@@ -38,6 +41,8 @@ from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state as recovery_state
 from sky.skylet import job_lib
 from sky.utils import common_utils
+from sky.utils import config_utils
+from sky.utils import context as sky_context
 from sky.utils import controller_utils
 from sky.utils import thread_utils
 
@@ -276,13 +281,13 @@ class TestSkyPilotReplicaManagerInitOrdering:
         assert '_replica_prober' in started
         assert '_system_recovery_route_prober' in started
 
-    def test_all_daemon_threads_share_ownership_stop_event(self):
+    def test_all_daemon_threads_share_manager_stop_event(self):
         calls = []
         mgr = self._build(lambda self_: None, [], supervisor_calls=calls)
 
         assert len(calls) == 4
-        assert all(
-            kwargs['stop_event'] is mgr._ownership_lost for _, kwargs in calls)
+        assert all(kwargs['stop_event'] is mgr._manager_daemon_stop
+                   for _, kwargs in calls)
 
     def test_legacy_per_gpu_yaml_uses_persisted_physical_semantics(self):
         legacy_yaml = """
@@ -389,6 +394,123 @@ class TestBackgroundDutyOwnershipLifecycle:
             mgr._replica_prober()
 
         mgr._probe_all_replicas.assert_not_called()
+
+    def test_delayed_job_result_cannot_mutate_after_update_recovery_fence(self):
+        mgr = _make_manager()
+        mgr._ownership_lost = threading.Event()
+        mgr._manager_daemon_stop = threading.Event()
+        mgr._update_recovery_required = False
+        mgr._is_pool = False
+        info = mock.Mock()
+        info.replica_id = 7
+        info.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.ORDINARY)
+        result_started = threading.Event()
+        release_result = threading.Event()
+
+        class _DelayedFailedResult:
+
+            def get(self):
+                result_started.set()
+                assert release_result.wait(timeout=5)
+                return {1: job_lib.JobStatus.FAILED}
+
+        mgr._persist_replica = mock.Mock()
+        mgr._terminate_replica = mock.Mock()
+        reducer = threading.Thread(target=mgr._handle_job_status_results,
+                                   args=([(info, _DelayedFailedResult())],))
+        reducer.start()
+        assert result_started.wait(timeout=5)
+
+        # Simulate delayed SIGTERM: the child remains alive after the partial
+        # runtime transition, but its manager fence is already irreversible.
+        mgr.fence_launches_for_update_recovery()
+        assert mgr._manager_daemon_stop.is_set()
+        assert not mgr._ownership_lost.is_set()
+        release_result.set()
+        reducer.join(timeout=5)
+
+        assert not reducer.is_alive()
+        mgr._persist_replica.assert_not_called()
+        mgr._terminate_replica.assert_not_called()
+
+    def test_update_recovery_fence_guards_direct_termination(self):
+        mgr = _make_manager()
+        mgr._ownership_lost = threading.Event()
+        mgr._manager_daemon_stop = threading.Event()
+        mgr.fence_launches_for_update_recovery()
+
+        with mock.patch.object(
+                mgr,
+                '_legacy_mutation_runtime_state',
+                side_effect=AssertionError('fenced termination reached state')):
+            mgr._terminate_replica(7,
+                                   sync_down_logs=True,
+                                   replica_drain_delay_seconds=0)
+
+        assert not mgr._ownership_lost.is_set()
+
+    def test_delayed_probe_result_cannot_reduce_after_update_recovery_fence(
+            self):
+        mgr = _make_manager()
+        mgr._ownership_lost = threading.Event()
+        mgr._manager_daemon_stop = threading.Event()
+        mgr._update_recovery_required = False
+        mgr._is_pool = True
+        mgr._uptime = None
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+        info = mock.Mock()
+        info.replica_id = 9
+        info.cluster_name = 'svc-9'
+        info.status_property.should_track_service_status.return_value = True
+
+        def _delayed_probe_pool(**_kwargs):
+            probe_started.set()
+            assert release_probe.wait(timeout=5)
+            return info, True, 123.0
+
+        info.probe_pool.side_effect = _delayed_probe_pool
+        mgr._persist_replicas = mock.Mock()
+        mgr._terminate_replica = mock.Mock()
+        result = []
+
+        def _run_probe():
+            result.append(
+                mgr._probe_all_replicas_with_snapshot(
+                    [info], phase_admission=mock.sentinel.phase_admission))
+
+        probe_thread = threading.Thread(target=_run_probe)
+        with mock.patch.object(replica_managers.backends,
+                               'CloudVmRayBackend'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'set_service_uptime') as set_uptime:
+            probe_thread.start()
+            assert probe_started.wait(timeout=5)
+            mgr.fence_launches_for_update_recovery()
+            release_probe.set()
+            probe_thread.join(timeout=5)
+
+        assert not probe_thread.is_alive()
+        assert result == [[info]]
+        set_uptime.assert_not_called()
+        mgr._persist_replicas.assert_not_called()
+        mgr._terminate_replica.assert_not_called()
+        assert not mgr._ownership_lost.is_set()
+
+    def test_update_recovery_fence_blocks_route_issuance(self):
+        mgr = _make_manager()
+        mgr._ownership_lost = threading.Event()
+        mgr._manager_daemon_stop = threading.Event()
+        registry = mock.Mock()
+        mgr._system_recovery_route_registry = registry
+        mgr.fence_launches_for_update_recovery()
+
+        issued = mgr._issue_system_recovery_route(mock.Mock(), 'http://replica',
+                                                  1.0, None)
+
+        assert not issued
+        registry.issue.assert_not_called()
 
     def test_prober_uses_authoritative_autoscaler_target_for_status(self):
         mgr = self._stopped_manager()
@@ -2574,6 +2696,97 @@ def _quota_error() -> exceptions.ResourcesUnavailableError:
                                                 failover_history=[attempt])
 
 
+def test_launch_worker_uses_its_frozen_controller_config(monkeypatch):
+    observed = {}
+    monkeypatch.setattr(os, 'environ',
+                        sky_context.ContextualEnviron(os.environ))
+    manager = _make_manager()
+    generation_one = config_utils.Config({
+        'active_workspace': 'generation-one',
+        'kubernetes': {
+            'allowed_contexts': ['east']
+        },
+    })
+    generation_two = config_utils.Config({
+        'active_workspace': 'generation-two',
+        'kubernetes': {
+            'allowed_contexts': ['phx']
+        },
+    })
+    completions: queue.SimpleQueue[int] = queue.SimpleQueue()
+    completion_event = threading.Event()
+
+    def _observe(*_args, launch_label, generation_guard, **_kwargs):
+        observed[launch_label] = {
+            'config': skypilot_config.to_dict(),
+            'path': os.environ.get(skypilot_config.ENV_VAR_SKYPILOT_CONFIG),
+            'context': sky_context.get(),
+            'guard': generation_guard(),
+        }
+
+    def _make_worker(replica_id, label, config, path, expected_version):
+        with skypilot_config.replace_skypilot_config_in_memory(config):
+            monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, path)
+            return replica_managers._ReplicaLaunchThread(
+                target=(replica_managers.
+                        launch_cluster_with_frozen_controller_config),
+                replica_id=replica_id,
+                completion_queue=completions,
+                completion_event=completion_event,
+                kwargs={
+                    'launch_label': label,
+                    'generation_guard': lambda: manager.
+                                        _queued_launch_generation_decision(
+                                            expected_version),
+                    'frozen_controller_config': skypilot_config.to_dict(),
+                    'frozen_controller_config_path': os.environ.get(
+                        skypilot_config.ENV_VAR_SKYPILOT_CONFIG),
+                })
+
+    # Queue v1 while C1 is live, but do not start the worker yet.
+    old_worker = _make_worker(1, 'old', generation_one,
+                              '/tmp/generation-one.yaml', 1)
+    # Publish the manager/config generation C2 before either worker starts.
+    manager.latest_version = 2
+    current_worker = _make_worker(2, 'current', generation_two,
+                                  '/tmp/generation-two.yaml', 2)
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG,
+                       '/tmp/generation-two.yaml')
+
+    with skypilot_config.replace_skypilot_config_in_memory(generation_two), \
+         mock.patch.object(replica_managers,
+                           'launch_cluster',
+                           side_effect=_observe):
+        old_worker.start()
+        current_worker.start()
+        old_worker.join(timeout=2)
+        current_worker.join(timeout=2)
+        assert not old_worker.is_alive()
+        assert not current_worker.is_alive()
+        assert skypilot_config.get_active_workspace() == 'generation-two'
+        assert os.environ[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] == (
+            '/tmp/generation-two.yaml')
+
+    assert old_worker.exception is None
+    assert current_worker.exception is None
+    assert observed['old']['config']['active_workspace'] == 'generation-one'
+    assert observed['old']['config']['kubernetes']['allowed_contexts'] == [
+        'east'
+    ]
+    assert observed['old']['path'] == '/tmp/generation-one.yaml'
+    assert observed['old']['context'] is not None
+    assert observed['old']['guard'] == (False, 'manager-version-changed')
+    assert observed['current']['config']['active_workspace'] == (
+        'generation-two')
+    assert observed['current']['config']['kubernetes']['allowed_contexts'] == [
+        'phx'
+    ]
+    assert observed['current']['path'] == '/tmp/generation-two.yaml'
+    assert observed['current']['context'] is not None
+    assert observed['current']['guard'] == (True, 'authorized')
+    assert {completions.get_nowait(), completions.get_nowait()} == {1, 2}
+
+
 class TestLaunchClusterRetry:
     """`launch_cluster` must fail fast ONLY on resource availability
     (capacity) failures when `availability_max_retry` caps them; other
@@ -2595,6 +2808,7 @@ class TestLaunchClusterRetry:
         observed_workspaces = kwargs.pop('observed_workspaces', None)
         launch_side_effect = kwargs.pop('launch_side_effect', None)
         terminate_side_effect = kwargs.pop('terminate_side_effect', None)
+        cancel_side_effect = kwargs.pop('cancel_side_effect', None)
         raised = None
         task = mock.MagicMock()
         resource = mock.MagicMock()
@@ -2613,6 +2827,8 @@ class TestLaunchClusterRetry:
                 backoff_seconds)
             if terminate_side_effect is not None:
                 mock_terminate.side_effect = terminate_side_effect
+            if cancel_side_effect is not None:
+                mock_sdk.api_cancel.side_effect = cancel_side_effect
             if launch_side_effect is not None:
                 mock_sdk.launch.side_effect = launch_side_effect
             elif observed_workspaces is None:
@@ -2637,7 +2853,7 @@ class TestLaunchClusterRetry:
                     replica_to_request_id=thread_utils.ThreadSafeDict(),
                     replica_to_launch_cancelled=replica_to_launch_cancelled,
                     **kwargs)
-            except (RuntimeError, exceptions.ReservedFillLaunchFenceError) as e:
+            except (RuntimeError, exceptions.RequestCancelled) as e:
                 raised = e
         return mock_sdk, mock_terminate, raised
 
@@ -2863,6 +3079,30 @@ run: echo hi
         mock_sdk.launch.assert_not_called()
         mock_terminate.assert_not_called()
 
+    def test_update_recovery_fence_rejects_cloud_mutation(self, tmp_path):
+        manager = _make_manager()
+        manager.fence_launches_for_update_recovery()
+
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [None],
+            pre_launch_guard=manager._service_is_launch_authorized)
+
+        assert raised is not None
+        assert 'ownership was lost' in str(raised)
+        mock_sdk.launch.assert_not_called()
+        mock_terminate.assert_not_called()
+
+    def test_update_recovery_fence_rejects_publish_and_scale_down(self):
+        manager = _make_manager()
+        manager._terminate_replica = mock.Mock()
+        manager.fence_launches_for_update_recovery()
+
+        assert not manager.publish_target_num_replicas(3, expected_version=1)
+        manager.scale_down(1, expected_version=1)
+
+        assert manager.get_target_num_replicas() is None
+        manager._terminate_replica.assert_not_called()
+
     def test_superseded_logical_guard_rejects_first_cloud_mutation(
             self, tmp_path):
         mock_sdk, mock_terminate, raised = self._run_launch_cluster(
@@ -2920,6 +3160,46 @@ run: echo hi
             tmp_path, [fence_error, None])
 
         assert raised is fence_error
+        assert mock_sdk.launch.call_count == 1
+        assert mock_sdk.stream_and_get.call_count == 1
+        mock_terminate.assert_not_called()
+
+    def test_provider_generation_cancellation_is_terminal_without_cleanup(
+            self, tmp_path):
+        cancelled = exceptions.ServeReplicaLaunchFenceError(
+            'durable generation changed')
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [cancelled, None], supersession_guard=lambda: True)
+
+        assert raised is cancelled
+        assert mock_sdk.launch.call_count == 1
+        assert mock_sdk.stream_and_get.call_count == 1
+        mock_terminate.assert_not_called()
+
+    def test_generic_request_cancellation_keeps_cleanup_and_retry(
+            self, tmp_path):
+        cancelled = exceptions.RequestCancelled('ordinary cancellation')
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [cancelled, None])
+
+        assert raised is None
+        assert mock_sdk.launch.call_count == 2
+        assert mock_sdk.stream_and_get.call_count == 2
+        mock_terminate.assert_called_once()
+
+    def test_provider_cancellation_maps_changed_guard_to_supersession(
+            self, tmp_path):
+        cancelled = exceptions.ServeReplicaLaunchFenceError(
+            'durable generation changed')
+        supersession_guard = mock.Mock(
+            side_effect=[(True, 'authorized'), (False,
+                                                'manager-version-changed')])
+        mock_sdk, mock_terminate, raised = self._run_launch_cluster(
+            tmp_path, [cancelled, None], supersession_guard=supersession_guard)
+
+        assert isinstance(raised,
+                          replica_managers._ReplicaLaunchSupersededError)
+        assert 'manager-version-changed' in str(raised)
         assert mock_sdk.launch.call_count == 1
         assert mock_sdk.stream_and_get.call_count == 1
         mock_terminate.assert_not_called()
@@ -2982,6 +3262,85 @@ run: echo hi
         assert raised is not None
         assert 'ownership loss' in str(raised)
         mock_sdk.api_cancel.assert_called_once_with('request-id')
+
+    def test_inflight_version_supersession_keeps_manager_healthy(
+            self, tmp_path):
+        manager = _make_manager()
+        manager._ownership_lost = threading.Event()
+        manager._manager_daemon_stop = threading.Event()
+        manager._update_recovery_required = False
+        supersession_observed = threading.Event()
+        cancelled = thread_utils.ThreadSafeDict()
+
+        def _generation_guard():
+            decision = manager._queued_launch_generation_decision(1)
+            if not decision[0]:
+                supersession_observed.set()
+            return decision
+
+        def _block_while_watchdog_runs(_request_id):
+            manager._pending_version = 2
+            assert supersession_observed.wait(timeout=5)
+            raise RuntimeError('request cancelled')
+
+        with mock.patch(
+                'sky.serve.replica_managers.'
+                '_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS', 0.01):
+            mock_sdk, _, raised = self._run_launch_cluster(
+                tmp_path,
+                _block_while_watchdog_runs,
+                supersession_guard=_generation_guard,
+                replica_to_launch_cancelled=cancelled)
+
+        assert isinstance(raised,
+                          replica_managers._ReplicaLaunchSupersededError)
+        assert 'newer-version-pending' in str(raised)
+        mock_sdk.api_cancel.assert_called_once_with('request-id')
+        assert not manager._ownership_lost.is_set()
+        assert not manager._manager_daemon_stop.is_set()
+        assert not cancelled
+
+        manager.latest_version = 2
+        manager._pending_version = None
+        next_mock_sdk, _, next_raised = self._run_launch_cluster(
+            tmp_path, [None],
+            supersession_guard=functools.partial(
+                manager._queued_launch_generation_decision, 2))
+        assert next_raised is None
+        next_mock_sdk.launch.assert_called_once()
+
+    def test_inflight_supersession_retries_transient_cancel_failure(
+            self, tmp_path):
+        manager = _make_manager()
+        manager._update_recovery_required = False
+        cancellation_succeeded = threading.Event()
+        cancel_attempts = 0
+
+        def _cancel(_request_id):
+            nonlocal cancel_attempts
+            cancel_attempts += 1
+            if cancel_attempts == 1:
+                raise RuntimeError('transient cancel transport failure')
+            cancellation_succeeded.set()
+
+        def _block_until_cancelled(_request_id):
+            manager._pending_version = 2
+            assert cancellation_succeeded.wait(timeout=5)
+            raise RuntimeError('request cancelled')
+
+        with mock.patch(
+                'sky.serve.replica_managers.'
+                '_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS', 0.01):
+            mock_sdk, _, raised = self._run_launch_cluster(
+                tmp_path,
+                _block_until_cancelled,
+                supersession_guard=functools.partial(
+                    manager._queued_launch_generation_decision, 1),
+                cancel_side_effect=_cancel)
+
+        assert isinstance(raised,
+                          replica_managers._ReplicaLaunchSupersededError)
+        assert mock_sdk.api_cancel.call_count == 2
 
     @staticmethod
     def _recovery_handle(cluster_name='svc-1'):
@@ -4094,6 +4453,25 @@ class TestLaunchOwnershipFence:
         mgr = self._owned_manager()
         mgr._enforce_launch_fence = False
         assert mgr._replica_launch_fence_context() is None
+
+    def test_queued_launch_is_fenced_by_manager_and_recovery_epochs(self):
+        mgr = self._owned_manager()
+        mgr.latest_version = 1
+        mgr._pending_version = None
+        assert mgr._queued_launch_generation_decision(1) == (True, 'authorized')
+
+        mgr._pending_version = 2
+        assert mgr._queued_launch_generation_decision(1) == (
+            False, 'newer-version-pending')
+        mgr._pending_version = None
+        mgr.latest_version = 2
+        assert mgr._queued_launch_generation_decision(1) == (
+            False, 'manager-version-changed')
+
+        mgr.fence_launches_for_update_recovery()
+        assert mgr._queued_launch_generation_decision(2) == (
+            False, 'controller-update-recovery-required')
+        assert not mgr._service_is_launch_authorized()
 
     def test_transient_owner_lookup_fails_attempt_without_latching_loss(self):
         mgr = self._owned_manager()
