@@ -42,13 +42,13 @@ class ProviderPhaseAdmission:
     __slots__ = ('_boot', '_gate', '_mode', '_phase_epoch', '_pid', '_sealed')
 
     _boot: object
-    _gate: '_ProviderPhaseGate'
+    _gate: _ProviderPhaseGate
     _mode: ProviderPhaseMode
     _phase_epoch: int
     _pid: int
     _sealed: bool
 
-    def __init__(self, gate: '_ProviderPhaseGate', mode: ProviderPhaseMode,
+    def __init__(self, gate: _ProviderPhaseGate, mode: ProviderPhaseMode,
                  pid: int, boot: object, phase_epoch: int) -> None:
         object.__setattr__(self, '_gate', gate)
         object.__setattr__(self, '_mode', mode)
