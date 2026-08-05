@@ -256,8 +256,17 @@ def shared_controller_vars_to_fill(
 
 def controller_config_snapshot(local_user_config: dict[str, Any],
                                workspace: str | None = None) -> dict[str, Any]:
-    """Return the config a controller process is allowed to consume."""
-    config = copy.deepcopy(local_user_config)
+    """Return the config a controller process is allowed to consume.
+
+    Always a plain dict. The API server's own config is a
+    ``config_utils.Config`` (a dict subclass), and yaml.safe_dump refuses to
+    represent subclasses: the update path serializes this snapshot directly,
+    so returning the subclass fails every `sky serve update` on the server
+    with a RepresenterError. Only the top level needs coercion --
+    ``Config.from_dict`` is ``cls(**config)``, so nested values are the plain
+    dicts the YAML loader produced.
+    """
+    config = dict(copy.deepcopy(local_user_config))
     # These are API-side concerns and must not be re-applied by a controller.
     config.pop('admin_policy', None)
     config.pop('api_server', None)
