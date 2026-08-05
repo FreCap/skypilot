@@ -1,7 +1,7 @@
 # Reusable SkyPilot Terraform modules
 
 - **Status:** Accepted after adversarial review
-- **Last updated:** 2026-07-31
+- **Last updated:** 2026-08-05
 - **Authoritative repository:** `boltz-bio/skypilot`, branch `improvements`
 
 ## Context
@@ -124,20 +124,31 @@ The caller supplies:
   PostgreSQL SQLAlchemy driver used by the connection string;
 - an API-server image only when overriding the chart default;
 - any optional OAuth, AWS credentials-file, catalog mirror, GCP WIF, Azure,
-  ingress, or additional Helm configuration.
+  ingress, request-store, or additional Helm configuration.
 
 When GCP or Azure login initialization is enabled, the helper image must also
 contain Bash and `gcloud` or `az`, respectively. Existing callers that pass only
 `api_server_image` retain that image as the helper-image fallback. The image
 reference should be immutable.
 
-The module remains PostgreSQL-only. Supported secret integrations accept
-Kubernetes secret names or cloud secret identifiers rather than secret payloads.
-That guarantee does not cover escape hatches: callers must never put credentials
-in `config_extra`, `extra_helm_values`, or `api_server_extra_envs`, because those
-values can enter Terraform state and, for configuration, a ConfigMap. A private
-ECR chart login also places a short-lived sensitive authorization-token data
-source in Terraform state.
+The module remains PostgreSQL-only for central API-server state and durable
+configuration. API request envelopes have a separate, typed `request_store`
+contract. It explicitly renders the chart-compatible SQLite backend, disabled
+built-in execution-quiescence enforcement, and durable cutover-gate path by
+default. A caller may select PostgreSQL after the chart's fresh-schema bootstrap
+or documented one-way cutover has completed. Execution-quiescence enforcement
+is valid only with PostgreSQL. `requestStore` is module-owned and cannot also be
+set through `extra_helm_values`; callers migrating an existing escape-hatch
+block move the same values to `request_store` in one plan so effective Helm
+values do not change.
+
+Supported secret integrations accept Kubernetes secret names or cloud secret
+identifiers rather than secret payloads. That guarantee does not cover escape
+hatches: callers must never put credentials in `config_extra`,
+`extra_helm_values`, or `api_server_extra_envs`, because those values can enter
+Terraform state and, for configuration, a ConfigMap. A private ECR chart login
+also places a short-lived sensitive authorization-token data source in
+Terraform state.
 
 Configuration seeding is a durable database mutation. IaC values recursively
 override persisted mappings, lists and scalars replace, and `workspaces` is
@@ -250,6 +261,9 @@ existing EKS host
   variables, outputs, physical defaults, tags, service accounts, or namespaces.
 - Defaults produce the same commercial-AWS names, policies, tags, and Helm
   values as the local modules they replace.
+- Request-store defaults retain the chart's SQLite compatibility behavior;
+  PostgreSQL selection is always explicit and cannot be inferred from the
+  required central-database connection secret.
 - Optional permissions boundaries default to `null`, preserving existing plans.
 - Supported named-secret integrations do not ingest long-lived secret payloads.
 - The control-plane chart and every cross-repository module source are pinned;
@@ -339,6 +353,13 @@ If any consumer plan proposes replacement, deletion, an address move, IAM
 policy broadening, namespace recreation, or persistent-volume recreation, stop
 the rollout. Correct the module contract first; do not approve the plan or add
 ad hoc state commands.
+
+Changing `request_store.backend` from SQLite to PostgreSQL is an operational
+one-way boundary, not an ordinary Terraform rollback. Existing installations
+must complete and verify the chart's cutover gate before applying that input.
+After cutover, rollback retains PostgreSQL, the enforcement setting, and the
+same gate path while reverting other release changes; it must never restore
+SQLite merely by omitting the module input.
 
 ## Verification
 
@@ -433,6 +454,12 @@ The rename-specific verification also completed on 2026-07-31:
 Phase 2 commands and PR descriptions must record their exact results. No live
 plan or apply evidence is claimed until the corresponding command has run
 successfully.
+
+The typed request-store contract was verified on 2026-08-05 with Terraform
+1.15.8: formatting and all 16 control-plane mocked contract/validation tests
+passed. Coverage includes explicit default rendering, PostgreSQL field mapping,
+invalid backend and gate inputs, enforcement with SQLite, and rejection of a
+conflicting `extra_helm_values.requestStore` block.
 
 ## Open gates
 

@@ -117,6 +117,17 @@ run "default_contract_is_provider_neutral_and_stable" {
   }
 
   assert {
+    condition = (
+      yamldecode(helm_release.skypilot.values[0]).requestStore == {
+        backend                                   = "sqlite"
+        cutoverGatePath                           = "/root/.sky/api-request-cutover.json"
+        enforceBuiltinExecutionQuiescenceBackends = false
+      }
+    )
+    error_message = "The module must render the chart-compatible request-store defaults explicitly."
+  }
+
+  assert {
     condition     = output.api_server_role_name == "skypilot-api-platform-eks"
     error_message = "The module must expose the effective API role name."
   }
@@ -134,6 +145,29 @@ run "default_contract_is_provider_neutral_and_stable" {
       ]
     )
     error_message = "The output must expose the root provider's exact EKS exec-auth contract."
+  }
+}
+
+run "postgres_request_store_is_rendered" {
+  command = plan
+
+  variables {
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+      cutover_gate_path                             = "/var/lib/skypilot/request-cutover.json"
+    }
+  }
+
+  assert {
+    condition = (
+      yamldecode(helm_release.skypilot.values[0]).requestStore == {
+        backend                                   = "postgres"
+        cutoverGatePath                           = "/var/lib/skypilot/request-cutover.json"
+        enforceBuiltinExecutionQuiescenceBackends = true
+      }
+    )
+    error_message = "The module must map request_store into the chart's requestStore contract."
   }
 }
 

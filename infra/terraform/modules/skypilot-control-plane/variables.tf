@@ -371,6 +371,41 @@ variable "db_connection_secret_name" {
   }
 }
 
+variable "request_store" {
+  description = <<-EOT
+    API request-envelope persistence settings rendered as the chart's
+    requestStore values. The SQLite defaults preserve the chart's compatibility
+    behavior; select PostgreSQL explicitly only after completing the chart's
+    one-way request-store cutover procedure. Enabling built-in execution
+    quiescence enforcement requires the PostgreSQL backend.
+  EOT
+  type = object({
+    backend                                       = optional(string, "sqlite")
+    enforce_builtin_execution_quiescence_backends = optional(bool, false)
+    cutover_gate_path                             = optional(string, "/root/.sky/api-request-cutover.json")
+  })
+  default  = {}
+  nullable = false
+
+  validation {
+    condition     = contains(["sqlite", "postgres"], var.request_store.backend)
+    error_message = "request_store.backend must be either sqlite or postgres."
+  }
+
+  validation {
+    condition     = trimspace(var.request_store.cutover_gate_path) != ""
+    error_message = "request_store.cutover_gate_path must be nonempty."
+  }
+
+  validation {
+    condition = (
+      !var.request_store.enforce_builtin_execution_quiescence_backends ||
+      var.request_store.backend == "postgres"
+    )
+    error_message = "request_store.enforce_builtin_execution_quiescence_backends requires request_store.backend=postgres."
+  }
+}
+
 # --- Ingress ----------------------------------------------------------------
 
 variable "ingress_enabled" {

@@ -285,6 +285,10 @@ locals {
     keys(local.extra_helm_values_decoded),
     [],
   ))
+  extra_helm_request_store_present = contains(
+    local.extra_helm_top_level_keys,
+    "requestStore",
+  )
   extra_helm_api_service_present = contains(
     local.extra_helm_top_level_keys,
     "apiService",
@@ -308,6 +312,11 @@ locals {
 
   helm_values = merge({
     apiService = merge(local.api_service_values, local.api_service_extra)
+    requestStore = {
+      backend                                   = var.request_store.backend
+      enforceBuiltinExecutionQuiescenceBackends = var.request_store.enforce_builtin_execution_quiescence_backends
+      cutoverGatePath                           = var.request_store.cutover_gate_path
+    }
     auth = {
       oauth          = local.oauth_values
       serviceAccount = { enabled = true }
@@ -398,6 +407,10 @@ resource "helm_release" "skypilot" {
     precondition {
       condition     = local.extra_helm_api_service_is_map
       error_message = "extra_helm_values.apiService must be a YAML map when present; null, scalar, and list values are not allowed."
+    }
+    precondition {
+      condition     = !local.extra_helm_request_store_present
+      error_message = "extra_helm_values must not redefine requestStore; use the typed request_store input so Terraform cannot silently override the selected persistence contract."
     }
     precondition {
       condition     = length(local.redefined_api_service_array_keys) == 0 && length(local.redefined_top_level_array_keys) == 0
