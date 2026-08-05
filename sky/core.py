@@ -930,7 +930,8 @@ def down(cluster_name: str,
          user_initiated: bool = False,
          _expected_cluster_record_uuid: str | None = None,
          _expected_cluster_hash: str | None = None,
-         _continue_guard: typing.Callable[[], bool] | None = None) -> None:
+         _continue_guard: typing.Callable[[], bool] | None = None,
+         _expected_cluster_record_handle: bytes | None = None) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Tears down a cluster.
 
@@ -962,9 +963,27 @@ def down(cluster_name: str,
             _expected_cluster_hash is not None):
         raise ValueError('Expected cluster-record UUID and legacy cluster hash '
                          'fences are mutually exclusive.')
+    if (_expected_cluster_record_handle is not None and
+            _expected_cluster_record_uuid is None):
+        raise ValueError('Expected serialized cluster handle requires an '
+                         'expected cluster-record UUID.')
+    if (_expected_cluster_record_handle is not None and
+        (not isinstance(_expected_cluster_record_handle, bytes) or
+         not _expected_cluster_record_handle)):
+        raise ValueError('Expected serialized cluster handle must be nonempty '
+                         'bytes.')
+    if _expected_cluster_record_handle is not None and graceful:
+        raise ValueError('Provider-classified teardown cannot run graceful '
+                         'pre-lock SSH cancellation.')
     if _expected_cluster_record_uuid is not None:
         snapshot = global_user_state.get_cluster_record_identity_snapshot(
             cluster_name, _expected_cluster_record_uuid)
+        if (snapshot is not None and
+                _expected_cluster_record_handle is not None and
+                snapshot.serialized_handle != _expected_cluster_record_handle):
+            raise global_user_state.ClusterRecordHandleChangedError(
+                f'Cluster {cluster_name!r} handle changed after provider '
+                'authority classification.')
         handle = None if snapshot is None else snapshot.handle
     elif _expected_cluster_hash is not None:
         handle = global_user_state.get_handle_from_cluster_name(

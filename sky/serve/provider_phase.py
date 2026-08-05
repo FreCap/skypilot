@@ -174,28 +174,35 @@ class _ProviderPhaseGate:
         self._active_mode = mode
 
     def _advance_locked(self, now: float) -> None:
-        """Start the maximal live same-mode prefix at the FIFO queue head."""
-        if self._active_users != 0:
-            return
-        self._active_mode = None
-        while self._queue and self._queue[0].deadline <= now:
-            waiter = self._queue.popleft()
-            waiter.state = _WaiterState.TIMED_OUT
-        if not self._queue:
-            self._condition.notify_all()
-            return
-
-        cohort_mode = self._queue[0].mode
-        self._start_phase_locked(cohort_mode)
-        while self._queue and self._queue[0].mode == cohort_mode:
-            waiter = self._queue.popleft()
-            if waiter.deadline <= now:
+        """Admit the maximal live active-mode prefix at the FIFO queue head."""
+        while True:
+            # An expired waiter no longer owns a FIFO barrier, even while a
+            # compatible cohort remains active. Without pruning here, an
+            # opposite waiter that times out can strand compatible followers
+            # until every original root retires.
+            while self._queue and self._queue[0].deadline <= now:
+                waiter = self._queue.popleft()
                 waiter.state = _WaiterState.TIMED_OUT
-                continue
+
+            if self._active_users == 0:
+                self._active_mode = None
+                if not self._queue:
+                    break
+                self._start_phase_locked(self._queue[0].mode)
+
+            cohort_mode = self._active_mode
+            if cohort_mode is None:
+                raise RuntimeError('Provider phase gate is internally corrupt.')
+            if not self._queue or self._queue[0].mode != cohort_mode:
+                break
+
+            # Grant one live compatible root into the current epoch, then loop
+            # so an expired barrier exposed behind it is removed before the
+            # next FIFO decision. A live opposite head always stops admission.
+            waiter = self._queue.popleft()
             waiter.admission = self._new_root_locked(cohort_mode)
             waiter.state = _WaiterState.GRANTED
-        # At least the live head was granted.  Notify both the cohort and any
-        # timed-out waiter that was removed while forming it.
+
         self._condition.notify_all()
 
     def _cancel_waiter_locked(self, waiter: _PhaseWaiter) -> None:

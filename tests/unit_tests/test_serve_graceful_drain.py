@@ -125,15 +125,20 @@ class TestWaitForDrain:
                     continue_guard=lambda: next(ownership))
 
         down.assert_called_once_with('svc-1',
-                                     _expected_cluster_record_uuid=None)
+                                     _expected_cluster_record_uuid=None,
+                                     _expected_cluster_record_handle=None)
 
     def test_terminate_pins_recorded_workspace_on_each_retry(self):
         context = mock.MagicMock()
         observed_workspaces = []
 
-        def _down(cluster_name, *, _expected_cluster_record_uuid=None):
+        def _down(cluster_name,
+                  *,
+                  _expected_cluster_record_uuid=None,
+                  _expected_cluster_record_handle=None):
             assert cluster_name == 'svc-1'
             assert _expected_cluster_record_uuid is None
+            assert _expected_cluster_record_handle is None
             observed_workspaces.append(skypilot_config.get_active_workspace())
             if len(observed_workspaces) == 1:
                 raise RuntimeError('transient down failure')
@@ -164,8 +169,12 @@ class TestWaitForDrain:
         context = mock.MagicMock()
         observed_workspaces = []
 
-        def _down(cluster_name, *, _expected_cluster_record_uuid=None):
+        def _down(cluster_name,
+                  *,
+                  _expected_cluster_record_uuid=None,
+                  _expected_cluster_record_handle=None):
             assert _expected_cluster_record_uuid is None
+            assert _expected_cluster_record_handle is None
             observed_workspaces.append(skypilot_config.get_active_workspace())
             raise exceptions.ClusterDoesNotExist(cluster_name)
 

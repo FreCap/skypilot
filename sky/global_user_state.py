@@ -376,6 +376,10 @@ class ClusterRecordIdentityConflictError(RuntimeError):
     """A cluster name or record UUID is already committed incompatibly."""
 
 
+class ClusterRecordHandleChangedError(ClusterRecordIdentityConflictError):
+    """The handle changed while an exact-record action was being prepared."""
+
+
 class ClusterRecordRemovalOutcome(enum.Enum):
     """Successful outcomes of expected-identity cluster-row removal."""
 

@@ -79,6 +79,14 @@ def _protocol_v2_cluster_record():
     }
 
 
+def _ordinary_identity_snapshot(cloud):
+    handle = mock.Mock(
+        spec=replica_managers.cloud_vm_ray_backend.CloudVmRayResourceHandle)
+    handle.cluster_name = 'svc-1'
+    handle.launched_resources = mock.Mock(cloud=cloud, region='region-a')
+    return mock.Mock(handle=handle, serialized_handle=b'ordinary-handle')
+
+
 def test_terminate_cluster_forwards_exact_resource_action_uuid(tmp_path):
     expected_uuid = '33333333-3333-4333-8333-333333333333'
     with mock.patch.object(replica_managers.global_user_state,
@@ -86,6 +94,10 @@ def test_terminate_cluster_forwards_exact_resource_action_uuid(tmp_path):
                            return_value={
                                'workspace': 'workspace-a'
                            }), \
+         mock.patch.object(
+             replica_managers.global_user_state,
+             'get_cluster_record_identity_snapshot',
+             return_value=None), \
          mock.patch.object(replica_managers.skypilot_config,
                            'local_active_workspace_ctx') as workspace_ctx, \
          mock.patch('sky.core.down') as down, \
@@ -97,7 +109,8 @@ def test_terminate_cluster_forwards_exact_resource_action_uuid(tmp_path):
             expected_cluster_record_uuid=expected_uuid)
 
     down.assert_called_once_with('svc-1',
-                                 _expected_cluster_record_uuid=expected_uuid)
+                                 _expected_cluster_record_uuid=expected_uuid,
+                                 _expected_cluster_record_handle=None)
 
 
 def test_terminate_cluster_does_not_retry_identity_conflict(tmp_path):
@@ -106,6 +119,10 @@ def test_terminate_cluster_does_not_retry_identity_conflict(tmp_path):
     with mock.patch.object(replica_managers.global_user_state,
                            'get_cluster_from_name',
                            return_value={}), \
+         mock.patch.object(
+             replica_managers.global_user_state,
+             'get_cluster_record_identity_snapshot',
+             return_value=None), \
          mock.patch('sky.core.down', side_effect=conflict) as down, \
          mock.patch.object(replica_managers.time, 'sleep'), \
          pytest.raises(
@@ -118,6 +135,110 @@ def test_terminate_cluster_does_not_retry_identity_conflict(tmp_path):
                 '33333333-3333-4333-8333-333333333333'))
 
     down.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ('cloud', 'expected_modes'),
+    [
+        (replica_managers.clouds.GCP(), []),
+        (replica_managers.clouds.Kubernetes(),
+         [replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY]),
+        (object(),
+         [replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY]),
+    ],
+)
+def test_action_aware_ordinary_cleanup_bypasses_only_exact_non_kubernetes(
+        tmp_path, cloud, expected_modes):
+    expected_uuid = '33333333-3333-4333-8333-333333333333'
+    modes = []
+
+    @contextlib.contextmanager
+    def _phase(mode):
+        modes.append(mode)
+        yield mock.sentinel.admission
+
+    with mock.patch.object(replica_managers.context,
+                           'get',
+                           return_value=mock.MagicMock()), \
+         mock.patch.object(
+             replica_managers.global_user_state,
+             'get_cluster_record_identity_snapshot',
+             return_value=_ordinary_identity_snapshot(cloud)), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value={'workspace': 'workspace-a'}), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           side_effect=_phase), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'local_active_workspace_ctx',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch('sky.core.down') as down, \
+         mock.patch.object(replica_managers.time, 'sleep'):
+        replica_managers.terminate_cluster.__wrapped__(
+            'svc-1',
+            str(tmp_path / 'down.log'),
+            expected_cluster_record_uuid=expected_uuid)
+
+    assert modes == expected_modes
+    expected_handle = (b'ordinary-handle' if isinstance(
+        cloud, replica_managers.clouds.GCP) else None)
+    down.assert_called_once_with(
+        'svc-1',
+        _expected_cluster_record_uuid=expected_uuid,
+        _expected_cluster_record_handle=expected_handle)
+
+
+def test_ordinary_cleanup_retries_handle_change_and_reclassifies_provider(
+        tmp_path):
+    expected_uuid = '33333333-3333-4333-8333-333333333333'
+    snapshots = [
+        _ordinary_identity_snapshot(replica_managers.clouds.GCP()),
+        _ordinary_identity_snapshot(replica_managers.clouds.Kubernetes()),
+    ]
+    modes = []
+
+    @contextlib.contextmanager
+    def _phase(mode):
+        modes.append(mode)
+        yield mock.sentinel.admission
+
+    changed = replica_managers.global_user_state.ClusterRecordHandleChangedError(
+        'same UUID handle changed')
+    with mock.patch.object(replica_managers.context,
+                           'get',
+                           return_value=mock.MagicMock()), \
+         mock.patch.object(
+             replica_managers.global_user_state,
+             'get_cluster_record_identity_snapshot',
+             side_effect=snapshots), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value={'workspace': 'workspace-a'}), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           side_effect=_phase), \
+         mock.patch.object(replica_managers.skypilot_config,
+                           'local_active_workspace_ctx',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch('sky.core.down', side_effect=[changed, None]) as down, \
+         mock.patch.object(replica_managers.time, 'sleep'):
+        replica_managers.terminate_cluster.__wrapped__(
+            'svc-1',
+            str(tmp_path / 'down.log'),
+            expected_cluster_record_uuid=expected_uuid)
+
+    assert modes == [
+        replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+    ]
+    assert down.call_args_list == [
+        mock.call('svc-1',
+                  _expected_cluster_record_uuid=expected_uuid,
+                  _expected_cluster_record_handle=b'ordinary-handle'),
+        mock.call('svc-1',
+                  _expected_cluster_record_uuid=expected_uuid,
+                  _expected_cluster_record_handle=None),
+    ]
 
 
 def test_protocol_v2_legacy_cleanup_forwards_hash_and_owner_guard(tmp_path):

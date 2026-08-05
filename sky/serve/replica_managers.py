@@ -1179,10 +1179,17 @@ def terminate_cluster(
         try:
             usage_lib.messages.usage.set_internal()
             logger.info(f'Sending down request to cluster {cluster_name}')
-            phase_mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
-                          if cleanup_fence is None else
-                          provider_phase.ProviderPhaseMode.V2_FENCED)
-            with provider_phase.provider_phase(phase_mode):
+            expected_cluster_record_handle = None
+            if cleanup_fence is None:
+                (phase_mode, expected_cluster_record_handle) = (
+                    _ordinary_cleanup_phase_authority(
+                        cluster_name, expected_cluster_record_uuid))
+            else:
+                phase_mode = provider_phase.ProviderPhaseMode.V2_FENCED
+            phase_context: contextlib.AbstractContextManager[Any] = (
+                contextlib.nullcontext() if phase_mode is None else
+                provider_phase.provider_phase(phase_mode))
+            with phase_context:
                 # Every retry re-reads the durable handle, generation, and
                 # workspace only after phase admission. A transient failure
                 # cannot reuse authority captured by an earlier attempt.
@@ -1246,7 +1253,9 @@ def terminate_cluster(
                     if cleanup_fence is None:
                         core.down(cluster_name,
                                   _expected_cluster_record_uuid=(
-                                      expected_cluster_record_uuid))
+                                      expected_cluster_record_uuid),
+                                  _expected_cluster_record_handle=(
+                                      expected_cluster_record_handle))
                     elif expected_cluster_record_uuid is not None:
                         core.down(cluster_name,
                                   _expected_cluster_record_uuid=(
@@ -1267,6 +1276,17 @@ def terminate_cluster(
             logger.info(
                 f'Replica cluster {cluster_name} is already terminated.')
             return
+        except global_user_state.ClusterRecordHandleChangedError as error:
+            # A same-generation handle update is retryable: the next attempt
+            # reclassifies the fresh provider before selecting its phase.
+            if retry_cnt >= max_retry:
+                raise RuntimeError('Failed to terminate the sky serve replica '
+                                   f'cluster {cluster_name}.') from error
+            gap_seconds = backoff.current_backoff()
+            logger.info(f'Cluster {cluster_name!r} handle changed during '
+                        'teardown classification. Retrying after '
+                        f'{gap_seconds} seconds.')
+            time.sleep(gap_seconds)
         except global_user_state.ClusterRecordIdentityConflictError:
             # A different/null durable identity is not a transient provider
             # failure. Never turn the exact action fence into repeated
@@ -1525,6 +1545,30 @@ def _provider_cleanup_phase_order(info: 'ReplicaInfo') -> int:
     except exceptions.KubernetesPhysicalClusterIdentityError:
         return 0
     return 0 if cleanup_fence is not None else 1
+
+
+def _ordinary_cleanup_phase_authority(
+    cluster_name: str,
+    expected_cluster_record_uuid: str | None,
+) -> tuple[provider_phase.ProviderPhaseMode | None, bytes | None]:
+    """Return ambient admission only when cleanup can touch Kubernetes.
+
+    The phase gate protects mutable Kubernetes context authority; AWS, GCP,
+    and other providers do not consult it.  Bypass the gate only from an
+    action-aware, UUID-predicated durable handle.  Missing, legacy, malformed,
+    or Kubernetes handles remain conservative ambient work.
+    """
+    if expected_cluster_record_uuid is None:
+        return provider_phase.ProviderPhaseMode.AMBIENT_LEGACY, None
+    snapshot = global_user_state.get_cluster_record_identity_snapshot(
+        cluster_name, expected_cluster_record_uuid)
+    if snapshot is None:
+        return provider_phase.ProviderPhaseMode.AMBIENT_LEGACY, None
+    phase_mode = reserved_capacity.ordinary_provider_phase_mode(
+        snapshot.handle, cluster_name)
+    serialized_handle = (snapshot.serialized_handle
+                         if phase_mode is None else None)
+    return phase_mode, serialized_handle
 
 
 def _zero_cost_pool_key(
@@ -4125,6 +4169,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         logical_reconcile_fence_requires_exact_generation: bool = False,
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
                                    None) = None,
+        try_provider_phase_admission: bool = False,
     ) -> bool:
         """Enqueue one replica launch.
 
@@ -4174,15 +4219,23 @@ class SkyPilotReplicaManager(ReplicaManager):
         existing launch.
 
         provider_phase_admission: blocking v2 admission acquired by the public
-        scale entrypoint before it takes ``self.lock``. It is required for a
-        protocol-v2 fill and ignored by provider-free ordinary launches.
+        single-scale entrypoint before it takes ``self.lock``.
+
+        try_provider_phase_admission: batch-only mode that takes a zero-wait
+        v2 admission at the exact physical-capture/persist seam. Contention
+        defers this one launch without writing a row or registering a thread.
         """
-        if (_is_protocol_v2_fill_override(resources_override) and
+        protocol_v2_fill = _is_protocol_v2_fill_override(resources_override)
+        if try_provider_phase_admission and (
+                not protocol_v2_fill or provider_phase_admission is not None):
+            raise exceptions.ProviderPhaseMisuseError(
+                'Try-only provider admission requires one protocol-v2 fill '
+                'without an existing admission.')
+        if (protocol_v2_fill and not try_provider_phase_admission and
             (provider_phase_admission is None or provider_phase_admission.mode
              != provider_phase.ProviderPhaseMode.V2_FENCED)):
             raise exceptions.ProviderPhaseMisuseError(
-                'A protocol-v2 fill launch requires fenced admission acquired '
-                'before the replica-manager lock.')
+                'A protocol-v2 fill launch requires fenced admission.')
         legacy_runtime = self._legacy_mutation_runtime_state()
         if replica_id in legacy_runtime.launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
@@ -4969,70 +5022,107 @@ class SkyPilotReplicaManager(ReplicaManager):
             )
 
         if fill_protocol_version == reserved_capacity_broker.PROTOCOL_V2:
-            # The caller acquired blocking admission before self.lock. Join it
-            # here to validate the capability, then prove the exact selected
-            # context/UID and retain both authorities continuously through the
-            # atomic broker persist and launch-thread argument freeze. The
-            # asynchronous request starts later with no phase held and proves
-            # its durable tuple afresh in the executor.
-            assert provider_phase_admission is not None
+            # Single-scale callers acquire blocking admission before self.lock.
+            # A batch already owns self.lock, so each item instead attempts a
+            # zero-wait admission here. FIFO prevents later items from barging
+            # once an ambient waiter queues, and a busy item leaks no durable
+            # row or launch thread. Retain the admitted phase and exact UID
+            # authority continuously through the atomic broker persist and
+            # launch-thread argument freeze. The asynchronous request starts
+            # later and proves its durable tuple afresh in the executor.
             assert fill_launch_context is not None
             assert isinstance(fill_physical_cluster_uid, str)
             assert isinstance(fill_service_generation, int)
             assert fill_grant_epoch is not None
             assert fill_pool_key is not None
+            phase_context: contextlib.AbstractContextManager[
+                provider_phase.ProviderPhaseAdmission]
+            if provider_phase_admission is None:
+                assert try_provider_phase_admission
+                phase_context = provider_phase.try_provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED)
+            else:
+                phase_context = contextlib.nullcontext(provider_phase_admission)
             try:
-                with provider_phase.join_provider_phase(
-                        provider_phase_admission):
-                    with kubernetes_adaptor.physical_cluster_uid_fence(
-                            fill_launch_context, fill_physical_cluster_uid):
-                        # Freeze the complete request tuple before its durable
-                        # reservation. Construction is side-effect free; doing
-                        # it first prevents an allocation row from being left
-                        # without local worker ownership if construction raises.
-                        try:
-                            launch_thread = _make_launch_thread({})
-                        except BaseException:
-                            self._release_unstarted_location_retry(location)
-                            raise
-                        logical_state_guard = (
-                            self._logical_state_lock if logical_reconcile_fence
-                            is not None else contextlib.nullcontext())
-                        with logical_state_guard:
-                            if (logical_reconcile_fence is not None and
-                                    not self._logical_reconcile_fence_holds(
-                                        logical_reconcile_fence,
-                                        require_exact_generation=
-                                        (logical_reconcile_fence_requires_exact_generation
-                                        ))):
-                                logger.info(
-                                    'Logical launch was superseded at its final '
-                                    'row-persistence fence.')
+                with phase_context as effective_admission:
+                    with provider_phase.join_provider_phase(
+                            effective_admission):
+                        physical_context = (
+                            kubernetes_adaptor.physical_cluster_uid_fence(
+                                fill_launch_context,
+                                fill_physical_cluster_uid,
+                                wait_for_initializer=False)
+                            if try_provider_phase_admission else
+                            kubernetes_adaptor.physical_cluster_uid_fence(
+                                fill_launch_context, fill_physical_cluster_uid))
+                        with physical_context:
+                            # Freeze the complete request tuple before its
+                            # durable reservation. Construction is side-effect
+                            # free; doing it first prevents an allocation row
+                            # from being left without local worker ownership if
+                            # construction raises.
+                            try:
+                                launch_thread = _make_launch_thread({})
+                            except BaseException:
                                 self._release_unstarted_location_retry(location)
-                                return False
-                            if not reserved_capacity_broker.persist_fill_replica(
-                                    self._service_name,
-                                    replica_id,
-                                    info,
-                                    pool_key=fill_pool_key,
-                                    expected_epoch=fill_grant_epoch,
-                                    expected_protocol_version=(
-                                        reserved_capacity_broker.PROTOCOL_V2),
-                                    expected_service_generation=(
-                                        fill_service_generation),
-                                    expected_physical_cluster_uid=(
-                                        fill_physical_cluster_uid),
-                                    **self._db_fence_kwargs()):
-                                self._release_unstarted_location_retry(location)
-                                self._log_fill_skip(
-                                    f'grant epoch {fill_grant_epoch} '
-                                    'superseded or round in flight at persist')
-                                return False
-                        legacy_runtime.launch_thread_pool[
-                            replica_id] = launch_thread
-                        if existing_replica_infos is not None:
-                            existing_replica_infos.append(info)
-                return True
+                                raise
+                            logical_state_guard = (self._logical_state_lock
+                                                   if logical_reconcile_fence
+                                                   is not None else
+                                                   contextlib.nullcontext())
+                            with logical_state_guard:
+                                if (logical_reconcile_fence is not None and
+                                        not self._logical_reconcile_fence_holds(
+                                            logical_reconcile_fence,
+                                            require_exact_generation=
+                                            (logical_reconcile_fence_requires_exact_generation
+                                            ))):
+                                    logger.info(
+                                        'Logical launch was superseded at its '
+                                        'final row-persistence fence.')
+                                    self._release_unstarted_location_retry(
+                                        location)
+                                    return False
+                                if not reserved_capacity_broker.persist_fill_replica(
+                                        self._service_name,
+                                        replica_id,
+                                        info,
+                                        pool_key=fill_pool_key,
+                                        expected_epoch=fill_grant_epoch,
+                                        expected_protocol_version=(
+                                            reserved_capacity_broker.PROTOCOL_V2
+                                        ),
+                                        expected_service_generation=(
+                                            fill_service_generation),
+                                        expected_physical_cluster_uid=(
+                                            fill_physical_cluster_uid),
+                                        **self._db_fence_kwargs()):
+                                    self._release_unstarted_location_retry(
+                                        location)
+                                    self._log_fill_skip(
+                                        f'grant epoch {fill_grant_epoch} '
+                                        'superseded or round in flight at '
+                                        'persist')
+                                    return False
+                            legacy_runtime.launch_thread_pool[
+                                replica_id] = launch_thread
+                            if existing_replica_infos is not None:
+                                existing_replica_infos.append(info)
+                    return True
+            except (exceptions.ProviderPhaseBusyError,
+                    exceptions.KubernetesPhysicalClusterFenceBusyError
+                   ) as error:
+                self._release_unstarted_location_retry(location)
+                self._log_fill_skip(
+                    'provider or physical-cluster phase is busy; deferring '
+                    'this launch without reserving capacity')
+                # A batch holds the manager lock. Continuing to churn later
+                # items after an opposite root is admitted would retain the
+                # lock that root needs and recreate phase-to-manager HOL.
+                assert try_provider_phase_admission
+                raise exceptions.ProviderPhaseBusyError(
+                    'Protocol-v2 batch item deferred at its persist seam.'
+                ) from error
             except exceptions.KubernetesPhysicalClusterIdentityError as error:
                 self._release_unstarted_location_retry(location)
                 self._log_fill_skip(
@@ -5581,6 +5671,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             if provider_phase_admission is not None:
                 direct_launch_kwargs['provider_phase_admission'] = (
                     provider_phase_admission)
+            elif _is_protocol_v2_fill_override(resources_override):
+                direct_launch_kwargs['try_provider_phase_admission'] = True
             launched = self._launch_replica(self._next_replica_id,
                                             resources_override,
                                             **direct_launch_kwargs)
@@ -5607,6 +5699,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             if provider_phase_admission is not None:
                 launch_kwargs['provider_phase_admission'] = (
                     provider_phase_admission)
+            elif _is_protocol_v2_fill_override(resources_override):
+                launch_kwargs['try_provider_phase_admission'] = True
             launched = self._launch_replica(self._next_replica_id,
                                             resources_override, **launch_kwargs)
         if launched:
@@ -5643,22 +5737,22 @@ class SkyPilotReplicaManager(ReplicaManager):
         expected_version: int | None = None,
         launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN)
     ) -> None:
-        """Enqueue a batch of replica launches under ONE lock acquisition.
+        """Enqueue a batch of replica launches under one manager lock.
 
         The manager lock is held by the readiness-probe round for tens of
         seconds per round on large fleets, so per-replica `scale_up` calls
         (one lock acquisition each) trickle through the short gaps between
         rounds: measured live at a 1000-target / ~340-replica fleet, launch
         enqueueing was the scaling bottleneck at ~100 replicas per several
-        minutes while the launch budget sat idle. Batching the whole
-        autoscaler tick into one acquisition makes the enqueue O(1) lock
-        waits per tick; the launch budget in `_refresh_thread_pool` then
-        paces actual `sky.launch` concurrency as intended.
+        minutes while the launch budget sat idle. Protocol-v2 items take a
+        zero-wait provider phase only at each physical UID proof and durable
+        reservation. This keeps the O(1) manager-lock acquisition while
+        allowing a queued ambient caller its FIFO turn between replicas.
 
-        Shared zero-cost placement also reuses one replica snapshot across the
-        wave. The launch path appends each successfully enqueued replica so
-        later decisions observe in-wave reservations without querying and
-        unpickling all existing rows once per launch.
+        Shared zero-cost placement reuses one replica snapshot across the wave.
+        The launch path appends each successfully enqueued replica so later
+        decisions observe in-wave reservations without querying and unpickling
+        all existing rows once per launch.
         """
         conflicting_v2_indexes = (
             _conflicting_protocol_v2_fill_override_indexes(resources_overrides))
@@ -5674,17 +5768,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             ]
             if not resources_overrides:
                 return
-        needs_v2_phase = any(
-            _is_protocol_v2_fill_override(resources_override)
-            for resources_override in resources_overrides)
-        phase_context: contextlib.AbstractContextManager[
-            provider_phase.ProviderPhaseAdmission | None]
-        if needs_v2_phase:
-            phase_context = provider_phase.provider_phase(
-                provider_phase.ProviderPhaseMode.V2_FENCED)
-        else:
-            phase_context = contextlib.nullcontext(None)
-        with phase_context as phase_admission:
+        try:
             with self.lock:
                 if self._spot_placer is not None:
                     self._spot_placer.refresh_workspace_policy()
@@ -5694,8 +5778,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 batch_kwargs: dict[str, Any] = {}
                 if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                     batch_kwargs['launch_priority'] = launch_priority
-                if phase_admission is not None:
-                    batch_kwargs['provider_phase_admission'] = phase_admission
                 if not needs_reservation:
                     self._scale_up_batch_locked(resources_overrides,
                                                 expected_version,
@@ -5712,14 +5794,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                     logger.info(
                         'Deferring demand scale-up because another service is '
                         'reserving shared zero-cost capacity.')
+        except exceptions.ProviderPhaseBusyError:
+            # The failed item already rolled back its location reservation and
+            # wrote no row/thread. Stop the wave so this lock is released to
+            # the phase owner; every remaining decision is retried next tick.
+            logger.info('Stopping protocol-v2 scale-up batch at a busy '
+                        'provider/physical phase boundary.')
 
     def _scale_up_batch_locked(
         self,
         resources_overrides: list[dict[str, Any] | None],
         expected_version: int | None = None,
         launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN),
-        provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
-                                   None) = None,
     ) -> None:
         """Persist one physical batch while any shared demand lock is held."""
         batch_version = self.latest_version
@@ -5792,9 +5878,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                     paid_location_launch_budget)
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 scale_up_kwargs['launch_priority'] = launch_priority
-            if provider_phase_admission is not None:
-                scale_up_kwargs['provider_phase_admission'] = (
-                    provider_phase_admission)
             stop_sequence_before = (paid_location_launch_budget.stop_sequence
                                     if paid_location_launch_budget is not None
                                     else 0)
@@ -9634,6 +9717,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         backend = backends.CloudVmRayBackend()
         ordinary_fetches: list[tuple[ReplicaInfo, Any, list[int] | None,
                                      bool]] = []
+        unphased_fetches: list[tuple[ReplicaInfo, Any, list[int] | None,
+                                     bool]] = []
         fenced_fetches: list[tuple[ReplicaInfo, Any, list[int] | None,
                                    bool]] = []
         invalid_recovery_ids: dict[
@@ -9706,6 +9791,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             fetch = (info, handle, job_ids, with_recovery)
             if cleanup_fence is not None:
                 fenced_fetches.append(fetch)
+            elif reserved_capacity.ordinary_provider_phase_mode(
+                    handle, info.cluster_name) is None:
+                unphased_fetches.append(fetch)
             else:
                 ordinary_fetches.append(fetch)
         for replica_id, message in identity_uncertainties:
@@ -9743,8 +9831,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                             phase_admission):
             # SSH into the replica's head node -- intentionally OUTSIDE
             # self.lock so an unreachable replica cannot wedge the round.
-            with reserved_capacity.protocol_v2_provider_fence(
-                    info, handle, phase_admission=phase_admission):
+            if phase_admission is None:
+                # The batched durable snapshot supplied this exact ordinary
+                # non-Kubernetes handle; the backend consumes it directly.
+                if (reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+                        is not None or
+                        reserved_capacity.ordinary_provider_phase_mode(
+                            handle, info.cluster_name) is not None):
+                    raise exceptions.ProviderPhaseMisuseError(
+                        'Unphased job status requires an exact ordinary '
+                        'non-Kubernetes handle.')
+                provider_context: contextlib.AbstractContextManager[Any] = (
+                    contextlib.nullcontext())
+            else:
+                provider_context = (
+                    reserved_capacity.protocol_v2_provider_fence(
+                        info, handle, phase_admission=phase_admission))
+            with provider_context:
                 if with_recovery:
                     return backend.get_job_status_with_system_recovery(
                         handle, job_ids, stream_logs=False)
@@ -9754,7 +9857,10 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         def _run_fetches(
             fetches: list[tuple[ReplicaInfo, Any, list[int] | None, bool]],
-            phase_admission: provider_phase.ProviderPhaseAdmission,
+            phase_admission: provider_phase.ProviderPhaseAdmission | None,
+            *,
+            provider_error_phase_mode: (provider_phase.ProviderPhaseMode |
+                                        None) = None,
         ) -> None:
             if not fetches:
                 return
@@ -9771,7 +9877,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                                        phase_admission)))
                     for info, handle, job_ids, with_recovery in fetches
                 ]
-                self._handle_job_status_results(fetch_results)
+                if provider_error_phase_mode is None:
+                    self._handle_job_status_results(fetch_results)
+                else:
+                    self._handle_job_status_results(
+                        fetch_results,
+                        provider_error_phase_mode=provider_error_phase_mode)
 
         fenced_invalid_ids = invalid_recovery_ids[
             provider_phase.ProviderPhaseMode.V2_FENCED]
@@ -9822,8 +9933,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                 _terminate_invalid_recovery_rows(ordinary_invalid_ids)
                 _run_fetches(ordinary_fetches, phase_admission)
 
+        # Healthy exact non-Kubernetes SSH can be arbitrarily slow without
+        # owning Kubernetes authority. If it fails, result reduction takes a
+        # fresh ambient phase before the manager lock and provider refresh.
+        _run_fetches(unphased_fetches,
+                     None,
+                     provider_error_phase_mode=(
+                         provider_phase.ProviderPhaseMode.AMBIENT_LEGACY))
+
     def _handle_job_status_results(
-            self, fetch_results: list[tuple[ReplicaInfo, Any]]) -> None:
+        self,
+        fetch_results: list[tuple[ReplicaInfo, Any]],
+        *,
+        provider_error_phase_mode: provider_phase.ProviderPhaseMode |
+        None = None,
+    ) -> None:
         """Consume the parallel job-status fetches, in submission order."""
         for info, result in fetch_results:
             try:
@@ -9853,33 +9977,51 @@ class SkyPilotReplicaManager(ReplicaManager):
             except exceptions.CommandError:
                 # If the job status fetch failed, it is likely that the
                 # cluster is preempted.
-                with self.lock:
-                    # Re-read under the lock: another thread may have
-                    # mutated/purged/scheduled-down this replica while we SSHed
-                    # lock-free; acting on the stale snapshot could clobber the
-                    # newer state or double-terminate.
-                    fresh = serve_state.get_replica_info_from_id(
-                        self._service_name, info.replica_id)
-                    if fresh is None:
-                        continue
-                    if not fresh.status_property.should_track_service_status():
-                        continue
-                    try:
-                        is_preempted = self._handle_preemption(fresh)
-                    except exceptions.KubernetesPhysicalClusterIdentityError as error:
-                        self._record_provider_identity_uncertain(
-                            fresh, 'preemption classification was fenced off: '
-                            f'{common_utils.format_exception(error)}')
-                        continue
-                    if (not is_preempted and fresh.system_recovery_disposition
-                            == system_recovery_state.SystemRecoveryDisposition.
-                            CAPABLE and
-                            self._system_recovery_status_barrier_expired(fresh)
-                       ):
-                        self._terminate_replica(fresh.replica_id,
-                                                sync_down_logs=True,
-                                                replica_drain_delay_seconds=0)
-                        is_preempted = True
+                error_phase_context: contextlib.AbstractContextManager[Any] = (
+                    contextlib.nullcontext()
+                    if provider_error_phase_mode is None else
+                    provider_phase.provider_phase(provider_error_phase_mode))
+                with error_phase_context:
+                    with self.lock:
+                        # Re-read only after any blocking phase admission:
+                        # another thread may have mutated/purged/scheduled-down
+                        # this replica while its SSH ran lock-free.
+                        fresh = serve_state.get_replica_info_from_id(
+                            self._service_name, info.replica_id)
+                        if fresh is None:
+                            continue
+                        if not fresh.status_property.should_track_service_status(
+                        ):
+                            continue
+                        try:
+                            fresh_cleanup_fence = (
+                                reserved_capacity.
+                                parse_protocol_v2_cleanup_fence(fresh))
+                            if (provider_error_phase_mode == provider_phase.
+                                    ProviderPhaseMode.AMBIENT_LEGACY and
+                                    fresh_cleanup_fence is not None):
+                                # The row changed authority while SSH was in
+                                # flight. Leave it unchanged for the next
+                                # strict-v2 round; never cross modes under lock.
+                                continue
+                            is_preempted = self._handle_preemption(fresh)
+                        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                            self._record_provider_identity_uncertain(
+                                fresh,
+                                'preemption classification was fenced off: '
+                                f'{common_utils.format_exception(error)}')
+                            continue
+                        if (not is_preempted and
+                                fresh.system_recovery_disposition
+                                == system_recovery_state.
+                                SystemRecoveryDisposition.CAPABLE and
+                                self._system_recovery_status_barrier_expired(
+                                    fresh)):
+                            self._terminate_replica(
+                                fresh.replica_id,
+                                sync_down_logs=True,
+                                replica_drain_delay_seconds=0)
+                            is_preempted = True
                 # Whether preempted or not, move on to the next replica: a
                 # replica whose job status cannot be fetched (e.g. a
                 # persistently broken but reachable node) must not abort the

@@ -958,6 +958,156 @@ def test_v2_job_status_batch_reuses_one_physical_uid_proof():
     assert backend.get_job_status.call_count == 2
 
 
+def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='-',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    handle = mock.Mock(spec=replica_managers.backends.CloudVmRayResourceHandle)
+    handle.cluster_name = info.cluster_name
+    handle.launched_resources = mock.Mock(cloud=clouds.GCP(),
+                                          region='us-central1')
+    records = {
+        info.cluster_name: {
+            'name': info.cluster_name,
+            'handle': handle,
+        }
+    }
+    mgr = _make_manager()
+    mgr._is_pool = True
+    backend = mock.Mock()
+    status_started = threading.Event()
+    release_status = threading.Event()
+
+    def _get_job_status(exact_handle, *_args, **_kwargs):
+        assert exact_handle is handle
+        status_started.set()
+        assert release_status.wait(timeout=5)
+        return {1: job_lib.JobStatus.RUNNING}
+
+    backend.get_job_status.side_effect = _get_job_status
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=records), \
+         mock.patch.object(replica_managers.backends,
+                           'CloudVmRayBackend',
+                           return_value=backend):
+        fetch_thread = threading.Thread(target=mgr._fetch_job_status)
+        fetch_thread.start()
+        assert status_started.wait(timeout=5)
+        try:
+            with replica_managers.provider_phase.try_provider_phase(
+                    replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED
+            ):
+                pass
+        finally:
+            release_status.set()
+            fetch_thread.join(timeout=5)
+
+    assert not fetch_thread.is_alive()
+    backend.get_job_status.assert_called_once_with(handle, [1],
+                                                   stream_logs=False)
+
+
+def test_non_kubernetes_job_status_error_takes_phase_before_manager_lock():
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='-',
+                                        is_spot=True,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    handle = mock.Mock(spec=replica_managers.backends.CloudVmRayResourceHandle)
+    handle.cluster_name = info.cluster_name
+    handle.launched_resources = mock.Mock(cloud=clouds.GCP(),
+                                          region='us-central1')
+    records = {
+        info.cluster_name: {
+            'name': info.cluster_name,
+            'handle': handle,
+        }
+    }
+    mgr = _make_manager()
+    mgr._is_pool = True
+    backend = mock.Mock()
+    status_raised = threading.Event()
+    preemption_checked = threading.Event()
+    errors = []
+
+    def _get_job_status(*_args, **_kwargs):
+        status_raised.set()
+        raise exceptions.CommandError(255, 'get_job_status', 'ssh failed', None)
+
+    backend.get_job_status.side_effect = _get_job_status
+
+    def _handle_preemption(fresh):
+        assert fresh is info
+        lease = (replica_managers.provider_phase._PROVIDER_PHASE_GATE.
+                 _current_lease())
+        assert lease is not None
+        assert lease.mode == (
+            replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
+        preemption_checked.set()
+        return False
+
+    mgr._handle_preemption = mock.Mock(side_effect=_handle_preemption)
+
+    def _fetch():
+        try:
+            mgr._fetch_job_status()
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            errors.append(error)
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(replica_managers.serve_state,
+                           'get_replica_info_from_id',
+                           return_value=info), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=records), \
+         mock.patch.object(replica_managers.backends,
+                           'CloudVmRayBackend',
+                           return_value=backend):
+        fetch_thread = threading.Thread(target=_fetch)
+        try:
+            with replica_managers.provider_phase.provider_phase(
+                    replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED
+            ):
+                fetch_thread.start()
+                assert status_raised.wait(timeout=5)
+                gate = replica_managers.provider_phase._PROVIDER_PHASE_GATE
+                with gate._condition:
+                    assert gate._condition.wait_for(lambda: any(
+                        waiter.mode == replica_managers.provider_phase.
+                        ProviderPhaseMode.AMBIENT_LEGACY
+                        for waiter in gate._queue),
+                                                    timeout=5)
+                # Error reduction is waiting for its phase, not holding the
+                # manager lock beneath that wait.
+                assert mgr.lock.acquire(blocking=False)
+                mgr.lock.release()
+                assert not preemption_checked.is_set()
+            # Exiting V2 above admits the queued error reducer.
+            assert preemption_checked.wait(timeout=5)
+        finally:
+            if fetch_thread.ident is not None:
+                fetch_thread.join(timeout=5)
+
+    assert not errors
+    assert not fetch_thread.is_alive()
+    mgr._handle_preemption.assert_called_once_with(info)
+
+
 def test_v2_cloud_liveness_uid_mismatch_is_unknown_not_preempted():
     info = replica_managers.ReplicaInfo(replica_id=1,
                                         cluster_name='svc-1',

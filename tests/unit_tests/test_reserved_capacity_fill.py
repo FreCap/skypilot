@@ -269,6 +269,36 @@ class TestProtocolV2CleanupFence(unittest.TestCase):
             provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
         ])
 
+    def test_ordinary_phase_classifier_requires_exact_real_cloud_handle(self):
+        ordinary_mode = provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+        for cloud in (clouds.AWS(), clouds.GCP()):
+            with self.subTest(cloud=cloud):
+                self.assertIsNone(
+                    reserved_capacity.ordinary_provider_phase_mode(
+                        self._handle(cloud=cloud), 'svc-1'))
+        for handle in (
+                None,
+                object(),
+                self._handle(),
+                self._handle(cloud=object()),
+                self._handle(cluster_name='replacement', cloud=clouds.GCP()),
+        ):
+            with self.subTest(handle=handle):
+                self.assertEqual(
+                    reserved_capacity.ordinary_provider_phase_mode(
+                        handle, 'svc-1'), ordinary_mode)
+
+    def test_ordinary_fence_rejects_wrong_admission_even_for_non_kubernetes(
+            self):
+        admission = types.SimpleNamespace(
+            mode=provider_phase.ProviderPhaseMode.V2_FENCED)
+        ordinary = types.SimpleNamespace(reserved_fill=False)
+        with self.assertRaises(exceptions.ProviderPhaseMisuseError):
+            reserved_capacity.protocol_v2_provider_fence(
+                ordinary,
+                self._handle(cloud=clouds.GCP()),
+                phase_admission=admission)
+
     def test_provider_fence_rejects_replaced_handle_without_provider_call(self):
         info = _protocol_v2_cleanup_info()
         handles = (
@@ -1279,6 +1309,7 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         for call in run_round.call_args_list:
             self.assertEqual(call.kwargs['expected_protocol_version'], 2)
             self.assertEqual(call.kwargs['expected_service_generation'], 1)
+            self.assertEqual(call.kwargs['lock_timeout_seconds'], 0)
         self.assertEqual(record_observation.call_count, 2)
         self.assertEqual(record_observation.call_args_list[0].args,
                          (placer, (east,), allocations[0]))
@@ -2165,19 +2196,9 @@ class TestFillLaunchPath(unittest.TestCase):
                                            override,
                                            provider_phase_admission=admission)
 
-    def test_v2_batch_phase_precedes_manager_lock(self):
+    def test_v2_batch_keeps_one_lock_and_defers_phase_to_each_item(self):
         manager = _make_manager(None)
         events = []
-        admission = mock.Mock(mode=provider_phase.ProviderPhaseMode.V2_FENCED)
-
-        @contextlib.contextmanager
-        def _phase(mode):
-            self.assertEqual(mode, provider_phase.ProviderPhaseMode.V2_FENCED)
-            events.append('phase-enter')
-            try:
-                yield admission
-            finally:
-                events.append('phase-exit')
 
         class _Lock:
 
@@ -2196,17 +2217,19 @@ class TestFillLaunchPath(unittest.TestCase):
             _PROTOCOL_KEY: reserved_capacity_broker.PROTOCOL_V2,
         }
 
-        with mock.patch.object(provider_phase,
-                               'provider_phase',
-                               side_effect=_phase):
+        with mock.patch.object(provider_phase, 'provider_phase') as phase, \
+             mock.patch.object(provider_phase,
+                               'try_provider_phase') as try_phase:
             manager.scale_up_batch([override])
 
-        self.assertEqual(
-            events,
-            ['phase-enter', 'lock-enter', 'scale', 'lock-exit', 'phase-exit'])
-        self.assertIs(
-            manager._scale_up_batch_locked.call_args.
-            kwargs['provider_phase_admission'], admission)
+        self.assertEqual(events, ['lock-enter', 'scale', 'lock-exit'])
+        self.assertEqual(manager._scale_up_batch_locked.call_count, 1)
+        self.assertNotIn('provider_phase_admission',
+                         manager._scale_up_batch_locked.call_args.kwargs)
+        # The mocked batch body owns item dispatch. The public wrapper must
+        # never wait for a phase while holding or before acquiring its lock.
+        phase.assert_not_called()
+        try_phase.assert_not_called()
 
     def test_v2_batch_drops_conflicting_uids_and_preserves_unrelated(self):
         phx = make_location('phx-context',
@@ -2265,6 +2288,271 @@ class TestFillLaunchPath(unittest.TestCase):
                                'persist_fill_replica') as persist:
             self.assertFalse(self._launch_v2(manager, override))
         persist.assert_not_called()
+
+    def test_v2_batch_item_requests_zero_wait_phase_at_persist_seam(self):
+        manager = _make_manager(None)
+        override = {
+            _FILL_KEY: True,
+            _PROTOCOL_KEY: reserved_capacity_broker.PROTOCOL_V2,
+        }
+        manager._launch_replica = mock.Mock(return_value=False)
+
+        self.assertFalse(manager._scale_up_one_locked(override, set()))
+
+        manager._launch_replica.assert_called_once_with(
+            manager._next_replica_id,
+            override,
+            try_provider_phase_admission=True)
+
+    def test_v2_batch_busy_phase_leaks_no_row_or_launch_thread(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+
+        class _BusyPhase:
+
+            def __enter__(self):
+                raise exceptions.ProviderPhaseBusyError('ambient waiter queued')
+
+            def __exit__(self, *_args):
+                return False
+
+        def _busy_phase(mode):
+            self.assertEqual(mode, provider_phase.ProviderPhaseMode.V2_FENCED)
+            return _BusyPhase()
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(provider_phase,
+                               'try_provider_phase',
+                               side_effect=_busy_phase), \
+             mock.patch.object(kubernetes_adaptor,
+                               'physical_cluster_uid_fence') as physical, \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist, \
+             mock.patch.object(replica_managers,
+                               '_ReplicaLaunchThread') as launch_thread:
+            with self.assertRaises(exceptions.ProviderPhaseBusyError):
+                manager._launch_replica(7,
+                                        self._v2_override(location),
+                                        try_provider_phase_admission=True)
+
+        physical.assert_not_called()
+        persist.assert_not_called()
+        launch_thread.assert_not_called()
+        self.assertNotIn(7, manager._launch_thread_pool)
+        placer.release_retry.assert_called_once_with(location)
+
+    def test_v2_batch_yields_to_fifo_ambient_between_items(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        existing = []
+
+        class _CountingLock:
+            """Records manager-lock acquisition by thread name."""
+
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.entries = []
+
+            def __enter__(self):
+                self._lock.acquire()
+                self.entries.append(threading.current_thread().name)
+                return self
+
+            def __exit__(self, *_args):
+                self._lock.release()
+
+        manager.lock = _CountingLock()
+        manager._batch_needs_placement_snapshot = mock.Mock(return_value=True)
+        manager._uses_shared_zero_cost_demand_budget = mock.Mock(
+            return_value=False)
+        first_persist = threading.Event()
+        release_first = threading.Event()
+        ambient_entered = threading.Event()
+        ambient_got_manager = threading.Event()
+        release_ambient = threading.Event()
+        batch_done = threading.Event()
+        errors = []
+        persist_count = 0
+
+        def _persist(*_args, **_kwargs):
+            nonlocal persist_count
+            persist_count += 1
+            self.assertEqual(persist_count, 1,
+                             'later item barged past the ambient FIFO root')
+            first_persist.set()
+            self.assertTrue(release_first.wait(timeout=5))
+            return True
+
+        def _ambient():
+            try:
+                with provider_phase.provider_phase(
+                        provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+                    ambient_entered.set()
+                    with manager.lock:
+                        ambient_got_manager.set()
+                    self.assertTrue(release_ambient.wait(timeout=5))
+            except BaseException as error:  # pylint: disable=broad-exception-caught
+                errors.append(error)
+
+        def _batch(overrides):
+            try:
+                manager.scale_up_batch(overrides)
+            except BaseException as error:  # pylint: disable=broad-exception-caught
+                errors.append(error)
+            finally:
+                batch_done.set()
+
+        @contextlib.contextmanager
+        def _physical(context, uid, *, wait_for_initializer=True):
+            self.assertEqual((context, uid, wait_for_initializer),
+                             ('phx-context', 'physical-uid', False))
+            yield
+
+        overrides = [
+            self._v2_override(location),
+            self._v2_override(location),
+            self._v2_override(location),
+        ]
+        real_try = provider_phase.try_provider_phase
+        try_modes = []
+
+        def _record_try(mode):
+            try_modes.append(mode)
+            return real_try(mode)
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=existing), \
+             mock.patch.object(replica_managers.paid_capacity,
+                               'build_launch_budget',
+                               return_value=None), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica',
+                               side_effect=_persist) as persist, \
+             mock.patch.object(kubernetes_adaptor,
+                               'physical_cluster_uid_fence',
+                               side_effect=_physical), \
+             mock.patch.object(replica_managers,
+                               '_ReplicaLaunchThread',
+                               return_value=object()) as launch_thread, \
+             mock.patch.object(provider_phase,
+                               'try_provider_phase',
+                               side_effect=_record_try):
+            batch = threading.Thread(target=_batch,
+                                     args=(overrides,),
+                                     name='batch')
+            ambient = threading.Thread(target=_ambient, name='ambient')
+            batch.start()
+            try:
+                self.assertTrue(first_persist.wait(timeout=5))
+                ambient.start()
+                gate = provider_phase._PROVIDER_PHASE_GATE
+                with gate._condition:
+                    self.assertTrue(
+                        gate._condition.wait_for(
+                            lambda: any(waiter.mode == provider_phase.
+                                        ProviderPhaseMode.AMBIENT_LEGACY
+                                        for waiter in gate._queue),
+                            timeout=5))
+                release_first.set()
+                self.assertTrue(batch_done.wait(timeout=5))
+                self.assertTrue(ambient_entered.wait(timeout=5))
+                self.assertTrue(ambient_got_manager.wait(timeout=5))
+            finally:
+                release_first.set()
+                release_ambient.set()
+                batch.join(timeout=5)
+                if ambient.ident is not None:
+                    ambient.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(batch.is_alive())
+        self.assertFalse(ambient.is_alive())
+        self.assertEqual(manager.lock.entries.count('batch'), 1)
+        self.assertEqual(try_modes, [
+            provider_phase.ProviderPhaseMode.V2_FENCED,
+            provider_phase.ProviderPhaseMode.V2_FENCED,
+        ])
+        persist.assert_called_once()
+        launch_thread.assert_called_once()
+        self.assertEqual(list(manager._launch_thread_pool), [7])
+        self.assertEqual([info.replica_id for info in existing], [7])
+        self.assertEqual(manager._next_replica_id, 8)
+
+    def test_v2_batch_physical_initializer_is_zero_wait_and_retires_phase(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        physical_busy = exceptions.KubernetesPhysicalClusterFenceBusyError(
+            'initializer busy', 'phx-context', 0)
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 side_effect=physical_busy) as physical, \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist, \
+             mock.patch.object(replica_managers,
+                               '_ReplicaLaunchThread') as launch_thread:
+            with self.assertRaises(exceptions.ProviderPhaseBusyError):
+                manager._launch_replica(7,
+                                        self._v2_override(location),
+                                        try_provider_phase_admission=True)
+
+        physical.assert_called_once_with('phx-context',
+                                         'physical-uid',
+                                         wait_for_initializer=False)
+        persist.assert_not_called()
+        launch_thread.assert_not_called()
+        self.assertNotIn(7, manager._launch_thread_pool)
+        placer.release_retry.assert_called_once_with(location)
+        # The failed item must retire its root before returning.
+        with provider_phase.try_provider_phase(
+                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+            pass
 
     def test_v2_pool_key_rejects_selected_accelerator_mismatch(self):
         location = make_location('phx-context',
@@ -3961,6 +4249,7 @@ class TestBrokerPollerCycle(unittest.TestCase):
             upsert_mock.call_args.kwargs['pool_key'],
             reserved_capacity_broker.make_pool_key('research-ctx', 'a100'))
         round_mock.assert_called_once()
+        self.assertEqual(round_mock.call_args.kwargs['lock_timeout_seconds'], 0)
         self.assertEqual(autoscaler._fill_grant, 3)
         self.assertEqual(autoscaler._fill_grant_epoch, 4)
         self.assertEqual(

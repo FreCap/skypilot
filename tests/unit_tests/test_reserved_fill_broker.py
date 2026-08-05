@@ -54,6 +54,25 @@ def test_protocol_v1_pool_key_encoding_is_unchanged():
                                 'A100') == json.dumps(['research-ctx', 'a100'])
 
 
+def test_phase_owner_can_make_broker_lock_admission_zero_wait():
+    timeout_lock = mock.MagicMock()
+    timeout_lock.__enter__.side_effect = locks.LockTimeout('busy')
+    query = mock.Mock()
+
+    with mock.patch.object(broker.locks, 'get_lock',
+                           return_value=timeout_lock) as get_lock:
+        allocation = broker.run_round_if_stale('svc',
+                                               _POOL,
+                                               query,
+                                               60.0,
+                                               lock_timeout_seconds=0)
+
+    assert allocation is None
+    get_lock.assert_called_once_with(
+        serve_constants.RESERVED_FILL_BROKER_LOCK_ID, timeout=0)
+    query.assert_not_called()
+
+
 def _replica(replica_id: int = 1) -> replica_managers.ReplicaInfo:
     return replica_managers.ReplicaInfo(replica_id=replica_id,
                                         cluster_name=f'svc-{replica_id}',

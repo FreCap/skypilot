@@ -1863,7 +1863,7 @@ class TestCloudVmRayBackendTeardownNoLock:
                                 'provisioner.teardown_cluster'
                             ) as provider_teardown:
             with pytest.raises(
-                    global_user_state.ClusterRecordIdentityConflictError,
+                    global_user_state.ClusterRecordHandleChangedError,
                     match='handle changed'):
                 backend.teardown_no_lock(
                     handle,

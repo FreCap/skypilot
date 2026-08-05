@@ -4969,7 +4969,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     f'Cluster {handle.cluster_name!r} disappeared before '
                     'action-fenced provider teardown.')
             if snapshot.serialized_handle != pickle.dumps(handle):
-                raise global_user_state.ClusterRecordIdentityConflictError(
+                raise global_user_state.ClusterRecordHandleChangedError(
                     f'Cluster {handle.cluster_name!r} handle changed before '
                     'action-fenced provider teardown.')
             return typing.cast(CloudVmRayResourceHandle, snapshot.handle)

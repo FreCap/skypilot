@@ -3036,13 +3036,16 @@ def get_my_allocation(service_name: str,
 
 
 def run_round_if_stale(
-        service_name: str,
-        pool_key: str,
-        query_fn: Callable[[], PoolObservation | None],
-        poll_interval_seconds: float,
-        *,
-        expected_protocol_version: int = PROTOCOL_V1,
-        expected_service_generation: int = 0) -> Allocation | None:
+    service_name: str,
+    pool_key: str,
+    query_fn: Callable[[], PoolObservation | None],
+    poll_interval_seconds: float,
+    *,
+    expected_protocol_version: int = PROTOCOL_V1,
+    expected_service_generation: int = 0,
+    lock_timeout_seconds: float = (
+        constants.RESERVED_FILL_BROKER_LOCK_TIMEOUT_SECONDS)
+) -> Allocation | None:
     """Reads the pool's round, driving a fresh one if it went stale.
 
     The caller (a service's capacity poller) must have upserted its claim
@@ -3064,12 +3067,14 @@ def run_round_if_stale(
     Returns None when the caller holds no live claim (expired, or rejected
     by a validation) or the round could not be driven; the caller then
     feeds its autoscaler zero free slots (existing holdings keep their
-    shelter via zero_cost_count, no new fill).
+    shelter via zero_cost_count, no new fill). Callers that already own a
+    bounded provider phase should pass a zero timeout: broker-lock contention
+    must retire that phase immediately instead of waiting behind another
+    controller's slow observation round.
     """
     try:
-        with locks.get_lock(
-                constants.RESERVED_FILL_BROKER_LOCK_ID,
-                timeout=constants.RESERVED_FILL_BROKER_LOCK_TIMEOUT_SECONDS):
+        with locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID,
+                            timeout=lock_timeout_seconds):
             return _run_round_locked(service_name, pool_key, query_fn,
                                      poll_interval_seconds,
                                      expected_protocol_version,
