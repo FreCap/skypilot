@@ -963,7 +963,7 @@ def resolve_service_workspace(
 
     if not serve_state.set_service_workspace_if_owner(service_name, workspace,
                                                       expected_service_hash):
-        refreshed = serve_state.get_service_from_name(service_name)
+        refreshed = serve_state.get_service_status_snapshot(service_name)
         if (refreshed is None or
                 refreshed.get('hash') != expected_service_hash or
                 refreshed.get('workspace') != workspace):
@@ -1649,7 +1649,7 @@ def get_yaml_content(service_name: str,
     # does not dump the yaml content to version database.
     # TODO(tian): Remove this after 2 minor releases, i.e. 0.13.0.
     if resource_scope is None:
-        record = serve_state.get_service_from_name(service_name)
+        record = serve_state.get_service_status_snapshot(service_name)
         resource_scope = record.get('resource_scope') if record else None
     latest_yaml_path = generate_task_yaml_file_name(
         service_name, version, resource_scope=resource_scope)

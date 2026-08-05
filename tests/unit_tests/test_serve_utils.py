@@ -191,12 +191,75 @@ def test_resolve_legacy_service_workspace_requires_trusted_empty_hint():
     set_workspace.assert_called_once_with('svc', 'research', 'incarnation-a')
 
 
+def test_resolve_service_workspace_rechecks_with_status_snapshot_only():
+    replicas = [types.SimpleNamespace(cluster_name='svc-r1')]
+    cluster_records = {
+        'svc-r1': {
+            'workspace': 'research'
+        },
+    }
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=replicas), \
+         mock.patch.object(serve_utils.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=cluster_records), \
+         mock.patch.object(serve_state,
+                           'set_service_workspace_if_owner',
+                           return_value=False), \
+         mock.patch.object(serve_state,
+                           'get_service_status_snapshot',
+                           return_value={
+                               'hash': 'incarnation-a',
+                               'workspace': 'research',
+                           }) as get_snapshot, \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           side_effect=AssertionError(
+                               'joined service read used')):
+        workspace = serve_utils.resolve_service_workspace(
+            'svc', {
+                'workspace': None,
+                'hash': 'incarnation-a'
+            }, 'research')
+
+    assert workspace == 'research'
+    get_snapshot.assert_called_once_with('svc')
+
+
 def test_resolve_service_workspace_rejects_stored_workspace_mismatch():
     with pytest.raises(RuntimeError, match="belongs to workspace 'research'"):
         serve_utils.resolve_service_workspace('svc', {
             'workspace': 'research',
             'hash': 'incarnation-a'
         }, 'production')
+
+
+def test_get_yaml_content_uses_status_snapshot_for_resource_scope_fallback(
+        tmp_path):
+    yaml_path = tmp_path / 'svc.yaml'
+    yaml_path.write_text('service: yaml\n', encoding='utf-8')
+
+    with mock.patch.object(serve_state,
+                           'get_yaml_content',
+                           return_value=None), \
+         mock.patch.object(serve_state,
+                           'get_service_status_snapshot',
+                           return_value={
+                               'resource_scope': 'scope-a',
+                           }) as get_snapshot, \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           side_effect=AssertionError(
+                               'joined service read used')), \
+         mock.patch.object(serve_utils,
+                           'generate_task_yaml_file_name',
+                           return_value=str(yaml_path)) as get_yaml_path:
+        content = serve_utils.get_yaml_content('svc', 7)
+
+    assert content == 'service: yaml\n'
+    get_snapshot.assert_called_once_with('svc')
+    get_yaml_path.assert_called_once_with('svc', 7, resource_scope='scope-a')
 
 
 def test_launch_quiesce_awaits_cancel_request_before_reporting_success():
