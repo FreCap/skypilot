@@ -724,6 +724,18 @@ export function useClusterData(options = {}) {
   const isInitialMount = useRef(true);
   const requestVersionRef = useRef(0);
   const refreshInFlightRef = useRef(null);
+  const serverRequestArgs = useMemo(
+    () => ({
+      page,
+      limit,
+      showHistory,
+      historyDays,
+      sortBy,
+      sortOrder,
+      filters,
+    }),
+    [page, limit, showHistory, historyDays, sortBy, sortOrder, filters]
+  );
 
   // Reset to page 1 when filters change, but skip on initial mount
   // so the page number read from the URL isn't overwritten.
@@ -743,17 +755,7 @@ export function useClusterData(options = {}) {
       console.log('[useClusterData] Using server-side pagination');
       const pluginFetch = getPaginationFetch();
 
-      const result = await dashboardCache.get(pluginFetch, [
-        {
-          page,
-          limit,
-          showHistory,
-          historyDays,
-          sortBy,
-          sortOrder,
-          filters,
-        },
-      ]);
+      const result = await dashboardCache.get(pluginFetch, [serverRequestArgs]);
       if (!isCurrentRequest()) {
         return;
       }
@@ -775,13 +777,8 @@ export function useClusterData(options = {}) {
       // Prefetch next page in background if there is one
       if (resultHasNext) {
         const nextPageOptions = {
+          ...serverRequestArgs,
           page: page + 1,
-          limit,
-          showHistory,
-          historyDays,
-          sortBy,
-          sortOrder,
-          filters,
         };
         dashboardCache
           .get(pluginFetch, [nextPageOptions], { ttl: 30000 })
@@ -791,7 +788,7 @@ export function useClusterData(options = {}) {
           );
       }
     },
-    [page, limit, showHistory, historyDays, sortBy, sortOrder, filters]
+    [page, serverRequestArgs]
   );
 
   /**
@@ -851,6 +848,20 @@ export function useClusterData(options = {}) {
   // This callback's dependency set covers every request input (including the
   // client-side subset), so its identity is the stable request context token.
   const requestContext = fetchServerSide;
+  const invalidateCurrentContext = useCallback(() => {
+    if (isPaginationPluginAvailable()) {
+      const pluginFetch = getPaginationFetch();
+      if (pluginFetch) {
+        dashboardCache.invalidate(pluginFetch, [serverRequestArgs]);
+      }
+      return;
+    }
+    if (showHistory) {
+      dashboardCache.invalidate(getClusterHistory, [null, historyDays]);
+      return;
+    }
+    dashboardCache.invalidate(getClusters, []);
+  }, [historyDays, serverRequestArgs, showHistory]);
 
   const startFetch = useCallback(
     (kind) => {
@@ -860,6 +871,9 @@ export function useClusterData(options = {}) {
         requestVersionRef.current === requestVersion;
       setLoading(true);
       setError(null);
+      if (kind === 'manual') {
+        invalidateCurrentContext();
+      }
 
       let refreshPromise;
       refreshPromise = (async () => {
@@ -896,7 +910,7 @@ export function useClusterData(options = {}) {
       };
       return refreshPromise;
     },
-    [fetchServerSide, fetchClientSide, requestContext]
+    [fetchServerSide, fetchClientSide, invalidateCurrentContext, requestContext]
   );
 
   /**
