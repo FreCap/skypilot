@@ -61,6 +61,10 @@ ROLE_DRAIN_MARKER_PATH = '/var/run/skypilot/draining'
 _CLAIM_LEASE_SECONDS = 30
 _CLAIM_HEARTBEAT_INTERVAL_SECONDS = 10
 _MAX_EXPIRED_CLAIMS_PER_SWEEP = 100
+# Ten claim leases after a request finished with no live lease, an
+# acknowledgement from its own executor can no longer be in flight.
+_ORPHANED_QUIESCENCE_GRACE_SECONDS = 300
+_MAX_ORPHANED_QUIESCENCE_PER_SWEEP = 100
 _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
 _INSTANCE_STALE_AFTER_SECONDS = 20
 _VALID_SERVER_ROLES = frozenset(
@@ -2359,6 +2363,52 @@ class PostgresQueueBackend(queue_base.QueueBackend):
     async def put_async(self, item: queue_base.QueueItemLike) -> None:
         await asyncio.to_thread(self.put, item)
 
+    def _reap_orphaned_execution_quiescence(
+            self, connection: sqlalchemy.engine.Connection) -> None:
+        """Publish quiescence no surviving owner can ever acknowledge.
+
+        Only the exact worker that claimed an execution generation may call
+        ``acknowledge_execution_quiescence``. When that worker dies mid-flight
+        its lease lapses, so nothing is left running effect-bearing code -- but
+        the row keeps ``execution_quiescence_required`` with no acknowledgement
+        forever. Every barrier waiting on it then blocks permanently: serve's
+        interrupted reserved-fill recovery wedges its whole replica manager,
+        which stops all reconciliation for the service.
+
+        An expired lease is the same proof of lost execution authority that
+        ``_reap_expired_claims`` already acts on. Wait a wide grace period past
+        the finish so an owner's own in-flight acknowledgement always wins,
+        then record the quiescence the dead owner cannot.
+        """
+        now = sqlalchemy.func.clock_timestamp()
+        stale_after = now - datetime.timedelta(
+            seconds=_ORPHANED_QUIESCENCE_GRACE_SECONDS)
+        orphaned = sqlalchemy.select(REQUESTS.c.request_id).where(
+            REQUESTS.c.status.in_([
+                status.value
+                for status in requests_lib.RequestStatus.finished_status()
+            ]),
+            REQUESTS.c.execution_quiescence_required,
+            REQUESTS.c.execution_quiesced_at.is_(None),
+            REQUESTS.c.execution_generation.is_not(None),
+            REQUESTS.c.finished_at.is_not(None),
+            REQUESTS.c.finished_at < stale_after,
+            # A live lease is the only thing that can still be executing, and
+            # its holder is the only party allowed to publish the proof.
+            sqlalchemy.or_(REQUESTS.c.lease_expires_at.is_(None),
+                           REQUESTS.c.lease_expires_at < now),
+        ).limit(_MAX_ORPHANED_QUIESCENCE_PER_SWEEP)
+        result = connection.execute(
+            sqlalchemy.update(REQUESTS).where(
+                REQUESTS.c.request_id.in_(orphaned)).values(
+                    execution_quiesced_generation=(
+                        REQUESTS.c.execution_generation),
+                    execution_quiesced_at=now,
+                    updated_at=now))
+        if result.rowcount:
+            logger.info(f'Recorded execution quiescence for {result.rowcount} '
+                        'terminal request(s) whose executor is gone.')
+
     def _reap_expired_claims(self,
                              connection: sqlalchemy.engine.Connection) -> None:
         now = sqlalchemy.func.clock_timestamp()
@@ -2450,6 +2500,7 @@ class PostgresQueueBackend(queue_base.QueueBackend):
             if not self._lock_controller_leadership(connection):
                 return None
             self._reap_expired_claims(connection)
+            self._reap_orphaned_execution_quiescence(connection)
             candidate = self._candidate(connection)
         if candidate is None:
             return None

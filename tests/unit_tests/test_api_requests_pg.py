@@ -3204,3 +3204,148 @@ def test_event_retention_batches_and_cascades_targets(request_database,
             ).select_from(event_schema.RESOURCE_EVENT_TARGETS)).scalar_one()
     assert events == ['fresh-event']
     assert target_count == 1
+
+
+def _orphaned_quiescence_row(engine,
+                             backend,
+                             request_id,
+                             *,
+                             finished_ago,
+                             lease_offset,
+                             status='CANCELLED',
+                             quiescence_required=True):
+    """Persist one terminal request awaiting an execution-quiescence ack."""
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    values = {
+        'status': status,
+        'execution_generation': 1,
+        'execution_quiescence_required': quiescence_required,
+        'execution_quiesced_generation': None,
+        'execution_quiesced_at': None,
+        'finished_at': (sqlalchemy.func.clock_timestamp() - finished_ago),
+        'lease_expires_at': (None if lease_offset is None else
+                             sqlalchemy.func.clock_timestamp() + lease_offset),
+    }
+    if lease_offset is not None:
+        # ck_api_requests_claim: a lease only exists alongside its claim.
+        values.update({
+            'claim_token': uuid.uuid4(),
+            'worker_instance_id': uuid.uuid4(),
+            'pid': 4242,
+        })
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    **values))
+
+
+def _quiescence_state(engine, request_id):
+    with engine.connect() as connection:
+        return connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.execution_quiesced_generation,
+                request_postgres.REQUESTS.c.execution_quiesced_at).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request_id)).first()
+
+
+def test_orphaned_execution_quiescence_is_reaped(request_database):
+    """A dead executor's unacknowledged quiescence must not wedge barriers.
+
+    Serve's interrupted reserved-fill recovery waits for every cancelled
+    launch to prove quiescence. Only the owning worker may publish that
+    proof, so a worker killed mid-flight (an API server restart) leaves the
+    row unprovable and blocks the whole replica manager forever.
+    """
+    engine, backend = request_database
+    stale = datetime.timedelta(
+        seconds=request_postgres._ORPHANED_QUIESCENCE_GRACE_SECONDS + 60)
+    _orphaned_quiescence_row(engine,
+                             backend,
+                             'orphaned-quiescence',
+                             finished_ago=stale,
+                             lease_offset=None)
+
+    queue = request_postgres.PostgresQueueBackend('short')
+    assert queue.get() is None
+
+    row = _quiescence_state(engine, 'orphaned-quiescence')
+    assert row.execution_quiesced_generation == 1
+    assert row.execution_quiesced_at is not None
+
+
+def test_recently_finished_execution_keeps_its_own_acknowledgement(
+        request_database):
+    """Inside the grace window the owner's own ack must still win."""
+    engine, backend = request_database
+    _orphaned_quiescence_row(engine,
+                             backend,
+                             'recently-finished',
+                             finished_ago=datetime.timedelta(seconds=5),
+                             lease_offset=None)
+
+    queue = request_postgres.PostgresQueueBackend('short')
+    assert queue.get() is None
+
+    row = _quiescence_state(engine, 'recently-finished')
+    assert row.execution_quiesced_generation is None
+    assert row.execution_quiesced_at is None
+
+
+def test_live_lease_holder_is_never_declared_quiescent(request_database):
+    """A live lease is the one thing that may still run effect-bearing code."""
+    engine, backend = request_database
+    stale = datetime.timedelta(
+        seconds=request_postgres._ORPHANED_QUIESCENCE_GRACE_SECONDS + 60)
+    _orphaned_quiescence_row(engine,
+                             backend,
+                             'live-lease',
+                             finished_ago=stale,
+                             lease_offset=datetime.timedelta(seconds=30))
+
+    queue = request_postgres.PostgresQueueBackend('short')
+    assert queue.get() is None
+
+    row = _quiescence_state(engine, 'live-lease')
+    assert row.execution_quiesced_generation is None
+    assert row.execution_quiesced_at is None
+
+
+def test_requests_without_a_quiescence_contract_are_untouched(request_database):
+    engine, backend = request_database
+    stale = datetime.timedelta(
+        seconds=request_postgres._ORPHANED_QUIESCENCE_GRACE_SECONDS + 60)
+    _orphaned_quiescence_row(engine,
+                             backend,
+                             'no-contract',
+                             finished_ago=stale,
+                             lease_offset=None,
+                             quiescence_required=False)
+
+    queue = request_postgres.PostgresQueueBackend('short')
+    assert queue.get() is None
+
+    row = _quiescence_state(engine, 'no-contract')
+    assert row.execution_quiesced_generation is None
+    assert row.execution_quiesced_at is None
+
+
+def test_non_terminal_requests_are_never_reaped(request_database):
+    """An unfinished execution is still running; it owns its own proof."""
+    engine, backend = request_database
+    stale = datetime.timedelta(
+        seconds=request_postgres._ORPHANED_QUIESCENCE_GRACE_SECONDS + 60)
+    _orphaned_quiescence_row(engine,
+                             backend,
+                             'still-running',
+                             finished_ago=stale,
+                             lease_offset=None,
+                             status='RUNNING')
+
+    queue = request_postgres.PostgresQueueBackend('short')
+    assert queue.get() is None
+
+    row = _quiescence_state(engine, 'still-running')
+    assert row.execution_quiesced_generation is None
+    assert row.execution_quiesced_at is None
