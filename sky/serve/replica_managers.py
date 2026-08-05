@@ -3495,9 +3495,40 @@ class SkyPilotReplicaManager(ReplicaManager):
         logger.warning(f'Replica {replica_id} cleanup will retry in '
                        f'{delay_seconds}s (attempt {attempt}).')
 
+    def _prove_cleanup_complete(self, info: ReplicaInfo, message: str) -> bool:
+        """Settle an unprovable cleanup by reading the physical cluster.
+
+        The durable record is not the only evidence available. A replica
+        retired before provisioning ever created one -- or one already
+        reclaimed by a status refresh -- owns no Pod, so its cleanup is
+        complete rather than uncertain. Retaining those rows forever grows
+        the replica table without bound and re-drives teardown for capacity
+        that never existed, so prove the negative before giving up.
+        """
+        try:
+            cleanup_fence = reserved_capacity.parse_protocol_v2_cleanup_fence(
+                info)
+        except exceptions.KubernetesPhysicalClusterIdentityError:
+            # A malformed identity is exactly the row that must be retained.
+            return False
+        if cleanup_fence is None:
+            return False
+        presence = reserved_capacity.probe_physical_replica_presence(
+            cleanup_fence, info.cluster_name)
+        if presence is not reserved_capacity.PhysicalReplicaPresence.ABSENT:
+            return False
+        logger.info(
+            f'Replica {info.replica_id} owns no Pod on '
+            f'{cleanup_fence.kubernetes_context!r}: treating cleanup as '
+            f'complete despite the unprovable step ({message}).')
+        self._handle_sky_down_finish(info, format_exc=None)
+        return True
+
     def _record_cleanup_uncertain(self, info: ReplicaInfo,
                                   message: str) -> None:
         """Retain one row whose exact provider cleanup cannot be proven."""
+        if self._prove_cleanup_complete(info, message):
+            return
         logger.error(f'Replica {info.replica_id} cleanup is uncertain: '
                      f'{message}')
         if info.status_property.sky_launch_status in (
@@ -6919,14 +6950,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.info(
                     f'Deferring log sync for replica {replica_id}: provider '
                     'authority is busy; continuing with fenced cleanup.')
-            except exceptions.KubernetesPhysicalClusterIdentityError:
-                # Log sync is credential delivery through KubernetesCommandRunner.
-                # Never downgrade an identity mismatch to the historical
-                # best-effort logging path before cleanup.
-                self._record_cleanup_uncertain(
-                    info, 'the physical Kubernetes identity could not be '
-                    'proved while syncing logs')
-                return
+            except exceptions.KubernetesPhysicalClusterIdentityError as e:
+                # Log sync is credential delivery through
+                # KubernetesCommandRunner, so an identity mismatch must never
+                # be downgraded to the historical best-effort logging path:
+                # skip the logs entirely. It must not abort the teardown
+                # either. Returning here would leave a replica that may still
+                # hold Pods running forever, which is the very leak this fence
+                # exists to prevent. Cleanup below re-proves identity under its
+                # own fence and records uncertainty only if it truly cannot act.
+                logger.warning(
+                    f'Skipping log sync for replica {replica_id}: the physical '
+                    'Kubernetes identity could not be proved; continuing with '
+                    f'fenced cleanup: {common_utils.format_exception(e)}')
             except Exception as e:  # pylint: disable=broad-except
                 # Logs aid diagnosis, but cannot be a prerequisite for
                 # stopping potentially billable infrastructure.
