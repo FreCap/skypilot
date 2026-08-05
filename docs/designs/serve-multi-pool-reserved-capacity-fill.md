@@ -3,12 +3,13 @@
 Status: feature and durable executor/provider-fence PRs are merged and deployed;
 the production PostgreSQL cutover, protocol-v2 activation, and pool-identity
 RBAC are complete; measured-capacity PR #1269 and UID-race PR #1271 are merged
-and deployed, and shared-round replay PR #1272 is merged but not yet deployed;
-live acceptance also exposed exact-card replay, mixed legacy/v2 provider-phase,
-and inherited workspace-context eligibility gaps, whose corrective hotfix,
-redeployment, PHX canary, and compatibility-cleanup merge gates remain open
+and deployed, while shared-round replay PR #1272 and launch-guard race PR #1274
+are merged but not yet deployed; live acceptance also exposed exact-card
+replay, mixed legacy/v2 provider-phase, and inherited workspace-context
+eligibility gaps, whose corrective hotfix, redeployment, PHX canary, and
+compatibility-cleanup merge gates remain open
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
 
 Canonical owner: this file. The implementation, rollout evidence, and the
 stacked compatibility-removal change must stay synchronized with this
@@ -200,13 +201,15 @@ expected UIDs for one context fail closed. Retargeting between observation, enqu
 restart, policy, optimization, client refresh, provider actuation, runtime
 bootstrap, setup, or job submission therefore cannot mutate or deliver data to
 a different physical cluster. Concurrent UID reads never publish out of
-generation order. A superseded forced launch-time read may return only the
-newer generation's live cache value or failure, never its own result. A
-non-forced observation whose successful read loses publication may return its
-own UID when no newer live entry exists: generations order lookup starts, not
-the reads themselves, and discarding that independently successful observation
-would spuriously withdraw the pool edge. Ordinary demand placement remains
-available.
+generation order. A superseded successful read returns the newer generation's
+live cache value when one is already published; otherwise both forced and non-
+forced callers may return their own independently successful read without
+publishing it. Generations order lookup starts, not read completion, so
+discarding that value is not a stronger identity proof: it spuriously
+withdraws the pool edge on observation and refuses every matching launch
+guard. A failed or empty read still returns no identity, and the exact launch
+capture independently proves the carried UID before provider mutation.
+Ordinary demand placement remains available.
 
 The process registry is deliberately conservative while a capture is active:
 an unleased same-context provider call, or a leased call that attempts a
@@ -332,9 +335,9 @@ owner-or-initializer collision waits at most 30 seconds for that context to
 become ambient again, using one absolute monotonic deadline across capture
 replacement races, and then re-reads the UID from fresh ambient credentials.
 The retry retains its original lookup generation and follows the same
-publication rule: a non-forced observation can report its successful post-wait
-read without stealing cache ownership, while a superseded forced read remains
-failed closed unless the newer generation has published a live value.
+publication rule: a forced or non-forced caller can report its successful
+post-wait read without stealing cache ownership when the newer generation has
+not yet published, while an available newer live cache value wins.
 It performs this wait without a broker/cache lock and only when the caller has
 no fence token, so it cannot deadlock its own scope. Owner and initializer
 retirement wake waiters. Other identity errors, a timeout, a context mismatch,
@@ -1447,6 +1450,13 @@ card map. That prevents aggregate A100-family capacity from releasing a full
 peer card in the same context, rejects malformed or CAS-lost evidence, and
 keeps v1 one-context and v2 exact-pool behavior aligned.
 
+PR #1274 subsequently repaired the other half of the UID race: a forced
+launch-guard read that completed successfully but lost cache publication had
+also returned `None`, causing every otherwise matching fill launch to be
+reported as a physical-UID mismatch. This branch inherits #1274 and extends its
+same successful-read rule through the bounded physical-fence-retirement retry;
+failures and genuine mismatches remain closed.
+
 Required feature CI on the preceding code-bearing head `1357dec79` completed
 all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
@@ -1464,7 +1474,8 @@ fleet no larger than the configured `max_replicas`.
 - Required feature and durable provider-fence CI passed. Helm revision 333
   currently runs release `1.1.1095` (merge
   `912555e6ee160aff404aca0db89337d2981493a1`) with merged PRs #1269 and #1271.
-  PR #1272 is merged upstream but is not present in that deployed image.
+  PRs #1272 and #1274 are merged upstream but are not present in that deployed
+  image.
   The production request store completed its one-way PostgreSQL cutover, Serve
   is at schema head 035, token-bound protocol v2 is active, and the exact
   `kube-system` Namespace read is present on east and PHX. The corrective
