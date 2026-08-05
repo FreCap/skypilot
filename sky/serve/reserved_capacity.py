@@ -784,9 +784,6 @@ def get_kubernetes_physical_cluster_uid(
                 return current_uid
             if current_generation > lookup_generation:
                 _PHYSICAL_CLUSTER_UID_CACHE.pop(context, None)
-        # No newer entry to defer to. A forced caller is fencing a launch, so
-        # it keeps failing closed: it asked for an identity read strictly
-        # after its own decision point and cannot prove this one is it.
         # No newer entry to defer to, because the newer lookup has not
         # finished yet. This caller did complete its own successful read of
         # this very context, and that read happened after its own request, so

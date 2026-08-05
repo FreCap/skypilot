@@ -1300,6 +1300,8 @@ class TestStrictDrain:
         manager._lb_in_flight_report = None
         manager._persist_replica = mock.Mock()
         manager._terminate_replica = mock.Mock()
+        manager._resolve_probe_urls = mock.Mock(
+            return_value={1: 'http://replica'})
         info = types.SimpleNamespace(
             replica_id=1,
             cluster_name='cluster-1',

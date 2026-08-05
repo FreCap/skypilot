@@ -930,6 +930,10 @@ class TestTerminateReplicaDrainAssembly:
         rm._down_thread_pool = {}
         rm._replica_to_request_id = {}
         rm._replica_to_launch_cancelled = {}
+        if url_error is not None:
+            rm._resolve_probe_urls = mock.Mock(side_effect=url_error)
+        else:
+            rm._resolve_probe_urls = mock.Mock(return_value={7: url})
         if interrupted_launch:
             finished_launch = mock.Mock()
             finished_launch.is_alive.return_value = False
@@ -1081,6 +1085,7 @@ class TestRecoveredStrictDrainDeadline:
         rm._wait_for_idle_trackers = {}
         rm._lb_in_flight_report = None
         rm._persist_replica = mock.Mock()
+        rm._resolve_probe_urls = mock.Mock(return_value={7: 'http://r7:8080'})
         info = mock.Mock(replica_id=7, cluster_name='svc-7')
         info.status_property = replica_managers.ReplicaStatusProperty(
             drain_cap_seconds=600, drain_started_at=started_at)

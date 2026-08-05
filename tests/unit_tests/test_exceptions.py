@@ -565,6 +565,9 @@ def test_all_current_skypilot_exceptions_round_trip_exactly():
         exceptions.KubernetesValidationError:
             lambda: exceptions.KubernetesValidationError(['spec', 'image'],
                                                          'bad value'),
+        exceptions.KubernetesPhysicalClusterFenceBusyError:
+            lambda: exceptions.KubernetesPhysicalClusterFenceBusyError(
+                'identity capture is busy', 'context-a', 3),
         exceptions.ProvisionPrechecksError:
             lambda: exceptions.ProvisionPrechecksError([ValueError('quota')]),
         exceptions.SkyPilotExcludeArgsBaseException:
