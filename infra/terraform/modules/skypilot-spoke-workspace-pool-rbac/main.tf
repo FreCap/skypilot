@@ -170,6 +170,18 @@ resource "kubernetes_role_v1" "pool" {
 # and `pods/portforward`, which would let any workload pod start pods and exec
 # into its neighbours. Teardown needs none of that.
 #
+# Unconditional. It briefly shipped as an opt-in flag defaulting to false,
+# because RBAC cannot scope `delete pods` to "pods this cluster owns" (names
+# are dynamic; verbs take no label selector), so in a namespace shared by
+# several users one SkyPilot workload can delete another's SkyPilot pods. That
+# reservation was misplaced: a pool namespace is not a tenant boundary and this
+# module never claimed it was -- the caller's `partitions` documentation says
+# so outright, and the control-plane subjects already hold pods create/exec/
+# portforward here. Meanwhile a pool without this grant cannot honour
+# `-i N --down` at all, and an operator has no way to notice until a cluster
+# has been idling for hours. A knob whose only correct value is `true` is a
+# footgun, so there is no knob.
+#
 # Verbs derived from sky/provision/kubernetes/instance.py:
 #   pods         list (filter_pods) + get/delete (_terminate_node)
 #   services     delete (_delete_services) + deletecollection over a label
@@ -180,8 +192,6 @@ resource "kubernetes_role_v1" "pool" {
 #                already wrapped in try/except; granting it just removes 403
 #                noise. No delete: HA controllers are control-plane managed.
 resource "kubernetes_role_v1" "pool_sa_self_teardown" {
-  count = var.allow_self_teardown ? 1 : 0
-
   metadata {
     name      = "${var.name}-self-teardown"
     namespace = var.namespace
@@ -216,8 +226,6 @@ resource "kubernetes_role_v1" "pool_sa_self_teardown" {
 }
 
 resource "kubernetes_role_binding_v1" "pool_sa_self_teardown" {
-  count = var.allow_self_teardown ? 1 : 0
-
   metadata {
     name      = "${var.name}-self-teardown"
     namespace = var.namespace
@@ -227,7 +235,7 @@ resource "kubernetes_role_binding_v1" "pool_sa_self_teardown" {
   role_ref {
     api_group = "rbac.authorization.k8s.io"
     kind      = "Role"
-    name      = kubernetes_role_v1.pool_sa_self_teardown[0].metadata[0].name
+    name      = kubernetes_role_v1.pool_sa_self_teardown.metadata[0].name
   }
 
   subject {
@@ -262,4 +270,20 @@ resource "kubernetes_role_binding_v1" "pool" {
   }
 
   depends_on = [kubernetes_namespace_v1.pool]
+}
+
+# The self-teardown pair shipped behind `count = var.allow_self_teardown ? 1 : 0`
+# and is now unconditional, which renames the state addresses from `[0]` to
+# unindexed. Without these, an already-applied pool would destroy and recreate
+# its Role and RoleBinding -- a window in which a node that hits its idle timer
+# cannot delete itself. A pool that never opted in has nothing at `[0]`, so the
+# blocks are a no-op there.
+moved {
+  from = kubernetes_role_v1.pool_sa_self_teardown[0]
+  to   = kubernetes_role_v1.pool_sa_self_teardown
+}
+
+moved {
+  from = kubernetes_role_binding_v1.pool_sa_self_teardown[0]
+  to   = kubernetes_role_binding_v1.pool_sa_self_teardown
 }

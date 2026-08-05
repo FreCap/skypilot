@@ -61,13 +61,6 @@ variable "partitions" {
     pod_identity_role_arn        = optional(string, "")
     pod_identity_service_account = optional(string, "skypilot-pool-sa")
 
-    # Let a node in this partition tear ITSELF down, which is what
-    # `sky launch -i N --down` needs -- that teardown runs inside the pod, as
-    # the pool ServiceAccount, not from the control plane. Off by default: the
-    # grant cannot be scoped to a single cluster's pods, so in a namespace
-    # shared by several users any SkyPilot workload can delete a neighbour's
-    # SkyPilot pods. See the rbac module's allow_self_teardown.
-    allow_self_teardown = optional(bool, false)
 
     priority_class = optional(object({
       value = number
