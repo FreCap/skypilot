@@ -153,3 +153,88 @@ class TestUnparseableTaskDoesNotRaise:
                                side_effect=RuntimeError('boom')):
             assert controller._catalog_missing_task_contexts(
                 _task_yaml(_EAST), _catalog()) == set()
+
+
+def _real_shape_entry(context: str, accelerator: str = 'A100-80GB') -> dict:
+    """One catalog entry exactly as the controller persists it.
+
+    Captured from the production catalog rather than invented, because the
+    detector walks this structure. A fixture that drifts from the real shape
+    would let the walker miss contexts that are present, and every commit
+    would then rebuild a catalog that was already complete.
+    """
+    return {
+        'location': {
+            'zone': None,
+            'cloud': 'Kubernetes',
+            'region': context,
+            'image_id': [{
+                'image': 'example.dkr.ecr.us-east-1.amazonaws.com/models:v1',
+                'region': 'docker',
+            }],
+            'use_spot': False,
+            'disk_tier': None,
+            'accelerators': {
+                accelerator: 1
+            },
+            'instance_type': f'4CPU--16GB--{accelerator}:1',
+            'container_image': None,
+            'ephemeral_storage': None,
+        },
+        'hourly_cost': 0.0,
+    }
+
+
+def _real_shape_catalog(*contexts: str) -> dict:
+    return {
+        'schema_version': 1,
+        'num_nodes': 1,
+        'entries': [_real_shape_entry(c) for c in contexts],
+    }
+
+
+class TestAgainstTheRealCatalogShape:
+    """No false positives on the structure actually persisted in production."""
+
+    def test_a_complete_real_shape_catalog_reports_nothing(self):
+        assert controller._catalog_missing_task_contexts(
+            _task_yaml(_EAST, _PHX), _real_shape_catalog(_EAST, _PHX)) == set()
+
+    def test_an_incomplete_real_shape_catalog_reports_the_gap(self):
+        assert controller._catalog_missing_task_contexts(
+            _task_yaml(_EAST, _PHX), _real_shape_catalog(_EAST)) == {_PHX}
+
+    def test_a_nested_image_id_region_is_not_mistaken_for_a_context(self):
+        # `image_id` carries its own {'region': 'docker'} entry. Treating that
+        # as a location would silently mark real contexts as satisfied.
+        catalog = _real_shape_catalog(_EAST)
+        blob = str(catalog)
+        assert "'region': 'docker'" in blob
+        assert controller._catalog_missing_task_contexts(
+            _task_yaml(_EAST, _PHX), catalog) == {_PHX}
+
+    def test_unknown_extra_keys_do_not_break_detection(self):
+        catalog = _real_shape_catalog(_EAST, _PHX)
+        catalog['entries'][0]['some_future_field'] = {'region': 'nonsense'}
+        catalog['future_top_level'] = ['anything']
+        assert controller._catalog_missing_task_contexts(
+            _task_yaml(_EAST, _PHX), catalog) == set()
+
+    def test_a_paid_only_catalog_reports_every_declared_context(self):
+        paid = {
+            'schema_version': 1,
+            'num_nodes': 1,
+            'entries': [{
+                'location': {
+                    'cloud': 'AWS',
+                    'region': 'us-east-1',
+                    'zone': 'us-east-1a',
+                    'accelerators': {
+                        'L4': 1
+                    },
+                },
+                'hourly_cost': 0.24,
+            }],
+        }
+        assert controller._catalog_missing_task_contexts(
+            _task_yaml(_EAST, _PHX), paid) == {_EAST, _PHX}
