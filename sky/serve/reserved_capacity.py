@@ -181,7 +181,8 @@ def _read_physical_replica_names(
     """
     # Imported lazily: `sky.provision.__init__` pulls in every cloud
     # provisioner, which the serve control path must not pay for at import.
-    from sky.provision import constants as provision_constants  # pylint: disable=import-outside-toplevel
+    # pylint: disable=import-outside-toplevel
+    from sky.provision import constants as provision_constants
 
     with kubernetes.physical_cluster_uid_fence(fence.kubernetes_context,
                                                fence.physical_cluster_uid,
