@@ -59,8 +59,12 @@ export function useVisibleRefreshInterval(
             scheduleNextRefresh(nextCadenceTickAfter(now));
             return;
           }
-          void onRefreshRef.current('interval');
-          scheduleNextRefresh(nextCadenceTickAfter(now));
+          const resumedDueAt = nextCadenceTickAfter(now);
+          try {
+            void onRefreshRef.current('interval');
+          } finally {
+            scheduleNextRefresh(resumedDueAt);
+          }
         },
         Math.max(0, dueAt - window.performance.now())
       );
@@ -79,12 +83,16 @@ export function useVisibleRefreshInterval(
         return;
       }
 
-      const handled = onRefreshRef.current('visibilitychange');
-      const resumedDueAt =
-        handled === false
-          ? nextCadenceTickAfter(now)
-          : nextCadenceTickAfter(now + intervalMs - 1);
-      scheduleNextRefresh(resumedDueAt);
+      let resumedDueAt = nextCadenceTickAfter(now);
+      try {
+        const handled = onRefreshRef.current('visibilitychange');
+        resumedDueAt =
+          handled === false
+            ? nextCadenceTickAfter(now)
+            : nextCadenceTickAfter(now + intervalMs - 1);
+      } finally {
+        scheduleNextRefresh(resumedDueAt);
+      }
     };
 
     scheduleNextRefresh(cadenceAnchor);

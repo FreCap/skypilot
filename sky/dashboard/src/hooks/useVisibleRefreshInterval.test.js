@@ -236,4 +236,86 @@ describe('useVisibleRefreshInterval', () => {
 
     unmount();
   });
+
+  it('keeps interval cadence armed after a synchronous interval failure', () => {
+    const onRefresh = jest
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('interval boom');
+      })
+      .mockImplementation(() => {});
+    const { unmount } = renderHook(() =>
+      useVisibleRefreshInterval(true, 1000, onRefresh)
+    );
+
+    expect(jest.getTimerCount()).toBe(1);
+
+    expect(() => {
+      act(() => {
+        jest.advanceTimersByTime(1000);
+      });
+    }).toThrow('interval boom');
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(1);
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(2);
+    expect(onRefresh).toHaveBeenLastCalledWith('interval');
+
+    unmount();
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('restores one future visible tick after a synchronous visibility failure', () => {
+    const onRefresh = jest
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('visibility boom');
+      })
+      .mockImplementation(() => {});
+    const { unmount } = renderHook(() =>
+      useVisibleRefreshInterval(true, 1000, onRefresh)
+    );
+    const suppressJsdomError = (event) => {
+      event.preventDefault();
+    };
+    window.addEventListener('error', suppressJsdomError);
+
+    try {
+      act(() => {
+        setDocumentVisibility('hidden');
+        window.document.dispatchEvent(new Event('visibilitychange'));
+      });
+      expect(jest.getTimerCount()).toBe(0);
+
+      act(() => {
+        jest.advanceTimersByTime(2000);
+      });
+
+      act(() => {
+        setDocumentVisibility('visible');
+        window.document.dispatchEvent(new Event('visibilitychange'));
+      });
+      expect(onRefresh).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(1);
+
+      act(() => {
+        jest.advanceTimersByTime(999);
+      });
+      expect(onRefresh).toHaveBeenCalledTimes(1);
+
+      act(() => {
+        jest.advanceTimersByTime(1);
+      });
+      expect(onRefresh).toHaveBeenCalledTimes(2);
+      expect(onRefresh).toHaveBeenLastCalledWith('interval');
+
+      unmount();
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      window.removeEventListener('error', suppressJsdomError);
+    }
+  });
 });
