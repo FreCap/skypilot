@@ -9,6 +9,7 @@ from typing import Any, Dict, Set
 from unittest import mock
 
 import pytest
+import yaml
 
 from sky import clouds
 from sky import exceptions
@@ -20,10 +21,12 @@ from sky.skylet import constants
 from sky.skylet import log_lib
 from sky.utils import common
 from sky.utils import common_utils
+from sky.utils import config_utils
 from sky.utils import controller_dependency_installation
 from sky.utils import controller_mount_translation
 from sky.utils import controller_utils
 from sky.utils import registry
+from sky.utils import yaml_utils
 
 _DEFAULT_AUTOSTOP = {
     'down': False,
@@ -70,6 +73,91 @@ def test_controller_config_snapshot_is_copied_and_keeps_workspace_policy():
     ]
     snapshot['kubernetes']['allowed_contexts'].append('other')
     assert original['kubernetes']['allowed_contexts'] == ['east', 'phx']
+
+
+def _server_shaped_config() -> config_utils.Config:
+    """The config object the API server actually holds.
+
+    ``skypilot_config.to_dict()`` returns a ``config_utils.Config``, not a
+    plain dict. ``Config.from_dict`` is ``cls(**config)``, so the subclass is
+    the top level only and nested values stay the plain dicts the YAML loader
+    produced -- which is why coercing the top level is sufficient.
+    """
+    contexts = ['prod_research_cluster_eks', 'phx_research_cluster_eks']
+    return config_utils.Config.from_dict({
+        'admin_policy': 'example.Policy',
+        'api_server': {
+            'endpoint': 'https://example.invalid'
+        },
+        'kubernetes': {
+            'allowed_contexts': list(contexts),
+            'ports': 'podip',
+        },
+        'workspaces': {
+            'mt_hybrid': {
+                'kubernetes': {
+                    'allowed_contexts': list(contexts),
+                    'namespace': 'preemptible-inference',
+                },
+                'private': False,
+            },
+        },
+    })
+
+
+class TestControllerConfigSnapshotIsSerializable:
+    """`sky serve update` serializes this snapshot; a dict subclass breaks it.
+
+    yaml.safe_dump represents ``dict`` but refuses dict SUBCLASSES, and the
+    API server's own config is a ``config_utils.Config``. Measured live:
+    every ``sky serve update`` against the deployed control plane failed with
+    ``CloudError: yaml error (RepresenterError): ('cannot represent an
+    object', {...})``, echoing the whole config into the error. The ``serve
+    up`` path survived only because it coerces with ``dict(**config)`` before
+    dumping, so no existing test covered the update path's direct dump.
+    """
+
+    def test_the_snapshot_of_a_server_config_is_a_plain_dict(self):
+        snapshot = controller_utils.controller_config_snapshot(
+            _server_shaped_config(), workspace='mt_hybrid')
+        assert type(snapshot) is dict
+
+    def test_the_snapshot_of_a_server_config_dumps_to_yaml(self):
+        snapshot = controller_utils.controller_config_snapshot(
+            _server_shaped_config(), workspace='mt_hybrid')
+        assert yaml_utils.safe_load(
+            yaml_utils.dump_yaml_str(snapshot)) == snapshot
+
+    def test_the_dumped_snapshot_keeps_every_declared_context(self):
+        # This is what refreshing the controller config on update buys: a
+        # context added to the workspace after `serve up` reaches the
+        # controller, so its placement catalogs can enumerate it.
+        snapshot = controller_utils.controller_config_snapshot(
+            _server_shaped_config(), workspace='mt_hybrid')
+        reloaded = yaml_utils.safe_load(yaml_utils.dump_yaml_str(snapshot))
+        assert (reloaded['workspaces']['mt_hybrid']['kubernetes']
+                ['allowed_contexts'] == [
+                    'prod_research_cluster_eks', 'phx_research_cluster_eks'
+                ])
+
+    def test_a_server_config_without_workspaces_is_still_a_plain_dict(self):
+        # The workspace branch rebuilds `config['workspaces']` and would mask
+        # the coercion; a config that never enters it must be plain too.
+        config = config_utils.Config.from_dict(
+            {'kubernetes': {
+                'ports': 'podip'
+            }})
+        snapshot = controller_utils.controller_config_snapshot(config)
+        assert type(snapshot) is dict
+        yaml_utils.dump_yaml_str(snapshot)
+
+    def test_the_unconverted_server_config_is_what_fails(self):
+        # Pins the premise the coercion exists for. If Config ever stops
+        # being a dict subclass this fails and the coercion can go.
+        assert isinstance(_server_shaped_config(), dict)
+        assert type(_server_shaped_config()) is not dict
+        with pytest.raises(yaml.representer.RepresenterError):
+            yaml_utils.dump_yaml_str(_server_shaped_config())
 
 
 @pytest.mark.parametrize('controller', list(controller_utils.Controllers))
