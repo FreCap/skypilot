@@ -114,7 +114,12 @@ def _format_replica_table(replica_records: list[dict[str, Any]], show_all: bool,
     truncate_hint = ''
     if not show_all:
         if len(replica_records) > _REPLICA_TRUNC_NUM:
-            truncate_hint = f'\n... (use --all to show all {noun}s)'
+            # `sky jobs pool status` owns an `--all` flag; `sky serve status`
+            # does not, and reaches show_all only through `--verbose`. Naming
+            # the wrong one sends an operator staring at a truncated table to
+            # a flag that exits with "no such option".
+            flag = '--all' if pool else '-v'
+            truncate_hint = f'\n... (use {flag} to show all {noun}s)'
         replica_records = replica_records[:_REPLICA_TRUNC_NUM]
 
     for record in replica_records:
