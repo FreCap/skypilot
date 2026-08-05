@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 import contextlib
 import dataclasses
+import enum
 import hashlib
 import json
 import math
@@ -144,6 +145,121 @@ class ProtocolV2CleanupFence:
 
     kubernetes_context: str
     physical_cluster_uid: str
+
+
+class PhysicalReplicaPresence(enum.Enum):
+    """Whether a replica still owns Pods on its fenced physical cluster."""
+
+    # No Pod claims this cluster name, and every observed Pod carried the
+    # ownership annotation, so the absence is authoritative.
+    ABSENT = 'ABSENT'
+    # At least one Pod still claims this cluster name.
+    PRESENT = 'PRESENT'
+    # The provider could not be read, or a Pod predating the ownership
+    # annotation makes a negative answer unsafe to trust.
+    UNPROVEN = 'UNPROVEN'
+
+
+# One provider read serves every replica torn down in the same sweep: a
+# service draining hundreds of rows would otherwise issue hundreds of
+# identical all-namespace Pod lists against the same physical cluster.
+_PHYSICAL_PRESENCE_SNAPSHOT_TTL_SECONDS = 30.0
+_physical_presence_snapshots: dict[tuple[str, str],
+                                   tuple[float, frozenset[str], frozenset[str],
+                                         bool]] = {}
+_physical_presence_lock = threading.Lock()
+
+
+def _read_physical_replica_names(
+    fence: ProtocolV2CleanupFence
+) -> tuple[frozenset[str], frozenset[str], bool]:
+    """List Pod ownership on the fenced physical cluster.
+
+    Returns the annotated logical cluster names, the on-cloud names taken
+    from the SkyPilot cluster label, and whether every observed Pod carried
+    the annotation (only then can absence be proven).
+    """
+    # Imported lazily: `sky.provision.__init__` pulls in every cloud
+    # provisioner, which the serve control path must not pay for at import.
+    # pylint: disable=import-outside-toplevel
+    from sky.provision import constants as provision_constants
+
+    with kubernetes.physical_cluster_uid_fence(fence.kubernetes_context,
+                                               fence.physical_cluster_uid,
+                                               wait_for_initializer=False):
+        pods = kubernetes.core_api(
+            fence.kubernetes_context).list_pod_for_all_namespaces(
+                label_selector=provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
+                _request_timeout=kubernetes.API_TIMEOUT).items
+    annotated_names: set[str] = set()
+    on_cloud_names: set[str] = set()
+    fully_annotated = True
+    for pod in pods:
+        metadata = getattr(pod, 'metadata', None)
+        annotations = getattr(metadata, 'annotations', None) or {}
+        labels = getattr(metadata, 'labels', None) or {}
+        annotated_name = annotations.get(
+            provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
+        on_cloud_name = labels.get(
+            provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
+        if isinstance(on_cloud_name, str) and on_cloud_name:
+            on_cloud_names.add(on_cloud_name)
+        if isinstance(annotated_name, str) and annotated_name:
+            annotated_names.add(annotated_name)
+        else:
+            # A Pod predating the ownership annotation cannot be attributed
+            # to a full cluster name, so no absence claim may rely on it.
+            fully_annotated = False
+    return frozenset(annotated_names), frozenset(
+        on_cloud_names), fully_annotated
+
+
+def probe_physical_replica_presence(
+        fence: ProtocolV2CleanupFence,
+        cluster_name: str,
+        now: float | None = None) -> PhysicalReplicaPresence:
+    """Prove whether `cluster_name` still owns Pods on the fenced cluster.
+
+    A cleanup whose durable record vanished is not evidence that provider
+    resources leaked: the replica may have been retired before provisioning
+    ever created one. Reading the provider converts that ambiguity into a
+    fact, so only genuinely unresolved rows are retained for retry.
+    """
+    if now is None:
+        now = time.monotonic()
+    key = (fence.kubernetes_context, fence.physical_cluster_uid)
+    snapshot: tuple[frozenset[str], frozenset[str], bool] | None = None
+    with _physical_presence_lock:
+        cached = _physical_presence_snapshots.get(key)
+        if (cached is not None and
+                now - cached[0] <= _PHYSICAL_PRESENCE_SNAPSHOT_TTL_SECONDS):
+            snapshot = (cached[1], cached[2], cached[3])
+    if snapshot is None:
+        try:
+            snapshot = _read_physical_replica_names(fence)
+        except Exception as error:  # pylint: disable=broad-except
+            # Contention, a retargeted kubeconfig, or an API failure all mean
+            # the same thing here: nothing was proven.
+            logger.debug(f'Could not read physical Pod ownership on '
+                         f'{fence.kubernetes_context!r}: '
+                         f'{common_utils.format_exception(error)}')
+            return PhysicalReplicaPresence.UNPROVEN
+        with _physical_presence_lock:
+            _physical_presence_snapshots[key] = (now, snapshot[0], snapshot[1],
+                                                 snapshot[2])
+    annotated_names, on_cloud_names, fully_annotated = snapshot
+    if cluster_name in annotated_names:
+        return PhysicalReplicaPresence.PRESENT
+    # The on-cloud name is the (possibly shortened) cluster name plus a hash
+    # suffix. A hit is positive evidence; a miss alone proves nothing because
+    # shortening can drop the prefix.
+    prefix = f'{cluster_name}-'
+    if any(name == cluster_name or name.startswith(prefix)
+           for name in on_cloud_names):
+        return PhysicalReplicaPresence.PRESENT
+    if not fully_annotated:
+        return PhysicalReplicaPresence.UNPROVEN
+    return PhysicalReplicaPresence.ABSENT
 
 
 def ordinary_provider_phase_mode(
