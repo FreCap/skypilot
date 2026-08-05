@@ -394,6 +394,83 @@ class TestMeasurementFeedsTheDownstreamGates:
         assert feeds['boltz-l4-fleet'] > feeds['boltz-l4-fleet-test']
 
 
+class TestProtocolV2DurableRoundBootstrap:
+    """A fresh committed round must seed launchability before the next query."""
+
+    @staticmethod
+    def _spec():
+        return reserved_capacity.FillPoolSpec(
+            position=0,
+            context='prod_research_cluster_eks',
+            shapes=(('A100-80GB', 1), ('A100', 1)),
+            locations=_EAST,
+            physical_cluster_uid='uid-east',
+            pool_key='v2:uid-east:a100',
+            legacy_pool_key='legacy-east')
+
+    def test_committed_round_bootstraps_launchable_and_hint_once(self):
+        placer = _placer(benched=_EAST)
+        spec = self._spec()
+        autoscaler = mock.MagicMock()
+        autoscaler.max_replicas = 500
+        autoscaler.reserved_fill_utilization_gate = False
+        autoscaler.reserved_fill_floor_replicas = 10
+        autoscaler.reserved_fill_weight = 100.0
+        autoscaler.get_final_target_num_replicas.return_value = 0
+        autoscaler.count_zero_cost_holdings_by_pool.return_value = {}
+        captured = {}
+        round_row = {
+            'last_observed_free': 218,
+            'last_observed_free_ts': time.time(),
+        }
+
+        def _capture_budgets(_global_budget, _service_floor, inputs):
+            captured['capacity_hints'] = [
+                entry.capacity_hint for entry in inputs
+            ]
+            return tuple(
+                reserved_capacity.FillPoolBudget(edge_cap=entry.capacity_hint,
+                                                 edge_floor=0)
+                for entry in inputs)
+
+        def _capture_claim_set(*_args, **kwargs):
+            captured['edges'] = kwargs['edges']
+            return 1
+
+        with mock.patch.object(reserved_capacity,
+                               'discover_fill_pool_specs',
+                               return_value=(spec,)), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_service_claim_set',
+                               return_value=None), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'utilization_gate_enabled',
+                 return_value=False), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_round',
+                               return_value=round_row) as get_round, \
+             mock.patch.object(reserved_capacity,
+                               'allocate_fill_pool_budgets',
+                               side_effect=_capture_budgets), \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'replace_claim_set',
+                 side_effect=_capture_claim_set), \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'run_round_if_stale',
+                               return_value=None):
+            reserved_capacity._broker_cycle_v2(autoscaler, placer, 'svc',
+                                               list(_EAST), None, None)
+
+        assert get_round.call_count == 1
+        assert captured['capacity_hints'] == [218]
+        assert captured['edges'][0]['launchable'] is True
+
+
 class TestMeasurementDurability:
     """Service updates rebuild the placer; controllers respawn."""
 

@@ -1361,6 +1361,59 @@ def _record_allocation_observation(
                              allocation.observed_at)
 
 
+def _fresh_round_observation(
+    round_row: dict[str, Any] | None,
+    now: float,
+) -> tuple[int, float] | None:
+    """Return a fresh durable pool observation, if one exists.
+
+    The broker's round row is already authoritative enough for
+    `_pool_capacity_hint()`. Reuse the same freshness contract when a
+    protocol-v2 controller rebuilds launchability from durable state after a
+    local placer bench or controller restart.
+    """
+    if round_row is None or round_row.get('last_observed_free') is None:
+        return None
+    observed_at = round_row.get('last_observed_free_ts')
+    if (not isinstance(observed_at, (int, float)) or
+            isinstance(observed_at, bool)):
+        return None
+    observed_at = float(observed_at)
+    if (now - observed_at > poll_interval_seconds() *
+            constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS):
+        return None
+    try:
+        free_slots = max(0, int(round_row['last_observed_free']))
+    except (TypeError, ValueError):
+        return None
+    return free_slots, observed_at
+
+
+def _seed_pool_launchability_from_round(
+    placer: 'spot_placer_lib.SpotPlacer',
+    locations: Sequence['spot_placer_lib.Location'],
+    round_row: dict[str, Any] | None,
+    now: float,
+) -> None:
+    """Apply a fresh committed round to the local placer before v2 claiming.
+
+    Protocol-v2 computes per-pool launchability and capacity hints before it
+    drives or reads the current round. If the local placer is still benched
+    but the durable broker row already measured free capacity, prime the
+    placer from that committed observation first so the claim heartbeat and
+    its budget partition do not ignore fresh broker state for one cycle.
+    """
+    observed = _fresh_round_observation(round_row, now)
+    if observed is None:
+        return
+    free_slots, observed_at = observed
+    _record_pool_observation(
+        placer, locations,
+        reserved_capacity_broker.PoolObservation(
+            free_slots=free_slots, gpu_names=(),
+            free_slots_by_accelerator=None), observed_at)
+
+
 def _broker_cycle(
     autoscaler: 'autoscalers.Autoscaler',
     placer: 'spot_placer_lib.SpotPlacer',
@@ -1487,23 +1540,22 @@ def _broker_cycle(
                 f'(round {allocation.round_id}, epoch {allocation.epoch}).')
 
 
-def _pool_capacity_hint(spec: FillPoolSpec, holdings: int, launchable: bool,
-                        previous_cap: int, now: float) -> int:
+def _pool_capacity_hint(spec: FillPoolSpec,
+                        holdings: int,
+                        launchable: bool,
+                        previous_cap: int,
+                        now: float,
+                        round_row: dict[str, Any] | None = None) -> int:
     """Return the bounded discovery/blackout hint for one pool edge."""
     if not launchable:
         return holdings
-    round_row = serve_state.get_reserved_fill_round(spec.pool_key)
+    if round_row is None:
+        round_row = serve_state.get_reserved_fill_round(spec.pool_key)
     if round_row is None or round_row.get('last_observed_free') is None:
         return holdings + 1
-    observed_at = round_row.get('last_observed_free_ts')
-    if observed_at is not None:
-        try:
-            fresh = (now - float(observed_at) <= poll_interval_seconds() *
-                     constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
-        except (TypeError, ValueError):
-            fresh = False
-        if fresh:
-            return holdings + max(0, int(round_row['last_observed_free']))
+    observed = _fresh_round_observation(round_row, now)
+    if observed is not None:
+        return holdings + observed[0]
     return max(holdings, previous_cap)
 
 
@@ -1596,6 +1648,13 @@ def _broker_cycle_v2(
         utilization_ceiling = global_headroom
     global_budget = min(global_headroom, utilization_ceiling)
 
+    round_rows = {
+        spec.pool_key: serve_state.get_reserved_fill_round(spec.pool_key)
+        for spec in specs
+    }
+    for spec in specs:
+        _seed_pool_launchability_from_round(placer, spec.locations,
+                                            round_rows[spec.pool_key], now)
     active_locations = placer.active_locations()
     launchable: dict[str, bool] = {
         spec.pool_key: any(
@@ -1615,9 +1674,12 @@ def _broker_cycle_v2(
         budget_inputs.append(
             FillPoolBudgetInput(holdings=holdings_fill,
                                 capacity_hint=_pool_capacity_hint(
-                                    spec, holdings_fill,
-                                    launchable[spec.pool_key], previous_cap,
-                                    now)))
+                                    spec,
+                                    holdings_fill,
+                                    launchable[spec.pool_key],
+                                    previous_cap,
+                                    now,
+                                    round_row=round_rows[spec.pool_key])))
     budgets = allocate_fill_pool_budgets(
         global_budget, autoscaler.reserved_fill_floor_replicas,
         tuple(budget_inputs))
