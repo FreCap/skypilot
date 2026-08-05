@@ -55,6 +55,54 @@ logger = sky_logging.init_logger(__name__)
 serve_history = controller_history.serve_history
 
 
+def _catalog_missing_task_contexts(
+        yaml_content: str, placement_catalog: dict[str, Any]) -> set[str]:
+    """Kubernetes contexts the task declares that the catalog does not carry.
+
+    Compared on the context name alone. A catalog entry pins cloud, region and
+    a purchase model; the question here is only whether the enumeration ever
+    considered this context, so anything narrower would report a spurious
+    mismatch on an unrelated field.
+
+    Best effort by construction: a task or catalog this cannot parse yields an
+    empty set, which preserves the previous reuse behavior rather than failing
+    an update on a parsing difference.
+    """
+    try:
+        task = task_lib.Task.from_yaml_str(yaml_content)
+    except Exception:  # pylint: disable=broad-except
+        return set()
+
+    declared: set[str] = set()
+    for resources in (task.resources or []):
+        cloud = getattr(resources, 'cloud', None)
+        if cloud is None or str(cloud).lower() != 'kubernetes':
+            continue
+        region = getattr(resources, 'region', None)
+        if isinstance(region, str) and region:
+            declared.add(region)
+    if not declared:
+        return set()
+
+    present: set[str] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            cloud = node.get('cloud')
+            region = node.get('region')
+            if (isinstance(cloud, str) and cloud.lower() == 'kubernetes' and
+                    isinstance(region, str) and region):
+                present.add(region)
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                _walk(value)
+
+    _walk(placement_catalog)
+    return declared - present
+
+
 def _uses_current_request_classification_protocol(
         request_data: dict[str, Any]) -> bool:
     """Whether one LB payload declares the controller's current protocol."""
@@ -3262,6 +3310,26 @@ class SkyServeController:
                                           status_code=400)
         placement_catalog = serve_state.get_placement_catalog(
             self._service_name, version)
+        if (placement_catalog is not None and
+                getattr(validation_service, 'spot_placer', None) is not None):
+            # A catalog reused from an earlier commit enumerates the locations
+            # that existed when it was built. Adding a Kubernetes context to a
+            # service afterwards therefore has no effect: the context never
+            # enters the catalog, the placer never lists it as zero-cost, and
+            # the reserved-fill broker never claims a pool for it. That failure
+            # is silent -- the spec, the workspace and the cluster all look
+            # correct while the capacity is simply never used. Observed in
+            # production with a spec-declared context absent from six
+            # consecutive versions' catalogs. Rebuild rather than inherit an
+            # enumeration the spec has outgrown.
+            missing = _catalog_missing_task_contexts(yaml_content,
+                                                     placement_catalog)
+            if missing:
+                logger.info(
+                    f'Rebuilding the placement catalog for version {version}: '
+                    f'the inherited catalog is missing Kubernetes context(s) '
+                    f'{sorted(missing)} that the task declares.')
+                placement_catalog = None
         needs_catalog = (getattr(validation_service, 'spot_placer', None)
                          is not None and placement_catalog is None)
         needs_logical_validation = (
@@ -3286,6 +3354,22 @@ class SkyServeController:
                         workspace=self._replica_manager.workspace)
                     assert built_catalog is not None
                     placement_catalog = built_catalog.to_dict()
+                    # A freshly built catalog that still omits a declared
+                    # context means the context is unreachable or not allowed
+                    # in this service's workspace, not that the catalog is
+                    # stale. Say so: the alternative is a service that runs
+                    # indefinitely without the capacity its spec asks for.
+                    still_missing = _catalog_missing_task_contexts(
+                        yaml_content, placement_catalog)
+                    if still_missing:
+                        logger.error(
+                            'Placement catalog for version '
+                            f'{version} omits Kubernetes context(s) '
+                            f'{sorted(still_missing)} declared by the task. '
+                            'Reserved fill will not claim a pool for them. '
+                            'Check that each context is reachable and allowed '
+                            'in workspace '
+                            f'{self._replica_manager.workspace!r}.')
             except (ValueError, RuntimeError) as e:
                 return responses.JSONResponse(content={'message': str(e)},
                                               status_code=400)
