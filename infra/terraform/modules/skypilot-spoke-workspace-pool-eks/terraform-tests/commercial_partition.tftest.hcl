@@ -137,45 +137,16 @@ run "commercial_pool_preserves_partition_identity_shapes" {
 }
 
 # The pool ServiceAccount is what a node runs as, so it is the identity that
-# performs an idle teardown. Per-partition, because the grant cannot be scoped
-# to one cluster's pods and so is only safe where the namespace is not shared.
-run "self_teardown_defaults_off_and_is_per_partition" {
+# performs an idle teardown. Every partition gets it: a pool namespace whose
+# nodes cannot delete themselves silently breaks `sky launch -i N --down`.
+run "every_partition_gets_node_self_teardown" {
   command = plan
 
   assert {
     condition = (
-      module.rbac["training"].self_teardown_role_name == null &&
-      module.rbac["inference"].self_teardown_role_name == null
+      module.rbac["training"].self_teardown_role_name == "training-self-teardown" &&
+      module.rbac["inference"].self_teardown_role_name == "inference-self-teardown"
     )
-    error_message = "Partitions must not grant node self-teardown unless they ask for it."
-  }
-}
-
-run "self_teardown_reaches_only_the_partition_that_asked" {
-  command = plan
-
-  variables {
-    partitions = [
-      {
-        namespace             = "training"
-        group                 = "training"
-        pod_identity_role_arn = "arn:aws:iam::210987654321:role/skypilot-training"
-        allow_self_teardown   = true
-      },
-      {
-        namespace = "inference"
-        group     = "inference"
-      },
-    ]
-  }
-
-  assert {
-    condition     = module.rbac["training"].self_teardown_role_name == "training-self-teardown"
-    error_message = "A partition opting in must receive the self-teardown role."
-  }
-
-  assert {
-    condition     = module.rbac["inference"].self_teardown_role_name == null
-    error_message = "Opting one partition in must not grant self-teardown to the others."
+    error_message = "Every partition must receive the node self-teardown grant."
   }
 }

@@ -20,8 +20,8 @@ output "role_name" {
 
 output "self_teardown_role_name" {
   description = <<-EOT
-    Name shared by the pod ServiceAccount's self-teardown role and its binding,
-    or null when allow_self_teardown is false (autodown unavailable in the pool).
+    Name shared by the pod ServiceAccount's self-teardown role and its binding
+    -- the grant that lets a node honour `sky launch -i N --down`.
   EOT
-  value       = one(kubernetes_role_v1.pool_sa_self_teardown[*].metadata[0].name)
+  value       = kubernetes_role_v1.pool_sa_self_teardown.metadata[0].name
 }

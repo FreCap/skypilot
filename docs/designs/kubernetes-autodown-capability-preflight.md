@@ -173,13 +173,37 @@ keeps billing". That helper catches the cloud-capability version of the
 problem (AWS one-time spot cannot stop). This catches the
 node-identity version, which no cloud-level feature flag can express.
 
+### The RBAC itself: `skypilot-spoke-workspace-pool-rbac`
+
+The infra half. The module creates the pool ServiceAccount and binds its
+Role and ClusterRole to `var.subjects`, whose validation accepts only
+`User`/`Group` — the control plane's identity. The ServiceAccount it
+creates was bound to nothing, which is why no pool could ever autodown.
+
+It now always creates a second, teardown-shaped Role bound to that
+ServiceAccount: pods `get`/`list`/`delete`, services
+`get`/`list`/`delete`/`deletecollection`, events `create`, deployments
+`list`. Separate from the control-plane Role on purpose — that one carries
+pods `create`, `pods/exec` and `pods/portforward`.
+
+This shipped first as an opt-in `allow_self_teardown` defaulting to
+`false`, on the reasoning that RBAC cannot scope `delete pods` to "pods
+this cluster owns", so in a shared namespace one SkyPilot workload can
+delete another's SkyPilot pods. That reservation was withdrawn: a pool
+namespace is not a tenant boundary and the caller's own `partitions`
+documentation says so, the control-plane subjects already hold pods
+`create`/`exec`/`portforward` there, and a pool that cannot honour
+`--down` is never what the caller wanted. A knob whose only correct value
+is `true` is a footgun. `moved` blocks carry the already-applied
+count-indexed addresses across the removal.
+
 ## Alternatives considered
 
-**Grant the RBAC from SkyPilot.** SkyPilot deliberately does not touch RBAC
-for an operator-supplied ServiceAccount, and in general lacks permission to
-create Roles in the target namespace. Rejected: this is an operator
-decision, and the incident's real remedy is an operator one. The product
-fix is to stop failing silently.
+**Have SkyPilot grant the RBAC at provision time.** SkyPilot deliberately
+does not touch RBAC for an operator-supplied ServiceAccount, and in
+general lacks permission to create Roles in the target namespace. Rejected
+for the runtime path: it is an operator decision, expressed in the pool
+module above. The product fix is to stop failing silently.
 
 **Warn instead of raising.** The incident launch ran with `-y` inside an
 agent session; a warning in a 400 KB provision log is indistinguishable
