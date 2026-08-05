@@ -1418,10 +1418,10 @@ Terraform formatting, and `git diff --check` also passed. Independent
 adversarial review found no remaining release blocker in the lifecycle-wide
 physical-cluster or cluster-generation fence.
 
-Corrective pre-PR validation on 2026-08-04 passed 570 focused broker,
+Corrective pre-PR validation on 2026-08-04 passed 555 focused broker,
 reserved-capacity, workspace, physical-fence, executor, and replica-contract
 tests plus 62 subtests. After updating three stale provider-phase test doubles,
-the broad affected Serve suite passed all 922 tests plus 9 subtests. Repository
+the broad affected Serve suite passed all 908 tests plus 23 subtests. Repository
 mypy completed with no issues across 884 source files, YAPF and isort completed,
 Python compilation and `git diff --check` passed, and an independent exact-head
 adversarial review found no release-blocking concurrency or identity issue.
