@@ -261,6 +261,83 @@ run "accepts_explicit_public_probe_ingress" {
   }
 }
 
+run "additional_ports_default_to_creating_no_extra_rule" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+    }
+  }
+
+  assert {
+    condition     = length(aws_security_group_rule.serve_control_plane_additional) == 0
+    error_message = "Omitting additional_ports must not widen an existing spoke."
+  }
+}
+
+run "grants_the_ssh_port_a_kubernetes_launch_needs" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+      additional_ports       = [22]
+    }
+  }
+
+  # The serving port keeps index [0] so an existing rule is not re-keyed, and
+  # the SSH port arrives as a separate, independently addressed rule.
+  assert {
+    condition     = aws_security_group_rule.serve_probe_from_control_plane[0].from_port == 8080
+    error_message = "The serving-port rule must keep its address and port."
+  }
+
+  assert {
+    condition     = aws_security_group_rule.serve_control_plane_additional["22"].from_port == 22
+    error_message = "A Kubernetes replica launch SSHes to the Pod IP; 22 must be granted."
+  }
+
+  assert {
+    condition     = aws_security_group_rule.serve_control_plane_additional["22"].cidr_blocks == tolist(["10.30.0.0/16"])
+    error_message = "The extra rule must reuse the reviewed control-plane CIDR."
+  }
+}
+
+run "rejects_an_additional_port_repeating_the_serving_port" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+      additional_ports       = [22, 8080]
+    }
+  }
+
+  expect_failures = [var.serve_probe_ingress]
+}
+
+run "rejects_an_out_of_range_additional_port" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+      additional_ports       = [70000]
+    }
+  }
+
+  expect_failures = [var.serve_probe_ingress]
+}
+
 run "rejects_a_controller_role_from_another_partition" {
   command = plan
 
