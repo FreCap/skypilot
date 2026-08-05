@@ -646,16 +646,23 @@ def get_kubernetes_physical_cluster_uid(
         # No newer entry to defer to. A forced caller is fencing a launch, so
         # it keeps failing closed: it asked for an identity read strictly
         # after its own decision point and cannot prove this one is it.
-        if force_refresh:
-            return None
-        # An observation-path reader, by contrast, just completed its own
-        # successful read of this very context. Discarding it takes the fill
-        # pool edge down for the whole cycle (`resolve_fill_pool_specs` drops
-        # any candidate that resolves to None), which switches reserved fill
-        # off fleet-wide whenever two services poll the same context at once.
-        # The generation stamp orders lookup STARTS, not the reads themselves,
-        # so a losing reader's value is not demonstrably older anyway. Report
-        # it without publishing: the newer generation still owns the cache.
+        # No newer entry to defer to, because the newer lookup has not
+        # finished yet. This caller did complete its own successful read of
+        # this very context, and that read happened after its own request, so
+        # it satisfies what both consumers need:
+        #
+        #  - the observation path, where discarding it drops the pool edge for
+        #    the cycle (`resolve_fill_pool_specs` skips a candidate that
+        #    resolves to None) and switches fill off fleet-wide;
+        #  - the launch fence, where `_authorize_reserved_fill_launch`
+        #    compares this value to the pinned pool UID and reads None as
+        #    `fill-physical-cluster-uid-mismatch`, refusing every fill launch.
+        #
+        # Returning None here was never a stronger fence: the generation stamp
+        # orders lookup STARTS, not the reads themselves, so a losing reader's
+        # value is not demonstrably older than the winner's. If the newer
+        # lookup does land a different identity it owns the cache, and the
+        # next check sees it. Report the read without publishing it.
         return uid
 
 
