@@ -1844,6 +1844,9 @@ class ReplicaManager:
 
         # Newest version among the currently provisioned and launched replicas
         self.latest_version: int = version
+        # A controller that died between a version transition and its sweep
+        # left superseded failure records behind, so sweep once on startup.
+        self._superseded_prune_pending: bool = True
         # Published only after an autoscaler decision tick has produced an
         # authoritative target. None preserves failure reporting across
         # controller startup and version transitions until that first tick.
@@ -1912,6 +1915,9 @@ class ReplicaManager:
                 self._update_mode = update_mode
                 self._status_epoch_generation = getattr(
                     self, '_status_epoch_generation', 0) + 1
+                # Failed records retained under the version just superseded
+                # are now stale; let the refresher collect them.
+                self._superseded_prune_pending = True
 
     def update_lb_in_flight(self,
                             in_flight_by_url: dict[str, int] | None,
@@ -9107,6 +9113,50 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'details={None if admission is None else admission.details}.')
         return allowed
 
+    # A failed replica is kept so the operator sees why its version failed.
+    # Only a teardown that already SUCCEEDED proves the row holds nothing;
+    # FAILED_CLEANUP and UNKNOWN are exactly the unresolved-cleanup rows the
+    # provider fences retain on purpose, so they are never pruned here.
+    _PRUNABLE_SUPERSEDED_STATUSES = frozenset({
+        serve_state.ReplicaStatus.FAILED,
+        serve_state.ReplicaStatus.FAILED_INITIAL_DELAY,
+        serve_state.ReplicaStatus.FAILED_PROBING,
+        serve_state.ReplicaStatus.FAILED_PROVISION,
+    })
+
+    def _prune_superseded_failed_replicas(self) -> None:
+        """Drop failed records whose version the service has moved past.
+
+        ``_handle_sky_down_finish`` already refuses to keep a failed record
+        for a version mismatch, but it only decides once, as that replica's
+        teardown finishes. A replica that failed while its version was still
+        the latest is therefore retained forever, and nothing re-examines it
+        when the service moves on. Across dozens of versions those records
+        accumulate without bound and bury the current version's real failures.
+
+        Re-apply the same policy whenever the applied version advances, and
+        only to rows that already proved their teardown succeeded. Scanning
+        on that edge (rather than every tick) keeps the refresher's budgeted
+        per-tick scans untouched.
+        """
+        if not getattr(self, '_superseded_prune_pending', False):
+            return
+        self._superseded_prune_pending = False
+        latest_version = self.latest_version
+        for info in serve_state.get_replica_infos(self._service_name):
+            if info.version == latest_version:
+                continue
+            if (info.status_property.sky_down_status
+                    != common_utils.ProcessStatus.SUCCEEDED):
+                continue
+            if (info.status not in self._PRUNABLE_SUPERSEDED_STATUSES):
+                continue
+            self._remove_replica(info.replica_id, info.replica_record_id)
+            logger.info(
+                f'Replica {info.replica_id} removed from the replica table '
+                f'for version outdated (version {info.version} superseded by '
+                f'{latest_version}).')
+
     @with_lock
     def _refresh_thread_pool(self) -> None:
         """Route mutation completion through the removable legacy runtime."""
@@ -9114,6 +9164,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             return
         self._legacy_mutation_runtime_state().refresh(
             self._refresh_legacy_mutation_runtime)
+        self._prune_superseded_failed_replicas()
 
     def _refresh_legacy_mutation_runtime(self) -> None:
         """Refresh the launch/down thread pool.
