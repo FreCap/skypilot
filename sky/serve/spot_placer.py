@@ -581,6 +581,33 @@ class PlacementCatalog:
         if workspace is not None:
             location_kwargs['workspace'] = workspace
         locations = _get_possible_location_from_task(task, **location_kwargs)
+        # A catalog is immutable for the life of a service version, and the
+        # Kubernetes contexts it enumerates decide which reserved pools that
+        # version can ever fill. When one is dropped -- because it is not
+        # reachable, or not allowed in the workspace this build ran under --
+        # nothing downstream can recover it, and the service simply never uses
+        # that capacity. Record what was enumerated and under which workspace,
+        # so the two can be compared against the task without reproducing the
+        # build.
+        declared_contexts = sorted({
+            str(resource.region)
+            for resource in (task.resources or [])
+            if (getattr(resource, 'cloud', None) is not None and
+                str(resource.cloud).lower() == 'kubernetes' and
+                isinstance(getattr(resource, 'region', None), str))
+        })
+        if declared_contexts:
+            enumerated_contexts = sorted({
+                str(location.region)
+                for location in locations
+                if str(location.cloud).lower() == 'kubernetes' and
+                location.region is not None
+            })
+            logger.info(
+                f'Placement catalog enumerated {len(locations)} location(s) '
+                f'under workspace {workspace!r}. Kubernetes contexts declared '
+                f'by the task: {declared_contexts}; enumerated: '
+                f'{enumerated_contexts}.')
         if len(locations) > _PLACEMENT_CATALOG_MAX_LOCATIONS:
             raise ValueError(
                 'Spot placement catalog contains too many locations: '
