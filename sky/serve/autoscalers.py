@@ -2019,6 +2019,25 @@ class Autoscaler:
                          max(num_latest_nonterminal, demand_target))
         hard_ceiling_headroom = max(0, self.max_replicas - planned_total)
         num_fill_up = min(desired_fill_up, hard_ceiling_headroom)
+        if num_fill_up <= 0 and self._fill_grant:
+            # A pool that is granted capacity but launches nothing is
+            # indistinguishable from a pool with nothing to launch, because
+            # the success line below is the only one emitted. That ambiguity
+            # cost a full debugging session against a fleet holding one
+            # replica while the broker fed it thirty. Name the term that is
+            # actually zero.
+            snapshot_age = (None if self._fill_snapshot_time is None else round(
+                time.time() - self._fill_snapshot_time, 1))
+            logger.info(
+                f'Reserved-capacity fill: no launch. spendable free slots '
+                f'{spendable_free_slots} (raw feed {self._fill_free_slots}, '
+                f'fresh {self._fresh_fill_free_slots()}, snapshot age '
+                f'{snapshot_age}s, zero-cost occupying '
+                f'{zero_cost_occupying}), desired {desired_fill_up}, '
+                f'launch target {fill_target_launch}, latest zero-cost '
+                f'{zero_cost_latest}, grant {self._fill_grant}, ceiling '
+                f'{fill_ceiling_launch}, demand target {demand_target}, '
+                f'hard-ceiling headroom {hard_ceiling_headroom}.')
         if num_fill_up > 0:
             logger.info(f'Reserved-capacity fill: launch target '
                         f'{fill_target_launch} (latest zero-cost replicas '
