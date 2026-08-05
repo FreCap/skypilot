@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved for implementation on 2026-07-20. The two milestones are independently shippable and are intentionally split into separate pull requests and deployments.
+Approved for implementation on 2026-07-20. The first two milestones are independently shippable and are intentionally split into separate pull requests and deployments. Milestone 2 was added after live research-only validation on 2026-08-05 exposed an indefinite-wait regression.
 
 Fable review 1 reshaped the design to use current-pod Karpenter Events rather than unproven pod conditions, and narrowed stale-worker cleanup to the confirmed launch-row race.
 
@@ -21,6 +21,11 @@ When Kubernetes reports a deterministic GPU-product incompatibility, the placeme
 When durable replica state no longer contains a completed launch worker's replica, the Serve controller should discard that stale local launch bookkeeping and continue reconciling other replicas. Durable state remains authoritative.
 
 Both changes must preserve existing mixed-version behavior, require no schema or API changes, and be independently reversible.
+
+When a caller explicitly selects an indefinite Kubernetes provisioning wait,
+occupied fixed GPU capacity must remain pending instead of taking the fast
+fallback path. This third behavior composes with the original goal: finite
+waits still fail fast so heterogeneous services can try their next candidate.
 
 ## Non-goals
 
@@ -88,6 +93,43 @@ Generic `FailedScheduling`, temporary insufficient capacity, taints, topology de
 
 Add focused unit tests for the exact HyperPod/Karpenter Event, a same-pod generic scheduler Event preceding it, a semicolon-delimited mixed-NodePool Event, a non-GPU incompatible requirement, an old or wrong-UID Event, old creation with a fresh coalesced occurrence, naive and aware timestamp normalization, Event API failure with negative caching, concurrent per-key single-flight, pin-safe entry eviction, entry and match bounds, and the normal scheduling path. Clear the process-local cache between two reads to prove the shared snapshot avoids a second Events call. Cover stable bucket selection, multiple colliding identities, a full-fresh collision skip, expired-entry replacement, malformed and future-dated snapshot repair, fixed staging-file atomic replacement, and shared-lock contention. Prove that concurrent launch loops using both the deterministic classifier and the Karpenter autoscaling heuristic make one total `list_namespaced_event` call per snapshot TTL. Prove that only the exact current single-diagnostic Karpenter GPU Event exits before the configured timeout and that the raised error retains the GPU insufficient-resource classification used by availability retry.
 
+## Milestone 2: Explicit Indefinite Reserved-GPU Wait
+
+`kubernetes.provision_timeout: -1` is the existing public contract for waiting
+indefinitely on an unscheduled pod. The scheduling loop already preserves a
+negative timeout in its deadline calculation, but Milestone 1 currently raises
+the Karpenter GPU incompatibility before that contract can take effect.
+
+This matters on `prod_research_cluster_eks`: fixed GPU nodes use
+`nvidia.com/gpu.product`, while Karpenter manages CPU-only groups. A pending
+A100-80GB pod can therefore have matching fixed nodes that are merely occupied
+and simultaneously receive Karpenter's “GPU product has no known values” Event.
+The Event proves only that Karpenter cannot add a matching node; it does not
+prove that a fixed matching slot can never become free.
+
+When the effective provisioning timeout is negative, skip the deterministic
+Karpenter GPU fast-fail and retain the pod in the ordinary scheduling loop.
+Finite zero or positive timeouts preserve Milestone 1 exactly: a matching Event
+still raises the GPU-classified Kubernetes error immediately and Serve may try
+its next candidate. No autoscaler-dialect override, node relabeling, schema
+change, API change, or new capacity is introduced.
+
+The live reproducer used server `1.1.1114` at
+`28f24dd495378385f270ebce0c0c5b93dd733028`, exactly one
+`A100-80GB:1`, and no cloud fallback. Kubernetes admitted the low-priority pod,
+reported 33 nodes with insufficient GPU and 10 selector mismatches, and left it
+unbound. The Milestone 1 shortcut removed it and retried. Earlier successful
+reserved-pod waiting predates the shortcut's 2026-08-04 deployment.
+
+### Milestone 2 tests
+
+Add a focused scheduling-loop test whose first observation is an unbound
+pending pod and whose later observation is the same pod bound to a node. With a
+negative timeout, prove the Karpenter fast-fail classifier is never called and
+the loop reaches the later scheduled observation. Retain the existing exact
+Karpenter Event test as proof that finite-timeout fast failure and GPU
+classification are unchanged.
+
 ## Resulting Flow
 
 ```text
@@ -96,9 +138,10 @@ Serve demand
        -> existing pod list/wait loop
        -> bounded shared FailedScheduling Event snapshot
           -> current Karpenter GPU incompatibility
-             -> existing KubernetesError with GPUs insufficient
-             -> existing Serve availability retry
-             -> next candidate
+             -> negative timeout: keep the admitted pod pending
+             -> finite timeout: existing KubernetesError with GPUs insufficient
+                -> existing Serve availability retry
+                -> next candidate
           -> any other pending signal
              -> existing timeout behavior
 
@@ -116,6 +159,12 @@ Polling Kubernetes Events independently from every launch would multiply API tra
 
 Adding a GPU Karpenter NodePool is an infrastructure capacity decision. SkyPilot still needs correct fallback when any reserved pool is exhausted or cannot expand.
 
+Configuring the context as the generic autoscaler dialect requires every GPU
+node to carry a durable `skypilot.co/accelerator` label. The live research nodes
+instead use GPU Feature Discovery's `nvidia.com/gpu.product` labels. Relabeling
+the shared cluster and maintaining replacement-node labels is a wider platform
+rollout than honoring the existing negative-timeout contract.
+
 Combining the milestones in one pull request would couple unrelated Serve and Kubernetes provisioning risks and make rollback less precise.
 
 ## Rollout and Verification
@@ -127,5 +176,11 @@ Deploy the exact generated release with Helm `--reuse-values`. Verify the live A
 For milestone 0, verify that controller refreshes no longer emit the missing-launch-row assertion and that teardown counts continue falling when a stale completed launch worker is encountered.
 
 For milestone 1, verify from a controlled saturation case or equivalent production event evidence that a deterministic reserved-cluster GPU incompatibility exits quickly and the next candidate begins provisioning. Also verify that reserved placements still succeed when matching GPU slots are available.
+
+For milestone 2, deploy a matching client/server commit and repeat the bounded
+one-A100-80GB research-only probe. Require the same admitted pod UID to remain
+unbound and Pending across the observation window, then remove only the exact
+temporary service. Verify no AWS resource or GPU allocation occurred. A later
+free-capacity acceptance must prove the waiting pod can proceed normally.
 
 Rollback is a Helm rollback to the prior chart revision. Neither milestone changes durable schema or API contracts.
