@@ -1070,6 +1070,7 @@ def override_skypilot_config(
     original_config = _get_loaded_config()
     original_config_path = loaded_config_path_serialized()
     override_configs = config_utils.Config(override_configs)
+    override_config_path: list[str | None]
     if override_config_path_serialized is None:
         override_config_path = []
     else:
