@@ -146,21 +146,21 @@ def _assert_json_pickle_parity(engine, replica_id: int) -> None:
     assert pickle_info.to_storage_dict() == json_info.to_storage_dict()
 
 
-def test_authorization_snapshot_pairs_elected_version_and_incarnation(
+def test_authorization_snapshot_pairs_quarantine_aware_version_and_incarnation(
         recovery_database) -> None:
     engine = recovery_database
     other_service_name = 'other-svc'
     other_service_hash = 'other-service-hash'
     other_lifecycle_epoch = 1
-    elected_spec = {'identity': 'elected'}
-    newer_spec = {'identity': 'newer-not-elected'}
+    stale_pointer_spec = {'identity': 'stale-current-pointer'}
+    newer_spec = {'identity': 'newest-applicable'}
     with engine.begin() as connection:
         connection.execute(serve_state.version_specs_table.insert(), [
             {
                 'service_name': _SERVICE_NAME,
                 'version': 3,
-                'spec': pickle.dumps(elected_spec),
-                'yaml_content': 'run: elected\n',
+                'spec': pickle.dumps(stale_pointer_spec),
+                'yaml_content': 'run: stale-pointer\n',
             },
             {
                 'service_name': _SERVICE_NAME,
@@ -210,12 +210,12 @@ def test_authorization_snapshot_pairs_elected_version_and_incarnation(
         'service_name': _SERVICE_NAME,
         'service_hash': _SERVICE_HASH,
         'workspace': _WORKSPACE,
-        'version': 3,
+        'version': 4,
         'status': serve_state.ServiceStatus.NO_REPLICA,
         'pool': False,
         'resource_action_mode': 'legacy',
-        'spec': elected_spec,
-        'yaml_content': 'run: elected\n',
+        'spec': newer_spec,
+        'yaml_content': 'run: newer\n',
         'quarantined_at': None,
         'replica_count': 0,
     }

@@ -1,7 +1,9 @@
 # pylint: disable=missing-module-docstring,protected-access,import-outside-toplevel,missing-class-docstring,unused-argument,redefined-outer-name,reimported,confusing-with-statement
 import contextlib
+import hashlib
 import os
 import pathlib
+import shlex
 import tempfile
 import threading
 import types
@@ -26,6 +28,792 @@ from sky.serve import serve_utils
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+
+
+def test_update_config_capability_rejects_old_controller_before_mutation():
+    response = mock.Mock(status_code=404)
+    with mock.patch.object(serve_utils,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        with pytest.raises(RuntimeError, match='does not support atomic'):
+            serve_utils.require_update_config_snapshot_capability(
+                'svc', 'incarnation-a')
+
+
+def test_update_config_capability_accepts_matching_protocol():
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'config_snapshot_protocol_version':
+            constants.SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+    }
+    with mock.patch.object(serve_utils,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        serve_utils.require_update_config_snapshot_capability(
+            'svc', 'incarnation-a')
+
+
+@pytest.mark.parametrize('malformed_version', [True, 1.0])
+def test_update_config_capability_rejects_non_integer_protocol(
+        malformed_version):
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'config_snapshot_protocol_version': malformed_version,
+    }
+    with mock.patch.object(serve_utils,
+                           '_get_to_controller_with_retry',
+                           return_value=response), \
+         pytest.raises(RuntimeError, match='incompatible'):
+        serve_utils.require_update_config_snapshot_capability(
+            'svc', 'incarnation-a')
+
+
+def test_update_config_snapshot_uses_new_endpoint_and_exact_digest():
+    digest = 'a' * 64
+    snapshot_id = 'c' * 64
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'message': 'update accepted',
+        'config_snapshot_id': snapshot_id,
+    }
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={'hash': 'incarnation-a'}), \
+         mock.patch.object(serve_utils,
+                           '_post_to_controller_with_retry',
+                           return_value=response) as post:
+        serve_utils.update_service_encoded(
+            'svc',
+            2,
+            'rolling',
+            pool=False,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=7,
+            has_config_snapshot=True,
+            expected_config_snapshot_digest=digest,
+            config_snapshot_id=snapshot_id)
+    assert post.call_args.args[2] == (
+        constants.CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH)
+
+
+def test_update_config_snapshot_rejects_stale_snapshot_ack():
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'message': 'update accepted',
+        'config_snapshot_id': 'b' * 64,
+    }
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={'hash': 'incarnation-a'}), \
+         mock.patch.object(serve_utils,
+                           '_post_to_controller_with_retry',
+                           return_value=response), \
+         pytest.raises(RuntimeError, match='different config snapshot'):
+        serve_utils.update_service_encoded(
+            'svc',
+            2,
+            'rolling',
+            pool=False,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=7,
+            has_config_snapshot=True,
+            expected_config_snapshot_digest='a' * 64,
+            config_snapshot_id='c' * 64)
+
+
+def test_secure_staged_controller_config_verifies_digest_and_tightens_mode(
+        tmp_path):
+    staged = tmp_path / 'config.yaml.staged'
+    config_bytes = b'active_workspace: research\n'
+    staged.write_bytes(config_bytes)
+    staged.chmod(0o644)
+
+    result = serve_utils.secure_staged_controller_config(
+        str(staged),
+        hashlib.sha256(config_bytes).hexdigest())
+
+    assert result == config_bytes
+    assert staged.stat().st_mode & 0o777 == 0o600
+
+
+def test_secure_staged_controller_config_rejects_digest_mismatch(tmp_path):
+    staged = tmp_path / 'config.yaml.staged'
+    staged.write_bytes(b'active_workspace: research\n')
+    staged.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match='digest does not match'):
+        serve_utils.secure_staged_controller_config(str(staged), '0' * 64)
+
+    # Tighten the raw snapshot before parsing or reporting a digest failure.
+    assert staged.stat().st_mode & 0o777 == 0o600
+
+
+def test_secure_staged_controller_config_rejects_symlink(tmp_path):
+    target = tmp_path / 'outside.yaml'
+    target.write_bytes(b'active_workspace: research\n')
+    staged = tmp_path / 'config.yaml.staged'
+    staged.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match='not a regular file'):
+        serve_utils.secure_staged_controller_config(
+            str(staged),
+            hashlib.sha256(target.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize('nonregular_kind', ['directory', 'fifo'])
+def test_secure_staged_controller_config_rejects_nonregular_without_blocking(
+        tmp_path, nonregular_kind):
+    staged = tmp_path / 'config.yaml.staged'
+    if nonregular_kind == 'directory':
+        staged.mkdir()
+    else:
+        os.mkfifo(staged)
+
+    with pytest.raises(RuntimeError, match='not a regular file'):
+        serve_utils.secure_staged_controller_config(str(staged), '0' * 64)
+
+
+def test_secure_staged_controller_config_rejects_oversize(tmp_path):
+    staged = tmp_path / 'config.yaml.staged'
+    config_bytes = b'x' * (1024 * 1024 + 1)
+    staged.write_bytes(config_bytes)
+
+    with pytest.raises(RuntimeError, match='exceeds the 1MiB limit'):
+        serve_utils.secure_staged_controller_config(
+            str(staged),
+            hashlib.sha256(config_bytes).hexdigest())
+
+
+def test_orphaned_config_stage_gc_is_nonce_and_commit_safe(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    now = 10_000.0
+    old_mtime = (now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1)
+    fresh_mtime = (now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS + 1)
+
+    def _write_stage(version, snapshot_id, mtime):
+        path = pathlib.Path(
+            serve_utils.generate_staged_config_yaml_file_name(
+                'svc', version, 'scope-a', snapshot_id=snapshot_id))
+        path.write_text('credential: raw\n', encoding='utf-8')
+        receipt = pathlib.Path(
+            serve_utils.generate_config_snapshot_receipt_file_name(str(path)))
+        receipt.write_text('receipt', encoding='utf-8')
+        os.utime(path, (mtime, mtime))
+        os.utime(receipt, (mtime, mtime))
+        return path, receipt
+
+    orphan_a = _write_stage(2, 'a' * 64, old_mtime)
+    orphan_b = _write_stage(2, 'b' * 64, old_mtime)
+    committed = _write_stage(3, 'c' * 64, old_mtime)
+    fresh = _write_stage(4, 'd' * 64, fresh_mtime)
+    missing_row = _write_stage(5, 'e' * 64, old_mtime)
+    legacy = _write_stage(6, None, old_mtime)
+    unrelated = tmp_path / 'config.yaml.v7.not-a-stage'
+    unrelated.write_text('preserve', encoding='utf-8')
+    monkeypatch.setattr(
+        serve_state, 'get_yaml_contents', lambda _service, _versions: {
+            2: None,
+            3: 'service: committed',
+            4: None,
+            6: None,
+        })
+
+    removed = serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                                'scope-a',
+                                                                now=now)
+
+    assert removed == [2, 6]
+    for stage, receipt in (orphan_a, orphan_b, legacy):
+        assert not stage.exists()
+        assert not receipt.exists()
+    for stage, receipt in (committed, fresh, missing_row):
+        assert stage.exists()
+        assert receipt.exists()
+    assert unrelated.read_text(encoding='utf-8') == 'preserve'
+
+
+def test_orphaned_config_stage_gc_preserves_concurrently_refreshed_path(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    snapshot_id = 'a' * 64
+    stage = pathlib.Path(
+        serve_utils.generate_staged_config_yaml_file_name(
+            'svc', 2, 'scope-a', snapshot_id=snapshot_id))
+    stage.write_text('old raw bytes', encoding='utf-8')
+    now = 10_000.0
+    old_mtime = (now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1)
+    os.utime(stage, (old_mtime, old_mtime))
+
+    def _refresh_during_db_read(_service, _versions):
+        stage.write_text('new request bytes', encoding='utf-8')
+        return {2: None}
+
+    monkeypatch.setattr(serve_state, 'get_yaml_contents',
+                        _refresh_during_db_read)
+
+    removed = serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                                'scope-a',
+                                                                now=now)
+
+    assert removed == []
+    assert stage.read_text(encoding='utf-8') == 'new request bytes'
+
+
+def test_orphaned_config_stage_gc_preserves_on_database_error(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    stage = pathlib.Path(
+        serve_utils.generate_staged_config_yaml_file_name('svc',
+                                                          2,
+                                                          'scope-a',
+                                                          snapshot_id='a' * 64))
+    stage.write_text('credential: raw\n', encoding='utf-8')
+    now = 10_000.0
+    old_mtime = (now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1)
+    os.utime(stage, (old_mtime, old_mtime))
+    monkeypatch.setattr(serve_state, 'get_yaml_contents',
+                        mock.Mock(side_effect=RuntimeError('database down')))
+
+    with pytest.raises(RuntimeError, match='database down'):
+        serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                          'scope-a',
+                                                          now=now)
+
+    assert stage.exists()
+
+
+def test_orphaned_receipt_temp_gc_cleans_crashed_writer_only_after_age_gate(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    old_receipt_temp = tmp_path / ('.config-receipt-' + 'a' * 32 + '.tmp')
+    fresh_receipt_temp = tmp_path / ('.config-receipt-' + 'b' * 32 + '.tmp')
+    old_receipt_temp.write_bytes(b'{"source_digest":"offline-verifier"}')
+    fresh_receipt_temp.write_bytes(b'{"source_digest":"in-flight"}')
+    malformed_neighbor = tmp_path / '.config-receipt-not-ours'
+    malformed_neighbor.write_text('preserve', encoding='utf-8')
+    now = 10_000.0
+    old_mtime = now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1
+    fresh_mtime = now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS + 1
+    os.utime(old_receipt_temp, (old_mtime, old_mtime))
+    os.utime(fresh_receipt_temp, (fresh_mtime, fresh_mtime))
+    get_yaml_contents = mock.Mock(side_effect=AssertionError(
+        'receipt temporaries do not require a database lookup'))
+    monkeypatch.setattr(serve_state, 'get_yaml_contents', get_yaml_contents)
+
+    removed = serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                                'scope-a',
+                                                                now=now)
+
+    assert removed == []
+    assert not old_receipt_temp.exists()
+    assert fresh_receipt_temp.exists()
+    assert malformed_neighbor.read_text(encoding='utf-8') == 'preserve'
+    get_yaml_contents.assert_not_called()
+
+
+def test_orphaned_receipt_temp_gc_preserves_concurrently_refreshed_path(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    receipt_temp = tmp_path / ('.config-receipt-' + 'c' * 32 + '.tmp')
+    receipt_temp.write_text('old verifier', encoding='utf-8')
+    now = 10_000.0
+    old_mtime = now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1
+    os.utime(receipt_temp, (old_mtime, old_mtime))
+    real_stat = os.stat
+    refreshed = False
+
+    def _refresh_before_recheck(path, *, follow_symlinks=True):
+        nonlocal refreshed
+        if os.fspath(path) == str(receipt_temp) and not refreshed:
+            refreshed = True
+            receipt_temp.write_text('new in-flight verifier', encoding='utf-8')
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, 'stat', _refresh_before_recheck)
+
+    removed = serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                                'scope-a',
+                                                                now=now)
+
+    assert removed == []
+    assert receipt_temp.read_text(encoding='utf-8') == 'new in-flight verifier'
+
+
+def test_version_controller_config_requires_custom_workspace_definition():
+    config_bytes = (b'active_workspace: research\n'
+                    b'workspaces: {}\n'
+                    b'kubernetes: {allowed_contexts: [east, phx]}\n')
+
+    with pytest.raises(RuntimeError,
+                       match="does not define durable workspace 'research'"):
+        serve_utils.parse_and_validate_version_controller_config(
+            config_bytes, 'research', 'deleted workspace test')
+
+
+def test_version_controller_config_allows_implicit_default_workspace():
+    parsed = serve_utils.parse_and_validate_version_controller_config(
+        b'active_workspace: default\n', 'default', 'default workspace test')
+
+    assert parsed.get_nested(('active_workspace',), None) == 'default'
+
+
+def test_ha_recovery_owner_fence_is_inserted_immediately_before_launch():
+    script = ('export EXISTING=value\n'
+              'python \\\n'
+              ' -u -m sky.serve.service --service-name svc\n')
+
+    bound = serve_utils.bind_ha_recovery_owner_fence(
+        script,
+        service_hash='incarnation-a',
+        lifecycle_epoch=8,
+        controller_pid=123,
+        controller_ip='10.4.0.1',
+        status=serve_state.ServiceStatus.CONTROLLER_FAILED,
+        recovery_version=7)
+
+    lines = bound.splitlines()
+    launch_index = lines.index('python \\')
+    fence_line = lines[launch_index - 1]
+    prefix = f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}='
+    assert fence_line.startswith(prefix)
+    encoded = shlex.split(fence_line[len('export '):].split('=', 1)[1])[0]
+    assert serve_utils.parse_ha_recovery_owner_fence(encoded) == {
+        'service_hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'controller_pid': 123,
+        'controller_ip': '10.4.0.1',
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'recovery_version': 7,
+    }
+
+
+def test_ha_recovery_owner_fence_rejects_partial_or_malformed_payload():
+    with pytest.raises(ValueError, match='invalid schema'):
+        serve_utils.parse_ha_recovery_owner_fence('{}')
+    with pytest.raises(ValueError, match='invalid version'):
+        serve_utils.parse_ha_recovery_owner_fence(
+            '{"service_hash":"i","lifecycle_epoch":1,'
+            '"controller_pid":null,"controller_ip":null,'
+            '"status":"CONTROLLER_FAILED","recovery_version":true}')
+
+
+@pytest.mark.parametrize('forged_location', ['staged', 'live'])
+def test_restore_uses_exact_db_bytes_over_forged_local_files(
+        tmp_path, forged_location):
+    live_path = str(tmp_path / 'config.yaml')
+    staged_path = str(tmp_path / 'config.yaml.v2.staged')
+    snapshot_id = 'c' * 64
+    durable = (b'active_workspace: research\n'
+               b'workspaces: {research: {}}\n'
+               b'kubernetes: {allowed_contexts: [east, phx]}\n')
+    forged = (b'active_workspace: research\n'
+              b'workspaces: {research: {}}\n'
+              b'kubernetes: {allowed_contexts: [attacker]}\n')
+    pathlib.Path(live_path).write_bytes(forged if forged_location ==
+                                        'live' else b'stale live config\n')
+    pathlib.Path(staged_path).write_bytes(
+        forged if forged_location == 'staged' else b'stale staged config\n')
+    live_receipt = pathlib.Path(
+        serve_utils.generate_config_snapshot_receipt_file_name(live_path))
+    staged_receipt = pathlib.Path(
+        serve_utils.generate_config_snapshot_receipt_file_name(staged_path))
+    live_receipt.write_text('forged live receipt', encoding='utf-8')
+    staged_receipt.write_text('forged staged receipt', encoding='utf-8')
+
+    snapshot = (durable, hashlib.sha256(durable).hexdigest(), snapshot_id)
+    with mock.patch.object(serve_state,
+                           'get_version_controller_config',
+                           return_value=snapshot) as get_snapshot:
+        restored = serve_utils.restore_version_controller_config(
+            'svc', 2, live_path, staged_path)
+
+    get_snapshot.assert_called_once_with('svc', 2)
+    assert restored == durable
+    assert pathlib.Path(live_path).read_bytes() == durable
+    assert pathlib.Path(live_path).stat().st_mode & 0o777 == 0o600
+    assert not pathlib.Path(staged_path).exists()
+    assert not live_receipt.exists()
+    assert not staged_receipt.exists()
+    assert b'attacker' not in pathlib.Path(live_path).read_bytes()
+
+
+def test_recovery_scrubs_raw_live_configs_but_preserves_stages(
+        tmp_path, monkeypatch):
+    base_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(base_path))
+    preserved_safe = tmp_path / 'config.yaml.v2'
+    paths = {
+        'config.yaml': b'credential: initial-secret\n',
+        'config.yaml.receipt': b'initial-source-digest',
+        'config.yaml.v1': b'credential: old-secret\n',
+        'config.yaml.v1.receipt': b'old-source-digest',
+        'config.yaml.v2': b'active_workspace: research\n',
+        'config.yaml.v2.receipt': b'current-source-digest',
+        'config.yaml.v3': b'credential: newer-secret\n',
+        'config.yaml.v3.receipt': b'newer-source-digest',
+        'config.yaml.v4.' + 'a' * 64 + '.staged': b'fresh-request',
+        'config.yaml.v4.' + 'a' * 64 + '.staged.receipt': b'fresh-receipt',
+        'config.yaml.v7.not-a-stage': b'unrelated',
+        '.config-receipt-' + 'b' * 32 + '.tmp': b'orphaned-source-digest',
+        '.config-receipt-not-ours': b'unrelated-dotfile',
+    }
+    for name, content in paths.items():
+        (tmp_path / name).write_bytes(content)
+
+    removed = serve_utils.scrub_obsolete_controller_config_files(
+        'svc', 2, 'scope-a')
+
+    assert removed == sorted([
+        'config.yaml',
+        'config.yaml.receipt',
+        'config.yaml.v1',
+        'config.yaml.v1.receipt',
+        'config.yaml.v2.receipt',
+        'config.yaml.v3',
+        'config.yaml.v3.receipt',
+        '.config-receipt-' + 'b' * 32 + '.tmp',
+    ])
+    assert preserved_safe.read_bytes() == b'active_workspace: research\n'
+    assert (tmp_path / ('config.yaml.v4.' + 'a' * 64 + '.staged')
+           ).read_bytes() == b'fresh-request'
+    assert (tmp_path / ('config.yaml.v4.' + 'a' * 64 + '.staged.receipt')
+           ).read_bytes() == b'fresh-receipt'
+    assert (tmp_path /
+            'config.yaml.v7.not-a-stage').read_bytes() == b'unrelated'
+    assert (tmp_path /
+            '.config-receipt-not-ours').read_bytes() == (b'unrelated-dotfile')
+
+
+def test_full_pod_ha_restores_versioned_db_config_before_runner(tmp_path):
+    service_dir = tmp_path / 'service-dir'
+    live_path = tmp_path / 'config.yaml'
+    staged_path = tmp_path / 'config.yaml.v7.staged'
+    live_path.write_text('active_workspace: stale\n', encoding='utf-8')
+    durable = (b'active_workspace: research\n'
+               b'workspaces: {research: {}}\n'
+               b'kubernetes: {allowed_contexts: [east, phx]}\n')
+    durable_digest = hashlib.sha256(durable).hexdigest()
+    recovery_script = serve_utils.strip_legacy_ha_recovery_config_payload(
+        'export SKYPILOT_CONFIG=/old/config.yaml\n'
+        '/usr/bin/python -u -m sky.serve.service --service-name svc\n',
+        '/old/config.yaml')
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+        'recovery_version': 7,
+        'config_protocol_active': True,
+    }
+    config_snapshot = (durable, durable_digest, 'c' * 64)
+    recovery_snapshot = {
+        **record,
+        'service_name': 'svc',
+        'controller_config_snapshot': config_snapshot,
+        'ha_recovery_script': recovery_script,
+    }
+    runner = mock.Mock()
+
+    def _run(script, require_outputs):
+        assert require_outputs is True
+        assert live_path.read_bytes() == durable
+        assert live_path.stat().st_mode & 0o777 == 0o600
+        assert f'export SKYPILOT_CONFIG={live_path}' in script
+        assert 'base64 -d' not in script
+        fence_prefix = (f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}=')
+        fence_line = next(line for line in script.splitlines()
+                          if line.startswith(fence_prefix))
+        encoded_fence = shlex.split(fence_line[len('export '):].split('=',
+                                                                      1)[1])[0]
+        assert serve_utils.parse_ha_recovery_owner_fence(
+            encoded_fence)['recovery_version'] == 7
+        return 0, '', ''
+
+    runner.run.side_effect = _run
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(serve_state,
+                           'get_latest_committed_versions',
+                           return_value={}), \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hashes',
+                           return_value={}), \
+         mock.patch.object(serve_state,
+                           'get_ha_recovery_script',
+                           return_value='legacy lookup must not run') as legacy, \
+         mock.patch.object(
+             serve_state,
+             'get_service_ha_recovery_snapshot',
+             return_value=recovery_snapshot) as authorize, \
+         mock.patch.object(serve_state,
+                           'get_recovery_version_spec') as recovery_lookup, \
+         mock.patch.object(
+             serve_state,
+             'get_version_controller_config') as get_snapshot, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value=str(service_dir)), \
+         mock.patch.object(serve_utils,
+                           'generate_versioned_config_yaml_file_name',
+                           return_value=str(live_path)), \
+         mock.patch.object(serve_utils,
+                           'generate_staged_config_yaml_file_name',
+                           return_value=str(staged_path)), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner',
+                           return_value=runner), \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    runner.run.assert_called_once()
+    authorize.assert_called_once_with('svc',
+                                      expected_service_hash='incarnation-a')
+    legacy.assert_not_called()
+    recovery_lookup.assert_not_called()
+    get_snapshot.assert_not_called()
+
+
+def test_full_pod_ha_refuses_corrupt_versioned_db_config(tmp_path):
+    live_path = tmp_path / 'config.yaml'
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+        'recovery_version': 7,
+        'config_protocol_active': True,
+    }
+    corrupt = b'active_workspace: attacker\nworkspaces: {attacker: {}}\n'
+    recovery_script = serve_utils.strip_legacy_ha_recovery_config_payload(
+        'export SKYPILOT_CONFIG=/old/config.yaml\n'
+        '/usr/bin/python -u -m sky.serve.service --service-name svc\n',
+        '/old/config.yaml')
+    recovery_snapshot = {
+        **record,
+        'service_name': 'svc',
+        'controller_config_snapshot':
+            (corrupt, hashlib.sha256(corrupt).hexdigest(), 'c' * 64),
+        'ha_recovery_script': recovery_script,
+    }
+    runner = mock.Mock()
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(serve_state,
+                           'get_latest_committed_versions',
+                           return_value={}), \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hashes',
+                           return_value={}), \
+         mock.patch.object(
+             serve_state,
+             'get_service_ha_recovery_snapshot',
+             return_value=recovery_snapshot) as authorize, \
+         mock.patch.object(serve_state,
+                           'get_version_controller_config') as get_snapshot, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value=str(tmp_path / 'service-dir')), \
+         mock.patch.object(serve_utils,
+                           'generate_versioned_config_yaml_file_name',
+                           return_value=str(live_path)), \
+         mock.patch.object(serve_utils,
+                           'generate_staged_config_yaml_file_name',
+                           return_value=str(tmp_path / 'config.staged')), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner',
+                           return_value=runner), \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    runner.run.assert_not_called()
+    authorize.assert_called_once_with('svc',
+                                      expected_service_hash='incarnation-a')
+    get_snapshot.assert_not_called()
+    assert not live_path.exists()
+    assert "belongs to workspace 'attacker', expected 'research'" in (
+        tmp_path / 'recovery_pool_.log').read_text(encoding='utf-8')
+
+
+def test_full_pod_ha_refuses_protocol_row_without_selected_config(tmp_path):
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+        'recovery_version': 7,
+        'config_protocol_active': True,
+    }
+    recovery_snapshot = {
+        **record,
+        'service_name': 'svc',
+        'controller_config_snapshot': None,
+        'ha_recovery_script': 'recover',
+    }
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(
+             serve_state,
+             'get_service_ha_recovery_snapshot',
+             return_value=recovery_snapshot) as authorize, \
+         mock.patch.object(serve_state,
+                           'get_version_controller_config') as get_snapshot, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value=str(tmp_path / 'service-dir')), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner_cls, \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    get_snapshot.assert_not_called()
+    authorize.assert_called_once_with('svc',
+                                      expected_service_hash='incarnation-a')
+    runner_cls.return_value.run.assert_not_called()
+    assert 'has no complete controller config snapshot' in (
+        tmp_path / 'recovery_pool_.log').read_text(encoding='utf-8')
+
+
+def test_full_pod_ha_skips_owner_changed_after_liveness_sweep(tmp_path):
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+        'recovery_version': 7,
+        'config_protocol_active': True,
+    }
+    current_snapshot = {
+        **record,
+        'service_name': 'svc',
+        'controller_pid': 9876,
+        'controller_ip': '10.4.0.8',
+        'controller_config_snapshot': None,
+        'ha_recovery_script': 'must not run',
+    }
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(
+             serve_state,
+             'get_service_ha_recovery_snapshot',
+             return_value=current_snapshot) as authorize, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_utils,
+                           'generate_remote_service_dir_name') as service_dir, \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner_cls, \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    authorize.assert_called_once_with('svc',
+                                      expected_service_hash='incarnation-a')
+    service_dir.assert_not_called()
+    runner_cls.return_value.run.assert_not_called()
+    assert 'changed recovery owner metadata (controller_pid, controller_ip)' in (
+        tmp_path / 'recovery_pool_.log').read_text(encoding='utf-8')
+
+
+def test_cleanup_staged_config_update_uses_nonce_and_lifecycle_fence():
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {'removed': True}
+    with mock.patch.object(serve_utils,
+                           '_post_to_controller_with_retry',
+                           return_value=response) as post:
+        removed = serve_utils.cleanup_staged_config_update_encoded(
+            'svc', 'incarnation-a', 2, 7, 'c' * 64)
+
+    assert removed
+    assert post.call_args.args[2] == (
+        constants.CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH)
+    assert post.call_args.kwargs['json'] == {
+        'version': 2,
+        'expected_lifecycle_epoch': 7,
+        'config_snapshot_id': 'c' * 64,
+    }
+
+
+def test_cleanup_staged_config_update_fails_closed_on_controller_error():
+    response = mock.Mock(status_code=409, text='version already committed')
+    with mock.patch.object(serve_utils,
+                           '_post_to_controller_with_retry',
+                           return_value=response), \
+         pytest.raises(RuntimeError, match='could not safely clean'):
+        serve_utils.cleanup_staged_config_update_encoded(
+            'svc', 'incarnation-a', 2, 7, 'c' * 64)
 
 
 def test_cleanup_history_mode_is_strong_for_v2_and_malformed_rows():
@@ -4411,8 +5199,9 @@ class TestHaRecoveryFencesOnLeadershipLoss:
 
     def test_leadership_lost_midway_stops_remaining(self, tmp_path,
                                                     monkeypatch):
-        # Leader for the first launch, lost before the second.
-        answers = iter([True, False])
+        # Leader through the first launch's preflight and final fence, then
+        # lost before the second service begins recovery.
+        answers = iter([True, True, False])
         run = self._run(lambda: next(answers), tmp_path, monkeypatch)
         assert run.call_count == 1
 

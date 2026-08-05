@@ -298,7 +298,7 @@ def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
                                          migration_utils.SERVE_VERSION)
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '035'
+        engine, migration_utils.SERVE_DB_NAME) == migration_utils.SERVE_VERSION
 
     inspector = sqlalchemy.inspect(engine)
     assert {
@@ -451,7 +451,7 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
     with pytest.raises(RuntimeError, match='additive and cannot be downgraded'):
         alembic_command.downgrade(config, '031')
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == '035'
+        engine, migration_utils.SERVE_DB_NAME) == migration_utils.SERVE_VERSION
 
 
 def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
@@ -487,7 +487,8 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
                            match='additive and cannot be downgraded'):
             alembic_command.downgrade(config, '031')
         assert migration_utils.get_current_alembic_revision(
-            engine, migration_utils.SERVE_DB_NAME) == '035'
+            engine,
+            migration_utils.SERVE_DB_NAME) == migration_utils.SERVE_VERSION
     finally:
         engine.dispose()
 

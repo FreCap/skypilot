@@ -386,6 +386,48 @@ def test_gang_schedule_retry_preserves_backoff_and_call_count():
     assert ray_up.call_count == 2
 
 
+def test_gang_schedule_revalidates_serve_fence_before_every_ray_up_retry():
+    handle = MagicMock(cluster_name='test-cluster', launched_nodes=2)
+    logging_info = {'region_name': 'us-east-1', 'zone_str': ''}
+    retryable_failure = (
+        1, 'Processing file mounts',
+        'Failed to setup head node. ConnectionResetError: [Errno 54] '
+        'Connection reset by peer')
+    provisioner = MagicMock()
+    provisioner._validate_service_replica_launch_fence.side_effect = [
+        None,
+        exceptions.RequestCancelled('generation changed'),
+    ]
+
+    with patch.object(
+            cloud_vm_ray_backend,
+            'write_ray_up_script_with_patched_launch_hash_fn',
+            return_value='/tmp/ray-up.py'), patch.object(
+                cloud_vm_ray_backend.log_lib,
+                'run_with_log',
+                return_value=retryable_failure) as ray_up, patch.object(
+                    cloud_vm_ray_backend.context_utils,
+                    'sleep_with_cancellation') as wait, patch.object(
+                        cloud_vm_ray_backend.common_utils,
+                        'Backoff') as backoff_cls:
+        backoff_cls.return_value.current_backoff.return_value = 17
+        with pytest.raises(exceptions.RequestCancelled,
+                           match='generation changed'):
+            RetryingVmProvisioner._gang_schedule_ray_up(  # pylint: disable=protected-access
+                provisioner,
+                cloud_vm_ray_backend.clouds.AWS(),
+                '/tmp/cluster.yaml',
+                handle,
+                '/tmp/provision.log',
+                stream_logs=False,
+                logging_info=logging_info,
+                use_spot=False)
+
+    assert provisioner._validate_service_replica_launch_fence.call_count == 2
+    ray_up.assert_called_once()
+    wait.assert_called_once_with(17)
+
+
 def test_wait_service_registration_rpc_covers_both_phase_budgets():
     """The RPC deadline must not preempt either server-side wait phase."""
     client = object.__new__(cloud_vm_ray_backend.SkyletClient)

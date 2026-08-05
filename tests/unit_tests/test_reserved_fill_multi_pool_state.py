@@ -33,15 +33,23 @@ def test_service_teardown_takes_broker_lock_before_database(
     with engine.begin() as connection:
         connection.execute(serve_state.services_table.insert().values(
             name='svc', status='READY'))
-    lock = mock.MagicMock()
-    with mock.patch.object(serve_state.locks, 'get_lock',
-                           return_value=lock) as get_lock:
+    broker_lock = mock.MagicMock()
+    launch_authority_lock = mock.MagicMock()
+    launch_authority_lock_id = serve_state._replica_launch_authority_lock_id(
+        'svc', engine)
+    with mock.patch.object(serve_state.locks,
+                           'get_lock',
+                           side_effect=[broker_lock,
+                                        launch_authority_lock]) as get_lock:
         serve_state.remove_service('svc')
     engine.dispose()
 
-    get_lock.assert_called_once_with(
-        serve_state.constants.RESERVED_FILL_BROKER_LOCK_ID)
-    lock.acquire.assert_called_once_with(blocking=True)
+    assert get_lock.call_args_list == [
+        mock.call(serve_state.constants.RESERVED_FILL_BROKER_LOCK_ID),
+        mock.call(launch_authority_lock_id, lock_type='filelock'),
+    ]
+    broker_lock.acquire.assert_called_once_with(blocking=True)
+    launch_authority_lock.acquire.assert_called_once_with(blocking=True)
 
 
 @pytest.fixture

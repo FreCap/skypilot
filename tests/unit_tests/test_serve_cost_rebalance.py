@@ -681,7 +681,9 @@ class TestPinnedReplacementLaunch:
             'kwargs',
         }
         runtime = manager._legacy_mutation_runtime_state()
-        assert construction.kwargs['target'] is replica_managers.launch_cluster
+        assert (
+            construction.kwargs['target']
+            is replica_managers.launch_cluster_with_frozen_controller_config)
         assert construction.kwargs['replica_id'] == 8
         assert (construction.kwargs['completion_queue']
                 is runtime.launch_completion_queue)
@@ -703,12 +705,15 @@ class TestPinnedReplacementLaunch:
             'exact_resources_override',
             'pre_launch_guard',
             'cloud_launch_guard',
+            'supersession_guard',
             'continue_guard',
             'cleanup_continue_guard',
             'launch_fence',
             'service_spec',
             'service_name',
             'workspace',
+            'frozen_controller_config',
+            'frozen_controller_config_path',
         }
         assert launch_kwargs['availability_max_retry'] == 1
         assert launch_kwargs['exact_resources_override'] is True
@@ -716,7 +721,8 @@ class TestPinnedReplacementLaunch:
         assert pre_launch_guard.__self__ is manager
         assert (pre_launch_guard.__func__
                 is type(manager)._service_is_launch_authorized)
-        assert launch_kwargs['cloud_launch_guard'] is None
+        assert launch_kwargs['cloud_launch_guard']() == (True, 'authorized')
+        assert launch_kwargs['supersession_guard']() == (True, 'authorized')
         continue_guard = launch_kwargs['continue_guard']
         assert continue_guard.__self__ is manager
         assert (continue_guard.__func__
@@ -729,6 +735,7 @@ class TestPinnedReplacementLaunch:
         assert launch_kwargs['service_spec'] is None
         assert launch_kwargs['service_name'] == 'svc'
         assert isinstance(launch_kwargs['workspace'], str)
+        assert launch_kwargs['frozen_controller_config'] is not None
         launch_thread = launch_thread_cls.return_value
         assert manager._launch_thread_pool[8] is launch_thread
         launch_thread.start.assert_not_called()
@@ -805,6 +812,7 @@ class TestPinnedReplacementLaunch:
         manager._service_name = 'svc'
         manager._resource_scope = None
         manager._spot_placer = placer
+        manager.latest_version = 1
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
         manager._replica_to_launch_cancelled = {}

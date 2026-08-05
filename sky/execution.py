@@ -107,16 +107,10 @@ def _validate_service_replica_launch_fence(
                  type(service_version) is int and service_version > 0) or
             not (controller_pid is None or isinstance(controller_pid, int)) or
             not (controller_ip is None or isinstance(controller_ip, str))):
-        raise exceptions.RequestCancelled(
+        raise exceptions.ServeReplicaLaunchFenceError(
             'SkyServe replica launch is missing its durable owner fence.')
-    owner = serve_state.get_service_controller_owner(service_name)
-    authorized = (
-        owner is not None and owner.get('hash') == service_hash and
-        (owner.get('controller_pid'), owner.get('controller_ip'))
-        == (controller_pid, controller_ip) and owner.get('status')
-        not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
-    if not authorized:
-        raise exceptions.RequestCancelled(
+    if not serve_state.service_replica_launch_fence_holds(launch_context):
+        raise exceptions.ServeReplicaLaunchFenceError(
             f'Refusing replica launch for stale service owner '
             f'{service_name!r}/{service_hash!r}.')
 

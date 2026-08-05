@@ -839,6 +839,18 @@ class RequestCancelled(Exception):
     pass
 
 
+class ServeReplicaLaunchFenceError(RequestCancelled):
+    """A SkyServe replica request no longer has durable launch authority.
+
+    This terminal classification is intentionally narrower than
+    ``RequestCancelled``.  A caller may receive an ordinary cancellation after
+    a provider has partially acted, in which case its normal reconciliation or
+    cleanup path must still run.  This error is reserved for the durable Serve
+    owner/generation fence, whose replica row is left for the current manager
+    to reconcile without retrying the stale request.
+    """
+
+
 class KubernetesPhysicalClusterIdentityError(RequestCancelled):
     """A fenced Kubernetes operation cannot prove its physical target.
 

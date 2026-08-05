@@ -183,6 +183,24 @@ version_specs_table = sqlalchemy.Table(
                       sqlalchemy.JSON(none_as_null=True).with_variant(
                           postgresql.JSONB(none_as_null=True), 'postgresql'),
                       server_default=None),
+    # Sanitized, workspace-scoped controller configuration is versioned with
+    # the service spec.  Recovery must select the config belonging to the
+    # elected version rather than reading a singleton from the HA script.
+    sqlalchemy.Column('controller_config',
+                      sqlalchemy.LargeBinary,
+                      server_default=None),
+    sqlalchemy.Column('controller_config_digest',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('controller_config_snapshot_id',
+                      sqlalchemy.Text,
+                      server_default=None),
+    # The first successful controller transition records this once.  Unlike
+    # active_versions, this survives scale-to-zero and is therefore suitable
+    # for choosing a proven generation after a newer version is quarantined.
+    sqlalchemy.Column('controller_applied_at',
+                      sqlalchemy.Float,
+                      server_default=None),
 )
 
 # Durable cleanup inventory is intentionally separate from ``version_specs``.

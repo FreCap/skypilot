@@ -1811,7 +1811,9 @@ def poller_loop(
     get_spot_placer: Callable[[], Optional['spot_placer_lib.SpotPlacer']],
     service_name: str | None = None,
     expected_service_hash: str | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    stop_event: threading.Event | None = None,
+    actuation_epoch_lock: contextlib.AbstractContextManager[Any] | None = None,
 ) -> None:
     """Poll free zero-cost capacity forever, feeding the autoscaler.
 
@@ -1835,63 +1837,80 @@ def poller_loop(
         fence_kwargs['expected_service_hash'] = expected_service_hash
     if expected_controller_owner is not None:
         fence_kwargs['expected_controller_owner'] = expected_controller_owner
-    while True:
-        try:
-            if service_name is not None and expected_service_hash is not None:
-                owner = serve_state.get_service_controller_owner(service_name)
-                current_owner = (owner.get('controller_pid'),
-                                 owner.get('controller_ip')) if owner else None
-                if (owner is None or
-                        owner.get('hash') != expected_service_hash or
-                    (expected_controller_owner is not None and
-                     current_owner != expected_controller_owner)):
-                    logger.info(
-                        f'Reserved-capacity poller for stale service owner '
-                        f'{service_name!r}/{expected_service_hash!r}/'
-                        f'{expected_controller_owner!r} is exiting.')
-                    return
-            placer = get_spot_placer()
-            # An update can turn the flag off on the live autoscaler; the
-            # thread stays alive (a later update can re-enable it) but
-            # must not keep issuing the expensive cluster-wide pod-listing
-            # query for a snapshot nobody consumes.
-            autoscaler = get_autoscaler()
-            fill_enabled = autoscaler.reserved_capacity_fill
-            if placer is not None and fill_enabled:
-                zero_cost = placer.zero_cost_locations()
-                keys: list[dict[str, Any]] = [
-                    location.to_pickleable() for location in zero_cost
-                ]
-                if service_name is None:
-                    _standalone_cycle(autoscaler, zero_cost, keys)
-                else:
-                    # Set BEFORE the cycle: it upserts the claim partway
-                    # through, and an exception after that upsert (e.g.
-                    # the round query) must still leave the flag true --
-                    # otherwise a subsequent disable would skip
-                    # remove_claim and leave a ghost claim absorbing
-                    # entitlement for the whole claim TTL.
-                    claim_may_exist = True
-                    protocol_version = (
-                        reserved_capacity_broker.get_protocol_version())
-                    if protocol_version == reserved_capacity_broker.PROTOCOL_V2:
-                        _broker_cycle_v2(autoscaler, placer, service_name,
-                                         zero_cost, expected_service_hash,
-                                         expected_controller_owner)
+    while stop_event is None or not stop_event.is_set():
+        epoch_context = (actuation_epoch_lock if actuation_epoch_lock
+                         is not None else contextlib.nullcontext())
+        with epoch_context:
+            # An update may have set the irreversible fence while this poller
+            # waited behind an autoscaler/update epoch. Never begin provider or
+            # durable broker work after that transition.
+            if stop_event is not None and stop_event.is_set():
+                return
+            try:
+                if (service_name is not None and
+                        expected_service_hash is not None):
+                    owner = serve_state.get_service_controller_owner(
+                        service_name)
+                    current_owner = ((owner.get('controller_pid'),
+                                      owner.get('controller_ip'))
+                                     if owner else None)
+                    if (owner is None or
+                            owner.get('hash') != expected_service_hash or
+                        (expected_controller_owner is not None and
+                         current_owner != expected_controller_owner)):
+                        logger.info(
+                            f'Reserved-capacity poller for stale service owner '
+                            f'{service_name!r}/{expected_service_hash!r}/'
+                            f'{expected_controller_owner!r} is exiting.')
+                        return
+                placer = get_spot_placer()
+                # An update can turn the flag off on the live autoscaler; the
+                # thread stays alive (a later update can re-enable it) but
+                # must not keep issuing the expensive cluster-wide pod-listing
+                # query for a snapshot nobody consumes.
+                autoscaler = get_autoscaler()
+                fill_enabled = autoscaler.reserved_capacity_fill
+                if placer is not None and fill_enabled:
+                    zero_cost = placer.zero_cost_locations()
+                    keys: list[dict[str, Any]] = [
+                        location.to_pickleable() for location in zero_cost
+                    ]
+                    if service_name is None:
+                        _standalone_cycle(autoscaler, zero_cost, keys)
                     else:
-                        _broker_cycle(autoscaler, placer, service_name,
-                                      zero_cost, keys, expected_service_hash,
-                                      expected_controller_owner)
-            elif service_name is not None and claim_may_exist:
-                # Fill turned off (or the placer is gone): withdraw the
-                # claim NOW instead of leaving peers arbitrating around a
-                # ghost for the whole claim TTL. Once per disable
-                # transition (idempotent; also drops our cached
-                # allocation), not re-spammed every cycle.
-                reserved_capacity_broker.remove_claim(service_name,
-                                                      **fence_kwargs)
-                claim_may_exist = False
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error('Error in reserved-capacity poller: '
-                         f'{common_utils.format_exception(e)}')
-        time.sleep(poll_interval_seconds())
+                        # Set BEFORE the cycle: it upserts the claim partway
+                        # through, and an exception after that upsert (e.g.
+                        # the round query) must still leave the flag true --
+                        # otherwise a subsequent disable would skip
+                        # remove_claim and leave a ghost claim absorbing
+                        # entitlement for the whole claim TTL.
+                        claim_may_exist = True
+                        protocol_version = (
+                            reserved_capacity_broker.get_protocol_version())
+                        if (protocol_version ==
+                                reserved_capacity_broker.PROTOCOL_V2):
+                            _broker_cycle_v2(autoscaler, placer, service_name,
+                                             zero_cost, expected_service_hash,
+                                             expected_controller_owner)
+                        else:
+                            _broker_cycle(autoscaler, placer, service_name,
+                                          zero_cost, keys,
+                                          expected_service_hash,
+                                          expected_controller_owner)
+                elif service_name is not None and claim_may_exist:
+                    # Fill turned off (or the placer is gone): withdraw the
+                    # claim NOW instead of leaving peers arbitrating around a
+                    # ghost for the whole claim TTL. Once per disable
+                    # transition (idempotent; also drops our cached
+                    # allocation), not re-spammed every cycle.
+                    reserved_capacity_broker.remove_claim(
+                        service_name, **fence_kwargs)
+                    claim_may_exist = False
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error('Error in reserved-capacity poller: '
+                             f'{common_utils.format_exception(e)}')
+        interval = poll_interval_seconds()
+        if stop_event is None:
+            time.sleep(interval)
+        elif stop_event.wait(interval):
+            return

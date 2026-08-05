@@ -31,6 +31,47 @@ _DEFAULT_AUTOSTOP = {
 }
 
 
+def test_controller_config_snapshot_is_copied_and_keeps_workspace_policy():
+    original = {
+        'active_workspace': 'research',
+        'admin_policy': 'example.Policy',
+        'api_server': {
+            'endpoint': 'https://example.invalid'
+        },
+        'kubernetes': {
+            'allowed_contexts': ['east', 'phx']
+        },
+        'workspaces': {
+            'research': {
+                'private': True,
+                'allowed_users': ['member@example.com'],
+            },
+            'peer': {
+                'kubernetes': {
+                    'allowed_contexts': ['peer-secret-context']
+                }
+            },
+        },
+    }
+    snapshot = controller_utils.controller_config_snapshot(original,
+                                                           workspace='research')
+    assert snapshot == {
+        'active_workspace': 'research',
+        'kubernetes': {
+            'allowed_contexts': ['east', 'phx']
+        },
+        'workspaces': {
+            'research': {},
+        },
+    }
+    assert original['admin_policy'] == 'example.Policy'
+    assert original['workspaces']['research']['allowed_users'] == [
+        'member@example.com'
+    ]
+    snapshot['kubernetes']['allowed_contexts'].append('other')
+    assert original['kubernetes']['allowed_contexts'] == ['east', 'phx']
+
+
 @pytest.mark.parametrize('controller', list(controller_utils.Controllers))
 def test_controller_identity_public_contract(controller):
     """Controller identities remain importable through the public module."""

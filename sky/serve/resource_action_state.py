@@ -439,8 +439,9 @@ class ActivationGateEvidenceV1:
         if self.api_schema_revision not in ('005', '007', '008'):
             raise ValueError('activation requires API schema revision 005 or '
                              'a 007-compatible revision (007 or 008).')
-        if self.serve_schema_revision != '035':
-            raise ValueError('activation requires Serve schema revision 035.')
+        if self.serve_schema_revision not in ('035', '036'):
+            raise ValueError(
+                'activation requires Serve schema revision 035 or 036.')
         if self.global_user_state_schema_revision != '028':
             raise ValueError('activation requires global-user-state schema '
                              'revision 028.')

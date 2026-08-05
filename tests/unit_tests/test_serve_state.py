@@ -8,6 +8,7 @@ leader-aware routing.
 # effects). Disable for the file.
 # pylint: disable=invalid-name,protected-access
 import contextlib
+import hashlib
 import json
 import pickle
 import sqlite3
@@ -26,6 +27,7 @@ from sky.serve import paid_capacity
 from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_managers
 from sky.serve import serve_state
+from sky.serve import service as service_lib
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state as recovery_state
 from sky.utils import common_utils
@@ -77,6 +79,17 @@ def _read_version_row(engine, name, version):
     return None if result is None else dict(result._mapping)  # pylint: disable=protected-access
 
 
+def _config_snapshot(config: bytes,
+                     snapshot_character: str = 'a') -> tuple[bytes, str, str]:
+    return (config, hashlib.sha256(config).hexdigest(), snapshot_character * 64)
+
+
+_VERSIONED_HA_SCRIPT = (
+    f'{serve_constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER}\n'
+    'export SKYPILOT_CONFIG=/tmp/config.yaml.v2\n'
+    'python -m sky.serve.service --service-name svc\n')
+
+
 @contextlib.contextmanager
 def _count_sql_statements(engine):
     counts = {'n': 0}
@@ -118,7 +131,10 @@ def _add_minimal_service(name: str,
                          spec=None,
                          created_by=None,
                          submitted_yaml_content=None,
-                         placement_catalog=None):
+                         placement_catalog=None,
+                         controller_config=None,
+                         controller_config_digest=None,
+                         controller_config_snapshot_id=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     return serve_state.add_service(
@@ -145,6 +161,9 @@ def _add_minimal_service(name: str,
         created_by=created_by,
         submitted_yaml_content=submitted_yaml_content,
         placement_catalog=placement_catalog,
+        controller_config=controller_config,
+        controller_config_digest=controller_config_digest,
+        controller_config_snapshot_id=controller_config_snapshot_id,
     )
 
 
@@ -1144,6 +1163,57 @@ def test_placement_catalog_migration_adds_nullable_column(
     assert legacy_catalog is None
 
 
+def test_controller_config_migration_adds_nullable_applied_receipt(
+        tmp_path, monkeypatch):
+    engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
+    legacy_metadata = sqlalchemy.MetaData()
+    legacy_versions = sqlalchemy.Table(
+        'version_specs',
+        legacy_metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
+        sqlalchemy.Column('yaml_content', sqlalchemy.Text),
+    )
+    legacy_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text('CREATE TABLE alembic_version_serve_state_db '
+                            '(version_num VARCHAR(32) NOT NULL)'))
+        connection.execute(
+            sqlalchemy.text(
+                "INSERT INTO alembic_version_serve_state_db VALUES ('035')"))
+        connection.execute(legacy_versions.insert().values(
+            service_name='legacy-svc',
+            version=7,
+            spec=b'opaque',
+            yaml_content='yaml: legacy'))
+
+    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '036')
+    serve_state.create_table(engine)
+
+    columns = {
+        column['name']: column
+        for column in sqlalchemy.inspect(engine).get_columns('version_specs')
+    }
+    assert {
+        'controller_config', 'controller_config_digest',
+        'controller_config_snapshot_id', 'controller_applied_at'
+    } <= columns.keys()
+    assert all(columns[name]['nullable']
+               for name in ('controller_config', 'controller_config_digest',
+                            'controller_config_snapshot_id',
+                            'controller_applied_at'))
+    with engine.connect() as connection:
+        migrated = connection.execute(
+            sqlalchemy.text('SELECT controller_config, '
+                            'controller_config_digest, '
+                            'controller_config_snapshot_id, '
+                            'controller_applied_at FROM version_specs '
+                            "WHERE service_name = 'legacy-svc'")).one()
+    assert migrated == (None, None, None, None)
+
+
 def test_service_version_terminal_lookup_uses_only_exact_history_keys(
         _mock_serve_db):
     engine = _mock_serve_db
@@ -1181,16 +1251,75 @@ def test_service_version_terminal_lookup_uses_only_exact_history_keys(
         ('svc-terminal', 2000, 'incarnation-a'): False,
         ('missing-service', 1, 'missing-incarnation'): True,
     }
-    assert len(statements) == 2
+    assert len(statements) == 1
     probe_statement = next(statement for statement in statements
                            if 'wanted_service_versions' in statement)
     assert 'WITH wanted_service_versions(service_name, version) AS' in (
         probe_statement)
-    assert probe_statement.count('EXISTS (SELECT') == 2
+    assert probe_statement.count('EXISTS (SELECT') == 3
     assert 'FROM version_specs' in probe_statement
     assert 'FROM replicas' in probe_statement
     assert 'SELECT replicas.service_name, replicas.version' not in (
         probe_statement)
+
+
+def test_service_version_terminal_state_retains_scale_zero_applied_fallback(
+        _mock_serve_db):
+    assert _add_minimal_service('svc-terminal-fallback',
+                                service_hash='incarnation-a',
+                                spec='spec-v1')
+    serve_state.set_service_status_and_active_versions(
+        'svc-terminal-fallback',
+        serve_state.ServiceStatus.READY,
+        active_versions=[])
+    assert serve_state.add_or_update_version(
+        'svc-terminal-fallback', 2, 'spec-v2',
+        'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
+    assert serve_state.quarantine_version('svc-terminal-fallback', 2,
+                                          'never applied')
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        result = serve_state.get_service_version_terminal_states([
+            ('svc-terminal-fallback', 1, 'incarnation-a'),
+        ])
+
+    assert counts['n'] == 1
+    assert result == {
+        ('svc-terminal-fallback', 1, 'incarnation-a'): False,
+    }
+
+
+def test_service_version_terminal_state_retains_all_applied_history(
+        _mock_serve_db):
+    owner = (12345, None)
+    assert _add_minimal_service('svc-applied-history',
+                                service_hash='incarnation-a',
+                                spec='spec-v1')
+    assert serve_state.add_or_update_version(
+        'svc-applied-history', 2, 'spec-v2',
+        'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
+    assert serve_state.mark_version_controller_applied(
+        'svc-applied-history',
+        2,
+        expected_service_hash='incarnation-a',
+        expected_controller_owner=owner)
+    assert serve_state.add_or_update_version(
+        'svc-applied-history', 3, 'spec-v3',
+        'yaml: v3') is serve_state.VersionCommitResult.COMMITTED
+    serve_state.set_service_status_and_active_versions(
+        'svc-applied-history',
+        serve_state.ServiceStatus.READY,
+        active_versions=[])
+
+    result = serve_state.get_service_version_terminal_states([
+        ('svc-applied-history', 1, 'incarnation-a'),
+        ('svc-applied-history', 2, 'incarnation-a'),
+    ])
+
+    assert result == {
+        ('svc-applied-history', 1, 'incarnation-a'): False,
+        ('svc-applied-history', 2, 'incarnation-a'): False,
+    }
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
@@ -1245,6 +1374,223 @@ def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
         'value: different')
     assert conflict_result is serve_state.VersionCommitResult.CONTENT_CONFLICT
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
+
+
+def test_initial_version_controller_config_persists_and_verifies(
+        _mock_serve_db):
+    snapshot = _config_snapshot(b'active_workspace: research\n')
+    assert _add_minimal_service('svc-initial-config',
+                                controller_config=snapshot[0],
+                                controller_config_digest=snapshot[1],
+                                controller_config_snapshot_id=snapshot[2])
+    assert (serve_state.get_version_controller_config('svc-initial-config',
+                                                      1) == snapshot)
+
+
+def test_version_controller_config_retry_requires_exact_snapshot(
+        _mock_serve_db):
+    assert _add_minimal_service('svc-config-retry')
+    assert serve_state.add_version('svc-config-retry') == 2
+    snapshot = _config_snapshot(b'active_workspace: research\n')
+    result = serve_state.add_or_update_version(
+        'svc-config-retry',
+        2,
+        types.SimpleNamespace(value='v2'),
+        'value: v2',
+        ha_recovery_script=_VERSIONED_HA_SCRIPT,
+        controller_config=snapshot[0],
+        controller_config_digest=snapshot[1],
+        controller_config_snapshot_id=snapshot[2])
+    assert result is serve_state.VersionCommitResult.COMMITTED
+    original_row = _read_version_row(_mock_serve_db, 'svc-config-retry', 2)
+
+    assert (serve_state.add_or_update_version(
+        'svc-config-retry',
+        2,
+        types.SimpleNamespace(value='v2'),
+        'value: v2',
+        controller_config=snapshot[0],
+        controller_config_digest=snapshot[1],
+        controller_config_snapshot_id=snapshot[2])
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+    assert (serve_state.add_or_update_version('svc-config-retry', 2,
+                                              types.SimpleNamespace(value='v2'),
+                                              'value: v2')
+            is serve_state.VersionCommitResult.CONTENT_CONFLICT)
+    different_snapshot = _config_snapshot(b'active_workspace: other\n', 'b')
+    assert (serve_state.add_or_update_version(
+        'svc-config-retry',
+        2,
+        types.SimpleNamespace(value='v2'),
+        'value: v2',
+        controller_config=different_snapshot[0],
+        controller_config_digest=different_snapshot[1],
+        controller_config_snapshot_id=different_snapshot[2])
+            is serve_state.VersionCommitResult.CONTENT_CONFLICT)
+    assert _read_version_row(_mock_serve_db, 'svc-config-retry',
+                             2) == (original_row)
+
+
+def test_config_aware_commit_backfills_only_null_prior_versions(_mock_serve_db):
+    initial_snapshot = _config_snapshot(b'active_workspace: initial\n', '1')
+    assert _add_minimal_service(
+        'svc-config-backfill',
+        service_hash='incarnation-a',
+        controller_config=initial_snapshot[0],
+        controller_config_digest=initial_snapshot[1],
+        controller_config_snapshot_id=initial_snapshot[2])
+    assert serve_state.add_version('svc-config-backfill') == 2
+    assert (serve_state.add_or_update_version(
+        'svc-config-backfill', 2, types.SimpleNamespace(value='legacy'),
+        'value: legacy') is serve_state.VersionCommitResult.COMMITTED)
+    assert serve_state.add_version('svc-config-backfill') == 3
+
+    current_snapshot = _config_snapshot(b'active_workspace: current\n', '3')
+    legacy_snapshot = _config_snapshot(b'active_workspace: legacy\n', '2')
+    assert (serve_state.add_or_update_version(
+        'svc-config-backfill',
+        3,
+        types.SimpleNamespace(value='current'),
+        'value: current',
+        ha_recovery_script=_VERSIONED_HA_SCRIPT,
+        controller_config=current_snapshot[0],
+        controller_config_digest=current_snapshot[1],
+        controller_config_snapshot_id=current_snapshot[2],
+        legacy_controller_config_snapshot=legacy_snapshot,
+        legacy_controller_applied_version=1,
+        expected_service_hash='incarnation-a',
+        expected_controller_owner=(12345, None))
+            is serve_state.VersionCommitResult.COMMITTED)
+    assert serve_state.get_version_controller_config('svc-config-backfill',
+                                                     1) == initial_snapshot
+    assert serve_state.get_version_controller_config('svc-config-backfill',
+                                                     2) == legacy_snapshot
+    assert serve_state.get_version_controller_config('svc-config-backfill',
+                                                     3) == current_snapshot
+
+
+def test_get_version_controller_config_rejects_digest_corruption(
+        _mock_serve_db):
+    snapshot = _config_snapshot(b'active_workspace: research\n')
+    assert _add_minimal_service('svc-corrupt-config',
+                                controller_config=snapshot[0],
+                                controller_config_digest=snapshot[1],
+                                controller_config_snapshot_id=snapshot[2])
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name ==
+                'svc-corrupt-config').values(controller_config_digest='0' * 64))
+        session.commit()
+    with pytest.raises(serve_state.ControllerConfigCorruptionError,
+                       match='failed integrity validation'):
+        serve_state.get_version_controller_config('svc-corrupt-config', 1)
+
+
+def test_invalid_controller_config_snapshot_is_rejected_before_write(
+        _mock_serve_db):
+    assert _add_minimal_service('svc-invalid-config')
+    assert serve_state.add_version('svc-invalid-config') == 2
+    with pytest.raises(ValueError, match='provide config bytes'):
+        serve_state.add_or_update_version(
+            'svc-invalid-config',
+            2,
+            types.SimpleNamespace(value='v2'),
+            'value: v2',
+            controller_config=b'config',
+            controller_config_digest=hashlib.sha256(b'config').hexdigest())
+    row = _read_version_row(_mock_serve_db, 'svc-invalid-config', 2)
+    assert row['yaml_content'] is None
+    assert row['controller_config'] is None
+
+
+def test_version_and_ha_recovery_script_commit_atomically(_mock_serve_db):
+    assert _add_minimal_service('svc-config') is True
+    assert serve_state.set_ha_recovery_script('svc-config', 'legacy-script')
+    assert serve_state.add_version('svc-config') == 2
+    result = serve_state.add_or_update_version(
+        'svc-config',
+        2,
+        types.SimpleNamespace(value='v2'),
+        'value: v2',
+        ha_recovery_script='config-free-recovery-script-v2')
+    assert result is serve_state.VersionCommitResult.COMMITTED
+    assert (serve_state.get_ha_recovery_script('svc-config') ==
+            'config-free-recovery-script-v2')
+    retry = serve_state.add_or_update_version(
+        'svc-config',
+        2,
+        types.SimpleNamespace(value='v2'),
+        'value: v2',
+        ha_recovery_script='config-free-recovery-script-v2')
+    assert retry is serve_state.VersionCommitResult.IDEMPOTENT_RETRY
+    stale_retry = serve_state.add_or_update_version(
+        'svc-config',
+        2,
+        types.SimpleNamespace(value='v2'),
+        'value: v2',
+        ha_recovery_script='different-script-for-same-version')
+    assert stale_retry is serve_state.VersionCommitResult.CONTENT_CONFLICT
+    assert (serve_state.get_ha_recovery_script('svc-config') ==
+            'config-free-recovery-script-v2')
+
+
+def test_ha_config_upsert_failure_rolls_back_version_transaction(
+        _mock_serve_db):
+    assert _add_minimal_service('svc-config-rollback',
+                                service_hash='incarnation-a') is True
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name ==
+                'svc-config-rollback',
+                serve_state.version_specs_table.c.version == 1).values(
+                    controller_applied_at=None))
+        session.commit()
+    assert serve_state.set_ha_recovery_script('svc-config-rollback',
+                                              'legacy-script')
+    assert serve_state.add_version('svc-config-rollback') == 2
+    current_snapshot = _config_snapshot(b'active_workspace: current\n', 'c')
+    legacy_snapshot = _config_snapshot(b'active_workspace: legacy\n', 'd')
+
+    def _fail_recovery_upsert(_connection, _cursor, statement, _parameters,
+                              _context, _executemany):
+        if 'INSERT INTO serve_ha_recovery_script' in statement:
+            raise RuntimeError('injected recovery upsert failure')
+
+    sqlalchemy.event.listen(_mock_serve_db, 'before_cursor_execute',
+                            _fail_recovery_upsert)
+    try:
+        with pytest.raises(RuntimeError, match='injected recovery'):
+            serve_state.add_or_update_version(
+                'svc-config-rollback',
+                2,
+                types.SimpleNamespace(value='v2'),
+                'value: v2',
+                ha_recovery_script=_VERSIONED_HA_SCRIPT,
+                controller_config=current_snapshot[0],
+                controller_config_digest=current_snapshot[1],
+                controller_config_snapshot_id=current_snapshot[2],
+                legacy_controller_config_snapshot=legacy_snapshot,
+                legacy_controller_applied_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=(12345, None))
+    finally:
+        sqlalchemy.event.remove(_mock_serve_db, 'before_cursor_execute',
+                                _fail_recovery_upsert)
+
+    version_row = _read_version_row(_mock_serve_db, 'svc-config-rollback', 2)
+    assert version_row is not None
+    assert version_row['yaml_content'] is None
+    assert version_row['controller_config'] is None
+    assert serve_state.get_version_controller_config('svc-config-rollback',
+                                                     1) is None
+    assert _read_version_row(_mock_serve_db, 'svc-config-rollback',
+                             1)['controller_applied_at'] is None
+    assert _read_row(_mock_serve_db,
+                     'svc-config-rollback')['current_version'] == 1
+    assert (serve_state.get_ha_recovery_script('svc-config-rollback') ==
+            'legacy-script')
 
 
 def test_version_placement_catalog_persists_and_backfills_once(_mock_serve_db):
@@ -1552,12 +1898,14 @@ def test_get_service_liveness_snapshots_is_one_slim_version_backed_query(
                                 controller_ip='10.0.0.2',
                                 controller_pid=22,
                                 service_hash='hash-b',
-                                resource_scope='scope-b') is True
+                                resource_scope='scope-b',
+                                workspace='workspace-b') is True
     assert _add_minimal_service('serve-a',
                                 controller_ip='10.0.0.1',
                                 controller_pid=11,
                                 service_hash='hash-a',
-                                resource_scope='scope-a') is True
+                                resource_scope='scope-a',
+                                workspace='workspace-a') is True
     assert _add_minimal_service('pool-a', pool=True) is True
     _insert_orphan_service_row(_mock_serve_db, 'serve-orphan')
     serve_state.set_service_status_and_active_versions(
@@ -1579,7 +1927,11 @@ def test_get_service_liveness_snapshots_is_one_slim_version_backed_query(
         'controller_ip': '10.0.0.1',
         'hash': 'hash-a',
         'resource_scope': 'scope-a',
+        'workspace': 'workspace-a',
         'yaml_content': 'yaml: v1',
+        'recovery_version': 1,
+        'config_protocol_active': False,
+        'recovery_config_present': False,
     }, {
         'name': 'serve-b',
         'status': serve_state.ServiceStatus.FAILED_CLEANUP,
@@ -1588,7 +1940,11 @@ def test_get_service_liveness_snapshots_is_one_slim_version_backed_query(
         'controller_ip': '10.0.0.2',
         'hash': 'hash-b',
         'resource_scope': 'scope-b',
+        'workspace': 'workspace-b',
         'yaml_content': 'yaml: v1',
+        'recovery_version': 1,
+        'config_protocol_active': False,
+        'recovery_config_present': False,
     }]
 
 
@@ -1608,6 +1964,47 @@ def test_get_service_liveness_snapshots_reports_latest_version_yaml(
     by_name = {record['name']: record for record in records}
     assert by_name['svc']['yaml_content'] == 'yaml: v2'
     assert by_name['placeholder']['yaml_content'] is None
+
+
+def test_get_service_liveness_snapshots_elects_applied_quarantine_fallback(
+        _mock_serve_db, monkeypatch):
+    """HA gets one workspace-bound recovery election without loading specs."""
+    config = (b'active_workspace: research\n'
+              b'workspaces: {research: {}}\n')
+    digest = hashlib.sha256(config).hexdigest()
+    assert _add_minimal_service('svc',
+                                workspace='research',
+                                spec='spec-1',
+                                controller_config=config,
+                                controller_config_digest=digest,
+                                controller_config_snapshot_id='a' * 64)
+    for version, snapshot_id in ((2, 'b' * 64), (3, 'c' * 64)):
+        assert serve_state.add_or_update_version(
+            'svc',
+            version,
+            f'spec-{version}',
+            f'yaml: v{version}',
+            controller_config=config,
+            controller_config_digest=digest,
+            controller_config_snapshot_id=snapshot_id,
+            ha_recovery_script=_VERSIONED_HA_SCRIPT,
+        ) is serve_state.VersionCommitResult.COMMITTED
+    assert serve_state.quarantine_version('svc', 3, 'never applied')
+
+    def _unexpected_spec_unpickle(_):
+        raise AssertionError('liveness snapshots must not deserialize specs')
+
+    monkeypatch.setattr(serve_state.pickle, 'loads', _unexpected_spec_unpickle)
+    with _count_sql_statements(_mock_serve_db) as counts:
+        records = serve_state.get_service_liveness_snapshots(pool=False)
+
+    assert counts['n'] == 1, counts
+    assert len(records) == 1
+    assert records[0]['workspace'] == 'research'
+    assert records[0]['yaml_content'] == 'yaml: v3'
+    assert records[0]['recovery_version'] == 1
+    assert records[0]['config_protocol_active'] is True
+    assert records[0]['recovery_config_present'] is True
 
 
 class TestAddServiceWritesControllerIp:
@@ -1664,6 +2061,11 @@ class TestAddServiceAtomicRegistration:
                 serve_constants.INITIAL_VERSION)
         assert serve_state.get_yaml_content(
             'svc-atomic', serve_constants.INITIAL_VERSION) == 'yaml: v1'
+        version_row = _read_version_row(_mock_serve_db, 'svc-atomic', 1)
+        assert version_row is not None
+        assert version_row['controller_applied_at'] is not None
+        assert (
+            version_row['controller_applied_at'] == version_row['created_at'])
 
     def test_duplicate_does_not_write_second_version_row(self, _mock_serve_db):
         assert _add_minimal_service('svc-dup') is True
@@ -2215,6 +2617,348 @@ class TestGetServiceControllerOwner:
         assert counts['n'] == 1
 
 
+class TestServiceReplicaLaunchAuthorization:
+    """Launch generations follow the quarantine-aware recovery election."""
+
+    def test_scale_zero_quarantine_uses_applied_not_intermediate_version(
+            self, _mock_serve_db):
+        owner = (321, '10.4.10.8')
+        assert _add_minimal_service('svc-launch-fence',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    service_hash='incarnation-a',
+                                    spec='spec-v1')
+        serve_state.set_service_status_and_active_versions(
+            'svc-launch-fence',
+            serve_state.ServiceStatus.READY,
+            # A target of zero produces no READY replica routing versions.
+            active_versions=[])
+        legacy_authorization = (
+            serve_state.get_service_replica_launch_authorization(
+                'svc-launch-fence'))
+        assert legacy_authorization is not None
+        assert legacy_authorization['launch_version_required'] is False
+        config = b'active_workspace: research\n'
+        config_digest = hashlib.sha256(config).hexdigest()
+        config_snapshot = (config, config_digest, 'a' * 64)
+        assert serve_state.add_or_update_version(
+            'svc-launch-fence',
+            2,
+            'spec-v2',
+            'yaml: v2',
+            ha_recovery_script=(
+                f'{serve_constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER}\n'
+                'python -m sky.serve.service\n'),
+            controller_config=config,
+            controller_config_digest=config_digest,
+            controller_config_snapshot_id='b' * 64,
+            legacy_controller_config_snapshot=config_snapshot,
+            legacy_controller_applied_version=1,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+        ) is serve_state.VersionCommitResult.COMMITTED
+        # v2 is committed, but the controller never completed its runtime
+        # transition and therefore has no applied receipt.
+        assert _read_version_row(_mock_serve_db, 'svc-launch-fence',
+                                 2)['controller_applied_at'] is None
+
+        config_v3 = _config_snapshot(b'active_workspace: research-v3\n', 'c')
+        assert serve_state.add_or_update_version(
+            'svc-launch-fence',
+            3,
+            'spec-v3',
+            'yaml: v3',
+            ha_recovery_script=_VERSIONED_HA_SCRIPT,
+            controller_config=config_v3[0],
+            controller_config_digest=config_v3[1],
+            controller_config_snapshot_id=config_v3[2]
+        ) is serve_state.VersionCommitResult.COMMITTED
+        assert _read_row(_mock_serve_db,
+                         'svc-launch-fence')['current_version'] == 3
+        committed_authorization = (
+            serve_state.get_service_replica_launch_authorization(
+                'svc-launch-fence'))
+        assert committed_authorization is not None
+        assert committed_authorization['launch_authorized_version'] == 3
+        assert committed_authorization['launch_version_required'] is True
+        assert serve_state.quarantine_version('svc-launch-fence', 3,
+                                              'deterministic update failure')
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            authorization = (
+                serve_state.get_service_replica_launch_authorization(
+                    'svc-launch-fence'))
+
+        assert counts['n'] == 1
+        assert authorization is not None
+        assert authorization['hash'] == 'incarnation-a'
+        assert (authorization['controller_pid'],
+                authorization['controller_ip']) == owner
+        assert authorization['status'] == serve_state.ServiceStatus.READY
+        # v2 is the newest non-quarantined commit, but v1 is the newest
+        # generation actually applied by this controller. This remains exact
+        # with no READY replicas and an empty active_versions routing set.
+        assert authorization['launch_authorized_version'] == 1
+        assert authorization['launch_version_required'] is True
+        recovery = serve_state.get_recovery_version_spec('svc-launch-fence')
+        assert recovery == (1, 'spec-v1')
+
+        config_v4 = _config_snapshot(b'active_workspace: research-v4\n', 'd')
+        assert serve_state.add_or_update_version(
+            'svc-launch-fence',
+            4,
+            'spec-v4',
+            'yaml: v4',
+            ha_recovery_script=_VERSIONED_HA_SCRIPT,
+            controller_config=config_v4[0],
+            controller_config_digest=config_v4[1],
+            controller_config_snapshot_id=config_v4[2]
+        ) is serve_state.VersionCommitResult.COMMITTED
+        superseding_authorization = (
+            serve_state.get_service_replica_launch_authorization(
+                'svc-launch-fence'))
+        assert superseding_authorization is not None
+        assert superseding_authorization['launch_authorized_version'] == 4
+        assert serve_state.get_recovery_version_spec('svc-launch-fence') == (
+            4, 'spec-v4')
+
+    def test_first_protocol_commit_seeds_legacy_scale_zero_fallback(
+            self, _mock_serve_db):
+        owner = (654, '10.4.10.9')
+        assert _add_minimal_service('svc-legacy-activation',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    service_hash='incarnation-legacy',
+                                    spec='spec-v1')
+        # Revision 036 is additive and intentionally does not guess which
+        # historical version an existing controller had applied.
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    'svc-legacy-activation',
+                    serve_state.version_specs_table.c.version == 1).values(
+                        controller_applied_at=None))
+            session.commit()
+        serve_state.set_service_status_and_active_versions(
+            'svc-legacy-activation',
+            serve_state.ServiceStatus.READY,
+            active_versions=[])
+
+        current_config = _config_snapshot(b'active_workspace: current\n', 'e')
+        legacy_config = _config_snapshot(b'active_workspace: legacy\n', 'f')
+        assert serve_state.add_or_update_version(
+            'svc-legacy-activation',
+            2,
+            'spec-v2',
+            'yaml: v2',
+            ha_recovery_script=_VERSIONED_HA_SCRIPT,
+            controller_config=current_config[0],
+            controller_config_digest=current_config[1],
+            controller_config_snapshot_id=current_config[2],
+            legacy_controller_config_snapshot=legacy_config,
+            legacy_controller_applied_version=1,
+            expected_service_hash='incarnation-legacy',
+            expected_controller_owner=owner,
+        ) is serve_state.VersionCommitResult.COMMITTED
+        assert _read_version_row(_mock_serve_db, 'svc-legacy-activation',
+                                 1)['controller_applied_at'] is not None
+        assert _read_version_row(_mock_serve_db, 'svc-legacy-activation',
+                                 2)['controller_applied_at'] is None
+        assert serve_state.quarantine_version(
+            'svc-legacy-activation',
+            2,
+            'deterministic preflight failure',
+            expected_service_hash='incarnation-legacy',
+            expected_controller_owner=owner)
+
+        authorization = serve_state.get_service_replica_launch_authorization(
+            'svc-legacy-activation')
+        assert authorization is not None
+        assert authorization['launch_authorized_version'] == 1
+        assert serve_state.get_recovery_version_spec(
+            'svc-legacy-activation') == (1, 'spec-v1')
+
+    def test_missing_service_has_no_launch_authorization(self, _mock_serve_db):
+        assert serve_state.get_service_replica_launch_authorization(
+            'missing') is None
+
+    def test_partial_config_tuple_still_requires_versioned_launch(
+            self, _mock_serve_db):
+        assert _add_minimal_service('svc-partial-config',
+                                    service_hash='incarnation-partial')
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    'svc-partial-config').values(controller_config_digest='a' *
+                                                 64))
+            session.commit()
+
+        authorization = serve_state.get_service_replica_launch_authorization(
+            'svc-partial-config')
+
+        assert authorization is not None
+        assert authorization['launch_authorized_version'] == 1
+        assert authorization['launch_version_required'] is True
+
+
+def test_system_recovery_snapshot_elects_applied_scale_zero_fallback(
+        _mock_serve_db):
+    assert _add_minimal_service('svc-system-recovery',
+                                service_hash='incarnation-a',
+                                workspace='research',
+                                spec='spec-v1')
+    serve_state.set_service_status_and_active_versions(
+        'svc-system-recovery',
+        serve_state.ServiceStatus.NO_REPLICA,
+        active_versions=[])
+    assert serve_state.add_or_update_version(
+        'svc-system-recovery', 2, 'spec-v2',
+        'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
+    assert serve_state.quarantine_version('svc-system-recovery', 2,
+                                          'never applied')
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        snapshot = serve_state.get_system_recovery_authorization_snapshot(
+            'svc-system-recovery')
+
+    assert counts['n'] == 1
+    assert snapshot is not None
+    assert snapshot['version'] == 1
+    assert snapshot['spec'] == 'spec-v1'
+    assert snapshot['yaml_content'] == 'yaml: v1'
+    assert snapshot['quarantined_at'] is None
+    assert snapshot['replica_count'] == 0
+
+
+def test_ha_recovery_snapshot_is_one_fenced_quarantine_aware_read(
+        _mock_serve_db, monkeypatch):
+    owner = (9876, '10.5.0.7')
+    lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(
+        'svc-ha-snapshot')
+    v1_config = _config_snapshot(
+        b'active_workspace: research\nworkspaces:\n  research: {}\n', '1')
+    assert _add_minimal_service('svc-ha-snapshot',
+                                controller_pid=owner[0],
+                                controller_ip=owner[1],
+                                service_hash='incarnation-a',
+                                lifecycle_epoch=lifecycle_epoch,
+                                resource_scope='scope-a',
+                                workspace='research',
+                                spec='spec-v1',
+                                controller_config=v1_config[0],
+                                controller_config_digest=v1_config[1],
+                                controller_config_snapshot_id=v1_config[2])
+    serve_state.set_service_status_and_active_versions(
+        'svc-ha-snapshot',
+        serve_state.ServiceStatus.NO_REPLICA,
+        active_versions=[])
+
+    v2_config = _config_snapshot(b'active_workspace: research\n', '2')
+    v3_config = _config_snapshot(b'active_workspace: research\n', '3')
+    assert serve_state.add_or_update_version(
+        'svc-ha-snapshot',
+        2,
+        'spec-v2',
+        'yaml: v2',
+        ha_recovery_script=_VERSIONED_HA_SCRIPT,
+        controller_config=v2_config[0],
+        controller_config_digest=v2_config[1],
+        controller_config_snapshot_id=v2_config[2]
+    ) is serve_state.VersionCommitResult.COMMITTED
+    assert serve_state.add_or_update_version(
+        'svc-ha-snapshot',
+        3,
+        'spec-v3',
+        'yaml: v3',
+        ha_recovery_script=_VERSIONED_HA_SCRIPT,
+        controller_config=v3_config[0],
+        controller_config_digest=v3_config[1],
+        controller_config_snapshot_id=v3_config[2]
+    ) is serve_state.VersionCommitResult.COMMITTED
+    assert serve_state.quarantine_version('svc-ha-snapshot', 3, 'never applied')
+
+    def _fail_if_spec_deserialized(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError('HA authorization must not deserialize a spec')
+
+    monkeypatch.setattr(serve_state.pickle, 'loads', _fail_if_spec_deserialized)
+    with _count_sql_statements(_mock_serve_db) as counts:
+        snapshot = serve_state.get_service_ha_recovery_snapshot(
+            'svc-ha-snapshot', expected_service_hash='incarnation-a')
+
+    assert counts['n'] == 1
+    assert snapshot == {
+        'service_name': 'svc-ha-snapshot',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': lifecycle_epoch,
+        'controller_pid': owner[0],
+        'controller_ip': owner[1],
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'status': serve_state.ServiceStatus.NO_REPLICA,
+        # v2 is newer but unproven; the dominant v3 quarantine falls back to
+        # the initial controller-applied generation and its exact config tuple.
+        'recovery_version': 1,
+        'config_protocol_active': True,
+        'controller_config_snapshot': v1_config,
+        'ha_recovery_script': _VERSIONED_HA_SCRIPT,
+    }
+
+
+def test_ha_recovery_snapshot_fences_incarnation_and_legacy_protocol(
+        _mock_serve_db):
+    lifecycle_epoch = serve_state.claim_service_lifecycle_epoch('svc-ha-legacy')
+    assert _add_minimal_service('svc-ha-legacy',
+                                controller_pid=4321,
+                                controller_ip='10.6.0.8',
+                                service_hash='incarnation-current',
+                                lifecycle_epoch=lifecycle_epoch,
+                                resource_scope='scope-current',
+                                workspace='research')
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        stale = serve_state.get_service_ha_recovery_snapshot(
+            'svc-ha-legacy', expected_service_hash='incarnation-stale')
+    assert counts['n'] == 1
+    assert stale is None
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        current = serve_state.get_service_ha_recovery_snapshot(
+            'svc-ha-legacy', expected_service_hash='incarnation-current')
+    assert counts['n'] == 1
+    assert current is not None
+    assert current['recovery_version'] == 1
+    assert current['config_protocol_active'] is False
+    assert current['controller_config_snapshot'] is None
+    assert current['ha_recovery_script'] is None
+
+
+def test_ha_recovery_snapshot_rejects_selected_config_corruption(
+        _mock_serve_db):
+    config = _config_snapshot(b'active_workspace: research\n', '4')
+    assert _add_minimal_service('svc-ha-corrupt',
+                                service_hash='incarnation-corrupt',
+                                workspace='research',
+                                controller_config=config[0],
+                                controller_config_digest=config[1],
+                                controller_config_snapshot_id=config[2])
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name ==
+                'svc-ha-corrupt').values(controller_config_digest='0' * 64))
+        session.commit()
+
+    with _count_sql_statements(_mock_serve_db) as counts, pytest.raises(
+            serve_state.ControllerConfigCorruptionError,
+            match='failed integrity validation'):
+        serve_state.get_service_ha_recovery_snapshot(
+            'svc-ha-corrupt', expected_service_hash='incarnation-corrupt')
+    assert counts['n'] == 1
+
+
 class TestGetServiceRuntimeSnapshot:
     """The controller hot paths should avoid the joined latest-spec read."""
 
@@ -2507,6 +3251,44 @@ class TestUpdateServiceControllerPidIfOwner:
             'svc', 'same-incarnation', 111, '10.0.0.1', 111,
             '10.0.0.3') is False
         assert _read_row(_mock_serve_db, 'svc')['controller_ip'] == '10.0.0.2'
+
+    def test_preclaim_atomically_fences_lifecycle_status_and_version(
+            self, _mock_serve_db):
+        lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(
+            'svc-jit-fence')
+        assert _add_minimal_service('svc-jit-fence',
+                                    controller_pid=111,
+                                    controller_ip='10.0.0.1',
+                                    service_hash='same-incarnation',
+                                    lifecycle_epoch=lifecycle_epoch)
+        kwargs = {
+            'service_name': 'svc-jit-fence',
+            'expected_service_hash': 'same-incarnation',
+            'expected_controller_pid': 111,
+            'expected_controller_ip': '10.0.0.1',
+            'controller_pid': 222,
+            'controller_ip': '10.0.0.2',
+        }
+        assert not serve_state.update_service_controller_pid_if_owner(
+            **kwargs,
+            expected_lifecycle_epoch=lifecycle_epoch + 1,
+            expected_status=serve_state.ServiceStatus.CONTROLLER_INIT,
+            expected_recovery_version=1)
+        assert not serve_state.update_service_controller_pid_if_owner(
+            **kwargs,
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_status=serve_state.ServiceStatus.READY,
+            expected_recovery_version=1)
+        assert not serve_state.update_service_controller_pid_if_owner(
+            **kwargs,
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_status=serve_state.ServiceStatus.CONTROLLER_INIT,
+            expected_recovery_version=2)
+        assert serve_state.update_service_controller_pid_if_owner(
+            **kwargs,
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_status=serve_state.ServiceStatus.CONTROLLER_INIT,
+            expected_recovery_version=1)
 
 
 class TestSetServiceControllerPortIfOwner:
@@ -3075,16 +3857,18 @@ class TestRecoveryVersionSelection:
         assert serve_state.get_latest_applicable_version_spec('svc') == (
             3, 'spec-3')
 
-    def test_recovery_prefers_proven_active_version_below_quarantine(
+    def test_recovery_prefers_proven_applied_version_below_quarantine(
             self, _mock_serve_db):
         assert _add_minimal_service('svc', spec='spec-1')
         serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
         serve_state.add_or_update_version('svc', 3, 'spec-3', 'yaml: v3')
+        # At target zero there are no routing versions to consult. v1 remains
+        # a safe fallback because registration durably recorded it as applied.
         serve_state.set_service_status_and_active_versions(
-            'svc', serve_state.ServiceStatus.READY, active_versions=[1])
+            'svc', serve_state.ServiceStatus.READY, active_versions=[])
 
         assert serve_state.quarantine_version('svc', 3, 'never ready')
-        # Version 2 is committed but never became an active routing version.
+        # Version 2 is committed but its runtime transition never completed.
         assert serve_state.get_latest_applicable_version_spec('svc') == (
             2, 'spec-2')
         assert serve_state.get_recovery_version_spec('svc') == (1, 'spec-1')
@@ -3093,6 +3877,122 @@ class TestRecoveryVersionSelection:
         # fresh rollout on recovery.
         serve_state.add_or_update_version('svc', 4, 'spec-4', 'yaml: v4')
         assert serve_state.get_recovery_version_spec('svc') == (4, 'spec-4')
+
+    def test_lb_grace_uses_applied_version_below_dominant_quarantine(
+            self, _mock_serve_db, monkeypatch):
+        v1 = types.SimpleNamespace(lb_stream_timeout_seconds=11,
+                                   graceful_drain_seconds=21)
+        v2 = types.SimpleNamespace(lb_stream_timeout_seconds=12,
+                                   graceful_drain_seconds=22)
+        v3 = types.SimpleNamespace(lb_stream_timeout_seconds=13,
+                                   graceful_drain_seconds=23)
+        assert _add_minimal_service('svc-grace', spec=v1)
+        assert serve_state.add_or_update_version(
+            'svc-grace', 2, v2,
+            'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
+        assert serve_state.add_or_update_version(
+            'svc-grace', 3, v3,
+            'yaml: v3') is serve_state.VersionCommitResult.COMMITTED
+        assert serve_state.quarantine_version('svc-grace', 3, 'never applied')
+        observed = []
+
+        def _grace(stream_timeout, drain_timeout):
+            observed.append((stream_timeout, drain_timeout))
+            return 123
+
+        monkeypatch.setattr(service_lib.lb_k8s,
+                            'lb_termination_grace_period_seconds', _grace)
+
+        assert (service_lib._get_latest_committed_lb_termination_grace_seconds(
+            'svc-grace') == 123)
+        assert observed == [(11, 21)]
+
+    def test_controller_applied_receipt_is_owner_fenced_and_idempotent(
+            self, _mock_serve_db):
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service('svc-applied',
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec='spec-1')
+        assert serve_state.add_or_update_version(
+            'svc-applied', 2, 'spec-2',
+            'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
+
+        assert not serve_state.mark_version_controller_applied(
+            'svc-applied',
+            2,
+            expected_service_hash='incarnation-b',
+            expected_controller_owner=owner,
+            applied_at=100.0)
+        assert not serve_state.mark_version_controller_applied(
+            'svc-applied',
+            2,
+            expected_service_hash='incarnation-a',
+            applied_at=100.0)
+        assert not serve_state.mark_version_controller_applied(
+            'svc-applied',
+            2,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=(456, '10.0.0.2'),
+            applied_at=100.0)
+        assert not serve_state.mark_version_controller_applied(
+            'svc-applied',
+            99,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            applied_at=100.0)
+
+        assert serve_state.mark_version_controller_applied(
+            'svc-applied',
+            2,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            applied_at=100.0)
+        assert serve_state.mark_version_controller_applied(
+            'svc-applied',
+            2,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            applied_at=200.0)
+        assert _read_version_row(_mock_serve_db, 'svc-applied',
+                                 2)['controller_applied_at'] == 100.0
+
+        # A later commit may race ahead while v3 is still applying. The exact
+        # owner may record v3 after v4 commits; reconciliation is serialized,
+        # and rejecting this would lose the only accurate fallback receipt.
+        assert serve_state.add_or_update_version(
+            'svc-applied', 3, 'spec-3',
+            'yaml: v3') is serve_state.VersionCommitResult.COMMITTED
+        assert serve_state.add_or_update_version(
+            'svc-applied', 4, 'spec-4',
+            'yaml: v4') is serve_state.VersionCommitResult.COMMITTED
+        assert serve_state.mark_version_controller_applied(
+            'svc-applied',
+            3,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            applied_at=300.0)
+        assert _read_version_row(_mock_serve_db, 'svc-applied',
+                                 3)['controller_applied_at'] == 300.0
+
+        assert serve_state.add_version('svc-applied') == 5
+        assert not serve_state.mark_version_controller_applied(
+            'svc-applied',
+            5,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            applied_at=400.0)
+        assert serve_state.add_or_update_version(
+            'svc-applied', 5, 'spec-5',
+            'yaml: v5') is serve_state.VersionCommitResult.COMMITTED
+        assert serve_state.quarantine_version('svc-applied', 5, 'bad update')
+        assert not serve_state.mark_version_controller_applied(
+            'svc-applied',
+            5,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            applied_at=400.0)
 
     def test_quarantine_rejects_placeholder_and_is_idempotent(
             self, _mock_serve_db):

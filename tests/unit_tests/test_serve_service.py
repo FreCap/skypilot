@@ -14,6 +14,7 @@ Focused on the helpers added for HA leader-aware routing:
 """
 # pylint: disable=import-outside-toplevel,missing-class-docstring
 # pylint: disable=protected-access,unreachable
+import json
 import multiprocessing
 import socket
 import threading
@@ -144,7 +145,7 @@ class TestLatestCommittedLbTerminationGraceSeconds:
 
     def test_returns_none_without_committed_snapshot(self):
         with mock.patch('sky.serve.service.serve_state.'
-                        'get_latest_applicable_version_spec',
+                        'get_recovery_version_spec',
                         return_value=None), \
              mock.patch('sky.serve.service.serve_state.'
                         'get_latest_committed_version',
@@ -165,7 +166,7 @@ class TestLatestCommittedLbTerminationGraceSeconds:
         spec.graceful_drain_seconds = 23
 
         with mock.patch('sky.serve.service.serve_state.'
-                        'get_latest_applicable_version_spec',
+                        'get_recovery_version_spec',
                         return_value=(7, spec)) as snapshot, \
              mock.patch('sky.serve.service.serve_state.'
                         'get_latest_committed_version',
@@ -776,6 +777,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
         'controller_job_id': 1,
         'controller_pid': 123,
         'controller_ip': '10.0.0.2',
+        'lifecycle_epoch': 8,
         'workspace': 'default',
         'resource_scope': 'incarnation-a',
         'pool': True,
@@ -785,7 +787,20 @@ def test_recovery_spawns_controller_with_persisted_semantics(
     process = mock.MagicMock(pid=456)
     controller_context = mock.MagicMock()
     controller_context.__enter__.return_value = (process, 20001)
-    with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
+    recovery_fence = json.dumps({
+        'service_hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.2',
+        'status': serve_state.ServiceStatus.READY.value,
+        'recovery_version': 3,
+    })
+    with mock.patch.dict(
+            service.os.environ, {
+                service.constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR:
+                    recovery_fence
+            }), \
+         mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
          mock.patch.object(service.serve_state,
                            'get_service_from_name',
                            return_value=record), \
@@ -812,7 +827,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
                            return_value=3), \
          mock.patch.object(service.serve_state,
                            'update_service_controller_pid_if_owner',
-                           return_value=True), \
+                           return_value=True) as preclaim, \
          mock.patch.object(service,
                            '_spawn_controller_on_reserved_port',
                            return_value=controller_context) as spawn, \
@@ -841,6 +856,16 @@ def test_recovery_spawns_controller_with_persisted_semantics(
 
     assert spawn.call_args.args[1] is persisted
     assert spawn.call_args.args[2] == 3
+    preclaim.assert_called_once_with(
+        'svc',
+        expected_service_hash='incarnation-a',
+        expected_controller_pid=123,
+        expected_controller_ip='10.0.0.2',
+        controller_pid=service.os.getpid(),
+        controller_ip=None,
+        expected_lifecycle_epoch=8,
+        expected_status=serve_state.ServiceStatus.READY,
+        expected_recovery_version=3)
 
 
 def test_start_releases_port_lock_before_readiness_wait():
@@ -1486,6 +1511,13 @@ class TestFailedStartupCleansOnlyScopedStorage:
         return mock.MagicMock(service=spec)
 
     def _common_patches(self, task):
+
+        def _open(_path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get('mode', 'r')
+            data = (b'active_workspace: default\n'
+                    if 'b' in mode else 'service: {}')
+            return mock.mock_open(read_data=data)()
+
         return [
             mock.patch.object(service.auth_utils, 'get_or_generate_keys'),
             mock.patch.object(service.serve_state,
@@ -1494,8 +1526,7 @@ class TestFailedStartupCleansOnlyScopedStorage:
             mock.patch.object(service.task_lib.Task,
                               'from_yaml_str',
                               return_value=task),
-            mock.patch('builtins.open',
-                       mock.mock_open(read_data='service: {}')),
+            mock.patch('builtins.open', side_effect=_open),
             mock.patch.object(service.serve_utils,
                               'generate_remote_service_dir_name',
                               return_value='/tmp/scoped-service'),

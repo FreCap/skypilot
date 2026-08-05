@@ -190,7 +190,8 @@ class PostgresLock(DistributedLock):
                  lock_id: str,
                  timeout: float | None = None,
                  poll_interval: float = 1,
-                 shared_lock: bool = False):
+                 shared_lock: bool = False,
+                 engine: sqlalchemy.engine.Engine | None = None):
         """Initialize the postgres lock.
 
         Args:
@@ -200,11 +201,14 @@ class PostgresLock(DistributedLock):
                 default to 1 second to avoid storming the database.
             shared_lock: Whether to use shared advisory lock or exclusive
                 advisory lock (default).
+            engine: Exact PostgreSQL engine whose database owns the lock.
+                Defaults to the global state engine for compatibility.
         """
         super().__init__(lock_id, timeout, poll_interval)
         # Convert string lock_id to integer for postgres advisory locks
         self._lock_key = postgres_lock_key(lock_id)
         self._shared_lock = shared_lock
+        self._engine = engine
         self._acquired = False
         self._connection: sqlalchemy.pool.PoolProxiedConnection | None = None
 
@@ -215,7 +219,8 @@ class PostgresLock(DistributedLock):
     @db_retries.retry
     def _get_connection(self) -> sqlalchemy.pool.PoolProxiedConnection:
         """Get database connection."""
-        engine = global_user_state.initialize_and_get_db()
+        engine = (self._engine if self._engine is not None else
+                  global_user_state.initialize_and_get_db())
         if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             raise ValueError('PostgresLock requires PostgreSQL database. '
                              f'Current dialect: {engine.dialect.name}')

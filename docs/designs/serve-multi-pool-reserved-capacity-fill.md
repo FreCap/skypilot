@@ -4,10 +4,13 @@ Status: feature and durable executor/provider-fence PRs are merged and deployed;
 the production PostgreSQL cutover, protocol-v2 activation, and pool-identity
 RBAC are complete; measured-capacity PR #1269, UID-race PR #1271, shared-round
 replay PR #1272, launch-guard race PR #1274, and exact-card/provider-phase/
-workspace corrective PR #1275 are merged and deployed. Live acceptance of
-#1275 exposed bounded provider-phase head-of-line blocking; the phase-scope
-hotfix, redeployment, sustained live verification, PHX canary, and
-compatibility-cleanup merge gates remain open
+workspace corrective PR #1275 and phase-scope hotfix #1280 are merged and
+deployed. Durable-round bootstrap PR #1278 is merged but not yet deployed.
+Live PHX canaries proved H200 scheduling, zero-cost accounting, and hub-to-PHX
+connectivity, but also exposed that `serve update` retained the controller's
+east-only config snapshot. The atomic config-refresh rollout, production fleet
+update, sustained live verification, and compatibility-cleanup merge gates
+remain open.
 
 Last updated: 2026-08-05
 
@@ -1157,10 +1160,18 @@ shelter them.
    transition, healthy-edge withdrawal, or physical-identity uncertainty.
    Every process must retain the same hotfix digest throughout.
 7. Update the inference workspace from its inherited east context to an
-   explicit east-plus-PHX list through the validated workspace API, restart the
-   long-lived API/controller processes so they load that committed snapshot,
-   and submit a fresh immutable `boltz-l4-fleet` version. Confirm two claims,
-   independent rounds, exact-context/UID east and PHX canaries, and the global
+   explicit east-plus-PHX list through the validated workspace API. Deploy the
+   config-snapshot update protocol described in
+   `docs/designs/serve-controller-config-refresh.md` to every API/controller
+   process, then submit
+   a fresh immutable `boltz-l4-fleet` version. The API must stage the
+   policy-admitted controller projection under the durable service workspace;
+   the controller must build that version's catalog under the staged snapshot,
+   atomically commit the version/catalog and sanitized HA recovery generation,
+   and only then install and reload it. An old controller fails capability
+   preflight before version allocation. A restart is a verification step, not
+   the mechanism that refreshes config. Confirm two claims, independent rounds,
+   exact-context/UID east and PHX canaries, restart persistence, and the global
    cap.
 8. Keep the stacked cleanup PR blocked until the observation window and
    rollback gate below pass.
@@ -1592,9 +1603,11 @@ larger than the configured `max_replicas`.
   requested phase-scope Helm rollout are intentional direct-deploy drift; a
   later Terragrunt apply will revert them unless the pin is reconciled. This
   rollout deliberately creates no boltz-platform PR, per operator direction.
-- The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`. After
-  the corrective rollout, the workspace update, fresh service version, exact
-  two-edge zero-cost claim/replica canary, H200 model endpoint check, and east
-  regression check remain open.
+- The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
+  Isolated exact-context and two-pool canaries passed, including an H200 replica
+  and HTTP 200 from Rainier, but versions 51--53 retained east-only placement
+  catalogs because the controller config was frozen. The atomic config refresh,
+  fresh production version, restart-persistence check, exact two-edge claim,
+  H200 model endpoint check, and east regression check remain open.
 - Draft compatibility cleanup PR #1263 is authored in stack #1264 and must
   remain blocked until the rollout gates above pass.
