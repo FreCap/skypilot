@@ -139,10 +139,19 @@ security group used by private endpoint interfaces. It rejects public `/0`
 sources. Configure routing and private DNS separately; this rule alone does not
 make a private endpoint reachable.
 
-`serve_probe_ingress` mutates a caller-owned security group. It grants one TCP
-port from one IPv4 CIDR and rejects `0.0.0.0/0` unless
+`serve_probe_ingress` mutates a caller-owned security group. It grants TCP
+ports from one IPv4 CIDR and rejects `0.0.0.0/0` unless
 `allow_public_cidr = true` is explicitly set. Review that ownership edge before
 enabling the rule.
+
+`port` is the replica serving port the prober and load balancer reach.
+`additional_ports` covers the rest of the control plane's Pod-IP traffic.
+Launching a Kubernetes replica SSHes to its Pod IP, so a spoke that grants only
+the serving port will accept the probe and still never finish a launch: the Pod
+runs, the container reports ready, and the replica stays PROVISIONING until it
+is culled. Grant `22` unless the control plane reaches Pods another way.
+Omitting `additional_ports` creates no extra rule, so existing spokes are
+unchanged.
 
 ## State and upgrades
 

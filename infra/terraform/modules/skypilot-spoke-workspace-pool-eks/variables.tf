@@ -228,14 +228,27 @@ variable "cluster_api_ingress_cidrs" {
 
 variable "serve_probe_ingress" {
   description = <<-EOT
-    Optional one-port ingress rule on a caller-owned node security group for a
-    SkyServe control-plane prober. The default creates no rule. The source CIDR
+    Optional ingress rules on a caller-owned node security group for the
+    SkyServe control plane. The default creates no rule. The source CIDR
     cannot be 0.0.0.0/0 unless allow_public_cidr is explicitly true.
+
+    `port` is the replica serving port the prober and load balancer reach.
+
+    `additional_ports` covers the rest of the control plane's Pod-IP traffic.
+    Provisioning a Kubernetes replica SSHes to its Pod IP, so a spoke whose
+    security group grants only the serving port accepts the probe but can
+    never finish a launch: the Pod runs, the container reports ready, and the
+    replica stays PROVISIONING until it is culled. Measured on a spoke built
+    from this module alone -- TCP/8080 answered while TCP/22 was dropped, and
+    every replica stalled. The sibling spoke worked only because an unrelated
+    legacy rule ("SSH access from admin subnets") happened to cover the same
+    control-plane CIDR, so the dependency was never represented here.
   EOT
   type = object({
     node_security_group_id = string
     control_plane_cidr     = string
     port                   = number
+    additional_ports       = optional(set(number), [])
     description            = optional(string, "SkyServe probe traffic from the control plane")
     allow_public_cidr      = optional(bool, false)
   })
@@ -259,6 +272,22 @@ variable "serve_probe_ingress" {
       var.serve_probe_ingress.port <= 65535
     )
     error_message = "serve_probe_ingress.port must be between 1 and 65535."
+  }
+
+  validation {
+    condition = var.serve_probe_ingress == null ? true : alltrue([
+      for p in var.serve_probe_ingress.additional_ports : p >= 1 && p <= 65535
+    ])
+    error_message = "serve_probe_ingress.additional_ports must be between 1 and 65535."
+  }
+
+  validation {
+    # A duplicate would make two rules claim the same port/CIDR pair on a
+    # caller-owned group; AWS rejects the second and the apply half-fails.
+    condition = var.serve_probe_ingress == null ? true : !contains(
+      var.serve_probe_ingress.additional_ports, var.serve_probe_ingress.port
+    )
+    error_message = "serve_probe_ingress.additional_ports must not repeat serve_probe_ingress.port."
   }
 
   validation {
