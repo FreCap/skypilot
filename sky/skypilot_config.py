@@ -207,7 +207,13 @@ def _get_loaded_config_path() -> list[str | None]:
 
 def _set_loaded_config_path(path: str | list[str | None] | None) -> None:
     if not path:
+        # Must return: falling through re-assigned json.dumps(None), i.e. the
+        # literal string 'null'. That is not "no path" to any consumer that
+        # only checks for None -- it round-trips through the request body and
+        # decodes back to None on the API server, where it is concatenated to
+        # a list. See override_skypilot_config.
         _get_config_context().config_path = None
+        return
     if isinstance(path, str):
         path = [path]
     _get_config_context().config_path = json.dumps(path)
@@ -1067,7 +1073,13 @@ def override_skypilot_config(
     if override_config_path_serialized is None:
         override_config_path = []
     else:
-        override_config_path = json.loads(override_config_path_serialized)
+        # `or []`: a serialized JSON null decodes to None, not to a list. Older
+        # clients (and any request body already in flight) can carry the string
+        # 'null' here, and concatenating that below raised
+        # "can only concatenate list (not NoneType) to list" -- inside the
+        # request executor's context manager, before the request log was even
+        # opened, so every affected launch failed with no diagnosable output.
+        override_config_path = json.loads(override_config_path_serialized) or []
 
     skipped_keys = config_utils.expand_nested_key_patterns(
         override_configs, constants.SKIPPED_CLIENT_OVERRIDE_KEYS)

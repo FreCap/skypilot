@@ -2088,3 +2088,90 @@ class TestRemoveQueueNameFromConfig:
                 ]:
                     assert current.get_nested(
                         keys, 'NOT_SET') is None, (f'Expected None at {keys}')
+
+
+class TestClearedConfigPathIsNotSerializedNull:
+    """Clearing the loaded config path must store None, never the string 'null'.
+
+    `_set_loaded_config_path(None)` fell through its own early branch and
+    re-assigned `json.dumps(None)`, i.e. the four characters 'null'. That value
+    is not None to any consumer, so it survived into a request body as
+    `override_skypilot_config_path` and decoded back to None on the API server,
+    where `override_skypilot_config` concatenated it to a list:
+
+        TypeError: can only concatenate list (not "NoneType") to list
+
+    It raised inside the request executor's context manager, before the
+    request log file was opened, so every affected `sky.launch` failed with an
+    empty log and no server-side frames in the client's traceback. Measured
+    live: 58 consecutive SkyServe replica launches lost this way, while the
+    reserved-fill broker kept granting the capacity they were meant to take.
+    """
+
+    def test_clearing_stores_none(self):
+        skypilot_config._set_loaded_config_path(None)
+        assert skypilot_config.loaded_config_path_serialized() is None
+
+    def test_clearing_never_stores_the_json_null_literal(self):
+        skypilot_config._set_loaded_config_path(None)
+        assert skypilot_config.loaded_config_path_serialized() != 'null'
+
+    @pytest.mark.parametrize('empty', [None, '', []])
+    def test_every_empty_path_clears_to_none(self, empty):
+        skypilot_config._set_loaded_config_path(['/some/real/path.yaml'])
+        skypilot_config._set_loaded_config_path(empty)
+        assert skypilot_config.loaded_config_path_serialized() is None
+
+    def test_a_real_path_still_round_trips(self):
+        skypilot_config._set_loaded_config_path('/a/config.yaml')
+        assert (skypilot_config._get_loaded_config_path() == ['/a/config.yaml'])
+        skypilot_config._set_loaded_config_path(['/a.yaml', '/b.yaml'])
+        assert (skypilot_config._get_loaded_config_path() == [
+            '/a.yaml', '/b.yaml'
+        ])
+
+    def test_replace_in_memory_leaves_no_null_literal(self):
+        """The serve controller clears the path through this helper."""
+        skypilot_config._set_loaded_config_path('/a/config.yaml')
+        observed = []
+        with skypilot_config.replace_skypilot_config_in_memory(
+                config_utils.Config.from_dict({'kubernetes': {}})):
+            observed.append(skypilot_config.loaded_config_path_serialized())
+        assert observed == [None]
+        assert (skypilot_config._get_loaded_config_path() == ['/a/config.yaml'])
+
+
+class TestOverrideAcceptsASerializedNullPath:
+    """The API server must survive a request body that carries 'null'.
+
+    Fixing the writer above stops new occurrences, but request bodies already
+    persisted (and clients on older builds) still carry the literal. Decoding
+    it yields None, and the previous code concatenated that directly.
+    """
+
+    def test_a_null_literal_path_does_not_raise(self, monkeypatch, tmp_path):
+        os.environ.pop(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, None)
+        config_path = tmp_path / 'config.yaml'
+        _create_config_file(config_path)
+        monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH', config_path)
+        skypilot_config.reload_config()
+        with skypilot_config.override_skypilot_config(
+            {'aws': {
+                'vpc_name': 'override-vpc'
+            }}, 'null'):
+            assert skypilot_config.get_nested(('aws', 'vpc_name'),
+                                              None) == 'override-vpc'
+
+    def test_a_real_serialized_path_is_still_appended(self, monkeypatch,
+                                                      tmp_path):
+        os.environ.pop(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, None)
+        config_path = tmp_path / 'config.yaml'
+        _create_config_file(config_path)
+        monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH', config_path)
+        skypilot_config.reload_config()
+        with skypilot_config.override_skypilot_config(
+            {'aws': {
+                'vpc_name': 'override-vpc'
+            }}, json.dumps(['/client/config.yaml'])):
+            assert ('/client/config.yaml'
+                    in skypilot_config._get_loaded_config_path())
