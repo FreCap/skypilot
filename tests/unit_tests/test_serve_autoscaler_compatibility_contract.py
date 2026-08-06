@@ -61,7 +61,10 @@ def test_historical_helper_identity_and_signatures():
              'configured_cards: list[str], final_target: int, '
              'allow_adopted_reassignment: bool = True, '
              'allow_unbacked_adopted_reassignment: bool = True, '
-             'old_version_supply: dict[str, int] | None = None) -> '
+             'allow_mixed_version_backed_reassignment: bool = False, '
+             'old_version_supply: dict[str, int] | None = None, '
+             'reassignment_target_by_accelerator: dict[str, int] | None = '
+             'None) -> '
              'dict[str, int]'),
     }
     for name in _HELPER_NAMES:
@@ -179,6 +182,62 @@ def test_revalidate_preserves_adopted_map_when_reassignment_is_disabled():
                       }
 
 
+def test_revalidate_requires_explicit_proof_to_move_old_backing():
+    revalidate = autoscalers._revalidate_actuation_target
+    common = {
+        'adopted_target': {
+            'A100': 3,
+        },
+        'desired_target': {
+            'L4': 3,
+        },
+        'nonretiring_supply': {},
+        'configured_cards': ['L4', 'A100'],
+        'final_target': 3,
+        'allow_adopted_reassignment': False,
+        'old_version_supply': {
+            'A100': 3,
+        },
+    }
+
+    assert revalidate(**common) == {'A100': 3}
+    assert revalidate(**common,
+                      allow_mixed_version_backed_reassignment=True) == {
+                          'L4': 3
+                      }
+
+
+def test_revalidate_bounds_movement_to_explicit_owned_subset():
+    revalidate = autoscalers._revalidate_actuation_target
+    assert revalidate(adopted_target={'A100': 3},
+                      desired_target={'L4': 3},
+                      nonretiring_supply={},
+                      configured_cards=['L4', 'A100'],
+                      final_target=3,
+                      allow_adopted_reassignment=False,
+                      allow_unbacked_adopted_reassignment=True,
+                      allow_mixed_version_backed_reassignment=True,
+                      old_version_supply={'A100': 1},
+                      reassignment_target_by_accelerator={'L4': 1}) == {
+                          'L4': 1,
+                          'A100': 2,
+                      }
+
+
+def test_revalidate_mixed_version_proof_keeps_exact_compatible_card():
+    revalidate = autoscalers._revalidate_actuation_target
+    assert revalidate(adopted_target={'L4': 40},
+                      desired_target={'L4': 40},
+                      nonretiring_supply={'A100': 40},
+                      configured_cards=['L4', 'A100'],
+                      final_target=40,
+                      allow_adopted_reassignment=False,
+                      allow_mixed_version_backed_reassignment=True,
+                      old_version_supply={'L4': 40}) == {
+                          'L4': 40
+                      }
+
+
 def test_revalidate_releases_capacity_gone_from_every_generation():
     """No latest-version supply AND no old-version supply means gone.
 
@@ -198,12 +257,40 @@ def test_revalidate_releases_capacity_gone_from_every_generation():
                       }
 
 
+def test_revalidate_without_old_version_provenance_fails_closed_mid_rollout():
+    """Unknown old-version supply cannot prove an adopted card vanished."""
+    revalidate = autoscalers._revalidate_actuation_target
+    assert revalidate(adopted_target={'L4': 1},
+                      desired_target={'A100': 1},
+                      nonretiring_supply={'A100': 1},
+                      configured_cards=['L4', 'A100'],
+                      final_target=1,
+                      allow_adopted_reassignment=False,
+                      old_version_supply=None) == {
+                          'L4': 1
+                      }
+
+
+def test_revalidate_complete_provenance_releases_only_vanished_capacity():
+    """An explicit map distinguishes backed and vanished adopted units."""
+    revalidate = autoscalers._revalidate_actuation_target
+    assert revalidate(adopted_target={'L4': 3},
+                      desired_target={'A100': 3},
+                      nonretiring_supply={'A100': 3},
+                      configured_cards=['L4', 'A100'],
+                      final_target=3,
+                      allow_adopted_reassignment=False,
+                      old_version_supply={'L4': 1}) == {
+                          'L4': 1,
+                          'A100': 2,
+                      }
+
+
 def test_revalidate_without_provenance_matches_the_old_behaviour():
     """Omitting old_version_supply must not change legacy callers.
 
-    The physical-path caller does not pass it; outside a rollout there are no
-    old-version rows anyway, and the pre-guard release is then subsumed by the
-    original release block, byte for byte.
+    The physical-path caller does not pass it. Outside a mixed-version rollout,
+    the original release block still handles unbacked capacity.
     """
     revalidate = autoscalers._revalidate_actuation_target
     assert revalidate(adopted_target={'L4': 1},

@@ -1,9 +1,9 @@
 # Reproductions
 
 Standalone, cluster-free reproductions for open issues. These are **not** part
-of the test suite and are not expected to pass on `improvements`: their job is
-to demonstrate a defect and to give whoever picks it up a harness that already
-encodes the scenarios.
+of the default test suite. Before a fix, they demonstrate the defect and encode
+the scenarios a solution must satisfy; after a fix, promoted regression cases
+remain here as executable incident documentation.
 
 Run one with the repo on the path:
 

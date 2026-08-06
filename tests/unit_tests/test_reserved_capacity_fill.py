@@ -2389,7 +2389,7 @@ class TestFillLaunchPath(unittest.TestCase):
             _FILL_KEY: True,
             _PROTOCOL_KEY: reserved_capacity_broker.PROTOCOL_V2,
         }
-        manager._launch_replica = mock.Mock(return_value=False)
+        manager._launch_replica = mock.Mock(return_value=None)
 
         self.assertFalse(manager._scale_up_one_locked(override, set()))
 

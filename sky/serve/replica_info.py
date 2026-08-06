@@ -753,7 +753,7 @@ class ReplicaInfo:
                 self, 'reserved_fill_physical_cluster_uid', None),
             'reserved_fill_kubernetes_context': getattr(
                 self, 'reserved_fill_kubernetes_context', None),
-            'is_zero_cost': bool(getattr(self, 'is_zero_cost', False)),
+            'is_zero_cost': self.is_zero_cost,
             'cost_rebalance_for_replica_id': getattr(
                 self, 'cost_rebalance_for_replica_id', None),
             'paid_capacity_pool_key': getattr(self, 'paid_capacity_pool_key',

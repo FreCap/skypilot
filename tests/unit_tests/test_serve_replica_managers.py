@@ -2477,16 +2477,27 @@ class TestLaunchCancellationWait:
         cancel.assert_not_called()
 
 
+def _accepted_launch_result(
+    replica_id,
+    planned_capacity=1,
+    funding=replica_managers._ReplicaLaunchFunding.PAID,
+):
+    return replica_managers._ReplicaLaunchResult(
+        replica_id=replica_id,
+        planned_capacity=planned_capacity,
+        funding=funding)
+
+
 def _record_launch(launched):
     """A _launch_replica side_effect that records the allocated replica id.
 
-    Returns True per the production contract ("launch enqueued"): the id
-    allocator only advances past an id whose launch was actually enqueued.
+    Returns the explicit production acceptance result: the id allocator only
+    advances past an id whose launch was actually enqueued.
     """
 
     def _side_effect(replica_id, _resources_override, **_kwargs):
         launched.append(replica_id)
-        return True
+        return _accepted_launch_result(replica_id)
 
     return _side_effect
 
@@ -2613,7 +2624,7 @@ class TestScaleUpDoesNotClobberLiveReplica:
 
         def _launch(*_args, **_kwargs):
             assert refreshed
-            return False
+            return None
 
         mgr._spot_placer.refresh_workspace_policy.side_effect = _refresh
         with mock.patch(
@@ -5611,7 +5622,7 @@ class TestScaleUpBatch:
             snapshots.append(
                 (existing_replica_infos, len(existing_replica_infos)))
             existing_replica_infos.append(_fake_replica_info(replica_id))
-            return True
+            return _accepted_launch_result(replica_id)
 
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
@@ -5818,7 +5829,7 @@ class TestScaleUpBatch:
             launched.append(replica_id)
             if replica_id == 2:
                 mgr.notify_version_pending(6)
-            return True
+            return _accepted_launch_result(replica_id)
 
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.'
@@ -6247,7 +6258,7 @@ class TestLogicalCapacityPlanning:
                              planned_capacity=width)
             existing.append(info)
             planned.append(width)
-            return True
+            return _accepted_launch_result(info.replica_id, width)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -6323,7 +6334,7 @@ class TestLogicalCapacityPlanning:
             existing.append(info)
             launched.append(info)
             seen_budgets.append(paid_location_launch_budget)
-            return True
+            return _accepted_launch_result(info.replica_id)
 
         with mock.patch.object(paid_capacity,
                                'central_authority_available',
@@ -6420,7 +6431,9 @@ class TestLogicalCapacityPlanning:
             info.status_property.is_scale_down = False
             info.get_spot_location.return_value = zero_a100
             existing.append(info)
-            return True
+            return _accepted_launch_result(
+                info.replica_id, 8,
+                replica_managers._ReplicaLaunchFunding.ZERO_COST)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -6485,7 +6498,9 @@ class TestLogicalCapacityPlanning:
             info.is_zero_cost = True
             existing.append(info)
             launched.append(info)
-            return True
+            return _accepted_launch_result(
+                info.replica_id,
+                funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -6538,7 +6553,7 @@ class TestLogicalCapacityPlanning:
             info.status_property.is_scale_down = False
             info.get_spot_location.return_value = None
             existing.append(info)
-            return True
+            return _accepted_launch_result(info.replica_id, width)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -6573,6 +6588,183 @@ class TestLogicalCapacityPlanning:
         }]
         assert priorities == [20, 50]
 
+    def test_logical_no_progress_does_not_buy_unfunded_retained_card(self):
+        mgr = _make_manager()
+        mgr.latest_version = 2
+        mgr._uses_logical_replicas = True
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=2,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(2, 7, 2, (('L4', 1), ('A100', 1)),
+                                   (('L4', 1), ('A100', 1)))
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        attempts = []
+
+        def _no_progress(resources_override, *_args, **kwargs):
+            attempts.append((next(iter(resources_override['accelerators'])),
+                             kwargs['paid_launch_allowed']))
+            return None
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_no_progress):
+            mgr.scale_up_to_logical_capacity(
+                target_capacity=2,
+                version=2,
+                reconcile_generation=7,
+                target_capacity_by_accelerator={
+                    'L4': 1,
+                    'A100': 1,
+                },
+                accelerator_shapes={
+                    'L4': 1,
+                    'A100': 1,
+                },
+                launch_priority_by_accelerator={
+                    'L4': 0,
+                    'A100': 0,
+                },
+                cold_launch_authority_by_accelerator={'L4': 1})
+
+        # The A100 target is retained only to replace old-version serving
+        # capacity.  The manager may still probe its exact zero-cost pool, but
+        # it must not buy A100 after the cheapest L4 placement makes no
+        # progress for the same flexible work.
+        assert attempts == [('L4', True), ('A100', False)]
+
+        attempts.clear()
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_no_progress):
+            mgr.scale_up_to_logical_capacity(
+                target_capacity=2,
+                version=2,
+                reconcile_generation=7,
+                target_capacity_by_accelerator={
+                    'L4': 1,
+                    'A100': 1,
+                },
+                accelerator_shapes={
+                    'L4': 1,
+                    'A100': 1,
+                },
+                launch_priority_by_accelerator={
+                    'L4': 0,
+                    'A100': 50,
+                },
+                cold_launch_authority_by_accelerator={
+                    'L4': 1,
+                    'A100': 1,
+                })
+
+        # A100-only or hard-floor work carries independent authority and must
+        # still be attempted after an unrelated L4 placement failure.
+        assert attempts == [('L4', True), ('A100', True)]
+
+    def test_logical_paid_authority_debits_only_paid_launch_results(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(1, 7, 3, (('L4', 3),), (('L4', 1),))
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+        fundings = iter([
+            replica_managers._ReplicaLaunchFunding.ZERO_COST,
+            replica_managers._ReplicaLaunchFunding.PAID,
+            replica_managers._ReplicaLaunchFunding.ZERO_COST,
+        ])
+        paid_permissions = []
+
+        def _accept(resources_override, _used_ids, existing, _budget, *,
+                    logical_reconcile_fence, paid_launch_allowed):
+            del logical_reconcile_fence
+            paid_permissions.append(paid_launch_allowed)
+            funding = next(fundings)
+            replica_id = len(existing) + 1
+            info = mock.Mock(replica_id=replica_id,
+                             is_terminal=False,
+                             is_ready=False,
+                             version=1,
+                             planned_capacity=1,
+                             resources_override=resources_override)
+            info.status_property.is_scale_down = False
+            info.get_spot_location.return_value = None
+            existing.append(info)
+            return _accepted_launch_result(replica_id, funding=funding)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_accept):
+            mgr.scale_up_to_logical_capacity(
+                target_capacity=3,
+                version=1,
+                reconcile_generation=7,
+                target_capacity_by_accelerator={'L4': 3},
+                accelerator_shapes={'L4': 1},
+                cold_launch_authority_by_accelerator={'L4': 1})
+
+        # The first accepted launch is zero-cost and consumes no paid
+        # authority. The second is paid and closes the paid path, while the
+        # third may still probe the exact zero-cost pool.
+        assert paid_permissions == [True, True, False]
+
+    @pytest.mark.parametrize('authority', [{
+        'A100': 1
+    }, {
+        'L4': True
+    }, {
+        'L4': -1
+    }, {
+        'L4': 2
+    }])
+    def test_malformed_logical_paid_authority_fails_closed(self, authority):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=7,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        mgr.publish_logical_target(1, 7, 1, (('L4', 1),), (('L4', 1),))
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), mock.patch.object(
+                                   mgr, '_scale_up_one_locked') as launch:
+            mgr.scale_up_to_logical_capacity(
+                target_capacity=1,
+                version=1,
+                reconcile_generation=7,
+                target_capacity_by_accelerator={'L4': 1},
+                accelerator_shapes={'L4': 1},
+                cold_launch_authority_by_accelerator=authority)
+
+        launch.assert_not_called()
+
     def test_logical_scale_up_keeps_full_fence_but_honors_launch_budget(self):
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
@@ -6603,7 +6795,7 @@ class TestLogicalCapacityPlanning:
             info.status_property.is_scale_down = False
             info.get_spot_location.return_value = None
             existing.append(info)
-            return True
+            return _accepted_launch_result(info.replica_id)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_grouped',
@@ -6658,8 +6850,7 @@ class TestLogicalCapacityPlanning:
         get_lock.assert_not_called()
         grouped.assert_not_called()
 
-    def test_logical_launch_budget_counts_appended_width_not_snapshot_drift(
-            self):
+    def test_logical_launch_budget_counts_result_width_not_snapshot_drift(self):
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
@@ -6711,7 +6902,7 @@ class TestLogicalCapacityPlanning:
             info.status_property.is_scale_down = False
             info.get_spot_location.return_value = None
             infos.append(info)
-            return True
+            return _accepted_launch_result(replica_id)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -6748,7 +6939,7 @@ class TestLogicalCapacityPlanning:
             card = next(iter(resources_override['accelerators']))
             attempted_cards.append(card)
             if card == 'L4':
-                return False
+                return None
             info = mock.Mock(replica_id=1,
                              is_terminal=False,
                              is_ready=False,
@@ -6758,7 +6949,7 @@ class TestLogicalCapacityPlanning:
             info.status_property.is_scale_down = False
             info.get_spot_location.return_value = None
             existing.append(info)
-            return True
+            return _accepted_launch_result(info.replica_id)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -6817,7 +7008,7 @@ class TestLogicalCapacityPlanning:
                     version=1,
                     status_property=types.SimpleNamespace(is_scale_down=False),
                     planned_capacity=8))
-            return True
+            return _accepted_launch_result(2, 8)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -7026,7 +7217,7 @@ class TestLogicalCapacityPlanning:
                     in_flight_by_replica_id={1: 0},
                     unknown_replica_ids=frozenset(),
                     received_at=replica_managers.time.monotonic()))
-            return True
+            return _accepted_launch_result(2, 8)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -11049,6 +11240,71 @@ class TestPaidLocationLaunchBudget:
             assert status == replica_managers.serve_state.ReplicaStatus.PENDING
         assert info.status == status
         return info
+
+    @pytest.mark.parametrize('is_zero_cost', [False, True])
+    def test_accepted_launch_reports_explicit_funding(self, is_zero_cost):
+        location = make_location(
+            'research' if is_zero_cost else 'us-east-1', {'L4': 4},
+            use_spot=not is_zero_cost,
+            cloud_name='Kubernetes' if is_zero_cost else 'AWS')
+        manager = self._manager({location: 0.0 if is_zero_cost else 1.0})
+        manager._next_replica_id = 7
+        manager._uses_logical_replicas = True
+        manager._default_planned_capacity = 4
+        manager._logical_exact_accelerator_shapes = {}
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        manager._persist_new_replica = mock.Mock()
+        existing = []
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'):
+            result = manager._scale_up_one_locked(
+                {'accelerators': {
+                    'L4': 4
+                }},
+                set(),
+                existing,
+                paid_launch_allowed=not is_zero_cost)
+
+        expected_funding = (replica_managers._ReplicaLaunchFunding.ZERO_COST
+                            if is_zero_cost else
+                            replica_managers._ReplicaLaunchFunding.PAID)
+        assert result == _accepted_launch_result(7, 4, expected_funding)
+        assert manager._next_replica_id == 8
+        assert len(existing) == 1
+        assert existing[0].is_zero_cost is is_zero_cost
+
+    def test_launch_without_paid_authority_rejects_paid_only_location(self):
+        paid = make_location('us-east-1', {'L4': 4}, cloud_name='AWS')
+        manager = self._manager({paid: 1.0})
+        manager._next_replica_id = 7
+        manager._uses_logical_replicas = True
+        manager._default_planned_capacity = 4
+        manager._logical_exact_accelerator_shapes = {}
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        manager._persist_new_replica = mock.Mock()
+        existing = []
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True):
+            result = manager._scale_up_one_locked({'accelerators': {
+                'L4': 4
+            }},
+                                                  set(),
+                                                  existing,
+                                                  paid_launch_allowed=False)
+
+        assert result is None
+        assert manager._next_replica_id == 7
+        assert not existing
+        manager._persist_new_replica.assert_not_called()
 
     def test_env_override_and_invalid_fallback(self, monkeypatch):
         paid_capacity._parse_positive_int.cache_clear()

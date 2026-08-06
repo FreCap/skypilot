@@ -918,8 +918,8 @@ class SkyServeController:
                     serve_constants.SYSTEM_RECOVERY_ROUTE_TOKEN_KEY:
                         route_marker.route_token,
                 })
-            is_zero_cost = getattr(info, 'is_zero_cost', None)
-            if isinstance(is_zero_cost, bool):
+            is_zero_cost = info.is_zero_cost
+            if type(is_zero_cost) is bool:
                 # Placement-cost provenance is independent from the launch
                 # reason: an ordinary demand launch may land on free reserved
                 # capacity and should receive the same economic tie-break.
@@ -2743,7 +2743,7 @@ class SkyServeController:
                 if isinstance(accelerators, dict) and accelerators:
                     accelerator = next(iter(accelerators))
             known_accelerator = accelerator != 'unknown'
-            is_zero_cost = bool(getattr(info, 'is_zero_cost', False))
+            is_zero_cost = info.is_zero_cost is True
             if callable(zero_cost_location_classifier):
                 classified = zero_cost_location_classifier(info)
                 # Loose mocks used by callers may synthesize arbitrary
@@ -4555,6 +4555,15 @@ class SkyServeController:
                                     'launch_priority_by_accelerator'] = dict(
                                         logical_target.
                                         launch_priority_by_accelerator)
+                            if (logical_target.
+                                    cold_launch_authority_by_accelerator
+                                    is not None):
+                                replacement_kwargs[
+                                    'cold_launch_authority_by_accelerator'] = (
+                                        dict(
+                                            logical_target.
+                                            cold_launch_authority_by_accelerator
+                                        ))
                             if logical_target.target_capacity_by_accelerator:
                                 replacement_kwargs[
                                     'target_capacity_by_accelerator'] = dict(

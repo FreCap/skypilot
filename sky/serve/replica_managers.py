@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 import contextlib
 import dataclasses
+import enum
 import functools
 from multiprocessing import pool as mp_pool
 import os
@@ -190,6 +191,22 @@ class _ZeroCostDemandBudget:
 
     remaining_by_pool: dict[tuple[str, str], int]
     measured_by_pool: dict[tuple[str, str], int | None]
+
+
+class _ReplicaLaunchFunding(enum.Enum):
+    """Funding provenance of one durably accepted replica launch."""
+
+    PAID = 'paid'
+    ZERO_COST = 'zero_cost'
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReplicaLaunchResult:
+    """Immutable accounting facts emitted by the launch persistence seam."""
+
+    replica_id: int
+    planned_capacity: int
+    funding: _ReplicaLaunchFunding
 
 
 class _ReplicaLaunchThread(thread_utils.SafeThread):
@@ -2121,6 +2138,7 @@ class ReplicaManager:
         launch_budget: int | None = None,
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
         launch_priority_by_accelerator: dict[str, int] | None = None,
+        cold_launch_authority_by_accelerator: dict[str, int] | None = None,
     ) -> None:
         """Persist complete backend shapes until target capacity is covered."""
         raise NotImplementedError
@@ -4122,8 +4140,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'resources_override': replica_info.resources_override,
                     'existing_replica_infos': all_replica_infos,
                     'recovering_existing_replica': True,
-                    'prior_is_zero_cost': bool(
-                        getattr(replica_info, 'is_zero_cost', False)),
+                    'prior_is_zero_cost': replica_info.is_zero_cost,
                     'prior_planned_capacity': prior_planned_capacity,
                     'prior_unknown_capacity_replacement': bool(
                         getattr(replica_info, 'unknown_capacity_replacement',
@@ -4416,6 +4433,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         prior_yaml_content: str | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
         paid_location_launch_budget: paid_capacity.LaunchBudget | None = None,
+        paid_launch_allowed: bool = True,
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
         recovering_existing_replica: bool = False,
         logical_reconcile_fence: LogicalTargetState | None = None,
@@ -4423,12 +4441,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
                                    None) = None,
         try_provider_phase_admission: bool = False,
-    ) -> bool:
+    ) -> _ReplicaLaunchResult | None:
         """Enqueue one replica launch.
 
-        Returns whether a launch was actually enqueued: a zero-cost-only
-        fill launch is skipped when no zero-cost location is ACTIVE, and
-        the skip must leak nothing -- no replica row, no launch thread.
+        Returns immutable accounting facts after a launch is durably accepted,
+        or None when no launch is accepted. A zero-cost-only fill launch is
+        skipped when no zero-cost location is ACTIVE, and the skip must leak
+        nothing -- no replica row, no launch thread.
 
         prior_is_zero_cost: placement-cost provenance of a recovery row. The
         recovered exact pin remains on the same capacity, so preserve it even
@@ -4467,6 +4486,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         placement. Recovery bypasses new admission; fresh cost-rebalance
         replacements bypass selection but still require exact-pool admission.
 
+        paid_launch_allowed: fail-closed acquisition fence for a demand-owned
+        exact-card target. False still permits an ACTIVE zero-cost placement,
+        but it must never fall through to a paid location and does not relabel
+        the resulting demand row as reserved fill.
+
         launch_priority: highest queued demand priority represented by this
         fresh launch. It gates new global claims only and never preempts an
         existing launch.
@@ -4482,7 +4506,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.info(
                 'Refusing to enqueue replica %s because the '
                 'controller update requires supervised recovery.', replica_id)
-            return False
+            return None
         protocol_v2_fill = _is_protocol_v2_fill_override(resources_override)
         if try_provider_phase_admission and (
                 not protocol_v2_fill or provider_phase_admission is not None):
@@ -4498,7 +4522,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if replica_id in legacy_runtime.launch_thread_pool:
             logger.warning(f'Launch thread for replica {replica_id} '
                            'already exists. Skipping.')
-            return False
+            return None
         # [boltz fork] Reserved-capacity fill scale-ups carry a sentinel
         # override key restricting the launch to zero-cost locations (plus,
         # under the broker, the grant epoch the decision was emitted
@@ -4545,7 +4569,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if raw_allowed_locations is not None:
                 if not isinstance(raw_allowed_locations, list):
                     self._log_fill_skip('malformed pool location fence')
-                    return False
+                    return None
                 fill_allowed_location_keys = raw_allowed_locations
             zero_cost_only = True
         if (resources_override is not None and
@@ -4595,14 +4619,20 @@ class SkyPilotReplicaManager(ReplicaManager):
             # only durable identity needed for cleanup.
             recovered_location = spot_placer.Location.from_resources_override(
                 resources_override)
-        if zero_cost_only and self._spot_placer is None:
+        if (zero_cost_only or
+                not paid_launch_allowed) and self._spot_placer is None:
             # Defensive: fill decisions are only emitted while the capacity
-            # poller runs, which requires a placer. Without one there is no
-            # way to guarantee zero-cost placement -- skip rather than risk
-            # a paid launch.
-            self._log_fill_skip('no spot placer available to pin a '
-                                'zero-cost-only fill launch')
-            return False
+            # poller runs, and an authority-limited demand launch also needs a
+            # placer to prove that its selected location is free. Without one
+            # there is no way to guarantee zero-cost placement -- skip rather
+            # than risk a paid launch.
+            if zero_cost_only:
+                self._log_fill_skip('no spot placer available to pin a '
+                                    'zero-cost-only fill launch')
+            else:
+                logger.info('Deferring demand launch without paid authority: '
+                            'no placer can prove a zero-cost location.')
+            return None
         # A fill launch must reach the placer even though zero-cost k8s
         # entries are use_spot=False (the _should_use_spot gate above keys
         # on the task/override spot-ness, which says nothing about fill).
@@ -4612,7 +4642,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                'placer is available.')
                 self._clean_up_skipped_cost_rebalance_redrive(
                     replica_id, prior_cost_rebalance_for_replica_id)
-                return False
+                return None
             pinned_location = spot_placer.Location.from_resources_override(
                 resources_override)
             if pinned_location is None:
@@ -4620,7 +4650,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                'location could not be reconstructed.')
                 self._clean_up_skipped_cost_rebalance_redrive(
                     replica_id, prior_cost_rebalance_for_replica_id)
-                return False
+                return None
             location = self._spot_placer.resolve_location(pinned_location)
             if (location is None or
                     not self._spot_placer.is_active_location(location)):
@@ -4628,7 +4658,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{pinned_location} is no longer active.')
                 self._clean_up_skipped_cost_rebalance_redrive(
                     replica_id, prior_cost_rebalance_for_replica_id)
-                return False
+                return None
             if not recovering_existing_replica:
                 if existing_replica_infos is None:
                     existing_replica_infos = serve_state.get_replica_infos(
@@ -4659,13 +4689,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'paid admission is closed at {location}.')
                         self._clean_up_skipped_cost_rebalance_redrive(
                             replica_id, prior_cost_rebalance_for_replica_id)
-                        return False
+                        return None
                     debit_paid_location_launch_budget = True
                 self._spot_placer.reserve_retry(location)
             resources_override = location.to_dict()
             use_spot = location.use_spot
             retry_until_up = False
-        elif (self._spot_placer is not None and (use_spot or zero_cost_only) and
+        elif (self._spot_placer is not None and
+              (use_spot or zero_cost_only or not paid_launch_allowed) and
               recovered_location is None):
             # For spot placer, we don't retry until up so any launch failed
             # due to availability issue will be handled by the placer.
@@ -4694,10 +4725,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     ]
                 except (AssertionError, KeyError, TypeError, ValueError):
                     self._log_fill_skip('malformed pool location fence')
-                    return False
+                    return None
                 if len(carried_locations) != len(fill_allowed_location_keys):
                     self._log_fill_skip('malformed pool location fence')
-                    return False
+                    return None
                 active = set(self._spot_placer.active_locations())
                 pool_allowed = {
                     candidate for candidate in active if any(
@@ -4719,7 +4750,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'no pool location matches the carried exact '
                         f'accelerator shape '
                         f'{resources_override["accelerators"]!r}')
-                    return False
+                    return None
+                if not paid_launch_allowed:
+                    logger.info(
+                        'Deferring demand launch without paid authority: no '
+                        'ACTIVE zero-cost location matches exact accelerator '
+                        f'override {resources_override["accelerators"]!r}.')
+                    return None
                 raise ValueError(
                     'No active placement location matches exact accelerator '
                     f'override {resources_override["accelerators"]!r}.')
@@ -4744,7 +4781,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'Deferring demand launch because every active '
                             'location belongs to a saturated reserved-fill '
                             'pool.')
-                        return False
+                        return None
             if zero_cost_only:
                 if fill_protocol_version is not None:
                     if (isinstance(fill_protocol_version, bool) or
@@ -4752,7 +4789,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             fill_protocol_version not in (1, 2)):
                         self._log_fill_skip('invalid reserved-fill protocol '
                                             'version')
-                        return False
+                        return None
                     if (not isinstance(fill_pool_key, str) or
                             not fill_pool_key or
                             isinstance(fill_grant_epoch, bool) or
@@ -4760,7 +4797,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             fill_grant_epoch < 1):
                         self._log_fill_skip('incomplete broker epoch/pool '
                                             'fence')
-                        return False
+                        return None
                 if fill_protocol_version == 2:
                     resource_scope = getattr(self, '_resource_scope', None)
                     service_hash = getattr(self, '_service_hash', None)
@@ -4770,7 +4807,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._log_fill_skip(
                             'protocol-v2 fill requires a durable service '
                             'incarnation scope')
-                        return False
+                        return None
                     if (isinstance(fill_service_generation, bool) or
                             not isinstance(fill_service_generation, int) or
                             fill_service_generation < 1 or
@@ -4779,7 +4816,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             fill_allowed_location_keys is None):
                         self._log_fill_skip('incomplete protocol-v2 pool '
                                             'fence')
-                        return False
+                        return None
                     assert isinstance(fill_pool_key, str)
                     try:
                         fill_pool_identity = (
@@ -4787,20 +4824,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 fill_pool_key))
                     except (TypeError, ValueError):
                         self._log_fill_skip('malformed protocol-v2 pool key')
-                        return False
+                        return None
                     if (fill_pool_identity.protocol_version != 2 or
                             fill_pool_identity.physical_cluster_uid
                             != fill_physical_cluster_uid):
                         self._log_fill_skip('protocol-v2 pool identity does '
                                             'not match its physical UID')
-                        return False
+                        return None
                     raw_exact_shape = resources_override.get('accelerators')
                     if raw_exact_shape is not None:
                         if (not isinstance(raw_exact_shape, dict) or
                                 len(raw_exact_shape) != 1):
                             self._log_fill_skip('malformed protocol-v2 exact '
                                                 'accelerator shape')
-                            return False
+                            return None
                         raw_card, raw_count = next(iter(
                             raw_exact_shape.items()))
                         if (not isinstance(raw_card, str) or not raw_card or
@@ -4810,7 +4847,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 not in fill_pool_identity.gpu_names):
                             self._log_fill_skip('protocol-v2 exact accelerator '
                                                 'shape is outside its pool')
-                            return False
+                            return None
                         fill_exact_accelerator_shape = (raw_card.casefold(),
                                                         raw_count)
                 # Broker epoch fence: a fill decision computed from a
@@ -4844,7 +4881,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._log_fill_skip(
                             f'grant epoch {fill_grant_epoch} superseded '
                             f'(current {broker_epoch})')
-                        return False
+                        return None
                 # The no-spill guarantee: a fill launch either lands on a
                 # zero-cost ACTIVE location or does not happen at all --
                 # checked BEFORE any replica row is persisted, so an
@@ -4856,7 +4893,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if zero_cost_location is None:
                     self._log_fill_skip(
                         'no ACTIVE zero-cost location available')
-                    return False
+                    return None
                 location = zero_cost_location
                 if fill_protocol_version == 2:
                     assert fill_pool_identity is not None
@@ -4871,7 +4908,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._log_fill_skip('selected pool location has no '
                                             'exact Kubernetes accelerator '
                                             'shape')
-                        return False
+                        return None
                     selected_card, selected_count = next(
                         iter(selected_shape.items()))
                     selected_capacity = _whole_gpu_capacity(selected_shape)
@@ -4883,7 +4920,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._log_fill_skip('selected pool location has no '
                                             'matching Kubernetes accelerator '
                                             'identity')
-                        return False
+                        return None
                     if fill_exact_accelerator_shape is not None:
                         if ((str(selected_card).casefold(), selected_count)
                                 != fill_exact_accelerator_shape):
@@ -4891,10 +4928,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                             self._log_fill_skip(
                                 'selected pool location changed the carried '
                                 'exact accelerator shape')
-                            return False
+                            return None
                     fill_launch_context = kube_context
                     fill_launch_accelerator_shape = (selected_card.casefold(),
                                                      selected_capacity)
+            elif not paid_launch_allowed:
+                if zero_cost_demand_budget is not None:
+                    location = self._select_budgeted_zero_cost_location(
+                        zero_cost_demand_budget, allowed_locations)
+                else:
+                    location = self._spot_placer.select_next_zero_cost_location(
+                        allowed_locations=allowed_locations)
+                if location is None:
+                    logger.info(
+                        'Deferring demand launch without paid authority: no '
+                        'ACTIVE budgeted zero-cost location is available.')
+                    return None
             else:
                 if paid_location_launch_budget is None:
                     paid_location_launch_budget = (
@@ -4928,7 +4977,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         logger.info(
                             'Deferring demand launch because every active paid '
                             'location is awaiting launch feedback.')
-                        return False
+                        return None
                     if (zero_cost_demand_budget is not None and location
                             in self._spot_placer.zero_cost_locations()):
                         budgeted_location = (
@@ -4939,7 +4988,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 'Deferring demand launch because the shared '
                                 'zero-cost GPU budget is exhausted and no '
                                 'paid location is active.')
-                            return False
+                            return None
                         location = budgeted_location
                 elif zero_cost_demand_budget is not None:
                     location = self._select_budgeted_zero_cost_location(
@@ -4954,7 +5003,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             logger.info(
                                 'Deferring demand launch because every active '
                                 'paid location is awaiting launch feedback.')
-                            return False
+                            return None
                         if location in self._spot_placer.zero_cost_locations():
                             # A successful zero (or an exhausted speculative
                             # allowance) is authoritative. If no paid candidate
@@ -4964,7 +5013,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 'Deferring demand launch because the shared '
                                 'zero-cost GPU budget is exhausted and no '
                                 'paid location is active.')
-                            return False
+                            return None
                 elif self._demand_should_skip_saturated_zero_cost(
                         existing_replica_infos):
                     location = paid_capacity.select_location(
@@ -4979,7 +5028,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if location is None:
                 logger.info('Deferring demand launch because every active paid '
                             'location is awaiting launch feedback.')
-                return False
+                return None
             debit_paid_location_launch_budget = (
                 paid_location_launch_budget is not None and
                 location in paid_location_launch_budget.remaining_by_location)
@@ -4994,7 +5043,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._release_unstarted_location_retry(location)
                     self._log_fill_skip('persisted pool location changed the '
                                         'carried exact accelerator shape')
-                    return False
+                    return None
             if fill_protocol_version == 2:
                 assert isinstance(fill_pool_key, str)
                 assert isinstance(fill_service_generation, int)
@@ -5018,7 +5067,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._log_fill_skip(
                         'selected protocol-v2 pool pin failed its pre-launch '
                         f'guard: {guard_reason}')
-                    return False
+                    return None
             # The location dictates the actual spot-ness of THIS launch
             # (a zero-cost reserved location is non-spot even though the
             # task as a whole is spot-managed).
@@ -5056,7 +5105,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         logical_reconcile_fence_requires_exact_generation)):
                 logger.info('Logical launch selection was superseded before '
                             'row persistence; dropping the unpersisted pin.')
-                return False
+                return None
         # When the spot placer owns failover (use_spot + placer above sets
         # retry_until_up=False), the launch is pinned to ONE location, so a
         # capacity failure there must propagate immediately for the placer to
@@ -5099,7 +5148,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._log_fill_skip(
                     'protocol-v2 fill requires a durable service-owner '
                     'launch fence')
-                return False
+                return None
             fill_card, fill_count = fill_launch_accelerator_shape
             launch_fence = dict(launch_fence)
             launch_fence.update(
@@ -5257,6 +5306,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             if isinstance(candidates, (list, tuple, set, frozenset)):
                 is_zero_cost = location in candidates
         info.is_zero_cost = is_zero_cost
+        launch_result = _ReplicaLaunchResult(
+            replica_id=replica_id,
+            planned_capacity=planned_capacity,
+            funding=(_ReplicaLaunchFunding.ZERO_COST
+                     if is_zero_cost else _ReplicaLaunchFunding.PAID))
         info.cost_rebalance_for_replica_id = (cost_rebalance_for_replica_id)
         info.paid_capacity_pool_key = prior_paid_capacity_pool_key
 
@@ -5362,7 +5416,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         'final row-persistence fence.')
                                     self._release_unstarted_location_retry(
                                         location)
-                                    return False
+                                    return None
                                 if not reserved_capacity_broker.persist_fill_replica(
                                         self._service_name,
                                         replica_id,
@@ -5383,12 +5437,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         f'grant epoch {fill_grant_epoch} '
                                         'superseded or round in flight at '
                                         'persist')
-                                    return False
+                                    return None
                             legacy_runtime.launch_thread_pool[
                                 replica_id] = launch_thread
                             if existing_replica_infos is not None:
                                 existing_replica_infos.append(info)
-                    return True
+                    return launch_result
             except (exceptions.ProviderPhaseBusyError,
                     exceptions.KubernetesPhysicalClusterFenceBusyError
                    ) as error:
@@ -5408,7 +5462,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._log_fill_skip(
                     'selected protocol-v2 pool physical identity could not be '
                     f'proved: {common_utils.format_exception(error)}')
-                return False
+                return None
 
         logical_state_guard = (self._logical_state_lock
                                if logical_reconcile_fence is not None else
@@ -5421,7 +5475,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             logical_reconcile_fence_requires_exact_generation)):
                     logger.info('Logical launch was superseded at its final '
                                 'row-persistence fence.')
-                    return False
+                    return None
             if (zero_cost_only and fill_grant_epoch is not None and
                     fill_pool_key is not None):
                 # Broker epoch fence, authoritative leg: the pre-check above
@@ -5450,7 +5504,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._log_fill_skip(
                         f'grant epoch {fill_grant_epoch} superseded or round '
                         'in flight at persist')
-                    return False
+                    return None
             else:
                 if debit_paid_location_launch_budget:
                     assert location is not None
@@ -5481,27 +5535,27 @@ class SkyPilotReplicaManager(ReplicaManager):
                             paid_location_launch_budget, location)
                         logger.info('Deferring paid demand launch at '
                                     f'{location}: {claim_result.value}.')
-                        return False
+                        return None
                     if claim_result == paid_capacity.ClaimResult.SATURATED:
                         paid_capacity.exhaust(paid_location_launch_budget,
                                               location)
                         logger.info('Deferring paid demand launch at '
                                     f'{location}: {claim_result.value}.')
-                        return False
+                        return None
                     if (claim_result ==
                             paid_capacity.ClaimResult.SERVICE_SATURATED):
                         paid_capacity.exhaust_service(
                             paid_location_launch_budget)
                         logger.info('Deferring paid demand launch because the '
                                     'service paid-capacity envelope is full.')
-                        return False
+                        return None
                     if (claim_result ==
                             paid_capacity.ClaimResult.HIGHER_PRIORITY_WAITING):
                         paid_capacity.defer_for_priority(
                             paid_location_launch_budget, location)
                         logger.info('Deferring paid demand launch at '
                                     f'{location}: {claim_result.value}.')
-                        return False
+                        return None
                     if claim_result == paid_capacity.ClaimResult.OWNERSHIP_LOST:
                         raise RuntimeError(
                             f'Service {self._service_name!r} controller '
@@ -5559,7 +5613,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # Don't start right now; we will start it later in _refresh_thread_pool
         # to avoid too many sky.launch running at the same time.
         legacy_runtime.launch_thread_pool[replica_id] = t
-        return True
+        return launch_result
 
     def _demand_should_skip_zero_cost(
             self, existing_replica_infos: list['ReplicaInfo'] | None) -> bool:
@@ -5919,9 +5973,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         logical_reconcile_fence_requires_exact_generation: bool = False,
         unknown_capacity_replacement: bool = False,
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
+        paid_launch_allowed: bool = True,
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
                                    None) = None,
-    ) -> bool:
+    ) -> _ReplicaLaunchResult | None:
         """Allocate an id and enqueue one replica launch. Lock must be held.
 
         `used_replica_ids` is the set of ids with a durable replica row,
@@ -5948,14 +6003,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             direct_launch_kwargs: dict[str, Any] = {}
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 direct_launch_kwargs['launch_priority'] = launch_priority
+            if not paid_launch_allowed:
+                direct_launch_kwargs['paid_launch_allowed'] = False
             if provider_phase_admission is not None:
                 direct_launch_kwargs['provider_phase_admission'] = (
                     provider_phase_admission)
             elif _is_protocol_v2_fill_override(resources_override):
                 direct_launch_kwargs['try_provider_phase_admission'] = True
-            launched = self._launch_replica(self._next_replica_id,
-                                            resources_override,
-                                            **direct_launch_kwargs)
+            launch_result = self._launch_replica(self._next_replica_id,
+                                                 resources_override,
+                                                 **direct_launch_kwargs)
         else:
             launch_kwargs: dict[str, Any] = {
                 'existing_replica_infos': existing_replica_infos
@@ -5976,16 +6033,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                 launch_kwargs['prior_unknown_capacity_replacement'] = True
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 launch_kwargs['launch_priority'] = launch_priority
+            if not paid_launch_allowed:
+                launch_kwargs['paid_launch_allowed'] = False
             if provider_phase_admission is not None:
                 launch_kwargs['provider_phase_admission'] = (
                     provider_phase_admission)
             elif _is_protocol_v2_fill_override(resources_override):
                 launch_kwargs['try_provider_phase_admission'] = True
-            launched = self._launch_replica(self._next_replica_id,
-                                            resources_override, **launch_kwargs)
-        if launched:
+            launch_result = self._launch_replica(self._next_replica_id,
+                                                 resources_override,
+                                                 **launch_kwargs)
+        if launch_result is not None:
+            assert launch_result.replica_id == self._next_replica_id
             self._next_replica_id += 1
-        return launched
+        return launch_result
 
     def scale_up(self,
                  resources_override: dict[str, Any] | None = None) -> None:
@@ -6172,11 +6233,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if paid_location_launch_budget is not None else None)
             override_before = (None if resources_override is None else
                                dict(resources_override))
-            launched = self._scale_up_one_locked(resources_override,
-                                                 used_replica_ids,
-                                                 existing_replica_infos,
-                                                 zero_cost_demand_budget,
-                                                 **scale_up_kwargs)
+            launch_result = self._scale_up_one_locked(resources_override,
+                                                      used_replica_ids,
+                                                      existing_replica_infos,
+                                                      zero_cost_demand_budget,
+                                                      **scale_up_kwargs)
             if paid_location_launch_budget is None:
                 continue
             paid_selection_stopped = (paid_location_launch_budget.stop_sequence
@@ -6185,7 +6246,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                  service_remaining_before > 0 and
                                  paid_location_launch_budget.service_remaining
                                  == 0)
-            if ((not launched and paid_selection_stopped) or service_exhausted):
+            if ((launch_result is None and paid_selection_stopped) or
+                    service_exhausted):
                 # Only suppress later equivalent fresh-paid decisions. A
                 # complete pass must still examine different accelerator
                 # cards plus reserved-fill and pinned-rebalance overrides.
@@ -6203,6 +6265,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_budget: int | None = None,
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
         launch_priority_by_accelerator: dict[str, int] | None = None,
+        cold_launch_authority_by_accelerator: dict[str, int] | None = None,
     ) -> None:
         """Plan and persist complete backend shapes up to a logical target.
 
@@ -6262,6 +6325,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         if launch_priority_by_accelerator:
             launch_kwargs['launch_priority_by_accelerator'] = dict(
                 launch_priority_by_accelerator)
+        if cold_launch_authority_by_accelerator is not None:
+            launch_kwargs['cold_launch_authority_by_accelerator'] = dict(
+                cold_launch_authority_by_accelerator)
         if not self._uses_shared_zero_cost_demand_budget():
             if target_capacity_by_accelerator is None:
                 self._scale_up_to_logical_capacity_locked(
@@ -6303,6 +6369,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         launch_budget: int | None = None,
         launch_priority: int = (serve_constants.LB_REQUEST_PRIORITY_MIN),
         launch_priority_by_accelerator: dict[str, int] | None = None,
+        cold_launch_authority_by_accelerator: dict[str, int] | None = None,
     ) -> None:
         """Persist complete shapes while the global demand lock is held."""
 
@@ -6336,6 +6403,21 @@ class SkyPilotReplicaManager(ReplicaManager):
             canonical_by_name = {card.casefold(): card for card in card_targets}
         else:
             canonical_by_name = {}
+        paid_authority_left: dict[str, int] | None = None
+        if cold_launch_authority_by_accelerator is not None:
+            if any(card not in card_targets or isinstance(raw_count, bool) or
+                   not isinstance(raw_count, int) or raw_count < 0 or
+                   raw_count > card_targets.get(card, 0) for card, raw_count in
+                   cold_launch_authority_by_accelerator.items()):
+                logger.warning(
+                    'Discarding malformed logical paid cold-launch authority: '
+                    f'target={card_targets}, authority='
+                    f'{cold_launch_authority_by_accelerator}.')
+                return
+            paid_authority_left = {
+                card: int(cold_launch_authority_by_accelerator.get(card, 0))
+                for card in card_targets
+            }
 
         def _replica_card(info: ReplicaInfo) -> str | None:
             accelerators = None
@@ -6433,19 +6515,30 @@ class SkyPilotReplicaManager(ReplicaManager):
                 existing_replica_infos, [None],
                 demand_count_override=required_capacity,
                 capacity_replica_infos=capacity_replica_infos)
-        paid_location_launch_budget = (paid_capacity.build_launch_budget(
-            self._spot_placer,
-            workspace=getattr(self, '_workspace',
-                              constants.SKYPILOT_DEFAULT_WORKSPACE),
-            existing_replica_infos=existing_replica_infos,
-            globally_managed=(getattr(self, '_service_hash', None) is not None),
-            service_name=self._service_name,
-            service_hash=getattr(self, '_service_hash', None),
-            requested_frontier_keys=(None if not card_targets else {
-                (str(card).casefold(),)
-                for card, target in card_targets.items()
-                if committed_by_card.get(card, 0) < target
-            })) if self._spot_placer is not None else None)
+        paid_cards = {
+            card for card, target in card_targets.items()
+            if committed_by_card.get(card, 0) < target and
+            (paid_authority_left is None or paid_authority_left.get(card, 0) > 0
+            )
+        }
+        should_build_paid_budget = (self._spot_placer is not None and
+                                    (not card_targets or
+                                     paid_authority_left is None or paid_cards))
+        paid_location_launch_budget = None
+        if should_build_paid_budget:
+            assert self._spot_placer is not None
+            paid_location_launch_budget = paid_capacity.build_launch_budget(
+                self._spot_placer,
+                workspace=getattr(self, '_workspace',
+                                  constants.SKYPILOT_DEFAULT_WORKSPACE),
+                existing_replica_infos=existing_replica_infos,
+                globally_managed=(getattr(self, '_service_hash', None)
+                                  is not None),
+                service_name=self._service_name,
+                service_hash=getattr(self, '_service_hash', None),
+                requested_frontier_keys=(None if not card_targets else {
+                    (str(card).casefold(),) for card in paid_cards
+                }))
         deferred_cards: set[str] = set()
         launched_capacity = 0
         while True:
@@ -6483,17 +6576,24 @@ class SkyPilotReplicaManager(ReplicaManager):
                         selected_card: shapes[selected_card]
                     }
                 }
-            if self._paid_service_envelope_blocks_launch(
-                    paid_location_launch_budget, resources_override):
+            paid_launch_allowed = (paid_authority_left is None or
+                                   selected_card is None or
+                                   paid_authority_left.get(selected_card,
+                                                           0) > 0)
+            if (paid_launch_allowed and
+                    self._paid_service_envelope_blocks_launch(
+                        paid_location_launch_budget, resources_override)):
                 if selected_card is not None:
                     deferred_cards.add(selected_card)
                     continue
                 break
-            before = len(existing_replica_infos)
             launch_kwargs: dict[str, Any] = {}
-            if paid_location_launch_budget is not None:
+            if (paid_launch_allowed and
+                    paid_location_launch_budget is not None):
                 launch_kwargs['paid_location_launch_budget'] = (
                     paid_location_launch_budget)
+            if paid_authority_left is not None:
+                launch_kwargs['paid_launch_allowed'] = paid_launch_allowed
             selected_launch_priority = launch_priority
             if (selected_card is not None and
                     launch_priority_by_accelerator is not None):
@@ -6510,7 +6610,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 launch_kwargs['unknown_capacity_replacement'] = True
                 launch_kwargs[
                     'logical_reconcile_fence_requires_exact_generation'] = True
-            launched = self._scale_up_one_locked(
+            launch_result = self._scale_up_one_locked(
                 resources_override,
                 used_replica_ids,
                 existing_replica_infos,
@@ -6523,7 +6623,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                          (version, reconcile_generation,
                                           target_capacity)),
                 **launch_kwargs)
-            if not launched or len(existing_replica_infos) == before:
+            if launch_result is None:
                 if selected_card is not None:
                     deferred_cards.add(selected_card)
                     logger.info('Deferring logical exact-card target '
@@ -6534,9 +6634,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.info('Logical scale-up made no placement progress; '
                             'retrying on the next reconciliation tick.')
                 break
-            launched_capacity += sum(
-                max(1, int(getattr(info, 'planned_capacity', 1)))
-                for info in existing_replica_infos[before:])
+            launched_capacity += launch_result.planned_capacity
+            if (paid_authority_left is not None and
+                    selected_card is not None and
+                    launch_result.funding is _ReplicaLaunchFunding.PAID):
+                paid_authority_left[selected_card] = max(
+                    0,
+                    paid_authority_left.get(selected_card, 0) -
+                    launch_result.planned_capacity)
 
     def notify_version_pending(self, version: int) -> None:
         with self._logical_state_lock:
@@ -9031,8 +9136,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 created_at = getattr(info, 'created_at', None)
                 if not isinstance(created_at, (int, float)):
                     created_at = float('-inf')
-                return (not bool(getattr(info, 'is_zero_cost', False)),
-                        float(created_at), info.replica_id)
+                return (info.is_zero_cost
+                        is not True, float(created_at), info.replica_id)
 
             for info in sorted(card_candidates, key=_candidate_key):
                 planned = int(getattr(info, 'planned_capacity', 1))

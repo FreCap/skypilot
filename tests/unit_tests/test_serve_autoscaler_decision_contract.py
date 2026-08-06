@@ -38,11 +38,27 @@ def test_autoscaler_decision_validation_and_repr():
         'target_capacity=11, target_capacity_by_accelerator=(), '
         'accelerator_shapes=(), replace_unknown_replica_ids=(), '
         'launch_budget=None, launch_priority=0, '
-        'launch_priority_by_accelerator=()), reason=None)')
+        'launch_priority_by_accelerator=(), '
+        'cold_launch_authority_by_accelerator=None), reason=None)')
 
     with pytest.raises(AssertionError):
         autoscalers.AutoscalerDecision(
             autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, target)
+
+
+def test_logical_paid_launch_authority_distinguishes_legacy_and_empty():
+    legacy = autoscalers.LogicalScaleTarget(version=3,
+                                            reconcile_generation=7,
+                                            target_capacity=11)
+    explicit_empty = autoscalers.LogicalScaleTarget(
+        version=3,
+        reconcile_generation=7,
+        target_capacity=11,
+        cold_launch_authority_by_accelerator=())
+
+    assert legacy.cold_launch_authority_by_accelerator is None
+    assert explicit_empty.cold_launch_authority_by_accelerator == ()
+    assert pickle.loads(pickle.dumps(explicit_empty)) == explicit_empty
 
 
 def test_fill_demand_sample_contract():

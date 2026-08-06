@@ -264,6 +264,9 @@ class _FakeReplicaInfo:
         self.last_provider_config = None
         self.planned_capacity = 1
         self.logical_bridge_capacity_verified = False
+        # Most routing tests exercise the protocol's legacy/unknown omission
+        # shape. Tests for persisted provenance override this with a bool.
+        self.is_zero_cost = None
         self.system_recovery_disposition = (
             system_recovery_state.SystemRecoveryDisposition.ORDINARY)
 
@@ -3384,6 +3387,55 @@ class TestAutoscalerRuntimeSnapshot:
         )
         ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
             0)
+
+    def test_logical_scale_up_forwards_explicit_paid_authority(self):
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock()
+        decision_autoscaler.latest_version = 2
+        decision_autoscaler.get_decision_interval.return_value = 0
+        logical_target = autoscalers.LogicalScaleTarget(
+            version=2,
+            reconcile_generation=7,
+            target_capacity=66,
+            target_capacity_by_accelerator=(('L4', 18), ('A100-80GB', 2),
+                                            ('H200', 46)),
+            accelerator_shapes=(('L4', 1), ('A100-80GB', 1), ('H200', 1)),
+            cold_launch_authority_by_accelerator=(('L4', 14),))
+        decision_autoscaler.generate_scaling_decisions.return_value = [
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_UP, logical_target)
+        ]
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1, 2]}):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_called_once_with(  # pylint: disable=line-too-long
+            66,
+            2,
+            7,
+            launch_priority=constants.LB_REQUEST_PRIORITY_MIN,
+            cold_launch_authority_by_accelerator={'L4': 14},
+            target_capacity_by_accelerator={
+                'L4': 18,
+                'A100-80GB': 2,
+                'H200': 46,
+            },
+            accelerator_shapes={
+                'L4': 1,
+                'A100-80GB': 1,
+                'H200': 1,
+            })
 
     def test_logical_scale_down_waves_are_batched_without_reordering(self):
         ctrl = _make_controller()
