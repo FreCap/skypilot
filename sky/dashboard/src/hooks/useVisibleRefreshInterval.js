@@ -63,6 +63,7 @@ export function useVisibleRefreshInterval(
           try {
             void onRefreshRef.current('interval');
           } finally {
+            // Keep the visible cadence armed even if the callback throws.
             scheduleNextRefresh(resumedDueAt);
           }
         },
@@ -91,6 +92,7 @@ export function useVisibleRefreshInterval(
             ? nextCadenceTickAfter(now)
             : nextCadenceTickAfter(now + intervalMs - 1);
       } finally {
+        // A synchronous visibility refresh failure must not drop the next tick.
         scheduleNextRefresh(resumedDueAt);
       }
     };
