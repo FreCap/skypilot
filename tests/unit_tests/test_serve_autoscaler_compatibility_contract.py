@@ -60,7 +60,8 @@ def test_historical_helper_identity_and_signatures():
              'dict[str, int], nonretiring_supply: dict[str, int], '
              'configured_cards: list[str], final_target: int, '
              'allow_adopted_reassignment: bool = True, '
-             'allow_unbacked_adopted_reassignment: bool = True) -> '
+             'allow_unbacked_adopted_reassignment: bool = True, '
+             'old_version_supply: dict[str, int] | None = None) -> '
              'dict[str, int]'),
     }
     for name in _HELPER_NAMES:
@@ -158,14 +159,59 @@ def test_revalidate_rejects_inconsistent_desired_total():
 
 
 def test_revalidate_preserves_adopted_map_when_reassignment_is_disabled():
+    """A card old-version rows still serve is mid-replacement, not gone.
+
+    This is the invariant the pre-provenance version of this test pinned by
+    accident: it passed no old-version supply, so it also froze cards whose
+    capacity had genuinely vanished, which turned a preemption during a
+    rolling update into paid same-card launch authority (#1301). The
+    protected scenario is stated explicitly now.
+    """
     revalidate = autoscalers._revalidate_actuation_target
     assert revalidate(adopted_target={'L4': 1},
                       desired_target={'A100': 1},
                       nonretiring_supply={'A100': 1},
                       configured_cards=['L4', 'A100'],
                       final_target=1,
-                      allow_adopted_reassignment=False) == {
+                      allow_adopted_reassignment=False,
+                      old_version_supply={'L4': 1}) == {
                           'L4': 1
+                      }
+
+
+def test_revalidate_releases_capacity_gone_from_every_generation():
+    """No latest-version supply AND no old-version supply means gone.
+
+    Preserving the card here is what bought paid A100 at roughly 6.8x while
+    the same card-agnostic requests accept L4 (#1301). The unit follows the
+    fresh placement instead, even mid-rollout.
+    """
+    revalidate = autoscalers._revalidate_actuation_target
+    assert revalidate(adopted_target={'L4': 1},
+                      desired_target={'A100': 1},
+                      nonretiring_supply={'A100': 1},
+                      configured_cards=['L4', 'A100'],
+                      final_target=1,
+                      allow_adopted_reassignment=False,
+                      old_version_supply={}) == {
+                          'A100': 1
+                      }
+
+
+def test_revalidate_without_provenance_matches_the_old_behaviour():
+    """Omitting old_version_supply must not change legacy callers.
+
+    The physical-path caller does not pass it; outside a rollout there are no
+    old-version rows anyway, and the pre-guard release is then subsumed by the
+    original release block, byte for byte.
+    """
+    revalidate = autoscalers._revalidate_actuation_target
+    assert revalidate(adopted_target={'L4': 1},
+                      desired_target={'A100': 1},
+                      nonretiring_supply={'A100': 1},
+                      configured_cards=['L4', 'A100'],
+                      final_target=1) == {
+                          'A100': 1
                       }
 
 

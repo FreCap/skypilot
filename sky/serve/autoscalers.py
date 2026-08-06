@@ -6494,9 +6494,15 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         cards = self._configured_cards_from_profiles()
         canonical_by_name = {card.casefold(): card for card in cards}
         nonretiring_supply = {card: 0 for card in cards}
+        # Old-version rows are provenance for the reconciler: they cannot
+        # authorize a launch, but a card they still serve is mid-replacement
+        # rather than gone, and must not be released as vanished capacity
+        # while the rollout drains. Preempted and scale-down rows are excluded
+        # on both versions for the same reason they are excluded from latest
+        # supply: they must not preserve, let alone replace, their card.
+        old_version_supply = {card: 0 for card in cards}
         for info in replica_infos:
-            if (info.is_terminal or info.version != self.latest_version or
-                    _replica_is_retiring_card_supply(info)):
+            if info.is_terminal or _replica_is_retiring_card_supply(info):
                 continue
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = canonical_by_name.get(raw_card.casefold())
@@ -6504,7 +6510,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 continue
             width = (max(1, int(self._replica_capacity(info)))
                      if self.replica_unit == 'logical' else 1)
-            nonretiring_supply[card] += width
+            if info.version == self.latest_version:
+                nonretiring_supply[card] += width
+            else:
+                old_version_supply[card] += width
         # Broker-reported free slots are opportunities, not materialized
         # supply. Treating them as backing here can move flexible L4 demand
         # onto A100 during a rollout. If the research slot then disappears,
@@ -6522,7 +6531,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 not info.is_terminal and info.version != self.latest_version
                 for info in replica_infos),
             allow_unbacked_adopted_reassignment=(self._raw_target_num_replicas
-                                                 >= self.target_num_replicas))
+                                                 >= self.target_num_replicas),
+            old_version_supply=old_version_supply)
         if not target and final_target > 0:
             self._logical_card_transition_pending = False
             return {}, False
