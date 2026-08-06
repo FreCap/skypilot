@@ -1330,7 +1330,7 @@ def adopt_existing_claims(
         if (getattr(info.status, 'value',
                     info.status) not in _UNRESOLVED_STATUS_VALUES or
                 getattr(info, 'reserved_fill', False) or
-                getattr(info, 'is_zero_cost', False) or getattr(
+                info.is_zero_cost is True or getattr(
                     info, 'cost_rebalance_for_replica_id', None) is not None):
             continue
         existing_key = getattr(info, 'paid_capacity_pool_key', None)

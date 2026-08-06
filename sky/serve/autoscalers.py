@@ -117,6 +117,26 @@ class _PoolFillState:
                                            self.free_slots_by_accelerator)))
 
 
+@dataclasses.dataclass(frozen=True)
+class _CompatibilityTargetResult:
+    """Explicit provenance for one exact-card compatibility allocation.
+
+    ``card_attribution_complete`` means every fixed replica row could be
+    mapped to a configured physical card. ``explicit_target_by_accelerator``
+    is the subset backed by explicit compatibility evidence, an exact-card
+    floor, or fixed exact-card work; it bounds cross-card rollout movement.
+    ``paid_target_by_accelerator`` is the independently allocated subset that
+    may acquire paid capacity. It also includes ordinary aggregate minimums
+    and headerless queued/rejected demand, but excludes inferred in-flight
+    overflow and generic overprovision padding.
+    """
+
+    target_by_accelerator: dict[str, int]
+    explicit_target_by_accelerator: dict[str, int]
+    paid_target_by_accelerator: dict[str, int]
+    card_attribution_complete: bool
+
+
 def _work_to_slots(work: float, capacity: float) -> int:
     """Whole slots needed for `work`, ignoring sub-epsilon float remainders."""
     if capacity <= 0:
@@ -2452,7 +2472,7 @@ class Autoscaler:
             return None
         if (self.reserved_capacity_fill and
             (getattr(incumbent, 'reserved_fill', False) or
-             getattr(incumbent, 'is_zero_cost', False))):
+             incumbent.is_zero_cost is True)):
             # The reserved-fill controller exclusively owns convergence to
             # free capacity. Generic rebalance handles paid-to-paid movement.
             return None
@@ -3928,7 +3948,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 continue
             if info.is_ready:
                 ready[card] += 1
-                if bool(getattr(info, 'is_zero_cost', False)):
+                if info.is_zero_cost is True:
                     ready_zero_cost[card] += 1
             else:
                 # Every nonterminal non-ready row is committed future
@@ -4718,6 +4738,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._logical_card_transition_pending: bool = False
         self._logical_actuation_target_by_accelerator: dict[str, int] = {}
         self._logical_actuation_desired_by_accelerator: dict[str, int] = {}
+        # Explicit compatibility/floor ownership carried with the adopted
+        # demand map. A later empty history can retry that exact owned card,
+        # while synthesized aggregate padding remains distinguishable.
+        self._logical_adopted_explicit_target_by_accelerator: dict[str,
+                                                                   int] = {}
+        # Paid-launch ownership is distinct from compatibility proof. An
+        # aggregate minimum or headerless queued request may buy the cheapest
+        # compatible card without proving that old-version work can move to
+        # it during a rollout.
+        self._logical_adopted_paid_target_by_accelerator: dict[str, int] = {}
+        # Absolute paid capacity ceiling for the current actuation map. It is
+        # derived from the separately allocated/adopted ownership map; during
+        # rollout it also includes live same-card old-version backing. The
+        # decision generator subtracts latest committed supply to obtain the
+        # incremental launch authority.
+        self._logical_paid_launch_target_by_accelerator: dict[str, int] = {}
         if (self.replica_unit == 'logical' and
                 self.max_scale_up_rate_percentage is not None):
             # A cold logical service must enter through the configured slot
@@ -4760,6 +4796,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._logical_card_transition_pending = False
             self._logical_actuation_target_by_accelerator = {}
             self._logical_actuation_desired_by_accelerator = {}
+            self._logical_adopted_explicit_target_by_accelerator = {}
+            self._logical_adopted_paid_target_by_accelerator = {}
+            self._logical_paid_launch_target_by_accelerator = {}
             self._compatibility_demand_complete = False
         if not self.configured_accelerator_shapes:
             self.target_num_replicas_by_accelerator = {}
@@ -4772,6 +4811,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._logical_card_transition_pending = False
             self._logical_actuation_target_by_accelerator = {}
             self._logical_actuation_desired_by_accelerator = {}
+            self._logical_adopted_explicit_target_by_accelerator = {}
+            self._logical_adopted_paid_target_by_accelerator = {}
+            self._logical_paid_launch_target_by_accelerator = {}
             self._compatibility_demand_complete = False
             return
         floors = {
@@ -4789,6 +4831,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         while sum(canonical_target.values()) < self.target_num_replicas:
             canonical_target[first] = canonical_target.get(first, 0) + 1
         self.target_num_replicas_by_accelerator = canonical_target
+        self._logical_adopted_explicit_target_by_accelerator = {
+            card: min(canonical_target.get(card, 0),
+                      max(0, int(floors.get(card.casefold(), 0))))
+            for card in canonical_target
+            if floors.get(card.casefold(), 0) > 0
+        }
+        self._logical_adopted_paid_target_by_accelerator = dict(
+            canonical_target)
 
     def set_free_reserved_slots_by_accelerator(self, slots: dict[str,
                                                                  int]) -> None:
@@ -6208,12 +6258,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         use_existing_supply: bool = False,
         pin_running_work: bool = False,
         use_free_reserved: bool = True,
-    ) -> tuple[dict[str, int], bool]:
+    ) -> _CompatibilityTargetResult:
         """Allocate the concurrency target in physical or logical units."""
         configured_cards = self._configured_cards_from_profiles()
         if not configured_cards:
             self.warm_retention_target_by_accelerator = {}
-            return {}, False
+            return _CompatibilityTargetResult({}, {}, {}, False)
         if self.replica_unit == 'logical':
             capacity_per_card = {
                 card: self._effective_logical_capacity_per_gpu()
@@ -6237,11 +6287,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             card = canonical_by_name.get(raw_card.casefold())
             if card is None:
                 continue
-            width = (max(1, int(self._replica_capacity(info)))
+            width = (max(0, self._committed_capacity(info))
                      if self.replica_unit == 'logical' else 1)
+            if width == 0:
+                continue
             if info.is_ready:
                 ready[card] += width
-                if bool(getattr(info, 'is_zero_cost', False)):
+                if info.is_zero_cost is True:
                     ready_zero_cost[card] += width
             else:
                 provisioning[card] += width
@@ -6250,23 +6302,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                      tuple(profile['compatible_accelerators']),
                      float(profile['count']))
                     for profile in self.queued_compatibility_profiles]
+        explicit_profiles = list(profiles)
+        paid_profiles = list(profiles)
         queue_profile_total = sum(work for _, _, work in profiles)
         default_compatible = tuple(configured_cards)
         if self._queue_depth > queue_profile_total:
-            profiles.append(
-                (constants.LB_REQUEST_PRIORITY_MIN, default_compatible,
-                 self._queue_depth - queue_profile_total))
+            default_queue_profile = (constants.LB_REQUEST_PRIORITY_MIN,
+                                     default_compatible,
+                                     self._queue_depth - queue_profile_total)
+            profiles.append(default_queue_profile)
+            paid_profiles.append(default_queue_profile)
         rejected_profiles = self._rejected_compatibility_work()
         profiles.extend(rejected_profiles)
+        explicit_profiles.extend(rejected_profiles)
+        paid_profiles.extend(rejected_profiles)
         rejected_profile_total = sum(work for _, _, work in rejected_profiles)
         rejected_total = self._rejected_work()
         if rejected_total > rejected_profile_total:
-            profiles.append(
-                (constants.LB_REQUEST_PRIORITY_MIN, default_compatible,
-                 rejected_total - rejected_profile_total))
+            default_rejected_profile = (constants.LB_REQUEST_PRIORITY_MIN,
+                                        default_compatible,
+                                        rejected_total - rejected_profile_total)
+            profiles.append(default_rejected_profile)
+            paid_profiles.append(default_rejected_profile)
         retention_fixed, flexible_fixed_overflow, attribution_complete = (
             self._fixed_concurrency_work_by_accelerator(replica_infos))
         allocation_fixed = retention_fixed
+        explicit_fixed = retention_fixed
         if (self.replica_unit == 'logical' and
                 self._compatibility_demand_complete and not pin_running_work):
             # Running work is physically non-preemptive but does not make its
@@ -6275,10 +6336,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # current in-flight population. When that history has aged out,
             # the protocol default remains all configured cards; warm
             # retention and the supply-aware actuation pass still keep the
-            # actual serving cards until their work drains.
+            # actual serving cards until their work drains. The allocation
+            # result marks that fallback as insufficient proof for a
+            # mixed-version cross-card replacement.
             fixed_work = (sum(retention_fixed.values()) +
                           flexible_fixed_overflow)
             allocation_fixed = {}
+            explicit_fixed = {}
             evidence = [(int(profile['priority']),
                          tuple(profile['compatible_accelerators']),
                          float(profile['count']))
@@ -6287,8 +6351,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             evidence_total = sum(work for _, _, work in evidence)
             if fixed_work > 0 and evidence_total > 0:
                 scale = fixed_work / evidence_total
-                profiles.extend((priority, compatible, work * scale)
-                                for priority, compatible, work in evidence)
+                scaled_evidence = [(priority, compatible, work * scale)
+                                   for priority, compatible, work in evidence]
+                profiles.extend(scaled_evidence)
+                explicit_profiles.extend(scaled_evidence)
+                paid_profiles.extend(scaled_evidence)
             elif fixed_work > 0:
                 profiles.append((constants.LB_REQUEST_PRIORITY_MIN,
                                  default_compatible, fixed_work))
@@ -6298,9 +6365,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if self.replica_unit == 'logical' and self._fresh_for_tick():
             allocator_attributed_work = (sum(allocation_fixed.values()) +
                                          sum(work for _, _, work in profiles))
-            profiles.extend(
-                self._arrival_compatibility_work(self._arrival_work(),
-                                                 allocator_attributed_work))
+            arrival_work = self._arrival_work()
+            arrival_profiles = self._arrival_compatibility_work(
+                arrival_work, allocator_attributed_work)
+            profiles.extend(arrival_profiles)
+            explicit_profiles.extend(arrival_profiles)
+            paid_profiles.extend(arrival_profiles)
         floors = {
             card.casefold(): int(floor)
             for card, floor in self.min_replicas_by_accelerator.items()
@@ -6314,22 +6384,48 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             }
         ceiling = (self.max_replicas if target_ceiling is None else min(
             self.max_replicas, target_ceiling))
-        target = _allocate_compatibility_target(
-            configured_cards=configured_cards,
-            capacities=capacity_per_card,
-            floors=floors,
-            min_replicas=min(
+        cold_order = self._cold_paid_card_order(configured_cards)
+
+        def allocate(
+            minimum: int,
+            demand_profiles: list[tuple[int, tuple[str, ...], float]],
+            fixed_work_by_accelerator: dict[str, float],
+        ) -> dict[str, int]:
+            return _allocate_compatibility_target(
+                configured_cards=configured_cards,
+                capacities=capacity_per_card,
+                floors=floors,
+                min_replicas=minimum,
+                max_replicas=ceiling,
+                demand_profiles=demand_profiles,
+                fixed_work_by_accelerator=fixed_work_by_accelerator,
+                ready_zero_cost=ready_zero_cost,
+                ready=ready,
+                provisioning=provisioning,
+                free_reserved=free_reserved,
+                cold_order=cold_order,
+                use_existing_supply=use_existing_supply)
+
+        target = allocate(
+            min(
                 self.min_replicas if min_replicas_override is None else
-                min_replicas_override, ceiling),
-            max_replicas=ceiling,
-            demand_profiles=profiles,
-            fixed_work_by_accelerator=allocation_fixed,
-            ready_zero_cost=ready_zero_cost,
-            ready=ready,
-            provisioning=provisioning,
-            free_reserved=free_reserved,
-            cold_order=self._cold_paid_card_order(configured_cards),
-            use_existing_supply=use_existing_supply)
+                min_replicas_override, ceiling), profiles, allocation_fixed)
+        raw_explicit_target = allocate(0, explicit_profiles, explicit_fixed)
+        raw_paid_target = allocate(min(self.min_replicas, ceiling),
+                                   paid_profiles, {})
+        # Unproven aggregate work can change a flexible profile's marginal
+        # placement under a hard ceiling. Intersect exact cards rather than
+        # transferring ownership to a different card by inference.
+        explicit_target = {
+            card: min(count, target.get(card, 0))
+            for card, count in raw_explicit_target.items()
+            if count > 0 and target.get(card, 0) > 0
+        }
+        paid_target = {
+            card: min(count, target.get(card, 0))
+            for card, count in raw_paid_target.items()
+            if count > 0 and target.get(card, 0) > 0
+        }
         if attribution_complete:
             self.warm_retention_target_by_accelerator = {
                 card: _work_to_slots(work, capacity_per_card[card])
@@ -6338,7 +6434,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             }
         else:
             self.warm_retention_target_by_accelerator = {}
-        return target, attribution_complete
+        return _CompatibilityTargetResult(target, explicit_target, paid_target,
+                                          attribution_complete)
 
     def _logical_committed_capacity_by_accelerator(
         self,
@@ -6480,18 +6577,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 sum(demand_target.values()) != self.target_num_replicas):
             self.warm_retention_target_by_accelerator = {}
             self.cold_launch_authority_by_accelerator = {}
+            self._logical_paid_launch_target_by_accelerator = {}
             self._logical_card_transition_pending = False
             return {}, False
         final_target = self.get_final_target_num_replicas()
-        desired_target, attribution_complete = (
-            self._calculate_concurrency_target_by_accelerator(
-                replica_infos,
-                target_ceiling=final_target,
-                min_replicas_override=final_target,
-                use_existing_supply=True,
-                pin_running_work=False,
-                use_free_reserved=False))
         cards = self._configured_cards_from_profiles()
+        allocation = self._calculate_concurrency_target_by_accelerator(
+            replica_infos,
+            target_ceiling=final_target,
+            min_replicas_override=final_target,
+            use_existing_supply=True,
+            pin_running_work=False,
+            use_free_reserved=False)
+        desired_target = allocation.target_by_accelerator
+        explicit_target = allocation.explicit_target_by_accelerator
+        paid_target = allocation.paid_target_by_accelerator
+        attribution_complete = allocation.card_attribution_complete
+        if (not attribution_complete or
+                sum(desired_target.values()) != final_target):
+            self._logical_paid_launch_target_by_accelerator = {}
+            self._logical_card_transition_pending = False
+            return {}, False
+        fresh_complete_attribution = (self._fresh_for_tick() and
+                                      self._compatibility_demand_complete and
+                                      attribution_complete and
+                                      sum(desired_target.values())
+                                      == final_target)
         canonical_by_name = {card.casefold(): card for card in cards}
         nonretiring_supply = {card: 0 for card in cards}
         # Old-version rows are provenance for the reconciler: they cannot
@@ -6501,6 +6612,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # on both versions for the same reason they are excluded from latest
         # supply: they must not preserve, let alone replace, their card.
         old_version_supply = {card: 0 for card in cards}
+        has_active_old_version = any(
+            not info.is_terminal and info.version != self.latest_version
+            for info in replica_infos)
         for info in replica_infos:
             if info.is_terminal or _replica_is_retiring_card_supply(info):
                 continue
@@ -6508,8 +6622,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             card = canonical_by_name.get(raw_card.casefold())
             if card is None:
                 continue
-            width = (max(1, int(self._replica_capacity(info)))
+            width = (max(0, self._committed_capacity(info))
                      if self.replica_unit == 'logical' else 1)
+            if width == 0:
+                continue
             if info.version == self.latest_version:
                 nonretiring_supply[card] += width
             else:
@@ -6521,21 +6637,113 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # fill owns those opportunities independently and carries the
         # zero-cost-only launch fence; demand actuation may reuse the card only
         # after a latest-version replica row materializes it.
+        downscale_hold = (self._raw_target_num_replicas
+                          < self.target_num_replicas)
+        if self.replica_unit != 'logical':
+            # Physical-backend scaling retains the legacy actuation contract:
+            # its exact-card target is itself the launch decision, so there is
+            # no separate paid-ownership channel to reconcile here.
+            target = _revalidate_actuation_target(
+                adopted_target=demand_target,
+                desired_target=desired_target,
+                nonretiring_supply=nonretiring_supply,
+                configured_cards=cards,
+                final_target=final_target,
+                allow_adopted_reassignment=not has_active_old_version,
+                allow_unbacked_adopted_reassignment=not downscale_hold,
+                old_version_supply=old_version_supply)
+            return target, (attribution_complete and
+                            sum(target.values()) == final_target)
+        # Rollout movement requires explicit compatibility evidence. In the
+        # latest-only case, paid-owned headerless/minimum demand can also move
+        # to its freshly allocated card. Inferred in-flight overflow and
+        # generic overprovision padding remain reconciliation-only.
+        allow_mixed_version_backed_reassignment = (has_active_old_version and
+                                                   not downscale_hold and
+                                                   fresh_complete_attribution
+                                                   and bool(explicit_target))
+        if fresh_complete_attribution and not downscale_hold:
+            reassignment_target = (explicit_target
+                                   if has_active_old_version else paid_target)
+        else:
+            reassignment_target = {}
         target = _revalidate_actuation_target(
             adopted_target=demand_target,
             desired_target=desired_target,
             nonretiring_supply=nonretiring_supply,
             configured_cards=cards,
             final_target=final_target,
-            allow_adopted_reassignment=not any(
-                not info.is_terminal and info.version != self.latest_version
-                for info in replica_infos),
-            allow_unbacked_adopted_reassignment=(self._raw_target_num_replicas
-                                                 >= self.target_num_replicas),
-            old_version_supply=old_version_supply)
+            allow_adopted_reassignment=(not has_active_old_version and
+                                        fresh_complete_attribution and
+                                        not downscale_hold),
+            allow_unbacked_adopted_reassignment=(fresh_complete_attribution and
+                                                 not downscale_hold),
+            allow_mixed_version_backed_reassignment=(
+                allow_mixed_version_backed_reassignment),
+            old_version_supply=old_version_supply,
+            reassignment_target_by_accelerator=reassignment_target)
         if not target and final_target > 0:
+            self._logical_paid_launch_target_by_accelerator = {}
             self._logical_card_transition_pending = False
             return {}, False
+        # Stale reports may preserve a prior exact-card reconciliation fence,
+        # but never authorize paid acquisition.  A downscale hold keeps its
+        # adopted exact-card retry contract; otherwise the fresh supply-aware
+        # placement is the sole economic authority for a new backend.
+        if not fresh_complete_attribution:
+            paid_launch_target: dict[str, int] = {}
+        else:
+            current_ownership = (explicit_target
+                                 if has_active_old_version else paid_target)
+            adopted_ownership = (
+                self._logical_adopted_explicit_target_by_accelerator
+                if has_active_old_version else
+                self._logical_adopted_paid_target_by_accelerator)
+            # Ownership is adopted with the aggregate target and survives a
+            # transiently empty histogram until a later target adoption
+            # replaces it. Current evidence may add ownership immediately;
+            # neither source can exceed the retained exact-card demand map.
+            paid_ownership = {
+                card: min(
+                    int(target.get(card, 0)),
+                    max(
+                        int(current_ownership.get(card, 0)),
+                        min(int(adopted_ownership.get(card, 0)),
+                            int(demand_target.get(card, 0)))))
+                for card in cards
+                if target.get(card, 0) > 0 and (current_ownership.get(
+                    card, 0) > 0 or adopted_ownership.get(card, 0) > 0)
+            }
+            # Paid ownership is separate from compatibility ownership. A
+            # latest-only minimum or headerless queue can buy its allocator-
+            # selected card; a mixed-version rollout requires explicit proof.
+            # Vanished adopted units and inferred in-flight/overprovision
+            # padding own no paid placement.
+            paid_launch_target = {
+                card: count
+                for card, count in paid_ownership.items()
+                if count > 0
+            }
+            if has_active_old_version:
+                for card in cards:
+                    # This is an absolute latest-version ceiling. The decision
+                    # generator subtracts latest committed supply later,
+                    # leaving exactly the live old-version backing as
+                    # same-card retry authority. Using old supply as an
+                    # incremental ceiling would stall a partially completed
+                    # rollout (latest=1, old=1, target=2) at zero authority.
+                    same_card_ceiling = min(
+                        int(target.get(card,
+                                       0)), int(demand_target.get(card, 0)),
+                        int(nonretiring_supply.get(card, 0)) +
+                        int(old_version_supply.get(card, 0)))
+                    if same_card_ceiling > paid_launch_target.get(card, 0):
+                        paid_launch_target[card] = same_card_ceiling
+        self._logical_paid_launch_target_by_accelerator = {
+            card: max(0, int(paid_launch_target.get(card, 0)))
+            for card in cards
+            if paid_launch_target.get(card, 0) > 0
+        }
         wave_budget = self._logical_actuation_wave_budget
         if wave_budget is not None:
             if self._logical_actuation_wave_started:
@@ -6554,6 +6762,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                                      replica_infos,
                                                      wave_budget))
         if not limited_target and final_target > 0:
+            self._logical_paid_launch_target_by_accelerator = {}
             self._logical_card_transition_pending = False
             return {}, False
         self._logical_actuation_target_by_accelerator = dict(limited_target)
@@ -6670,18 +6879,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 if best_capacity > 0:
                     raw_target_num += math.ceil(remaining / best_capacity)
 
+        candidate_allocation: _CompatibilityTargetResult | None = None
         candidate_target_by_accelerator: dict[str, int] | None = None
         if self._compatibility_demand_complete:
-            candidate, attribution_complete = (
+            candidate_allocation = (
                 self._calculate_concurrency_target_by_accelerator(replica_infos)
             )
-            if attribution_complete:
-                candidate_target_by_accelerator = candidate
+            if candidate_allocation.card_attribution_complete:
+                candidate_target_by_accelerator = (
+                    candidate_allocation.target_by_accelerator)
                 # Compatibility constraints can require a different physical
                 # packing than the aggregate best-capacity estimate. The
                 # aggregate offered-arrival floor remains independently
                 # authoritative when compatibility evidence is unavailable.
-                raw_target_num = max(raw_target_num, sum(candidate.values()))
+                raw_target_num = max(
+                    raw_target_num,
+                    sum(candidate_allocation.target_by_accelerator.values()))
 
         target_num_replicas = self._clip_concurrency_demand_target(
             raw_target_num)
@@ -6712,6 +6925,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         old_target_num_replicas = self.target_num_replicas
         old_target_by_accelerator = dict(
             self.target_num_replicas_by_accelerator)
+        old_explicit_target_by_accelerator = dict(
+            self._logical_adopted_explicit_target_by_accelerator)
+        old_paid_target_by_accelerator = dict(
+            self._logical_adopted_paid_target_by_accelerator)
         if (self.replica_unit == 'logical' and candidate_covers_raw_target and
                 sum(old_target_by_accelerator.values())
                 != old_target_num_replicas):
@@ -6721,15 +6938,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # aggregate through the fresh compatibility allocator. Committed
             # A100 supply belongs to the separate actuation map and must not
             # become A100 demand merely because it survived the restart.
-            recovered_map, recovered_complete = (
+            recovered_allocation = (
                 self._calculate_concurrency_target_by_accelerator(
                     replica_infos,
                     target_ceiling=old_target_num_replicas,
                     min_replicas_override=old_target_num_replicas))
-            if (recovered_complete and
+            recovered_map = recovered_allocation.target_by_accelerator
+            if (recovered_allocation.card_attribution_complete and
                     sum(recovered_map.values()) == old_target_num_replicas):
                 self.target_num_replicas_by_accelerator = recovered_map
+                self._logical_adopted_explicit_target_by_accelerator = {
+                    card: min(count, recovered_map.get(card, 0))
+                    for card, count in
+                    recovered_allocation.explicit_target_by_accelerator.items()
+                    if count > 0 and recovered_map.get(card, 0) > 0
+                }
+                self._logical_adopted_paid_target_by_accelerator = {
+                    card: min(count, recovered_map.get(card, 0))
+                    for card, count in
+                    recovered_allocation.paid_target_by_accelerator.items()
+                    if count > 0 and recovered_map.get(card, 0) > 0
+                }
                 old_target_by_accelerator = dict(recovered_map)
+                old_explicit_target_by_accelerator = dict(
+                    self._logical_adopted_explicit_target_by_accelerator)
+                old_paid_target_by_accelerator = dict(
+                    self._logical_adopted_paid_target_by_accelerator)
         target_map_changed = (candidate_target_by_accelerator is not None and
                               candidate_target_by_accelerator
                               != old_target_by_accelerator)
@@ -6824,11 +7058,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if ((apply_target or apply_card_transition) and
                 candidate_covers_raw_target):
             if (self._raw_target_num_replicas < self.target_num_replicas):
-                fresh_map, attribution_complete = (
+                fresh_allocation = (
                     self._calculate_concurrency_target_by_accelerator(
                         replica_infos,
                         target_ceiling=self._raw_target_num_replicas,
                         min_replicas_override=self._raw_target_num_replicas))
+                fresh_map = fresh_allocation.target_by_accelerator
                 adopted_map = _merge_fresh_target_into_downscale_hold(
                     adopted_target=old_target_by_accelerator,
                     fresh_target=fresh_map,
@@ -6837,14 +7072,52 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         self._configured_cards_from_profiles()),
                     target_total=self.target_num_replicas)
             else:
-                adopted_map, attribution_complete = (
+                adopted_allocation = (
                     self._calculate_concurrency_target_by_accelerator(
                         replica_infos,
                         target_ceiling=self.target_num_replicas,
                         min_replicas_override=self.target_num_replicas))
-            if (attribution_complete and
+                adopted_map = adopted_allocation.target_by_accelerator
+                fresh_allocation = adopted_allocation
+            if (fresh_allocation.card_attribution_complete and
                     sum(adopted_map.values()) == self.target_num_replicas):
                 self.target_num_replicas_by_accelerator = adopted_map
+                fresh_explicit = {
+                    card: min(count, adopted_map.get(card, 0))
+                    for card, count in
+                    fresh_allocation.explicit_target_by_accelerator.items()
+                    if count > 0 and adopted_map.get(card, 0) > 0
+                }
+                fresh_paid = {
+                    card: min(count, adopted_map.get(card, 0))
+                    for card, count in
+                    fresh_allocation.paid_target_by_accelerator.items()
+                    if count > 0 and adopted_map.get(card, 0) > 0
+                }
+                if self._raw_target_num_replicas < self.target_num_replicas:
+                    self._logical_adopted_explicit_target_by_accelerator = {
+                        card: max(
+                            fresh_explicit.get(card, 0),
+                            min(old_explicit_target_by_accelerator.get(card, 0),
+                                adopted_map.get(card, 0)))
+                        for card in adopted_map
+                        if (fresh_explicit.get(card, 0) > 0 or
+                            old_explicit_target_by_accelerator.get(card, 0) > 0)
+                    }
+                    self._logical_adopted_paid_target_by_accelerator = {
+                        card: max(
+                            fresh_paid.get(card, 0),
+                            min(old_paid_target_by_accelerator.get(card, 0),
+                                adopted_map.get(card, 0)))
+                        for card in adopted_map
+                        if (fresh_paid.get(card, 0) > 0 or
+                            old_paid_target_by_accelerator.get(card, 0) > 0)
+                    }
+                else:
+                    self._logical_adopted_explicit_target_by_accelerator = (
+                        fresh_explicit)
+                    self._logical_adopted_paid_target_by_accelerator = (
+                        fresh_paid)
 
         self._upscale_pending = (
             target_num_replicas > self.target_num_replicas or
@@ -7056,6 +7329,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # wave, including any aggregate or per-card floor.
             self.target_num_replicas = 0
             self.target_num_replicas_by_accelerator = {}
+            self._logical_adopted_explicit_target_by_accelerator = {}
+            self._logical_adopted_paid_target_by_accelerator = {}
             # A retained ceiling belongs to the previous version's committed
             # capacity. Keep the shared timer, but fail closed for the rest of
             # that cooldown instead of granting the new version the old
@@ -7500,17 +7775,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         launch_budget = self._logical_actuation_wave_budget
         launch_authority_left = launch_budget
         if use_card_targets:
+            paid_launch_target = (
+                self._logical_paid_launch_target_by_accelerator)
             for card, card_target in target_by_card.items():
-                shortage = max(0, card_target - committed_by_card.get(card, 0))
+                committed_on_card = committed_by_card.get(card, 0)
+                target_shortage = max(0, card_target - committed_on_card)
+                ownership_shortage = max(
+                    0,
+                    paid_launch_target.get(card, 0) - committed_on_card)
+                # The retained actuation map remains the reconciliation and
+                # retirement fence. Paid acquisition is the intersection of
+                # that shortage with the fresh supply-aware replacement
+                # placement: a warm/old-version card may remain in the former
+                # without becoming purchase authority in the latter.
+                shortage = min(target_shortage, ownership_shortage)
                 if launch_authority_left is not None:
                     shortage = min(shortage, launch_authority_left)
                     launch_authority_left -= shortage
                 if shortage > 0:
                     self.cold_launch_authority_by_accelerator[card] = shortage
-        card_shortage = (use_card_targets and any(
-            committed_by_card.get(card, 0) < card_target
-            for card, card_target in target_by_card.items()))
-        if committed < target or card_shortage:
+        paid_card_shortage = bool(use_card_targets and
+                                  self.cold_launch_authority_by_accelerator)
+        # A proof-free card mismatch with sufficient aggregate committed
+        # capacity is only a zero-cost placement preference. Do not emit a
+        # no-op reconciliation request for it; an aggregate shortage still
+        # emits the exact fence so eligible zero-cost supply can fill it.
+        if committed < target or paid_card_shortage:
             if launch_budget is not None and launch_budget > 0:
                 # Completing the full exact-card fence can consume the map's
                 # transition delta in the first restart tick. Later launch
@@ -7547,7 +7837,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         replace_unknown_replica_ids=replace_unknown_replica_ids,
                         launch_priority=self.current_launch_priority(),
                         launch_priority_by_accelerator=(
-                            launch_priorities_by_accelerator)))
+                            launch_priorities_by_accelerator),
+                        cold_launch_authority_by_accelerator=(tuple(
+                            self.cold_launch_authority_by_accelerator.items())
+                                                              if
+                                                              use_card_targets
+                                                              else None)))
             ]
         if (not self._fresh_for_tick() or self._upscale_pending or
                 self._logical_card_transition_pending or

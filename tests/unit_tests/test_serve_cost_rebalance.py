@@ -53,6 +53,7 @@ class _Replica:
         self.is_terminal = status in serve_state.ReplicaStatus.terminal_statuses(
         )
         self.is_ready = status == serve_state.ReplicaStatus.READY
+        self.is_zero_cost = False
         self.cost_rebalance_for_replica_id = replacement_for
         self.status_property = types.SimpleNamespace(
             sky_launch_status=common_utils.ProcessStatus.SUCCEEDED,
@@ -906,6 +907,7 @@ def _pending_row(replica_id, replacement_for):
         status_property=status_property,
         resources_override={'region': 'research'},
         reserved_fill=False,
+        is_zero_cost=False,
         replica_record_id=(f'00000000-0000-4000-8000-{replica_id:012d}'),
         system_recovery_quarantine=None,
         system_recovery_disposition=(
@@ -995,7 +997,7 @@ class TestPinnedLaunchFailClosed:
         placer.location2status[cheap] = (
             replica_managers.spot_placer.LocationStatus.PREEMPTED)
         manager = self._manager(placer)
-        assert self._launch(manager, cheap) is False
+        assert self._launch(manager, cheap) is None
         manager._persist_replica.assert_not_called()
         assert not manager._launch_thread_pool
 
@@ -1007,7 +1009,7 @@ class TestPinnedLaunchFailClosed:
                               accelerators={'A100': 1},
                               use_spot=False)
         manager = self._manager(make_placer({other: 0.0}))
-        assert self._launch(manager, cheap) is False
+        assert self._launch(manager, cheap) is None
         manager._persist_replica.assert_not_called()
         assert not manager._launch_thread_pool
 

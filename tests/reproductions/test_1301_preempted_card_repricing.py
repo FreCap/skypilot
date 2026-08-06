@@ -7,10 +7,11 @@ ordinary regression coverage. `TestCrossCardMigrationIsStillGated` and
 `TestTheDownscaleHoldIsUnchanged` protect the other side of the trade: a fix
 must not drop serving capacity mid-rollout.
 
-Note these drive `_revalidate_actuation_target` WITHOUT old_version_supply,
-the pre-provenance call shape: capacity absent from the latest version and
-with no old-version rows offered is gone, and is re-priced even during a
-rollout. The caller-level provenance behaviour is pinned in
+These scenarios pass an explicit empty `old_version_supply`, meaning the
+snapshot is complete and no old-generation rows back the adopted cards.
+Capacity absent from latest-version supply is therefore known gone and is
+re-priced even during a rollout. The unknown-provenance fail-closed behaviour
+and old-version backing are pinned in
 tests/unit_tests/test_serve_autoscaler_compatibility_contract.py.
 
     PYTHONPATH=. pytest tests/reproductions/test_1301_preempted_card_repricing.py
@@ -39,7 +40,9 @@ def _revalidate(*, adopted, desired, supply, final=_TOTAL, rollout, holding):
         # during every rolling update.
         allow_adopted_reassignment=not rollout,
         # False during an aggregate downscale hold.
-        allow_unbacked_adopted_reassignment=not holding)
+        allow_unbacked_adopted_reassignment=not holding,
+        # This harness models a complete snapshot with no old-version rows.
+        old_version_supply={})
 
 
 class TestPreemptedReservedCapacityIsRepricing:
@@ -211,11 +214,11 @@ class TestTheAllocatorItselfIsCorrect:
         assert target['L4'] == 15
 
 
-# Why the obvious fix does not work
-# ---------------------------------
-# Moving the unbacked-release block above the mixed-version guard in
-# `_revalidate_actuation_target` turns the three failing cases above green.
-# It also breaks `test_logical_exact_card_rollout_keeps_uncovered_old_card`
+# Why the obvious fix was rejected
+# --------------------------------
+# Moving the unbacked-release block above the mixed-version guard without
+# generation provenance turns the incident cases above green. It also breaks
+# `test_logical_exact_card_rollout_keeps_uncovered_old_card`
 # in tests/unit_tests/test_concurrency_autoscaler.py: 40 old-version L4
 # replicas serving demand whose profile is `compatible_accelerators: ['L4']`,
 # with one new-version A100 replica ready. `nonretiring_supply` counts
@@ -223,13 +226,13 @@ class TestTheAllocatorItselfIsCorrect:
 # serving L4-only demand are retired in favour of a card that demand cannot
 # use. That is an outage, not a saving.
 #
-# "Unbacked" therefore means two different things, and the reconciler cannot
-# tell them apart from its current inputs:
+# "Unbacked" therefore means two different things:
 #   1. the replacement has not materialized yet during a rollout (preserve)
 #   2. the capacity is genuinely gone (release and re-price)
 #
-# A fix needs provenance passed in: either per-card old-version supply, so the
-# mixed-version guard applies only to cards whose replacement is still coming,
-# or zero-cost supply per card, enforcing the invariant directly: reserved
-# capacity may satisfy a target, but may never create authority to buy that
-# card.
+# The reconciler now accepts complete per-card old-version supply provenance.
+# An explicit empty map proves case 2 for this harness. Live old-version rows
+# prove case 1 for conservative or stale reconciliation; a fresh, complete
+# compatibility allocation may still choose a different compatible card for
+# their nonpreemptive replacement. If provenance is unavailable (`None`), the
+# mixed-version guard fails closed and preserves the adopted card map.

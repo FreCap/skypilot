@@ -153,6 +153,26 @@ def test_storage_round_trip_is_lossless_and_does_not_mutate_source():
     assert restored.status is serve_state.ReplicaStatus.READY
 
 
+def test_legacy_pickle_migration_materializes_zero_cost_provenance():
+    legacy_state = dict(vars(_replica()))
+    legacy_state['_version'] = 10
+    legacy_state.pop('is_zero_cost')
+    restored = replica_managers.ReplicaInfo.__new__(
+        replica_managers.ReplicaInfo)
+
+    restored.__setstate__(legacy_state)
+
+    assert vars(restored)['is_zero_cost'] is False
+
+
+def test_current_record_requires_explicit_zero_cost_provenance():
+    replica = _replica()
+    del replica.is_zero_cost
+
+    with pytest.raises(AttributeError, match='is_zero_cost'):
+        replica.to_storage_dict()
+
+
 @pytest.mark.parametrize('marker', [0, 1, 'yes'])
 def test_storage_rejects_non_boolean_reserved_fill_marker(marker):
     replica = _replica()
