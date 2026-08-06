@@ -28,5 +28,7 @@ resource "aws_security_group_rule" "serve_control_plane_additional" {
   to_port           = tonumber(each.key)
   protocol          = "tcp"
   cidr_blocks       = [var.serve_probe_ingress.control_plane_cidr]
-  description       = "${var.serve_probe_ingress.description} (port ${each.key})"
+  description = lookup(var.serve_probe_ingress.additional_port_descriptions,
+    each.key,
+  "${var.serve_probe_ingress.description} (port ${each.key})")
 }
