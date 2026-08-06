@@ -41,10 +41,17 @@ print('   supply-blind  :', allocate(READY_ZERO_COST, READY, False))
 print('   supply-aware  :', allocate(READY_ZERO_COST, READY, True),
       '  <- matches production exactly')
 print('   after the reserved A100s are preempted:')
-print('   supply-aware  :',
-      allocate({'H200': 46, 'A100-80GB': 2},
-               {'H200': 46, 'A100': 3, 'A100-80GB': 2, 'L4': 4}, True),
-      '  <- re-prices to L4 by itself')
+print(
+    '   supply-aware  :',
+    allocate({
+        'H200': 46,
+        'A100-80GB': 2
+    }, {
+        'H200': 46,
+        'A100': 3,
+        'A100-80GB': 2,
+        'L4': 4
+    }, True), '  <- re-prices to L4 by itself')
 
 print()
 print('2. The reconciler is where it goes wrong')
@@ -63,6 +70,7 @@ for reassign in (True, False):
             allow_unbacked_adopted_reassignment=unbacked)
         a100 = target.get('A100', 0)
         print('   reassign=%-5s unbacked=%-5s -> A100 target=%d, buys %d paid '
-              'A100' % (reassign, unbacked, a100, max(0, a100 - supply['A100'])))
+              'A100' %
+              (reassign, unbacked, a100, max(0, a100 - supply['A100'])))
 print('   allow_adopted_reassignment is `not any(old-version replica)`, so it')
 print('   is False during every rolling update. Production sat on row 3.')

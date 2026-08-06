@@ -1,16 +1,20 @@
-"""The scenarios a fix for #1301 has to satisfy. Not wired into CI.
+"""The scenarios a fix for #1301 has to satisfy.
 
-Three cases in `TestPreemptedReservedCapacityIsRepriced` FAIL on `improvements`
-today. They are the defect.
+The three defect cases in `TestPreemptedReservedCapacityIsRepricing` are marked
+`xfail(strict=True)`: the suite is green while the bug exists, and the moment a
+fix lands they hard-fail as XPASS, forcing that change to remove the markers
+and promote them into ordinary regression tests.
 
 `TestCrossCardMigrationIsStillGated` and `TestTheDownscaleHoldIsUnchanged`
-already PASS and must keep passing. They are what proves a fix has not traded
-the cost defect for dropped serving capacity, which is exactly what the obvious
-reordering does: see the note at the bottom.
+pass today and must keep passing under any fix. They are what proves a fix has
+not traded the cost defect for dropped serving capacity, which is exactly what
+the obvious reordering does: see the note at the bottom.
 
     PYTHONPATH=. pytest tests/reproductions/test_1301_preempted_card_repricing.py
 """
 # pylint: disable=protected-access
+import pytest
+
 from sky.serve.autoscaler_compatibility import _allocate_compatibility_target
 from sky.serve.autoscaler_compatibility import _revalidate_actuation_target
 
@@ -37,8 +41,8 @@ def _revalidate(*, adopted, desired, supply, final=_TOTAL, rollout, holding):
         allow_unbacked_adopted_reassignment=not holding)
 
 
-class TestPreemptedReservedCapacityIsRepriced:
-    """FAILS TODAY (3 cases). Reserved A100s reclaimed mid-rollout."""
+class TestPreemptedReservedCapacityIsRepricing:
+    """Reserved A100s reclaimed mid-rollout. Three strict xfails."""
 
     _SUPPLY = {'L4': 4, 'A100': 3, 'A100-80GB': 2, 'H200': 46}
     _DESIRED = {'L4': 15, 'A100': 3, 'A100-80GB': 2, 'H200': 46}
@@ -50,17 +54,29 @@ class TestPreemptedReservedCapacityIsRepriced:
                            rollout=True,
                            holding=False)
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason='#1301: a rolling update turns preempted reserved capacity into '
+        'paid same-card launch authority; remove this marker with the fix.')
     def test_a_rollout_no_longer_buys_the_preempted_card(self):
         # Today 7, i.e. 4 paid A100 purchases at roughly 6.8x the L4 price
         # that the same card-agnostic requests accept.
         assert self._target()['A100'] == 3
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason='#1301: a rolling update turns preempted reserved capacity into '
+        'paid same-card launch authority; remove this marker with the fix.')
     def test_the_freed_work_lands_on_the_cheapest_card(self):
         assert self._target()['L4'] == 15
 
     def test_the_total_is_conserved(self):
         assert sum(self._target().values()) == _TOTAL
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason='#1301: a rolling update turns preempted reserved capacity into '
+        'paid same-card launch authority; remove this marker with the fix.')
     def test_partially_backed_capacity_releases_only_the_missing_part(self):
         # 5 of the 7 adopted A100 units still exist, so only 2 may be released.
         target = _revalidate(adopted=_ADOPTED,
@@ -184,8 +200,9 @@ class TestTheAllocatorItselfIsCorrect:
             use_existing_supply=use_existing_supply)
 
     def test_the_supply_blind_pass_buys_only_the_cheapest_card(self):
-        assert self._allocate(self._READY_ZERO_COST, self._READY,
-                              False) == {'L4': _TOTAL}
+        assert self._allocate(self._READY_ZERO_COST, self._READY, False) == {
+            'L4': _TOTAL
+        }
 
     def test_the_supply_aware_pass_reproduces_production(self):
         assert self._allocate(self._READY_ZERO_COST, self._READY,

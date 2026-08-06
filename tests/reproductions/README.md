@@ -16,7 +16,8 @@ PYTHONPATH=. python tests/reproductions/repro_1301_preempted_card_repricing.py
 | `repro_1301_preempted_card_repricing.py` | #1301, free-tier card targets leak into the paid tier |
 | `test_1301_preempted_card_repricing.py` | #1301, the scenarios a fix must satisfy |
 
-For `#1301`, three cases in `TestPreemptedReservedCapacityIsRepriced` fail
-fix. Two others already pass and **must keep passing**: they are what proves a
-fix has not traded the cost defect for dropped serving capacity during a
-rolling update.
+For `#1301`, the three defect cases are `xfail(strict=True)`: green while the
+bug exists, hard-failing the moment a fix lands so that change must promote
+them into ordinary regression tests. The guard classes already pass and **must
+keep passing**: they are what proves a fix has not traded the cost defect for
+dropped serving capacity during a rolling update.
