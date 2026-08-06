@@ -36,6 +36,7 @@ from typing import Any, Optional
 from sky import backends
 from sky import clouds
 from sky import exceptions
+from sky import resources as resources_lib
 from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.catalog import kubernetes_catalog
@@ -49,6 +50,7 @@ from sky.utils import locks
 
 if typing.TYPE_CHECKING:
     from sky.serve import autoscalers
+    from sky.serve import replica_info as replica_info_lib
 
 logger = sky_logging.init_logger(__name__)
 
@@ -272,11 +274,13 @@ def ordinary_provider_phase_mode(
     may bypass the process gate. Unknown or malformed handles remain ambient
     because a later provider read could still consult mutable kubeconfig.
     """
-    launched_resources = getattr(handle, 'launched_resources', None)
-    cloud = getattr(launched_resources, 'cloud', None)
-    if (isinstance(handle, backends.CloudVmRayResourceHandle) and
-            getattr(handle, 'cluster_name', None) == cluster_name and
-            launched_resources is not None and
+    if not isinstance(handle, backends.CloudVmRayResourceHandle):
+        return provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+    launched_resources = handle.launched_resources
+    if launched_resources is None:
+        return provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+    cloud = launched_resources.cloud
+    if (handle.cluster_name == cluster_name and
             isinstance(cloud, clouds.Cloud) and
             not isinstance(cloud, clouds.Kubernetes)):
         return None
@@ -328,7 +332,7 @@ def _protocol_v2_provider_fence_scope(
 
 
 def protocol_v2_provider_fence(
-    replica_info: Any,
+    replica_info: 'replica_info_lib.ReplicaInfo',
     handle: 'backends.CloudVmRayResourceHandle | None' = None,
     *,
     phase_admission: provider_phase.ProviderPhaseAdmission | None = None,
@@ -368,16 +372,20 @@ def protocol_v2_provider_fence(
             phase_admission.mode != provider_phase.ProviderPhaseMode.V2_FENCED):
         raise exceptions.ProviderPhaseMisuseError(
             'A protocol-v2 provider operation requires fenced admission.')
-    cluster_name = getattr(replica_info, 'cluster_name', None)
-    launched_resources = getattr(handle, 'launched_resources', None)
+    try:
+        cluster_name = replica_info.cluster_name
+    except AttributeError as error:
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'The durable replica record has no cluster identity.') from error
+    if not isinstance(handle, backends.CloudVmRayResourceHandle):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'The durable replica handle does not match its fenced Kubernetes '
+            'context.')
+    launched_resources = handle.launched_resources
     if (not isinstance(cluster_name, str) or not cluster_name or
-            not isinstance(handle, backends.CloudVmRayResourceHandle) or
-            getattr(handle, 'cluster_name', None) != cluster_name or
-            launched_resources is None or
-            not isinstance(getattr(launched_resources, 'cloud', None),
-                           clouds.Kubernetes) or
-            getattr(launched_resources, 'region',
-                    None) != cleanup_fence.kubernetes_context):
+            handle.cluster_name != cluster_name or launched_resources is None or
+            not isinstance(launched_resources.cloud, clouds.Kubernetes) or
+            launched_resources.region != cleanup_fence.kubernetes_context):
         raise exceptions.KubernetesPhysicalClusterIdentityError(
             'The durable replica handle does not match its fenced Kubernetes '
             'context.')
@@ -717,14 +725,14 @@ def make_protocol_v2_launch_fence(
 
 def validate_protocol_v2_launch_resources(
     fence: ProtocolV2LaunchFence,
-    resources: Any,
+    resources: resources_lib.Resources,
 ) -> None:
     """Require one final provider candidate to retain the durable exact pin."""
     if (resources is None or
-            not isinstance(getattr(resources, 'cloud', None), clouds.Kubernetes)
-            or getattr(resources, 'region', None) != fence.kubernetes_context):
+            not isinstance(resources.cloud, clouds.Kubernetes) or
+            resources.region != fence.kubernetes_context):
         raise ValueError('Reserved-fill Kubernetes context changed.')
-    accelerators = getattr(resources, 'accelerators', None)
+    accelerators = resources.accelerators
     if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
         raise ValueError('Reserved-fill accelerator shape changed.')
     accelerator, count = next(iter(accelerators.items()))
@@ -1441,7 +1449,7 @@ def _record_pool_observation(
         # A failed query is a blackout, not a measurement of zero: leave the
         # existing reading (and its own freshness clock) alone.
         return
-    by_accelerator = getattr(observation, 'free_slots_by_accelerator', None)
+    by_accelerator = observation.free_slots_by_accelerator
     free_by_name: dict[str, int] | None = None
     if by_accelerator:
         free_by_name = {

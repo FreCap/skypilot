@@ -762,6 +762,7 @@ class SkyServiceSpec:
         state.setdefault('_lb_high_availability', False)
         state.setdefault('_lb_high_availability_specified', False)
         state.setdefault('_consecutive_failure_threshold_timeout', None)
+        state.setdefault('_pool', False)
         # Added with the concurrency autoscaler; old DB rows predate it.
         state.setdefault('_target_concurrency_per_replica', None)
         state.setdefault('_min_replicas_by_accelerator', {})
@@ -1255,15 +1256,25 @@ class SkyServiceSpec:
                         self.target_qps_per_replica)
         add_if_not_none('replica_policy', 'target_concurrency_per_replica',
                         self.target_concurrency_per_replica)
-        for field in ('target_utilization_percentage',
-                      'expected_request_duration_seconds',
-                      'initial_provision_lead_time_seconds',
-                      'adaptive_demand_estimation',
-                      'max_scale_up_rate_percentage',
-                      'scale_up_rate_min_replicas',
-                      'scale_up_rate_period_seconds', 'adaptive_scale_up',
-                      'max_scale_down_rate_percentage'):
-            add_if_not_none('replica_policy', field, getattr(self, f'_{field}'))
+        replica_policy_values = (
+            ('target_utilization_percentage',
+             self._target_utilization_percentage),
+            ('expected_request_duration_seconds',
+             self._expected_request_duration_seconds),
+            ('initial_provision_lead_time_seconds',
+             self._initial_provision_lead_time_seconds),
+            ('adaptive_demand_estimation', self._adaptive_demand_estimation),
+            ('max_scale_up_rate_percentage',
+             self._max_scale_up_rate_percentage),
+            ('scale_up_rate_min_replicas', self._scale_up_rate_min_replicas),
+            ('scale_up_rate_period_seconds',
+             self._scale_up_rate_period_seconds),
+            ('adaptive_scale_up', self._adaptive_scale_up),
+            ('max_scale_down_rate_percentage',
+             self._max_scale_down_rate_percentage),
+        )
+        for field, value in replica_policy_values:
+            add_if_not_none('replica_policy', field, value)
         # no_empty omits the disabled None/False forms. Enabled fill always
         # serializes as an object so its utilization policy is unambiguous
         # across server versions.
@@ -1484,50 +1495,50 @@ class SkyServiceSpec:
 
     @property
     def target_concurrency_per_replica(self) -> float | None:
-        # Per GPU: replica capacity = knob * gpu_count. Guarded with getattr
-        # semantics via __setstate__ for specs unpickled from old DB rows.
+        # Per GPU: replica capacity = knob * gpu_count. __setstate__
+        # materializes the field for specs unpickled from old DB rows.
         return self._target_concurrency_per_replica
 
     @property
     def target_utilization_percentage(self) -> int:
-        value = getattr(self, '_target_utilization_percentage', None)
+        value = self._target_utilization_percentage
         return 100 if value is None else value
 
     @property
     def expected_request_duration_seconds(self) -> float | None:
-        return getattr(self, '_expected_request_duration_seconds', None)
+        return self._expected_request_duration_seconds
 
     @property
     def initial_provision_lead_time_seconds(self) -> float | str | None:
         """Configured seed: a number, the 'auto' sentinel, or unset."""
-        return getattr(self, '_initial_provision_lead_time_seconds', None)
+        return self._initial_provision_lead_time_seconds
 
     @property
     def adaptive_demand_estimation(self) -> bool:
         # Default-on: measuring the workload is the correct behavior, and an
         # explicit false is the only way to keep static configured estimates.
-        return getattr(self, '_adaptive_demand_estimation', None) is not False
+        return self._adaptive_demand_estimation is not False
 
     @property
     def max_scale_up_rate_percentage(self) -> int | None:
-        return getattr(self, '_max_scale_up_rate_percentage', None)
+        return self._max_scale_up_rate_percentage
 
     @property
     def scale_up_rate_min_replicas(self) -> int | None:
-        return getattr(self, '_scale_up_rate_min_replicas', None)
+        return self._scale_up_rate_min_replicas
 
     @property
     def scale_up_rate_period_seconds(self) -> int | None:
-        return getattr(self, '_scale_up_rate_period_seconds', None)
+        return self._scale_up_rate_period_seconds
 
     @property
     def adaptive_scale_up(self) -> dict[str, Any] | None:
-        value = getattr(self, '_adaptive_scale_up', None)
+        value = self._adaptive_scale_up
         return dict(value) if value is not None else None
 
     @property
     def max_scale_down_rate_percentage(self) -> int:
-        value = getattr(self, '_max_scale_down_rate_percentage', None)
+        value = self._max_scale_down_rate_percentage
         return 50 if value is None else value
 
     @property
@@ -1538,7 +1549,7 @@ class SkyServiceSpec:
 
     @property
     def uses_logical_replicas(self) -> bool:
-        return getattr(self, '_uses_logical_replicas', False)
+        return self._uses_logical_replicas
 
     @property
     def reserved_capacity_fill(self) -> bool:
@@ -1648,9 +1659,6 @@ class SkyServiceSpec:
 
     @property
     def pool(self) -> bool:
-        # This can happen for backward compatibility.
-        if not hasattr(self, '_pool'):
-            return False
         return bool(self._pool)
 
     @property

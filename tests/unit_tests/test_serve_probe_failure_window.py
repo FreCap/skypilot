@@ -41,7 +41,8 @@ def _replica_info(replica_id):
 
 
 def _make_manager(failure_threshold):
-    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     manager.lock = threading.Lock()
     manager._service_name = 'svc'
     manager._is_pool = False

@@ -196,8 +196,7 @@ def _replica_is_retiring_card_supply(
         replica_info: 'replica_managers.ReplicaInfo') -> bool:
     """Whether a row must not authorize replacement on its current card."""
     status = replica_info.status_property
-    return (getattr(status, 'is_scale_down', False) is True or
-            getattr(status, 'preempted', False) is True)
+    return status.is_scale_down is True or status.preempted is True
 
 
 def _merge_fresh_target_into_downscale_hold(

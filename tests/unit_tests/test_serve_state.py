@@ -12,7 +12,6 @@ import hashlib
 import json
 import pickle
 import sqlite3
-import types
 import uuid
 
 import pytest
@@ -28,6 +27,7 @@ from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import service as service_lib
+from sky.serve import service_spec as service_spec_lib
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state as recovery_state
 from sky.utils import common_utils
@@ -48,14 +48,56 @@ def _replica(replica_id: int,
     )
 
 
-class _FakeSpec:
+class _TestServiceSpec(service_spec_lib.SkyServiceSpec):
+    """Small, fully-formed service spec used by persistence tests."""
 
-    def __init__(self, policy: str, load_balancing_policy: str):
+    def __init__(self,
+                 label: str = 'test-spec',
+                 *,
+                 policy: str | None = None,
+                 load_balancing_policy: str = 'least_load',
+                 uses_logical_replicas: bool = False,
+                 graceful_drain_async_occupancy: bool | None = None,
+                 lb_stream_timeout_seconds: int = 10,
+                 graceful_drain_seconds: int | None = None):
+        if uses_logical_replicas:
+            graceful_drain_async_occupancy = True
+        super().__init__(
+            readiness_path='/ready',
+            initial_delay_seconds=0,
+            readiness_timeout_seconds=5,
+            endpoint_probe_interval_seconds=1,
+            lb_stream_timeout_seconds=lb_stream_timeout_seconds,
+            min_replicas=1,
+            lb_high_availability=False,
+            max_replicas=1 if uses_logical_replicas else None,
+            target_concurrency_per_replica=(1
+                                            if uses_logical_replicas else None),
+            spot_placer=('dynamic_fallback_per_gpu'
+                         if uses_logical_replicas else None),
+            load_balancing_policy=load_balancing_policy,
+            graceful_drain_seconds=graceful_drain_seconds,
+            graceful_drain_async_occupancy=(graceful_drain_async_occupancy),
+        )
+        self.test_label = label
         self._policy = policy
-        self.load_balancing_policy = load_balancing_policy
 
     def autoscaling_policy_str(self):
-        return self._policy
+        if self._policy is not None:
+            return self._policy
+        return super().autoscaling_policy_str()
+
+
+def _service_spec(label: str = 'test-spec', **kwargs) -> _TestServiceSpec:
+    return _TestServiceSpec(label, **kwargs)
+
+
+def _labeled_version_spec(result) -> tuple[int, str] | None:
+    if result is None:
+        return None
+    version, spec = result
+    assert isinstance(spec, _TestServiceSpec)
+    return version, spec.test_label
 
 
 def _read_row(engine, name):
@@ -383,6 +425,7 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     assert restored.status == info.status
 
     legacy_state = info.to_storage_dict()
+    legacy_state['replica_info_version'] = 13
     legacy_state['status_property'].pop('logical_retirement_bounded_deadline')
     legacy_restored = replica_managers.ReplicaInfo.from_storage_dict(
         legacy_state)
@@ -396,6 +439,7 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     assert not malformed_restored.status_property.logical_retirement_bounded_deadline
 
     legacy_commit_state = info.to_storage_dict()
+    legacy_commit_state['replica_info_version'] = 13
     legacy_commit_state['status_property'].pop('logical_retirement_committed')
     legacy_commit_restored = replica_managers.ReplicaInfo.from_storage_dict(
         legacy_commit_state)
@@ -412,6 +456,7 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
         is None)
 
     legacy_drain_state = info.to_storage_dict()
+    legacy_drain_state['replica_info_version'] = 13
     legacy_drain_state['status_property'].pop('drain_started_at')
     legacy_drain_restored = replica_managers.ReplicaInfo.from_storage_dict(
         legacy_drain_state)
@@ -819,15 +864,15 @@ def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
     uncertain_status.logical_retirement_generation = 3
     uncertain_status.logical_retirement_target_capacity = 1
     uncertain_status.logical_retirement_confirmed_generation = 4
-    # Model a real pre-field pickle: deleting the instance key still makes
-    # getattr() see the new dataclass class default False after unpickling.
+    # Model a real pre-field v13 pickle. The decode boundary must materialize
+    # the missing-vs-uncommitted distinction explicitly.
+    uncertain._version = 13
     vars(uncertain_status).pop('logical_retirement_committed')
     uncertain_blob = pickle.dumps(uncertain)
     loaded_uncertain = pickle.loads(uncertain_blob)
     assert ('logical_retirement_committed'
-            not in vars(loaded_uncertain.status_property))
-    assert getattr(loaded_uncertain.status_property,
-                   'logical_retirement_committed') is False
+            in vars(loaded_uncertain.status_property))
+    assert loaded_uncertain.status_property.logical_retirement_committed is None
     assert (loaded_uncertain.to_storage_dict()['status_property']
             ['logical_retirement_committed'] is None)
     with engine.begin() as connection:
@@ -1267,13 +1312,13 @@ def test_service_version_terminal_state_retains_scale_zero_applied_fallback(
         _mock_serve_db):
     assert _add_minimal_service('svc-terminal-fallback',
                                 service_hash='incarnation-a',
-                                spec='spec-v1')
+                                spec=_service_spec('spec-v1'))
     serve_state.set_service_status_and_active_versions(
         'svc-terminal-fallback',
         serve_state.ServiceStatus.READY,
         active_versions=[])
     assert serve_state.add_or_update_version(
-        'svc-terminal-fallback', 2, 'spec-v2',
+        'svc-terminal-fallback', 2, _service_spec('spec-v2'),
         'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
     assert serve_state.quarantine_version('svc-terminal-fallback', 2,
                                           'never applied')
@@ -1294,9 +1339,9 @@ def test_service_version_terminal_state_retains_all_applied_history(
     owner = (12345, None)
     assert _add_minimal_service('svc-applied-history',
                                 service_hash='incarnation-a',
-                                spec='spec-v1')
+                                spec=_service_spec('spec-v1'))
     assert serve_state.add_or_update_version(
-        'svc-applied-history', 2, 'spec-v2',
+        'svc-applied-history', 2, _service_spec('spec-v2'),
         'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
     assert serve_state.mark_version_controller_applied(
         'svc-applied-history',
@@ -1304,7 +1349,7 @@ def test_service_version_terminal_state_retains_all_applied_history(
         expected_service_hash='incarnation-a',
         expected_controller_owner=owner)
     assert serve_state.add_or_update_version(
-        'svc-applied-history', 3, 'spec-v3',
+        'svc-applied-history', 3, _service_spec('spec-v3'),
         'yaml: v3') is serve_state.VersionCommitResult.COMMITTED
     serve_state.set_service_status_and_active_versions(
         'svc-applied-history',
@@ -1323,18 +1368,18 @@ def test_service_version_terminal_state_retains_all_applied_history(
 
 
 def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
-    initial_spec = types.SimpleNamespace(graceful_drain_async_occupancy=False)
+    initial_spec = _service_spec(graceful_drain_async_occupancy=False)
     assert _add_minimal_service('svc-specs', spec=initial_spec) is True
     serve_state.add_or_update_version(
         'svc-specs',
         1,
-        types.SimpleNamespace(graceful_drain_async_occupancy=False),
+        _service_spec(graceful_drain_async_occupancy=False),
         'yaml: v1',
     )
     serve_state.add_or_update_version(
         'svc-specs',
         2,
-        types.SimpleNamespace(graceful_drain_async_occupancy=True),
+        _service_spec(graceful_drain_async_occupancy=True),
         'yaml: v2',
     )
 
@@ -1350,7 +1395,7 @@ def test_get_specs_batches_requested_versions_in_one_query(_mock_serve_db):
 def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
     assert _add_minimal_service('svc-immutable') is True
     assert serve_state.add_version('svc-immutable') == 2
-    original_spec = types.SimpleNamespace(value='original')
+    original_spec = _service_spec('original')
     result = serve_state.add_or_update_version('svc-immutable', 2,
                                                original_spec, 'value: original')
     assert result is serve_state.VersionCommitResult.COMMITTED
@@ -1363,15 +1408,14 @@ def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
 
     # A lost-response retry is idempotent and does not rewrite either stored
     # payload, even if the caller reconstructed a fresh spec object.
-    retry_result = serve_state.add_or_update_version(
-        'svc-immutable', 2, types.SimpleNamespace(value='original'),
-        'value: original')
+    retry_result = serve_state.add_or_update_version('svc-immutable', 2,
+                                                     _service_spec('original'),
+                                                     'value: original')
     assert retry_result is serve_state.VersionCommitResult.IDEMPOTENT_RETRY
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
 
     conflict_result = serve_state.add_or_update_version(
-        'svc-immutable', 2, types.SimpleNamespace(value='different'),
-        'value: different')
+        'svc-immutable', 2, _service_spec('different'), 'value: different')
     assert conflict_result is serve_state.VersionCommitResult.CONTENT_CONFLICT
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
 
@@ -1395,7 +1439,7 @@ def test_version_controller_config_retry_requires_exact_snapshot(
     result = serve_state.add_or_update_version(
         'svc-config-retry',
         2,
-        types.SimpleNamespace(value='v2'),
+        _service_spec('v2'),
         'value: v2',
         ha_recovery_script=_VERSIONED_HA_SCRIPT,
         controller_config=snapshot[0],
@@ -1407,21 +1451,20 @@ def test_version_controller_config_retry_requires_exact_snapshot(
     assert (serve_state.add_or_update_version(
         'svc-config-retry',
         2,
-        types.SimpleNamespace(value='v2'),
+        _service_spec('v2'),
         'value: v2',
         controller_config=snapshot[0],
         controller_config_digest=snapshot[1],
         controller_config_snapshot_id=snapshot[2])
             is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     assert (serve_state.add_or_update_version('svc-config-retry', 2,
-                                              types.SimpleNamespace(value='v2'),
-                                              'value: v2')
+                                              _service_spec('v2'), 'value: v2')
             is serve_state.VersionCommitResult.CONTENT_CONFLICT)
     different_snapshot = _config_snapshot(b'active_workspace: other\n', 'b')
     assert (serve_state.add_or_update_version(
         'svc-config-retry',
         2,
-        types.SimpleNamespace(value='v2'),
+        _service_spec('v2'),
         'value: v2',
         controller_config=different_snapshot[0],
         controller_config_digest=different_snapshot[1],
@@ -1440,9 +1483,10 @@ def test_config_aware_commit_backfills_only_null_prior_versions(_mock_serve_db):
         controller_config_digest=initial_snapshot[1],
         controller_config_snapshot_id=initial_snapshot[2])
     assert serve_state.add_version('svc-config-backfill') == 2
-    assert (serve_state.add_or_update_version(
-        'svc-config-backfill', 2, types.SimpleNamespace(value='legacy'),
-        'value: legacy') is serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version('svc-config-backfill', 2,
+                                              _service_spec('legacy'),
+                                              'value: legacy')
+            is serve_state.VersionCommitResult.COMMITTED)
     assert serve_state.add_version('svc-config-backfill') == 3
 
     current_snapshot = _config_snapshot(b'active_workspace: current\n', '3')
@@ -1450,7 +1494,7 @@ def test_config_aware_commit_backfills_only_null_prior_versions(_mock_serve_db):
     assert (serve_state.add_or_update_version(
         'svc-config-backfill',
         3,
-        types.SimpleNamespace(value='current'),
+        _service_spec('current'),
         'value: current',
         ha_recovery_script=_VERSIONED_HA_SCRIPT,
         controller_config=current_snapshot[0],
@@ -1495,7 +1539,7 @@ def test_invalid_controller_config_snapshot_is_rejected_before_write(
         serve_state.add_or_update_version(
             'svc-invalid-config',
             2,
-            types.SimpleNamespace(value='v2'),
+            _service_spec('v2'),
             'value: v2',
             controller_config=b'config',
             controller_config_digest=hashlib.sha256(b'config').hexdigest())
@@ -1511,7 +1555,7 @@ def test_version_and_ha_recovery_script_commit_atomically(_mock_serve_db):
     result = serve_state.add_or_update_version(
         'svc-config',
         2,
-        types.SimpleNamespace(value='v2'),
+        _service_spec('v2'),
         'value: v2',
         ha_recovery_script='config-free-recovery-script-v2')
     assert result is serve_state.VersionCommitResult.COMMITTED
@@ -1520,14 +1564,14 @@ def test_version_and_ha_recovery_script_commit_atomically(_mock_serve_db):
     retry = serve_state.add_or_update_version(
         'svc-config',
         2,
-        types.SimpleNamespace(value='v2'),
+        _service_spec('v2'),
         'value: v2',
         ha_recovery_script='config-free-recovery-script-v2')
     assert retry is serve_state.VersionCommitResult.IDEMPOTENT_RETRY
     stale_retry = serve_state.add_or_update_version(
         'svc-config',
         2,
-        types.SimpleNamespace(value='v2'),
+        _service_spec('v2'),
         'value: v2',
         ha_recovery_script='different-script-for-same-version')
     assert stale_retry is serve_state.VersionCommitResult.CONTENT_CONFLICT
@@ -1565,7 +1609,7 @@ def test_ha_config_upsert_failure_rolls_back_version_transaction(
             serve_state.add_or_update_version(
                 'svc-config-rollback',
                 2,
-                types.SimpleNamespace(value='v2'),
+                _service_spec('v2'),
                 'value: v2',
                 ha_recovery_script=_VERSIONED_HA_SCRIPT,
                 controller_config=current_snapshot[0],
@@ -1613,16 +1657,17 @@ def test_version_placement_catalog_persists_and_backfills_once(_mock_serve_db):
     }
     assert (serve_state.add_or_update_version('svc-catalog',
                                               2,
-                                              types.SimpleNamespace(value='v2'),
+                                              _service_spec('v2'),
                                               'value: v2',
                                               placement_catalog=update_catalog)
             is serve_state.VersionCommitResult.COMMITTED)
     assert serve_state.get_placement_catalog('svc-catalog', 2) == update_catalog
 
     assert serve_state.add_version('svc-catalog') == 3
-    assert (serve_state.add_or_update_version(
-        'svc-catalog', 3, types.SimpleNamespace(value='legacy'),
-        'value: legacy') is serve_state.VersionCommitResult.COMMITTED)
+    assert (serve_state.add_or_update_version('svc-catalog', 3,
+                                              _service_spec('legacy'),
+                                              'value: legacy')
+            is serve_state.VersionCommitResult.COMMITTED)
     winner = {'schema_version': 1, 'entries': [{'winner': True}]}
     loser = {'schema_version': 1, 'entries': [{'winner': False}]}
     assert serve_state.set_placement_catalog_if_missing('svc-catalog', 3,
@@ -1635,35 +1680,34 @@ def test_version_placement_catalog_persists_and_backfills_once(_mock_serve_db):
 def test_identical_version_retry_only_backfills_missing_catalog(_mock_serve_db):
     assert _add_minimal_service('svc-catalog-retry') is True
     catalog = {'schema_version': 1, 'entries': []}
-    assert (serve_state.add_or_update_version(
-        'svc-catalog-retry',
-        1,
-        types.SimpleNamespace(value='ignored'),
-        'yaml: v1',
-        placement_catalog=catalog)
+    assert (serve_state.add_or_update_version('svc-catalog-retry',
+                                              1,
+                                              _service_spec('ignored'),
+                                              'yaml: v1',
+                                              placement_catalog=catalog)
             is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     row = _read_version_row(_mock_serve_db, 'svc-catalog-retry', 1)
     assert row['placement_catalog'] == catalog
     original_spec = row['spec']
-    assert (serve_state.add_or_update_version(
-        'svc-catalog-retry',
-        1,
-        types.SimpleNamespace(value='different'),
-        'yaml: v1',
-        placement_catalog={
-            'schema_version': 1,
-            'entries': [{
-                'other': True
-            }]
-        }) is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+    assert (serve_state.add_or_update_version('svc-catalog-retry',
+                                              1,
+                                              _service_spec('different'),
+                                              'yaml: v1',
+                                              placement_catalog={
+                                                  'schema_version': 1,
+                                                  'entries': [{
+                                                      'other': True
+                                                  }]
+                                              })
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     final_row = _read_version_row(_mock_serve_db, 'svc-catalog-retry', 1)
     assert final_row['placement_catalog'] == catalog
     assert final_row['spec'] == original_spec
 
 
 def test_logical_replica_activation_is_durable_and_one_way(_mock_serve_db):
-    physical = types.SimpleNamespace(uses_logical_replicas=False)
-    logical = types.SimpleNamespace(uses_logical_replicas=True)
+    physical = _service_spec('physical')
+    logical = _service_spec('logical', uses_logical_replicas=True)
     assert _add_minimal_service('svc-logical', spec=physical) is True
     assert not serve_state.service_uses_logical_replica_semantics('svc-logical')
 
@@ -1688,8 +1732,8 @@ def test_logical_replica_activation_is_durable_and_one_way(_mock_serve_db):
 
 def test_lower_logical_commit_cannot_flip_newer_physical_semantics(
         _mock_serve_db):
-    physical = types.SimpleNamespace(uses_logical_replicas=False)
-    logical = types.SimpleNamespace(uses_logical_replicas=True)
+    physical = _service_spec('physical')
+    logical = _service_spec('logical', uses_logical_replicas=True)
     assert _add_minimal_service('svc-out-of-order', spec=physical) is True
     assert serve_state.add_version('svc-out-of-order') == 2
     assert serve_state.add_version('svc-out-of-order') == 3
@@ -1708,7 +1752,7 @@ def test_lower_logical_commit_cannot_flip_newer_physical_semantics(
 
 
 def test_initial_logical_service_sets_activation_fence(_mock_serve_db):
-    logical = types.SimpleNamespace(uses_logical_replicas=True)
+    logical = _service_spec('logical', uses_logical_replicas=True)
     assert _add_minimal_service('svc-initial-logical', spec=logical) is True
     assert serve_state.service_uses_logical_replica_semantics(
         'svc-initial-logical')
@@ -1774,13 +1818,13 @@ def test_get_yaml_contents_batches_requested_versions_in_one_query(
     serve_state.add_or_update_version(
         'svc-yamls',
         1,
-        types.SimpleNamespace(graceful_drain_async_occupancy=False),
+        _service_spec(graceful_drain_async_occupancy=False),
         'yaml: v1',
     )
     serve_state.add_or_update_version(
         'svc-yamls',
         2,
-        types.SimpleNamespace(graceful_drain_async_occupancy=True),
+        _service_spec(graceful_drain_async_occupancy=True),
         'yaml: v2',
     )
 
@@ -1808,13 +1852,13 @@ def test_get_version_yaml_contents_fetches_all_versions_in_one_query(
     serve_state.add_or_update_version(
         'svc-all-yamls',
         2,
-        types.SimpleNamespace(graceful_drain_async_occupancy=True),
+        _service_spec(graceful_drain_async_occupancy=True),
         'yaml: v2',
     )
     serve_state.add_or_update_version(
         'svc-all-yamls',
         1,
-        types.SimpleNamespace(graceful_drain_async_occupancy=False),
+        _service_spec(graceful_drain_async_occupancy=False),
         'yaml: v1',
     )
     # Interrupted updates leave a NULL-yaml placeholder.  The batched cleanup
@@ -1838,7 +1882,7 @@ def test_get_version_yaml_contents_unknown_service_returns_empty(
 
 
 def test_get_service_from_name_uses_joined_spec_in_single_query(_mock_serve_db):
-    spec = _FakeSpec('qps=2', 'least_load')
+    spec = _service_spec(policy='qps=2', load_balancing_policy='least_load')
     assert _add_minimal_service('svc-read', spec=spec) is True
 
     with _count_sql_statements(_mock_serve_db) as counts:
@@ -1955,7 +1999,7 @@ def test_get_service_liveness_snapshots_reports_latest_version_yaml(
     without a per-service joined read."""
     assert _add_minimal_service('svc', yaml_content='yaml: v1') is True
     serve_state.add_or_update_version(
-        'svc', 2, types.SimpleNamespace(graceful_drain_async_occupancy=False),
+        'svc', 2, _service_spec(graceful_drain_async_occupancy=False),
         'yaml: v2')
     assert _add_minimal_service('placeholder', yaml_content=None) is True
 
@@ -1974,7 +2018,7 @@ def test_get_service_liveness_snapshots_elects_applied_quarantine_fallback(
     digest = hashlib.sha256(config).hexdigest()
     assert _add_minimal_service('svc',
                                 workspace='research',
-                                spec='spec-1',
+                                spec=_service_spec('spec-1'),
                                 controller_config=config,
                                 controller_config_digest=digest,
                                 controller_config_snapshot_id='a' * 64)
@@ -1982,7 +2026,7 @@ def test_get_service_liveness_snapshots_elects_applied_quarantine_fallback(
         assert serve_state.add_or_update_version(
             'svc',
             version,
-            f'spec-{version}',
+            _service_spec(f'spec-{version}'),
             f'yaml: v{version}',
             controller_config=config,
             controller_config_digest=digest,
@@ -2086,8 +2130,8 @@ class TestAddServiceAtomicRegistration:
         # its own Serve DB is still authoritative. Never overwrite the last
         # cleanup inventory merely because this registration is legacy-shaped.
         serve_state.add_or_update_version('svc-stale',
-                                          serve_constants.INITIAL_VERSION, None,
-                                          'yaml: stale')
+                                          serve_constants.INITIAL_VERSION,
+                                          _service_spec('stale'), 'yaml: stale')
         assert _read_row(_mock_serve_db, 'svc-stale') is None  # no svc row
 
         with pytest.raises(serve_state.OrphanedVersionRecordsError):
@@ -2101,9 +2145,11 @@ class TestAddServiceAtomicRegistration:
         # An older interrupted teardown can leave v1 AND v2+ without the
         # parent services row. Replacing v1 alone makes MAX(version)=v2 and
         # leaks the predecessor's spec/yaml into the new incarnation.
-        serve_state.add_or_update_version('svc-stale', 1, 'old-spec-1',
+        serve_state.add_or_update_version('svc-stale', 1,
+                                          _service_spec('old-spec-1'),
                                           'yaml: old-v1')
-        serve_state.add_or_update_version('svc-stale', 2, 'old-spec-2',
+        serve_state.add_or_update_version('svc-stale', 2,
+                                          _service_spec('old-spec-2'),
                                           'yaml: old-v2')
         assert serve_state.set_ha_recovery_script('svc-stale', 'old-script')
         with orm.Session(_mock_serve_db) as session:
@@ -2361,7 +2407,7 @@ class TestServiceLifecycleEpoch:
         assert not serve_state.add_or_update_version(
             'svc',
             2,
-            None,
+            _service_spec('stale'),
             'stale: yaml',
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch_a)
@@ -2392,7 +2438,7 @@ class TestServiceLifecycleEpoch:
         assert not serve_state.add_or_update_version(
             'svc',
             2,
-            None,
+            _service_spec('stale'),
             'yaml: stale',
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch)
@@ -2512,7 +2558,7 @@ service:
         assert serve_state.add_or_update_version(
             'svc',
             2,
-            None,
+            _service_spec('generation-2'),
             yaml_content,
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=update_epoch,
@@ -2627,7 +2673,7 @@ class TestServiceReplicaLaunchAuthorization:
                                     controller_pid=owner[0],
                                     controller_ip=owner[1],
                                     service_hash='incarnation-a',
-                                    spec='spec-v1')
+                                    spec=_service_spec('spec-v1'))
         serve_state.set_service_status_and_active_versions(
             'svc-launch-fence',
             serve_state.ServiceStatus.READY,
@@ -2644,7 +2690,7 @@ class TestServiceReplicaLaunchAuthorization:
         assert serve_state.add_or_update_version(
             'svc-launch-fence',
             2,
-            'spec-v2',
+            _service_spec('spec-v2'),
             'yaml: v2',
             ha_recovery_script=(
                 f'{serve_constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER}\n'
@@ -2666,7 +2712,7 @@ class TestServiceReplicaLaunchAuthorization:
         assert serve_state.add_or_update_version(
             'svc-launch-fence',
             3,
-            'spec-v3',
+            _service_spec('spec-v3'),
             'yaml: v3',
             ha_recovery_script=_VERSIONED_HA_SCRIPT,
             controller_config=config_v3[0],
@@ -2701,13 +2747,13 @@ class TestServiceReplicaLaunchAuthorization:
         assert authorization['launch_authorized_version'] == 1
         assert authorization['launch_version_required'] is True
         recovery = serve_state.get_recovery_version_spec('svc-launch-fence')
-        assert recovery == (1, 'spec-v1')
+        assert _labeled_version_spec(recovery) == (1, 'spec-v1')
 
         config_v4 = _config_snapshot(b'active_workspace: research-v4\n', 'd')
         assert serve_state.add_or_update_version(
             'svc-launch-fence',
             4,
-            'spec-v4',
+            _service_spec('spec-v4'),
             'yaml: v4',
             ha_recovery_script=_VERSIONED_HA_SCRIPT,
             controller_config=config_v4[0],
@@ -2719,8 +2765,9 @@ class TestServiceReplicaLaunchAuthorization:
                 'svc-launch-fence'))
         assert superseding_authorization is not None
         assert superseding_authorization['launch_authorized_version'] == 4
-        assert serve_state.get_recovery_version_spec('svc-launch-fence') == (
-            4, 'spec-v4')
+        assert _labeled_version_spec(
+            serve_state.get_recovery_version_spec('svc-launch-fence')) == (
+                4, 'spec-v4')
 
     def test_first_protocol_commit_seeds_legacy_scale_zero_fallback(
             self, _mock_serve_db):
@@ -2729,7 +2776,7 @@ class TestServiceReplicaLaunchAuthorization:
                                     controller_pid=owner[0],
                                     controller_ip=owner[1],
                                     service_hash='incarnation-legacy',
-                                    spec='spec-v1')
+                                    spec=_service_spec('spec-v1'))
         # Revision 036 is additive and intentionally does not guess which
         # historical version an existing controller had applied.
         with orm.Session(_mock_serve_db) as session:
@@ -2750,7 +2797,7 @@ class TestServiceReplicaLaunchAuthorization:
         assert serve_state.add_or_update_version(
             'svc-legacy-activation',
             2,
-            'spec-v2',
+            _service_spec('spec-v2'),
             'yaml: v2',
             ha_recovery_script=_VERSIONED_HA_SCRIPT,
             controller_config=current_config[0],
@@ -2776,8 +2823,9 @@ class TestServiceReplicaLaunchAuthorization:
             'svc-legacy-activation')
         assert authorization is not None
         assert authorization['launch_authorized_version'] == 1
-        assert serve_state.get_recovery_version_spec(
-            'svc-legacy-activation') == (1, 'spec-v1')
+        assert _labeled_version_spec(
+            serve_state.get_recovery_version_spec('svc-legacy-activation')) == (
+                1, 'spec-v1')
 
     def test_missing_service_has_no_launch_authorization(self, _mock_serve_db):
         assert serve_state.get_service_replica_launch_authorization(
@@ -2808,13 +2856,13 @@ def test_system_recovery_snapshot_elects_applied_scale_zero_fallback(
     assert _add_minimal_service('svc-system-recovery',
                                 service_hash='incarnation-a',
                                 workspace='research',
-                                spec='spec-v1')
+                                spec=_service_spec('spec-v1'))
     serve_state.set_service_status_and_active_versions(
         'svc-system-recovery',
         serve_state.ServiceStatus.NO_REPLICA,
         active_versions=[])
     assert serve_state.add_or_update_version(
-        'svc-system-recovery', 2, 'spec-v2',
+        'svc-system-recovery', 2, _service_spec('spec-v2'),
         'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
     assert serve_state.quarantine_version('svc-system-recovery', 2,
                                           'never applied')
@@ -2826,7 +2874,7 @@ def test_system_recovery_snapshot_elects_applied_scale_zero_fallback(
     assert counts['n'] == 1
     assert snapshot is not None
     assert snapshot['version'] == 1
-    assert snapshot['spec'] == 'spec-v1'
+    assert snapshot['spec'].test_label == 'spec-v1'
     assert snapshot['yaml_content'] == 'yaml: v1'
     assert snapshot['quarantined_at'] is None
     assert snapshot['replica_count'] == 0
@@ -2846,7 +2894,7 @@ def test_ha_recovery_snapshot_is_one_fenced_quarantine_aware_read(
                                 lifecycle_epoch=lifecycle_epoch,
                                 resource_scope='scope-a',
                                 workspace='research',
-                                spec='spec-v1',
+                                spec=_service_spec('spec-v1'),
                                 controller_config=v1_config[0],
                                 controller_config_digest=v1_config[1],
                                 controller_config_snapshot_id=v1_config[2])
@@ -2860,7 +2908,7 @@ def test_ha_recovery_snapshot_is_one_fenced_quarantine_aware_read(
     assert serve_state.add_or_update_version(
         'svc-ha-snapshot',
         2,
-        'spec-v2',
+        _service_spec('spec-v2'),
         'yaml: v2',
         ha_recovery_script=_VERSIONED_HA_SCRIPT,
         controller_config=v2_config[0],
@@ -2870,7 +2918,7 @@ def test_ha_recovery_snapshot_is_one_fenced_quarantine_aware_read(
     assert serve_state.add_or_update_version(
         'svc-ha-snapshot',
         3,
-        'spec-v3',
+        _service_spec('spec-v3'),
         'yaml: v3',
         ha_recovery_script=_VERSIONED_HA_SCRIPT,
         controller_config=v3_config[0],
@@ -2964,7 +3012,7 @@ class TestGetServiceRuntimeSnapshot:
 
     def test_returns_runtime_fields_without_loading_spec(
             self, _mock_serve_db, monkeypatch):
-        spec = _FakeSpec('qps=3', 'least_load')
+        spec = _service_spec(policy='qps=3', load_balancing_policy='least_load')
         _add_minimal_service('svc-runtime',
                              controller_ip='10.4.10.9',
                              spec=spec)
@@ -3591,7 +3639,7 @@ class TestTerminalVersionFences:
         assert not serve_state.add_or_update_version(
             'svc',
             2,
-            None,
+            _service_spec('terminal'),
             'yaml: v2',
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=epoch,
@@ -3649,7 +3697,8 @@ class TestUnrecoverableServiceRows:
             self, _mock_serve_db):
         _insert_orphan_service_row(_mock_serve_db, 'svc')
         assert serve_state.set_ha_recovery_script('svc', 'bootable script')
-        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
+        serve_state.add_or_update_version('svc', 1, _service_spec('spec-1'),
+                                          'yaml: v1')
 
         assert not serve_state.mark_unrecoverable_service_for_cleanup(
             'svc', 'orphan', pool=False)
@@ -3676,8 +3725,10 @@ class TestRecoveryVersionSelection:
     def test_committed_version_skips_placeholder(self, _mock_serve_db):
         # Two committed versions, then an interrupted update creates a
         # NULL-yaml placeholder v3 as the new MAX.
-        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
-        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+        serve_state.add_or_update_version('svc', 1, _service_spec('spec-1'),
+                                          'yaml: v1')
+        serve_state.add_or_update_version('svc', 2, _service_spec('spec-2'),
+                                          'yaml: v2')
         assert serve_state.add_version('svc') == 3  # placeholder
         # Raw MAX points at the placeholder (the bug)...
         assert serve_state.get_latest_version('svc') == 3
@@ -3691,11 +3742,14 @@ class TestRecoveryVersionSelection:
 
     def test_batch_committed_versions_match_single_row_answers(
             self, _mock_serve_db):
-        serve_state.add_or_update_version('svc-a', 1, 'spec-a1', 'yaml: a1')
-        serve_state.add_or_update_version('svc-a', 2, 'spec-a2', 'yaml: a2')
+        serve_state.add_or_update_version('svc-a', 1, _service_spec('spec-a1'),
+                                          'yaml: a1')
+        serve_state.add_or_update_version('svc-a', 2, _service_spec('spec-a2'),
+                                          'yaml: a2')
         serve_state.add_version('svc-a')  # placeholder v3
         serve_state.add_version('svc-b')  # placeholder v1, never committed
-        serve_state.add_or_update_version('svc-c', 1, 'spec-c1', 'yaml: c1')
+        serve_state.add_or_update_version('svc-c', 1, _service_spec('spec-c1'),
+                                          'yaml: c1')
 
         with _count_sql_statements(_mock_serve_db) as counts:
             committed_versions = serve_state.get_latest_committed_versions(
@@ -3775,9 +3829,11 @@ class TestRecoveryVersionSelection:
         real_name = 'zzz-second-chunk-svc'
         getter = getattr(serve_state, getter_name)
         if getter_name == 'get_latest_committed_versions':
-            serve_state.add_or_update_version(real_name, 1, 'spec-1',
+            serve_state.add_or_update_version(real_name, 1,
+                                              _service_spec('spec-1'),
                                               'yaml: v1')
-            serve_state.add_or_update_version(real_name, 2, 'spec-2',
+            serve_state.add_or_update_version(real_name, 2,
+                                              _service_spec('spec-2'),
                                               'yaml: v2')
             serve_state.add_version(real_name)  # uncommitted placeholder v3
             expected_value = 2
@@ -3802,18 +3858,21 @@ class TestRecoveryVersionSelection:
         timestamps = iter([1001.0, 1002.0])
         monkeypatch.setattr(serve_state.time, 'time', lambda: next(timestamps))
         assert _add_minimal_service('svc',
-                                    spec='spec-1',
+                                    spec=_service_spec('spec-1'),
                                     created_by='alice',
                                     submitted_yaml_content='submitted: v1')
         assert serve_state.add_version('svc', created_by='bob') == 2
         serve_state.add_or_update_version(
             'svc',
             2,
-            'spec-2',
+            _service_spec('spec-2'),
             'yaml: v2',
             submitted_yaml_content='submitted: v2')
 
-        assert serve_state.get_version_records('svc') == [{
+        records = serve_state.get_version_records('svc')
+        for record in records:
+            record['spec'] = record['spec'].test_label
+        assert records == [{
             'version': 1,
             'spec': 'spec-1',
             'yaml_content': 'yaml: v1',
@@ -3835,33 +3894,41 @@ class TestRecoveryVersionSelection:
 
     def test_quarantine_is_durable_and_applicable_snapshot_skips_it(
             self, _mock_serve_db):
-        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
-        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+        serve_state.add_or_update_version('svc', 1, _service_spec('spec-1'),
+                                          'yaml: v1')
+        serve_state.add_or_update_version('svc', 2, _service_spec('spec-2'),
+                                          'yaml: v2')
 
         assert serve_state.quarantine_version('svc',
                                               2,
                                               'deterministic port failure',
                                               quarantined_at=123.0)
         assert serve_state.get_latest_committed_version('svc') == 2
-        assert serve_state.get_latest_committed_version_spec('svc') == (
-            2, 'spec-2')
-        assert serve_state.get_latest_applicable_version_spec('svc') == (
-            1, 'spec-1')
+        assert _labeled_version_spec(
+            serve_state.get_latest_committed_version_spec('svc')) == (2,
+                                                                      'spec-2')
+        assert _labeled_version_spec(
+            serve_state.get_latest_applicable_version_spec('svc')) == (1,
+                                                                       'spec-1')
         assert serve_state.get_latest_quarantined_version('svc') == {
             'version': 2,
             'quarantined_at': 123.0,
             'quarantine_reason': 'deterministic port failure',
         }
 
-        serve_state.add_or_update_version('svc', 3, 'spec-3', 'yaml: v3')
-        assert serve_state.get_latest_applicable_version_spec('svc') == (
-            3, 'spec-3')
+        serve_state.add_or_update_version('svc', 3, _service_spec('spec-3'),
+                                          'yaml: v3')
+        assert _labeled_version_spec(
+            serve_state.get_latest_applicable_version_spec('svc')) == (3,
+                                                                       'spec-3')
 
     def test_recovery_prefers_proven_applied_version_below_quarantine(
             self, _mock_serve_db):
-        assert _add_minimal_service('svc', spec='spec-1')
-        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
-        serve_state.add_or_update_version('svc', 3, 'spec-3', 'yaml: v3')
+        assert _add_minimal_service('svc', spec=_service_spec('spec-1'))
+        serve_state.add_or_update_version('svc', 2, _service_spec('spec-2'),
+                                          'yaml: v2')
+        serve_state.add_or_update_version('svc', 3, _service_spec('spec-3'),
+                                          'yaml: v3')
         # At target zero there are no routing versions to consult. v1 remains
         # a safe fallback because registration durably recorded it as applied.
         serve_state.set_service_status_and_active_versions(
@@ -3869,23 +3936,30 @@ class TestRecoveryVersionSelection:
 
         assert serve_state.quarantine_version('svc', 3, 'never ready')
         # Version 2 is committed but its runtime transition never completed.
-        assert serve_state.get_latest_applicable_version_spec('svc') == (
-            2, 'spec-2')
-        assert serve_state.get_recovery_version_spec('svc') == (1, 'spec-1')
+        assert _labeled_version_spec(
+            serve_state.get_latest_applicable_version_spec('svc')) == (2,
+                                                                       'spec-2')
+        assert _labeled_version_spec(
+            serve_state.get_recovery_version_spec('svc')) == (1, 'spec-1')
 
         # A later commit supersedes the quarantine and remains eligible for a
         # fresh rollout on recovery.
-        serve_state.add_or_update_version('svc', 4, 'spec-4', 'yaml: v4')
-        assert serve_state.get_recovery_version_spec('svc') == (4, 'spec-4')
+        serve_state.add_or_update_version('svc', 4, _service_spec('spec-4'),
+                                          'yaml: v4')
+        assert _labeled_version_spec(
+            serve_state.get_recovery_version_spec('svc')) == (4, 'spec-4')
 
     def test_lb_grace_uses_applied_version_below_dominant_quarantine(
             self, _mock_serve_db, monkeypatch):
-        v1 = types.SimpleNamespace(lb_stream_timeout_seconds=11,
-                                   graceful_drain_seconds=21)
-        v2 = types.SimpleNamespace(lb_stream_timeout_seconds=12,
-                                   graceful_drain_seconds=22)
-        v3 = types.SimpleNamespace(lb_stream_timeout_seconds=13,
-                                   graceful_drain_seconds=23)
+        v1 = _service_spec('v1',
+                           lb_stream_timeout_seconds=11,
+                           graceful_drain_seconds=21)
+        v2 = _service_spec('v2',
+                           lb_stream_timeout_seconds=12,
+                           graceful_drain_seconds=22)
+        v3 = _service_spec('v3',
+                           lb_stream_timeout_seconds=13,
+                           graceful_drain_seconds=23)
         assert _add_minimal_service('svc-grace', spec=v1)
         assert serve_state.add_or_update_version(
             'svc-grace', 2, v2,
@@ -3914,9 +3988,9 @@ class TestRecoveryVersionSelection:
                                     service_hash='incarnation-a',
                                     controller_pid=owner[0],
                                     controller_ip=owner[1],
-                                    spec='spec-1')
+                                    spec=_service_spec('spec-1'))
         assert serve_state.add_or_update_version(
-            'svc-applied', 2, 'spec-2',
+            'svc-applied', 2, _service_spec('spec-2'),
             'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
 
         assert not serve_state.mark_version_controller_applied(
@@ -3962,10 +4036,10 @@ class TestRecoveryVersionSelection:
         # owner may record v3 after v4 commits; reconciliation is serialized,
         # and rejecting this would lose the only accurate fallback receipt.
         assert serve_state.add_or_update_version(
-            'svc-applied', 3, 'spec-3',
+            'svc-applied', 3, _service_spec('spec-3'),
             'yaml: v3') is serve_state.VersionCommitResult.COMMITTED
         assert serve_state.add_or_update_version(
-            'svc-applied', 4, 'spec-4',
+            'svc-applied', 4, _service_spec('spec-4'),
             'yaml: v4') is serve_state.VersionCommitResult.COMMITTED
         assert serve_state.mark_version_controller_applied(
             'svc-applied',
@@ -3984,7 +4058,7 @@ class TestRecoveryVersionSelection:
             expected_controller_owner=owner,
             applied_at=400.0)
         assert serve_state.add_or_update_version(
-            'svc-applied', 5, 'spec-5',
+            'svc-applied', 5, _service_spec('spec-5'),
             'yaml: v5') is serve_state.VersionCommitResult.COMMITTED
         assert serve_state.quarantine_version('svc-applied', 5, 'bad update')
         assert not serve_state.mark_version_controller_applied(
@@ -3998,7 +4072,8 @@ class TestRecoveryVersionSelection:
             self, _mock_serve_db):
         assert serve_state.add_version('svc') == 1
         assert not serve_state.quarantine_version('svc', 1, 'not committed')
-        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
+        serve_state.add_or_update_version('svc', 1, _service_spec('spec-1'),
+                                          'yaml: v1')
         assert serve_state.quarantine_version('svc',
                                               1,
                                               'first reason',
@@ -4018,7 +4093,8 @@ class TestRecoveryVersionSelection:
                                     service_hash='incarnation-a',
                                     controller_pid=123,
                                     controller_ip='10.0.0.1')
-        serve_state.add_or_update_version('svc-owner', 2, 'spec-2', 'yaml: v2')
+        serve_state.add_or_update_version('svc-owner', 2,
+                                          _service_spec('spec-2'), 'yaml: v2')
 
         assert not serve_state.quarantine_version(
             'svc-owner',
@@ -4042,8 +4118,10 @@ class TestRecoveryVersionSelection:
         }
 
     def test_committed_version_spec_is_one_row_snapshot(self, _mock_serve_db):
-        serve_state.add_or_update_version('svc', 1, 'spec-1', 'yaml: v1')
-        serve_state.add_or_update_version('svc', 2, 'spec-2', 'yaml: v2')
+        serve_state.add_or_update_version('svc', 1, _service_spec('spec-1'),
+                                          'yaml: v1')
+        serve_state.add_or_update_version('svc', 2, _service_spec('spec-2'),
+                                          'yaml: v2')
         serve_state.add_version('svc')  # placeholder v3
 
         statements = []
@@ -4059,7 +4137,7 @@ class TestRecoveryVersionSelection:
             sqlalchemy.event.remove(_mock_serve_db, 'before_cursor_execute',
                                     _record_statement)
 
-        assert snapshot == (2, 'spec-2')
+        assert _labeled_version_spec(snapshot) == (2, 'spec-2')
         assert len(statements) == 1, statements
 
     def test_committed_version_spec_none_without_committed_row(
@@ -4069,7 +4147,13 @@ class TestRecoveryVersionSelection:
 
     def test_committed_version_spec_none_for_unusable_spec(
             self, _mock_serve_db):
-        serve_state.add_or_update_version('svc', 1, None, 'yaml: v1')
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(serve_state.version_specs_table.insert().values(
+                service_name='svc',
+                version=1,
+                spec=pickle.dumps(None),
+                yaml_content='yaml: v1'))
+            session.commit()
         assert serve_state.get_latest_committed_version_spec('svc') is None
 
 
@@ -4131,8 +4215,8 @@ class TestTerminalServiceRejectsVersionWrites:
 
         with pytest.raises(RuntimeError, match='terminal status'):
             serve_state.add_version('svc')
-        assert not serve_state.add_or_update_version('svc', 2, 'spec-2',
-                                                     'yaml: v2')
+        assert not serve_state.add_or_update_version(
+            'svc', 2, _service_spec('spec-2'), 'yaml: v2')
         assert serve_state.get_latest_version('svc') == 1
         assert serve_state.get_yaml_content('svc', 1) == 'yaml: v1'
 

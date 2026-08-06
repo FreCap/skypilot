@@ -77,6 +77,7 @@ if typing.TYPE_CHECKING:
     import requests
 
     import sky
+    from sky.data import storage as storage_lib
     from sky.serve import replica_managers
     from sky.serve import service_spec as service_spec_lib
     WorkerHandle = backends.CloudVmRayResourceHandle | None
@@ -431,8 +432,16 @@ for _status_formatter_symbol in (
 del _status_formatter_symbol
 
 
+class _ClusterYamlHandle(typing.Protocol):
+    """Handle interface needed by the batched provider-config reader."""
+
+    @property
+    def cluster_yaml(self) -> str | None:
+        ...
+
+
 def get_provider_configs_for_handles(
-        handles_by_key: 'typing.Mapping[Any, Any]'
+    handles_by_key: 'typing.Mapping[Any, _ClusterYamlHandle | None]'
 ) -> dict[Any, dict[str, Any]]:
     """Fetch provider configs once per unique cluster YAML path.
 
@@ -444,7 +453,9 @@ def get_provider_configs_for_handles(
     yaml_paths: list[str] = []
     keys_by_yaml: dict[str, list[Any]] = collections.defaultdict(list)
     for key, handle in handles_by_key.items():
-        cluster_yaml = getattr(handle, 'cluster_yaml', None)
+        if handle is None:
+            continue
+        cluster_yaml = handle.cluster_yaml
         if not isinstance(cluster_yaml, str):
             continue
         if cluster_yaml not in keys_by_yaml:
@@ -1433,8 +1444,7 @@ def validate_logical_replica_task(
     if service_spec is None:
         service_spec = task.service
     if (service_spec is not None and
-            getattr(service_spec, 'uses_logical_replicas', False) is True and
-            task.num_nodes != 1):
+            service_spec.uses_logical_replicas is True and task.num_nodes != 1):
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
                 'dynamic_fallback_per_gpu currently supports only single-node '
@@ -1633,14 +1643,14 @@ def generate_ephemeral_storage_scope_id(resource_scope: str,
     return f'sv{_resource_scope_tag(identity, length=10)}'
 
 
-def ephemeral_storage_identity_matches_scope(storage: Any,
+def ephemeral_storage_identity_matches_scope(storage: 'storage_lib.Storage',
                                              scope_id: str) -> bool:
     """Whether a storage object's bucket/subpath carries ``scope_id``."""
     suffix = f'-{scope_id}'
-    name = getattr(storage, 'name', None)
+    name = storage.name
     if isinstance(name, str) and name.endswith(suffix):
         return True
-    source = getattr(storage, 'source', None)
+    source = storage.source
     if isinstance(source, str):
         # Covers provider URI shapes (bucket in netloc for S3/GCS/R2, path
         # segment for Azure/COS/OCI) without treating a substring inside a
@@ -1650,7 +1660,7 @@ def ephemeral_storage_identity_matches_scope(storage: Any,
                 segment.endswith(suffix)
                 for segment in source_without_query.split('/')):
             return True
-    bucket_sub_path = getattr(storage, '_bucket_sub_path', None)
+    bucket_sub_path = storage._bucket_sub_path  # pylint: disable=protected-access
     if isinstance(bucket_sub_path, str):
         scoped_prefix = f'job-{scope_id}'
         normalized = bucket_sub_path.strip('/')
@@ -3326,11 +3336,8 @@ def _finalize_prepared_service_status(
                                         replica_records):
             status = replica_record['status'].value
             full_status_counts[status] += 1
-            planned_capacity = getattr(info, 'planned_capacity', 1)
-            if (not isinstance(planned_capacity, int) or
-                    isinstance(planned_capacity, bool) or planned_capacity < 1):
-                planned_capacity = 1
-            full_capacity_counts[status] += planned_capacity if logical else 1
+            full_capacity_counts[status] += (info.planned_capacity
+                                             if logical else 1)
         _set_replica_status_aggregates(record, dict(full_status_counts),
                                        dict(full_capacity_counts))
         if prepared.pool:
@@ -5218,7 +5225,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
 
     matching_info = serve_state.get_replica_info_from_id(
         service_name, replica_id)
-    recorded_cluster_name = (getattr(matching_info, 'cluster_name', None)
+    recorded_cluster_name = (matching_info.cluster_name
                              if matching_info is not None else None)
     replica_cluster_name = (recorded_cluster_name if isinstance(
         recorded_cluster_name, str) else generate_replica_cluster_name(

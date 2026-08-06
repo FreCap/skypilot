@@ -4,7 +4,20 @@ from unittest import mock
 
 import pytest
 
+from sky.serve import replica_managers
 from sky.serve import system_oom_recovery_observability as observability
+
+
+def _replica(location, *, is_spot: bool) -> replica_managers.ReplicaInfo:
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=is_spot,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    info.location = location
+    return info
 
 
 def test_unknown_event_is_rejected() -> None:
@@ -52,30 +65,22 @@ def test_unknown_provider_and_market_map_to_closed_other_labels() -> None:
     }, False, ('gcp', 'on_demand')),
     ({
         'cloud': 'private-provider'
-    }, None, ('other', 'unknown')),
-    (None, None, ('unknown', 'unknown')),
+    }, False, ('other', 'on_demand')),
+    (None, False, ('unknown', 'on_demand')),
 ])
 def test_replica_labels_are_bounded(location, is_spot, expected) -> None:
-    info = mock.Mock(location=location,
-                     is_spot=is_spot,
-                     resources_override=None)
+    info = _replica(location, is_spot=is_spot)
     assert observability.labels_for_replica(info) == expected
 
 
 def test_resources_override_provider_is_bounded() -> None:
-    info = mock.Mock(location=None,
-                     is_spot=False,
-                     resources_override={'cloud': 'Kubernetes'})
+    info = _replica(None, is_spot=False)
+    info.resources_override = {'cloud': 'Kubernetes'}
     assert observability.labels_for_replica(info) == ('kubernetes', 'on_demand')
 
 
 def test_record_for_replica_emits_only_closed_dimensions() -> None:
-    info = mock.Mock(location={'cloud': 'AWS'},
-                     is_spot=True,
-                     resources_override=None,
-                     service_name='secret-service',
-                     service_job_id=987654,
-                     replica_id=123)
+    info = _replica({'cloud': 'AWS'}, is_spot=True)
     with mock.patch.object(observability, 'record') as record:
         observability.record_for_replica('recovery_succeeded', info)
 

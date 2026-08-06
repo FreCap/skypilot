@@ -45,4 +45,5 @@ def make_placer(
     }
     placer.location2preempted_at = {}
     placer.location2cost = dict(costs)
+    placer.num_nodes = 1
     return placer

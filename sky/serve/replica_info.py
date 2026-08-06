@@ -50,6 +50,7 @@ SYSTEM_RECOVERY_STORAGE_FIELDS = (
 # rollback shape; any nonempty proper subset is quarantined.
 V13_ADDITIVE_STORAGE_FIELDS = ('replica_record_id',
                                *SYSTEM_RECOVERY_STORAGE_FIELDS)
+_REPLICA_INFO_VERSION = 14
 
 # A fixed namespace makes the one supported v12/rollback transition identity
 # reproducible across processes and across JSON/pickle readers.  New v13 rows
@@ -74,9 +75,10 @@ def _canonical_replica_record_id(value: object) -> str:
 
 
 def _derive_transition_replica_record_id(replica: Any) -> str:
-    replica_id = getattr(replica, 'replica_id', None)
-    cluster_name = getattr(replica, 'cluster_name', None)
-    created_at = getattr(replica, 'created_at', None)
+    persisted = vars(replica)
+    replica_id = persisted.get('replica_id')
+    cluster_name = persisted.get('cluster_name')
+    created_at = persisted.get('created_at')
     if (isinstance(replica_id, bool) or not isinstance(replica_id, int) or
             replica_id < 0):
         raise system_recovery_state.RecoveryStateError(
@@ -114,8 +116,7 @@ def _set_transition_replica_record_id(replica: Any) -> None:
 
 def _ensure_replica_record_id(replica: Any) -> None:
     try:
-        _canonical_replica_record_id(getattr(replica, 'replica_record_id',
-                                             None))
+        _canonical_replica_record_id(vars(replica).get('replica_record_id'))
     except system_recovery_state.RecoveryStateError:
         _set_transition_replica_record_id(replica)
 
@@ -182,8 +183,8 @@ class ReplicaStatusProperty:
     # retirement was scheduled, persisted so a recovery re-drive reuses
     # it exactly instead of re-resolving (the spec lookup can fail after
     # a crash and silently substitute the 120s default). None on purge
-    # and failure teardowns, and on rows written before this field
-    # existed (read via getattr for unpickle back-compat).
+    # and failure teardowns, and on rows written before this field existed.
+    # Legacy decoders materialize that missing field explicitly.
     drain_cap_seconds: int | None = None
     # Wall-clock epoch seconds at which the bounded drain first became
     # durable. Unlike time.monotonic(), this survives controller restarts and
@@ -192,7 +193,8 @@ class ReplicaStatusProperty:
     drain_started_at: float | None = None
     # Economic replacement is fail-closed: persist the off-route retirement
     # intent, but do not admit sky.down until a fresh LB report proves zero
-    # occupancy.  getattr is used for rows predating this field.
+    # occupancy. Legacy decoders materialize False for rows predating this
+    # field.
     wait_for_idle_before_termination: bool = False
     # Logical autoscaling retirement fence. None on physical services and
     # destructive purge/failure cleanup.
@@ -337,6 +339,148 @@ class ReplicaStatusProperty:
         else:
             # No readiness probe passed and sky.launch finished
             return serve_state.ReplicaStatus.STARTING
+
+
+_REPLICA_STATUS_PROPERTY_FIELDS = tuple(
+    field.name for field in dataclasses.fields(ReplicaStatusProperty))
+_REPLICA_STATUS_PROPERTY_LEGACY_DEFAULTS = dict(vars(ReplicaStatusProperty()))
+# Absence predates the down-admission commit bit. It is not equivalent to the
+# current default False: a missing bit makes a SCHEDULED teardown ambiguous.
+_REPLICA_STATUS_PROPERTY_LEGACY_DEFAULTS['logical_retirement_committed'] = None
+
+
+def _materialize_legacy_status_property_fields(
+        status_property: ReplicaStatusProperty) -> None:
+    """Own every status field after decoding a pre-v14 replica record."""
+    status_state = vars(status_property)
+    for field, default in _REPLICA_STATUS_PROPERTY_LEGACY_DEFAULTS.items():
+        status_state.setdefault(field, default)
+
+
+def _require_status_property_fields(status_property: ReplicaStatusProperty, *,
+                                    owner: str) -> None:
+    """Reject a current record whose status object is only partially owned."""
+    status_state = vars(status_property)
+    missing = [
+        field for field in _REPLICA_STATUS_PROPERTY_FIELDS
+        if field not in status_state
+    ]
+    if missing:
+        raise AttributeError(
+            f'{owner} is missing required ReplicaStatusProperty fields: '
+            f'{", ".join(missing)}')
+
+
+_REPLICA_INFO_OWNED_FIELDS = (
+    'replica_id',
+    'cluster_name',
+    'version',
+    'replica_port',
+    'created_at',
+    'replica_record_id',
+    'first_not_ready_time',
+    'first_consecutive_failure_time',
+    'status_property',
+    'is_spot',
+    'location',
+    'resources_override',
+    'planned_capacity',
+    'unknown_capacity_replacement',
+    'logical_bridge_capacity_verified',
+    'reserved_fill',
+    'reserved_fill_pool_key',
+    'reserved_fill_service_generation',
+    'reserved_fill_physical_cluster_uid',
+    'reserved_fill_kubernetes_context',
+    'is_zero_cost',
+    'cost_rebalance_for_replica_id',
+    'paid_capacity_pool_key',
+    'system_recovery_launch_intent',
+    'system_recovery_disposition',
+    'launch_request_id',
+    'service_job_id',
+    'candidate_ready_observed_at',
+    'ordinary_release_not_before',
+    'system_recovery_revision',
+    'system_recovery',
+    'system_recovery_quarantine',
+)
+_REPLICA_INFO_STORAGE_FIELDS = ('replica_info_version',
+                                *_REPLICA_INFO_OWNED_FIELDS)
+_REPLICA_INFO_LEGACY_DEFAULTS = {
+    'created_at': None,
+    'first_not_ready_time': None,
+    'first_consecutive_failure_time': None,
+    'is_spot': False,
+    'location': None,
+    'resources_override': None,
+    'planned_capacity': 1,
+    'unknown_capacity_replacement': False,
+    'logical_bridge_capacity_verified': False,
+    'reserved_fill': False,
+    'reserved_fill_pool_key': None,
+    'reserved_fill_service_generation': None,
+    'reserved_fill_physical_cluster_uid': None,
+    'reserved_fill_kubernetes_context': None,
+    'is_zero_cost': False,
+    'cost_rebalance_for_replica_id': None,
+    'paid_capacity_pool_key': None,
+}
+
+
+def _materialize_legacy_replica_info_fields(replica: Any) -> None:
+    """Own additive ReplicaInfo fields after decoding a pre-v14 record."""
+    replica_state = vars(replica)
+    for field, default in _REPLICA_INFO_LEGACY_DEFAULTS.items():
+        replica_state.setdefault(field, default)
+    status_property = replica.status_property
+    _materialize_legacy_status_property_fields(status_property)
+
+
+def _require_replica_info_fields(replica: Any, *, owner: str) -> None:
+    """Reject a current in-memory record with an incomplete interface."""
+    replica_state = vars(replica)
+    missing = [
+        field for field in _REPLICA_INFO_OWNED_FIELDS
+        if field not in replica_state
+    ]
+    if missing:
+        raise AttributeError(f'{owner} is missing required ReplicaInfo fields: '
+                             f'{", ".join(missing)}')
+    _require_status_property_fields(replica.status_property, owner=owner)
+
+
+def _require_current_storage_fields(state: dict[str, Any]) -> None:
+    """Reject a v14 JSON record with missing owned-interface fields."""
+    missing = [
+        field for field in _REPLICA_INFO_STORAGE_FIELDS if field not in state
+    ]
+    if missing:
+        raise ValueError('Current ReplicaInfo storage record is missing '
+                         f'required fields: {", ".join(missing)}')
+    status_state = state['status_property']
+    if not isinstance(status_state, dict):
+        raise ValueError('Current ReplicaInfo status_property must be a dict.')
+    missing_status = [
+        field for field in _REPLICA_STATUS_PROPERTY_FIELDS
+        if field not in status_state
+    ]
+    if missing_status:
+        raise ValueError('Current ReplicaInfo storage record is missing '
+                         'required ReplicaStatusProperty fields: '
+                         f'{", ".join(missing_status)}')
+
+
+def _require_current_pickle_fields(state: dict[str, Any], version: int) -> None:
+    """Reject a v14+ pickle whose owned in-memory interface is partial."""
+    missing = [
+        field for field in _REPLICA_INFO_OWNED_FIELDS if field not in state
+    ]
+    owner = f'ReplicaInfo v{version} pickle'
+    if missing:
+        raise AttributeError(f'{owner} is missing required ReplicaInfo fields: '
+                             f'{", ".join(missing)}')
+    _require_status_property_fields(state['status_property'], owner=owner)
 
 
 def _encode_replica_resource_state(
@@ -538,9 +682,10 @@ def copy_system_recovery_fields(source: Any,
     """
     _validate_system_recovery_fields(source)
     source_revision = source.system_recovery_revision
-    destination_revision = getattr(destination, 'system_recovery_revision', 0)
+    destination_state = vars(destination)
+    destination_revision = destination_state.get('system_recovery_revision', 0)
     source_record_id = source.replica_record_id
-    destination_record_id = getattr(destination, 'replica_record_id', None)
+    destination_record_id = destination_state.get('replica_record_id')
     if (isinstance(destination_revision, bool) or
             not isinstance(destination_revision, int) or
             destination_revision < 0):
@@ -555,12 +700,12 @@ def copy_system_recovery_fields(source: Any,
     for field in SYSTEM_RECOVERY_STORAGE_FIELDS:
         if field == 'system_recovery_revision':
             continue
-        setattr(destination, field, getattr(source, field))
+        setattr(destination, field, vars(source)[field])
     destination.system_recovery_revision = (
         system_recovery_state.next_recovery_revision(destination_revision)
         if increment_revision else source_revision)
-    setattr(destination, '_version', max(getattr(destination, '_version', 0),
-                                         13))
+    setattr(destination, '_version',
+            max(destination_state.get('_version', 0), _REPLICA_INFO_VERSION))
     _validate_system_recovery_fields(destination)
 
 
@@ -584,7 +729,9 @@ class ReplicaInfo:
     # with an unresolved fresh demand launch. Version 13 adds the closed
     # system-recovery launch disposition, exact associations, freshness
     # anchors, monotonic subdocument revision, nested state, and quarantine.
-    _VERSION = 13
+    # Version 14 makes every field owned by ReplicaInfo and
+    # ReplicaStatusProperty explicit after the storage/pickle decode boundary.
+    _VERSION = _REPLICA_INFO_VERSION
 
     def __init__(self,
                  replica_id: int,
@@ -620,8 +767,8 @@ class ReplicaInfo:
         self.first_consecutive_failure_time: float | None = None
         self.status_property: ReplicaStatusProperty = ReplicaStatusProperty()
         self.is_spot: bool = is_spot
-        self.location: dict[str, str | None] | None = (
-            location.to_pickleable() if location is not None else None)
+        self.location: dict[str, Any] | None = (location.to_pickleable() if
+                                                location is not None else None)
         self.resources_override: dict[str, Any] | None = resources_override
         if (isinstance(planned_capacity, bool) or
                 not isinstance(planned_capacity, int) or planned_capacity < 1):
@@ -641,9 +788,8 @@ class ReplicaInfo:
         # interrupted fill row because its one-shot broker authority was
         # consumed; recovery tears it down and lets a fresh round refill.
         self.reserved_fill: bool = False
-        # Protocol-v2 origin fences for reserved fill. These are additive JSON
-        # fields rather than a ReplicaInfo version bump: old readers already
-        # preserve the v13 envelope and safely ignore unknown state keys.
+        # Protocol-v2 origin fences for reserved fill. These were additive
+        # through v13; the v14 decode boundary makes them explicit attributes.
         self.reserved_fill_pool_key: str | None = None
         self.reserved_fill_service_generation: int | None = None
         self.reserved_fill_physical_cluster_uid: str | None = None
@@ -673,16 +819,48 @@ class ReplicaInfo:
 
     def to_storage_dict(self) -> dict[str, Any]:
         """Serialize control-plane state into the versioned JSON contract."""
+        replica_state = vars(self)
+        record_version = replica_state.get('_version')
+        if (isinstance(record_version, bool) or
+                not isinstance(record_version, int)):
+            raise AttributeError(
+                'ReplicaInfo is missing a valid record version.')
+        if record_version < self._VERSION:
+            _materialize_legacy_replica_info_fields(self)
+        else:
+            _require_replica_info_fields(self,
+                                         owner=f'ReplicaInfo v{record_version}')
+
+        # Pre-v13 pickles have no recovery fields and are ordinary by
+        # contract. The only missing v13 shape accepted is the exact rollback
+        # bundle in which all additive recovery fields are absent. Current
+        # v14 objects were checked above and can never enter either path.
+        present_recovery_fields = {
+            field for field in V13_ADDITIVE_STORAGE_FIELDS
+            if field in vars(self)
+        }
+        if record_version < 13:
+            _set_ordinary_system_recovery_defaults(self)
+            _set_transition_replica_record_id(self)
+        elif (not present_recovery_fields and record_version == 13):
+            _set_ordinary_system_recovery_defaults(self)
+            _set_transition_replica_record_id(self)
+        elif present_recovery_fields != set(V13_ADDITIVE_STORAGE_FIELDS):
+            _quarantine_system_recovery(
+                self, system_recovery_state.RecoveryQuarantineReason.
+                PARTIAL_V13_BUNDLE)
+        if record_version < self._VERSION:
+            self._version = self._VERSION
+        _require_replica_info_fields(self,
+                                     owner=f'ReplicaInfo v{self._version}')
+        _validate_system_recovery_fields(self)
+
         status_property = self.status_property
-        # getattr() is insufficient for old pickles. If a pre-field dataclass
-        # instance lacks this key, attribute lookup falls through to the new
-        # class-level default False and destroys the missing-vs-uncommitted
-        # distinction needed to recover an ambiguous SCHEDULED teardown.
-        logical_retirement_committed = vars(status_property).get(
-            'logical_retirement_committed')
+        logical_retirement_committed = (
+            status_property.logical_retirement_committed)
         if type(logical_retirement_committed) is not bool:
             logical_retirement_committed = None
-        drain_started_at = getattr(status_property, 'drain_started_at', None)
+        drain_started_at = status_property.drain_started_at
         if not _is_valid_drain_started_at(drain_started_at):
             drain_started_at = None
         location = _encode_replica_resource_state(self.location)
@@ -695,32 +873,11 @@ class ReplicaInfo:
                 # path accepts its registry name and reconstructs the object.
                 resources_override['cloud'] = str(cloud)
 
-        # Old pickles have no v13 attributes and are ordinary by contract.
-        # Any other partial in-memory bundle is isolated rather than silently
-        # becoming routable ordinary state.
-        present_recovery_fields = {
-            field for field in V13_ADDITIVE_STORAGE_FIELDS
-            if hasattr(self, field)
-        }
-        if getattr(self, '_version', 0) < 13:
-            _set_ordinary_system_recovery_defaults(self)
-            _set_transition_replica_record_id(self)
-            self._version = 13
-        elif (not present_recovery_fields and
-              getattr(self, '_version', 0) == 13):
-            _set_ordinary_system_recovery_defaults(self)
-            _set_transition_replica_record_id(self)
-        elif present_recovery_fields != set(V13_ADDITIVE_STORAGE_FIELDS):
-            _quarantine_system_recovery(
-                self, system_recovery_state.RecoveryQuarantineReason.
-                PARTIAL_V13_BUNDLE)
-        _validate_system_recovery_fields(self)
         launch_intent = self.system_recovery_launch_intent
         disposition = self.system_recovery_disposition
         recovery = self.system_recovery
         quarantine = self.system_recovery_quarantine
-        reserved_fill = _exact_reserved_fill_marker(
-            vars(self).get('reserved_fill', False))
+        reserved_fill = _exact_reserved_fill_marker(self.reserved_fill)
 
         def _process_status_value(
             status: common_utils.ProcessStatus | None,) -> str | None:
@@ -732,32 +889,29 @@ class ReplicaInfo:
             'cluster_name': self.cluster_name,
             'version': self.version,
             'replica_port': self.replica_port,
-            'created_at': getattr(self, 'created_at', None),
-            'first_not_ready_time': getattr(self, 'first_not_ready_time', None),
-            'first_consecutive_failure_time': getattr(
-                self, 'first_consecutive_failure_time', None),
+            'created_at': self.created_at,
+            'first_not_ready_time': self.first_not_ready_time,
+            'first_consecutive_failure_time':
+                self.first_consecutive_failure_time,
             'is_spot': self.is_spot,
             'location': location,
             'resources_override': resources_override,
-            'planned_capacity': int(getattr(self, 'planned_capacity', 1)),
+            'planned_capacity': int(self.planned_capacity),
             'unknown_capacity_replacement': bool(
-                getattr(self, 'unknown_capacity_replacement', False)),
+                self.unknown_capacity_replacement),
             'logical_bridge_capacity_verified': bool(
-                getattr(self, 'logical_bridge_capacity_verified', False)),
+                self.logical_bridge_capacity_verified),
             'reserved_fill': reserved_fill,
-            'reserved_fill_pool_key': getattr(self, 'reserved_fill_pool_key',
-                                              None),
-            'reserved_fill_service_generation': getattr(
-                self, 'reserved_fill_service_generation', None),
-            'reserved_fill_physical_cluster_uid': getattr(
-                self, 'reserved_fill_physical_cluster_uid', None),
-            'reserved_fill_kubernetes_context': getattr(
-                self, 'reserved_fill_kubernetes_context', None),
+            'reserved_fill_pool_key': self.reserved_fill_pool_key,
+            'reserved_fill_service_generation':
+                self.reserved_fill_service_generation,
+            'reserved_fill_physical_cluster_uid':
+                self.reserved_fill_physical_cluster_uid,
+            'reserved_fill_kubernetes_context':
+                self.reserved_fill_kubernetes_context,
             'is_zero_cost': self.is_zero_cost,
-            'cost_rebalance_for_replica_id': getattr(
-                self, 'cost_rebalance_for_replica_id', None),
-            'paid_capacity_pool_key': getattr(self, 'paid_capacity_pool_key',
-                                              None),
+            'cost_rebalance_for_replica_id': self.cost_rebalance_for_replica_id,
+            'paid_capacity_pool_key': self.paid_capacity_pool_key,
             'replica_record_id': self.replica_record_id,
             'system_recovery_launch_intent':
                 (launch_intent.to_dict() if launch_intent is not None else None
@@ -785,28 +939,22 @@ class ReplicaInfo:
                 'purged': status_property.purged,
                 'failed_spot_availability':
                     status_property.failed_spot_availability,
-                'drain_cap_seconds': getattr(status_property,
-                                             'drain_cap_seconds', None),
+                'drain_cap_seconds': status_property.drain_cap_seconds,
                 'drain_started_at': drain_started_at,
                 'wait_for_idle_before_termination': bool(
-                    getattr(status_property, 'wait_for_idle_before_termination',
-                            False)),
-                'logical_retirement_version': getattr(
-                    status_property, 'logical_retirement_version', None),
-                'logical_retirement_controller_epoch': getattr(
-                    status_property, 'logical_retirement_controller_epoch',
-                    None),
-                'logical_retirement_generation': getattr(
-                    status_property, 'logical_retirement_generation', None),
-                'logical_retirement_target_capacity': getattr(
-                    status_property, 'logical_retirement_target_capacity',
-                    None),
-                'logical_retirement_confirmed_generation': getattr(
-                    status_property, 'logical_retirement_confirmed_generation',
-                    None),
+                    status_property.wait_for_idle_before_termination),
+                'logical_retirement_version':
+                    status_property.logical_retirement_version,
+                'logical_retirement_controller_epoch':
+                    status_property.logical_retirement_controller_epoch,
+                'logical_retirement_generation':
+                    status_property.logical_retirement_generation,
+                'logical_retirement_target_capacity':
+                    status_property.logical_retirement_target_capacity,
+                'logical_retirement_confirmed_generation':
+                    status_property.logical_retirement_confirmed_generation,
                 'logical_retirement_bounded_deadline':
-                    (getattr(status_property,
-                             'logical_retirement_bounded_deadline', False)
+                    (status_property.logical_retirement_bounded_deadline
                      is True),
                 'logical_retirement_committed': logical_retirement_committed,
             },
@@ -815,15 +963,26 @@ class ReplicaInfo:
     @classmethod
     def from_storage_dict(cls, state: dict[str, Any]) -> 'ReplicaInfo':
         """Reconstruct a replica from the JSON storage contract."""
+        record_version = int(state['replica_info_version'])
+        if record_version == cls._VERSION:
+            _require_current_storage_fields(state)
         status_state = state['status_property']
 
+        def _status_value(field: str) -> Any:
+            if record_version == cls._VERSION:
+                return status_state[field]
+            return status_state.get(
+                field, _REPLICA_STATUS_PROPERTY_LEGACY_DEFAULTS[field])
+
         def _process_status(
-            value: str | None,) -> common_utils.ProcessStatus | None:
-            return (common_utils.ProcessStatus(value)
-                    if value is not None else None)
+            value: common_utils.ProcessStatus | str | None,
+        ) -> common_utils.ProcessStatus | None:
+            if value is None or isinstance(value, common_utils.ProcessStatus):
+                return value
+            return common_utils.ProcessStatus(value)
 
         replica = cls.__new__(cls)
-        replica._version = int(state['replica_info_version'])
+        replica._version = record_version
         replica.replica_id = int(state['replica_id'])
         replica.cluster_name = str(state['cluster_name'])
         replica.version = int(state['version'])
@@ -866,7 +1025,7 @@ class ReplicaInfo:
             # Old writers cannot choose or preserve the v13 fence. Ignore an
             # untrusted additive key on an old-labelled row.
             _set_transition_replica_record_id(replica)
-        elif replica._version > 13:
+        elif replica._version > cls._VERSION:
             _quarantine_system_recovery(
                 replica, system_recovery_state.RecoveryQuarantineReason.
                 INCONSISTENT_V13_BUNDLE)
@@ -919,43 +1078,43 @@ class ReplicaInfo:
                     _quarantine_system_recovery(
                         replica, system_recovery_state.RecoveryQuarantineReason.
                         INCONSISTENT_V13_BUNDLE)
+        drain_started_at = _status_value('drain_started_at')
+        logical_retirement_committed = _status_value(
+            'logical_retirement_committed')
         replica.status_property = ReplicaStatusProperty(
             sky_launch_status=typing.cast(
                 common_utils.ProcessStatus,
-                _process_status(status_state['sky_launch_status'])),
-            user_app_failed=bool(status_state['user_app_failed']),
-            service_ready_now=bool(status_state['service_ready_now']),
-            first_ready_time=status_state.get('first_ready_time'),
-            sky_down_status=_process_status(
-                status_state.get('sky_down_status')),
-            is_scale_down=bool(status_state['is_scale_down']),
-            preempted=bool(status_state['preempted']),
-            purged=bool(status_state['purged']),
+                _process_status(_status_value('sky_launch_status'))),
+            user_app_failed=bool(_status_value('user_app_failed')),
+            service_ready_now=bool(_status_value('service_ready_now')),
+            first_ready_time=_status_value('first_ready_time'),
+            sky_down_status=_process_status(_status_value('sky_down_status')),
+            is_scale_down=bool(_status_value('is_scale_down')),
+            preempted=bool(_status_value('preempted')),
+            purged=bool(_status_value('purged')),
             failed_spot_availability=bool(
-                status_state['failed_spot_availability']),
-            drain_cap_seconds=status_state.get('drain_cap_seconds'),
-            drain_started_at=(status_state.get('drain_started_at')
-                              if _is_valid_drain_started_at(
-                                  status_state.get('drain_started_at')) else
-                              None),
+                _status_value('failed_spot_availability')),
+            drain_cap_seconds=_status_value('drain_cap_seconds'),
+            drain_started_at=(drain_started_at
+                              if _is_valid_drain_started_at(drain_started_at)
+                              else None),
             wait_for_idle_before_termination=bool(
-                status_state.get('wait_for_idle_before_termination', False)),
-            logical_retirement_version=status_state.get(
+                _status_value('wait_for_idle_before_termination')),
+            logical_retirement_version=_status_value(
                 'logical_retirement_version'),
-            logical_retirement_controller_epoch=status_state.get(
+            logical_retirement_controller_epoch=_status_value(
                 'logical_retirement_controller_epoch'),
-            logical_retirement_generation=status_state.get(
+            logical_retirement_generation=_status_value(
                 'logical_retirement_generation'),
-            logical_retirement_target_capacity=status_state.get(
+            logical_retirement_target_capacity=_status_value(
                 'logical_retirement_target_capacity'),
-            logical_retirement_confirmed_generation=status_state.get(
+            logical_retirement_confirmed_generation=_status_value(
                 'logical_retirement_confirmed_generation'),
-            logical_retirement_bounded_deadline=(status_state.get(
-                'logical_retirement_bounded_deadline', False) is True),
-            logical_retirement_committed=(
-                status_state.get('logical_retirement_committed') if type(
-                    status_state.get('logical_retirement_committed')) is bool
-                else None),
+            logical_retirement_bounded_deadline=(
+                _status_value('logical_retirement_bounded_deadline') is True),
+            logical_retirement_committed=(logical_retirement_committed
+                                          if type(logical_retirement_committed)
+                                          is bool else None),
         )
         quarantine = replica.system_recovery_quarantine
         if quarantine is not None:
@@ -971,6 +1130,8 @@ class ReplicaInfo:
                 'Quarantined system recovery state for replica %s (%s); '
                 'the row remains off-route pending legacy cleanup.',
                 replica.replica_id, quarantine.reason.value)
+        _require_replica_info_fields(
+            replica, owner=f'decoded ReplicaInfo v{record_version}')
         return replica
 
     def get_spot_location(self) -> spot_placer.Location | None:
@@ -1007,14 +1168,12 @@ class ReplicaInfo:
                 self.status == serve_state.ReplicaStatus.READY)
 
     def _system_recovery_forces_off_route(self) -> bool:
-        if getattr(self, 'system_recovery_quarantine', None) is not None:
+        if self.system_recovery_quarantine is not None:
             return True
-        disposition = getattr(
-            self, 'system_recovery_disposition',
-            system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+        disposition = self.system_recovery_disposition
         if disposition == system_recovery_state.SystemRecoveryDisposition.CANDIDATE:
             return True
-        recovery = getattr(self, 'system_recovery', None)
+        recovery = self.system_recovery
         return (
             disposition
             == system_recovery_state.SystemRecoveryDisposition.CAPABLE and
@@ -1168,7 +1327,7 @@ class ReplicaInfo:
                 handle = None
         else:
             handle = self.handle(cluster_record)
-        created_at = getattr(self, 'created_at', None)
+        created_at = self.created_at
         ready_at = self.status_property.first_ready_time
         # ``-1`` is the persisted sentinel for an exhausted initial-delay
         # window, not a successful readiness probe.
@@ -1199,7 +1358,7 @@ class ReplicaInfo:
             'replica_info_version': self._version,
             # Immutable logical width selected when this physical backend was
             # placed. It is one for ordinary and legacy physical replicas.
-            'planned_capacity': int(getattr(self, 'planned_capacity', 1)),
+            'planned_capacity': int(self.planned_capacity),
             'endpoint': endpoint,
             'is_spot': self.is_spot,
             'launched_at': (cluster_record['launched_at']
@@ -1390,12 +1549,16 @@ class ReplicaInfo:
                 f'{colorama.Style.RESET_ALL}')
         return self, False, probe_time
 
-    def __setstate__(self, state):
+    def __setstate__(self, state: dict[str, Any]) -> None:
         """Set state from pickled state, for backward compatibility."""
         version = state.pop('_version', None)
         # Handle old version(s) here.
         if version is None:
             version = -1
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError('Pickled ReplicaInfo version must be an integer.')
+        if version == self._VERSION:
+            _require_current_pickle_fields(state, version)
 
         if version < 0:
             # It will be handled with RequestRateAutoscaler.
@@ -1431,12 +1594,13 @@ class ReplicaInfo:
             # economic tie-break until natural replacement.
             self.is_zero_cost = False
 
-        state.setdefault('cost_rebalance_for_replica_id', None)
-        state.setdefault('paid_capacity_pool_key', None)
-        state.setdefault('reserved_fill_pool_key', None)
-        state.setdefault('reserved_fill_service_generation', None)
-        state.setdefault('reserved_fill_physical_cluster_uid', None)
-        state.setdefault('reserved_fill_kubernetes_context', None)
+        if version < self._VERSION:
+            state.setdefault('cost_rebalance_for_replica_id', None)
+            state.setdefault('paid_capacity_pool_key', None)
+            state.setdefault('reserved_fill_pool_key', None)
+            state.setdefault('reserved_fill_service_generation', None)
+            state.setdefault('reserved_fill_physical_cluster_uid', None)
+            state.setdefault('reserved_fill_kubernetes_context', None)
 
         if version < 7:
             # Rows written before version 7 carry the full list of failed
@@ -1455,17 +1619,22 @@ class ReplicaInfo:
 
         self.__dict__.update(state)
         self._version = version if version >= 0 else 0
+        if version < self._VERSION:
+            _materialize_legacy_replica_info_fields(self)
+        elif version == self._VERSION:
+            _require_replica_info_fields(self,
+                                         owner=f'ReplicaInfo v{version} pickle')
 
         recovery_fields = set(V13_ADDITIVE_STORAGE_FIELDS)
         present_recovery_fields = recovery_fields.intersection(state)
         if version < 13:
             _set_ordinary_system_recovery_defaults(self)
             _set_transition_replica_record_id(self)
-        elif version > 13:
+        elif version > self._VERSION:
             _quarantine_system_recovery(
                 self, system_recovery_state.RecoveryQuarantineReason.
                 INCONSISTENT_V13_BUNDLE)
-        elif not present_recovery_fields:
+        elif version == 13 and not present_recovery_fields:
             _set_ordinary_system_recovery_defaults(self)
             _set_transition_replica_record_id(self)
         elif present_recovery_fields != recovery_fields:
@@ -1479,6 +1648,8 @@ class ReplicaInfo:
                 _quarantine_system_recovery(
                     self, system_recovery_state.RecoveryQuarantineReason.
                     INCONSISTENT_V13_BUNDLE)
+        _require_replica_info_fields(
+            self, owner=f'decoded ReplicaInfo v{version} pickle')
         if self.system_recovery_quarantine is not None:
             self.status_property.service_ready_now = False
             self.first_consecutive_failure_time = None

@@ -60,12 +60,21 @@ _K8S_KEY = {
 
 def _spec(min_replicas=1, max_replicas=10, fill=True):
     return types.SimpleNamespace(min_replicas=min_replicas,
+                                 min_replicas_by_accelerator={},
                                  max_replicas=max_replicas,
                                  num_overprovision=None,
+                                 replica_unit='physical_backend',
                                  target_qps_per_replica=None,
                                  upscale_delay_seconds=None,
                                  downscale_delay_seconds=None,
-                                 reserved_capacity_fill=fill)
+                                 reserved_capacity_fill=fill,
+                                 reserved_fill_floor_replicas=0,
+                                 reserved_fill_weight=1.0,
+                                 reserved_fill_utilization_gate=False,
+                                 cost_rebalance=False,
+                                 cost_rebalance_min_savings_fraction=0.3,
+                                 cost_rebalance_max_parallel_replacements=1,
+                                 cost_rebalance_stabilization_seconds=300.0)
 
 
 def _make_autoscaler(**spec_kwargs):
@@ -80,7 +89,8 @@ def _replica(replica_id,
              location_key=None,
              status=serve_state.ReplicaStatus.READY,
              version=1,
-             created_at=None):
+             created_at=None,
+             reserved_fill=True):
     # created_at=None mirrors a pre-upgrade pickled row (treated as older
     # than any fill snapshot); pass a float to model a row created at a
     # known time relative to the snapshot.
@@ -92,6 +102,15 @@ def _replica(replica_id,
     info.is_ready = status == serve_state.ReplicaStatus.READY
     info.cluster_name = f'cluster-{replica_id}'
     info.created_at = created_at
+    info.reserved_fill = reserved_fill
+    info.is_zero_cost = False
+    info.cost_rebalance_for_replica_id = None
+    info.planned_capacity = 1
+    info.unknown_capacity_replacement = False
+    info.resources_override = None
+    info.status_property.sky_down_status = None
+    info.status_property.first_ready_time = None
+    info.status_property.is_scale_down = False
     info.status_property.unrecoverable_failure.return_value = False
     info.get_spot_location.return_value = (
         spot_placer.Location.from_pickleable(location_key))
@@ -396,8 +415,10 @@ class TestFlagOff(unittest.TestCase):
         disabled = _make_autoscaler(fill=False)
         # Even a (spuriously) fed snapshot must not alter decisions.
         _feed(disabled, 5)
-        control_spec = _spec()
-        del control_spec.reserved_capacity_fill  # pre-flag spec object
+        # Persisted pre-flag SkyServiceSpec rows are normalized by
+        # SkyServiceSpec.__setstate__, so consumers always see an explicit
+        # disabled value.
+        control_spec = _spec(fill=False)
         control = autoscalers.RequestRateAutoscaler('svc',
                                                     control_spec,
                                                     version=1)
@@ -2147,6 +2168,7 @@ def _make_manager(placer):
     manager._fill_skip_last_log_time = 0.0
     manager._next_replica_id = 7
     manager.latest_version = 1
+    manager._version_specs = {1: _spec()}
     return manager
 
 

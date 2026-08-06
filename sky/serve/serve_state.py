@@ -30,6 +30,8 @@ from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
 from sky.serve import serve_state_schema
+from sky.serve.lb_cutover_state import (
+    lb_cutover_kubernetes_guard as _lb_cutover_kubernetes_guard)
 from sky.serve.serve_statuses import ReplicaStatus
 from sky.serve.serve_statuses import ServiceStatus
 from sky.server.requests import postgres_schema as request_postgres_schema
@@ -444,8 +446,7 @@ def add_service(name: str,
         controller_config, controller_config_digest,
         controller_config_snapshot_id)
     engine = _db_manager.get_engine()
-    lb_ha_enabled = bool(spec is not None and
-                         getattr(spec, 'lb_high_availability', False))
+    lb_ha_enabled = bool(spec is not None and spec.lb_high_availability)
     if (lb_ha_enabled and
             engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
         raise RuntimeError('External load balancer high availability requires '
@@ -553,7 +554,8 @@ def add_service(name: str,
                     resource_scope=resource_scope,
                     entrypoint=entrypoint,
                     logical_replica_semantics=int(
-                        getattr(spec, 'uses_logical_replicas', False) is True),
+                        spec is not None and
+                        spec.uses_logical_replicas is True),
                     lb_ha_enabled=int(lb_ha_enabled),
                     lb_active_slot=(lb_ha.LbSlot.A.value
                                     if lb_ha_enabled else None),
@@ -2049,11 +2051,13 @@ def service_replica_launch_fence_holds(launch_context: dict[str, Any]) -> bool:
                  owner.get('launch_authorized_version') == service_version))
 
 
-_require_postgresql_lb_cutover = getattr(lb_cutover_state,
-                                         '_require_postgresql_lb_cutover')
+_require_postgresql_lb_cutover = (
+    lb_cutover_state._require_postgresql_lb_cutover  # pylint: disable=protected-access
+)
 get_lb_cutover_state = lb_cutover_state.get_lb_cutover_state
-_lb_cutover_owner_predicates = getattr(lb_cutover_state,
-                                       '_lb_cutover_owner_predicates')
+_lb_cutover_owner_predicates = (
+    lb_cutover_state._lb_cutover_owner_predicates  # pylint: disable=protected-access
+)
 begin_lb_ha_migration = lb_cutover_state.begin_lb_ha_migration
 finish_lb_ha_migration = lb_cutover_state.finish_lb_ha_migration
 begin_lb_ha_rollback = lb_cutover_state.begin_lb_ha_rollback
@@ -2068,10 +2072,7 @@ get_lb_demand_handoff = lb_cutover_state.get_lb_demand_handoff
 mark_lb_demand_handoff_complete = (
     lb_cutover_state.mark_lb_demand_handoff_complete)
 clear_lb_demand_handoff = lb_cutover_state.clear_lb_demand_handoff
-lb_cutover_kubernetes_guard: typing.Callable[
-    ..., typing.ContextManager[bool]] = typing.cast(
-        typing.Callable[..., typing.ContextManager[bool]],
-        getattr(lb_cutover_state, 'lb_cutover_kubernetes_guard'))
+lb_cutover_kubernetes_guard = _lb_cutover_kubernetes_guard
 abort_lb_cutover_preparation = (lb_cutover_state.abort_lb_cutover_preparation)
 
 
@@ -2288,8 +2289,9 @@ def get_orphaned_service_child_mode(service_name: str) -> bool | None:
             return None
     for spec_bytes, yaml_content in version_rows:
         try:
-            spec = pickle.loads(spec_bytes)
-            if spec is not None and hasattr(spec, 'pool'):
+            spec = typing.cast('Optional[service_spec.SkyServiceSpec]',
+                               pickle.loads(spec_bytes))
+            if spec is not None:
                 modes.add(bool(spec.pool))
                 continue
         except Exception:  # pylint: disable=broad-except
@@ -2489,8 +2491,7 @@ def _require_system_recovery_postgres() -> sqlalchemy.engine.Engine:
 
 
 def _system_recovery_storage_fields() -> tuple[str, ...]:
-    fields = getattr(replica_info_lib, 'SYSTEM_RECOVERY_STORAGE_FIELDS',
-                     _SYSTEM_RECOVERY_STORAGE_FIELDS_FALLBACK)
+    fields = replica_info_lib.SYSTEM_RECOVERY_STORAGE_FIELDS
     if (not isinstance(fields, tuple) or
             fields != _SYSTEM_RECOVERY_STORAGE_FIELDS_FALLBACK):
         raise ReplicaSystemRecoveryMutationRejected(
@@ -2500,8 +2501,7 @@ def _system_recovery_storage_fields() -> tuple[str, ...]:
 
 
 def _v13_additive_storage_fields() -> tuple[str, ...]:
-    fields = getattr(replica_info_lib, 'V13_ADDITIVE_STORAGE_FIELDS',
-                     _V13_ADDITIVE_STORAGE_FIELDS_FALLBACK)
+    fields = replica_info_lib.V13_ADDITIVE_STORAGE_FIELDS
     if (not isinstance(fields, tuple) or
             fields != _V13_ADDITIVE_STORAGE_FIELDS_FALLBACK):
         raise ReplicaSystemRecoveryMutationRejected(
@@ -2523,16 +2523,13 @@ def _copy_system_recovery_fields(source: 'replica_managers.ReplicaInfo',
     Recovery transitions use the same primitive only after their expected
     revision has been checked under lock.
     """
-    copy_fields = getattr(replica_info_lib, 'copy_system_recovery_fields', None)
-    if copy_fields is None:
-        raise ReplicaSystemRecoveryMutationRejected(
-            'Replica v13 recovery-copy helper is unavailable.')
-    copy_fields(source, destination, increment_revision=increment_revision)
+    replica_info_lib.copy_system_recovery_fields(
+        source, destination, increment_revision=increment_revision)
 
 
 def _system_recovery_revision(
         replica_info: 'replica_managers.ReplicaInfo') -> int:
-    revision = getattr(replica_info, 'system_recovery_revision', None)
+    revision = replica_info.system_recovery_revision
     if (isinstance(revision, bool) or not isinstance(revision, int) or
             revision < 0):
         raise ReplicaSystemRecoveryMutationRejected(
@@ -2542,19 +2539,27 @@ def _system_recovery_revision(
 
 def _system_recovery_snapshot(
         replica_info: 'replica_managers.ReplicaInfo') -> tuple[Any, ...]:
-    return tuple(
-        copy.deepcopy(getattr(replica_info, field_name))
-        for field_name in _system_recovery_storage_fields())
+    _system_recovery_storage_fields()
+    return (
+        copy.deepcopy(replica_info.system_recovery_launch_intent),
+        copy.deepcopy(replica_info.system_recovery_disposition),
+        copy.deepcopy(replica_info.launch_request_id),
+        copy.deepcopy(replica_info.service_job_id),
+        copy.deepcopy(replica_info.candidate_ready_observed_at),
+        copy.deepcopy(replica_info.ordinary_release_not_before),
+        copy.deepcopy(replica_info.system_recovery_revision),
+        copy.deepcopy(replica_info.system_recovery),
+        copy.deepcopy(replica_info.system_recovery_quarantine),
+    )
 
 
 def _enum_value(value: Any) -> Any:
-    return getattr(value, 'value', value)
+    return value.value if isinstance(value, enum.Enum) else value
 
 
 def _system_recovery_disposition(
         replica_info: 'replica_managers.ReplicaInfo') -> str:
-    disposition = _enum_value(
-        getattr(replica_info, 'system_recovery_disposition', None))
+    disposition = _enum_value(replica_info.system_recovery_disposition)
     if disposition not in ('ORDINARY', 'CANDIDATE', 'CAPABLE'):
         raise ReplicaSystemRecoveryMutationRejected(
             'Replica has an invalid system-recovery disposition.')
@@ -2571,14 +2576,10 @@ def _has_system_recovery_teardown_intent(
 
 def _nested_system_recovery_is_exhausted(
         replica_info: 'replica_managers.ReplicaInfo') -> bool:
-    recovery = getattr(replica_info, 'system_recovery', None)
+    recovery = replica_info.system_recovery
     if recovery is None:
         return False
-    for field_name in ('controller_state', 'state', 'phase'):
-        value = getattr(recovery, field_name, None)
-        if _enum_value(value) == 'EXHAUSTED':
-            return True
-    return False
+    return _enum_value(recovery.state) == 'EXHAUSTED'
 
 
 def _validate_system_recovery_transition(
@@ -2596,13 +2597,13 @@ def _validate_system_recovery_transition(
         return
 
     if (_has_system_recovery_teardown_intent(current) or
-            getattr(current, 'system_recovery_quarantine', None) is not None or
+            current.system_recovery_quarantine is not None or
             _nested_system_recovery_is_exhausted(current)):
         raise ReplicaSystemRecoveryMutationRejected(
             'Terminal teardown, exhaustion, and quarantine are absorbing.')
 
-    current_intent = getattr(current, 'system_recovery_launch_intent', None)
-    desired_intent = getattr(desired, 'system_recovery_launch_intent', None)
+    current_intent = current.system_recovery_launch_intent
+    desired_intent = desired.system_recovery_launch_intent
     if current_intent is not None and desired_intent != current_intent:
         raise ReplicaSystemRecoveryMutationRejected(
             'A persisted recovery launch intent is immutable.')
@@ -2611,20 +2612,20 @@ def _validate_system_recovery_transition(
         raise ReplicaSystemRecoveryMutationRejected(
             'Candidate/capable state requires an exact launch intent.')
 
-    current_request_id = getattr(current, 'launch_request_id', None)
-    desired_request_id = getattr(desired, 'launch_request_id', None)
+    current_request_id = current.launch_request_id
+    desired_request_id = desired.launch_request_id
     if (current_request_id is not None and
             desired_request_id != current_request_id):
         raise ReplicaSystemRecoveryMutationRejected(
             'A bound launch request ID is immutable.')
-    current_job_id = getattr(current, 'service_job_id', None)
-    desired_job_id = getattr(desired, 'service_job_id', None)
+    current_job_id = current.service_job_id
+    desired_job_id = desired.service_job_id
     if current_job_id is not None and desired_job_id != current_job_id:
         raise ReplicaSystemRecoveryMutationRejected(
             'A bound service job ID is immutable.')
 
-    current_quarantine = getattr(current, 'system_recovery_quarantine', None)
-    desired_quarantine = getattr(desired, 'system_recovery_quarantine', None)
+    current_quarantine = current.system_recovery_quarantine
+    desired_quarantine = desired.system_recovery_quarantine
     if current_quarantine is not None and desired_quarantine != current_quarantine:
         raise ReplicaSystemRecoveryMutationRejected(
             'System-recovery quarantine is absorbing.')
@@ -2705,10 +2706,9 @@ def _lock_and_merge_existing_replica_rows_in_session(
         int(row.replica_id): _replica_from_state(
             row.replica_state_version, row.replica_state) for row in rows
     }
-    if any(
-            getattr(incoming, 'replica_record_id', None) != getattr(
-                latest_by_id[replica_id], 'replica_record_id', None)
-            for replica_id, incoming in replica_infos):
+    if any(incoming.replica_record_id !=
+           latest_by_id[replica_id].replica_record_id
+           for replica_id, incoming in replica_infos):
         return None
     merged = []
     for replica_id, incoming in replica_infos:
@@ -2721,7 +2721,7 @@ def _lock_and_merge_existing_replica_rows_in_session(
 def _validate_replica_row_identity(
         replica_id: int, replica_info: 'replica_managers.ReplicaInfo') -> None:
     """Require the physical key and versioned payload to name one replica."""
-    payload_replica_id = getattr(replica_info, 'replica_id', None)
+    payload_replica_id = replica_info.replica_id
     if (isinstance(replica_id, bool) or not isinstance(replica_id, int) or
             isinstance(payload_replica_id, bool) or
             not isinstance(payload_replica_id, int) or
@@ -2749,10 +2749,9 @@ def _replica_row_values(
             (sky_down_status.value if sky_down_status is not None else None),
         'version': replica_info.version,
         'cluster_name': replica_info.cluster_name,
-        'created_at': getattr(replica_info, 'created_at', None),
+        'created_at': replica_info.created_at,
         'is_spot': replica_info.is_spot,
-        'paid_capacity_pool_key': getattr(replica_info,
-                                          'paid_capacity_pool_key', None),
+        'paid_capacity_pool_key': replica_info.paid_capacity_pool_key,
         'replica_state': replica_state,
     }
     assert tuple(values) == _LEGACY_REPLICA_ROW_COLUMNS
@@ -3039,13 +3038,12 @@ def _mutate_replica_system_recovery(
                 desired.replica_id != replica_id):
             raise ReplicaSystemRecoveryMutationRejected(
                 'Recovery transition returned a different replica.')
-        desired_intent = getattr(desired, 'system_recovery_launch_intent', None)
+        desired_intent = desired.system_recovery_launch_intent
         if (desired_intent is not None and
-            (getattr(desired_intent, 'service_hash',
-                     None) != expected_service_hash or
-             getattr(desired_intent, 'replica_id', None) != replica_id or
-             getattr(desired_intent, 'launch_generation', None) != replica_id or
-             getattr(desired_intent, 'workspace', None) != owner.workspace)):
+            (desired_intent.service_hash != expected_service_hash or
+             desired_intent.replica_id != replica_id or
+             desired_intent.launch_generation != replica_id or
+             desired_intent.workspace != owner.workspace)):
             raise ReplicaSystemRecoveryMutationRejected(
                 'Recovery intent does not match its locked service generation.')
         _validate_system_recovery_transition(current, desired)
@@ -3111,8 +3109,8 @@ def create_replica_system_recovery_candidate(
     expected_revision: int,
 ) -> 'replica_managers.ReplicaInfo':
     """Persist the first owner-fenced CANDIDATE transition."""
-    if (_system_recovery_disposition(desired_info) != 'CANDIDATE' or getattr(
-            desired_info, 'system_recovery_launch_intent', None) is None):
+    if (_system_recovery_disposition(desired_info) != 'CANDIDATE' or
+            desired_info.system_recovery_launch_intent is None):
         raise ValueError('Candidate persistence requires an exact intent.')
     return patch_replica_system_recovery(
         service_name,
@@ -3178,16 +3176,16 @@ def bind_replica_system_recovery_launch_request(
                 'System-recovery workspace changed before request bind.')
         current = _lock_replica_info_for_system_recovery(
             session, service_name, replica_id)
-        if (_has_system_recovery_teardown_intent(current) or getattr(
-                current, 'system_recovery_quarantine', None) is not None or
+        if (_has_system_recovery_teardown_intent(current) or
+                current.system_recovery_quarantine is not None or
                 _nested_system_recovery_is_exhausted(current) or
                 _system_recovery_disposition(current) != 'CANDIDATE'):
             raise ReplicaSystemRecoveryMutationRejected(
                 'Only a live CANDIDATE may bind a launch request.')
-        if getattr(current, 'launch_request_id', None) is not None:
+        if current.launch_request_id is not None:
             raise ReplicaSystemRecoveryMutationRejected(
                 'Recovery launch nonce was already consumed.')
-        intent = getattr(current, 'system_recovery_launch_intent', None)
+        intent = current.system_recovery_launch_intent
         if intent is None:
             raise ReplicaSystemRecoveryMutationRejected(
                 'Recovery candidate has no launch intent.')
@@ -4375,7 +4373,7 @@ def _lock_replica_record_ids_in_session(
                 replica_id = int(row.replica_id)
                 info = _replica_from_state(row.replica_state_version,
                                            row.replica_state)
-                record_id = getattr(info, 'replica_record_id', None)
+                record_id = info.replica_record_id
                 if (info.replica_id != replica_id or
                         not isinstance(record_id, str)):
                     return None
@@ -5223,8 +5221,7 @@ def add_or_update_version(
                 session.rollback()
                 return VersionCommitResult.STALE_VERSION
 
-        uses_logical_replicas = (getattr(spec, 'uses_logical_replicas', False)
-                                 is True)
+        uses_logical_replicas = spec.uses_logical_replicas is True
         semantics_row = session.execute(
             sqlalchemy.select(services_table.c.logical_replica_semantics,
                               services_table.c.lb_ha_enabled).where(
@@ -5236,7 +5233,7 @@ def add_or_update_version(
                 bool(semantics_row[0]) and not uses_logical_replicas):
             session.rollback()
             return VersionCommitResult.SEMANTIC_CONFLICT
-        requested_lb_ha = bool(getattr(spec, 'lb_high_availability', False))
+        requested_lb_ha = bool(spec.lb_high_availability)
         if (not identical_retry and semantics_row is not None and
                 bool(semantics_row[1]) != requested_lb_ha):
             # Enabling and disabling HA move Kubernetes traffic authority and
@@ -7509,9 +7506,9 @@ def _reserved_fill_replica_row_values(
         replica_info: 'replica_managers.ReplicaInfo', *, pool_key: str,
         expected_protocol_version: int) -> dict[str, Any] | None:
     """Build a row only for exact, protocol-attributed fill provenance."""
-    if getattr(replica_info, 'reserved_fill', None) is not True:
+    if replica_info.reserved_fill is not True:
         return None
-    persisted_pool_key = getattr(replica_info, 'reserved_fill_pool_key', None)
+    persisted_pool_key = replica_info.reserved_fill_pool_key
     if (persisted_pool_key != pool_key or
             _reserved_fill_pool_key_protocol(persisted_pool_key)
             != expected_protocol_version):
@@ -7660,12 +7657,11 @@ def add_replica_if_round_epoch(
                             expected_service_generation
                             for edge in edge_rows) or matching is None or
                         matching.physical_cluster_uid
-                        != expected_physical_cluster_uid or getattr(
-                            replica_info, 'reserved_fill_service_generation',
-                            None) != expected_service_generation or
-                        getattr(replica_info,
-                                'reserved_fill_physical_cluster_uid',
-                                None) != expected_physical_cluster_uid):
+                        != expected_physical_cluster_uid or
+                        replica_info.reserved_fill_service_generation
+                        != expected_service_generation or
+                        replica_info.reserved_fill_physical_cluster_uid
+                        != expected_physical_cluster_uid):
                     session.rollback()
                     return False
             row_values = _reserved_fill_replica_row_values(

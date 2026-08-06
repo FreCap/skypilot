@@ -7,6 +7,7 @@ logical targets divide demand by the per-GPU saturation knob and publish GPU
 slots. Neither mode shrinks while its demand signal is stale (a rebuilt
 controller must not mass-retire a live fleet before the first LB sync).
 """
+import dataclasses
 import math
 import threading
 # pylint: disable=protected-access
@@ -24,6 +25,45 @@ from sky.utils import common_utils
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
 _SCALE_DOWN = autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+
+
+@dataclasses.dataclass
+class _AutoscalerSpec:
+    """Complete mutable test implementation of SkyServiceSpec's interface."""
+
+    min_replicas: int = 0
+    min_replicas_by_accelerator: dict[str, int] = dataclasses.field(
+        default_factory=dict)
+    max_replicas: int | None = 20
+    num_overprovision: int | None = None
+    target_qps_per_replica: float | dict[str, float] | None = None
+    target_concurrency_per_replica: float | None = 1.0
+    replica_unit: str = 'physical_backend'
+    target_utilization_percentage: int = 100
+    expected_request_duration_seconds: float | None = None
+    initial_provision_lead_time_seconds: float | str | None = None
+    adaptive_demand_estimation: bool | None = None
+    max_scale_up_rate_percentage: int | None = None
+    scale_up_rate_min_replicas: int | None = None
+    scale_up_rate_period_seconds: int | None = None
+    adaptive_scale_up: dict | None = None
+    max_scale_down_rate_percentage: int = 100
+    lb_request_queue: dict | None = None
+    reserved_capacity_fill: bool = False
+    reserved_fill_floor_replicas: int = 0
+    reserved_fill_weight: float = 1.0
+    reserved_fill_utilization_gate: bool = False
+    cost_rebalance: bool = False
+    cost_rebalance_min_savings_fraction: float = 0.3
+    cost_rebalance_max_parallel_replacements: int = 1
+    cost_rebalance_stabilization_seconds: float = 300.0
+    upscale_delay_seconds: int | None = None
+    downscale_delay_seconds: int | None = None
+    pool: bool = False
+    use_ondemand_fallback: bool = False
+    dynamic_ondemand_fallback: bool | None = None
+    base_ondemand_fallback_replicas: int | None = None
+    queue_length_threshold: int | None = None
 
 
 def _spec(knob=1.0,
@@ -49,7 +89,7 @@ def _spec(knob=1.0,
     # thresholds of 1 tick, so most tests observe target changes on the
     # first post-snap recompute.
     interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
-    return types.SimpleNamespace(
+    return _AutoscalerSpec(
         min_replicas=min_replicas,
         min_replicas_by_accelerator=(min_replicas_by_accelerator or {}),
         max_replicas=max_replicas,
@@ -99,8 +139,13 @@ def _replica(replica_id,
                              if planned_capacity is None else planned_capacity)
     info.unknown_capacity_replacement = False
     info.reserved_fill = reserved_fill
+    info.created_at = None
+    info.is_zero_cost = False
+    info.cost_rebalance_for_replica_id = None
     info.status_property.sky_launch_status = (
         common_utils.ProcessStatus.SUCCEEDED)
+    info.status_property.sky_down_status = None
+    info.status_property.first_ready_time = None
     info.status_property.is_scale_down = False
     info.status_property.unrecoverable_failure.return_value = False
     info.resources_override = {'accelerators': {card: gpu_count}}
@@ -220,20 +265,12 @@ class TestFromSpecSelection(unittest.TestCase):
             autoscalers.Autoscaler.from_spec('svc', spec, version=1)
         mock_cls.assert_called_once()
 
-    def test_spec_without_knob_attribute_falls_through(self):
-        # from_spec must stay robust against spec objects predating the
-        # knob (e.g. unpickled from old DB rows): no attribute at all.
-        spec = types.SimpleNamespace(min_replicas=1,
-                                     max_replicas=2,
-                                     num_overprovision=None,
-                                     pool=False,
-                                     use_ondemand_fallback=False,
-                                     target_qps_per_replica=2.0,
-                                     upscale_delay_seconds=None,
-                                     downscale_delay_seconds=None)
-        autoscaler = autoscalers.Autoscaler.from_spec('svc', spec)
-        self.assertIsInstance(autoscaler, autoscalers.RequestRateAutoscaler)
-        self.assertNotIsInstance(autoscaler, autoscalers.ConcurrencyAutoscaler)
+    def test_incomplete_spec_interface_is_rejected(self):
+        # Persisted SkyServiceSpec objects are normalized by __setstate__.
+        # Other callers must implement the current interface explicitly.
+        spec = types.SimpleNamespace(pool=False)
+        with self.assertRaises(AttributeError):
+            autoscalers.Autoscaler.from_spec('svc', spec)
 
     def test_none_knob_falls_through(self):
         spec = _spec(knob=None)
@@ -242,6 +279,14 @@ class TestFromSpecSelection(unittest.TestCase):
         spec.target_qps_per_replica = 2.0
         autoscaler = autoscalers.Autoscaler.from_spec('svc', spec)
         self.assertIsInstance(autoscaler, autoscalers.RequestRateAutoscaler)
+
+    def test_base_interface_exposes_replica_unit(self):
+        spec = _spec(knob=None)
+        spec.target_qps_per_replica = 2.0
+
+        autoscaler = autoscalers.Autoscaler.from_spec('svc', spec)
+
+        self.assertEqual(autoscaler.replica_unit, 'physical_backend')
 
 
 class TestColdPaidCardOrdering(unittest.TestCase):
@@ -915,7 +960,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
     @staticmethod
     def _instance_aware_autoscaler():
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
-        spec = types.SimpleNamespace(
+        spec = _AutoscalerSpec(
             min_replicas=0,
             min_replicas_by_accelerator={},
             max_replicas=100,
@@ -924,6 +969,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 'L4': 1.0,
                 'A100': 1.0,
             },
+            target_concurrency_per_replica=None,
             upscale_delay_seconds=2 * interval,
             downscale_delay_seconds=2 * interval,
         )
@@ -6177,6 +6223,14 @@ class TestUpdateVersion(unittest.TestCase):
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_num_replicas, 5)
 
+    def test_update_refreshes_base_replica_unit(self):
+        autoscaler = _make_autoscaler(knob=1.0)
+
+        autoscaler.update_version(2, _spec(knob=1.0, replica_unit='logical'),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+
+        self.assertEqual(autoscaler.replica_unit, 'logical')
+
     def test_update_resets_logical_downscale_elapsed_window(self):
         autoscaler = _make_autoscaler(knob=1.0,
                                       replica_unit='logical',
@@ -6337,13 +6391,14 @@ class TestUpdateVersion(unittest.TestCase):
                 }],
                 rejected_profiles=[],
                 compatibility_complete=True)
-        qps_spec = types.SimpleNamespace(min_replicas=0,
-                                         min_replicas_by_accelerator={},
-                                         max_replicas=4,
-                                         num_overprovision=None,
-                                         target_qps_per_replica={'H100': 1.0},
-                                         upscale_delay_seconds=0,
-                                         downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={},
+                                   max_replicas=4,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={'H100': 1.0},
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)
@@ -6392,16 +6447,17 @@ class TestUpdateVersion(unittest.TestCase):
                 queued_profiles=[],
                 rejected_profiles=[],
                 compatibility_complete=True)
-        qps_spec = types.SimpleNamespace(min_replicas=0,
-                                         min_replicas_by_accelerator={},
-                                         max_replicas=4,
-                                         num_overprovision=None,
-                                         target_qps_per_replica={
-                                             'A100': 1.0,
-                                             'H100': 1.0,
-                                         },
-                                         upscale_delay_seconds=0,
-                                         downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={},
+                                   max_replicas=4,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={
+                                       'A100': 1.0,
+                                       'H100': 1.0,
+                                   },
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)
@@ -6453,16 +6509,17 @@ class TestUpdateVersion(unittest.TestCase):
                 in_flight={},
                 timestamps=[now] * 600,
                 compatibility_complete=False)
-        qps_spec = types.SimpleNamespace(min_replicas=0,
-                                         min_replicas_by_accelerator={},
-                                         max_replicas=20,
-                                         num_overprovision=None,
-                                         target_qps_per_replica={
-                                             'A100': 1.0,
-                                             'H100': 1.0,
-                                         },
-                                         upscale_delay_seconds=0,
-                                         downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={},
+                                   max_replicas=20,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={
+                                       'A100': 1.0,
+                                       'H100': 1.0,
+                                   },
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)
@@ -6505,16 +6562,17 @@ class TestUpdateVersion(unittest.TestCase):
                     'count': 60,
                 }],
                 compatibility_complete=True)
-        qps_spec = types.SimpleNamespace(min_replicas=0,
-                                         min_replicas_by_accelerator={},
-                                         max_replicas=20,
-                                         num_overprovision=None,
-                                         target_qps_per_replica={
-                                             'A100': 1.0,
-                                             'H100': 1.0,
-                                         },
-                                         upscale_delay_seconds=0,
-                                         downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={},
+                                   max_replicas=20,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={
+                                       'A100': 1.0,
+                                       'H100': 1.0,
+                                   },
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)
@@ -6544,14 +6602,14 @@ class TestUpdateVersion(unittest.TestCase):
                     'count': 120,
                 }],
                 compatibility_complete=True)
-        qps_spec = types.SimpleNamespace(
-            min_replicas=0,
-            min_replicas_by_accelerator={'H100': 1},
-            max_replicas=4,
-            num_overprovision=None,
-            target_qps_per_replica={'H100': 1.0},
-            upscale_delay_seconds=0,
-            downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={'H100': 1},
+                                   max_replicas=4,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={'H100': 1.0},
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)

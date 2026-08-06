@@ -82,10 +82,10 @@ def _catalog_missing_task_contexts(
 
     declared: set[str] = set()
     for resources in (task.resources or []):
-        cloud = getattr(resources, 'cloud', None)
+        cloud = resources.cloud
         if cloud is None or str(cloud).lower() != 'kubernetes':
             continue
-        region = getattr(resources, 'region', None)
+        region = resources.region
         if isinstance(region, str) and region:
             declared.add(region)
     if not declared:
@@ -361,8 +361,7 @@ class SkyServeController:
                                   controller_ip is not None else None)
         if (service_hash is not None and
                 serve_state.service_uses_logical_replica_semantics(service_name)
-                and getattr(service_spec, 'uses_logical_replicas',
-                            False) is not True):
+                and service_spec.uses_logical_replicas is not True):
             raise RuntimeError(
                 'Refusing to recover a service whose durable logical-replica '
                 'activation fence disagrees with its latest specification.')
@@ -416,9 +415,9 @@ class SkyServeController:
         self._lb_demand_lock: asyncio.Lock | None = None
         durable_lb_state = (serve_state.get_lb_cutover_state(service_name)
                             if service_hash is not None else None)
-        self._lb_ha_enabled = (
-            durable_lb_state.enabled if durable_lb_state is not None else
-            getattr(service_spec, 'lb_high_availability', False) is True)
+        self._lb_ha_enabled = (durable_lb_state.enabled
+                               if durable_lb_state is not None else
+                               service_spec.lb_high_availability is True)
         self._lb_session_ledger = (lb_ha.LbSessionLedger(
             serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
@@ -485,7 +484,7 @@ class SkyServeController:
         # poller_loop). The poller is the only component allowed to
         # issue the expensive cluster-wide realtime free-GPU query.
         self._reserved_capacity_fill_enabled: bool = bool(
-            getattr(service_spec, 'reserved_capacity_fill', False))
+            service_spec.reserved_capacity_fill)
         self._reserved_capacity_poller_started: bool = False
         # update_service handlers run in FastAPI's threadpool, so two
         # concurrent fill-enabling updates could both observe the
@@ -588,14 +587,13 @@ class SkyServeController:
         """Persist stabilization before authorizing economic scale-up."""
         if not autoscaler.cost_rebalance_state_dirty:
             return True
-        service_hash = getattr(self, '_service_hash', None)
+        service_hash = self._service_hash
         if service_hash is None:
             autoscaler.mark_cost_rebalance_state_persisted()
             return True
         try:
             persisted = serve_state.set_service_cost_rebalance_state(
-                self._service_name, service_hash,
-                getattr(self, '_controller_owner', None),
+                self._service_name, service_hash, self._controller_owner,
                 autoscaler.dump_cost_rebalance_state())
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
@@ -640,8 +638,8 @@ class SkyServeController:
             self._service_name, require_version=True)
         assert runtime_snapshot is not None, ('No service record found for '
                                               f'{self._service_name}')
-        service_hash = getattr(self, '_service_hash', None)
-        controller_owner = getattr(self, '_controller_owner', None)
+        service_hash = self._service_hash
+        controller_owner = self._controller_owner
         if (service_hash is not None and
             (runtime_snapshot.get('hash') != service_hash or
              (runtime_snapshot.get('controller_pid'),
@@ -677,8 +675,8 @@ class SkyServeController:
             info: 'replica_managers.ReplicaInfo'
         ) -> tuple[str, str, int] | None:
             cached = self._lb_replica_cache.get(info.replica_id)
-            if getattr(self, '_lb_replica_cache_record_ids',
-                       {}).get(info.replica_id) != info.replica_record_id:
+            if (self._lb_replica_cache_record_ids.get(info.replica_id)
+                    != info.replica_record_id):
                 return None
             return cached
 
@@ -960,7 +958,7 @@ class SkyServeController:
             replica_id: cached
             for replica_id, cached in self._lb_translation_cache.items()
             if (replica_id in nonterminal_records and
-                getattr(self, '_lb_translation_cache_record_ids', {}).get(
+                self._lb_translation_cache_record_ids.get(
                     replica_id) == nonterminal_records[replica_id])
         }
         translation_cache_record_ids = {
@@ -1033,7 +1031,7 @@ class SkyServeController:
         observed_slots: dict[int, int],
     ) -> dict[int, int]:
         """Return fresh physical-bridge widths bounded by launched GPUs."""
-        if getattr(self._autoscaler, 'replica_unit', None) != 'logical':
+        if self._autoscaler.replica_unit != 'logical':
             return {}
         candidates: dict[int, int] = {}
         for info in replica_infos:
@@ -1042,13 +1040,9 @@ class SkyServeController:
             observed = observed_slots.get(info.replica_id)
             if observed is None or observed < 1:
                 continue
-            current = getattr(info, 'planned_capacity', 1)
-            if (isinstance(current, bool) or not isinstance(current, int) or
-                    current < 1):
-                current = 1
-            durable_bound = (current if bool(
-                getattr(info, 'logical_bridge_capacity_verified', False)) else
-                             1)
+            current = info.planned_capacity
+            durable_bound = (current
+                             if info.logical_bridge_capacity_verified else 1)
             cached = self._lb_translation_cache.get(info.replica_id)
             if cached is None:
                 observed_slots[info.replica_id] = min(observed, durable_bound)
@@ -1061,8 +1055,7 @@ class SkyServeController:
             verified = min(observed, gpu_count)
             # Pass only state transitions to the manager. This keeps the LB
             # sync hot path free of a redundant DB read/write per heartbeat.
-            if (not bool(
-                    getattr(info, 'logical_bridge_capacity_verified', False)) or
+            if (not info.logical_bridge_capacity_verified or
                     verified > current):
                 candidates[info.replica_id] = verified
             # Reporter-controlled values must never reach the autoscaler above
@@ -1207,14 +1200,11 @@ class SkyServeController:
             replica_infos, logical_versions, observed_slots)
         if not bridge_candidates:
             return
-        confirmer = getattr(self._replica_manager,
-                            'confirm_logical_bridge_capacities', None)
-        if not callable(confirmer):
-            return
         loop = asyncio.get_running_loop()
         try:
-            confirmed = await loop.run_in_executor(None, confirmer,
-                                                   bridge_candidates)
+            confirmed = await loop.run_in_executor(
+                None, self._replica_manager.confirm_logical_bridge_capacities,
+                bridge_candidates)
         except Exception as e:  # pylint: disable=broad-except
             logger.warning('Failed to persist verified logical bridge '
                            'capacity; retaining conservative width one: '
@@ -1300,7 +1290,7 @@ class SkyServeController:
         autoscaler/replica-manager phase.
         """
         (reporter_is_live, demand_authoritative, _) = authority
-        ha_enabled = getattr(self, '_lb_ha_enabled', False)
+        ha_enabled = self._lb_ha_enabled
         if not reporter_is_live:
             logger.warning('Ignoring non-authoritative load balancer demand '
                            'and drain report for service '
@@ -1316,31 +1306,30 @@ class SkyServeController:
                     self._restore_lb_demand_handoff(state.generation)
                     complete_report = self._lb_demand_report_is_complete(
                         request_data)
-                    handoff = getattr(self, '_lb_demand_handoff', None)
-                    if handoff is not None:
-                        if (complete_report and
-                                handoff.complete_report_at is None and
-                                handoff.generation == state.generation):
-                            fence = self._lb_cutover_fence()
-                            if fence is not None:
-                                service_hash, owner, lifecycle_epoch = fence
-                                complete_at = (
-                                    serve_state.mark_lb_demand_handoff_complete(
-                                        self._service_name, service_hash, owner,
-                                        lifecycle_epoch, state.generation))
-                                handoff.restore(handoff.generation,
-                                                handoff.snapshot, complete_at)
-                        handoff_generation = handoff.generation
-                        effective_request_data = handoff.apply(
-                            state.generation, request_data, complete_report)
-                        if (handoff_generation is not None and
-                                handoff.generation is None):
-                            fence = self._lb_cutover_fence()
-                            if fence is not None:
-                                service_hash, owner, lifecycle_epoch = fence
-                                serve_state.clear_lb_demand_handoff(
+                    handoff = self._lb_demand_handoff
+                    if (complete_report and
+                            handoff.complete_report_at is None and
+                            handoff.generation == state.generation):
+                        fence = self._lb_cutover_fence()
+                        if fence is not None:
+                            service_hash, owner, lifecycle_epoch = fence
+                            complete_at = (
+                                serve_state.mark_lb_demand_handoff_complete(
                                     self._service_name, service_hash, owner,
-                                    lifecycle_epoch, handoff_generation)
+                                    lifecycle_epoch, state.generation))
+                            handoff.restore(handoff.generation,
+                                            handoff.snapshot, complete_at)
+                    handoff_generation = handoff.generation
+                    effective_request_data = handoff.apply(
+                        state.generation, request_data, complete_report)
+                    if (handoff_generation is not None and
+                            handoff.generation is None):
+                        fence = self._lb_cutover_fence()
+                        if fence is not None:
+                            service_hash, owner, lifecycle_epoch = fence
+                            serve_state.clear_lb_demand_handoff(
+                                self._service_name, service_hash, owner,
+                                lifecycle_epoch, handoff_generation)
                 demand_snapshot = lb_ha.DemandSnapshot.from_request(
                     request_data)
                 self._lb_last_demand_snapshot = demand_snapshot
@@ -1395,8 +1384,7 @@ class SkyServeController:
             effective_request_data.get('occupancy_sampled_urls', []),
             effective_request_data.get('unknown_in_flight_urls', []),
             force_all_live_unknown=(not drain_authoritative and not ha_enabled))
-        self._reconcile_generation = getattr(self, '_reconcile_generation',
-                                             0) + 1
+        self._reconcile_generation += 1
         reconcile_generation = self._reconcile_generation
         # Validate the reporter epoch and ingest its exact-card gauges under
         # the same lock used to publish a new catalog/version. The report is
@@ -1453,8 +1441,8 @@ class SkyServeController:
                 'pressure_report_is_floored':
                     effective_request_data.get('pressure_report_is_floored'),
             })
-            if (translated_in_flight is not None and getattr(
-                    self._autoscaler, 'replica_unit', None) == 'logical'):
+            if (translated_in_flight is not None and
+                    self._autoscaler.replica_unit == 'logical'):
                 self._replica_manager.update_logical_reconcile_snapshot(
                     version=self._autoscaler.latest_version,
                     generation=reconcile_generation,
@@ -1581,7 +1569,7 @@ class SkyServeController:
             # Serialize only demand-handoff mutations; ordinary role
             # heartbeats do not take this lock and must remain responsive even
             # when PostgreSQL/Kubernetes fencing for a sync is slow.
-            demand_lock = getattr(self, '_lb_demand_lock', None)
+            demand_lock = self._lb_demand_lock
             if demand_lock is None:
                 demand_lock = asyncio.Lock()
                 self._lb_demand_lock = demand_lock
@@ -1664,7 +1652,7 @@ class SkyServeController:
                 # Legacy-selected and non-HA reporters can own drain state.
                 # Order their publication after any role transition that ran
                 # while the runtime tail waited on manager locks.
-                role_lock = getattr(self, '_lb_role_lock', None)
+                role_lock = self._lb_role_lock
                 if role_lock is None:
                     role_lock = asyncio.Lock()
                     self._lb_role_lock = role_lock
@@ -1732,7 +1720,7 @@ class SkyServeController:
 
     def _lb_promotion_report_is_current(self, request_data: dict[str,
                                                                  Any]) -> bool:
-        if not getattr(self, '_lb_occupancy_contract_known', False):
+        if not self._lb_occupancy_contract_known:
             return False
         routing_version = request_data.get('routing_version')
         if (not isinstance(routing_version, int) or
@@ -1820,8 +1808,8 @@ class SkyServeController:
         authority = self._lb_report_authority(request_data.get('lb_session_id'))
         if not authority[0]:
             return False
-        return self._apply_load_balancer_drain_report(
-            request_data, authority, getattr(self, '_lb_ha_enabled', False))
+        return self._apply_load_balancer_drain_report(request_data, authority,
+                                                      self._lb_ha_enabled)
 
     def _load_balancer_disclosure_is_authorized(self,
                                                 session_id: str | None) -> bool:
@@ -1977,9 +1965,8 @@ class SkyServeController:
             clean = report.complete and report.local_in_flight == 0
         drain_started_at = state.drain_started_at
         timed_out = (drain_started_at is not None and
-                     time.time() - drain_started_at >= getattr(
-                         self, '_lb_drain_timeout_seconds',
-                         serve_constants.LB_DRAIN_CLOSE_GRACE_SECONDS))
+                     time.time() - drain_started_at
+                     >= self._lb_drain_timeout_seconds)
         if timed_out and not clean:
             logger.warning('Finishing HA LB drain after the bounded Pod '
                            f'termination budget for {self._service_name!r}.')
@@ -2066,7 +2053,7 @@ class SkyServeController:
         if role_lock is None:
             role_lock = asyncio.Lock()
             self._lb_role_lock = role_lock
-        demand_lock = getattr(self, '_lb_demand_lock', None)
+        demand_lock = self._lb_demand_lock
         if demand_lock is None:
             demand_lock = asyncio.Lock()
             self._lb_demand_lock = demand_lock
@@ -2171,10 +2158,9 @@ class SkyServeController:
                     lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
 
             service_hash, expected_owner, lifecycle_epoch = fence
-            transition_legacy_selected = bool(
-                state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
-                                lb_ha.LbCutoverPhase.ROLLING_BACK) and
-                getattr(routing, 'legacy_selected', False))
+            transition_legacy_selected = (isinstance(
+                routing, lb_k8s.LbServiceTransitionRouting) and
+                                          routing.legacy_selected)
             ready_by_slot = {
                 candidate_slot: {
                     uid
@@ -2556,8 +2542,8 @@ class SkyServeController:
 
     def _owns_current_service(self) -> bool:
         """Whether this controller parent still owns the exact DB row."""
-        service_hash = getattr(self, '_service_hash', None)
-        controller_owner = getattr(self, '_controller_owner', None)
+        service_hash = self._service_hash
+        controller_owner = self._controller_owner
         if service_hash is None:
             # Compatibility for direct/legacy controller construction.
             return True
@@ -2579,18 +2565,16 @@ class SkyServeController:
         replica_versions = sorted({info.version for info in replica_infos})
         version_specs = serve_state.get_specs(self._service_name,
                                               replica_versions)
-        async_occupancy_by_version: dict[int, bool | None] = {
-            replica_version: None if version_specs.get(replica_version)
-                             is None else getattr(
-                                 version_specs[replica_version],
-                                 'graceful_drain_async_occupancy',
-                                 None) for replica_version in replica_versions
-        }
-        logical_versions = {
-            replica_version for replica_version in replica_versions
-            if getattr(version_specs.get(replica_version),
-                       'uses_logical_replicas', False) is True
-        }
+        async_occupancy_by_version: dict[int, bool | None] = {}
+        logical_versions: set[int] = set()
+        for replica_version in replica_versions:
+            version_spec = version_specs.get(replica_version)
+            async_occupancy_by_version[replica_version] = (
+                None if version_spec is None else
+                version_spec.graceful_drain_async_occupancy)
+            if (version_spec is not None and
+                    version_spec.uses_logical_replicas is True):
+                logical_versions.add(replica_version)
         return replica_infos, async_occupancy_by_version, logical_versions
 
     def _get_capacity_hint(
@@ -2625,22 +2609,21 @@ class SkyServeController:
         latest_version = self._autoscaler.latest_version
         num_provisioning = 0
         num_latest_demand_nonterminal = 0
-        logical = getattr(self._autoscaler, 'replica_unit', None) == 'logical'
+        logical = self._autoscaler.replica_unit == 'logical'
         if logical_versions is None:
             logical_versions = {latest_version} if logical else set()
         for info in replica_infos:
             if info.version != latest_version or info.is_terminal:
                 continue
-            if (logical and getattr(getattr(info, 'status_property', None),
-                                    'is_scale_down', False) is True):
+            if logical and info.status_property.is_scale_down is True:
                 continue
-            width = int(getattr(info, 'planned_capacity', 1)) if logical else 1
+            width = info.planned_capacity if logical else 1
             # reserved_fill is launch-origin attribution. The dedicated
             # ready/provisioning fields still describe all usable capacity,
             # but opportunistic fill cannot raise this traffic-intent floor.
             # Legacy rows missing the additive flag remain demand-owned,
             # matching the autoscaler's restart baseline.
-            if not getattr(info, 'reserved_fill', False):
+            if not info.reserved_fill:
                 num_latest_demand_nonterminal += width
             if not info.is_ready:
                 num_provisioning += width
@@ -2661,11 +2644,9 @@ class SkyServeController:
             for key, value in replica_counts.items()
             if key != 'replica_unit'
         })
-        min_by_accelerator = getattr(self._autoscaler,
-                                     'min_replicas_by_accelerator', {})
-        demand_by_accelerator = getattr(self._autoscaler,
-                                        'target_num_replicas_by_accelerator',
-                                        {})
+        min_by_accelerator = self._autoscaler.min_replicas_by_accelerator
+        demand_by_accelerator = (
+            self._autoscaler.target_num_replicas_by_accelerator)
         if (isinstance(self._autoscaler, autoscalers.ConcurrencyAutoscaler) and
                 not self._autoscaler.has_recomputed_with_fresh_data()):
             demand_by_accelerator = {}
@@ -2678,18 +2659,14 @@ class SkyServeController:
         if (isinstance(self._autoscaler, autoscalers.ConcurrencyAutoscaler) and
                 self._autoscaler.has_recomputed_with_fresh_data()):
             hint['warm_retention_target_by_accelerator'] = dict(
-                getattr(self._autoscaler,
-                        'warm_retention_target_by_accelerator', {}))
+                self._autoscaler.warm_retention_target_by_accelerator)
             hint['cold_launch_authority_by_accelerator'] = dict(
-                getattr(self._autoscaler,
-                        'cold_launch_authority_by_accelerator', {}))
+                self._autoscaler.cold_launch_authority_by_accelerator)
         if logical:
             planned_capacity_by_url = {
-                cached[0]: int(getattr(info, 'planned_capacity', 1))
-                for info in replica_infos
-                if (info.version in logical_versions or bool(
-                    getattr(info, 'logical_bridge_capacity_verified', False))
-                   ) and not info.is_terminal
+                cached[0]: info.planned_capacity for info in replica_infos
+                if (info.version in logical_versions or info.
+                    logical_bridge_capacity_verified) and not info.is_terminal
                 for cached in [self._lb_translation_cache.get(info.replica_id)]
                 if cached is not None
             }
@@ -2702,8 +2679,8 @@ class SkyServeController:
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> dict[str, Any]:
         """Return logical capacity and physical backend status aggregates."""
-        autoscaler = getattr(self, '_autoscaler', None)
-        logical = getattr(autoscaler, 'replica_unit', None) == 'logical'
+        autoscaler = self._autoscaler
+        logical = autoscaler.replica_unit == 'logical'
 
         ready = total = failed = 0
         physical_ready = physical_total = physical_failed = 0
@@ -2712,8 +2689,6 @@ class SkyServeController:
         total_by_accelerator: dict[str, int] = {}
         zero_cost_ready_by_accelerator: dict[str, int] = {}
         zero_cost_total_by_accelerator: dict[str, int] = {}
-        zero_cost_location_classifier = getattr(
-            autoscaler, 'is_replica_on_zero_cost_location', None)
         failed_statuses = serve_state.ReplicaStatus.failed_statuses()
         committed_unready_statuses = {
             serve_state.ReplicaStatus.PENDING,
@@ -2726,37 +2701,20 @@ class SkyServeController:
             # Pre-activation bridge rows deserialize with planned_capacity=1;
             # every logical version keeps its selected width. This lets a
             # rolling activation count both generations without spec queries.
-            planned_capacity = getattr(info, 'planned_capacity', 1)
-            width = (planned_capacity
-                     if logical and isinstance(planned_capacity, int) and
-                     not isinstance(planned_capacity, bool) and
-                     planned_capacity > 0 else 1)
+            width = info.planned_capacity if logical else 1
             cached = self._lb_translation_cache.get(info.replica_id)
             accelerator = cached[1] if cached is not None else 'unknown'
             if accelerator == 'unknown':
-                resources = getattr(getattr(info, 'handle', None),
-                                    'launched_resources', None)
-                accelerators = getattr(resources, 'accelerators', None)
-                if not accelerators:
-                    accelerators = (getattr(info, 'resources_override', None) or
-                                    {}).get('accelerators')
+                accelerators = (info.resources_override or
+                                {}).get('accelerators')
                 if isinstance(accelerators, dict) and accelerators:
                     accelerator = next(iter(accelerators))
             known_accelerator = accelerator != 'unknown'
-            is_zero_cost = info.is_zero_cost is True
-            if callable(zero_cost_location_classifier):
-                classified = zero_cost_location_classifier(info)
-                # Loose mocks used by callers may synthesize arbitrary
-                # attributes. Only the classifier's real boolean contract is
-                # accepted; persisted provenance remains a valid positive
-                # signal for builds/configurations without a location match.
-                if type(classified) is bool:
-                    is_zero_cost = is_zero_cost or classified
+            is_zero_cost = (info.is_zero_cost is True or
+                            autoscaler.is_replica_on_zero_cost_location(info))
             if status == serve_state.ReplicaStatus.READY:
-                capacity_getter = getattr(autoscaler,
-                                          'get_ready_replica_capacity', None)
-                observed_ready = (capacity_getter(info) if logical and
-                                  callable(capacity_getter) else width)
+                observed_ready = (autoscaler.get_ready_replica_capacity(info)
+                                  if logical else width)
                 ready += max(0, int(observed_ready))
                 physical_ready += 1
                 if known_accelerator:
@@ -2807,8 +2765,7 @@ class SkyServeController:
             zero_cost_total_by_accelerator, free_reserved)
         if fill_target:
             counts['fill_target_by_accelerator'] = fill_target
-        demand_target = getattr(autoscaler,
-                                'target_num_replicas_by_accelerator', {})
+        demand_target = autoscaler.target_num_replicas_by_accelerator
         if (isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler) and
                 not autoscaler.has_recomputed_with_fresh_data()):
             demand_target = {}
@@ -2817,23 +2774,21 @@ class SkyServeController:
         if (isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler) and
                 autoscaler.has_recomputed_with_fresh_data()):
             counts['warm_retention_target_by_accelerator'] = dict(
-                getattr(autoscaler, 'warm_retention_target_by_accelerator', {}))
+                autoscaler.warm_retention_target_by_accelerator)
             counts['cold_launch_authority_by_accelerator'] = dict(
-                getattr(autoscaler, 'cold_launch_authority_by_accelerator', {}))
+                autoscaler.cold_launch_authority_by_accelerator)
         counts['replica_unit'] = ('logical_slot'
                                   if logical else 'physical_backend')
         return counts
 
     def _get_free_reserved_slots_by_accelerator(self) -> dict[str, int]:
         """Return fresh observed physical supply for cataloged free cards."""
-        placer = getattr(getattr(self, '_replica_manager', None), 'spot_placer',
-                         None)
+        placer = self._replica_manager.spot_placer
         # LB sync is latency-sensitive and consumes both immutable catalog
         # identities and observations refreshed by the background poller.
-        getter = getattr(placer, 'zero_cost_locations', None)
-        if not callable(getter):
+        if placer is None:
             return {}
-        locations = getter()  # pylint: disable=not-callable
+        locations = placer.zero_cost_locations()
         if not isinstance(locations, list) or not locations:
             return {}
         shapes = reserved_capacity.zero_cost_pool_shapes(locations)
@@ -2859,17 +2814,15 @@ class SkyServeController:
         free_reserved: dict[str, int],
     ) -> dict[str, int]:
         """Return a fully attributable aggregate fill overlay by exact card."""
-        if getattr(self._autoscaler, 'reserved_capacity_fill',
-                   False) is not True:
+        if self._autoscaler.reserved_capacity_fill is not True:
             return {}
-        raw_aggregate_target = getattr(self._autoscaler, '_fill_target', 0)
+        raw_aggregate_target = self._autoscaler.fill_target
         aggregate_target = (max(0, raw_aggregate_target)
                             if isinstance(raw_aggregate_target, int) and
                             not isinstance(raw_aggregate_target, bool) else 0)
         card_order: list[str] = []
         seen: set[str] = set()
-        demand_target = getattr(self._autoscaler,
-                                'target_num_replicas_by_accelerator', {})
+        demand_target = self._autoscaler.target_num_replicas_by_accelerator
         if not isinstance(demand_target, dict):
             demand_target = {}
         for mapping in (demand_target, zero_cost_total, free_reserved):
@@ -2900,8 +2853,7 @@ class SkyServeController:
 
     def _configured_accelerators(self, service_spec: Any) -> list[str]:
         """Return configured exact accelerator IDs in service resource order."""
-        yaml_content = getattr(getattr(self, '_replica_manager', None),
-                               'yaml_content', None)
+        yaml_content = self._replica_manager.yaml_content
         if not isinstance(yaml_content, str):
             # Direct controller unit tests replace ReplicaManager with a loose
             # mock. A real manager always owns the committed YAML string.
@@ -2924,7 +2876,7 @@ class SkyServeController:
                     continue
                 seen.add(normalized)
                 configured.append(accelerator)
-        floors = getattr(service_spec, 'min_replicas_by_accelerator', {})
+        floors = service_spec.min_replicas_by_accelerator
         configured_by_name = {name.casefold(): name for name in configured}
         unknown_floors = [
             name for name in floors if name.casefold() not in configured_by_name
@@ -2959,8 +2911,7 @@ class SkyServeController:
                 'SkyServe exact-card compatibility requires one positive GPU '
                 'count shape per accelerator; found ambiguous shapes '
                 f'{ambiguous}.')
-        placer = getattr(getattr(self, '_replica_manager', None), 'spot_placer',
-                         None)
+        placer = self._replica_manager.spot_placer
         if len(configured) > 1 and not isinstance(task.resources,
                                                   list) and placer is None:
             if floors:
@@ -2978,7 +2929,7 @@ class SkyServeController:
         # the instance-aware QPS key order and then exact lexical order.
         if not isinstance(task.resources, list):
             qps_order: dict[str, int] = {}
-            target_qps = getattr(service_spec, 'target_qps_per_replica', {})
+            target_qps = service_spec.target_qps_per_replica
             if isinstance(target_qps, dict):
                 for key in target_qps:
                     card = key.partition(':')[0].casefold()
@@ -3035,8 +2986,7 @@ class SkyServeController:
         configured = self._configured_accelerators(service_spec)
         if not configured:
             return {}
-        yaml_content = getattr(getattr(self, '_replica_manager', None),
-                               'yaml_content', None)
+        yaml_content = self._replica_manager.yaml_content
         if not isinstance(yaml_content, str):
             return {}
         task = replica_managers.load_task_with_service_spec(
@@ -3069,8 +3019,7 @@ class SkyServeController:
             self, candidate_autoscaler: autoscalers.Autoscaler,
             service_spec: Any) -> dict[str, int]:
         """Resolve the exact catalog for one autoscaler/spec transition."""
-        if (getattr(service_spec, 'load_balancing_policy',
-                    None) != 'instance_aware_least_load' or
+        if (service_spec.load_balancing_policy != 'instance_aware_least_load' or
                 not isinstance(candidate_autoscaler,
                                (autoscalers.InstanceAwareRequestRateAutoscaler,
                                 autoscalers.ConcurrencyAutoscaler))):
@@ -3082,11 +3031,10 @@ class SkyServeController:
             service_spec: Any,
             candidate_autoscaler: autoscalers.Autoscaler | None = None) -> bool:
         """Whether routing and autoscaling share the exact-card contract."""
-        compatible_autoscaler = (getattr(self, '_autoscaler', None)
-                                 if candidate_autoscaler is None else
-                                 candidate_autoscaler)
-        return (getattr(service_spec, 'load_balancing_policy',
-                        None) == 'instance_aware_least_load' and
+        compatible_autoscaler = (self._autoscaler if candidate_autoscaler
+                                 is None else candidate_autoscaler)
+        return (service_spec.load_balancing_policy
+                == 'instance_aware_least_load' and
                 isinstance(compatible_autoscaler,
                            (autoscalers.InstanceAwareRequestRateAutoscaler,
                             autoscalers.ConcurrencyAutoscaler)))
@@ -3115,8 +3063,8 @@ class SkyServeController:
             # Lets an instance-aware LB weight replicas per-GPU when the
             # service sizes on concurrency (no QPS dict to weight by) --
             # and clear stale QPS weights after an update switches modes.
-            'target_concurrency_per_replica': getattr(
-                service_spec, 'target_concurrency_per_replica', None),
+            'target_concurrency_per_replica':
+                service_spec.target_concurrency_per_replica,
             'stream_timeout_seconds': service_spec.lb_stream_timeout_seconds,
             'retriable_status_codes':
                 (list(retriable_status_codes)
@@ -3124,7 +3072,7 @@ class SkyServeController:
             'max_retries': service_spec.lb_max_retries,
             'retry_initial_backoff_seconds':
                 (service_spec.lb_retry_initial_backoff_seconds),
-            'request_queue': getattr(service_spec, 'lb_request_queue', None),
+            'request_queue': service_spec.lb_request_queue,
         }
         if configured_accelerators:
             routing_spec.update({
@@ -3149,7 +3097,7 @@ class SkyServeController:
         immutable in-memory snapshot removes that mismatch window and avoids
         steady-state DB reads on the hottest serve control-plane path.
         """
-        return getattr(self, '_routing_spec', None)
+        return self._routing_spec
 
     def _load_service_for_update(self, version: int, yaml_content: str) -> Any:
         """Parse a new update or reuse an exact legacy committed spec.
@@ -3366,36 +3314,19 @@ class SkyServeController:
         threading.Thread(target=_terminate_for_recovery, daemon=True).start()
 
     def _get_actuation_epoch_lock(self) -> threading.RLock:
-        lock = getattr(self, '_actuation_epoch_lock', None)
-        if lock is None:
-            # Compatibility for tests and embedders that bypass __init__.
-            lock = threading.RLock()
-            self._actuation_epoch_lock = lock
-        return lock
+        return self._actuation_epoch_lock
 
     def _get_actuation_stop(self) -> threading.Event:
-        stop_event = getattr(self, '_actuation_stop', None)
-        if stop_event is None:
-            # Compatibility for tests and embedders that bypass __init__.
-            stop_event = threading.Event()
-            self._actuation_stop = stop_event
-        return stop_event
+        return self._actuation_stop
 
     def _get_update_reconciler_stop(self) -> threading.Event:
-        stop_event = getattr(self, '_update_reconciler_stop', None)
-        if stop_event is None:
-            # Compatibility for tests and embedders that bypass __init__.
-            stop_event = threading.Event()
-            self._update_reconciler_stop = stop_event
-        return stop_event
+        return self._update_reconciler_stop
 
     def _fence_actuation_for_update_recovery(self) -> None:
         """Irreversibly stop this partial child from changing fleet state."""
         self._update_recovery_required = True
         self._get_actuation_stop().set()
-        update_reconciler_stop = getattr(self, '_update_reconciler_stop', None)
-        if update_reconciler_stop is not None:
-            update_reconciler_stop.set()
+        self._update_reconciler_stop.set()
         self._replica_manager.fence_launches_for_update_recovery()
 
     def _mark_controller_applied_version(self, version: int) -> bool:
@@ -3629,11 +3560,10 @@ class SkyServeController:
                 validation_service,
                 expected_service_hash=requested_service_hash,
                 expected_lifecycle_epoch=lifecycle_epoch)
-        current_autoscaler = getattr(self, '_autoscaler', None)
-        if (authoritative_retry_service is None and getattr(
-                current_autoscaler, 'replica_unit', None) == 'logical' and
-                getattr(validation_service, 'replica_unit',
-                        'physical_backend') != 'logical'):
+        current_autoscaler = self._autoscaler
+        if (authoritative_retry_service is None and
+                current_autoscaler.replica_unit == 'logical' and
+                validation_service.replica_unit != 'logical'):
             self._discard_prepared_controller_config(prepared_config)
             return responses.JSONResponse(content={
                 'message': 'An existing dynamic_fallback_per_gpu service '
@@ -3641,8 +3571,7 @@ class SkyServeController:
                            'semantics. Create a new service for that migration.'
             },
                                           status_code=400)
-        if (getattr(validation_service, 'replica_unit',
-                    'physical_backend') == 'logical' and
+        if (validation_service.replica_unit == 'logical' and
                 update_mode == serve_utils.UpdateMode.BLUE_GREEN):
             self._discard_prepared_controller_config(prepared_config)
             return responses.JSONResponse(content={
@@ -3655,7 +3584,7 @@ class SkyServeController:
         placement_catalog = serve_state.get_placement_catalog(
             self._service_name, version)
         if (placement_catalog is not None and
-                getattr(validation_service, 'spot_placer', None) is not None):
+                validation_service.spot_placer is not None):
             # A catalog reused from an earlier commit enumerates the locations
             # that existed when it was built. Adding a Kubernetes context to a
             # service afterwards therefore has no effect: the context never
@@ -3674,11 +3603,11 @@ class SkyServeController:
                     f'the inherited catalog is missing Kubernetes context(s) '
                     f'{sorted(missing)} that the task declares.')
                 placement_catalog = None
-        needs_catalog = (getattr(validation_service, 'spot_placer', None)
-                         is not None and placement_catalog is None)
-        needs_logical_validation = (
-            authoritative_retry_service is None and
-            getattr(validation_service, 'uses_logical_replicas', False) is True)
+        needs_catalog = (validation_service.spot_placer is not None and
+                         placement_catalog is None)
+        needs_logical_validation = (authoritative_retry_service is None and
+                                    validation_service.uses_logical_replicas
+                                    is True)
         if needs_catalog or needs_logical_validation:
             try:
                 if needs_catalog:
@@ -3833,10 +3762,9 @@ class SkyServeController:
         if prepared_config is None:
             return
         with self._update_condition:
-            stage_in_use = any(
-                update is not None and update.version == version
-                for update in (self._pending_update,
-                               getattr(self, '_applying_update', None)))
+            stage_in_use = any(update is not None and update.version == version
+                               for update in (self._pending_update,
+                                              self._applying_update))
         if not stage_in_use:
             serve_utils.remove_staged_controller_config(
                 prepared_config.staged_path)
@@ -3861,7 +3789,7 @@ class SkyServeController:
                     # This matches controller recovery, which also boots only
                     # the newest committed version.
                     self._pending_update = update
-                    if pending is not getattr(self, '_applying_update', None):
+                    if pending is not self._applying_update:
                         discarded = pending
                     scheduled = True
                     self._update_apply_error = None
@@ -3947,7 +3875,7 @@ class SkyServeController:
 
     def _reconcile_pending_update_once(self, wait: bool = False) -> bool:
         """Apply one pending update; optionally wait through retry backoff."""
-        if getattr(self, '_update_recovery_required', False):
+        if self._update_recovery_required:
             return True
         with self._update_condition:
             while (self._pending_update is None or
@@ -4048,9 +3976,8 @@ class SkyServeController:
 
     def _run_update_reconciler(self) -> None:
         """Continuously converge runtime state to the newest committed spec."""
-        stop_event = getattr(self, '_update_reconciler_stop', None)
-        while (not getattr(self, '_update_recovery_required', False) and
-               (stop_event is None or not stop_event.is_set())):
+        stop_event = self._update_reconciler_stop
+        while (not self._update_recovery_required and not stop_event.is_set()):
             self._reconcile_pending_update_once(wait=True)
 
     def _run_orphaned_config_stage_sweeper(self) -> None:
@@ -4135,9 +4062,8 @@ class SkyServeController:
         try:
 
             def _preflight() -> Any:
-                if (getattr(self._autoscaler, 'replica_unit', None) == 'logical'
-                        and getattr(service, 'uses_logical_replicas',
-                                    False) is not True):
+                if (self._autoscaler.replica_unit == 'logical' and
+                        service.uses_logical_replicas is not True):
                     raise ValueError(
                         'Refusing to apply a physical-backend version after '
                         'logical replica semantics were activated.')
@@ -4203,7 +4129,7 @@ class SkyServeController:
             # task parsing between the runtime transition and its version fence.
             new_routing_spec = self._build_routing_spec(service, new_autoscaler)
             reserved_capacity_fill_enabled = bool(
-                getattr(service, 'reserved_capacity_fill', False))
+                service.reserved_capacity_fill)
             with self._routing_state_lock:
                 if replace_autoscaler:
                     old_autoscaler = self._autoscaler
@@ -4271,7 +4197,7 @@ class SkyServeController:
                     f'{common_utils.format_exception(e)}') from e
             raise
         finally:
-            if not getattr(self, '_update_recovery_required', False):
+            if not self._update_recovery_required:
                 self._replica_manager.clear_pending_version(version)
             actuation_epoch_lock.release()
         if reserved_capacity_fill_enabled:
@@ -4386,10 +4312,8 @@ class SkyServeController:
                     demand_target = (
                         decision_autoscaler.get_final_target_num_replicas())
                     fill_target = 0
-                    if (getattr(decision_autoscaler, 'reserved_capacity_fill',
-                                False) is True):
-                        fill_target = getattr(decision_autoscaler,
-                                              '_fill_target', 0)
+                    if decision_autoscaler.reserved_capacity_fill is True:
+                        fill_target = decision_autoscaler.fill_target
                     if (type(fill_target) is not int or  # pylint: disable=unidiomatic-typecheck
                             fill_target < 0):
                         fill_target = 0
@@ -4634,7 +4558,7 @@ class SkyServeController:
         # Every non-pool service uses the external LB topology. Refuse to boot
         # an externally reachable controller with either auth boundary absent;
         # pools have no LB and retain optional localhost/admin auth.
-        auth_required = not getattr(self, '_is_pool', True)
+        auth_required = not self._is_pool
         if auth_required:
             serve_utils.get_lb_sync_auth_tokens(required=True)
             serve_utils.get_controller_admin_auth_tokens(required=True)
@@ -4686,13 +4610,11 @@ class SkyServeController:
                 try:
                     budget = paid_capacity.build_launch_budget(
                         placer,
-                        workspace=getattr(self._replica_manager, '_workspace',
-                                          constants.SKYPILOT_DEFAULT_WORKSPACE),
+                        workspace=self._replica_manager.workspace,
                         existing_replica_infos=replica_infos,
-                        globally_managed=getattr(self, '_service_hash',
-                                                 None) is not None,
+                        globally_managed=self._service_hash is not None,
                         service_name=self._service_name,
-                        service_hash=getattr(self, '_service_hash', None))
+                        service_hash=self._service_hash)
                     paid_admission = (
                         paid_capacity.admission_snapshot_by_location(budget))
                 except Exception as e:  # pylint: disable=broad-except

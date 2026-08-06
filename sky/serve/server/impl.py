@@ -970,8 +970,9 @@ def set_load_balancer_high_availability(service_name: str, enabled: bool,
                     in serve_state.ServiceStatus.terminal_statuses() or
                     service_status
                     == serve_state.ServiceStatus.CONTROLLER_INIT):
-                status_text = getattr(service_status, 'value',
-                                      str(service_status))
+                status_text = (service_status.value if isinstance(
+                    service_status, serve_state.ServiceStatus) else
+                               str(service_status))
                 raise RuntimeError(
                     f'Service {service_name!r} is not ready for a load '
                     f'balancer topology change (status={status_text}).')

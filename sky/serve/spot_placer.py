@@ -592,9 +592,8 @@ class PlacementCatalog:
         declared_contexts = sorted({
             str(resource.region)
             for resource in (task.resources or [])
-            if (getattr(resource, 'cloud', None) is not None and
-                str(resource.cloud).lower() == 'kubernetes' and
-                isinstance(getattr(resource, 'region', None), str))
+            if (resource.cloud is not None and str(resource.cloud).lower() ==
+                'kubernetes' and isinstance(resource.region, str))
         })
         if declared_contexts:
             enumerated_contexts = sorted({
@@ -937,6 +936,23 @@ class SpotPlacer:
     _RETRY_STATE_VERSION = 1
     _BENCH_REASONS = frozenset({'capacity', 'quota', 'preempted'})
 
+    def __new__(cls, *args: Any, **kwargs: Any) -> 'SpotPlacer':
+        """Allocate the complete process-local compatibility interface.
+
+        Pickle restoration and lightweight test construction may skip
+        ``__init__``. Defaults belong at allocation time so runtime methods
+        use one explicit interface instead of probing for fields.
+        """
+        del args, kwargs
+        instance = super().__new__(cls)
+        instance._workspace = None
+        instance.location2preempted_at = {}
+        instance.location2preempted_reason = {}
+        instance.location2retry_reserved_at = {}
+        instance.location2observed_free = {}
+        instance._retry_state_dirty = False
+        return instance
+
     def __init__(
         self,
         task: 'task_lib.Task',
@@ -991,17 +1007,6 @@ class SpotPlacer:
         self.resources = list(task.resources)[0]
         self.num_nodes = task.num_nodes
 
-    def _ensure_retry_state_fields(self) -> None:
-        """Initialize fields for lightweight or legacy reconstructed placers."""
-        if not hasattr(self, 'location2preempted_reason'):
-            self.location2preempted_reason = {}
-        if not hasattr(self, 'location2retry_reserved_at'):
-            self.location2retry_reserved_at = {}
-        if not hasattr(self, 'location2observed_free'):
-            self.location2observed_free = {}
-        if not hasattr(self, '_retry_state_dirty'):
-            self._retry_state_dirty = False
-
     def observe_zero_cost_capacity(self, free_by_location: dict[Location, int],
                                    observed_at: float) -> None:
         """Record a broker round's measured free slots per zero-cost location.
@@ -1014,7 +1019,6 @@ class SpotPlacer:
         Only zero-cost locations are accepted. A paid region is never measured,
         so a caller naming one must not buy it a bench bypass.
         """
-        self._ensure_retry_state_fields()
         if not math.isfinite(observed_at):
             return
         for location, free in free_by_location.items():
@@ -1039,7 +1043,6 @@ class SpotPlacer:
         affinity, admission webhooks) would spin: every failure re-benches,
         and a single stale reading would clear it again forever.
         """
-        self._ensure_retry_state_fields()
         entry = self.location2observed_free.get(location)
         if entry is None:
             return False
@@ -1125,7 +1128,6 @@ class SpotPlacer:
                    location: Location,
                    *,
                    selected_at: float | None = None) -> None:
-        self._ensure_retry_state_fields()
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if resolved is None:
@@ -1155,7 +1157,6 @@ class SpotPlacer:
                        *,
                        reason: str = 'capacity',
                        observed_at: float | None = None) -> None:
-        self._ensure_retry_state_fields()
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if resolved is None:
@@ -1200,7 +1201,6 @@ class SpotPlacer:
                                 observed_at=observed_at)
 
     def clear_preemptive_locations(self) -> None:
-        self._ensure_retry_state_fields()
         changed = bool(self.location2preempted_at or
                        self.location2preempted_reason or
                        self.location2retry_reserved_at)
@@ -1220,8 +1220,6 @@ class SpotPlacer:
         model, image, disk tier, or ephemeral storage; a capacity failure for
         the old shape must not bench that new shape.
         """
-        self._ensure_retry_state_fields()
-        old_placer._ensure_retry_state_fields()  # pylint: disable=protected-access
         for location in self.location2status:
             if (old_placer.location2status.get(location)
                     != LocationStatus.PREEMPTED):
@@ -1247,7 +1245,6 @@ class SpotPlacer:
 
     def dump_retry_state(self) -> dict[str, Any]:
         """Return bounded JSON-safe placement retry state."""
-        self._ensure_retry_state_fields()
         benches = []
         for location in sorted(self.location2status,
                                key=lambda candidate: candidate.sort_key()):
@@ -1275,7 +1272,6 @@ class SpotPlacer:
 
     def load_retry_state(self, state: dict[str, Any] | None) -> None:
         """Restore exact durable benches without restarting their clocks."""
-        self._ensure_retry_state_fields()
         if not isinstance(state, dict) or state.get(
                 'version') != self._RETRY_STATE_VERSION:
             return
@@ -1331,7 +1327,7 @@ class SpotPlacer:
 
     @property
     def retry_state_dirty(self) -> bool:
-        return getattr(self, '_retry_state_dirty', False)
+        return self._retry_state_dirty
 
     def mark_retry_state_persisted(self) -> None:
         self._retry_state_dirty = False
@@ -1352,7 +1348,6 @@ class SpotPlacer:
         its bench is ACTIVE on that count instead of on the probe clock: the
         bench was standing in for an observation that has since arrived.
         """
-        self._ensure_retry_state_fields()
         status = self.location2status[location]
         if status == LocationStatus.PREEMPTED:
             if self._measured_available(location):
@@ -1373,7 +1368,7 @@ class SpotPlacer:
         workspace cloud, capability, and context policy can change after a
         scale-to-zero service's placer was constructed.
         """
-        workspace = getattr(self, '_workspace', None)
+        workspace = self._workspace
         if workspace is None:
             return set(self.location2status)
         allowed_cloud_names = {
@@ -1419,7 +1414,7 @@ class SpotPlacer:
 
     def refresh_workspace_policy(self) -> None:
         """Reload centrally managed config before final launch admission."""
-        if getattr(self, '_workspace', None) is not None:
+        if self._workspace is not None:
             skypilot_config.safe_reload_config()
 
     def _location_with_status(self, status: LocationStatus) -> list[Location]:
@@ -1443,7 +1438,6 @@ class SpotPlacer:
         underlying provider observation. A successful launch clears both via
         set_active; a generic failure releases only the reservation.
         """
-        self._ensure_retry_state_fields()
         if self._measured_available(location):
             # Selection is riding a live count, not a probe. Charging it to the
             # probe budget would re-bench the location after one launch and cap
@@ -1462,7 +1456,6 @@ class SpotPlacer:
 
     def release_retry(self, location: Location) -> None:
         """Release an expired-bench probe after a non-availability failure."""
-        self._ensure_retry_state_fields()
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if (resolved is not None and
@@ -1493,7 +1486,6 @@ class SpotPlacer:
         paid_admission_by_location: dict[Location, dict[str, Any]] | None = None
     ) -> dict[str, Any]:
         """Serialize already-resident retry state without provider calls."""
-        self._ensure_retry_state_fields()
         if (not isinstance(limit, int) or isinstance(limit, bool) or
                 limit < 1 or limit > _PLACEMENT_SNAPSHOT_MAX_LOCATIONS):
             raise ValueError(f'limit must be an integer from 1 to '

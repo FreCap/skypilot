@@ -49,7 +49,7 @@ def _record_request_history(self: Any, request_data: dict[str, Any]) -> bool:
     request_history = request_data.get('request_history')
     if request_history is None:
         return True
-    service_hash = getattr(self, '_service_hash', None)
+    service_hash = self._service_hash
     if service_hash is None:
         # Compatibility for direct/legacy controller construction without
         # an incarnation fence. Do not create history that could leak into
@@ -118,7 +118,7 @@ def _record_request_classification_history(
             'Request classification protocol version '
             f'{declared_version} is newer than supported version '
             f'{serve_history.REQUEST_CLASSIFICATION_PROTOCOL_VERSION}.')
-    service_hash = getattr(self, '_service_hash', None)
+    service_hash = self._service_hash
     if service_hash is None:
         return True
     lb_session_id = request_data.get('lb_session_id')
@@ -169,7 +169,7 @@ def _record_response_time_history(self: Any, request_data: dict[str,
     response_time_history = request_data.get('response_time_history')
     if response_time_history is None:
         return True
-    service_hash = getattr(self, '_service_hash', None)
+    service_hash = self._service_hash
     if service_hash is None:
         return True
     lb_session_id = request_data.get('lb_session_id')
@@ -219,7 +219,7 @@ def _record_prediction_time_history(self: Any, request_data: dict[str,
     prediction_time_history = request_data.get('prediction_time_history')
     if prediction_time_history is None:
         return True
-    service_hash = getattr(self, '_service_hash', None)
+    service_hash = self._service_hash
     if service_hash is None:
         return True
     lb_session_id = request_data.get('lb_session_id')
@@ -264,7 +264,7 @@ def _record_autoscaler_history(
     timestamp: float | None = None,
 ) -> int:
     """Persist one minute observation from already-computed sync state."""
-    service_hash = getattr(self, '_service_hash', None)
+    service_hash = self._service_hash
     if service_hash is None:
         return 0
     replica_unit = replica_counts.get('replica_unit')
@@ -315,14 +315,13 @@ def _get_accelerator_history_breakdown(
         self: Any, replica_counts: dict[str, Any],
         aggregate_fill_target: int) -> dict[str, Any] | None:
     """Build one complete exact-card observation, or mark unavailable."""
-    shapes = getattr(self._autoscaler, 'configured_accelerator_shapes', {})
+    shapes = self._autoscaler.configured_accelerator_shapes
     if not isinstance(shapes, dict) or not shapes:
         return None
     if not self._autoscaler.has_recomputed_with_fresh_data():
         return None
     configured = list(shapes)
-    demand_target = getattr(self._autoscaler,
-                            'target_num_replicas_by_accelerator', {})
+    demand_target = self._autoscaler.target_num_replicas_by_accelerator
     if (not isinstance(demand_target, dict) or sum(demand_target.values())
             != self._autoscaler.target_num_replicas):
         # An aggregate fallback or mixed-version report cannot be
@@ -344,15 +343,12 @@ def _get_accelerator_history_breakdown(
         'capacity_semantics_version':
             serve_history.ACCELERATOR_BREAKDOWN_CAPACITY_SEMANTICS_VERSION,
         'configured_accelerators': configured,
-        'min_replicas': dict(
-            getattr(self._autoscaler, 'min_replicas_by_accelerator', {})),
+        'min_replicas': dict(self._autoscaler.min_replicas_by_accelerator),
         'demand_target': dict(demand_target),
         'warm_retention_target': dict(
-            getattr(self._autoscaler, 'warm_retention_target_by_accelerator',
-                    {})),
+            self._autoscaler.warm_retention_target_by_accelerator),
         'cold_launch_authority': dict(
-            getattr(self._autoscaler, 'cold_launch_authority_by_accelerator',
-                    {})),
+            self._autoscaler.cold_launch_authority_by_accelerator),
         'ready_capacity': mapping('ready_replicas_by_accelerator'),
         'provisioning_capacity':
             mapping('provisioning_replicas_by_accelerator'),

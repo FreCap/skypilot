@@ -15,6 +15,18 @@ def test_default_min_replicas_is_zero():
     assert spec.min_replicas == 0
 
 
+def test_old_pickled_spec_backfills_non_pool_interface():
+    spec = service_spec.SkyServiceSpec.from_yaml_config({})
+    state = spec.__dict__.copy()
+    state.pop('_pool')
+    restored = object.__new__(service_spec.SkyServiceSpec)
+
+    restored.__setstate__(state)
+
+    assert restored.__dict__['_pool'] is False
+    assert restored.pool is False
+
+
 class TestLoadBalancerHighAvailability:
     """The mode is derived from pool-ness; the YAML field is ignored."""
 

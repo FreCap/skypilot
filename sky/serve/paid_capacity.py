@@ -600,8 +600,7 @@ def _legacy_local_remaining(
 ) -> dict[spot_placer.Location, int]:
     remaining = {location: legacy_local_limit() for location in paid_locations}
     for info in existing_replica_infos:
-        if (getattr(info.status, 'value', info.status)
-                not in _UNRESOLVED_STATUS_VALUES):
+        if info.status.value not in _UNRESOLVED_STATUS_VALUES:
             continue
         replica_location = info.get_spot_location()
         if replica_location is None:
@@ -667,10 +666,9 @@ def _service_claim_count(
         existing_replica_infos: Iterable['replica_managers.ReplicaInfo']
 ) -> int:
     """Count this service's unresolved rows with an exact paid claim."""
-    return sum(
-        getattr(info.status, 'value', info.status) in _UNRESOLVED_STATUS_VALUES
-        and isinstance(getattr(info, 'paid_capacity_pool_key', None), str)
-        for info in existing_replica_infos)
+    return sum(info.status.value in _UNRESOLVED_STATUS_VALUES and
+               isinstance(info.paid_capacity_pool_key, str)
+               for info in existing_replica_infos)
 
 
 def _evidence_aware_service_limit(
@@ -761,10 +759,9 @@ def build_launch_budget(
         if location not in zero_cost
     ]
     keys = {
-        location: pool_key(location,
-                           workspace=workspace,
-                           num_nodes=getattr(placer, 'num_nodes',
-                                             1)) for location in paid_locations
+        location:
+            pool_key(location, workspace=workspace, num_nodes=placer.num_nodes)
+        for location in paid_locations
     }
     if not globally_managed or not central_authority_available():
         return LaunchBudget(remaining_by_location=_legacy_local_remaining(
@@ -799,13 +796,12 @@ def build_launch_budget(
     unknown_owned_pool_keys = set()
     oldest_unknown_claimed_at = None
     for info in existing_replica_infos:
-        if (getattr(info.status, 'value', info.status)
-                not in _UNRESOLVED_STATUS_VALUES):
+        if info.status.value not in _UNRESOLVED_STATUS_VALUES:
             continue
-        key = getattr(info, 'paid_capacity_pool_key', None)
+        key = info.paid_capacity_pool_key
         if not isinstance(key, str):
             continue
-        claimed_at = getattr(info, 'created_at', None)
+        claimed_at = info.created_at
         normalized_claimed_at = None
         if (isinstance(claimed_at, (int, float)) and
                 not isinstance(claimed_at, bool)):
@@ -1327,13 +1323,11 @@ def adopt_existing_claims(
         placer.zero_cost_locations()) if placer is not None else set()
     claims = []
     for info in replica_infos:
-        if (getattr(info.status, 'value',
-                    info.status) not in _UNRESOLVED_STATUS_VALUES or
-                getattr(info, 'reserved_fill', False) or
-                info.is_zero_cost is True or getattr(
-                    info, 'cost_rebalance_for_replica_id', None) is not None):
+        if (info.status.value not in _UNRESOLVED_STATUS_VALUES or
+                info.reserved_fill or info.is_zero_cost is True or
+                info.cost_rebalance_for_replica_id is not None):
             continue
-        existing_key = getattr(info, 'paid_capacity_pool_key', None)
+        existing_key = info.paid_capacity_pool_key
         if isinstance(existing_key, str):
             claims.append((info.replica_id, existing_key, priority, info))
             continue
@@ -1347,7 +1341,7 @@ def adopt_existing_claims(
             continue
         key = pool_key(location,
                        workspace=workspace,
-                       num_nodes=getattr(placer, 'num_nodes', 1))
+                       num_nodes=placer.num_nodes)
         claims.append((info.replica_id, key, priority, info))
     return serve_state.adopt_paid_capacity_claims(
         service_name,

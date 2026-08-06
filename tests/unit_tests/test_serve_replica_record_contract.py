@@ -1,6 +1,7 @@
 """Characterization tests for SkyServe's versioned replica record."""
 # pylint: disable=protected-access
 import copy
+import dataclasses
 import pickle
 from unittest import mock
 
@@ -103,6 +104,28 @@ def _protocol_v2_handle(
     return handle
 
 
+def _status_field_names() -> tuple[str, ...]:
+    return tuple(
+        field.name
+        for field in dataclasses.fields(replica_managers.ReplicaStatusProperty))
+
+
+def _assert_materialized_legacy_status_defaults(
+        status: replica_managers.ReplicaStatusProperty) -> None:
+    expected = dict(vars(replica_managers.ReplicaStatusProperty()))
+    expected['logical_retirement_committed'] = None
+    assert vars(status) == expected
+
+
+def test_constructor_owns_complete_explicit_interface():
+    replica = _replica()
+
+    assert set(vars(replica)) == {
+        '_version', *replica_info._REPLICA_INFO_OWNED_FIELDS
+    }
+    assert set(vars(replica.status_property)) == set(_status_field_names())
+
+
 @pytest.mark.parametrize(('updates', 'expected'), [
     ({}, serve_state.ReplicaStatus.PENDING),
     ({
@@ -142,6 +165,8 @@ def test_storage_round_trip_is_lossless_and_does_not_mutate_source():
     state = replica.to_storage_dict()
     restored = replica_managers.ReplicaInfo.from_storage_dict(state)
 
+    assert state['replica_info_version'] == 14
+    assert set(state) == set(replica_info._REPLICA_INFO_STORAGE_FIELDS)
     assert replica.resources_override['cloud'] is cloud_before
     assert replica.resources_override['image_id'] == image_id_before
     assert restored.to_storage_dict() == state
@@ -165,12 +190,68 @@ def test_legacy_pickle_migration_materializes_zero_cost_provenance():
     assert vars(restored)['is_zero_cost'] is False
 
 
+def test_legacy_pickle_migration_materializes_logical_capacity_fields():
+    legacy_state = copy.deepcopy(vars(_replica()))
+    legacy_state['_version'] = 8
+    legacy_state.pop('unknown_capacity_replacement')
+    legacy_state.pop('logical_bridge_capacity_verified')
+    restored = replica_managers.ReplicaInfo.__new__(
+        replica_managers.ReplicaInfo)
+
+    restored.__setstate__(legacy_state)
+
+    assert vars(restored)['unknown_capacity_replacement'] is False
+    assert vars(restored)['logical_bridge_capacity_verified'] is False
+
+
+def test_legacy_pickle_migration_materializes_every_status_field():
+    legacy_state = copy.deepcopy(vars(_replica()))
+    legacy_state['_version'] = 13
+    vars(legacy_state['status_property']).clear()
+    restored = replica_managers.ReplicaInfo.__new__(
+        replica_managers.ReplicaInfo)
+
+    restored.__setstate__(legacy_state)
+
+    assert set(vars(restored.status_property)) == set(_status_field_names())
+    _assert_materialized_legacy_status_defaults(restored.status_property)
+
+
 def test_current_record_requires_explicit_zero_cost_provenance():
     replica = _replica()
     del replica.is_zero_cost
 
     with pytest.raises(AttributeError, match='is_zero_cost'):
         replica.to_storage_dict()
+
+
+@pytest.mark.parametrize('field', replica_info._REPLICA_INFO_OWNED_FIELDS)
+def test_current_record_requires_complete_owned_interface(field):
+    replica = _replica()
+    delattr(replica, field)
+
+    with pytest.raises(AttributeError, match=field):
+        replica.to_storage_dict()
+
+
+@pytest.mark.parametrize('field', _status_field_names())
+def test_current_record_requires_every_status_field(field):
+    replica = _replica()
+    vars(replica.status_property).pop(field)
+
+    with pytest.raises(AttributeError, match=field):
+        replica.to_storage_dict()
+
+
+@pytest.mark.parametrize('field', replica_info._REPLICA_INFO_OWNED_FIELDS)
+def test_current_pickle_requires_complete_owned_interface(field):
+    current_state = copy.deepcopy(vars(_replica()))
+    current_state.pop(field)
+    restored = replica_managers.ReplicaInfo.__new__(
+        replica_managers.ReplicaInfo)
+
+    with pytest.raises(AttributeError, match=field):
+        restored.__setstate__(current_state)
 
 
 @pytest.mark.parametrize('marker', [0, 1, 'yes'])
@@ -304,11 +385,13 @@ def test_pool_probe_propagates_explicit_provider_phase_admission():
 
 def test_legacy_null_image_key_and_missing_fields_remain_compatible():
     state = _replica().to_storage_dict()
+    state['replica_info_version'] = 13
     state['resources_override']['image_id'] = {
         'null': 'global-image',
         'us-east-1': 'regional-image',
     }
     state.pop('planned_capacity')
+    state.pop('unknown_capacity_replacement')
     state.pop('logical_bridge_capacity_verified')
     state['status_property'].pop('logical_retirement_committed')
 
@@ -319,8 +402,38 @@ def test_legacy_null_image_key_and_missing_fields_remain_compatible():
         'us-east-1': 'regional-image',
     }
     assert restored.planned_capacity == 1
+    assert restored.unknown_capacity_replacement is False
     assert restored.logical_bridge_capacity_verified is False
     assert restored.status_property.logical_retirement_committed is None
+
+
+def test_legacy_json_materializes_every_status_field():
+    state = _replica().to_storage_dict()
+    state['replica_info_version'] = 13
+    state['status_property'] = {}
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    assert set(vars(restored.status_property)) == set(_status_field_names())
+    _assert_materialized_legacy_status_defaults(restored.status_property)
+
+
+@pytest.mark.parametrize('field', replica_info._REPLICA_INFO_OWNED_FIELDS)
+def test_current_json_requires_complete_owned_interface(field):
+    state = _replica().to_storage_dict()
+    state.pop(field)
+
+    with pytest.raises(ValueError, match=field):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('field', _status_field_names())
+def test_current_json_requires_every_status_field(field):
+    state = _replica().to_storage_dict()
+    state['status_property'].pop(field)
+
+    with pytest.raises(ValueError, match=field):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
 
 
 def test_public_class_and_pickle_identity_remain_stable():

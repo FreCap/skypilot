@@ -51,7 +51,8 @@ def _batched_cluster_records(monkeypatch):
 
 
 def _build_manager():
-    mgr = object.__new__(replica_managers.SkyPilotReplicaManager)
+    mgr = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     mgr.lock = threading.Lock()
     mgr._service_name = 'svc'
     mgr._is_pool = False

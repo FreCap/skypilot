@@ -37,6 +37,7 @@ from sky.provision import common as provision_common
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import serve_utils
+from sky.serve import service_spec
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state as recovery_state
 from sky.skylet import job_lib
@@ -514,9 +515,10 @@ class TestBackgroundDutyOwnershipLifecycle:
 
     def test_prober_uses_authoritative_autoscaler_target_for_status(self):
         mgr = self._stopped_manager()
-        mgr._ownership_lost = mock.Mock(spec=threading.Event)
-        mgr._ownership_lost.is_set.return_value = False
-        mgr._ownership_lost.wait.return_value = True
+        mgr._ownership_lost = threading.Event()
+        mgr._manager_daemon_stop = mock.Mock(spec=threading.Event)
+        mgr._manager_daemon_stop.is_set.return_value = False
+        mgr._manager_daemon_stop.wait.return_value = True
         mgr._probe_all_replicas = mock.Mock(return_value=[])
         mgr._target_num_replicas_lock = threading.Lock()
         mgr._target_num_replicas = 0
@@ -614,9 +616,10 @@ class TestBackgroundDutyOwnershipLifecycle:
 
     def test_prober_discards_snapshot_when_status_epoch_changes(self):
         mgr = self._stopped_manager()
-        mgr._ownership_lost = mock.Mock(spec=threading.Event)
-        mgr._ownership_lost.is_set.return_value = False
-        mgr._ownership_lost.wait.return_value = True
+        mgr._ownership_lost = threading.Event()
+        mgr._manager_daemon_stop = mock.Mock(spec=threading.Event)
+        mgr._manager_daemon_stop.is_set.return_value = False
+        mgr._manager_daemon_stop.wait.return_value = True
         mgr._target_num_replicas_lock = threading.Lock()
         mgr._target_num_replicas = 0
         mgr._target_num_replicas_generation = 0
@@ -820,10 +823,9 @@ run: echo hi
 
 
 def _make_manager(service_name='svc', next_replica_id=1):
-    """Build a bare SkyPilotReplicaManager with only the attributes the
-    recovery / scale-up id-allocator and version-spec lookup paths touch,
-    skipping the heavy __init__ (yaml parse, spot placer, daemon threads)."""
-    mgr = object.__new__(replica_managers.SkyPilotReplicaManager)
+    """Allocate the real runtime interface without the I/O-bearing init."""
+    mgr = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     mgr.lock = threading.RLock()
     mgr._service_name = service_name
     mgr._next_replica_id = next_replica_id
@@ -837,6 +839,7 @@ def _make_manager(service_name='svc', next_replica_id=1):
     mgr._spot_placer = None
     mgr._pending_version = None
     mgr._uses_logical_replicas = False
+    mgr._version_specs = {1: mock.Mock()}
     mgr._logical_exact_accelerator_shapes = {}
     mgr._logical_reconcile_snapshot = None
     mgr._logical_target = None
@@ -851,25 +854,34 @@ def _make_manager(service_name='svc', next_replica_id=1):
 
 
 def _fake_replica_info(replica_id, status=None):
-    info = mock.Mock()
-    info.replica_id = replica_id
-    info.version = 1
-    # Explicit, inert lifecycle fields: a bare Mock attribute is truthy and
-    # would accidentally route the fake into the spot-orphan / re-drive
-    # teardown scans of `_recover_replica_operations`.
-    info.status = status
-    info.is_spot = False
-    info.status_property.preempted = False
-    info.status_property.is_scale_down = False
-    info.status_property.purged = False
-    # Recovery fields are also lifecycle inputs.  Bare Mock attributes are
-    # truthy, which would make an ordinary fake look quarantined/capable and
-    # route it into the fail-closed teardown path.
-    info.system_recovery_quarantine = None
-    info.system_recovery_disposition = (
-        recovery_state.SystemRecoveryDisposition.ORDINARY)
-    info.system_recovery_launch_intent = None
-    info.system_recovery = None
+    info = replica_managers.ReplicaInfo(replica_id=replica_id,
+                                        cluster_name=f'svc-{replica_id}',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    if status is None:
+        # Most callers need an inert existing row only for identity/accounting.
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        expected_status = (
+            replica_managers.serve_state.ReplicaStatus.FAILED_CLEANUP)
+    elif status == replica_managers.serve_state.ReplicaStatus.PENDING:
+        expected_status = status
+    elif status == replica_managers.serve_state.ReplicaStatus.PROVISIONING:
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.RUNNING)
+        expected_status = status
+    elif status == replica_managers.serve_state.ReplicaStatus.READY:
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        info.status_property.service_ready_now = True
+        info.status_property.first_ready_time = 1.0
+        expected_status = status
+    else:
+        raise ValueError(f'Unsupported fake replica status: {status!r}')
+    assert info.status == expected_status
     return info
 
 
@@ -1435,7 +1447,7 @@ def test_candidate_guard_is_dropped_on_concurrent_capable_promotion():
     assert updated is promoted
     assert off_route is True
     assert teardown is False
-    assert manager._candidate_release_monotonic_deadlines == {}
+    assert not manager._candidate_release_monotonic_deadlines
 
 
 def test_capable_status_guard_is_dropped_on_concurrent_exhaustion():
@@ -2522,7 +2534,8 @@ def test_confirm_logical_bridge_capacity_is_durable_and_monotonic():
         confirmed = mgr.confirm_logical_bridge_capacities({1: 8})
 
     assert confirmed == {1: 8}
-    assert info.to_storage_dict()['replica_info_version'] == 13
+    assert info.to_storage_dict()['replica_info_version'] == (
+        replica_managers.ReplicaInfo._VERSION)
     assert info.planned_capacity == 8
     assert info.logical_bridge_capacity_verified is True
     assert persisted == [(1, info)]
@@ -3473,6 +3486,7 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         manager._service_name = 'svc'
         manager.yaml_content = 'dummy: yaml'
         manager.latest_version = 1
+        manager._version_specs = {1: mock.Mock()}
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -3568,6 +3582,25 @@ class TestUpdateVersionHoldsManagerLock:
 
 class TestUpdateVersionBatchesPriorVersionYamls:
     """`update_version` should reuse old YAMLs per distinct version."""
+
+    @pytest.fixture(autouse=True)
+    def _explicit_prior_specs(self):
+
+        def _get_specs(_service_name, versions):
+            return {
+                version: service_spec.SkyServiceSpec(
+                    readiness_path='/',
+                    initial_delay_seconds=0,
+                    readiness_timeout_seconds=15,
+                    endpoint_probe_interval_seconds=10,
+                    lb_stream_timeout_seconds=30,
+                    min_replicas=1) for version in versions
+            }
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_specs',
+                               side_effect=_get_specs):
+            yield
 
     def test_reuses_preflight_spot_placer_for_new_task(self):
         mgr = _make_manager()
@@ -5610,6 +5643,8 @@ class TestScaleUpBatch:
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         mgr.yaml_content = 'dummy: yaml'
         initial = [_fake_replica_info(40), _fake_replica_info(41)]
+        for info in initial:
+            info.get_spot_location = mock.Mock(wraps=info.get_spot_location)
         stale_local = [_fake_replica_info(99)]
         snapshots = []
         reservation_lock = mock.MagicMock()
@@ -5658,6 +5693,7 @@ class TestScaleUpBatch:
         location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
         mgr = _make_manager(next_replica_id=1)
         mgr._spot_placer = make_placer({location: 1.0})
+        mgr._spot_placer.num_nodes = 1
         mgr._workspace = 'w'
         mgr._service_hash = 'hash'
         mgr._controller_owner = (1, '10.0.0.1')
@@ -6286,6 +6322,7 @@ class TestLogicalCapacityPlanning:
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
         mgr._spot_placer = make_placer({location: 1.0})
+        mgr._spot_placer.num_nodes = 1
         mgr._workspace = 'w'
         mgr._service_hash = 'hash'
         mgr._controller_owner = (1, '10.0.0.1')
@@ -6402,6 +6439,7 @@ class TestLogicalCapacityPlanning:
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
         mgr._spot_placer = make_placer({paid_l4: 1.0, zero_a100: 0.0})
+        mgr._spot_placer.num_nodes = 1
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
                 version=1,
@@ -6465,6 +6503,7 @@ class TestLogicalCapacityPlanning:
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
         mgr._spot_placer = make_placer({zero: 0.0})
+        mgr._spot_placer.num_nodes = 1
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
                 version=1,
@@ -7001,13 +7040,14 @@ class TestLogicalCapacityPlanning:
             assert logical_reconcile_fence_requires_exact_generation is True
             launches.append(unknown_capacity_replacement)
             existing.append(
-                types.SimpleNamespace(
-                    replica_id=2,
-                    is_terminal=False,
-                    is_ready=False,
-                    version=1,
-                    status_property=types.SimpleNamespace(is_scale_down=False),
-                    planned_capacity=8))
+                replica_managers.ReplicaInfo(replica_id=2,
+                                             cluster_name='svc-2',
+                                             replica_port='8080',
+                                             is_spot=False,
+                                             location=None,
+                                             version=1,
+                                             resources_override=None,
+                                             planned_capacity=8))
             return _accepted_launch_result(2, 8)
 
         with mock.patch.object(replica_managers.serve_state,
@@ -7201,13 +7241,14 @@ class TestLogicalCapacityPlanning:
                           logical_reconcile_fence):
             launches.append(8)
             existing.append(
-                types.SimpleNamespace(
-                    replica_id=2,
-                    is_terminal=False,
-                    is_ready=False,
-                    version=1,
-                    status_property=types.SimpleNamespace(is_scale_down=False),
-                    planned_capacity=8))
+                replica_managers.ReplicaInfo(replica_id=2,
+                                             cluster_name='svc-2',
+                                             replica_port='8080',
+                                             is_spot=False,
+                                             location=None,
+                                             version=1,
+                                             resources_override=None,
+                                             planned_capacity=8))
             # The original backend recovers while the first placement runs.
             mgr._logical_reconcile_snapshot = (
                 replica_managers.LogicalReconcileSnapshot(
@@ -9937,9 +9978,10 @@ class TestLogicalCapacityPlanning:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[retiring, survivor]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=retiring), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 return_value=(retiring, None)), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
                                side_effect=_infos_from_ids), \
@@ -10055,6 +10097,10 @@ class TestLogicalCapacityPlanning:
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=retiring), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 return_value=(retiring, None)), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
                                side_effect=_infos_from_ids), \
@@ -10267,6 +10313,10 @@ class TestLogicalCapacityPlanning:
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=retiring), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 return_value=(retiring, None)), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
                                return_value={9: retiring}), \
@@ -10466,6 +10516,7 @@ class TestLaunchReplicaSnapshotAccumulation:
         manager._service_name = 'svc'
         manager.yaml_content = 'dummy: yaml'
         manager.latest_version = 1
+        manager._version_specs = {1: mock.Mock()}
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -10604,6 +10655,7 @@ class TestLaunchReplicaSnapshotAccumulation:
         manager = self._make_manager(placer)
         manager._uses_logical_replicas = True
         manager._default_planned_capacity = 1
+        manager._version_specs[7] = mock.Mock()
         resources_override = {
             'cloud': 'AWS',
             'region': 'us-east-1',
@@ -10646,6 +10698,8 @@ class TestLaunchReplicaSnapshotAccumulation:
         manager.latest_version = 8
         manager.yaml_content = 'resources:\n  accelerators: A100:8\n'
         manager._uses_logical_replicas = True
+        prior_spec = mock.Mock()
+        manager._version_specs[7] = prior_spec
         persisted = []
         thread = mock.Mock()
 
@@ -10680,7 +10734,7 @@ class TestLaunchReplicaSnapshotAccumulation:
         assert safe_thread.call_args.kwargs['args'][1] == (
             'resources:\n  accelerators: L4:1\n')
         get_ports.assert_called_once_with('resources:\n  accelerators: L4:1\n',
-                                          None)
+                                          prior_spec)
 
 
 class TestFailedCleanupReconciliation:
@@ -10789,6 +10843,7 @@ class TestFailedCleanupReconciliation:
         info.status_property.drain_cap_seconds = 600
         info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
         legacy_state = info.to_storage_dict()
+        legacy_state['replica_info_version'] = 13
         legacy_state['status_property'].pop('drain_started_at')
         legacy_info = replica_managers.ReplicaInfo.from_storage_dict(
             legacy_state)
@@ -10942,6 +10997,12 @@ class TestFailedCleanupReconciliation:
                                'get_replica_info_from_id',
                                side_effect=lambda _service, replica_id:
                                durable.get(replica_id)), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 side_effect=lambda _service, replica_id:
+                 ((info, None) if (info := durable.get(replica_id)) is not None
+                  else None)), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[retiring, survivor]), \
@@ -11044,6 +11105,11 @@ class TestFailedCleanupReconciliation:
                                'get_replica_info_from_id',
                                side_effect=lambda _service, replica_id:
                                _clone(durable[replica_id])), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 side_effect=lambda _service, replica_id:
+                 (_clone(durable[replica_id]), None)), \
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                side_effect=_read_all), \
@@ -11128,6 +11194,10 @@ class TestFailedCleanupReconciliation:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 return_value=(info, None)), \
              mock.patch.object(replica_managers.serve_utils,
                                'generate_replica_log_file_name',
                                return_value='/tmp/replica.log'), \
@@ -11176,6 +11246,10 @@ class TestFailedCleanupReconciliation:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 return_value=(info, None)), \
              mock.patch.object(replica_managers.serve_utils,
                                'generate_replica_log_file_name',
                                return_value='/tmp/replica.log'), \
@@ -11207,10 +11281,12 @@ class TestPaidLocationLaunchBudget:
         manager._service_name = 'svc'
         manager.yaml_content = 'resources:\n  use_spot: true\n'
         manager.latest_version = 1
+        manager._version_specs = {1: mock.Mock()}
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
         manager._spot_placer = make_placer(costs)
+        manager._spot_placer.num_nodes = 1
         manager._workspace = 'default'
         manager._service_hash = None
         manager._controller_owner = None
@@ -13480,6 +13556,7 @@ class TestRefreshThreadPoolUnfencedLaunch:
         manager = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
         manager._service_name = 'svc'
+        manager.latest_version = 1
         manager._is_pool = False
         manager.lock = threading.Lock()
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
@@ -13515,6 +13592,7 @@ class TestRefreshThreadPoolUnfencedLaunch:
         manager = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
         manager._service_name = 'svc'
+        manager.latest_version = 1
         manager._is_pool = False
         manager.lock = threading.Lock()
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
