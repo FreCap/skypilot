@@ -249,6 +249,7 @@ def _revalidate_actuation_target(
     final_target: int,
     allow_adopted_reassignment: bool = True,
     allow_unbacked_adopted_reassignment: bool = True,
+    old_version_supply: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Build a supply-aware actuator without bypassing target adoption.
 
@@ -259,6 +260,24 @@ def _revalidate_actuation_target(
     units for a not-yet-adopted compatibility migration. During an aggregate
     downscale hold, unbacked adopted units remain on their exact cards, while
     materialized compatible supply may still replace them.
+
+    ``old_version_supply`` is per-card nonterminal, non-retiring supply on
+    versions OTHER than the latest. It exists to split the two meanings that
+    "unbacked" used to conflate during a rolling update, when
+    ``nonretiring_supply`` (latest-version only) says nothing about whether a
+    card is still serving:
+
+    - A card with no latest-version supply but live old-version supply is
+      mid-replacement. Releasing it retires replicas that are still serving
+      demand which may accept only that card, so it is preserved.
+    - A card with supply on NEITHER generation is genuinely gone (preempted
+      reserved capacity is the measured case). Preserving it turned the loss
+      into paid same-card launch authority at roughly 6.8x the price the
+      same card-agnostic requests accept, so it is released and re-priced
+      even while a rollout is in flight.
+
+    Outside a rollout there are no old-version rows, the map is empty, and
+    behaviour is byte-for-byte what it was before the parameter existed.
     """
     if sum(desired_target.values()) != final_target:
         return {}
@@ -288,12 +307,36 @@ def _revalidate_actuation_target(
     if remaining < 0 or fill_toward_desired(remaining,
                                             require_backing=False) != 0:
         return {}
+    # Release adopted capacity that no generation still backs, BEFORE the
+    # mixed-version guard: capacity that exists on neither the latest nor any
+    # old version is genuinely gone, and preserving its card turns a
+    # preemption into paid same-card launch authority. A card that old-version
+    # rows still serve is only mid-replacement and is preserved here; the
+    # rollout-scoped release below (gated on adopted reassignment) handles it
+    # once the fleet is single-version again.
+    old_supply = old_version_supply or {}
+    if allow_unbacked_adopted_reassignment:
+        vanished = 0
+        for card in configured_cards:
+            backing = (max(0, int(nonretiring_supply.get(card, 0))) +
+                       max(0, int(old_supply.get(card, 0))))
+            unbacked = max(0, target[card] - backing)
+            removable = min(unbacked,
+                            max(0, target[card] - desired_target.get(card, 0)))
+            target[card] -= removable
+            vanished += removable
+        if fill_toward_desired(vanished, require_backing=False) != 0:
+            return {}
+
     if not allow_adopted_reassignment:
         # A mixed-version rollout must preserve the compatibility-owned card
-        # map. Old-version supply cannot prove that a cross-card replacement is
-        # compatible, and moving an adopted unit here can turn a warm
-        # zero-cost card into paid same-card launch authority. Generic
-        # overprovision was assigned above without changing adopted demand.
+        # map for every card that is still serving on SOME version:
+        # old-version supply cannot prove that a cross-card replacement is
+        # compatible, and moving a still-backed adopted unit here can turn a
+        # warm zero-cost card into paid same-card launch authority. Generic
+        # overprovision was assigned above without changing adopted demand,
+        # and capacity gone from every generation was released above without
+        # asserting any cross-card compatibility.
         return {card: count for card, count in target.items() if count > 0}
 
     # First replace adopted capacity that is disappearing. This is allowed to
