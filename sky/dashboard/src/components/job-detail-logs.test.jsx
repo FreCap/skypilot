@@ -269,6 +269,77 @@ it('does not start a mismatched stream across cluster-job route changes', () => 
   ).toBe(false);
 });
 
+it('keeps the cluster-job route in loading instead of rendering a partial detail card while a new route is fetching', async () => {
+  const refreshA = jest.fn().mockResolvedValue(undefined);
+  const refreshB = jest.fn().mockResolvedValue(undefined);
+  let clusterBLoading = true;
+  useClusterDetails.mockImplementation(({ cluster }) => {
+    if (cluster === 'cluster-a') {
+      return {
+        clusterData: {
+          cluster: 'cluster-a',
+          workspace: 'workspace-a',
+          infra: 'AWS',
+          user: 'alice',
+          user_hash: 'user-a',
+        },
+        clusterJobData: [{ id: 7, status: 'RUNNING', job: 'training-a' }],
+        loading: false,
+        clusterJobsLoading: false,
+        refreshData: refreshA,
+      };
+    }
+    return {
+      clusterData: null,
+      clusterJobData: null,
+      loading: clusterBLoading,
+      clusterJobsLoading: clusterBLoading,
+      refreshData: refreshB,
+    };
+  });
+
+  router.query = { cluster: 'cluster-a', job: '7' };
+  const { rerender } = render(<ClusterJobDetails />);
+  await screen.findByText('Job ID');
+
+  router.query = { cluster: 'cluster-b', job: '8' };
+  rerender(<ClusterJobDetails />);
+
+  expect(screen.queryByText('Job ID')).not.toBeInTheDocument();
+  expect(screen.queryByText('training-a')).not.toBeInTheDocument();
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(2);
+  expect(refreshA).not.toHaveBeenCalled();
+  expect(refreshB).not.toHaveBeenCalled();
+
+  clusterBLoading = false;
+  rerender(<ClusterJobDetails />);
+  await screen.findByText('Job not found');
+});
+
+it('keeps matching cluster-job detail visible during background loading', async () => {
+  router.query = { cluster: 'cluster-a', job: '7' };
+  useClusterDetails.mockReturnValue({
+    clusterData: {
+      cluster: 'cluster-a',
+      workspace: 'workspace-a',
+      infra: 'AWS',
+      user: 'alice',
+      user_hash: 'user-a',
+    },
+    clusterJobData: [{ id: 7, status: 'RUNNING', job: 'training-a' }],
+    loading: true,
+    clusterJobsLoading: false,
+    refreshData: jest.fn().mockResolvedValue(undefined),
+  });
+
+  render(<ClusterJobDetails />);
+
+  expect(await screen.findByText('Job ID')).toBeInTheDocument();
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
+});
+
 it('uses the current job rows for its pool-link snapshot', async () => {
   render(<JobDetails />);
 
