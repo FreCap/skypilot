@@ -3094,7 +3094,7 @@ def _serialize_prepared_replica(prepared: _PreparedServiceStatus,
         replica_record = info.to_info_dict(
             with_handle=True,
             with_url=not prepared.pool,
-            cluster_record=prepared.cluster_records[info.cluster_name],
+            cluster_record=prepared.cluster_records.get(info.cluster_name),
             rate_cache=prepared.rate_cache,
         )
     if replica_record.get('provider_identity_uncertain'):
