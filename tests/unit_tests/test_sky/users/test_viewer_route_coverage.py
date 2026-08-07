@@ -155,23 +155,8 @@ _KNOWN_VIEWER_DENIED: set = {
     # only the download endpoint stays admin-only because the dump file
     # itself may contain sensitive state.
     ('/debug/dump_download/{dump_filename}', 'GET'),
-    # --- /api/* paths: RBAC-skipped at middleware level, not on
-    # viewer allowlist; explicitly enumerated here for documentation.
-    # These are reachable to viewer regardless of allowlist (the
-    # middleware short-circuits before the role dispatch), but we
-    # mark them "denied" in the *intent* sense so the coverage test
-    # forces a deliberate decision.
-    ('/api/get', 'GET'),
-    ('/api/stream', 'GET'),
-    ('/api/status', 'GET'),
-    ('/api/status/query', 'POST'),
-    ('/api/health', 'GET'),
-    ('/api/health/ready', 'GET'),
-    ('/api/cancel', 'POST'),  # request cancellation
-    ('/api/completion/cluster_name', 'GET'),
-    ('/api/completion/storage_name', 'GET'),
-    ('/api/completion/volume_name', 'GET'),
-    ('/api/completion/api_request', 'GET'),
+    # Request lifecycle reads are explicitly allowlisted and enforce their
+    # row-level scope in the endpoint. Cancellation remains a viewer write.
     # --- Misc index route ---
     ('/', 'GET'),
 }

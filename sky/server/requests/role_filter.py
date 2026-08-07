@@ -112,7 +112,7 @@ def _is_viewer(request: fastapi.Request) -> bool:
     matching the perf pattern in
     `PermissionService.check_endpoint_permission`.
     """
-    auth_user = getattr(request.state, 'auth_user', None)
+    auth_user = request.state.auth_user
     if auth_user is None:
         return False
     # Trust the in-memory grouping policy; same source the middleware

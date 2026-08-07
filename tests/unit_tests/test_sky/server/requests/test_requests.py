@@ -31,16 +31,18 @@ def isolated_database(tmp_path):
     temp_log_path = tmp_path / "logs"
     temp_log_path.mkdir()
 
+    # Close the prior aiosqlite worker before switching paths.  Dropping the
+    # module reference without closing it leaks a non-daemon thread and can
+    # hang a serial pytest process during interpreter shutdown.
+    asyncio.run(requests.close_db_async())
+
     # Patch the database path and log path constants
     with mock.patch('sky.server.constants.API_SERVER_REQUEST_DB_PATH',
                     str(temp_db_path)):
         with mock.patch('sky.server.constants.REQUEST_LOG_PATH_PREFIX',
                         str(temp_log_path)):
-            # Reset the global database variable to force re-initialization
-            requests._DB = None
             yield
-            # Clean up after the test
-            requests._DB = None
+            asyncio.run(requests.close_db_async())
 
 
 @pytest.mark.asyncio
@@ -1473,7 +1475,8 @@ def test_encode_requests_single_request():
     payload = result[0]
     assert payload.request_id == 'test-req-1'
     assert payload.name == 'test-request'
-    assert payload.entrypoint == 'dummy'
+    assert payload.entrypoint == ''
+    assert payload.request_body == 'null'
     assert payload.status == 'PENDING'
     assert payload.created_at == current_time
     assert payload.user_id == 'user-123'
@@ -1481,6 +1484,7 @@ def test_encode_requests_single_request():
     assert payload.pid is None
     assert payload.return_value == 'null'
     assert payload.error == 'null'
+    assert payload.status_msg is None
 
 
 def test_encode_requests_multiple_requests():
@@ -1621,8 +1625,8 @@ def test_encode_requests_readable_encode_parity():
     """encode_requests and readable_encode must produce identical payloads.
 
     Both feed the request table display (readable_encode delegates to
-    encode_requests); this locks in the shared field list, including
-    file_mounts_blob_id.
+    encode_requests); private request-body and file-mount capability fields
+    stay out of that projection.
     """
     from sky import models
 
@@ -1642,7 +1646,8 @@ def test_encode_requests_readable_encode_parity():
         batched_payload = requests.encode_requests([request])[0]
         per_row_payload = request.readable_encode()
 
-    assert batched_payload.file_mounts_blob_id == 'blob-123'
+    assert batched_payload.file_mounts_blob_id is None
+    assert batched_payload.request_body == 'null'
     assert per_row_payload.model_dump() == batched_payload.model_dump()
 
 
@@ -1836,6 +1841,40 @@ async def test_get_latest_request_id_async(isolated_database):
     request_id = await requests.get_latest_request_id_async()
     assert request_id == 'test-request-id-2'
 
+    other_request = requests.Request(request_id='other-user-latest',
+                                     name='test-request',
+                                     entrypoint=dummy,
+                                     request_body=payloads.RequestBody(),
+                                     status=RequestStatus.PENDING,
+                                     created_at=current_time + 2,
+                                     user_id='other-user')
+    await requests.create_if_not_exists_async(other_request)
+    assert await requests.get_latest_request_id_async() == 'other-user-latest'
+    assert (await requests.get_latest_request_id_async('test-user') ==
+            'test-request-id-2')
+
+
+@pytest.mark.asyncio
+async def test_sqlite_targeted_cancel_enforces_owner(isolated_database):
+    for request_id, user_id in (('cancel-own', 'alice'), ('cancel-foreign',
+                                                          'bob')):
+        await requests.create_if_not_exists_async(
+            requests.Request(request_id=request_id,
+                             name='test-request',
+                             entrypoint=dummy,
+                             request_body=payloads.RequestBody(),
+                             status=RequestStatus.PENDING,
+                             created_at=time.time(),
+                             user_id=user_id))
+
+    backend = requests.request_storage.get_request_backend()
+    assert backend.kill_requests(['cancel-own', 'cancel-foreign'],
+                                 user_id='alice') == ['cancel-own']
+    own = await requests.get_request_async('cancel-own')
+    foreign = await requests.get_request_async('cancel-foreign')
+    assert own is not None and own.status is RequestStatus.CANCELLED
+    assert foreign is not None and foreign.status is RequestStatus.PENDING
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('test_async', [True, False])
@@ -1897,6 +1936,17 @@ async def test_get_requests_with_prefix(isolated_database, test_async):
         result = requests.get_requests_with_prefix('batch-request')
     assert result is not None
     assert len(result) == 3
+
+    if test_async:
+        owned_result = await requests.get_requests_async_with_prefix(
+            'batch-request', fields=['request_id'], user_id='test-user-1')
+    else:
+        owned_result = requests.get_requests_with_prefix('batch-request',
+                                                         fields=['request_id'],
+                                                         user_id='test-user-1')
+    assert owned_result is not None
+    assert [request.request_id for request in owned_result
+           ] == ['batch-request-001']
 
     # Verify all returned requests match the prefix
     returned_ids = [req.request_id for req in result]

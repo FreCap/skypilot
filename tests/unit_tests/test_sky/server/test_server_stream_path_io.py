@@ -15,6 +15,7 @@ async def test_stream_resolves_user_log_path_off_event_loop(tmp_path):
     log_path = tmp_path / 'request.log'
     log_path.write_text('output', encoding='utf-8')
     request = mock.MagicMock(spec=fastapi.Request)
+    request.state.auth_user = None
     original_to_thread = asyncio.to_thread
 
     with mock.patch.object(constants, 'SKY_LOGS_DIRECTORY', str(tmp_path)), \

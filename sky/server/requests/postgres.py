@@ -471,24 +471,8 @@ def _request_from_mapping(
     return requests_lib.Request.from_durable_values(values)
 
 
-_SCALAR_REQUEST_PROJECTION_FIELDS = frozenset({
-    'request_id',
-    'name',
-    'status',
-    'pid',
-    'created_at',
-    'cluster_name',
-    'schedule_type',
-    'user_id',
-    'status_msg',
-    'should_retry',
-    'finished_at',
-    'file_mounts_blob_id',
-    'execution_generation',
-    'execution_quiescence_required',
-    'execution_quiesced_generation',
-    'execution_quiesced_at',
-})
+_SCALAR_REQUEST_PROJECTION_FIELDS = (
+    requests_lib.SCALAR_REQUEST_QUERY_FIELD_SET)
 
 
 def _scalar_projection_entrypoint() -> None:
@@ -507,7 +491,8 @@ def _request_from_scalar_mapping(
         request_id=str(values.get('request_id', '')),
         name=str(values.get('name', '')),
         entrypoint=_scalar_projection_entrypoint,
-        request_body=payloads.RequestBody(),
+        # The public status encoder emits JSON null for this display-only body.
+        request_body=payloads.RequestBody.projection_placeholder(),
         status=status,
         created_at=float(_timestamp(values.get('created_at')) or 0),
         user_id=str(values.get('user_id', '')),
@@ -526,6 +511,21 @@ def _request_from_scalar_mapping(
             values.get('execution_quiesced_generation') is not None else None),
         execution_quiesced_at=_timestamp(values.get('execution_quiesced_at')),
     )
+
+
+def _request_projection_statement(
+        fields: list[str] | None) -> sqlalchemy.sql.Select:
+    if fields and set(fields).issubset(_SCALAR_REQUEST_PROJECTION_FIELDS):
+        return sqlalchemy.select(*(REQUESTS.c[field] for field in fields))
+    return sqlalchemy.select(REQUESTS)
+
+
+def _request_projection_decoder(
+    fields: list[str] | None,
+) -> Callable[[sqlalchemy.engine.RowMapping], requests_lib.Request]:
+    if fields and set(fields).issubset(_SCALAR_REQUEST_PROJECTION_FIELDS):
+        return _request_from_scalar_mapping
+    return _request_from_mapping
 
 
 def _initialize_schema(engine: sqlalchemy.engine.Engine) -> None:
@@ -1117,15 +1117,7 @@ def _request_is_retention_safe() -> sqlalchemy.ColumnElement[bool]:
 
 def _request_filter_statement(
     req_filter: requests_lib.RequestTaskFilter,) -> sqlalchemy.sql.Select:
-    scalar_projection = bool(
-        req_filter.fields and
-        set(req_filter.fields).issubset(_SCALAR_REQUEST_PROJECTION_FIELDS))
-    if scalar_projection:
-        assert req_filter.fields is not None
-        statement = sqlalchemy.select(
-            *(REQUESTS.c[field] for field in req_filter.fields))
-    else:
-        statement = sqlalchemy.select(REQUESTS)
+    statement = _request_projection_statement(req_filter.fields)
     if req_filter.status is not None:
         statement = statement.where(
             REQUESTS.c.status.in_(
@@ -1436,26 +1428,26 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             self,
             request_id: str,
             fields: list[str] | None = None) -> requests_lib.Request | None:
-        del fields
         engine = initialize_and_get_db()
         with engine.connect() as connection:
             row = connection.execute(
-                sqlalchemy.select(REQUESTS).where(
+                _request_projection_statement(fields).where(
                     REQUESTS.c.request_id == request_id)).mappings().first()
-        return _request_from_mapping(row) if row is not None else None
+        decoder = _request_projection_decoder(fields)
+        return decoder(row) if row is not None else None
 
     async def get_request_async(
             self,
             request_id: str,
             fields: list[str] | None = None) -> requests_lib.Request | None:
-        del fields
         engine = await _get_async_engine()
         async with engine.connect() as connection:
             result = await connection.execute(
-                sqlalchemy.select(REQUESTS).where(
+                _request_projection_statement(fields).where(
                     REQUESTS.c.request_id == request_id))
             row = result.mappings().first()
-        return _request_from_mapping(row) if row is not None else None
+        decoder = _request_projection_decoder(fields)
+        return decoder(row) if row is not None else None
 
     @contextlib.contextmanager
     def update_request(
@@ -1656,9 +1648,7 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         with engine.connect() as connection:
             rows = connection.execute(
                 _request_filter_statement(req_filter)).mappings().all()
-        decoder = (_request_from_scalar_mapping if req_filter.fields and set(
-            req_filter.fields).issubset(_SCALAR_REQUEST_PROJECTION_FIELDS) else
-                   _request_from_mapping)
+        decoder = _request_projection_decoder(req_filter.fields)
         return [decoder(row) for row in rows]
 
     async def query_requests_async(
@@ -1669,9 +1659,7 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             result = await connection.execute(
                 _request_filter_statement(req_filter))
             rows = result.mappings().all()
-        decoder = (_request_from_scalar_mapping if req_filter.fields and set(
-            req_filter.fields).issubset(_SCALAR_REQUEST_PROJECTION_FIELDS) else
-                   _request_from_mapping)
+        decoder = _request_projection_decoder(req_filter.fields)
         return [decoder(row) for row in rows]
 
     async def delete_requests(self, request_ids: list[str]) -> None:
@@ -2093,16 +2081,16 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                                  request_id_prefix: str,
                                  fields: list[str] | None = None
                                 ) -> list[requests_lib.Request] | None:
-        del fields
         engine = initialize_and_get_db()
         escaped = db_utils.glob_to_like_pattern(request_id_prefix) + '%'
         with engine.connect() as connection:
             rows = connection.execute(
-                sqlalchemy.select(REQUESTS).where(
+                _request_projection_statement(fields).where(
                     REQUESTS.c.request_id.like(
                         escaped,
                         escape=db_utils.LIKE_ESCAPE_CHAR))).mappings().all()
-        return ([_request_from_mapping(row) for row in rows] if rows else None)
+        decoder = _request_projection_decoder(fields)
+        return ([decoder(row) for row in rows] if rows else None)
 
     async def get_requests_async_with_prefix(
             self,

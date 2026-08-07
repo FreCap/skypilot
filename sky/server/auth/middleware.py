@@ -93,8 +93,7 @@ class RBACMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     async def dispatch(self, request: fastapi.Request, call_next):
         # TODO(hailong): should have a list of paths
         # that are not checked for RBAC
-        if (request.url.path.startswith('/dashboard/') or
-                request.url.path.startswith('/api/')):
+        if request.url.path.startswith('/dashboard/'):
             return await call_next(request)
 
         auth_user = request.state.auth_user
@@ -212,11 +211,16 @@ def _generate_auth_token(request: fastapi.Request) -> str:
 @middleware_utils.websocket_aware
 class InitializeRequestAuthUserMiddleware(
         starlette.middleware.base.BaseHTTPMiddleware):
+    """Establish the explicit request-scoped auth and security state."""
 
     async def dispatch(self, request: fastapi.Request, call_next):
-        # Make sure that request.state.auth_user is set. Otherwise, we may get a
-        # KeyError while trying to read it.
+        # Establish the complete request-state interface before any inner
+        # middleware or endpoint reads it.  Authentication and HTML/controller
+        # middleware may replace these explicit defaults.
         request.state.auth_user = None
+        request.state.anonymous_user = False
+        request.state.controller_origin = None
+        request.state.csp_nonce = None
         return await call_next(request)
 
 
@@ -503,7 +507,9 @@ class InternalServeControllerSyncAuthMiddleware(
                 {'detail': 'Invalid controller sync bearer token.'})
 
         # Normal authentication middlewares use this state as their trusted
-        # "already authenticated" signal.  RBAC does not apply to /api/*.
+        # "already authenticated" signal.  The system principal is not a
+        # viewer, so the blocklist-based RBAC policy permits this internal
+        # route while the dedicated token remains the authentication gate.
         request.state.auth_user = models.User(
             id='skypilot-system-lb-sync',
             name='SkyServe external load balancer',

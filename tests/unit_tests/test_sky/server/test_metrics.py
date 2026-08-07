@@ -583,8 +583,8 @@ def test_get_user_label_with_auth_user():
 
 def test_get_user_label_anonymous():
     """Test _get_user_label with no auth_user."""
-    request = MagicMock(spec=['state'])
-    request.state = MagicMock(spec=[])  # No auth_user attribute
+    request = MagicMock()
+    request.state.auth_user = None
 
     result = metrics._get_user_label(request)
     assert result == 'anonymous'
@@ -689,7 +689,8 @@ async def test_middleware_records_anonymous_user_metrics(
     request = MagicMock(spec=['url', 'method', 'state'])
     request.url.path = '/api/v1/status'
     request.method = 'GET'
-    request.state = MagicMock(spec=[])  # No auth_user attribute
+    request.state = MagicMock()
+    request.state.auth_user = None
 
     response = MagicMock()
     response.status_code = 200
