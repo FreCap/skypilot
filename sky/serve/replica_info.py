@@ -832,17 +832,14 @@ class ReplicaInfo:
                                          owner=f'ReplicaInfo v{record_version}')
 
         # Pre-v13 pickles have no recovery fields and are ordinary by
-        # contract. The only missing v13 shape accepted is the exact rollback
-        # bundle in which all additive recovery fields are absent. Current
-        # v14 objects were checked above and can never enter either path.
+        # contract. Every v13 recovery bundle must be complete; a partial or
+        # completely absent bundle is quarantined. Current v14 objects were
+        # checked above and can never enter either path.
         present_recovery_fields = {
             field for field in V13_ADDITIVE_STORAGE_FIELDS
             if field in vars(self)
         }
         if record_version < 13:
-            _set_ordinary_system_recovery_defaults(self)
-            _set_transition_replica_record_id(self)
-        elif (not present_recovery_fields and record_version == 13):
             _set_ordinary_system_recovery_defaults(self)
             _set_transition_replica_record_id(self)
         elif present_recovery_fields != set(V13_ADDITIVE_STORAGE_FIELDS):

@@ -197,6 +197,7 @@ def test_all_fields_absent_v13_quarantines_json_pickle_and_memory() -> None:
     from_pickle.__setstate__(pickle_state)
 
     in_memory = _replica()
+    in_memory._version = 13  # pylint: disable=protected-access
     for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
         delattr(in_memory, field)
     serialized = in_memory.to_storage_dict()
@@ -221,6 +222,7 @@ def test_all_fields_absent_v13_quarantines_json_pickle_and_memory() -> None:
     assert v12_restored.system_recovery_disposition == (
         recovery_state.SystemRecoveryDisposition.ORDINARY)
     assert v12_restored.replica_record_id == from_json.replica_record_id
+
 
 def test_future_replica_info_versions_are_quarantined() -> None:
     missing = _replica().to_storage_dict()

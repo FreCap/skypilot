@@ -26,16 +26,19 @@ is the Terraform/Helm deployment authority for that exact release. The
 seven-day clock has not started, and no missing-series interval earns
 removal-gate credit. This restacked #1183 branch removes those sentinels
 together with the deprecated readers; it remains draft and undeployed with all
-seven global gates open._
+seven global gates open. A 2026-08-07 repository review confirmed that
+boltz-platform #7823 is still open, draft, and undeployed, so it supplies no
+new gate evidence. The cleanup code has been refreshed against current
+`improvements`; no production claim below is advanced by that code-only
+refresh._
 
-_Last updated: 2026-08-04_
+_Last updated: 2026-08-07_
 
-_Design baseline: transition PR #1258 implementation
-`3ec9e23eedc23569b7a2bc5df408338781da763b`, merged as
-`004870a6f20ed6a4e783575a858795a0a66e65a8`. PR #1183 has base
-`improvements` at that merge commit; its restacked cleanup implementation
-commit `ae7dd8bf99b35c13d96cfa6555d0ff78673f57b6` is the direct child, and the
-current branch adds only the cleanup-contract test/design correction above it._
+_Design baseline: current `origin/improvements` at
+`336bcc701ce8d0a34c40d898c8e269aeb0777e95`. Transition PR #1258 remains
+merged as `004870a6f20ed6a4e783575a858795a0a66e65a8`; #1183 replays its two
+authored cleanup commits on the current baseline and includes only the
+current-code integration correction documented in the verification evidence._
 
 ## Context and decision
 
@@ -1525,11 +1528,9 @@ readers and other transition paths.
 
 ### PR 3 / #1183: `[Serve] Remove deprecated direct-shell OOM recovery`
 
-_[PR #1183](https://github.com/boltz-bio/skypilot/pull/1183), with base
-`improvements` at merged #1258 commit
-`004870a6f20ed6a4e783575a858795a0a66e65a8`; cleanup implementation commit
-`ae7dd8bf99b35c13d96cfa6555d0ff78673f57b6` is its direct child, followed only
-by the cleanup-contract test/design correction. It remains a draft, undeployed
+_[PR #1183](https://github.com/boltz-bio/skypilot/pull/1183), refreshed on
+2026-08-07 onto `improvements` at
+`336bcc701ce8d0a34c40d898c8e269aeb0777e95`. It remains a draft, undeployed
 removal change._
 
 This accepts only authorization document v3, removes authorization-document
@@ -2332,7 +2333,22 @@ deprecated event names and only the eight operational event labels remain.
 Exact per-replica associations remain in current `ReplicaInfo`; bounded
 structured logs supply diagnostic correlation but are not lifecycle authority.
 
-### Verification evidence (updated 2026-08-04)
+### Verification evidence (updated 2026-08-07)
+
+- The #1183 cleanup was replayed onto exact current `origin/improvements`
+  `336bcc701ce8d0a34c40d898c8e269aeb0777e95`. The intervening v14
+  `ReplicaInfo` interface required preserving all new owned fields while
+  removing the v13 all-fields-absent normalization from JSON, pickle, and
+  in-memory serialization. The refreshed focused suite reports 509 passed and
+  11 PostgreSQL-environment skips across the 13 cleanup and current record-
+  contract modules. The exact v13 quarantine regression passes through each
+  supported decode form. Refreshed required CI, including PostgreSQL execution,
+  remains authoritative before merge.
+- GitHub evidence on 2026-08-07 shows boltz-platform #7823 still open and
+  draft at `7039ca9eb2225aa7a3e168e6609f627403585522`. Release 1.1.1087 and its
+  four visibility sentinels therefore remain undeployed by the recorded
+  authority, the seven-day clock has not started, and all seven removal gates
+  remain open.
 
 - The expanded 33-module changed-test sweep collects 1,782 tests under Python
   3.14. All 1,582 tests in the 29 non-PostgreSQL modules pass. The four real-
