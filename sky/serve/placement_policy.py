@@ -5,8 +5,9 @@ names and their typed runtime meaning, but imports neither service specs nor
 placement engines.
 """
 
+from collections.abc import Mapping
 import dataclasses
-from typing import Any, Mapping
+from typing import Any
 
 SPOT_HEDGE_PLACER = 'dynamic_fallback'
 CAPACITY_AWARE_SPOT_PLACER = 'dynamic_fallback_per_gpu'
