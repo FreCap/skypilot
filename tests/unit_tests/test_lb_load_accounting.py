@@ -156,7 +156,7 @@ class TestSelectReplicaScoring:
 
 
 def _make_lb(policy, client_pool):
-    balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+    balancer = lb_module.SkyServeLoadBalancer('http://controller:8001', 0)
     balancer._load_balancing_policy = policy
     balancer._client_pool = client_pool
     balancer._client_pool_lock = threading.Lock()
@@ -228,7 +228,7 @@ class TestProxySlotRelease:
         send_response.status_code = 200
         send_response.headers = {}
 
-        async def _send(*args, **kwargs):
+        async def _send(*_args, **_kwargs):
             return send_response
 
         client.send = _send
@@ -282,7 +282,7 @@ class TestProxySlotRelease:
 
         send_response.aclose = _aclose
 
-        async def _send(*args, **kwargs):
+        async def _send(*_args, **_kwargs):
             return send_response
 
         client.send = _send
@@ -325,7 +325,7 @@ class TestProxySlotRelease:
 
         send_response.aclose = _aclose
 
-        async def _send(*args, **kwargs):
+        async def _send(*_args, **_kwargs):
             return send_response
 
         client.send = _send
@@ -416,7 +416,8 @@ class TestProxySlotRelease:
 
             try:
                 await response(self._asgi_scope(), _receive, _send)
-            except BaseException:  # Starlette version-specific wrapper.
+            except BaseException:  # pylint: disable=broad-exception-caught
+                # Starlette uses a version-specific exception-group wrapper.
                 pass
 
         asyncio.run(_run())
@@ -483,7 +484,7 @@ class TestProxySlotRelease:
         client = mock.MagicMock()
         captured = {}
 
-        def _build_request(*args, **kwargs):
+        def _build_request(*_args, **kwargs):
             captured['timeout'] = kwargs.get('timeout')
             raise httpx.RequestError('stop here')
 
@@ -525,7 +526,7 @@ class TestDrainPrunedClients(unittest.TestCase):
         client = mock.MagicMock()
         seen = {}
 
-        def _build_request(*args, **kwargs):
+        def _build_request(*_args, **_kwargs):
             # In-flight while the request is being executed.
             seen['inflight_during'] = getattr(client, lb_module._INFLIGHT_ATTR,
                                               0)

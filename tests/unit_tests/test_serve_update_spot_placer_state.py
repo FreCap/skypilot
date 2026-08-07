@@ -33,7 +33,8 @@ def test_update_preserves_bench_for_unchanged_location(monkeypatch):
     old_placer.set_preemptive(reshaped_old)
     benched_at = old_placer.location2preempted_at[unchanged]
 
-    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     manager.lock = threading.RLock()
     manager._service_name = 'svc'
     manager.latest_version = 1

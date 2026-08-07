@@ -98,7 +98,7 @@ def test_request_metadata_callable_contract(name: str) -> None:
 
 
 def test_request_metadata_error_and_translation_contract() -> None:
-    lb = object.__new__(load_balancer.SkyServeLoadBalancer)
+    lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 0)
     lb._configured_accelerators = ('L4', 'A100-80GB')
     lb._request_accelerator_compatibility_version = 1
 

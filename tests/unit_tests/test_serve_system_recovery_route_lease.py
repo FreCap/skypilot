@@ -4,13 +4,14 @@ These tests deliberately drive the LB's monotonic lease clock and exact client
 objects.  A recovery-capable process can restart behind the same URL, so URL
 equality alone is not a dispatch fence.
 """
-# pylint: disable=protected-access
+# pylint: disable=protected-access,missing-class-docstring
+# pylint: disable=use-implicit-booleaness-not-comparison
 import asyncio
-import threading
 from unittest import mock
 
 import fastapi
 import httpx
+from load_balancer_test_utils import publish_current_occupancy_snapshot
 import pytest
 from starlette.datastructures import Headers
 from starlette.datastructures import URL
@@ -295,26 +296,22 @@ def test_partial_or_invalid_marker_is_fail_closed(invalid_info):
         _MARKED_URL: invalid_info,
         _ORDINARY_URL: {},
     })
-    now = lb_module.time.monotonic()
     with lb._client_pool_lock:
         assert _MARKED_URL in lb._system_recovery_invalid_route_marker_urls
         assert lb._routable_ready_urls_locked() == {_ORDINARY_URL}
-        lb._replica_free_slots = {
-            _MARKED_URL: 4,
-            _ORDINARY_URL: 3,
-        }
-        lb._occupancy_dispatch_generation = {
-            _MARKED_URL: 0,
-            _ORDINARY_URL: 0,
-        }
-        lb._occupancy_sample_generation = {
-            _MARKED_URL: 0,
-            _ORDINARY_URL: 0,
-        }
-        lb._occupancy_sample_time = {
-            _MARKED_URL: now,
-            _ORDINARY_URL: now,
-        }
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={
+                                               _MARKED_URL: 0,
+                                               _ORDINARY_URL: 0,
+                                           },
+                                           total_slots={
+                                               _MARKED_URL: 4,
+                                               _ORDINARY_URL: 3,
+                                           },
+                                           free_slots={
+                                               _MARKED_URL: 4,
+                                               _ORDINARY_URL: 3,
+                                           })
         assert lb._effective_replica_free_slots_locked() == {_ORDINARY_URL: 3}
 
 

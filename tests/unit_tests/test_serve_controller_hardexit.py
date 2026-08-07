@@ -13,6 +13,7 @@ controller. ``run()`` therefore force-terminates the subprocess once
 ``uvicorn.run()`` returns (in a ``finally`` so it also fires on an exception).
 """
 # pylint: disable=protected-access
+import threading
 from unittest import mock
 
 import fastapi
@@ -30,6 +31,9 @@ def _make_controller(monkeypatch):
     ctrl._host = '127.0.0.1'
     ctrl._port = 20010
     ctrl._controller_owner_fingerprint = 'owner-a'
+    ctrl._is_pool = True
+    ctrl._update_reconciler_stop = threading.Event()
+    ctrl._actuation_stop = threading.Event()
     # run() consults the reserved-capacity fill flag before deciding whether
     # to start the poller thread; disabled short-circuits before touching
     # the (absent) replica manager.

@@ -1,5 +1,6 @@
 """Durable repository for external load balancer cutover state."""
 
+from collections.abc import Iterator
 import contextlib
 import json
 import time
@@ -478,7 +479,7 @@ def lb_cutover_kubernetes_guard(
     expected_generation: int,
     expected_phase: lb_ha.LbCutoverPhase,
     expected_pending_slot: lb_ha.LbSlot | None,
-):
+) -> Iterator[bool]:
     """Hold the service row lock across one external Kubernetes mutation.
 
     Controller ownership updates write the same PostgreSQL row and therefore

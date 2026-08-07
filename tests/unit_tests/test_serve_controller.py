@@ -264,6 +264,17 @@ class _FakeReplicaInfo:
         self.last_provider_config = None
         self.planned_capacity = 1
         self.logical_bridge_capacity_verified = False
+        self.resources_override = None
+        self.reserved_fill = False
+        self.unknown_capacity_replacement = False
+        self.created_at = None
+        self.cost_rebalance_for_replica_id = None
+        self.status_property = types.SimpleNamespace(
+            is_scale_down=False,
+            sky_down_status=None,
+            first_ready_time=None,
+            sky_launch_status=None,
+        )
         # Most routing tests exercise the protocol's legacy/unknown omission
         # shape. Tests for persisted provenance override this with a bool.
         self.is_zero_cost = None
@@ -305,20 +316,39 @@ def _make_controller() -> controller.SkyServeController:
     ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
     ctrl._resource_scope = None  # pylint: disable=protected-access
+    ctrl._service_hash = None  # pylint: disable=protected-access
+    ctrl._controller_owner = None  # pylint: disable=protected-access
+    ctrl._history_session_id = 'test-session'  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
     ctrl._lb_replica_cache_record_ids = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache_record_ids = {}  # pylint: disable=protected-access
     ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+        yaml_content=None,
+        spot_placer=None,
         system_recovery_allows_routing=lambda _info: True,
         system_recovery_route_marker=lambda _info, _url: None,
         retire_system_recovery_route=lambda _info: None)
+    ctrl._autoscaler = None  # pylint: disable=protected-access
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
     ctrl._lb_role_lock = None  # pylint: disable=protected-access
     ctrl._lb_demand_lock = None  # pylint: disable=protected-access
+    ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
+    ctrl._lb_session_ledger = None  # pylint: disable=protected-access
+    ctrl._lb_expected_occupancy_urls = set()  # pylint: disable=protected-access
+    ctrl._lb_occupancy_contract_known = False  # pylint: disable=protected-access
+    ctrl._lb_last_demand_snapshot = None  # pylint: disable=protected-access
+    ctrl._lb_demand_handoff = controller.lb_ha.DemandHandoff(  # pylint: disable=protected-access
+        constants.LB_DEMAND_HANDOFF_SECONDS)
     ctrl._routing_spec = None  # pylint: disable=protected-access
     ctrl._applied_version = 1  # pylint: disable=protected-access
     ctrl._routing_state_lock = threading.RLock()  # pylint: disable=protected-access
+    ctrl._actuation_epoch_lock = threading.RLock()  # pylint: disable=protected-access
+    ctrl._actuation_stop = threading.Event()  # pylint: disable=protected-access
+    ctrl._update_reconciler_stop = threading.Event()  # pylint: disable=protected-access
+    ctrl._update_recovery_required = False  # pylint: disable=protected-access
+    ctrl._reconcile_generation = 0  # pylint: disable=protected-access
+    ctrl._is_pool = False  # pylint: disable=protected-access
     ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
     return ctrl
 
@@ -390,7 +420,10 @@ class _FakeSpec:
                  lb_retriable_status_codes=None,
                  lb_max_retries=None,
                  lb_retry_initial_backoff_seconds=None,
-                 target_concurrency_per_replica=None) -> None:
+                 target_concurrency_per_replica=None,
+                 lb_request_queue=None,
+                 reserved_capacity_fill=False,
+                 uses_logical_replicas=False) -> None:
         self.load_balancing_policy = load_balancing_policy
         self.target_qps_per_replica = target_qps_per_replica
         self.lb_stream_timeout_seconds = lb_stream_timeout_seconds
@@ -399,6 +432,9 @@ class _FakeSpec:
         self.lb_retry_initial_backoff_seconds = (
             lb_retry_initial_backoff_seconds)
         self.target_concurrency_per_replica = (target_concurrency_per_replica)
+        self.lb_request_queue = lb_request_queue
+        self.reserved_capacity_fill = reserved_capacity_fill
+        self.uses_logical_replicas = uses_logical_replicas
 
 
 class TestGetRoutingSpec:
@@ -420,7 +456,6 @@ class TestGetRoutingSpec:
             'target_qps_per_replica': {
                 'L4': 2.5
             },
-            # _FakeSpec has no concurrency knob; getattr resolves None.
             'target_concurrency_per_replica': None,
             'stream_timeout_seconds': 120,
             'retriable_status_codes': [503],
@@ -537,7 +572,8 @@ class TestGetRoutingSpec:
     def test_controller_feeds_exact_task_gpu_counts_to_autoscaler(self):
         ctrl = _make_controller()
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
-            yaml_content='service: {}')
+            yaml_content='service: {}',
+            spot_placer=None)
         ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
             spec=controller.autoscalers.InstanceAwareRequestRateAutoscaler)
         task = types.SimpleNamespace(resources=[
@@ -720,6 +756,7 @@ class TestGetRoutingSpec:
         ctrl._routing_spec = ctrl._build_routing_spec(old_spec)  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._autoscaler = mock.MagicMock()  # pylint: disable=protected-access
+        ctrl._autoscaler.replica_unit = 'physical'  # pylint: disable=protected-access
         ctrl._mark_controller_applied_version = mock.Mock(  # pylint: disable=protected-access
             return_value=True)
         ctrl._seed_fill_zero_cost_locations = mock.Mock()  # pylint: disable=protected-access
@@ -799,6 +836,8 @@ class TestGetRoutingSpec:
 
 def _make_update_controller() -> controller.SkyServeController:
     ctrl = _make_controller()
+    ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+        replica_unit='physical_backend')
     ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
     ctrl._controller_owner = (123, '10.0.0.1')  # pylint: disable=protected-access
     ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
@@ -819,6 +858,44 @@ def _make_update_controller() -> controller.SkyServeController:
     ctrl._mark_controller_applied_version = mock.Mock(  # pylint: disable=protected-access
         return_value=True)
     return ctrl
+
+
+def _make_update_spec(
+        replica_unit: str = 'physical_backend') -> types.SimpleNamespace:
+    """Build the explicit service interface consumed by update tests."""
+    return types.SimpleNamespace(
+        replica_unit=replica_unit,
+        uses_logical_replicas=(replica_unit == 'logical'),
+        spot_placer=None,
+    )
+
+
+def _make_autoscaler_spec(**overrides) -> types.SimpleNamespace:
+    """Build the explicit SkyServiceSpec interface used by autoscalers."""
+    values = {
+        'min_replicas': 0,
+        'min_replicas_by_accelerator': {},
+        'max_replicas': 20,
+        'num_overprovision': None,
+        'replica_unit': 'physical_backend',
+        'target_qps_per_replica': None,
+        'target_concurrency_per_replica': None,
+        'pool': False,
+        'use_ondemand_fallback': False,
+        'queue_length_threshold': None,
+        'upscale_delay_seconds': None,
+        'downscale_delay_seconds': None,
+        'reserved_capacity_fill': False,
+        'reserved_fill_floor_replicas': 0,
+        'reserved_fill_weight': 1.0,
+        'reserved_fill_utilization_gate': False,
+        'cost_rebalance': False,
+        'cost_rebalance_min_savings_fraction': 0.3,
+        'cost_rebalance_max_parallel_replacements': 1,
+        'cost_rebalance_stabilization_seconds': 300.0,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
 
 
 def _make_prepared_controller_config(
@@ -975,7 +1052,7 @@ class TestServiceUpdateReconciler:
                                    side_effect=_commit):
             response = ctrl._commit_service_update(  # pylint: disable=protected-access
                 2,
-                types.SimpleNamespace(replica_unit='physical_backend'),
+                _make_update_spec(),
                 'service: changed',
                 serve_utils.UpdateMode.ROLLING,
                 'incarnation-a',
@@ -1103,9 +1180,7 @@ class TestServiceUpdateReconciler:
                 2, digest, 'c' * 64)
 
         assert prepared.legacy_snapshot is None
-        service = types.SimpleNamespace(replica_unit='physical_backend',
-                                        spot_placer=None,
-                                        uses_logical_replicas=False)
+        service = _make_update_spec()
         with mock.patch.object(controller.serve_state,
                                'get_yaml_content',
                                return_value=None), \
@@ -1709,7 +1784,7 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='logical')
-        legacy_spec = types.SimpleNamespace(replica_unit='physical_backend')
+        legacy_spec = _make_update_spec()
 
         with mock.patch.object(controller.serve_state,
                                'add_or_update_version') as commit:
@@ -1726,7 +1801,7 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='logical')
-        logical_spec = types.SimpleNamespace(replica_unit='logical')
+        logical_spec = _make_update_spec('logical')
 
         with mock.patch.object(controller.serve_state,
                                'add_or_update_version') as commit:
@@ -1740,14 +1815,15 @@ class TestServiceUpdateReconciler:
 
     def test_content_conflict_returns_409_without_scheduling(self):
         ctrl = _make_update_controller()
+        spec = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
         with mock.patch.object(controller.serve_state,
                                'add_or_update_version',
                                return_value=serve_state.VersionCommitResult.
                                CONTENT_CONFLICT) as commit:
             response = ctrl._commit_service_update(  # pylint: disable=protected-access
-                2, mock.sentinel.spec, 'service: changed',
-                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+                2, spec, 'service: changed', serve_utils.UpdateMode.ROLLING,
+                'incarnation-a', 7)
 
         assert response.status_code == 409
         assert 'already committed with different content' in json.loads(
@@ -1755,7 +1831,7 @@ class TestServiceUpdateReconciler:
         ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
         commit.assert_called_once_with('svc',
                                        2,
-                                       mock.sentinel.spec,
+                                       spec,
                                        'service: changed',
                                        submitted_yaml_content=None,
                                        expected_service_hash='incarnation-a',
@@ -1765,14 +1841,15 @@ class TestServiceUpdateReconciler:
 
     def test_stale_version_returns_409_without_scheduling(self):
         ctrl = _make_update_controller()
+        spec = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
         with mock.patch.object(
                 controller.serve_state,
                 'add_or_update_version',
                 return_value=serve_state.VersionCommitResult.STALE_VERSION):
             response = ctrl._commit_service_update(  # pylint: disable=protected-access
-                2, mock.sentinel.spec, 'service: stale',
-                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+                2, spec, 'service: stale', serve_utils.UpdateMode.ROLLING,
+                'incarnation-a', 7)
 
         assert response.status_code == 409
         assert 'superseded' in json.loads(response.body)['message']
@@ -1785,8 +1862,7 @@ class TestServiceUpdateReconciler:
         # fence, not the currently published autoscaler, must reject v3.
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='physical_backend')
-        physical = types.SimpleNamespace(replica_unit='physical_backend',
-                                         uses_logical_replicas=False)
+        physical = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
         with mock.patch.object(controller.serve_state,
                                'add_or_update_version',
@@ -1818,8 +1894,7 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='physical_backend')
-        logical = types.SimpleNamespace(replica_unit='logical',
-                                        uses_logical_replicas=True)
+        logical = _make_update_spec('logical')
         update_task = types.SimpleNamespace(service=logical, num_nodes=2)
 
         with mock.patch.object(controller.task_lib.Task,
@@ -1844,10 +1919,8 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='physical_backend')
-        caller = types.SimpleNamespace(replica_unit='logical',
-                                       uses_logical_replicas=True)
-        persisted = types.SimpleNamespace(replica_unit='physical_backend',
-                                          uses_logical_replicas=False)
+        caller = _make_update_spec('logical')
+        persisted = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
 
         with mock.patch.object(controller.serve_state,
@@ -1871,8 +1944,7 @@ class TestServiceUpdateReconciler:
 
     def test_exact_legacy_yaml_is_loaded_before_current_parser(self):
         ctrl = _make_update_controller()
-        persisted = types.SimpleNamespace(replica_unit='physical_backend',
-                                          uses_logical_replicas=False)
+        persisted = _make_update_spec()
         with mock.patch.object(controller.serve_state,
                                'get_yaml_content',
                                return_value='old-invalid-yaml'), \
@@ -1894,8 +1966,7 @@ class TestServiceUpdateReconciler:
             replica_unit='logical')
         ctrl._committed_version = 3  # pylint: disable=protected-access
         ctrl._applied_version = 3  # pylint: disable=protected-access
-        persisted = types.SimpleNamespace(replica_unit='physical_backend',
-                                          uses_logical_replicas=False)
+        persisted = _make_update_spec()
 
         with mock.patch.object(controller.serve_state,
                                'get_yaml_content',
@@ -1921,8 +1992,7 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='logical')
-        persisted = types.SimpleNamespace(replica_unit='logical',
-                                          uses_logical_replicas=True)
+        persisted = _make_update_spec('logical')
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
 
         with mock.patch.object(controller.serve_state,
@@ -1975,9 +2045,7 @@ class TestServiceUpdateReconciler:
                                                   '3' * 64)
         prepared_v2 = _make_prepared_controller_config(2,
                                                        staged_path=str(staged))
-        persisted = types.SimpleNamespace(replica_unit='physical_backend',
-                                          uses_logical_replicas=False,
-                                          spot_placer=None)
+        persisted = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
         ctrl._install_controller_config = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.reset_mock()  # pylint: disable=protected-access
@@ -3248,7 +3316,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
         ctrl._autoscaler.latest_version = 2
         ctrl._autoscaler.reserved_capacity_fill = True
-        ctrl._autoscaler._fill_target = 3  # pylint: disable=protected-access
+        ctrl._autoscaler.fill_target = 3
         ctrl._autoscaler.generate_scaling_decisions.return_value = []
         ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
         ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
@@ -3279,7 +3347,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
         ctrl._autoscaler.latest_version = 2
         ctrl._autoscaler.reserved_capacity_fill = False
-        ctrl._autoscaler._fill_target = 3  # pylint: disable=protected-access
+        ctrl._autoscaler.fill_target = 3
         ctrl._autoscaler.generate_scaling_decisions.return_value = []
         ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
         ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
@@ -3359,6 +3427,11 @@ class TestAutoscalerRuntimeSnapshot:
         decision_autoscaler = mock.Mock(spec=autoscalers.ConcurrencyAutoscaler)
         decision_autoscaler.latest_version = 1
         decision_autoscaler.replica_unit = 'logical'
+        decision_autoscaler.reserved_capacity_fill = False
+        decision_autoscaler.target_num_replicas_by_accelerator = {}
+        decision_autoscaler.has_recomputed_with_fresh_data.return_value = False
+        decision_autoscaler.cost_rebalance_state_dirty = False
+        decision_autoscaler.unrecoverable_rollout_failure = None
         decision_autoscaler.logical_target_state = None
         decision_autoscaler.configured_accelerator_shapes = {
             'L4': 1,
@@ -3499,17 +3572,10 @@ class TestAutoscalerRuntimeSnapshot:
 
     def test_instance_aware_physical_batches_keep_per_card_priority(self):
         ctrl = _make_controller()
-        spec = types.SimpleNamespace(
-            min_replicas=0,
-            max_replicas=20,
-            num_overprovision=None,
-            target_qps_per_replica={
-                'L4': 1.0,
-                'A100': 2.0,
-            },
-            upscale_delay_seconds=None,
-            downscale_delay_seconds=None,
-        )
+        spec = _make_autoscaler_spec(target_qps_per_replica={
+            'L4': 1.0,
+            'A100': 2.0,
+        },)
         decision_autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
             'svc', spec, version=1)
         l4_override = {'accelerators': {'L4': 1}}
@@ -3879,6 +3945,12 @@ class _StatefulDemandAutoscaler:
         self.latest_version = 1
         self.max_replicas = 100
         self.target_num_replicas = 1
+        self.min_replicas_by_accelerator = {}
+        self.target_num_replicas_by_accelerator = {}
+        self.warm_retention_target_by_accelerator = {}
+        self.cold_launch_authority_by_accelerator = {}
+        self.reserved_capacity_fill = False
+        self.fill_target = 0
         self.request_timestamps = [101]
         self.in_flight_by_replica_id = {1: 9}
         self.unknown_in_flight_replica_ids = {1}
@@ -3892,6 +3964,12 @@ class _StatefulDemandAutoscaler:
 
     def has_recomputed_with_fresh_data(self):
         return True
+
+    def is_replica_on_zero_cost_location(self, _info):
+        return False
+
+    def get_ready_replica_capacity(self, info):
+        return info.planned_capacity
 
     def info(self):
         return {
@@ -3921,6 +3999,8 @@ class _StatefulReplicaManager:
     """Small stateful drain-report sink used to detect any mutation."""
 
     def __init__(self) -> None:
+        self.spot_placer = None
+        self.yaml_content = None
         self.report = ({
             'http://trusted:8080': 4
         }, ['http://trusted:8080'], ['http://trusted:8080'],
@@ -4311,7 +4391,7 @@ class TestAuthoritativeLbReportIngestion:
         ctrl, _, _ = self._controller_and_report()
         autoscaler = mock.Mock()
         autoscaler.reserved_capacity_fill = True
-        autoscaler._fill_target = 3
+        autoscaler.fill_target = 3
         autoscaler.target_num_replicas_by_accelerator = {
             'A100': 0,
             'A100-80GB': 0,
@@ -4934,7 +5014,8 @@ class TestAuthoritativeLbReportIngestion:
                  'get_specs',
                  return_value={
                      1: types.SimpleNamespace(
-                         graceful_drain_async_occupancy=False),
+                         graceful_drain_async_occupancy=False,
+                         uses_logical_replicas=False),
                      3: types.SimpleNamespace(
                          graceful_drain_async_occupancy=True,
                          uses_logical_replicas=True),
@@ -4973,12 +5054,24 @@ class _FakeAutoscaler:
         self.latest_version = latest_version
         self.max_replicas = 20
         self.replica_unit = replica_unit
+        self.min_replicas_by_accelerator = {}
+        self.target_num_replicas_by_accelerator = {}
+        self.warm_retention_target_by_accelerator = {}
+        self.cold_launch_authority_by_accelerator = {}
+        self.reserved_capacity_fill = False
+        self.fill_target = 0
 
     def get_final_target_num_replicas(self) -> int:
         return self._target
 
     def has_recomputed_with_fresh_data(self) -> bool:
         return self._recomputed
+
+    def is_replica_on_zero_cost_location(self, _info) -> bool:
+        return False
+
+    def get_ready_replica_capacity(self, info) -> int:
+        return info.planned_capacity
 
 
 class TestGetCapacityHint:

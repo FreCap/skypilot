@@ -351,10 +351,13 @@ class Autoscaler:
         self._service_name: str = service_name
         self.min_replicas: int = spec.min_replicas
         self.min_replicas_by_accelerator: dict[str, int] = dict(
-            getattr(spec, 'min_replicas_by_accelerator', {}))
+            spec.min_replicas_by_accelerator)
         self.max_replicas: int = (spec.max_replicas if spec.max_replicas
                                   is not None else spec.min_replicas)
         self.num_overprovision: int | None = spec.num_overprovision
+        # All autoscaler implementations expose the service's replica unit so
+        # controller consumers can rely on one explicit base-class interface.
+        self.replica_unit: str = spec.replica_unit
         # Target number of replicas is initialized to min replicas
         self.target_num_replicas: int = max(
             spec.min_replicas, sum(self.min_replicas_by_accelerator.values()))
@@ -370,6 +373,23 @@ class Autoscaler:
         # target, this never treats satisfied warm retention as scale-up
         # demand.
         self.cold_launch_authority_by_accelerator: dict[str, int] = {}
+        # Optional demand surfaces have explicit neutral defaults in the base
+        # interface. Shape-aware and request-rate autoscalers replace these
+        # values with their live state; generic autoscalers do not need
+        # capability probes to participate in shared status/fill logic.
+        self.request_timestamps: list[float] | None = None
+        self.qps_window_size: int | None = None
+        self._queue_depth_by_priority: dict[int, int] | None = None
+        self.compatibility_profiles: list[dict[str, Any]] = []
+        self.queued_compatibility_profiles: list[dict[str, Any]] = []
+        self.rejected_compatibility_profiles: list[dict[str, Any]] = []
+        self._compatibility_demand_complete: bool = False
+        self.configured_accelerator_shapes: dict[str, int] = {}
+        self.free_reserved_slots_by_accelerator: dict[str, int] = {}
+        # Shape-aware autoscalers publish a per-tick handle snapshot before
+        # entering their state lock. The neutral value is part of the shared
+        # resolver interface and means no snapshot is active.
+        self._gpu_shape_handles_for_tick: dict[int, Any] | None = None
         # Seed from the constructed service version (not always
         # INITIAL_VERSION). On a controller restart/respawn the autoscaler is
         # rebuilt; if it reset to version 1 while live replicas are at version
@@ -392,23 +412,20 @@ class Autoscaler:
         self.update_mode = serve_utils.DEFAULT_UPDATE_MODE
         # [boltz fork] Reserved-capacity fill (opt-in): snapshot state fed
         # by the controller's poller thread via collect_reserved_capacity.
-        # Lives in the base class so fill composes with every autoscaler
-        # type without touching their demand math. getattr: robust against
-        # spec objects predating the flag (e.g. unpickled from old DB
-        # rows).
-        self.reserved_capacity_fill: bool = bool(
-            getattr(spec, 'reserved_capacity_fill', False))
+        # Lives in the base class so fill composes with every autoscaler type
+        # without touching their demand math. SkyServiceSpec.__setstate__
+        # materializes the field for specs unpickled from old DB rows.
+        self.reserved_capacity_fill: bool = bool(spec.reserved_capacity_fill)
         # Broker claim parameters, snapshotted from the spec so the poller
-        # can read them off the live autoscaler (update_version refreshes
-        # them). getattr: spec objects predating the knobs.
+        # can read them off the live autoscaler (update_version refreshes them).
         self.reserved_fill_floor_replicas: int = int(
-            getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
-        self.reserved_fill_weight: float = float(
-            getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
+            spec.reserved_fill_floor_replicas or 0)
+        self.reserved_fill_weight: float = float(spec.reserved_fill_weight or
+                                                 1.0)
         # Whether this service releases its whole fill entitlement while it
         # demonstrates no work (see reserved_capacity_broker).
         self.reserved_fill_utilization_gate: bool = bool(
-            getattr(spec, 'reserved_fill_utilization_gate', False))
+            spec.reserved_fill_utilization_gate)
         # Damped free-slot value the fill target acts on (see
         # collect_reserved_capacity for the two-poll increase damping).
         self._fill_free_slots: int = 0
@@ -439,13 +456,13 @@ class Autoscaler:
         self._fill_pool_states: dict[str, _PoolFillState] = {}
         # Opt-in economic replacement.  The placer reference is injected by
         # the controller each tick because ReplicaManager owns placement state.
-        self.cost_rebalance: bool = bool(getattr(spec, 'cost_rebalance', False))
+        self.cost_rebalance: bool = bool(spec.cost_rebalance)
         self.cost_rebalance_min_savings_fraction: float = float(
-            getattr(spec, 'cost_rebalance_min_savings_fraction', 0.3))
+            spec.cost_rebalance_min_savings_fraction)
         self.cost_rebalance_max_parallel_replacements: int = int(
-            getattr(spec, 'cost_rebalance_max_parallel_replacements', 1))
+            spec.cost_rebalance_max_parallel_replacements)
         self.cost_rebalance_stabilization_seconds: float = float(
-            getattr(spec, 'cost_rebalance_stabilization_seconds', 300.0))
+            spec.cost_rebalance_stabilization_seconds)
         self._cost_rebalance_spot_placer: spot_placer.SpotPlacer | None = None
         self._cost_rebalance_candidate_since: dict[tuple[int,
                                                          spot_placer.Location],
@@ -468,7 +485,7 @@ class Autoscaler:
         if not self._launch_priority_evidence_is_fresh():
             return constants.LB_REQUEST_PRIORITY_MIN
         priorities = [constants.LB_REQUEST_PRIORITY_MIN]
-        by_priority = getattr(self, '_queue_depth_by_priority', None)
+        by_priority = self._queue_depth_by_priority
         if isinstance(by_priority, dict):
             priorities.extend(
                 int(priority)
@@ -476,10 +493,9 @@ class Autoscaler:
                 if isinstance(priority, int) and
                 not isinstance(priority, bool) and isinstance(count, int) and
                 not isinstance(count, bool) and count > 0)
-        for field in ('queued_compatibility_profiles',
-                      'rejected_compatibility_profiles',
-                      'compatibility_profiles'):
-            profiles = getattr(self, field, ())
+        for profiles in (self.queued_compatibility_profiles,
+                         self.rejected_compatibility_profiles,
+                         self.compatibility_profiles):
             if not isinstance(profiles, list):
                 continue
             for profile in profiles:
@@ -516,10 +532,9 @@ class Autoscaler:
         if not self._launch_priority_evidence_is_fresh():
             return priorities
         saw_valid_profile = False
-        for field in ('queued_compatibility_profiles',
-                      'rejected_compatibility_profiles',
-                      'compatibility_profiles'):
-            profiles = getattr(self, field, ())
+        for profiles in (self.queued_compatibility_profiles,
+                         self.rejected_compatibility_profiles,
+                         self.compatibility_profiles):
             if not isinstance(profiles, list):
                 continue
             for profile in profiles:
@@ -559,6 +574,11 @@ class Autoscaler:
         """Return this tick's typed never-ready rollout failure, if any."""
         return self._unrecoverable_rollout_failure
 
+    @property
+    def fill_target(self) -> int:
+        """Return the latest aggregate reserved-capacity fill target."""
+        return self._fill_target
+
     def _calculate_target_num_replicas(self) -> int:
         """Calculate target number of replicas."""
         raise NotImplementedError
@@ -572,9 +592,10 @@ class Autoscaler:
         self.latest_version = version
         self.min_replicas = spec.min_replicas
         self.min_replicas_by_accelerator = dict(
-            getattr(spec, 'min_replicas_by_accelerator', {}))
+            spec.min_replicas_by_accelerator)
         self.max_replicas = (spec.max_replicas if spec.max_replicas is not None
                              else spec.min_replicas)
+        self.replica_unit = spec.replica_unit
         # Re-clip self.target_num_replicas with new min and max replicas.
         self.target_num_replicas = self._clip_target_num_replicas(
             self.target_num_replicas)
@@ -584,16 +605,14 @@ class Autoscaler:
         # seeds the zero-cost location set and starts the poller when an
         # update enables the flag -- no respawn needed, provided the spot
         # placer already exists.)
-        self.reserved_capacity_fill = bool(
-            getattr(spec, 'reserved_capacity_fill', False))
+        self.reserved_capacity_fill = bool(spec.reserved_capacity_fill)
         # Broker claim knobs follow the update too: the poller reads them
         # off the live autoscaler on its next heartbeat.
         self.reserved_fill_floor_replicas = int(
-            getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
-        self.reserved_fill_weight = float(
-            getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
+            spec.reserved_fill_floor_replicas or 0)
+        self.reserved_fill_weight = float(spec.reserved_fill_weight or 1.0)
         self.reserved_fill_utilization_gate = bool(
-            getattr(spec, 'reserved_fill_utilization_gate', False))
+            spec.reserved_fill_utilization_gate)
         with self._fill_pool_state_lock:
             # A service update may add/remove/reorder pool edges and therefore
             # advance the authoritative service generation. Preserve location
@@ -612,13 +631,13 @@ class Autoscaler:
                 pool_state.grant = 0
                 pool_state.grant_epoch = None
             self._refresh_legacy_fill_projection_locked()
-        self.cost_rebalance = bool(getattr(spec, 'cost_rebalance', False))
+        self.cost_rebalance = bool(spec.cost_rebalance)
         self.cost_rebalance_min_savings_fraction = float(
-            getattr(spec, 'cost_rebalance_min_savings_fraction', 0.3))
+            spec.cost_rebalance_min_savings_fraction)
         self.cost_rebalance_max_parallel_replacements = int(
-            getattr(spec, 'cost_rebalance_max_parallel_replacements', 1))
+            spec.cost_rebalance_max_parallel_replacements)
         self.cost_rebalance_stabilization_seconds = float(
-            getattr(spec, 'cost_rebalance_stabilization_seconds', 300.0))
+            spec.cost_rebalance_stabilization_seconds)
         self._clear_cost_rebalance_candidates()
         self.warm_retention_target_by_accelerator = {}
         self.cold_launch_authority_by_accelerator = {}
@@ -1061,10 +1080,10 @@ class Autoscaler:
 
         The broker claim heartbeat reports this split: fill holdings are
         broker property (arbitrated by grants), demand-placed rows are
-        demand-protected and exempt from the ceiling. Rows pickled before
-        the reserved_fill flag existed read as demand (getattr default) --
-        the conservative direction: they keep their shelter and inflate
-        nobody's fill count.
+        demand-protected and exempt from the ceiling. ReplicaInfo's storage
+        decoder materializes rows predating reserved_fill as demand -- the
+        conservative direction: they keep their shelter and inflate nobody's
+        fill count.
         """
         fill = 0
         demand = 0
@@ -1073,7 +1092,7 @@ class Autoscaler:
                 continue
             if not self._replica_on_zero_cost_location(info):
                 continue
-            if getattr(info, 'reserved_fill', False):
+            if info.reserved_fill:
                 fill += 1
             else:
                 demand += 1
@@ -1120,7 +1139,7 @@ class Autoscaler:
             replica_pool_key = self._fill_pool_key_for_replica(info, states)
             if replica_pool_key is None:
                 continue
-            index = 0 if getattr(info, 'reserved_fill', False) else 1
+            index = 0 if info.reserved_fill else 1
             counts[replica_pool_key][index] += self._fill_capacity_units(info)
         return {
             pool_key: (values[0], values[1])
@@ -1210,7 +1229,7 @@ class Autoscaler:
         if self._fill_snapshot_time is None:
             # No snapshot: spendable free slots are 0 regardless.
             return False
-        created_at = getattr(info, 'created_at', None)
+        created_at = info.created_at
         return created_at is not None and created_at > self._fill_snapshot_time
 
     def _replica_on_zero_cost_location(
@@ -1240,6 +1259,16 @@ class Autoscaler:
         del info
         return 1
 
+    def _supports_exact_fill_shape_resolution(self) -> bool:
+        """Whether this autoscaler can resolve exact replica GPU shapes."""
+        return False
+
+    def _resolve_fill_gpu_shape(
+            self, info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
+        """Resolve one replica's exact GPU shape for fill accounting."""
+        del info
+        raise NotImplementedError
+
     def _exact_card_fill_shelter(
         self,
         zero_cost_infos: list['replica_managers.ReplicaInfo'],
@@ -1253,12 +1282,12 @@ class Autoscaler:
         drain one reserved card and immediately refill another. Autoscalers
         without a complete exact-card view retain the legacy aggregate path.
         """
-        demand_target = getattr(self, 'target_num_replicas_by_accelerator', {})
-        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        demand_target = self.target_num_replicas_by_accelerator
+        configured_shapes = self.configured_accelerator_shapes
         if (not isinstance(demand_target, dict) or
                 not isinstance(configured_shapes, dict) or
                 not configured_shapes or
-                not getattr(self, '_compatibility_demand_complete', False)):
+                not self._compatibility_demand_complete):
             return None
 
         canonical_by_name = {
@@ -1328,16 +1357,13 @@ class Autoscaler:
         debit only compatible physical pools instead of assigning an H200
         demand claim to (for example) an unrelated L4 pool.
         """
-        raw_free = getattr(self, 'free_reserved_slots_by_accelerator', None)
-        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
-        shape_resolver = getattr(self, '_get_gpu_shape_from_replica_info', None)
+        raw_free = self.free_reserved_slots_by_accelerator
+        configured_shapes = self.configured_accelerator_shapes
         if (not isinstance(raw_free, dict) or not raw_free or
                 not isinstance(configured_shapes, dict) or
-                not configured_shapes or not callable(shape_resolver)):
+                not configured_shapes or
+                not self._supports_exact_fill_shape_resolution()):
             return 0, None, None
-        shape_resolver_fn = typing.cast(
-            typing.Callable[['replica_managers.ReplicaInfo'], tuple[str, int]],
-            shape_resolver)
         canonical_by_name = {
             str(card).casefold(): str(card) for card in configured_shapes
         }
@@ -1355,8 +1381,7 @@ class Autoscaler:
             if (info.is_terminal or info.version != self.latest_version or
                     _replica_is_retiring_card_supply(info)):
                 continue
-            raw_card, _ = shape_resolver_fn(  # pylint: disable=not-callable
-                info)
+            raw_card, _ = self._resolve_fill_gpu_shape(info)
             card = canonical_by_name.get(str(raw_card).casefold())
             if card is not None:
                 current_capacity_by_card[card] += self._fill_capacity_units(
@@ -1427,12 +1452,12 @@ class Autoscaler:
         ordered_keys: list[str],
     ) -> tuple[dict[str, dict[str, int]], dict[int, str]] | None:
         """Partition exact-card demand coverage independently by pool."""
-        demand_target = getattr(self, 'target_num_replicas_by_accelerator', {})
-        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        demand_target = self.target_num_replicas_by_accelerator
+        configured_shapes = self.configured_accelerator_shapes
         if (not isinstance(demand_target, dict) or
                 not isinstance(configured_shapes, dict) or
                 not configured_shapes or
-                not getattr(self, '_compatibility_demand_complete', False)):
+                not self._compatibility_demand_complete):
             return None
         canonical_by_name = {
             str(card).casefold(): str(card) for card in configured_shapes
@@ -1537,12 +1562,12 @@ class Autoscaler:
             if is_latest:
                 entry['latest'] += units
             state = states[pool_key]
-            created_at = getattr(info, 'created_at', None)
+            created_at = info.created_at
             if (not info.is_ready or
                 (state.snapshot_time is not None and created_at is not None and
                  created_at > state.snapshot_time)):
                 entry['occupying'] += units
-            if not getattr(info, 'reserved_fill', False):
+            if not info.reserved_fill:
                 entry['demand'] += units
                 if is_latest:
                     entry['demand_latest'] += units
@@ -1915,7 +1940,7 @@ class Autoscaler:
                 # split in count_zero_cost_holdings): they keep their
                 # shelter but stay ceiling-exempt until natural churn
                 # replaces them with flagged rows.
-                if not getattr(info, 'reserved_fill', False):
+                if not info.reserved_fill:
                     zero_cost_demand_placed += capacity_units
                     if is_latest:
                         zero_cost_demand_placed_latest += capacity_units
@@ -2102,8 +2127,7 @@ class Autoscaler:
                 result.extend(
                     _generate_scale_up_decisions(num_fill_up, fill_override))
             else:
-                configured_shapes = getattr(self,
-                                            'configured_accelerator_shapes', {})
+                configured_shapes = self.configured_accelerator_shapes
                 remaining = num_fill_up
                 for card, raw_gpu_count in configured_shapes.items():
                     if remaining <= 0:
@@ -2172,19 +2196,19 @@ class Autoscaler:
             'target_num_replicas': self.target_num_replicas,
             'min_replicas': self.min_replicas,
             'max_replicas': self.max_replicas,
-            'min_replicas_by_accelerator': dict(
-                getattr(self, 'min_replicas_by_accelerator', {})),
+            'min_replicas_by_accelerator': dict(self.min_replicas_by_accelerator
+                                               ),
             'target_num_replicas_by_accelerator': dict(
-                getattr(self, 'target_num_replicas_by_accelerator', {})),
+                self.target_num_replicas_by_accelerator),
             'demand_target_by_accelerator': dict(
-                getattr(self, 'target_num_replicas_by_accelerator', {})),
+                self.target_num_replicas_by_accelerator),
             'warm_retention_target_by_accelerator': dict(
-                getattr(self, 'warm_retention_target_by_accelerator', {})),
+                self.warm_retention_target_by_accelerator),
             'cold_launch_authority_by_accelerator': dict(
-                getattr(self, 'cold_launch_authority_by_accelerator', {})),
+                self.cold_launch_authority_by_accelerator),
         }
-        request_timestamps = getattr(self, 'request_timestamps', None)
-        request_window_seconds = getattr(self, 'qps_window_size', None)
+        request_timestamps = self.request_timestamps
+        request_window_seconds = self.qps_window_size
         if (isinstance(request_timestamps, list) and
                 isinstance(request_window_seconds, int) and
                 request_window_seconds > 0):
@@ -2263,9 +2287,9 @@ class Autoscaler:
         # TODO(MaoZiming): use NAME to get the class.
         if spec.pool:
             return QueueLengthAutoscaler(service_name, spec, version)
-        # getattr: keep from_spec robust against spec objects predating the
-        # concurrency knob (e.g. specs unpickled from old DB rows).
-        elif getattr(spec, 'target_concurrency_per_replica', None) is not None:
+        # SkyServiceSpec.__setstate__ materializes the concurrency knob for
+        # specs unpickled from old DB rows.
+        elif spec.target_concurrency_per_replica is not None:
             # Checked before the qps branches: the knob is mutually
             # exclusive with target_qps_per_replica (validated at spec
             # load), so a set knob unambiguously selects concurrency-based
@@ -2407,8 +2431,7 @@ class Autoscaler:
         by_id = {info.replica_id: info for info in replica_infos}
         pairs: dict[int, replica_managers.ReplicaInfo] = {}
         for replacement in replica_infos:
-            victim_id = getattr(replacement, 'cost_rebalance_for_replica_id',
-                                None)
+            victim_id = replacement.cost_rebalance_for_replica_id
             if victim_id is None or replacement.is_terminal:
                 continue
             victim = by_id.get(victim_id)
@@ -2471,8 +2494,7 @@ class Autoscaler:
         if placer is None:
             return None
         if (self.reserved_capacity_fill and
-            (getattr(incumbent, 'reserved_fill', False) or
-             incumbent.is_zero_cost is True)):
+            (incumbent.reserved_fill or incumbent.is_zero_cost is True)):
             # The reserved-fill controller exclusively owns convergence to
             # free capacity. Generic rebalance handles paid-to-paid movement.
             return None
@@ -2549,21 +2571,18 @@ class Autoscaler:
             if self.cost_rebalance and replacement_preserves_policy:
                 if (replacement.is_ready and
                         not _replica_is_retiring_card_supply(replacement) and
-                        getattr(victim.status_property, 'sky_down_status',
-                                None) is None):
+                        victim.status_property.sky_down_status is None):
                     decisions.extend(
                         _generate_scale_down_decisions(
                             [victim.replica_id],
                             reason=AutoscalerDecisionReason.COST_REBALANCE))
             elif (replacement.is_ready and
-                  getattr(replacement.status_property, 'sky_down_status',
-                          None) is None):
+                  replacement.status_property.sky_down_status is None):
                 decisions.extend(
                     _generate_scale_down_decisions(
                         [replacement.replica_id],
                         reason=AutoscalerDecisionReason.COST_REBALANCE))
-            elif getattr(replacement.status_property, 'sky_down_status',
-                         None) is None:
+            elif replacement.status_property.sky_down_status is None:
                 decisions.extend(
                     _generate_scale_down_decisions([replacement.replica_id]))
 
@@ -3139,16 +3158,25 @@ class _GpuShapeResolverMixin:
     # rules as the shape cache). Backs cost-aware victim ordering in both
     # shape-aware autoscalers.
     _replica_cost_cache: dict[int, float]
+    configured_accelerator_shapes: dict[str, int]
     # Immutable per-decision legacy handle snapshot, populated before the
     # autoscaler state lock is acquired.
     _gpu_shape_handles_for_tick: dict[int, Any] | None
+
+    def _supports_exact_fill_shape_resolution(self) -> bool:
+        return True
+
+    def _resolve_fill_gpu_shape(
+            self, info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
+        """Expose exact GPU shapes to the shared reserved-fill overlay."""
+        return self._get_gpu_shape_from_replica_info(info)
 
     @staticmethod
     def _gpu_shape_from_resources_override(
             replica_info: 'replica_managers.ReplicaInfo'
     ) -> tuple[str, int] | None:
         """Return the exact shape carried by a replica launch override."""
-        resources_override = getattr(replica_info, 'resources_override', None)
+        resources_override = replica_info.resources_override
         if not isinstance(resources_override, dict):
             return None
         accelerators = resources_override.get('accelerators')
@@ -3192,7 +3220,7 @@ class _GpuShapeResolverMixin:
         ]
         if not uncached:
             return {}
-        tick_handles = getattr(self, '_gpu_shape_handles_for_tick', None)
+        tick_handles = self._gpu_shape_handles_for_tick
         if tick_handles is not None:
             return {
                 info.replica_id: tick_handles.get(info.replica_id)
@@ -3256,8 +3284,7 @@ class _GpuShapeResolverMixin:
         resolved = False
         try:
             if handle is _UNRESOLVED_HANDLE:
-                tick_handles = getattr(self, '_gpu_shape_handles_for_tick',
-                                       None)
+                tick_handles = self._gpu_shape_handles_for_tick
                 if tick_handles is not None:
                     handle = tick_handles.get(replica_info.replica_id)
                 else:
@@ -3290,8 +3317,7 @@ class _GpuShapeResolverMixin:
             gpu_type = 'unknown'
             gpu_count = 1
             if handle is _UNRESOLVED_HANDLE:
-                tick_handles = getattr(self, '_gpu_shape_handles_for_tick',
-                                       None)
+                tick_handles = self._gpu_shape_handles_for_tick
                 if tick_handles is not None:
                     handle = tick_handles.get(replica_info.replica_id,
                                               _UNRESOLVED_HANDLE)
@@ -3324,7 +3350,7 @@ class _GpuShapeResolverMixin:
         location: spot_placer.Location,
     ) -> bool:
         """Keep authoritative exact-card targets stable during rebalancing."""
-        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        configured_shapes = self.configured_accelerator_shapes
         if not configured_shapes:
             return True
         canonical_by_name = {
@@ -3995,20 +4021,17 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             self.request_timestamps) / self.qps_window_size
         candidate_target_by_accelerator: dict[str, int] | None = None
         latest_capacities: list[float] = []
-        configured_accelerator_shapes = getattr(
-            self, 'configured_accelerator_shapes', {})
-        has_exact_profiles = bool(
-            getattr(self, 'compatibility_profiles', []) or
-            getattr(self, 'queued_compatibility_profiles', []))
-        exact_profiles_available = (
-            has_exact_profiles and
-            (getattr(self, '_compatibility_demand_complete', False) or
-             not configured_accelerator_shapes))
+        configured_accelerator_shapes = self.configured_accelerator_shapes
+        has_exact_profiles = bool(self.compatibility_profiles or
+                                  self.queued_compatibility_profiles)
+        exact_profiles_available = (has_exact_profiles and
+                                    (self._compatibility_demand_complete or
+                                     not configured_accelerator_shapes))
         exact_arrival_qps = 0.0
         if exact_profiles_available:
             exact_arrival_qps = (sum(
                 float(profile.get('count', 1))
-                for profile in getattr(self, 'compatibility_profiles', [])) /
+                for profile in self.compatibility_profiles) /
                                  self.qps_window_size)
         # Completeness describes the current report and its replaceable
         # gauges. It cannot retroactively attribute aggregate arrivals from an
@@ -4017,7 +4040,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         aggregate_fallback_qps = max(
             0.0, num_requests_per_second - exact_arrival_qps)
         if (configured_accelerator_shapes or exact_profiles_available or
-                getattr(self, 'min_replicas_by_accelerator', {})):
+                self.min_replicas_by_accelerator):
             candidate_target_by_accelerator = (
                 self._calculate_target_by_accelerator(
                     replica_infos,
@@ -4054,9 +4077,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                     estimated_qps = max(target_qps_dict.values())
                 if estimated_qps > 0 and remaining_qps > 0:
                     raw_target_num += math.ceil(remaining_qps / estimated_qps)
-            raw_target_num = max(
-                raw_target_num,
-                sum(getattr(self, 'min_replicas_by_accelerator', {}).values()))
+            raw_target_num = max(raw_target_num,
+                                 sum(self.min_replicas_by_accelerator.values()))
             target_num_replicas = self._clip_target_num_replicas(raw_target_num)
         logger.info(f'Instance-aware autoscaling: '
                     f'requests/s: {num_requests_per_second}, '
@@ -4070,9 +4092,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         old_target_num_replicas = self.target_num_replicas
 
         target_map_changed = (candidate_target_by_accelerator is not None and
-                              candidate_target_by_accelerator != getattr(
-                                  self, 'target_num_replicas_by_accelerator',
-                                  {}))
+                              candidate_target_by_accelerator
+                              != self.target_num_replicas_by_accelerator)
         candidate_target_map = candidate_target_by_accelerator or {}
         apply_target = False
         if self._snap_target_on_next_recompute:
@@ -4098,9 +4119,9 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 self.downscale_counter = 0
                 apply_target = True
         elif (target_map_changed and any(
-                candidate_target_map.get(card, 0) > getattr(
-                    self, 'target_num_replicas_by_accelerator', {}).get(
-                        card, 0) for card in candidate_target_map)):
+                candidate_target_map.get(card, 0) >
+                self.target_num_replicas_by_accelerator.get(card, 0)
+                for card in candidate_target_map)):
             # A same-size exact-card migration is an upscale for hysteresis
             # purposes. A LOWER aggregate target is handled by the branch
             # above even when its card mix contains a positive delta: card
@@ -4541,23 +4562,20 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                  spec: 'service_spec.SkyServiceSpec',
                  version: int = constants.INITIAL_VERSION) -> None:
         super().__init__(service_name, spec, version)
-        target_concurrency = getattr(spec, 'target_concurrency_per_replica',
-                                     None)
+        target_concurrency = spec.target_concurrency_per_replica
         assert target_concurrency is not None, (
             'ConcurrencyAutoscaler requires target_concurrency_per_replica')
         # Per-GPU target concurrency; a replica's capacity in concurrency
         # units is this knob x its gpu_count.
         self.target_concurrency_per_replica: float = float(target_concurrency)
-        self.replica_unit: str = getattr(spec, 'replica_unit',
-                                         'physical_backend')
         self.target_utilization_percentage: int = int(
-            getattr(spec, 'target_utilization_percentage', 100))
-        self.expected_request_duration_seconds: float | None = getattr(
-            spec, 'expected_request_duration_seconds', None)
-        self.initial_provision_lead_time_seconds: float | str | None = getattr(
-            spec, 'initial_provision_lead_time_seconds', None)
-        self.adaptive_demand_estimation: bool = (getattr(
-            spec, 'adaptive_demand_estimation', True) is not False)
+            spec.target_utilization_percentage)
+        self.expected_request_duration_seconds: float | None = (
+            spec.expected_request_duration_seconds)
+        self.initial_provision_lead_time_seconds: float | str | None = (
+            spec.initial_provision_lead_time_seconds)
+        self.adaptive_demand_estimation: bool = (spec.adaptive_demand_estimation
+                                                 is not False)
         # Live demand-estimation state. Both estimators supersede their
         # configured counterpart only while they hold enough fresh evidence;
         # configuration remains the fallback and the cold-start value.
@@ -4571,26 +4589,26 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._provision_lead_at: float | None = None
         # Replica rows whose launch-to-ready has already been sampled.
         self._provision_lead_seen_replica_ids: set[int] = set()
-        self.max_scale_up_rate_percentage: int | None = getattr(
-            spec, 'max_scale_up_rate_percentage', None)
-        self.scale_up_rate_min_replicas: int | None = getattr(
-            spec, 'scale_up_rate_min_replicas', None)
-        self.scale_up_rate_period_seconds: int | None = getattr(
-            spec, 'scale_up_rate_period_seconds', None)
-        adaptive_scale_up = getattr(spec, 'adaptive_scale_up', None)
+        self.max_scale_up_rate_percentage: int | None = (
+            spec.max_scale_up_rate_percentage)
+        self.scale_up_rate_min_replicas: int | None = (
+            spec.scale_up_rate_min_replicas)
+        self.scale_up_rate_period_seconds: int | None = (
+            spec.scale_up_rate_period_seconds)
+        adaptive_scale_up = spec.adaptive_scale_up
         self.adaptive_scale_up: dict[str, Any] | None = (
             dict(adaptive_scale_up)
             if isinstance(adaptive_scale_up, dict) else None)
-        queue_config = getattr(spec, 'lb_request_queue', None) or {}
+        queue_config = spec.lb_request_queue or {}
         self._queue_timeout_seconds: float | None = queue_config.get(
             'timeout_seconds')
         self._queue_timeout_thresholds: tuple[tuple[int, float], ...] = tuple(
             (int(entry['min_priority']), float(entry['timeout_seconds']))
             for entry in queue_config.get('timeout_seconds_by_priority', ()))
         # SkyServiceSpec exposes 50 for new specs and restores 100 for old
-        # pickles. Attribute-less test/legacy objects preserve old behavior.
+        # pickles through __setstate__.
         self.max_scale_down_rate_percentage: int = int(
-            getattr(spec, 'max_scale_down_rate_percentage', 100))
+            spec.max_scale_down_rate_percentage)
         self._last_scale_up_wave_at: float | None = None
         # The timestamp opens a rollout window; this ceiling retains the
         # unspent part of that window when placement cannot make progress on
@@ -4988,13 +5006,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     continue
                 if not self._replica_on_zero_cost_location(info):
                     continue
-                if not getattr(info, 'reserved_fill', False):
+                if not info.reserved_fill:
                     # Demand-placed zero-cost rows are demand-protected and
                     # already exempt from the grant ceiling, so counting
                     # them here would inflate the need by capacity the gate
                     # can never reclaim anyway.
                     continue
-                if getattr(info, 'status', None) in pre_ready_statuses:
+                if info.status in pre_ready_statuses:
                     pre_ready += 1
                 elif self._replica_is_busy(info):
                     busy += 1
@@ -5329,7 +5347,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         try:
             spec = serve_state.get_spec(self._service_name, version)
             if spec is not None:
-                knob = getattr(spec, 'target_concurrency_per_replica', None)
+                knob = spec.target_concurrency_per_replica
         except Exception as e:  # pylint: disable=broad-except
             logger.warning('Failed to load spec for version '
                            f'{version}: {common_utils.format_exception(e)}')
@@ -5349,7 +5367,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         The knob is resolved for the replica's OWN version after updates.
         """
         if self.replica_unit == 'logical':
-            return float(getattr(info, 'planned_capacity', 1))
+            return float(info.planned_capacity)
         _, gpu_count = self._get_gpu_shape_from_replica_info(info)
         return self._get_knob_for_version(info.version) * gpu_count
 
@@ -5386,8 +5404,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if (self.replica_unit == 'logical' and
                     degraded_since is not None and
                     replacement_age >= replacement_timeout and
-                    getattr(info, 'unknown_capacity_replacement',
-                            False) is not True):
+                    info.unknown_capacity_replacement is not True):
                 return 0
             return planned
         if info.is_ready and observed is not None:
@@ -5701,9 +5718,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             live_ids.add(replica_id)
             if replica_id in self._provision_lead_seen_replica_ids:
                 continue
-            created_at = getattr(info, 'created_at', None)
-            ready_at = getattr(getattr(info, 'status_property', None),
-                               'first_ready_time', None)
+            created_at = info.created_at
+            ready_at = info.status_property.first_ready_time
             if (not isinstance(created_at,
                                (int, float)) or isinstance(created_at, bool) or
                     not isinstance(ready_at,
@@ -5749,9 +5765,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
-            if
-            (not info.is_terminal and info.version == self.latest_version and
-             getattr(info.status_property, 'is_scale_down', False) is not True))
+            if (not info.is_terminal and info.version == self.latest_version and
+                info.status_property.is_scale_down is not True))
 
     def _latest_demand_owned_logical_capacity(
         self,
@@ -5768,8 +5783,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
             if (not info.is_terminal and info.version == self.latest_version and
-                getattr(info.status_property, 'is_scale_down', False)
-                is not True and not getattr(info, 'reserved_fill', False)))
+                info.status_property.is_scale_down is not True and
+                not info.reserved_fill))
 
     def _total_ready_demand_owned_logical_capacity(
         self,
@@ -5779,9 +5794,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
-            if (info.is_ready and not info.is_terminal and getattr(
-                info.status_property, 'is_scale_down', False) is not True and
-                not getattr(info, 'reserved_fill', False)))
+            if (info.is_ready and not info.is_terminal and info.status_property.
+                is_scale_down is not True and not info.reserved_fill))
 
     def _nonterminal_committed_logical_capacity(
         self,
@@ -5800,8 +5814,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
-            if (not info.is_terminal and getattr(
-                info.status_property, 'is_scale_down', False) is not True))
+            if (not info.is_terminal and
+                info.status_property.is_scale_down is not True))
 
     def _limit_logical_scale_up(
         self,
@@ -5936,8 +5950,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._committed_capacity(info)
             for info in replica_infos
             if (not info.is_terminal and info.version == self.latest_version and
-                info.status in provisioning_statuses and getattr(
-                    info.status_property, 'is_scale_down', False) is not True))
+                info.status in provisioning_statuses and
+                info.status_property.is_scale_down is not True))
 
     def _provisioning_demand_owned_logical_capacity(
         self,
@@ -5953,9 +5967,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._committed_capacity(info)
             for info in replica_infos
             if (not info.is_terminal and info.version == self.latest_version and
-                info.status in provisioning_statuses and
-                getattr(info.status_property, 'is_scale_down', False)
-                is not True and not getattr(info, 'reserved_fill', False)))
+                info.status in provisioning_statuses and info.status_property.
+                is_scale_down is not True and not info.reserved_fill))
 
     def _adopt_scale_down_target(
         self,
@@ -6089,8 +6102,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     original_unknown_floor += fallback_capacity
                 else:
                     capacity = self._unknown_occupancy_work(info)
-                    if getattr(info, 'unknown_capacity_replacement',
-                               False) is True:
+                    if info.unknown_capacity_replacement is True:
                         replacement_unknown_floor += capacity
                     else:
                         original_unknown_floor += capacity
@@ -6182,8 +6194,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if info is None:
                 complete = False
                 continue
-            destination = (replacement_unknown if getattr(
-                info, 'unknown_capacity_replacement', False) is True else
+            destination = (replacement_unknown
+                           if info.unknown_capacity_replacement is True else
                            original_unknown)
             add(replica_id, self._unknown_occupancy_work(info), destination)
         # Mirror _outstanding_work(): an uncertain bounded replacement wave
@@ -7277,41 +7289,35 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # rejected call either.
             super().update_version(version, spec, update_mode)
             return
-        target_concurrency = getattr(spec, 'target_concurrency_per_replica',
-                                     None)
+        target_concurrency = spec.target_concurrency_per_replica
         if target_concurrency is not None:
             # Assign BEFORE the base update runs so any recompute it
             # triggers sees the new knob.
             self.target_concurrency_per_replica = float(target_concurrency)
             self._knob_by_version[version] = float(target_concurrency)
-        self.replica_unit = getattr(spec, 'replica_unit', 'physical_backend')
         self.target_utilization_percentage = int(
-            getattr(spec, 'target_utilization_percentage', 100))
-        self.expected_request_duration_seconds = getattr(
-            spec, 'expected_request_duration_seconds', None)
-        self.initial_provision_lead_time_seconds = getattr(
-            spec, 'initial_provision_lead_time_seconds', None)
+            spec.target_utilization_percentage)
+        self.expected_request_duration_seconds = (
+            spec.expected_request_duration_seconds)
+        self.initial_provision_lead_time_seconds = (
+            spec.initial_provision_lead_time_seconds)
         # Measurements describe the workload, not the spec revision, so an
         # update keeps them. Disabling the feature must take effect at once.
-        self.adaptive_demand_estimation = (getattr(
-            spec, 'adaptive_demand_estimation', True) is not False)
-        self.max_scale_up_rate_percentage = getattr(
-            spec, 'max_scale_up_rate_percentage', None)
-        self.scale_up_rate_min_replicas = getattr(spec,
-                                                  'scale_up_rate_min_replicas',
-                                                  None)
-        self.scale_up_rate_period_seconds = getattr(
-            spec, 'scale_up_rate_period_seconds', None)
-        adaptive_scale_up = getattr(spec, 'adaptive_scale_up', None)
+        self.adaptive_demand_estimation = (spec.adaptive_demand_estimation
+                                           is not False)
+        self.max_scale_up_rate_percentage = spec.max_scale_up_rate_percentage
+        self.scale_up_rate_min_replicas = spec.scale_up_rate_min_replicas
+        self.scale_up_rate_period_seconds = spec.scale_up_rate_period_seconds
+        adaptive_scale_up = spec.adaptive_scale_up
         self.adaptive_scale_up = (dict(adaptive_scale_up) if isinstance(
             adaptive_scale_up, dict) else None)
-        queue_config = getattr(spec, 'lb_request_queue', None) or {}
+        queue_config = spec.lb_request_queue or {}
         self._queue_timeout_seconds = queue_config.get('timeout_seconds')
         self._queue_timeout_thresholds = tuple(
             (int(entry['min_priority']), float(entry['timeout_seconds']))
             for entry in queue_config.get('timeout_seconds_by_priority', ()))
         self.max_scale_down_rate_percentage = int(
-            getattr(spec, 'max_scale_down_rate_percentage', 100))
+            spec.max_scale_down_rate_percentage)
         super().update_version(version, spec, update_mode)
         self._reset_downscale_hysteresis()
         self._downscale_veto_streak = 0
@@ -7400,8 +7406,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             old_nonterminal = [
                 info for info in replica_infos
                 if (info.version < self.latest_version and not info.is_terminal
-                    and getattr(info.status_property, 'is_scale_down',
-                                False) is not True)
+                    and info.status_property.is_scale_down is not True)
             ]
             if not old_nonterminal:
                 return []
@@ -7808,12 +7813,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # authorized, even though that complete map no longer changes.
                 self._record_logical_scale_up_wave(replica_infos, launch_budget)
             replace_unknown_replica_ids = tuple(
-                sorted(info.replica_id
-                       for info in latest_nonterminal_replicas
-                       if getattr(info.status_property, 'is_scale_down',
-                                  False) is not True and info.replica_id in
-                       self._degraded_capacity_since_by_replica_id and
-                       self._committed_capacity(info) == 0))
+                sorted(
+                    info.replica_id
+                    for info in latest_nonterminal_replicas
+                    if info.status_property.is_scale_down is not True and info.
+                    replica_id in self._degraded_capacity_since_by_replica_id
+                    and self._committed_capacity(info) == 0))
             launch_priorities_by_accelerator: tuple[tuple[str, int], ...] = ()
             if use_card_targets:
                 current_priorities = (
@@ -7859,8 +7864,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         candidates = [
             info for info in latest_nonterminal_replicas
-            if (getattr(info.status_property, 'is_scale_down', False)
-                is not True and not self._replica_is_busy(info))
+            if (info.status_property.is_scale_down is not True and
+                not self._replica_is_busy(info))
         ]
         candidates.sort(key=lambda info: (
             _status_rank(info),
@@ -7888,8 +7893,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         remaining_demand_pending = sum(
             self._committed_capacity(info)
             for info in latest_nonterminal_replicas
-            if (info.status in provisioning_statuses and
-                not getattr(info, 'reserved_fill', False)))
+            if (info.status in provisioning_statuses and not info.reserved_fill
+               ))
         decisions: list[AutoscalerDecision] = []
         for info in candidates:
             card = _card(info)
@@ -7901,7 +7906,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             remaining_card_ready = (remaining_ready_by_card.get(card, 0)
                                     if card is not None else 0)
             committed_width = self._committed_capacity(info)
-            demand_owned = not getattr(info, 'reserved_fill', False)
+            demand_owned = not info.reserved_fill
             if (info.status in provisioning_statuses and demand_owned and
                     self._pending_retention_floor is not None and
                     remaining_demand_pending - committed_width

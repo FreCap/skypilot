@@ -29,6 +29,8 @@ def _register_controller_routes(monkeypatch,
     ctrl._replica_counts_snapshot = None
     ctrl._get_update_status = mock.Mock(return_value={})
     ctrl._update_lock = threading.Lock()
+    ctrl._update_reconciler_stop = threading.Event()
+    ctrl._actuation_stop = threading.Event()
     ctrl._reserved_capacity_fill_enabled = False
     ctrl._host = '127.0.0.1'
     ctrl._port = 0

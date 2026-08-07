@@ -22,11 +22,28 @@ from sky.utils import common_utils
 def _spec(**overrides):
     values = {
         'min_replicas': 2,
+        'min_replicas_by_accelerator': {},
         'max_replicas': 2,
         'num_overprovision': None,
+        'target_qps_per_replica': None,
         'target_concurrency_per_replica': 1.0,
+        'replica_unit': 'physical_backend',
+        'target_utilization_percentage': 100,
+        'expected_request_duration_seconds': None,
+        'initial_provision_lead_time_seconds': None,
+        'adaptive_demand_estimation': None,
+        'max_scale_up_rate_percentage': None,
+        'scale_up_rate_min_replicas': None,
+        'scale_up_rate_period_seconds': None,
+        'adaptive_scale_up': None,
+        'max_scale_down_rate_percentage': 100,
+        'lb_request_queue': None,
         'upscale_delay_seconds': 10,
         'downscale_delay_seconds': 10,
+        'reserved_capacity_fill': False,
+        'reserved_fill_floor_replicas': 0,
+        'reserved_fill_weight': 1.0,
+        'reserved_fill_utilization_gate': False,
         'cost_rebalance': True,
         'cost_rebalance_min_savings_fraction': 0.3,
         'cost_rebalance_max_parallel_replacements': 1,
@@ -54,13 +71,27 @@ class _Replica:
         )
         self.is_ready = status == serve_state.ReplicaStatus.READY
         self.is_zero_cost = False
+        self.reserved_fill = False
+        self.created_at = None
+        self.planned_capacity = gpu_count
+        self.unknown_capacity_replacement = False
         self.cost_rebalance_for_replica_id = replacement_for
         self.status_property = types.SimpleNamespace(
             sky_launch_status=common_utils.ProcessStatus.SUCCEEDED,
+            sky_down_status=None,
+            first_ready_time=None,
+            is_scale_down=False,
+            preempted=False,
             unrecoverable_failure=lambda: False)
         self._location = location
+        accelerator = next(iter(location.accelerators))
+        self.resources_override = {
+            'accelerators': {
+                accelerator: gpu_count,
+            },
+        }
         launched_resources = types.SimpleNamespace(
-            accelerators={next(iter(location.accelerators)): gpu_count},
+            accelerators={accelerator: gpu_count},
             get_cost=lambda seconds: cost * seconds / 3600)
         self._handle = types.SimpleNamespace(
             launched_resources=launched_resources)
@@ -644,6 +675,7 @@ class TestPinnedReplacementLaunch:
         manager._spot_placer = placer
         manager.yaml_content = 'resources: {}'
         manager.latest_version = 1
+        manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
         manager._replica_to_launch_cancelled = {}
@@ -733,7 +765,7 @@ class TestPinnedReplacementLaunch:
         assert (cleanup_continue_guard.__func__
                 is type(manager)._service_is_cleanup_authorized)
         assert launch_kwargs['launch_fence'] is None
-        assert launch_kwargs['service_spec'] is None
+        assert launch_kwargs['service_spec'] is manager._version_specs[1]
         assert launch_kwargs['service_name'] == 'svc'
         assert isinstance(launch_kwargs['workspace'], str)
         assert launch_kwargs['frozen_controller_config'] is not None
@@ -760,6 +792,7 @@ class TestPinnedReplacementLaunch:
         manager._spot_placer = placer
         manager.yaml_content = 'resources: {}'
         manager.latest_version = 1
+        manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
         manager._replica_to_launch_cancelled = {}
@@ -814,6 +847,7 @@ class TestPinnedReplacementLaunch:
         manager._resource_scope = None
         manager._spot_placer = placer
         manager.latest_version = 1
+        manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
         manager._replica_to_launch_cancelled = {}
@@ -856,6 +890,7 @@ class TestPinnedReplacementLaunch:
         manager._resource_scope = None
         manager._spot_placer = None
         manager.yaml_content = 'resources: {}'
+        manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._terminate_replica = mock.Mock()
 
@@ -883,6 +918,7 @@ def _recovery_manager():
         replica_managers.SkyPilotReplicaManager)
     manager._service_name = 'svc'
     manager.latest_version = 1
+    manager._version_specs = {1: _spec()}
     manager.yaml_content = 'resources: {}'
     manager._is_pool = False
     manager._lb_in_flight_report = None
@@ -908,6 +944,11 @@ def _pending_row(replica_id, replacement_for):
         resources_override={'region': 'research'},
         reserved_fill=False,
         is_zero_cost=False,
+        planned_capacity=1,
+        unknown_capacity_replacement=False,
+        cost_rebalance_for_replica_id=None,
+        paid_capacity_pool_key=None,
+        created_at=None,
         replica_record_id=(f'00000000-0000-4000-8000-{replica_id:012d}'),
         system_recovery_quarantine=None,
         system_recovery_disposition=(
@@ -944,7 +985,7 @@ class TestRecoveryRedrive:
         assert kwargs['prior_cost_rebalance_for_replica_id'] == 7
         assert kwargs['resources_override'] == {'region': 'research'}
 
-    def test_pre_field_row_redrives_without_pairing_kwarg(self):
+    def test_normalized_pre_field_row_redrives_without_pairing_kwarg(self):
         row = _pending_row(3, replacement_for=_ABSENT)
         manager = self._recover(row)
         kwargs = manager._launch_replica.call_args.kwargs
@@ -968,6 +1009,7 @@ class TestPinnedLaunchFailClosed:
         manager._spot_placer = placer
         manager.yaml_content = 'resources: {}'
         manager.latest_version = 1
+        manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
         manager._replica_to_launch_cancelled = {}
@@ -1027,10 +1069,19 @@ class TestWaitForIdleRecovery:
         info = types.SimpleNamespace(
             replica_id=1,
             cluster_name='cluster-1',
+            version=1,
             url='http://replica',
             is_spot=False,
             status=serve_state.ReplicaStatus.SHUTTING_DOWN,
             status_property=status_property,
+            resources_override=None,
+            reserved_fill=False,
+            is_zero_cost=False,
+            planned_capacity=1,
+            unknown_capacity_replacement=False,
+            cost_rebalance_for_replica_id=None,
+            paid_capacity_pool_key=None,
+            created_at=None,
             replica_record_id='00000000-0000-4000-8000-000000000001',
             system_recovery_quarantine=None,
             system_recovery_disposition=(
@@ -1136,6 +1187,7 @@ class TestStrictDrain:
             replica_id: types.SimpleNamespace(
                 replica_id=replica_id,
                 cluster_name=f'cluster-{replica_id}',
+                version=1,
                 status_property=_status_property(True))
             for replica_id in range(51)
         }
@@ -1145,6 +1197,7 @@ class TestStrictDrain:
         infos[51] = types.SimpleNamespace(
             replica_id=51,
             cluster_name='cluster-51',
+            version=1,
             status_property=_status_property(False))
         live_clusters = {
             f'cluster-{replica_id}': ('UP', 1)
@@ -1192,6 +1245,7 @@ class TestStrictDrain:
         manager._terminate_replica = mock.Mock()
         info = types.SimpleNamespace(replica_id=1,
                                      cluster_name='cluster-1',
+                                     version=1,
                                      status_property=_status_property(True))
 
         with mock.patch.object(
@@ -1284,6 +1338,7 @@ class TestStrictDrain:
             logical_retirement_target_capacity=8)
         info = types.SimpleNamespace(replica_id=1,
                                      cluster_name='cluster-1',
+                                     version=1,
                                      status_property=status)
 
         with mock.patch.object(replica_managers.serve_state,
@@ -1315,6 +1370,7 @@ class TestStrictDrain:
         info = types.SimpleNamespace(
             replica_id=1,
             cluster_name='cluster-1',
+            version=1,
             url='http://replica',
             status_property=replica_managers.ReplicaStatusProperty(
                 sky_launch_status=common_utils.ProcessStatus.SUCCEEDED))
@@ -1378,6 +1434,7 @@ class TestStrictDrain:
         info = types.SimpleNamespace(
             replica_id=1,
             cluster_name='cluster-1',
+            version=1,
             url='http://replica',
             status_property=replica_managers.ReplicaStatusProperty(
                 sky_launch_status=common_utils.ProcessStatus.SUCCEEDED))

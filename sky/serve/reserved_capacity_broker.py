@@ -47,6 +47,7 @@ import re
 import stat
 import threading
 import time
+import typing
 from typing import Any, TypeGuard
 
 from sky import sky_logging
@@ -58,6 +59,9 @@ from sky.server.requests import postgres as request_postgres
 from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils.db import migration_utils
+
+if typing.TYPE_CHECKING:
+    from sky.serve import replica_managers
 
 logger = sky_logging.init_logger(__name__)
 
@@ -2402,7 +2406,7 @@ def _zero_v2_mixed_width_allocation(
 
 
 def _replica_row_on_pool(
-    info: Any,
+    info: 'replica_managers.ReplicaInfo',
     context: str | tuple[str, ...],
     gpu_names: tuple[str, ...],
     *,
@@ -2434,22 +2438,21 @@ def _replica_row_on_pool(
         # Preserve protocol-v1 attribution exactly during the rollout window.
         # Its historical rows may carry only the v1 pool key, and pre-upgrade
         # shape-less rows remain physical occupants of this context.
-        persisted_pool_key = getattr(info, 'reserved_fill_pool_key', None)
+        persisted_pool_key = info.reserved_fill_pool_key
         if isinstance(persisted_pool_key, str) and persisted_pool_key:
             return persisted_pool_key == pool_key
-        persisted_uid = getattr(info, 'reserved_fill_physical_cluster_uid',
-                                None)
+        persisted_uid = info.reserved_fill_physical_cluster_uid
         if (isinstance(persisted_uid, str) and persisted_uid and
                 physical_cluster_uid is not None):
             if persisted_uid != physical_cluster_uid:
                 return False
-            location = getattr(info, 'location', None)
+            location = info.location
             accelerators = (location or {}).get('accelerators') or {}
             return (not accelerators or any(
                 isinstance(name, str) and name.lower() in gpu_names
                 for name in accelerators))
         contexts = (context,) if isinstance(context, str) else context
-        location = getattr(info, 'location', None)
+        location = info.location
         if not location:
             return False
         if str(location.get('cloud', '')).lower() != 'kubernetes':
@@ -2463,7 +2466,7 @@ def _replica_row_on_pool(
         return not accelerators or accelerator_matches
 
     contexts = (context,) if isinstance(context, str) else context
-    location = getattr(info, 'location', None)
+    location = info.location
     if not isinstance(location, Mapping) or not location:
         return False
     if str(location.get('cloud', '')).lower() != 'kubernetes':
@@ -2486,16 +2489,9 @@ def _replica_row_on_pool(
             accelerator_count >= 1 and float(accelerator_count).is_integer() and
             int(accelerator_count) == pool_gpus_per_replica)
 
-    # Read only real persisted attributes. unittest.mock.Mock synthesizes
-    # arbitrary attributes on getattr, which could otherwise turn a legacy
-    # test double into apparent provenance authority.
-    try:
-        persisted = vars(info)
-    except TypeError:
-        persisted = {}
-    persisted_pool_key = persisted.get('reserved_fill_pool_key')
-    persisted_generation = persisted.get('reserved_fill_service_generation')
-    persisted_uid = persisted.get('reserved_fill_physical_cluster_uid')
+    persisted_pool_key = info.reserved_fill_pool_key
+    persisted_generation = info.reserved_fill_service_generation
+    persisted_uid = info.reserved_fill_physical_cluster_uid
     provenance = (persisted_pool_key, persisted_generation, persisted_uid)
     if any(value is not None for value in provenance):
         if (not isinstance(persisted_pool_key, str) or not persisted_pool_key or
@@ -2526,7 +2522,7 @@ def _replica_row_on_pool(
         for name in accelerators))
 
 
-def _row_was_launched(info: Any) -> bool:
+def _row_was_launched(info: 'replica_managers.ReplicaInfo') -> bool:
     """Whether the row's sky.launch completed (a cluster was provisioned).
 
     SHUTTING_DOWN is broader than "bound graceful drainer": a
@@ -2539,9 +2535,8 @@ def _row_was_launched(info: Any) -> bool:
     DID partially bind reads as free-side undercount for its short
     cleanup window -- the conservative direction (never over-grant).
     """
-    status_property = getattr(info, 'status_property', None)
-    return (getattr(status_property, 'sky_launch_status',
-                    None) == common_utils.ProcessStatus.SUCCEEDED)
+    return (info.status_property.sky_launch_status ==
+            common_utils.ProcessStatus.SUCCEEDED)
 
 
 def _occupying_debit(
@@ -2704,10 +2699,8 @@ def _occupying_debit(
                 # the launch actually provisioned a pod -- see the
                 # unclaimed_fill docstring above for the demand-drain,
                 # FAILED_CLEANUP and unbound-launch reasoning).
-                if (getattr(info, 'status',
-                            None) == serve_state.ReplicaStatus.SHUTTING_DOWN and
-                        bool(getattr(info, 'reserved_fill', False)) and
-                        _replica_row_on_pool(
+                if (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN and
+                        info.reserved_fill and _replica_row_on_pool(
                             info,
                             contexts,
                             gpu_names,
@@ -2729,7 +2722,7 @@ def _occupying_debit(
                                                 {}).get(name),
                     pool_gpus_per_replica=pool_gpus_per_replica):
                 continue
-            is_fill = bool(getattr(info, 'reserved_fill', False))
+            is_fill = info.reserved_fill
             if not is_claimant and not is_fill:
                 # Non-claimants' demand rows stay invisible by design
                 # (demand capacity is not fill-arbitrable); only their
@@ -2742,7 +2735,7 @@ def _occupying_debit(
                     # Former claimant's fill row: unclaimed occupancy,
                     # conserved like a drainer (see docstring).
                     unclaimed_fill += 1
-            created_at = getattr(info, 'created_at', None)
+            created_at = info.created_at
             post_snapshot = (created_at is not None and
                              created_at > snapshot_time)
             if (not info.is_ready) or post_snapshot:

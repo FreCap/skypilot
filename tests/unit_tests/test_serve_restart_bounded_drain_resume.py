@@ -11,7 +11,8 @@ def _make_manager(service_name='svc', next_replica_id=1):
     """Bare SkyPilotReplicaManager skipping the heavy __init__ (mirrors the
     helper in test_serve_replica_managers.py, which CI cannot import across
     test modules)."""
-    mgr = object.__new__(replica_managers.SkyPilotReplicaManager)
+    mgr = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     mgr.lock = threading.RLock()
     mgr._service_name = service_name
     mgr._next_replica_id = next_replica_id

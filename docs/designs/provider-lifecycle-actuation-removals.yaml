@@ -16903,7 +16903,7 @@ artifacts:
   - kind: python_call_within
     path: sky/serve/replica_managers.py
     symbol: SkyPilotReplicaManager._service_launch_authorization
-    call: completion_event.set
+    call: self._launch_completion_event.set
   - kind: python_call_within
     path: sky/serve/replica_managers.py
     symbol: SkyPilotReplicaManager._launch_replica

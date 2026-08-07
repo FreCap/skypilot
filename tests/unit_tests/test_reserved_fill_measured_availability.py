@@ -570,12 +570,17 @@ class TestObservationInputHandling:
                                           observed_at=now - 300)
         assert placer._effective_status(_EAST_A100_80GB) == _ACTIVE
 
-    def test_a_placer_without_the_field_still_works(self):
-        # Old pickled placers predate the observation map.
+    def test_legacy_placer_materializes_the_observation_map(self):
+        # Pickle allocation supplies current defaults before an old state is
+        # restored, so runtime policy still consumes one complete interface.
         placer = _placer(benched=_EAST, benched_at=time.time() - 10_000)
-        if hasattr(placer, 'location2observed_free'):
-            del placer.location2observed_free
-        assert placer._effective_status(_EAST_A100_80GB) == _ACTIVE
+        legacy_state = vars(placer).copy()
+        legacy_state.pop('location2observed_free')
+        restored = type(placer).__new__(type(placer))
+        vars(restored).update(legacy_state)
+
+        assert not restored.location2observed_free
+        assert restored._effective_status(_EAST_A100_80GB) == _ACTIVE
 
 
 class TestBrokerWiresTheObservationIntoThePlacer:
@@ -696,5 +701,5 @@ class TestBrokerWiresTheObservationIntoThePlacer:
         reserved_capacity._record_allocation_observation(
             placer, _EAST, old_round)
 
-        assert not hasattr(placer, 'location2observed_free')
+        assert not placer.location2observed_free
         assert placer._effective_status(_EAST_A100_80GB) == _PREEMPTED

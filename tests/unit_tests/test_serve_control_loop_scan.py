@@ -28,6 +28,7 @@ from sky.utils import controller_utils
 class _NotStartedThread:
     """Stands in for a queued-but-not-started launch SafeThread."""
     format_exc = None
+    exception = None
 
     def __init__(self):
         self.started = False
@@ -66,9 +67,11 @@ def _existing_replica_writer(replicas):
 
 def _build_manager(num_launching: int):
     # Bypass __init__: it spawns the refresher/prober/job-status daemon threads.
-    mgr = object.__new__(replica_managers.SkyPilotReplicaManager)
+    mgr = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     mgr.lock = threading.Lock()
     mgr._service_name = 'svc'
+    mgr.latest_version = 1
     mgr._is_pool = False
     mgr._spot_placer = None
     mgr._launch_thread_pool = {

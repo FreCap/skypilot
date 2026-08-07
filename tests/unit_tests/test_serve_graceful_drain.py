@@ -275,6 +275,31 @@ class TestWaitForDrain:
         provider_fence.assert_not_called()
         down.assert_not_called()
 
+    def test_protocol_v2_rejects_handle_without_launched_resources(self):
+        context = mock.MagicMock()
+        cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+        record = _protocol_v2_cluster_record()
+        record['handle'].launched_resources = None
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value=record), \
+             mock.patch.object(
+                 replica_managers.kubernetes_adaptor,
+                 'physical_cluster_uid_fence') as provider_fence, \
+             mock.patch('sky.core.down') as down, \
+             pytest.raises(
+                 exceptions.KubernetesPhysicalClusterIdentityError,
+                 match='handle does not match'):
+            replica_managers.terminate_cluster.__wrapped__(
+                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+
+        provider_fence.assert_not_called()
+        down.assert_not_called()
+
     def test_protocol_v2_cluster_disappearing_is_not_success(self):
         context = mock.MagicMock()
         down = mock.MagicMock(
@@ -880,31 +905,10 @@ class TestRecoveryRedrive:
         kwargs = self._redrive(is_scale_down=True, persisted_cap=0)
         assert kwargs['in_flight_drain_cap_seconds'] == 0
 
-    def test_pre_field_row_falls_back_to_resolver(self):
-        # An unpickled row from before the field existed has no
-        # drain_cap_seconds attribute at all; getattr must default it.
-        kwargs = self._redrive(is_scale_down=True)
-        del kwargs  # Re-run with the attribute genuinely absent.
-        rm = _scale_down_manager(spec_drain=600)
-        rm._launch_thread_pool = {}
-        rm._down_thread_pool = {}
-        sp = mock.Mock()
-        sp.is_scale_down = True
-        sp.purged = False
-        sp.preempted = False
-        del sp.drain_cap_seconds
-        info = mock.Mock()
-        info.replica_id = 7
-        info.status_property = sp
-        info.status = (replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
-        with mock.patch.object(replica_managers.serve_state,
-                               'get_replica_infos',
-                               return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=info):
-            rm._recover_replica_operations()
-        kwargs = rm._terminate_replica.call_args.kwargs
+    def test_materialized_pre_field_row_falls_back_to_resolver(self):
+        # ReplicaInfo's decode boundary materializes a missing legacy cap as
+        # None. Recovery consumes that explicit value and resolves the spec.
+        kwargs = self._redrive(is_scale_down=True, persisted_cap=None)
         assert kwargs['in_flight_drain_cap_seconds'] == 600
 
 
@@ -980,6 +984,10 @@ class TestTerminateReplicaDrainAssembly:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info), \
+             mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_info_with_resource_action_identity',
+                return_value=(info, None)), \
              mock.patch.object(replica_managers.serve_state,
                                'add_or_update_replica',
                                side_effect=_snapshot_write), \

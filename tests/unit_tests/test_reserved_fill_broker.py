@@ -557,18 +557,22 @@ def _replica_stub(is_ready=True,
                   reserved_fill=False,
                   status=None,
                   launched=True):
-    info = mock.Mock()
-    info.is_ready = is_ready
-    info.is_terminal = is_terminal
+    info = _replica()
     info.created_at = created_at
     info.reserved_fill = reserved_fill
-    info.status = status
     # launched=False models a launch-cancelled row (sky.launch interrupted
     # before a pod was provisioned).
-    info.status_property = mock.Mock()
     info.status_property.sky_launch_status = (
         common_utils.ProcessStatus.SUCCEEDED
         if launched else common_utils.ProcessStatus.INTERRUPTED)
+    if is_ready:
+        info.status_property.service_ready_now = True
+        info.status_property.first_ready_time = 1.0
+    if status == serve_state.ReplicaStatus.SHUTTING_DOWN:
+        info.status_property.sky_down_status = common_utils.ProcessStatus.RUNNING
+    elif (status == serve_state.ReplicaStatus.FAILED_CLEANUP or
+          (is_terminal and status is None)):
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
     info.location = {
         'cloud': 'Kubernetes',
         'region': region,

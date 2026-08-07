@@ -1,4 +1,4 @@
-"""Version-13 ReplicaInfo system-recovery storage contract tests."""
+"""ReplicaInfo system-recovery storage compatibility contract tests."""
 
 import copy
 import logging
@@ -74,7 +74,7 @@ def _retry_state() -> recovery_state.ReplicaSystemRecovery:
     return reduced.state
 
 
-def test_v13_capable_record_round_trip_is_lossless() -> None:
+def test_current_capable_record_round_trip_is_lossless() -> None:
     info = _replica()
     info.system_recovery_launch_intent = _intent()
     info.system_recovery_disposition = (
@@ -89,7 +89,7 @@ def test_v13_capable_record_round_trip_is_lossless() -> None:
     state = info.to_storage_dict()
     restored = replica_info.ReplicaInfo.from_storage_dict(state)
 
-    assert state['replica_info_version'] == 13
+    assert state['replica_info_version'] == 14
     assert restored.to_storage_dict() == state
     assert restored.system_recovery_launch_intent == _intent()
     assert restored.system_recovery_revision == 4
@@ -153,7 +153,7 @@ def test_v12_and_older_rows_default_to_ordinary() -> None:
     assert (replica_info.ReplicaInfo.from_storage_dict(legacy_state).
             replica_record_id == '6f7d7c8f-8eac-5728-a487-b46516e74ba7')
     rewritten = restored.to_storage_dict()
-    assert rewritten['replica_info_version'] == 13
+    assert rewritten['replica_info_version'] == 14
     assert rewritten['replica_record_id'] == restored.replica_record_id
 
 
@@ -175,13 +175,14 @@ def test_v12_pickle_and_json_derive_the_same_transition_identity() -> None:
 
     assert from_pickle.replica_record_id == from_json.replica_record_id
     assert uuid.UUID(from_pickle.replica_record_id).version == 5
-    assert from_pickle.to_storage_dict()['replica_info_version'] == 13
+    assert from_pickle.to_storage_dict()['replica_info_version'] == 14
     assert (pickle.loads(pickle.dumps(from_pickle)).replica_record_id ==
             from_json.replica_record_id)
 
 
 def test_exact_all_fields_absent_v13_is_the_only_rollback_shape() -> None:
     rollback = _replica().to_storage_dict()
+    rollback['replica_info_version'] = 13
     rollback['created_at'] = 123.5
     for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
         rollback.pop(field)
@@ -200,23 +201,35 @@ def test_exact_all_fields_absent_v13_is_the_only_rollback_shape() -> None:
             restored.replica_record_id)
 
     future = copy.deepcopy(rollback)
-    future['replica_info_version'] = 14
+    future['replica_info_version'] = 15
     future_restored = replica_info.ReplicaInfo.from_storage_dict(future)
     assert future_restored.system_recovery_quarantine == (
         recovery_state.SystemRecoveryQuarantine(
             recovery_state.RecoveryQuarantineReason.INCONSISTENT_V13_BUNDLE))
 
     future_complete = _replica().to_storage_dict()
-    future_complete['replica_info_version'] = 14
+    future_complete['replica_info_version'] = 15
     assert (
         replica_info.ReplicaInfo.from_storage_dict(future_complete).
         system_recovery_quarantine == recovery_state.SystemRecoveryQuarantine(
+            recovery_state.RecoveryQuarantineReason.INCONSISTENT_V13_BUNDLE))
+
+    future_pickle = copy.deepcopy(vars(_replica()))
+    future_pickle['_version'] = 15
+    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
+        future_pickle.pop(field)
+    future_pickle_restored = replica_info.ReplicaInfo.__new__(
+        replica_info.ReplicaInfo)
+    future_pickle_restored.__setstate__(future_pickle)
+    assert future_pickle_restored.system_recovery_quarantine == (
+        recovery_state.SystemRecoveryQuarantine(
             recovery_state.RecoveryQuarantineReason.INCONSISTENT_V13_BUNDLE))
 
 
 def test_partial_v13_is_reason_only_quarantine_and_does_not_abort_read(
         caplog) -> None:
     partial = _replica().to_storage_dict()
+    partial['replica_info_version'] = 13
     partial.pop('service_job_id')
     partial['system_recovery_launch_intent'] = {'raw-secret': 'do-not-log'}
 
@@ -241,6 +254,7 @@ def test_partial_v13_is_reason_only_quarantine_and_does_not_abort_read(
 
 def test_partial_in_memory_v13_bundle_is_not_silently_demoted() -> None:
     info = _replica()
+    info._version = 13  # pylint: disable=protected-access
     del info.service_job_id
 
     state = info.to_storage_dict()
@@ -254,6 +268,7 @@ def test_partial_in_memory_v13_bundle_is_not_silently_demoted() -> None:
 
 def test_v13_missing_only_record_id_is_partial_and_quarantined() -> None:
     partial = _replica().to_storage_dict()
+    partial['replica_info_version'] = 13
     partial.pop('replica_record_id')
 
     restored = replica_info.ReplicaInfo.from_storage_dict(partial)

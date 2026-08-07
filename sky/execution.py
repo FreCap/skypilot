@@ -138,9 +138,13 @@ def _validate_reserved_fill_final_resources(
     fence: reserved_capacity.ProtocolV2LaunchFence,
 ) -> None:
     """Revalidate a queued fill pin immediately before provider actuation."""
+    best_resources = task.best_resources
+    if best_resources is None:
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Reserved-fill launch has no finalized resources.')
     try:
         reserved_capacity.validate_protocol_v2_launch_resources(
-            fence, task.best_resources)
+            fence, best_resources)
     except ValueError as error:
         raise reserved_capacity.ReservedFillLaunchFenceError(
             'Reserved-fill launch no longer matches its fenced Kubernetes '
@@ -602,9 +606,11 @@ def _execute_dag_under_provider_fence(
     elif controller is not None:
         workload_type = 'controller'
     if workload_type == 'cluster':
-        previous_resources = getattr(handle, 'launched_resources', None)
-        previous_resolution = getattr(previous_resources,
-                                      'resolved_container_image', None)
+        previous_resolution = None
+        if isinstance(handle, backends.CloudVmRayResourceHandle):
+            previous_resources = handle.launched_resources
+            if previous_resources is not None:
+                previous_resolution = previous_resources.resolved_container_image
         _extra_launch_context = (
             container_image_consumers.reuse_persisted_cluster_epoch(
                 _extra_launch_context, previous_resolution))

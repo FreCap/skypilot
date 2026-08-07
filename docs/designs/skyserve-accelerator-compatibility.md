@@ -97,7 +97,8 @@ not evidence that the behavior is active in production.
 | `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
 | `1.1.721` | PR #877, reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Included in deployed `1.1.726`. Production then exposed a separate catalog-ordering edge case when a zero-cost-only A100 preceded paid L4. |
 | Unreleased | PR #1303, generation-aware vanished-card release, plus tri-state provenance hardening | Splits an adopted card with live old-version backing from one whose capacity is absent from every generation. A complete provenance snapshot permits only the latter to move toward explicitly owned compatible placement before the mixed-version rollout guard; an unproven vanished unit receives no paid same-card authority. The follow-up makes unknown provenance preserve the adopted map instead of treating it as known empty. | PR #1303 merged 2026-08-06; the hardening is included in this follow-up. Neither change is deployed; both await the next control-plane release. |
-| Unreleased | Mixed-version compatible replacement authority | On a fresh, complete, non-downscale logical tick with explicit cross-card compatibility proof, recomputes the supply-aware latest-version target even when adopted units are still backed by old-version rows. Old rows continue fencing nonpreemptive retirement, but do not select the paid replacement card. The manager consumes explicit paid authority using typed launch funding provenance. | Implemented and covered by unit and cluster-free incident reproduction tests in this follow-up; production deployment remains pending. |
+| Unreleased | PR #1304, mixed-version compatible replacement authority | On a fresh, complete, non-downscale logical tick with explicit cross-card compatibility proof, recomputes the supply-aware latest-version target even when adopted units are still backed by old-version rows. Old rows continue fencing nonpreemptive retirement, but do not select the paid replacement card. The manager consumes explicit paid authority using typed launch funding provenance. | Merged 2026-08-06 and covered by unit and cluster-free incident reproduction tests; production deployment remains pending. |
+| Unreleased | Owned Serve interface normalization | Materializes every supported legacy `ReplicaInfo`, `ReplicaStatusProperty`, and `SkyServiceSpec` default at its persistence boundary, and gives autoscalers, managers, controllers, and load balancers complete runtime state at construction. Policy, admission, recovery, and accounting code use those declared fields and methods directly. A malformed current-version object fails loudly instead of being silently reinterpreted through a local `getattr()` default. | Implemented in this follow-up; production deployment remains pending. |
 | Unreleased | Preserve exact cards during downscale-held retries | Keeps the held part of an adopted exact-card target on its prior cards while the request queue is briefly empty. Fresh remaining demand may still change its own card assignment, but the held portion cannot turn an L40S retry into an L4 cold launch. | Required after the 2026-07-27 `clin-structure-eval-6f51471-l40s-v8` acceptance run selected L4 while reporting an exact `{"L40S": 1}` target. |
 | Unreleased | Reserved-only card paid fallback | Excludes cards whose every successfully priced location is zero-cost from flexible cold-paid ordering. Paid-capable and unpriced cards keep the all-or-nothing service-order fallback, while exact demand can still target a reserved-only card. | Required before the next `opendde-10c200s-v4` rollout so default-all demand selects paid L4 instead of waiting on the reserved-only A100 location. |
 | Unreleased | Centralized placement catalog | Materializes every exact location and nominal cost once per immutable service version, persists the complete catalog in PostgreSQL, backfills legacy versions before controller-child spawn, and removes the old partial-cache accessors and fallback feasibility resolver. | Supersedes the bounded partial-cache fix for the July 23 `boltz-l4-fleet` and `boltz-l4-fleet-test` controller startup failures. The canonical subdesign is `docs/designs/serve-central-placement-catalog.md`. |
@@ -151,6 +152,31 @@ implicit success-channel side effect. Policy code reads that typed field
 directly. Pre-v11 pickle migration and JSON decoding materialize the boolean at
 the record boundary; downstream admission, allocation, recovery, and ordering
 must not carry independent `getattr(..., False)` fallback paths.
+
+The same boundary owns every persisted replica field used by Serve policy.
+`ReplicaInfo.__setstate__()` and `ReplicaInfo.from_storage_dict()` materialize
+the complete current `ReplicaInfo` and nested `ReplicaStatusProperty`
+interfaces, including conservative defaults for pre-v8 logical width, pre-v9
+unknown-capacity replacement, pre-v10 bridge verification, additive fill and
+paid-capacity provenance, and retirement state. Missing
+`logical_retirement_committed` remains the one deliberate tri-state migration:
+it decodes as `None`, while a newly constructed record uses `False`. Outside
+those decoding/migration seams, consumers access declared fields directly.
+Tests and mocks must implement the real interface; they must not cause
+production code to grow attribute-existence fallbacks. A current-version object
+with a deleted required field is malformed and must raise rather than acquire a
+policy default.
+
+The same rule applies to non-record Serve objects. `SkyServiceSpec.__setstate__`
+owns persisted-spec compatibility; normal properties never probe whether their
+backing fields exist. Autoscaler, replica-manager, controller, spot-placement,
+and load-balancer constructors initialize their complete shared runtime
+interfaces, including neutral values for capabilities that only some concrete
+implementations populate. Shared code calls declared methods and reads declared
+fields directly instead of using reflection as a capability test. Reflection
+remains appropriate only at explicitly dynamic integration boundaries, such as
+Kubernetes client models, HTTP request/client/response metadata, SQLAlchemy
+column namespaces, and deliberate schema-field iteration.
 
 ### Production operating point
 
