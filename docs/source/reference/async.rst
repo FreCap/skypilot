@@ -171,6 +171,10 @@ List requests
 
 To view all requests on the server, run ``sky api status``.
 
+The status table is shared server metadata: it includes requests from all
+users, but never includes request bodies, callables, return values, errors,
+status messages, executor process IDs, or file-mount blob IDs.
+
 .. code-block:: console
 
     $ # List ongoing requests, default to show 50 requests
@@ -195,6 +199,10 @@ Stream logs
 
 To stream the logs of a request, run ``sky api logs <request-id>``.
 
+On an authenticated multi-user API server, non-admin users can stream only
+their own requests. Streaming an arbitrary ``--log-path`` or the API server
+log requires an admin role.
+
 .. code-block:: console
 
     $ sky api logs 0d35ffa7
@@ -204,6 +212,10 @@ Cancel requests
 ~~~~~~~~~~~~~~~
 
 To cancel requests, run ``sky api cancel <request-id> <request-id> ...``.
+
+On an authenticated multi-user API server, non-admin users can cancel only
+their own requests, and viewers cannot cancel requests. Admins may use
+``--all-users``.
 
 .. code-block:: console
 

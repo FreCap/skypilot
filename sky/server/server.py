@@ -76,6 +76,7 @@ from sky.server.auth import oauth2_proxy
 from sky.server.auth import sessions as auth_sessions
 from sky.server.blob import blob_storage as bs
 from sky.server.events import server as events_rest
+from sky.server.requests import access as request_access
 from sky.server.requests import executor
 from sky.server.requests import launch_identity
 from sky.server.requests import log_provider
@@ -1658,10 +1659,24 @@ async def local_down(request: fastapi.Request,
     )
 
 
-async def get_expanded_request_id(request_id: str) -> str:
-    """Gets the expanded request ID for a given request ID prefix."""
+async def _request_access_scope(
+        request: fastapi.Request) -> request_access.RequestAccessScope:
+    """Resolve the caller's persisted-request authorization scope."""
+    auth_user = request.state.auth_user
+    roles: list[str] = []
+    if auth_user is not None:
+        roles = await asyncio.to_thread(
+            permission.permission_service.get_user_roles, auth_user.id)
+    return request_access.resolve_request_access(auth_user, roles)
+
+
+async def get_expanded_request_id(
+    request_id: str,
+    owner_user_id: str | None = None,
+) -> str:
+    """Gets an unambiguous request ID within an optional owner scope."""
     request_tasks = await requests_lib.get_requests_async_with_prefix(
-        request_id, fields=['request_id'])
+        request_id, fields=['request_id'], user_id=owner_user_id)
     if request_tasks is None:
         raise fastapi.HTTPException(status_code=404,
                                     detail=f'Request {request_id!r} not found')
@@ -1674,10 +1689,13 @@ async def get_expanded_request_id(request_id: str) -> str:
 
 # === API server related APIs ===
 @app.get('/api/get')
-async def api_get(request_id: str) -> payloads.RequestPayload:
+async def api_get(request: fastapi.Request,
+                  request_id: str) -> payloads.RequestPayload:
     """Gets a request with a given request ID prefix."""
+    access_scope = await _request_access_scope(request)
     # Validate request_id prefix matches a single request.
-    request_id = await get_expanded_request_id(request_id)
+    request_id = await get_expanded_request_id(request_id,
+                                               access_scope.owner_user_id)
 
     # Exponential backoff: start fast (10ms) for short requests like
     # status/queue, then back off to 100ms for long requests like
@@ -1799,11 +1817,20 @@ async def stream(
             status_code=400,
             detail='Only one of request_id and log_path can be provided')
 
+    access_scope = await _request_access_scope(request)
+    if (log_path is not None and
+            not access_scope.can_stream_arbitrary_log_path):
+        raise fastapi.HTTPException(
+            status_code=403,
+            detail='Only admins can stream server-owned log paths.')
+
     if request_id is not None:
-        request_id = await get_expanded_request_id(request_id)
+        request_id = await get_expanded_request_id(request_id,
+                                                   access_scope.owner_user_id)
 
     if request_id is None and log_path is None:
-        request_id = await requests_lib.get_latest_request_id_async()
+        request_id = await requests_lib.get_latest_request_id_async(
+            access_scope.owner_user_id)
         if request_id is None:
             raise fastapi.HTTPException(status_code=404,
                                         detail='No request found')
@@ -1957,6 +1984,15 @@ async def stream(
 async def api_cancel(request: fastapi.Request,
                      request_cancel_body: payloads.RequestCancelBody) -> None:
     """Cancels requests."""
+    access_scope = await _request_access_scope(request)
+    if not access_scope.can_cancel:
+        raise fastapi.HTTPException(
+            status_code=403, detail='Viewers cannot cancel API requests.')
+    if not access_scope.can_access_all_users:
+        # Persist only the authenticated owner.  The body-supplied user_id is
+        # a legacy client hint and is never an authorization credential.
+        request_cancel_body = request_cancel_body.model_copy(
+            update={'user_id': access_scope.owner_user_id})
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.API_CANCEL,
@@ -1979,6 +2015,17 @@ async def _api_status(
     exact_request_ids: bool,
 ) -> list[payloads.RequestPayload]:
     """Shared GET/POST request-status projection."""
+    if not fields:
+        fields = list(requests_lib.REQUEST_STATUS_QUERY_FIELDS)
+    else:
+        invalid_fields = (set(fields) -
+                          requests_lib.REQUEST_STATUS_QUERY_FIELD_SET)
+        if invalid_fields:
+            raise fastapi.HTTPException(
+                status_code=400,
+                detail=('Request status exposes metadata fields only; '
+                        f'unsupported fields: {sorted(invalid_fields)}'))
+        fields = list(dict.fromkeys(fields))
     if cluster_name is not None and cluster_names is not None:
         raise fastapi.HTTPException(
             status_code=400,
@@ -2028,7 +2075,7 @@ async def _api_status(
         matched_request_tasks = []
         for request_id in request_ids:
             request_tasks = await requests_lib.get_requests_async_with_prefix(
-                request_id)
+                request_id, fields=fields)
             if request_tasks is None:
                 continue
             matched_request_tasks.extend(request_tasks)
@@ -2048,7 +2095,7 @@ async def api_status(
     limit: int | None = fastapi.Query(
         None, description='Number of requests to show.'),
     fields: list[str] | None = fastapi.Query(
-        None, description='Fields to get. If None, get all fields.'),
+        None, description='Safe request metadata fields to get.'),
     cluster_name: str | None = fastapi.Query(
         None, description='Filter requests by cluster name.'),
 ) -> list[payloads.RequestPayload]:
@@ -2074,7 +2121,7 @@ async def api_status_query(
             status_code=400,
             detail='The internal request-name filter is server-owned.')
     if internal_mode:
-        controller_origin = getattr(request.state, 'controller_origin', None)
+        controller_origin = request.state.controller_origin
         locally_trusted = auth_loopback.is_loopback_request(request)
         if controller_origin is None and not locally_trusted:
             raise fastapi.HTTPException(
@@ -2165,7 +2212,7 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         responses.APIHealthResponse: The health response.
     """
     user = request.state.auth_user
-    is_anonymous = getattr(request.state, 'anonymous_user', False)
+    is_anonymous = request.state.anonymous_user
     server_status = common.ApiServerStatus.HEALTHY
     if is_anonymous:
         # API server authentication is enabled, but the request is not

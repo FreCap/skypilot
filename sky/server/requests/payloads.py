@@ -271,6 +271,18 @@ class RequestBody(BasePayload):
     # the header — i.e. an old client.
     client_api_version: int | None = None
 
+    @classmethod
+    def projection_placeholder(cls) -> 'RequestBody':
+        """Build an inert body for a metadata-only database projection.
+
+        Normal construction intentionally captures client process context in
+        ``__init__``.  A projected row has no body, so invoking that path would
+        synthesize unrelated API-server state.  ``model_construct`` applies
+        the declared field defaults without running the ambient-context
+        constructor.
+        """
+        return cls.model_construct()
+
     def __init__(self, **data):
         data['env_vars'] = data.get('env_vars', request_body_env_vars())
         usage_lib_entrypoint = usage_lib.messages.usage.entrypoint

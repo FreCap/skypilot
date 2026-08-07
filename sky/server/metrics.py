@@ -727,7 +727,7 @@ def _get_user_label(request: fastapi.Request) -> str:
 
     Returns the authenticated user's name if available, otherwise 'anonymous'.
     """
-    auth_user = getattr(request.state, 'auth_user', None)
+    auth_user = request.state.auth_user
     if auth_user is not None and auth_user.name:
         return auth_user.name
     return 'anonymous'

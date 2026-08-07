@@ -2366,9 +2366,10 @@ def test_scalar_status_projection_does_not_decode_large_payload(
         request_id=request_id,
         name='sky.launch',
         entrypoint=execution.launch,
-        request_body=payloads.LaunchBody(task='resources:\n  cpus: 2\n' +
-                                         '# large-payload\n' * 10000,
-                                         cluster_name='projection-cluster'),
+        request_body=payloads.LaunchBody(
+            task='resources:\n  cpus: 2\n' + '# large-payload\n' * 10000,
+            cluster_name='projection-cluster',
+            env_vars={'STORED_PROJECTION_SECRET': 'stored-canary'}),
         status=requests.RequestStatus.PENDING,
         created_at=time.time(),
         user_id='user',
@@ -2376,9 +2377,10 @@ def test_scalar_status_projection_does_not_decode_large_payload(
         schedule_type=requests.ScheduleType.LONG,
         should_enqueue=True)
     assert asyncio.run(backend.create_if_not_exists_async(request))
-    monkeypatch.setattr(
-        registry, 'decode_payload',
-        mock.Mock(side_effect=AssertionError('payload must not be decoded')))
+    monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'ambient-canary')
+    decode_payload = mock.Mock(
+        side_effect=AssertionError('payload must not be decoded'))
+    monkeypatch.setattr(registry, 'decode_payload', decode_payload)
 
     [projected] = backend.query_requests(
         requests.RequestTaskFilter(request_ids=[request_id],
@@ -2393,7 +2395,9 @@ def test_scalar_status_projection_does_not_decode_large_payload(
 
     assert projected.request_id == request_id
     assert projected.cluster_name == 'projection-cluster'
-    assert projected.request_body == payloads.RequestBody()
+    assert projected.request_body == payloads.RequestBody.projection_placeholder(
+    )
+    decode_payload.assert_not_called()
 
 
 def test_pending_direct_cancel_does_not_invent_quiescence(request_database):

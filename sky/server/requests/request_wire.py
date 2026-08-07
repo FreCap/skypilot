@@ -163,19 +163,15 @@ def encode_requests(
     all_users = get_all_users()
     all_users_map = {user.id: user.name for user in all_users}
     for request in requests:
-        if request.request_body is not None:
-            assert isinstance(request.request_body,
-                              payloads.RequestBody), (request.name,
-                                                      request.request_body)
         user_name = all_users_map.get(request.user_id)
         payload = payloads.RequestPayload(
             request_id=request.request_id,
             name=request.name,
-            entrypoint=request.entrypoint.__name__
-            if request.entrypoint is not None else '',
-            request_body=request.request_body.model_dump_json()
-            if request.request_body is not None else
-            orjson.dumps(None).decode('utf-8'),
+            # This encoder is the public request-status projection.  Execution
+            # callables and bodies are deliberately available only through the
+            # owner-authorized full-result endpoint.
+            entrypoint='',
+            request_body=orjson.dumps(None).decode('utf-8'),
             status=project_status(request.status.value),
             return_value=orjson.dumps(None).decode('utf-8'),
             error=orjson.dumps(None).decode('utf-8'),
@@ -185,10 +181,11 @@ def encode_requests(
             user_id=request.user_id,
             user_name=user_name,
             cluster_name=request.cluster_name,
-            status_msg=request.status_msg,
+            # Retry and precondition messages can contain exception details.
+            status_msg=None,
             should_retry=request.should_retry,
             finished_at=request.finished_at,
-            file_mounts_blob_id=request.file_mounts_blob_id,
+            file_mounts_blob_id=None,
             execution_generation=request.execution_generation,
             execution_quiescence_required=(
                 request.execution_quiescence_required),

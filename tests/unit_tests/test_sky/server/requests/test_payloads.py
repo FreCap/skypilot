@@ -120,6 +120,24 @@ def test_request_body_env_vars_client_user_hash_none_with_basic_auth(
     assert constants.CLIENT_USER_HASH_ENV_VAR not in env_vars
 
 
+def test_request_body_projection_placeholder_is_inert(monkeypatch):
+    ambient_env = mock.Mock(
+        side_effect=AssertionError('projection must not capture ambient env'))
+    monkeypatch.setattr(payloads, 'request_body_env_vars', ambient_env)
+
+    body = payloads.RequestBody.projection_placeholder()
+
+    ambient_env.assert_not_called()
+    assert body.env_vars == {}
+    assert body.entrypoint == ''
+    assert body.entrypoint_command == ''
+    assert body.using_remote_api_server is False
+    assert body.override_skypilot_config == {}
+    assert body.override_skypilot_config_path is None
+    assert body.file_mounts_blob_id is None
+    assert body.client_api_version is None
+
+
 def test_persisted_payload_strips_server_owned_kubernetes_autoscaler():
     body = payloads.ServeUpBody(task='name: task',
                                 service_name='service',

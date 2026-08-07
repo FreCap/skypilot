@@ -78,12 +78,13 @@ class SecurityHeadersMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
                      'frame-ancestors \'self\'')
 
     async def dispatch(self, request: fastapi.Request, call_next):
+        request.state.csp_nonce = None
         response = await call_next(request)
         # Endpoints that serve HTML set request.state.csp_nonce so the
         # CSP header can reference the nonce that was injected into the
         # HTML body.  Non-HTML responses get a strict policy with no
         # inline allowance.
-        nonce = getattr(request.state, 'csp_nonce', None)
+        nonce = request.state.csp_nonce
         if nonce:
             script_src = f'\'self\' \'nonce-{nonce}\''
         else:

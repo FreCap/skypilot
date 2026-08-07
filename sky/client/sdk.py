@@ -2553,7 +2553,8 @@ def get(request_id: server_common.RequestId[T]) -> T:
 
     Args:
         request_id: The request ID of the request to get. May be a full request
-            ID or a prefix.
+            ID or a prefix. Authenticated non-admin users can retrieve only
+            requests they own.
 
     Returns:
         The ``Request Returns`` of the specified request. See the documentation
@@ -2612,7 +2613,8 @@ def stream_and_get(
             request ID or a prefix.
             If None, the latest request submitted to the API server is streamed.
             Using None request_id is not recommended in multi-user environments.
-        log_path: The path to the log file to stream.
+        log_path: The path to the log file to stream. On an authenticated
+            multi-user server, arbitrary log paths require an admin role.
         tail: The number of lines to show from the end of the logs.
             If None, show all logs.
         follow: Whether to follow the logs.
@@ -2656,7 +2658,8 @@ def api_cancel(request_ids: server_common.RequestId[T] |
     Args:
         request_ids: The request ID(s) to abort. Can be a single string or a
             list of strings.
-        all_users: Whether to abort all requests from all users.
+        all_users: Whether to abort all requests from all users. This requires
+            an admin role on an authenticated server.
         silent: Whether to suppress the output.
 
     Returns:
@@ -2733,7 +2736,9 @@ def api_status(
         all_status: Whether to list all finished requests as well. This argument
             is ignored if request_ids is not None.
         limit: The number of requests to show. If None, show all requests.
-        fields: The fields to get. If None, get all fields.
+        fields: Safe metadata fields to get. Request bodies, callables, return
+            values, errors, status messages, executor PIDs, and file-mount blob
+            IDs are not available from the organization-wide status interface.
         cluster_name: Filter requests by cluster name.
             If None, show all requests.
         cluster_names: Filter requests by any of these cluster names in one

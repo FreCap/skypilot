@@ -30,6 +30,10 @@ from sky.utils import common_utils
 from sky.utils import config_utils
 
 
+def _status_projection_entrypoint():
+    return None
+
+
 @mock.patch('uvicorn.run')
 @mock.patch('sky.server.requests.executor.start')
 @mock.patch('sky.utils.common_utils.get_cpu_count')
@@ -1748,7 +1752,8 @@ def test_api_get_endpoint_serializes_request_payload(monkeypatch):
         user_id='user-123',
     )
 
-    async def fake_expand(request_id):
+    async def fake_expand(request_id, owner_user_id=None):
+        del owner_user_id
         return request_id
 
     async def fake_status(request_id, include_msg=False):
@@ -1866,3 +1871,110 @@ async def test_status_query_accepts_current_controller_and_owns_allowlist(
     assert await server.api_status_query(request, body) == []
     assert len(captured) == 1
     assert captured[0].include_request_names == ['sky.launch']
+
+
+@pytest.mark.asyncio
+async def test_api_status_uses_fixed_safe_default_projection(monkeypatch):
+    captured = []
+
+    async def get_request_tasks(req_filter):
+        captured.append(req_filter)
+        return []
+
+    monkeypatch.setattr(server.requests_lib, 'get_request_tasks_async',
+                        get_request_tasks)
+    monkeypatch.setattr(server.requests_lib, 'encode_requests',
+                        lambda request_tasks: request_tasks)
+
+    api_status_impl = server._api_status  # pylint: disable=protected-access
+    assert await api_status_impl(None, False, 5, None, None, None, None, False,
+                                 False) == []
+    assert len(captured) == 1
+    assert captured[0].fields == list(
+        server.requests_lib.REQUEST_STATUS_QUERY_FIELDS)
+    assert set(captured[0].fields).issubset(
+        server.requests_lib.REQUEST_STATUS_QUERY_FIELD_SET)
+    assert {
+        'entrypoint', 'request_body', 'return_value', 'error', 'status_msg',
+        'pid', 'file_mounts_blob_id'
+    }.isdisjoint(captured[0].fields)
+    assert set(
+        server.requests_lib.REQUEST_STATUS_POSTGRES_QUERY_FIELDS).isdisjoint(
+            captured[0].fields)
+
+
+@pytest.mark.asyncio
+async def test_api_status_default_projection_reads_sqlite(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'sqlite')
+    monkeypatch.setattr(server_constants, 'API_SERVER_REQUEST_DB_PATH',
+                        str(tmp_path / 'requests.db'))
+    monkeypatch.setattr(server_constants, 'REQUEST_LOG_PATH_PREFIX',
+                        str(tmp_path / 'logs'))
+    await server.requests_lib.close_db_async()
+    monkeypatch.setattr(server.requests_lib.request_storage, '_storage_backend',
+                        server.requests_lib.SqliteRequestBackend())
+    request = server.requests_lib.Request(
+        request_id='sqlite-status-request',
+        name='test-request',
+        entrypoint=_status_projection_entrypoint,
+        request_body=server.payloads.RequestBody(),
+        status=server.requests_lib.RequestStatus.PENDING,
+        created_at=123.0,
+        user_id='sqlite-user',
+    )
+    try:
+        assert await server.requests_lib.create_if_not_exists_async(request)
+        api_status_impl = server._api_status  # pylint: disable=protected-access
+        [projected] = await api_status_impl(None, False, 5, None, None, None,
+                                            None, False, False)
+    finally:
+        await server.requests_lib.close_db_async()
+
+    assert projected.request_id == request.request_id
+    assert projected.user_id == request.user_id
+    assert projected.request_body == 'null'
+    assert projected.entrypoint == ''
+
+
+@pytest.mark.parametrize('unsafe_field', [
+    'entrypoint',
+    'request_body',
+    'return_value',
+    'error',
+    'status_msg',
+    'pid',
+    'file_mounts_blob_id',
+])
+@pytest.mark.asyncio
+async def test_api_status_rejects_unsafe_fields(unsafe_field):
+    api_status_impl = server._api_status  # pylint: disable=protected-access
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        await api_status_impl(None, False, None, ['request_id', unsafe_field],
+                              None, None, None, False, False)
+
+    assert exc_info.value.status_code == 400
+    assert unsafe_field in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_api_status_passes_safe_fields_to_prefix_lookup(monkeypatch):
+    calls = []
+
+    async def get_requests_with_prefix(request_id,
+                                       *,
+                                       fields=None,
+                                       user_id=None):
+        calls.append((request_id, fields, user_id))
+        return []
+
+    monkeypatch.setattr(server.requests_lib, 'get_requests_async_with_prefix',
+                        get_requests_with_prefix)
+    monkeypatch.setattr(server.requests_lib, 'encode_requests',
+                        lambda request_tasks: request_tasks)
+
+    api_status_impl = server._api_status  # pylint: disable=protected-access
+    assert await api_status_impl(['request-prefix'], False, None,
+                                 ['status', 'request_id', 'status'], None, None,
+                                 None, False, False) == []
+    assert calls == [('request-prefix', ['status', 'request_id'], None)]

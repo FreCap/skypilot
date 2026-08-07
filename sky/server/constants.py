@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 72  # Unauthenticated public capacity API
+API_VERSION = 73  # Owner-scoped persisted request access
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -133,6 +133,9 @@ MIN_SERVE_DASHBOARD_PRICING_API_VERSION = 71
 
 # Minimum server API version that exposes GET /api/v1/public/capacity.
 MIN_PUBLIC_CAPACITY_API_VERSION = 72
+
+# Minimum API version that scopes persisted request payload access by owner.
+MIN_OWNER_SCOPED_REQUEST_ACCESS_API_VERSION = 73
 
 # This exact method/path pair is the only unauthenticated capacity surface.
 # Keep the predicate centralized so every authentication middleware applies

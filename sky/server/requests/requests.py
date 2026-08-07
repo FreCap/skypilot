@@ -300,6 +300,57 @@ REQUEST_QUERY_FIELDS = frozenset(REQUEST_COLUMNS) | frozenset({
     'execution_quiesced_at',
 })
 
+# Scalar projections avoid decoding the durable request payload.  This is an
+# internal persistence interface, not the public status contract below.
+SCALAR_REQUEST_QUERY_FIELDS = (
+    'request_id',
+    'name',
+    'status',
+    'pid',
+    'created_at',
+    COL_CLUSTER_NAME,
+    'schedule_type',
+    COL_USER_ID,
+    COL_STATUS_MSG,
+    COL_SHOULD_RETRY,
+    COL_FINISHED_AT,
+    COL_FILE_MOUNTS_BLOB_ID,
+    'execution_generation',
+    'execution_quiescence_required',
+    'execution_quiesced_generation',
+    'execution_quiesced_at',
+)
+SCALAR_REQUEST_QUERY_FIELD_SET = frozenset(SCALAR_REQUEST_QUERY_FIELDS)
+
+# Public request-status responses are metadata projections.  The default list
+# is deliberately portable across SQLite and PostgreSQL.  PostgreSQL-only
+# execution metadata remains an allowed explicit projection for the internal
+# execution-quiescence protocol.
+#
+# Keep both interfaces explicit: request bodies, callables, return values,
+# errors, free-form status messages, executor PIDs, and file-mount blob IDs can
+# contain private data or internal capabilities.  Full request payloads remain
+# available to their owner through /api/get.
+REQUEST_STATUS_QUERY_FIELDS = (
+    'request_id',
+    'name',
+    'status',
+    'created_at',
+    COL_CLUSTER_NAME,
+    'schedule_type',
+    COL_USER_ID,
+    COL_SHOULD_RETRY,
+    COL_FINISHED_AT,
+)
+REQUEST_STATUS_POSTGRES_QUERY_FIELDS = (
+    'execution_generation',
+    'execution_quiescence_required',
+    'execution_quiesced_generation',
+    'execution_quiesced_at',
+)
+REQUEST_STATUS_QUERY_FIELD_SET = frozenset(
+    (*REQUEST_STATUS_QUERY_FIELDS, *REQUEST_STATUS_POSTGRES_QUERY_FIELDS))
+
 
 class ScheduleType(enum.Enum):
     """The schedule type for the requests."""
@@ -1278,7 +1329,8 @@ def kill_requests(request_ids: list[str] | None = None,
         expanded_request_ids = []
         for request_id in request_ids:
             request_tasks = get_requests_with_prefix(request_id,
-                                                     fields=['request_id'])
+                                                     fields=['request_id'],
+                                                     user_id=user_id)
             if request_tasks is None or len(request_tasks) == 0:
                 continue
             if len(request_tasks) > 1:
@@ -1429,10 +1481,17 @@ async def _get_request_no_lock_async(request_id: str,
 
 
 @metrics_lib.time_me
-async def get_latest_request_id_async() -> str | None:
-    """Get the latest request ID."""
-    return await request_storage.get_request_backend(
-    ).get_latest_request_id_async()
+async def get_latest_request_id_async(user_id: str | None = None) -> str | None:
+    """Get the latest request ID, optionally for one owner."""
+    backend = request_storage.get_request_backend()
+    if user_id is None:
+        return await backend.get_latest_request_id_async()
+    requests = await backend.query_requests_async(
+        RequestTaskFilter(user_id=user_id,
+                          fields=['request_id'],
+                          sort=True,
+                          limit=1))
+    return requests[0].request_id if requests else None
 
 
 @metrics_lib.time_me
@@ -1454,20 +1513,40 @@ async def get_request_async(request_id: str,
 @metrics_lib.time_me
 def get_requests_with_prefix(
         request_id_prefix: str,
-        fields: list[str] | None = None) -> list[Request] | None:
-    """Get requests with a given request ID prefix."""
-    return request_storage.get_request_backend().get_requests_with_prefix(
-        request_id_prefix, fields)
+        fields: list[str] | None = None,
+        user_id: str | None = None) -> list[Request] | None:
+    """Get requests with a given ID prefix and optional owner."""
+    query_fields = fields
+    if user_id is not None and fields and COL_USER_ID not in fields:
+        query_fields = [*fields, COL_USER_ID]
+    requests = request_storage.get_request_backend().get_requests_with_prefix(
+        request_id_prefix, query_fields)
+    if requests is None or user_id is None:
+        return requests
+    owned_requests = [
+        request for request in requests if request.user_id == user_id
+    ]
+    return owned_requests or None
 
 
 @metrics_lib.time_me_async
 @asyncio_utils.shield
 async def get_requests_async_with_prefix(
         request_id_prefix: str,
-        fields: list[str] | None = None) -> list[Request] | None:
-    """Async version of get_request_with_prefix."""
-    return await request_storage.get_request_backend(
-    ).get_requests_async_with_prefix(request_id_prefix, fields)
+        fields: list[str] | None = None,
+        user_id: str | None = None) -> list[Request] | None:
+    """Async version of get_requests_with_prefix."""
+    query_fields = fields
+    if user_id is not None and fields and COL_USER_ID not in fields:
+        query_fields = [*fields, COL_USER_ID]
+    requests = await request_storage.get_request_backend(
+    ).get_requests_async_with_prefix(request_id_prefix, query_fields)
+    if requests is None or user_id is None:
+        return requests
+    owned_requests = [
+        request for request in requests if request.user_id == user_id
+    ]
+    return owned_requests or None
 
 
 class StatusWithMsg(NamedTuple):
@@ -2495,6 +2574,8 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                 if not _should_kill_request(request_id, request_record):
                     continue
                 assert request_record is not None
+                if (user_id is not None and request_record.user_id != user_id):
+                    continue
                 if request_record.pid is not None:
                     logger.debug(
                         f'Killing request process {request_record.pid}')

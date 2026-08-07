@@ -10,7 +10,8 @@ def test_api_get_returns_not_found_if_request_is_garbage_collected(monkeypatch):
     """A terminal request can be deleted between the status and row reads."""
     request_id = 'garbage-collected-request'
 
-    async def fake_expand(request_id_prefix):
+    async def fake_expand(request_id_prefix, owner_user_id=None):
+        del owner_user_id
         return request_id_prefix
 
     async def fake_status(request_id_to_check, include_msg=False):
