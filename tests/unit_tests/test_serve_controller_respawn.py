@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import service
 from sky.utils import subprocess_utils
@@ -128,6 +129,37 @@ def test_respawn_recreates_only_controller_on_fresh_port(monkeypatch):
     assert 111 not in killed
     # There is intentionally no in-pod LB process to restart: the stable API
     # proxy resolves the newly published port on its next request.
+
+
+def test_controller_hold_blocks_service_respawn_before_reap(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: (False, _HASH))
+    monkeypatch.setattr(service, '_reap_dead_controller_for_respawn',
+                        lambda *unused_args: pytest.fail('reaped held child'))
+
+    result = service._respawn_controller('svc',
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111),
+                                         service_hash=_HASH)
+
+    assert result is None
+
+
+def test_controller_hold_preserves_pool_respawn(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: (True, _HASH))
+    dead = _FakeProc(False, 111)
+    replacement = _FakeProc(True, 333)
+    _setup(monkeypatch, new_controller=replacement)
+
+    result = service._respawn_controller('pool-a',
+                                         '127.0.0.1',
+                                         dead,
+                                         service_hash=_HASH)
+
+    assert result == (replacement, _PORT)
 
 
 def test_respawn_releases_port_lock_before_readiness_wait(monkeypatch):

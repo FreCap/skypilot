@@ -259,7 +259,10 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         with mock.patch.object(serve_controller.replica_managers,
                                'SkyPilotReplicaManager'), \
              mock.patch.object(serve_controller.autoscalers.Autoscaler,
-                               'from_spec') as mock_from_spec:
+                               'from_spec') as mock_from_spec, \
+             mock.patch.object(
+                 serve_controller.SkyServeController,
+                 '_acknowledge_pending_placement_normalization'):
             serve_controller.SkyServeController(
                 'svc',
                 mock.MagicMock(),

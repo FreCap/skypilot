@@ -363,7 +363,7 @@ def test_legacy_per_gpu_spec_stays_physical_until_explicit_update():
                          graceful_drain_async_occupancy=True)
     legacy_state = dict(current.__dict__)
     _remove_versioned_placement_contract(legacy_state)
-    del legacy_state['_uses_logical_replicas']
+    legacy_state.pop('_uses_logical_replicas', None)
     legacy = service_spec_lib.SkyServiceSpec.__new__(
         service_spec_lib.SkyServiceSpec)
     legacy.__setstate__(legacy_state)
@@ -415,7 +415,7 @@ def test_old_pickled_per_gpu_spec_copy_preserves_unbounded_downscale():
                   '_scale_up_rate_min_replicas',
                   '_scale_up_rate_period_seconds',
                   '_max_scale_down_rate_percentage'):
-        del old_state[field]
+        old_state.pop(field, None)
     legacy = service_spec_lib.SkyServiceSpec.__new__(
         service_spec_lib.SkyServiceSpec)
     legacy.__setstate__(old_state)

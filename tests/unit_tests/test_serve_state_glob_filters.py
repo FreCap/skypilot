@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy import event
 
 from sky.serve import serve_state
+from sky.serve import service_spec
 
 
 @pytest.fixture
@@ -19,6 +20,14 @@ def _mock_serve_db(tmp_path, monkeypatch):
 
 
 def _add_service(name: str, *, pool: bool) -> None:
+    spec = service_spec.SkyServiceSpec.from_yaml_config({
+        'pool': {},
+        'workers': 1,
+    } if pool else {
+        'replicas': 1,
+    })
+    if not pool:
+        spec = spec.copy(lb_high_availability=False)
     serve_state.add_service(
         name=name,
         controller_job_id=1,
@@ -30,7 +39,7 @@ def _add_service(name: str, *, pool: bool) -> None:
         pool=pool,
         controller_pid=12345,
         entrypoint='entry',
-        spec=None,
+        spec=spec,
         yaml_content='yaml: v1',
         service_hash=f'hash-{name}',
     )

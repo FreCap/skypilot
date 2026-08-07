@@ -635,7 +635,7 @@ def _install_old_feature_draft(engine: sqlalchemy.engine.Engine) -> None:
                                                           checkfirst=True)
 
 
-def test_serve_alembic_lineage_has_033_through_controller_config_036() -> None:
+def test_serve_alembic_lineage_has_033_through_normalization_037() -> None:
     engine = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
@@ -643,12 +643,13 @@ def test_serve_alembic_lineage_has_033_through_controller_config_036() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [revision.revision for revision in revisions]
     assert len(revision_ids) == len(set(revision_ids))
-    assert scripts.get_heads() == ['036']
+    assert scripts.get_heads() == ['037']
     revision_032 = scripts.get_revision('032')
     revision_033 = scripts.get_revision('033')
     revision_034 = scripts.get_revision('034')
     revision_035 = scripts.get_revision('035')
     revision_036 = scripts.get_revision('036')
+    revision_037 = scripts.get_revision('037')
     assert Path(revision_032.path).name == (
         '032_serve_request_rejection_classification.py')
     assert revision_032.down_revision == '031'
@@ -661,7 +662,10 @@ def test_serve_alembic_lineage_has_033_through_controller_config_036() -> None:
     assert revision_035.down_revision == '034'
     assert Path(revision_036.path).name == ('036_version_controller_config.py')
     assert revision_036.down_revision == '035'
-    assert migration_utils.SERVE_VERSION == '036'
+    assert Path(
+        revision_037.path).name == ('037_placement_normalization_ledger.py')
+    assert revision_037.down_revision == '036'
+    assert migration_utils.SERVE_VERSION == '037'
 
 
 def test_staged_and_head_schema_aliases_are_disjoint_and_complete() -> None:
@@ -914,6 +918,264 @@ def test_postgres_revision_036_adds_nullable_version_config_and_applied_receipt(
     assert row.controller_config_digest is None
     assert row.controller_config_snapshot_id is None
     assert row.controller_applied_at is None
+
+
+def test_postgres_revision_037_adds_normalization_ledger_without_rewriting_rows(
+        postgres_engine) -> None:
+    engine = postgres_engine
+    with engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    metadata = sqlalchemy.MetaData()
+    services = sqlalchemy.Table(
+        'services',
+        metadata,
+        sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('status', sqlalchemy.Text),
+    )
+    versions = sqlalchemy.Table(
+        'version_specs',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
+        sqlalchemy.Column('yaml_content', sqlalchemy.Text),
+    )
+    alembic_version = sqlalchemy.Table(
+        _VERSION_TABLE,
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(services.insert().values(name='svc', status='READY'))
+        connection.execute(versions.insert().values(
+            service_name='svc',
+            version=7,
+            spec=b'opaque-spec',
+            yaml_content='service: preserved'))
+        connection.execute(alembic_version.insert().values(version_num='036'))
+
+    _upgrade(engine, '037')
+
+    assert _revision(engine) == '037'
+    inspector = sqlalchemy.inspect(engine)
+    assert {
+        'placement_normalization_runs',
+        'placement_normalization_rows',
+    } <= set(inspector.get_table_names())
+    service_columns = _column_map(inspector, 'services')
+    assert {
+        'placement_normalization_requested_run_id',
+        'placement_normalization_loaded_run_id',
+        'placement_normalization_loaded_image_commit',
+        'placement_normalization_loaded_controller_pid',
+        'placement_normalization_loaded_controller_ip',
+        'placement_normalization_loaded_boot_id',
+        'placement_normalization_loaded_at',
+    } <= set(service_columns)
+    version_columns = _column_map(inspector, 'version_specs')
+    assert {
+        'retired_yaml_content',
+        'retired_at',
+        'retirement_reason',
+        'retirement_run_id',
+    } <= set(version_columns)
+    assert all(service_columns[name]['nullable'] for name in (
+        'placement_normalization_requested_run_id',
+        'placement_normalization_loaded_run_id',
+        'placement_normalization_loaded_image_commit',
+        'placement_normalization_loaded_controller_pid',
+        'placement_normalization_loaded_controller_ip',
+        'placement_normalization_loaded_boot_id',
+        'placement_normalization_loaded_at',
+    ))
+    assert all(version_columns[name]['nullable'] for name in (
+        'retired_yaml_content',
+        'retired_at',
+        'retirement_reason',
+        'retirement_run_id',
+    ))
+    assert isinstance(
+        service_columns['placement_normalization_requested_run_id']['type'],
+        sqlalchemy.Uuid)
+    assert isinstance(version_columns['retirement_run_id']['type'],
+                      sqlalchemy.Uuid)
+    assert 'ck_version_specs_retirement_all_or_none' in _check_names(
+        inspector, 'version_specs')
+    assert _foreign_keys(inspector, 'services') == {
+        'fk_services_placement_normalization_loaded_run':
+            ('placement_normalization_runs',
+             ('placement_normalization_loaded_run_id',), ('run_id',), 'RESTRICT'
+            ),
+        'fk_services_placement_normalization_requested_run':
+            ('placement_normalization_runs',
+             ('placement_normalization_requested_run_id',), ('run_id',),
+             'RESTRICT'),
+    }
+    assert _foreign_keys(inspector, 'version_specs') == {
+        'fk_version_specs_retirement_run':
+            ('placement_normalization_runs', ('retirement_run_id',),
+             ('run_id',), 'RESTRICT')
+    }
+    assert tuple(
+        inspector.get_pk_constraint('placement_normalization_runs')
+        ['constrained_columns']) == ('run_id',)
+    assert tuple(
+        inspector.get_pk_constraint('placement_normalization_rows')
+        ['constrained_columns']) == ('run_id', 'service_name', 'version')
+    assert _foreign_keys(inspector, 'placement_normalization_rows') == {
+        'fk_placement_normalization_rows_run':
+            ('placement_normalization_runs', ('run_id',), ('run_id',),
+             'RESTRICT')
+    }
+    with engine.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.text('SELECT * FROM services')).mappings().one()
+        version = connection.execute(
+            sqlalchemy.text('SELECT * FROM version_specs')).mappings().one()
+    assert service['name'] == 'svc'
+    assert service['status'] == 'READY'
+    assert all(service[name] is None for name in (
+        'placement_normalization_requested_run_id',
+        'placement_normalization_loaded_run_id',
+        'placement_normalization_loaded_image_commit',
+        'placement_normalization_loaded_controller_pid',
+        'placement_normalization_loaded_controller_ip',
+        'placement_normalization_loaded_boot_id',
+        'placement_normalization_loaded_at',
+    ))
+    assert version['service_name'] == 'svc'
+    assert version['version'] == 7
+    assert bytes(version['spec']) == b'opaque-spec'
+    assert version['yaml_content'] == 'service: preserved'
+    assert all(version[name] is None for name in (
+        'retired_yaml_content',
+        'retired_at',
+        'retirement_reason',
+        'retirement_run_id',
+    ))
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text('UPDATE version_specs SET retired_at = 1 '
+                                "WHERE service_name = 'svc' AND version = 7"))
+
+    retirement_run_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(serve_state_schema.
+                           placement_normalization_runs_table.insert().values(
+                               run_id=retirement_run_id,
+                               mode='retire_terminal_historical',
+                               normalizer_version='1',
+                               schema_revision='037',
+                               release_version='test-release',
+                               started_at=0.5,
+                               completed_at=1.0,
+                               row_bound=1,
+                               row_count=1,
+                               classification_counts={'historical': 1},
+                               pre_inventory_sha256='a' * 64,
+                               post_inventory_sha256='b' * 64,
+                               freeze_evidence_sha256='c' * 64))
+        connection.execute(
+            sqlalchemy.text(
+                'UPDATE version_specs SET yaml_content = NULL, '
+                'retired_yaml_content = :yaml, retired_at = :retired_at, '
+                'retirement_reason = :reason, '
+                'retirement_run_id = :run_id '
+                "WHERE service_name = 'svc' AND version = 7"), {
+                    'yaml': 'service: preserved',
+                    'retired_at': 1.0,
+                    'reason': 'terminal historical contract',
+                    'run_id': retirement_run_id,
+                })
+    with engine.connect() as connection:
+        retired = connection.execute(
+            sqlalchemy.text(
+                'SELECT yaml_content, retired_yaml_content, retired_at, '
+                'retirement_reason, retirement_run_id FROM version_specs '
+                "WHERE service_name = 'svc' AND version = 7")).one()
+    assert retired.yaml_content is None
+    assert retired.retired_yaml_content == 'service: preserved'
+    assert retired.retired_at == 1.0
+    assert retired.retirement_reason == 'terminal historical contract'
+    assert retired.retirement_run_id == retirement_run_id
+
+
+def test_controller_local_sqlite_revision_037_adds_only_inert_state(
+        tmp_path) -> None:
+    engine = sqlalchemy.create_engine(
+        f'sqlite:///{tmp_path / "serve-037.sqlite"}')
+    metadata = sqlalchemy.MetaData()
+    services = sqlalchemy.Table(
+        'services',
+        metadata,
+        sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('status', sqlalchemy.Text),
+    )
+    versions = sqlalchemy.Table(
+        'version_specs',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('spec', sqlalchemy.LargeBinary),
+        sqlalchemy.Column('yaml_content', sqlalchemy.Text),
+    )
+    alembic_version = sqlalchemy.Table(
+        _VERSION_TABLE,
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(services.insert().values(name='svc', status='READY'))
+        connection.execute(versions.insert().values(
+            service_name='svc',
+            version=7,
+            spec=b'opaque-spec',
+            yaml_content='service: preserved'))
+        connection.execute(alembic_version.insert().values(version_num='036'))
+
+    _upgrade(engine, '037')
+
+    assert _revision(engine) == '037'
+    inspector = sqlalchemy.inspect(engine)
+    assert {
+        'placement_normalization_runs',
+        'placement_normalization_rows',
+    } <= set(inspector.get_table_names())
+    assert {
+        'placement_normalization_requested_run_id',
+        'placement_normalization_loaded_run_id',
+        'placement_normalization_loaded_image_commit',
+        'placement_normalization_loaded_controller_pid',
+        'placement_normalization_loaded_controller_ip',
+        'placement_normalization_loaded_boot_id',
+        'placement_normalization_loaded_at',
+    } <= set(_column_map(inspector, 'services'))
+    assert {
+        'retired_yaml_content',
+        'retired_at',
+        'retirement_reason',
+        'retirement_run_id',
+    } <= set(_column_map(inspector, 'version_specs'))
+    with engine.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.text('SELECT name, status FROM services')).one()
+        version = connection.execute(
+            sqlalchemy.text('SELECT service_name, version, spec, '
+                            'yaml_content FROM version_specs')).one()
+    assert tuple(service) == ('svc', 'READY')
+    assert version.service_name == 'svc'
+    assert version.version == 7
+    assert bytes(version.spec) == b'opaque-spec'
+    assert version.yaml_content == 'service: preserved'
 
 
 def test_postgres_revision_035_serializes_concurrent_legacy_writer_and_reupgrade(

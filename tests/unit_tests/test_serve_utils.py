@@ -21,6 +21,7 @@ from sky import exceptions
 from sky.resources import Resources
 from sky.serve import constants
 from sky.serve import controller_transport
+from sky.serve import maintenance
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -28,6 +29,60 @@ from sky.serve import serve_utils
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+
+
+@pytest.mark.parametrize(('value', 'expected'),
+                         [(None, False), ('false', False), ('true', True)])
+def test_serve_controller_hold_requires_explicit_boolean(
+        monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR,
+                           raising=False)
+    else:
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, value)
+
+    assert maintenance.is_controller_hold_active() is expected
+
+
+def test_serve_controller_hold_rejects_malformed_value(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'TRUE')
+
+    with pytest.raises(RuntimeError, match='must be exactly'):
+        maintenance.is_controller_hold_active()
+
+
+def test_serve_controller_hold_blocks_ha_recovery_before_state_reads(
+        monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    with mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner, \
+         mock.patch.object(serve_utils.serve_state,
+                           'get_glob_service_names') as get_names:
+        serve_utils.ha_recovery_for_consolidation_mode(pool=False)
+
+    runner.assert_not_called()
+    get_names.assert_not_called()
+
+
+def test_serve_controller_hold_blocks_termination_before_state_reads(
+        monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    with mock.patch.object(serve_utils.serve_state,
+                           'get_glob_service_names') as get_names, \
+         pytest.raises(RuntimeError, match='termination and purge'):
+        serve_utils.terminate_services(['svc'], purge=True, pool=False)
+
+    get_names.assert_not_called()
+
+
+def test_serve_controller_hold_does_not_block_pool_termination(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    with mock.patch.object(serve_utils.serve_state,
+                           'get_glob_service_names',
+                           return_value=[]):
+        message = serve_utils.terminate_services([], purge=False, pool=True)
+
+    assert message == 'No pool to terminate.'
 
 
 def test_update_config_capability_rejects_old_controller_before_mutation():

@@ -247,7 +247,12 @@ def add_all_tables_to_db_sqlalchemy(
     blindly creating every current index would make historical upgrades fail.
     """
     reconcile_indexes = frozenset(reconcile_indexes_for)
-    for table in metadata.tables.values():
+    # Historical bootstrap revisions import the current metadata graph and
+    # create its tables one at a time so index reconciliation can remain
+    # selective.  Follow the graph's foreign-key topology: declaration order
+    # is not a dependency contract, and a newly added parent may be declared
+    # after an older child table.
+    for table in metadata.sorted_tables:
         try:
             table.create(bind=engine, checkfirst=True)
         except (sqlalchemy_exc.OperationalError,

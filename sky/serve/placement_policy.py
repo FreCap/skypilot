@@ -34,8 +34,8 @@ RESERVED_FILL_MODE_SINGLE_GPU_BACKEND = 'single_gpu_backend'
 WORKLOAD_KIND_SERVICE = 'service'
 WORKLOAD_KIND_POOL = 'pool'
 
-PLACEMENT_CONTRACT_VERSION_TRANSITION = 1
-PLACEMENT_CONTRACT_VERSION_CLEANUP = 2
+PLACEMENT_CONTRACT_VERSION_V1 = 1
+PLACEMENT_CONTRACT_VERSION_V2 = 2
 
 CONTRACT_VERSION_FIELD = '_placement_contract_version'
 CONTRACT_ENGINE_FIELD = '_placement_engine'
@@ -164,13 +164,8 @@ class PlacementContract:
             return hourly_cost / slots
         raise ValueError('A placement-disabled contract has no cost order.')
 
-    def persisted_fields(self, version: int) -> dict[str, Any]:
-        if (not isinstance(version, int) or isinstance(version, bool) or
-                version not in (PLACEMENT_CONTRACT_VERSION_TRANSITION,
-                                PLACEMENT_CONTRACT_VERSION_CLEANUP)):
-            raise ValueError(f'Unsupported placement contract version: '
-                             f'{version!r}.')
-        if (version == PLACEMENT_CONTRACT_VERSION_CLEANUP and
+    def _persisted_fields_for_version(self, version: int) -> dict[str, Any]:
+        if (version == PLACEMENT_CONTRACT_VERSION_V2 and
                 self.is_legacy_physical_per_gpu):
             raise ValueError('Placement contract v2 cannot encode the '
                              'transition-only historical physical/per-GPU '
@@ -184,6 +179,14 @@ class PlacementContract:
             CONTRACT_RESERVED_FILL_MODE_FIELD: self.reserved_fill_mode,
             CONTRACT_WORKLOAD_KIND_FIELD: self.workload_kind,
         }
+
+    def persisted_fields(self) -> dict[str, Any]:
+        """Return the sole current, mirror-free persistence representation."""
+        return self._persisted_fields_for_version(PLACEMENT_CONTRACT_VERSION_V2)
+
+    def _legacy_v1_persisted_fields(self) -> dict[str, Any]:
+        """Encode the read-only legacy v1 compatibility representation."""
+        return self._persisted_fields_for_version(PLACEMENT_CONTRACT_VERSION_V1)
 
 
 def workload_kind_from_pool(pool: Any) -> str:
@@ -326,8 +329,8 @@ def decode_contract_state(
     if not isinstance(version, int) or isinstance(version, bool):
         raise ValueError('Placement contract version must be an integer; got '
                          f'{version!r}.')
-    if version not in (PLACEMENT_CONTRACT_VERSION_TRANSITION,
-                       PLACEMENT_CONTRACT_VERSION_CLEANUP):
+    if version not in (PLACEMENT_CONTRACT_VERSION_V1,
+                       PLACEMENT_CONTRACT_VERSION_V2):
         raise ValueError(f'Unsupported placement contract version: '
                          f'{version!r}.')
     values = [state[field] for field in CONTRACT_FIELDS[1:]]
@@ -342,7 +345,7 @@ def decode_contract_state(
     if contract.workload_kind != workload_kind:
         raise ValueError('Placement contract workload kind disagrees with '
                          f'_pool: {contract.workload_kind!r} versus {pool!r}.')
-    if (version == PLACEMENT_CONTRACT_VERSION_CLEANUP and
+    if (version == PLACEMENT_CONTRACT_VERSION_V2 and
             contract.is_legacy_physical_per_gpu):
         raise ValueError('Placement contract v2 cannot encode the '
                          'transition-only historical physical/per-GPU '
@@ -350,10 +353,10 @@ def decode_contract_state(
     _validate_policy_mapping(
         contract,
         state[POLICY_NAME_FIELD],
-        allow_legacy_per_gpu=(version == PLACEMENT_CONTRACT_VERSION_TRANSITION))
+        allow_legacy_per_gpu=(version == PLACEMENT_CONTRACT_VERSION_V1))
 
     has_mirror = ROLLBACK_REPLICA_UNIT_FIELD in state
-    if version == PLACEMENT_CONTRACT_VERSION_TRANSITION:
+    if version == PLACEMENT_CONTRACT_VERSION_V1:
         if not has_mirror:
             raise ValueError('Placement contract v1 requires the rollback '
                              'logical replica marker.')

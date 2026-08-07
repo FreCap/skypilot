@@ -42,6 +42,8 @@ def _restore_consolidation_override():
     """Keep in-process controller markers scoped to each test."""
     marker = controller.constants.OVERRIDE_CONSOLIDATION_MODE
     original = os.environ.pop(marker, None)
+    original_process_title = controller.setproctitle.getproctitle()
+    restore_process_title = controller.setproctitle.setproctitle
     original_metrics_role = (
         controller.db_utils._postgres_connection_metrics_process_role_override)
     controller.db_utils._postgres_connection_metrics_process_role_override = None
@@ -49,6 +51,7 @@ def _restore_consolidation_override():
     os.environ.pop(marker, None)
     if original is not None:
         os.environ[marker] = original
+    restore_process_title(original_process_title)
     controller.db_utils._postgres_connection_metrics_process_role_override = (
         original_metrics_role)
 
@@ -136,19 +139,36 @@ def test_run_controller_sets_connection_metric_role_before_initialization(
         monkeypatch):
     initialization_order = []
     monkeypatch.setattr(
+        controller.setproctitle, 'setproctitle',
+        lambda title: initialization_order.append(('process-title', title)))
+    monkeypatch.setattr(
         controller.db_utils, 'set_postgres_connection_metrics_process_role',
         lambda role: initialization_order.append(('metrics-role', role)))
     monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
                         lambda: initialization_order.append(('context', None)))
     controller_instance = mock.Mock()
-    monkeypatch.setattr(controller, 'SkyServeController',
-                        mock.Mock(return_value=controller_instance))
 
-    controller.run_controller('pool', mock.Mock(), 1, '127.0.0.1', 20001,
-                              'fingerprint')
+    def _construct_controller(*_args, **_kwargs):
+        initialization_order.append(('controller-construction', None))
+        return controller_instance
 
-    assert initialization_order[:2] == [('metrics-role', 'serve-controller'),
-                                        ('context', None)]
+    monkeypatch.setattr(controller, 'SkyServeController', _construct_controller)
+
+    controller.run_controller('pool',
+                              mock.Mock(),
+                              1,
+                              '127.0.0.1',
+                              20001,
+                              'fingerprint',
+                              service_hash='incarnation-a')
+
+    assert initialization_order == [
+        ('process-title', 'sky.serve.controller --service-name pool '
+         '--service-incarnation incarnation-a'),
+        ('metrics-role', 'serve-controller'),
+        ('context', None),
+        ('controller-construction', None),
+    ]
     controller_instance.run.assert_called_once_with()
 
 
@@ -354,6 +374,13 @@ def _make_controller() -> controller.SkyServeController:
     return ctrl
 
 
+def _explicit_placement_contract_spec():
+    spec = types.SimpleNamespace(_spot_placer=None, _pool=False)
+    contract = placement_policy.resolve_fresh_contract(None, False)
+    spec.__dict__.update(contract.persisted_fields())
+    return spec
+
+
 def test_cost_rebalance_state_persistence_is_owner_fenced():
     ctrl = _make_controller()
     ctrl._service_hash = 'incarnation-a'
@@ -389,6 +416,80 @@ def test_cost_rebalance_state_db_error_suppresses_only_economic_work():
         assert not ctrl._persist_cost_rebalance_state(scaler)
 
     scaler.mark_cost_rebalance_state_persisted.assert_not_called()
+
+
+def test_controller_startup_acknowledges_pending_normalization(monkeypatch):
+    ctrl = _make_controller()
+    ctrl._service_hash = 'incarnation-a'
+    ctrl._controller_owner = (123, '10.0.0.1')
+    ctrl._committed_version = 3
+    ctrl._history_session_id = 'a' * 32
+    request = serve_state.PlacementNormalizationRequest(
+        run_id=controller.uuid.uuid4(),
+        recovery_version=2,
+        current_version=3,
+        lifecycle_epoch=7)
+    read_request = mock.Mock(return_value=request)
+    acknowledge = mock.Mock(return_value=True)
+    monkeypatch.setattr(controller.serve_state,
+                        'get_placement_normalization_request', read_request)
+    monkeypatch.setattr(controller.serve_state,
+                        'acknowledge_placement_normalization_loaded',
+                        acknowledge)
+    monkeypatch.setattr(controller, 'sky_commit', 'commit-a')
+    monkeypatch.setattr(controller.os, 'getpid', lambda: 456)
+
+    ctrl._acknowledge_pending_placement_normalization(
+        _explicit_placement_contract_spec(), 2)
+
+    read_request.assert_called_once_with('svc',
+                                         recovery_version=2,
+                                         current_version=3,
+                                         expected_service_hash='incarnation-a',
+                                         expected_controller_owner=(123,
+                                                                    '10.0.0.1'))
+    acknowledge.assert_called_once_with('svc',
+                                        request,
+                                        expected_service_hash='incarnation-a',
+                                        expected_controller_owner=(123,
+                                                                   '10.0.0.1'),
+                                        image_commit='commit-a',
+                                        child_controller_pid=456,
+                                        boot_id='a' * 32)
+
+
+def test_controller_startup_fails_when_normalization_receipt_cas_is_stale():
+    ctrl = _make_controller()
+    ctrl._service_hash = 'incarnation-a'
+    ctrl._controller_owner = (123, '10.0.0.1')
+    ctrl._committed_version = 1
+    request = serve_state.PlacementNormalizationRequest(
+        run_id=controller.uuid.uuid4(),
+        recovery_version=1,
+        current_version=1,
+        lifecycle_epoch=7)
+    with mock.patch.object(controller.serve_state,
+                           'get_placement_normalization_request',
+                           return_value=request), mock.patch.object(
+                               controller.serve_state,
+                               'acknowledge_placement_normalization_loaded',
+                               return_value=False), pytest.raises(
+                                   RuntimeError, match='Could not acknowledge'):
+        ctrl._acknowledge_pending_placement_normalization(
+            _explicit_placement_contract_spec(), 1)
+
+
+def test_controller_startup_rejects_fieldless_placement_contract():
+    ctrl = _make_controller()
+    fieldless = types.SimpleNamespace(_spot_placer=None,
+                                      _pool=False,
+                                      _uses_logical_replicas=False)
+    with mock.patch.object(
+            controller.serve_state,
+            'get_placement_normalization_request') as read_request, \
+            pytest.raises(RuntimeError, match='fieldless legacy'):
+        ctrl._acknowledge_pending_placement_normalization(fieldless, 1)
+    read_request.assert_not_called()
 
 
 def test_recovery_rejects_physical_spec_after_durable_logical_activation():
@@ -891,7 +992,7 @@ def _make_legacy_physical_per_gpu_spec() -> controller.serve.SkyServiceSpec:
     legacy_state = dict(current.__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
         legacy_state.pop(field)
-    legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
     restored = controller.serve.SkyServiceSpec.__new__(
         controller.serve.SkyServiceSpec)
     restored.__setstate__(legacy_state)

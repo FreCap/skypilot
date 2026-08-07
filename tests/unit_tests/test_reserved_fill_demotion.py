@@ -47,7 +47,7 @@ def _install_demotion_preconditions(monkeypatch,
                         mock.Mock(return_value={'protocol_version': 2}))
 
 
-@pytest.mark.parametrize('serve_revision', ['035', '036'])
+@pytest.mark.parametrize('serve_revision', ['035', '036', '037'])
 def test_demotion_attests_stable_token_bound_rollout_under_lock(
         monkeypatch, serve_revision):
     lock = _TrackedLock()
@@ -111,7 +111,7 @@ def test_demotion_rejects_schema_outside_compatible_set(monkeypatch):
                         setter)
 
     with pytest.raises(broker.ProtocolV1DemotionError,
-                       match='Serve schema revision 035 or 036'):
+                       match='Serve schema revision 035, 036, or 037'):
         broker.demote_protocol_v1()
     attester.assert_not_called()
     setter.assert_not_called()

@@ -80,6 +80,41 @@ services_table = sqlalchemy.Table(
     # Pod IP where the controller process is running.
     # Written by the sky.serve.service process at startup.
     sqlalchemy.Column('controller_ip', sqlalchemy.Text, server_default=None),
+    # A placement normalization updates persisted representation without
+    # changing service semantics.  The requested run fences controller reload;
+    # the remaining fields are the durable receipt written only after that
+    # controller has loaded and validated the normalized generation.
+    sqlalchemy.Column('placement_normalization_requested_run_id',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      sqlalchemy.ForeignKey(
+                          'placement_normalization_runs.run_id',
+                          name=('fk_services_placement_normalization_'
+                                'requested_run'),
+                          ondelete='RESTRICT'),
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_run_id',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      sqlalchemy.ForeignKey(
+                          'placement_normalization_runs.run_id',
+                          name=('fk_services_placement_normalization_'
+                                'loaded_run'),
+                          ondelete='RESTRICT'),
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_image_commit',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_controller_pid',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_controller_ip',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_boot_id',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_at',
+                      sqlalchemy.Float,
+                      server_default=None),
     # Durable one-way activation fence. Logical per-GPU semantics may be
     # enabled by an update, but cannot safely be changed back to physical
     # backend counts in place. This parent-row bit makes that rule atomic with
@@ -179,6 +214,22 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('quarantined_at', sqlalchemy.Float, server_default=None),
     sqlalchemy.Column('quarantine_reason', sqlalchemy.Text,
                       server_default=None),
+    # Historical retirement preserves operator-readable YAML separately while
+    # removing the row from every live committed-version query.  The CHECK
+    # below prevents partially written retirement evidence.
+    sqlalchemy.Column('retired_yaml_content',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('retired_at', sqlalchemy.Float, server_default=None),
+    sqlalchemy.Column('retirement_reason', sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('retirement_run_id',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      sqlalchemy.ForeignKey(
+                          'placement_normalization_runs.run_id',
+                          name='fk_version_specs_retirement_run',
+                          ondelete='RESTRICT'),
+                      server_default=None),
     sqlalchemy.Column('placement_catalog',
                       sqlalchemy.JSON(none_as_null=True).with_variant(
                           postgresql.JSONB(none_as_null=True), 'postgresql'),
@@ -201,7 +252,107 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_applied_at',
                       sqlalchemy.Float,
                       server_default=None),
+    sqlalchemy.CheckConstraint(
+        '((retired_at IS NULL AND retired_yaml_content IS NULL AND '
+        'retirement_reason IS NULL AND retirement_run_id IS NULL) OR '
+        '(retired_at IS NOT NULL AND yaml_content IS NULL AND '
+        'retired_yaml_content IS NOT NULL AND retirement_reason IS NOT NULL '
+        'AND retirement_run_id IS NOT NULL))',
+        name='ck_version_specs_retirement_all_or_none'),
 )
+
+# One immutable manifest per successfully committed normalization phase.  Raw
+# specs and YAML are intentionally absent: the manifest and row inventory keep
+# only canonical digests and non-secret contract/dependency projections.
+placement_normalization_runs_table = sqlalchemy.Table(
+    'placement_normalization_runs',
+    Base.metadata,
+    sqlalchemy.Column('run_id', sqlalchemy.Uuid(as_uuid=True),
+                      primary_key=True),
+    sqlalchemy.Column('mode', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('normalizer_version', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('schema_revision', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('release_version', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('started_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('completed_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('row_bound', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('row_count', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('classification_counts',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      nullable=False),
+    sqlalchemy.Column('pre_inventory_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('post_inventory_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('freeze_evidence_sha256', sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.CheckConstraint(
+        "mode IN ('apply_supported', 'retire_terminal_historical')",
+        name='ck_placement_normalization_run_mode'),
+    sqlalchemy.CheckConstraint('completed_at >= started_at',
+                               name='ck_placement_normalization_run_times'),
+    sqlalchemy.CheckConstraint(
+        'row_bound >= 0 AND row_count >= 0 AND row_count <= row_bound',
+        name='ck_placement_normalization_run_row_bound'),
+    sqlalchemy.CheckConstraint(
+        'length(pre_inventory_sha256) = 64 AND '
+        'length(post_inventory_sha256) = 64 AND '
+        'length(freeze_evidence_sha256) = 64',
+        name='ck_placement_normalization_run_digests'),
+)
+
+placement_normalization_rows_table = sqlalchemy.Table(
+    'placement_normalization_rows',
+    Base.metadata,
+    sqlalchemy.Column('run_id',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      sqlalchemy.ForeignKey(
+                          'placement_normalization_runs.run_id',
+                          name='fk_placement_normalization_rows_run',
+                          ondelete='RESTRICT'),
+                      primary_key=True),
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('classification', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('outcome', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('original_spec_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('result_spec_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('original_row_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('result_row_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('original_column_sha256s',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      nullable=False),
+    sqlalchemy.Column('result_column_sha256s',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      nullable=False),
+    sqlalchemy.Column(
+        'contract_projection',
+        sqlalchemy.JSON(none_as_null=True).with_variant(
+            postgresql.JSONB(none_as_null=True), 'postgresql')),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('service_lifecycle_epoch',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('dependency_facts',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      nullable=False),
+    sqlalchemy.CheckConstraint("outcome IN ('unchanged', 'changed', 'retired')",
+                               name='ck_placement_normalization_row_outcome'),
+    sqlalchemy.CheckConstraint(
+        'length(classification) > 0',
+        name='ck_placement_normalization_row_classification'),
+    sqlalchemy.CheckConstraint(
+        'length(original_spec_sha256) = 64 AND '
+        'length(result_spec_sha256) = 64 AND '
+        'length(original_row_sha256) = 64 AND '
+        'length(result_row_sha256) = 64',
+        name='ck_placement_normalization_row_digests'),
+)
+sqlalchemy.Index('placement_normalization_rows_version_idx',
+                 placement_normalization_rows_table.c.service_name,
+                 placement_normalization_rows_table.c.version)
 
 # Durable cleanup inventory is intentionally separate from ``version_specs``.
 # Version rows are immutable deployment history, while cleanup intents track

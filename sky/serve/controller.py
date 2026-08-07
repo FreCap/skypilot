@@ -25,8 +25,10 @@ import colorama
 import fastapi
 from fastapi import responses
 import filelock
+import setproctitle
 import uvicorn
 
+from sky import __commit__ as sky_commit
 from sky import exceptions
 from sky import global_user_state
 from sky import serve
@@ -41,6 +43,7 @@ from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
 from sky.serve import paid_capacity
+from sky.serve import placement_policy
 from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
@@ -540,6 +543,7 @@ class SkyServeController:
             raise RuntimeError(
                 f'Could not durably mark recovered service version {version} '
                 'as controller-applied under the current ownership fence.')
+        self._acknowledge_pending_placement_normalization(service_spec, version)
 
     @contextlib.asynccontextmanager
     async def lifespan(self, _: fastapi.FastAPI):
@@ -3339,6 +3343,45 @@ class SkyServeController:
             self._service_hash,
             expected_controller_owner=self._controller_owner)
 
+    def _acknowledge_pending_placement_normalization(
+            self, service_spec: serve.SkyServiceSpec, version: int) -> None:
+        """Prove this child loaded one explicit, still-requested generation."""
+        try:
+            _, contract_version = placement_policy.decode_contract_state(
+                service_spec.__dict__)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                'Recovered service spec has an invalid placement contract.') \
+                from exc
+        if contract_version is None:
+            raise RuntimeError(
+                'Recovered service spec still has a fieldless legacy '
+                'placement contract.')
+        if self._service_hash is None:
+            return
+        if self._controller_owner is None:
+            raise RuntimeError('A durable service incarnation must carry an '
+                               'exact parent controller owner.')
+        request = serve_state.get_placement_normalization_request(
+            self._service_name,
+            recovery_version=version,
+            current_version=self._committed_version,
+            expected_service_hash=self._service_hash,
+            expected_controller_owner=self._controller_owner)
+        if request is None:
+            return
+        if not serve_state.acknowledge_placement_normalization_loaded(
+                self._service_name,
+                request,
+                expected_service_hash=self._service_hash,
+                expected_controller_owner=self._controller_owner,
+                image_commit=sky_commit,
+                child_controller_pid=os.getpid(),
+                boot_id=self._history_session_id):
+            raise RuntimeError(
+                'Could not acknowledge the requested placement normalization '
+                'generation under the current owner and version fences.')
+
     @staticmethod
     def _install_controller_config(prepared: _PreparedControllerConfig) -> None:
         """Publish a config only after its version and recovery are durable."""
@@ -5029,6 +5072,9 @@ def run_controller(service_name: str,
                    controller_ip: str | None = None,
                    enforce_launch_fence: bool = False,
                    controller_socket: socket.socket | None = None):
+    setproctitle.setproctitle('sky.serve.controller '
+                              f'--service-name {service_name} '
+                              f'--service-incarnation {service_hash or ""}')
     db_utils.set_postgres_connection_metrics_process_role('serve-controller')
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.

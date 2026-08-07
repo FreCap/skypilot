@@ -1,5 +1,6 @@
 """The database for services information."""
 import collections
+from collections.abc import Mapping
 import contextlib
 import copy
 import dataclasses
@@ -28,7 +29,9 @@ from sky.adaptors import common as adaptors_common
 from sky.serve import constants
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
+from sky.serve import maintenance
 from sky.serve import paid_capacity
+from sky.serve import placement_policy
 from sky.serve import serve_state_schema
 from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
 from sky.serve.serve_statuses import ReplicaStatus
@@ -45,13 +48,17 @@ from sky.utils.db import db_utils
 if typing.TYPE_CHECKING:
     from sqlalchemy.engine import row
 
+    from sky.serve import placement_contract_normalization
     from sky.serve import replica_managers
     from sky.serve import resource_action_state
     from sky.serve import service_spec
 else:
+    placement_contract_normalization = adaptors_common.LazyImport(
+        'sky.serve.placement_contract_normalization')
     replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
     resource_action_state = adaptors_common.LazyImport(
         'sky.serve.resource_action_state')
+    service_spec = adaptors_common.LazyImport('sky.serve.service_spec')
 
 replica_info_lib = adaptors_common.LazyImport('sky.serve.replica_info')
 system_oom_recovery = adaptors_common.LazyImport(
@@ -65,6 +72,10 @@ Base = serve_state_schema.Base
 services_table = serve_state_schema.services_table
 replicas_table = serve_state_schema.replicas_table
 version_specs_table = serve_state_schema.version_specs_table
+placement_normalization_runs_table = (
+    serve_state_schema.placement_normalization_runs_table)
+placement_normalization_rows_table = (
+    serve_state_schema.placement_normalization_rows_table)
 ephemeral_storage_cleanup_intents_table = (
     serve_state_schema.ephemeral_storage_cleanup_intents_table)
 serve_ha_recovery_script_table = (
@@ -402,6 +413,27 @@ def _replica_launch_authority_write_session(
                        f'authority: {engine.dialect.name!r}.')
 
 
+def _serialize_current_service_spec(
+        spec: 'service_spec.SkyServiceSpec') -> bytes:
+    """Serialize one intentional write from an explicit v2 object state."""
+    if type(spec) is not service_spec.SkyServiceSpec:
+        raise TypeError('Persisted Serve spec must use the exact '
+                        'SkyServiceSpec class.')
+    state = spec.__dict__
+    if not isinstance(state, dict):
+        raise TypeError('Persisted SkyServiceSpec state must be a dictionary.')
+    try:
+        _, version = placement_policy.decode_contract_state(state)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('Persisted SkyServiceSpec has an invalid placement '
+                         'contract.') from exc
+    if (version != placement_policy.PLACEMENT_CONTRACT_VERSION_V2 or
+            placement_policy.ROLLBACK_REPLICA_UNIT_FIELD in state):
+        raise ValueError('New Serve versions require an explicit mirror-free '
+                         'v2 placement contract.')
+    return pickle.dumps(spec, protocol=4)
+
+
 @_with_reserved_fill_broker_lock
 def add_service(name: str,
                 controller_job_id: int,
@@ -413,7 +445,7 @@ def add_service(name: str,
                 pool: bool,
                 controller_pid: int,
                 entrypoint: str,
-                spec: Optional['service_spec.SkyServiceSpec'],
+                spec: 'service_spec.SkyServiceSpec',
                 yaml_content: str,
                 workspace: str | None = None,
                 controller_ip: str | None = None,
@@ -441,11 +473,12 @@ def add_service(name: str,
         True if the service is added successfully, False if the service already
         exists.
     """
+    serialized_spec = _serialize_current_service_spec(spec)
     controller_config_snapshot = _validate_controller_config_snapshot(
         controller_config, controller_config_digest,
         controller_config_snapshot_id)
     engine = _db_manager.get_engine()
-    lb_ha_enabled = bool(spec is not None and spec.lb_high_availability)
+    lb_ha_enabled = bool(spec.lb_high_availability)
     if (lb_ha_enabled and
             engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
         raise RuntimeError('External load balancer high availability requires '
@@ -553,7 +586,6 @@ def add_service(name: str,
                     resource_scope=resource_scope,
                     entrypoint=entrypoint,
                     logical_replica_semantics=int(
-                        spec is not None and
                         spec.uses_logical_replicas is True),
                     lb_ha_enabled=int(lb_ha_enabled),
                     lb_active_slot=(lb_ha.LbSlot.A.value
@@ -570,7 +602,7 @@ def add_service(name: str,
             version_insert_stmt = insert_func(version_specs_table).values(
                 service_name=name,
                 version=constants.INITIAL_VERSION,
-                spec=pickle.dumps(spec),
+                spec=serialized_spec,
                 yaml_content=yaml_content,
                 submitted_yaml_content=submitted_yaml_content,
                 placement_catalog=placement_catalog,
@@ -2007,6 +2039,10 @@ def get_service_replica_launch_authorization(
         return None
     mapping = row._mapping  # pylint: disable=protected-access
     record = _controller_owner_record(mapping)
+    # Keep the raw integer alongside the public boolean projection.  The
+    # maintenance hold may exempt only an exactly persisted pool discriminator;
+    # truthiness would turn corrupt values such as 2 into launch authority.
+    record['pool_discriminator'] = mapping['pool']
     record['launch_authorized_version'] = mapping['launch_authorized_version']
     record['launch_version_required'] = bool(mapping['config_protocol_active'])
     return record
@@ -2041,7 +2077,11 @@ def service_replica_launch_fence_holds(launch_context: dict[str, Any]) -> bool:
         return False
 
     owner = get_service_replica_launch_authorization(service_name)
-    return bool(owner is not None and owner.get('hash') == service_hash and
+    return bool(owner is not None and
+                (not maintenance.is_controller_hold_active() or
+                 (type(owner.get('pool_discriminator')) is int and
+                  owner.get('pool_discriminator') == 1)) and
+                owner.get('hash') == service_hash and
                 (owner.get('controller_pid'), owner.get('controller_ip'))
                 == (controller_pid, controller_ip) and owner.get('status')
                 not in ServiceStatus.replica_launch_blocking_statuses() and
@@ -2278,7 +2318,8 @@ def get_orphaned_service_child_mode(service_name: str) -> bool | None:
                 replicas_table.c.service_name == service_name)).scalars().all()
         version_rows = session.execute(
             sqlalchemy.select(version_specs_table.c.spec,
-                              version_specs_table.c.yaml_content).where(
+                              version_specs_table.c.yaml_content,
+                              version_specs_table.c.retired_yaml_content).where(
                                   version_specs_table.c.service_name ==
                                   service_name)).fetchall()
     for replica_state in replica_rows:
@@ -2286,7 +2327,7 @@ def get_orphaned_service_child_mode(service_name: str) -> bool | None:
             modes.add(replica_state['replica_port'] == '-')
         except Exception:  # pylint: disable=broad-except
             return None
-    for spec_bytes, yaml_content in version_rows:
+    for spec_bytes, yaml_content, retired_yaml_content in version_rows:
         try:
             spec = typing.cast('service_spec.SkyServiceSpec | None',
                                pickle.loads(spec_bytes))
@@ -2295,8 +2336,10 @@ def get_orphaned_service_child_mode(service_name: str) -> bool | None:
                 continue
         except Exception:  # pylint: disable=broad-except
             pass
+        cleanup_yaml_content = (yaml_content if yaml_content is not None else
+                                retired_yaml_content)
         try:
-            config = yaml_utils.safe_load(yaml_content)
+            config = yaml_utils.safe_load(cleanup_yaml_content)
         except Exception:  # pylint: disable=broad-except
             return None
         if not isinstance(config, dict) or not isinstance(
@@ -4917,6 +4960,16 @@ class VersionCommitResult(enum.Enum):
 ControllerConfigSnapshot = tuple[bytes, str, str]
 
 
+@dataclasses.dataclass(frozen=True)
+class PlacementNormalizationRequest:
+    """Exact service/version generation awaiting a controller-load receipt."""
+
+    run_id: uuid.UUID
+    recovery_version: int
+    current_version: int
+    lifecycle_epoch: int | None
+
+
 class ControllerConfigCorruptionError(RuntimeError):
     """A persisted controller-config snapshot failed integrity validation."""
 
@@ -5036,7 +5089,7 @@ def add_version(service_name: str,
         insert_stmt = sqlalchemy.insert(version_specs_table).values(
             service_name=service_name,
             version=max_version_subquery,
-            spec=pickle.dumps(None),
+            spec=pickle.dumps(None, protocol=4),
             created_by=created_by).returning(version_specs_table.c.version)
 
         result = session.execute(insert_stmt)
@@ -5136,9 +5189,17 @@ def add_or_update_version(
                 version_specs_table.c.controller_config,
                 version_specs_table.c.controller_config_digest,
                 version_specs_table.c.controller_config_snapshot_id,
-                version_specs_table.c.submitted_yaml_content).where(
+                version_specs_table.c.submitted_yaml_content,
+                version_specs_table.c.retired_at).where(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version)).fetchone()
+        # A retired history row deliberately resembles an interrupted
+        # placeholder to old readers (NULL committed YAML plus pickled None),
+        # but its version identity is permanently consumed.  Never let the
+        # ordinary commit path refill that tombstone.
+        if existing is not None and existing[6] is not None:
+            session.rollback()
+            return VersionCommitResult.CONTENT_CONFLICT
         identical_retry = existing is not None and existing[0] == yaml_content
         if existing is not None and existing[
                 0] is not None and not identical_retry:
@@ -5156,6 +5217,9 @@ def add_or_update_version(
                  existing[5] != submitted_yaml_content)):
                 session.rollback()
                 return VersionCommitResult.CONTENT_CONFLICT
+        serialized_spec: bytes | None = None
+        if not identical_retry:
+            serialized_spec = _serialize_current_service_spec(spec)
         if not identical_retry and controller_config_snapshot is not None:
             marker = constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER
             if (ha_recovery_script is None or
@@ -5241,10 +5305,11 @@ def add_or_update_version(
             session.rollback()
             return VersionCommitResult.LB_HA_CONFLICT
         if existing is None:
+            assert serialized_spec is not None
             session.execute(version_specs_table.insert().values(
                 service_name=service_name,
                 version=version,
-                spec=pickle.dumps(spec),
+                spec=serialized_spec,
                 yaml_content=yaml_content,
                 submitted_yaml_content=submitted_yaml_content,
                 placement_catalog=placement_catalog,
@@ -5260,12 +5325,14 @@ def add_or_update_version(
         elif existing[0] is None:
             # `add_version` reserves a NULL-YAML placeholder. The service-row
             # lock above serializes the one transition that fills it.
-            session.execute(
+            assert serialized_spec is not None
+            filled_placeholder = session.execute(
                 sqlalchemy.update(version_specs_table).where(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version,
-                    version_specs_table.c.yaml_content.is_(None)).values(
-                        spec=pickle.dumps(spec),
+                    version_specs_table.c.yaml_content.is_(None),
+                    version_specs_table.c.retired_at.is_(None)).values(
+                        spec=serialized_spec,
                         yaml_content=yaml_content,
                         submitted_yaml_content=submitted_yaml_content,
                         placement_catalog=placement_catalog,
@@ -5279,6 +5346,9 @@ def add_or_update_version(
                             None if controller_config_snapshot is None else
                             controller_config_snapshot[2]),
                         created_at=time.time()))
+            if filled_placeholder.rowcount != 1:
+                session.rollback()
+                return VersionCommitResult.CONTENT_CONFLICT
         elif identical_retry and existing[1] is None and placement_catalog:
             # A retry may be the first new binary to touch a version committed
             # by an older controller. Backfill only the absent catalog; the
@@ -5506,16 +5576,21 @@ def get_yaml_contents(service_name: str,
 
 
 def get_version_yaml_contents(service_name: str) -> dict[int, str]:
-    """Gets yaml contents for all of a service's versions in one query.
+    """Gets cleanup YAML for all of a service's versions in one query.
 
-    Versions whose yaml content is missing (NULL) are omitted. Keys are
-    returned in ascending version order.
+    A retired history row has no live ``yaml_content`` by construction, but
+    its copied ``retired_yaml_content`` remains cleanup inventory.  Live
+    election and recovery readers intentionally do not use this accessor.
+    Rows missing both representations are omitted, and keys are returned in
+    ascending version order.
     """
+    cleanup_yaml = sqlalchemy.func.coalesce(
+        version_specs_table.c.yaml_content,
+        version_specs_table.c.retired_yaml_content).label('cleanup_yaml')
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         rows = session.execute(
-            sqlalchemy.select(version_specs_table.c.version,
-                              version_specs_table.c.yaml_content).
+            sqlalchemy.select(version_specs_table.c.version, cleanup_yaml).
             where(version_specs_table.c.service_name == service_name).order_by(
                 version_specs_table.c.version)).fetchall()
     return {row[0]: row[1] for row in rows if row[1] is not None}
@@ -5680,6 +5755,558 @@ def mark_version_controller_applied(
     return True
 
 
+_LOADABLE_NORMALIZATION_LEDGER_OUTCOMES = frozenset({
+    ('fieldless_supported', 'changed'),
+    ('explicit_v1', 'changed'),
+    ('explicit_v2', 'unchanged'),
+})
+_FILLABLE_NORMALIZATION_LEDGER_OUTCOMES = frozenset({
+    ('placeholder', 'unchanged'),
+})
+
+
+def _placement_normalization_raw_spec_bytes(row: Mapping[str, Any],
+                                            prefix: str) -> bytes:
+    raw_spec = row[f'{prefix}_spec']
+    if isinstance(raw_spec, memoryview):
+        raw_spec = raw_spec.tobytes()
+    if not isinstance(raw_spec, bytes):
+        raise RuntimeError(
+            f'Placement normalization {prefix} persisted spec is not bytes.')
+    return raw_spec
+
+
+def _validate_raw_explicit_placement_contract(
+    row: Mapping[str, Any],
+    prefix: str,
+    *,
+    require_cleanup_contract: bool,
+) -> None:
+    """Require DB bytes to encode an allowed version without repair."""
+    raw_spec = _placement_normalization_raw_spec_bytes(row, prefix)
+    analysis = placement_contract_normalization.analyze_spec_pickle(raw_spec)
+    allowed: tuple[Any, ...]
+    if require_cleanup_contract:
+        allowed = (placement_contract_normalization.Classification.EXPLICIT_V2,)
+        expected = 'explicit mirror-free v2 placement contract'
+    else:
+        allowed = (
+            placement_contract_normalization.Classification.FIELDLESS_SUPPORTED,
+            placement_contract_normalization.Classification.EXPLICIT_V1,
+            placement_contract_normalization.Classification.EXPLICIT_V2,
+            placement_contract_normalization.Classification.
+            HISTORICAL_PHYSICAL_PER_GPU,
+        )
+        expected = 'supported fieldless/v1/v2/historical placement contract'
+    if analysis.classification not in allowed:
+        detail = (analysis.blocker_reason if analysis.blocker_reason is not None
+                  else analysis.classification.value)
+        raise RuntimeError(
+            f'Placement normalization {prefix} raw persisted spec is not an '
+            f'{expected}: {detail}.')
+
+
+def _placement_normalization_receipt_query(
+    service_name: str,
+    recovery_version: int,
+    current_version: int,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    *,
+    require_ledger: bool,
+) -> sqlalchemy.Select:
+    """Build one owner/version snapshot with both raw-ledger proofs."""
+    expected_pid, expected_ip = expected_controller_owner
+    recovery_row = version_specs_table.alias(
+        'placement_normalization_recovery_version')
+    current_row = version_specs_table.alias(
+        'placement_normalization_current_version')
+    recovery_ledger = placement_normalization_rows_table.alias(
+        'placement_normalization_recovery_ledger')
+    current_ledger = placement_normalization_rows_table.alias(
+        'placement_normalization_current_ledger')
+    requested_run = placement_normalization_runs_table.alias(
+        'placement_normalization_requested_run')
+    source = services_table.join(
+        recovery_row,
+        sqlalchemy.and_(
+            recovery_row.c.service_name == services_table.c.name,
+            recovery_row.c.version == recovery_version,
+            recovery_row.c.yaml_content.isnot(None),
+            recovery_row.c.retired_at.is_(None),
+            recovery_row.c.quarantined_at.is_(None),
+        )).join(
+            current_row,
+            sqlalchemy.and_(
+                current_row.c.service_name == services_table.c.name,
+                current_row.c.version == current_version,
+                current_row.c.yaml_content.isnot(None),
+                current_row.c.retired_at.is_(None),
+            )).outerjoin(
+                requested_run, requested_run.c.run_id ==
+                services_table.c.placement_normalization_requested_run_id)
+    ledger_join = source.join if require_ledger else source.outerjoin
+    source = ledger_join(
+        recovery_ledger,
+        sqlalchemy.and_(
+            recovery_ledger.c.run_id ==
+            services_table.c.placement_normalization_requested_run_id,
+            recovery_ledger.c.service_name == services_table.c.name,
+            recovery_ledger.c.version == recovery_version,
+        ))
+    ledger_join = source.join if require_ledger else source.outerjoin
+    source = ledger_join(
+        current_ledger,
+        sqlalchemy.and_(
+            current_ledger.c.run_id ==
+            services_table.c.placement_normalization_requested_run_id,
+            current_ledger.c.service_name == services_table.c.name,
+            current_ledger.c.version == current_version,
+        ))
+    return sqlalchemy.select(
+        services_table.c.lifecycle_epoch.label('lifecycle_epoch'),
+        services_table.c.placement_normalization_requested_run_id.label(
+            'requested_run_id'),
+        services_table.c.placement_normalization_loaded_run_id.label(
+            'loaded_run_id'),
+        services_table.c.placement_normalization_loaded_image_commit.label(
+            'loaded_image_commit'),
+        services_table.c.placement_normalization_loaded_controller_pid.label(
+            'loaded_controller_pid'),
+        services_table.c.placement_normalization_loaded_controller_ip.label(
+            'loaded_controller_ip'),
+        services_table.c.placement_normalization_loaded_boot_id.label(
+            'loaded_boot_id'),
+        services_table.c.placement_normalization_loaded_at.label('loaded_at'),
+        requested_run.c.run_id.label('manifest_run_id'),
+        requested_run.c.mode.label('manifest_mode'),
+        requested_run.c.normalizer_version.label('manifest_normalizer_version'),
+        requested_run.c.schema_revision.label('manifest_schema_revision'),
+        requested_run.c.release_version.label('manifest_release_version'),
+        requested_run.c.started_at.label('manifest_started_at'),
+        requested_run.c.completed_at.label('manifest_completed_at'),
+        requested_run.c.row_bound.label('manifest_row_bound'),
+        requested_run.c.row_count.label('manifest_row_count'),
+        requested_run.c.classification_counts.label(
+            'manifest_classification_counts'),
+        requested_run.c.pre_inventory_sha256.label(
+            'manifest_pre_inventory_sha256'),
+        requested_run.c.post_inventory_sha256.label(
+            'manifest_post_inventory_sha256'),
+        requested_run.c.freeze_evidence_sha256.label(
+            'manifest_freeze_evidence_sha256'),
+        recovery_row.c.spec.label('recovery_spec'),
+        recovery_row.c.created_at.label('recovery_created_at'),
+        recovery_ledger.c.classification.label('recovery_classification'),
+        recovery_ledger.c.outcome.label('recovery_outcome'),
+        recovery_ledger.c.result_spec_sha256.label(
+            'recovery_result_spec_sha256'),
+        recovery_ledger.c.service_hash.label('recovery_service_hash'),
+        recovery_ledger.c.service_lifecycle_epoch.label(
+            'recovery_service_lifecycle_epoch'),
+        current_row.c.spec.label('current_spec'),
+        current_row.c.created_at.label('current_created_at'),
+        current_ledger.c.classification.label('current_classification'),
+        current_ledger.c.outcome.label('current_outcome'),
+        current_ledger.c.result_spec_sha256.label('current_result_spec_sha256'),
+        current_ledger.c.service_hash.label('current_service_hash'),
+        current_ledger.c.service_lifecycle_epoch.label(
+            'current_service_lifecycle_epoch'),
+    ).select_from(source).where(
+        services_table.c.name == service_name,
+        services_table.c.hash == expected_service_hash,
+        services_table.c.controller_pid == expected_pid,
+        services_table.c.controller_ip == expected_ip,
+        services_table.c.current_version == current_version,
+    )
+
+
+def _validate_placement_normalization_run_manifest(
+        row: Mapping[str, Any], requested_run_id: uuid.UUID) -> float:
+    """Validate the bounded metadata for a requested completed run."""
+    if row['manifest_run_id'] != requested_run_id:
+        raise RuntimeError('Placement normalization requested run manifest '
+                           'is missing or belongs to another generation.')
+    if row['manifest_mode'] not in ('apply_supported',
+                                    'retire_terminal_historical'):
+        raise RuntimeError('Placement normalization requested run manifest '
+                           'has an invalid mode.')
+    if (not isinstance(row['manifest_normalizer_version'], str) or
+            not row['manifest_normalizer_version'] or
+            not isinstance(row['manifest_release_version'], str) or
+            not row['manifest_release_version'] or
+            row['manifest_schema_revision'] != '037'):
+        raise RuntimeError('Placement normalization requested run manifest '
+                           'has invalid release identity.')
+    started_at = row['manifest_started_at']
+    completed_at = row['manifest_completed_at']
+    if (isinstance(started_at, bool) or not isinstance(started_at,
+                                                       (int, float)) or
+            not math.isfinite(float(started_at)) or started_at < 0 or
+            isinstance(completed_at, bool) or
+            not isinstance(completed_at, (int, float)) or
+            not math.isfinite(float(completed_at)) or
+            completed_at < started_at):
+        raise RuntimeError('Placement normalization requested run manifest '
+                           'has invalid completion timestamps.')
+    row_bound = row['manifest_row_bound']
+    row_count = row['manifest_row_count']
+    if (type(row_bound) is not int or type(row_count) is not int or
+            not 0 <= row_count <= row_bound):
+        raise RuntimeError('Placement normalization requested run manifest '
+                           'has invalid inventory bounds.')
+    classification_counts = row['manifest_classification_counts']
+    if (not isinstance(classification_counts, dict) or
+            any(not isinstance(name, str) or not name or
+                type(count) is not int or count < 0
+                for name, count in classification_counts.items()) or
+            sum(classification_counts.values()) != row_count):
+        raise RuntimeError('Placement normalization requested run manifest '
+                           'has invalid classification counts.')
+    for field in ('pre_inventory_sha256', 'post_inventory_sha256',
+                  'freeze_evidence_sha256'):
+        digest = row[f'manifest_{field}']
+        if (not isinstance(digest, str) or
+                re.fullmatch(r'[0-9a-f]{64}', digest) is None):
+            raise RuntimeError('Placement normalization requested run '
+                               f'manifest has an invalid {field} digest.')
+    return float(completed_at)
+
+
+def _validate_placement_normalization_ledger_result(
+    row: Mapping[str, Any],
+    prefix: str,
+    expected_service_hash: str,
+) -> None:
+    """Validate immutable result bytes and service incarnation in a ledger."""
+    classification = row[f'{prefix}_classification']
+    outcome = row[f'{prefix}_outcome']
+    if (classification, outcome) not in _LOADABLE_NORMALIZATION_LEDGER_OUTCOMES:
+        raise RuntimeError(
+            f'Placement normalization {prefix} ledger row is absent or does '
+            'not prove a loadable explicit contract result.')
+    result_digest = row[f'{prefix}_result_spec_sha256']
+    if (not isinstance(result_digest, str) or
+            re.fullmatch(r'[0-9a-f]{64}', result_digest) is None):
+        raise RuntimeError(
+            f'Placement normalization {prefix} ledger result digest is '
+            'invalid.')
+    raw_spec = _placement_normalization_raw_spec_bytes(row, prefix)
+    if hashlib.sha256(raw_spec).hexdigest() != result_digest:
+        raise RuntimeError(
+            f'Placement normalization {prefix} persisted spec does not match '
+            'its requested-run result digest.')
+    _validate_placement_normalization_ledger_service_incarnation(
+        row, prefix, expected_service_hash)
+
+
+def _validate_placement_normalization_ledger_service_incarnation(
+    row: Mapping[str, Any],
+    prefix: str,
+    expected_service_hash: str,
+) -> None:
+    """Bind one inventoried identity to the current service incarnation."""
+    if row[f'{prefix}_service_hash'] != expected_service_hash:
+        raise RuntimeError(
+            f'Placement normalization {prefix} ledger service incarnation '
+            'does not match the current service.')
+
+
+def _validate_placement_normalization_pending_ledger_proof(
+    row: Mapping[str, Any],
+    prefix: str,
+    expected_service_hash: str,
+    lifecycle_epoch: int | None,
+) -> None:
+    """Validate a pending load against its exact normalization generation."""
+    _validate_placement_normalization_ledger_result(row, prefix,
+                                                    expected_service_hash)
+    if row[f'{prefix}_service_lifecycle_epoch'] != lifecycle_epoch:
+        raise RuntimeError(
+            f'Placement normalization {prefix} ledger lifecycle epoch does '
+            'not match the current service.')
+
+
+def _validate_placement_normalization_completed_ledger_result(
+    row: Mapping[str, Any],
+    prefix: str,
+    expected_service_hash: str,
+    manifest_completed_at: float,
+) -> None:
+    """Validate immutable inventoried bytes after the receipt is complete."""
+    classification = row[f'{prefix}_classification']
+    outcome = row[f'{prefix}_outcome']
+    ledger_outcome = (classification, outcome)
+    if classification is None:
+        created_at = row[f'{prefix}_created_at']
+        if (isinstance(created_at, bool) or
+                not isinstance(created_at, (int, float)) or
+                not math.isfinite(float(created_at)) or
+                created_at <= manifest_completed_at):
+            raise RuntimeError(
+                f'Placement normalization {prefix} version predates the '
+                'requested run completion but has no ledger inventory row.')
+        # A version created after the completed run is an ordinary later
+        # version and need not appear in the old inventory.
+        return
+    if ledger_outcome in _FILLABLE_NORMALIZATION_LEDGER_OUTCOMES:
+        # A placeholder had no contract to load.  Filling it through the
+        # v2-only version writer is an ordinary later commit, but the old
+        # inventory identity must still belong to this service incarnation.
+        _validate_placement_normalization_ledger_service_incarnation(
+            row, prefix, expected_service_hash)
+        return
+    _validate_placement_normalization_ledger_result(row, prefix,
+                                                    expected_service_hash)
+
+
+def _validate_placement_normalization_loaded_receipt(
+        row: Mapping[str, Any], requested_run_id: uuid.UUID | None) -> None:
+    loaded_values = (
+        row['loaded_run_id'],
+        row['loaded_image_commit'],
+        row['loaded_controller_pid'],
+        row['loaded_controller_ip'],
+        row['loaded_boot_id'],
+        row['loaded_at'],
+    )
+    loaded_run_id = loaded_values[0]
+    if requested_run_id is None:
+        if any(value is not None for value in loaded_values):
+            raise RuntimeError('Placement normalization receipt exists '
+                               'without a requested run.')
+        return
+    if loaded_run_id is None:
+        if any(value is not None for value in loaded_values[1:]):
+            raise RuntimeError('Placement normalization loaded receipt is '
+                               'only partially populated.')
+        return
+    loaded_commit, loaded_pid, loaded_ip, loaded_boot_id, loaded_at = (
+        loaded_values[1:])
+    if loaded_run_id != requested_run_id:
+        raise RuntimeError('Placement normalization loaded receipt does not '
+                           'match the requested run.')
+    if not isinstance(loaded_commit, str) or not loaded_commit:
+        raise RuntimeError('Placement normalization loaded receipt has no '
+                           'image commit.')
+    if type(loaded_pid) is not int or loaded_pid < 1:
+        raise RuntimeError('Placement normalization loaded receipt has an '
+                           'invalid controller PID.')
+    if loaded_ip is not None and (not isinstance(loaded_ip, str) or
+                                  not loaded_ip):
+        raise RuntimeError('Placement normalization loaded receipt has an '
+                           'invalid controller IP.')
+    if (not isinstance(loaded_boot_id, str) or
+            re.fullmatch(r'[0-9a-f]{32}', loaded_boot_id) is None):
+        raise RuntimeError('Placement normalization loaded receipt has an '
+                           'invalid boot ID.')
+    if (isinstance(loaded_at, bool) or not isinstance(loaded_at,
+                                                      (int, float)) or
+            not math.isfinite(float(loaded_at)) or loaded_at < 0):
+        raise RuntimeError('Placement normalization loaded receipt has an '
+                           'invalid timestamp.')
+
+
+def get_placement_normalization_request(
+    service_name: str,
+    recovery_version: int,
+    current_version: int,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+) -> PlacementNormalizationRequest | None:
+    """Read the normalization generation owned by one exact controller.
+
+    ``None`` means the exact owner/version generation has no requested reload.
+    A requested run is returned only when its per-version ledger proves that
+    both raw persisted specs are explicit loadable results.  A missing proof,
+    ownership change, or version change fails instead of looking like "no
+    request".
+    """
+    if not isinstance(service_name, str) or not service_name:
+        raise ValueError('Service name must be a non-empty string.')
+    if not isinstance(expected_service_hash, str) or not expected_service_hash:
+        raise ValueError('Service hash must be a non-empty string.')
+    if (type(recovery_version) is not int or recovery_version < 1 or
+            type(current_version) is not int or current_version < 1):
+        raise ValueError('Recovery and current versions must be positive '
+                         'integers.')
+    expected_pid, expected_ip = expected_controller_owner
+    if type(expected_pid) is not int or expected_pid < 1:
+        raise ValueError('Controller owner PID must be a positive integer.')
+    if (expected_ip is not None and
+        (not isinstance(expected_ip, str) or not expected_ip)):
+        raise ValueError('Controller owner IP must be a non-empty string or '
+                         'None.')
+
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            _placement_normalization_receipt_query(
+                service_name,
+                recovery_version,
+                current_version,
+                expected_service_hash,
+                expected_controller_owner,
+                require_ledger=False)).mappings().one_or_none()
+    if row is None:
+        raise RuntimeError(
+            'Placement normalization receipt read lost its exact service '
+            'owner, recovery-version, or current-version fence.')
+
+    requested_run_id = row['requested_run_id']
+    if requested_run_id is not None and not isinstance(requested_run_id,
+                                                       uuid.UUID):
+        raise RuntimeError('Placement normalization requested run ID is not '
+                           'a UUID.')
+    lifecycle_epoch = row['lifecycle_epoch']
+    if (lifecycle_epoch is not None and
+        (type(lifecycle_epoch) is not int or lifecycle_epoch < 1)):
+        raise RuntimeError('Service lifecycle epoch is invalid.')
+    require_cleanup_contract = requested_run_id is not None
+    manifest_completed_at: float | None = None
+    if requested_run_id is not None:
+        manifest_completed_at = _validate_placement_normalization_run_manifest(
+            row, requested_run_id)
+    _validate_raw_explicit_placement_contract(
+        row, 'recovery', require_cleanup_contract=require_cleanup_contract)
+    _validate_raw_explicit_placement_contract(
+        row, 'current', require_cleanup_contract=require_cleanup_contract)
+    _validate_placement_normalization_loaded_receipt(row, requested_run_id)
+    if requested_run_id is None:
+        return None
+    # The ledger proves the one forced post-normalization load.  A completed
+    # receipt does not make an inventoried version mutable: when the requested
+    # run still has a row for either loaded version, verify that its exact
+    # bytes still match the result digest.  Later ordinary version commits are
+    # independent of the old run inventory and therefore have no ledger row.
+    if row['loaded_run_id'] == requested_run_id:
+        assert manifest_completed_at is not None
+        for prefix in ('recovery', 'current'):
+            _validate_placement_normalization_completed_ledger_result(
+                row, prefix, expected_service_hash, manifest_completed_at)
+        return None
+    _validate_placement_normalization_pending_ledger_proof(
+        row, 'recovery', expected_service_hash, lifecycle_epoch)
+    _validate_placement_normalization_pending_ledger_proof(
+        row, 'current', expected_service_hash, lifecycle_epoch)
+    return PlacementNormalizationRequest(
+        run_id=requested_run_id,
+        recovery_version=recovery_version,
+        current_version=current_version,
+        lifecycle_epoch=lifecycle_epoch,
+    )
+
+
+def acknowledge_placement_normalization_loaded(
+    service_name: str,
+    request: PlacementNormalizationRequest,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    image_commit: str,
+    child_controller_pid: int,
+    boot_id: str,
+    loaded_at: float | None = None,
+) -> bool:
+    """CAS a controller-load receipt for one still-requested generation."""
+    if not isinstance(request, PlacementNormalizationRequest):
+        raise TypeError('request must be a PlacementNormalizationRequest.')
+    if not isinstance(request.run_id, uuid.UUID):
+        raise ValueError('Requested normalization run ID must be a UUID.')
+    if (type(request.recovery_version) is not int or
+            request.recovery_version < 1 or
+            type(request.current_version) is not int or
+            request.current_version < 1):
+        raise ValueError('Requested recovery and current versions must be '
+                         'positive integers.')
+    if (request.lifecycle_epoch is not None and
+        (type(request.lifecycle_epoch) is not int or
+         request.lifecycle_epoch < 1)):
+        raise ValueError('Requested lifecycle epoch must be a positive '
+                         'integer or None.')
+    if not isinstance(service_name, str) or not service_name:
+        raise ValueError('Service name must be a non-empty string.')
+    if not isinstance(expected_service_hash, str) or not expected_service_hash:
+        raise ValueError('Service hash must be a non-empty string.')
+    expected_pid, expected_ip = expected_controller_owner
+    if type(expected_pid) is not int or expected_pid < 1:
+        raise ValueError('Controller owner PID must be a positive integer.')
+    if (expected_ip is not None and
+        (not isinstance(expected_ip, str) or not expected_ip)):
+        raise ValueError('Controller owner IP must be a non-empty string or '
+                         'None.')
+    if not isinstance(image_commit, str) or not image_commit:
+        raise ValueError('Image commit must be a non-empty string.')
+    if type(child_controller_pid) is not int or child_controller_pid < 1:
+        raise ValueError('Child controller PID must be a positive integer.')
+    if (not isinstance(boot_id, str) or
+            re.fullmatch(r'[0-9a-f]{32}', boot_id) is None):
+        raise ValueError('Controller boot ID must be 32 lowercase hexadecimal '
+                         'characters.')
+    if loaded_at is None:
+        loaded_at = time.time()
+    if (isinstance(loaded_at, bool) or not isinstance(loaded_at,
+                                                      (int, float)) or
+            not math.isfinite(float(loaded_at)) or loaded_at < 0):
+        raise ValueError('Loaded-at timestamp must be a finite nonnegative '
+                         'number.')
+
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
+        _begin_immediate_if_sqlite(session, engine)
+        query = _placement_normalization_receipt_query(
+            service_name,
+            request.recovery_version,
+            request.current_version,
+            expected_service_hash,
+            expected_controller_owner,
+            require_ledger=True).where(
+                services_table.c.placement_normalization_requested_run_id ==
+                request.run_id)
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            query = query.with_for_update()
+        row = session.execute(query).mappings().one_or_none()
+        if row is None or row['lifecycle_epoch'] != request.lifecycle_epoch:
+            session.rollback()
+            return False
+        _validate_raw_explicit_placement_contract(row,
+                                                  'recovery',
+                                                  require_cleanup_contract=True)
+        _validate_raw_explicit_placement_contract(row,
+                                                  'current',
+                                                  require_cleanup_contract=True)
+        _validate_placement_normalization_loaded_receipt(row, request.run_id)
+        _validate_placement_normalization_pending_ledger_proof(
+            row, 'recovery', expected_service_hash, request.lifecycle_epoch)
+        _validate_placement_normalization_pending_ledger_proof(
+            row, 'current', expected_service_hash, request.lifecycle_epoch)
+        predicates = [
+            services_table.c.name == service_name,
+            services_table.c.hash == expected_service_hash,
+            services_table.c.controller_pid == expected_pid,
+            services_table.c.controller_ip == expected_ip,
+            services_table.c.current_version == request.current_version,
+            services_table.c.placement_normalization_requested_run_id ==
+            request.run_id,
+        ]
+        if request.lifecycle_epoch is not None:
+            predicates.append(
+                services_table.c.lifecycle_epoch == request.lifecycle_epoch)
+        result = session.execute(
+            sqlalchemy.update(services_table).where(*predicates).values(
+                placement_normalization_loaded_run_id=request.run_id,
+                placement_normalization_loaded_image_commit=image_commit,
+                placement_normalization_loaded_controller_pid=
+                child_controller_pid,
+                placement_normalization_loaded_controller_ip=expected_ip,
+                placement_normalization_loaded_boot_id=boot_id,
+                placement_normalization_loaded_at=float(loaded_at)))
+        if result.rowcount != 1:
+            session.rollback()
+            return False
+        session.commit()
+    return True
+
+
 def quarantine_version(
     service_name: str,
     version: int,
@@ -5813,9 +6440,10 @@ def get_latest_version(service_name: str) -> int | None:
 def get_latest_committed_version(service_name: str) -> int | None:
     """Returns the latest version whose yaml was fully committed.
 
-    `add_version` inserts a placeholder row (spec=pickle.dumps(None),
-    yaml_content=NULL) and only later does `add_or_update_version` fill in the
-    real spec/yaml. A restart in that window can leave such a placeholder as
+    `add_version` inserts a protocol-4 placeholder row
+    (`spec=pickle.dumps(None, protocol=4)`, `yaml_content=NULL`) and only later
+    does `add_or_update_version` fill in the real spec/yaml. A restart in that
+    window can leave such a placeholder as
     MAX(version). Recovery must skip it and resume the latest version that
     actually has its yaml persisted -- booting a controller at a NULL-yaml
     version crash-loops it (SkyPilotReplicaManager asserts yaml is not None).

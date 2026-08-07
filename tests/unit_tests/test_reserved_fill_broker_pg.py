@@ -47,11 +47,14 @@ from sky import global_user_state
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
+from sky.serve import placement_contract_normalization
 from sky.serve import placement_history
+from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_history
 from sky.serve import serve_state
+from sky.serve import service_spec
 from sky.serve import spot_placer
 from sky.utils import common_utils
 from sky.utils import locks
@@ -83,6 +86,23 @@ pytestmark = pytest.mark.skipif(
     reason='docker unavailable; skipping real-Postgres broker tests')
 if _DOCKER_UNAVAILABLE and _POSTGRES_REQUIRED:
     pytest.fail('Docker is required for Serve PostgreSQL tests.', pytrace=False)
+
+
+def _service_spec(*, pool: bool = False) -> service_spec.SkyServiceSpec:
+    return service_spec.SkyServiceSpec.from_yaml_config({
+        'pool': {},
+        'workers': 1,
+    } if pool else {
+        'replicas': 1,
+    })
+
+
+def _v1_service_spec() -> service_spec.SkyServiceSpec:
+    spec = _service_spec()
+    contract = spec.placement_contract
+    spec.__dict__.update(contract._legacy_v1_persisted_fields())
+    spec.__dict__[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+    return spec
 
 
 @pytest.fixture(scope='session')
@@ -162,6 +182,69 @@ class TestFixtureWiring:
         re-run on sqlite and this module would test nothing new."""
         engine = serve_state._db_manager.get_engine()
         assert engine.dialect.name == 'postgresql'
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestPlacementContractWriteBoundaryPG:
+
+    def test_new_writes_reject_v1_and_store_only_raw_v2(self):
+        with pytest.raises(ValueError, match='mirror-free v2'):
+            serve_state.add_service(name='legacy-registration',
+                                    controller_job_id=1,
+                                    policy='policy',
+                                    requested_resources_str='1x[CPU:1+]',
+                                    load_balancing_policy='round_robin',
+                                    status=serve_state.ServiceStatus.READY,
+                                    tls_encrypted=False,
+                                    pool=False,
+                                    controller_pid=11,
+                                    entrypoint='entry',
+                                    spec=_v1_service_spec(),
+                                    yaml_content='service: {}')
+        engine = serve_state._db_manager.get_engine()
+        with sqlalchemy.orm.Session(engine) as session:
+            assert session.execute(
+                sqlalchemy.select(serve_state.services_table.c.name).where(
+                    serve_state.services_table.c.name ==
+                    'legacy-registration')).first() is None
+
+        assert serve_state.add_service(name='v2-boundary',
+                                       controller_job_id=1,
+                                       policy='policy',
+                                       requested_resources_str='1x[CPU:1+]',
+                                       load_balancing_policy='round_robin',
+                                       status=serve_state.ServiceStatus.READY,
+                                       tls_encrypted=False,
+                                       pool=False,
+                                       controller_pid=11,
+                                       entrypoint='entry',
+                                       spec=_service_spec(),
+                                       yaml_content='service: {}')
+        assert serve_state.add_version('v2-boundary') == 2
+        with pytest.raises(ValueError, match='mirror-free v2'):
+            serve_state.add_or_update_version('v2-boundary', 2,
+                                              _v1_service_spec(),
+                                              'service: {legacy: true}')
+        with sqlalchemy.orm.Session(engine) as session:
+            placeholder = session.execute(
+                sqlalchemy.select(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    'v2-boundary', serve_state.version_specs_table.c.version ==
+                    2)).mappings().one()
+        assert placeholder['yaml_content'] is None
+
+        assert serve_state.add_or_update_version(
+            'v2-boundary', 2, _service_spec(), 'service: {current: true}') is (
+                serve_state.VersionCommitResult.COMMITTED)
+        with sqlalchemy.orm.Session(engine) as session:
+            payload = session.execute(
+                sqlalchemy.select(serve_state.version_specs_table.c.spec).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    'v2-boundary', serve_state.version_specs_table.c.version ==
+                    2)).scalar_one()
+        assert placement_contract_normalization.analyze_spec_pickle(
+            payload).classification is (
+                placement_contract_normalization.Classification.EXPLICIT_V2)
 
 
 class TestSingleClaimantFastPathPG(sqlite_suite.TestSingleClaimantFastPath):
@@ -249,7 +332,7 @@ class TestPaidCapacityAuthorityPG:
                                        pool=False,
                                        controller_pid=pid,
                                        entrypoint='entry',
-                                       spec=None,
+                                       spec=_service_spec(),
                                        yaml_content='service: {}',
                                        controller_ip='10.0.0.1',
                                        service_hash=service_hash,
@@ -2742,7 +2825,7 @@ class TestServiceLivenessSnapshotPG:
                                        pool=False,
                                        controller_pid=11,
                                        entrypoint='entry',
-                                       spec=None,
+                                       spec=_service_spec(),
                                        yaml_content='service: {}',
                                        controller_ip='10.0.0.1',
                                        service_hash='hash-a',
@@ -2757,7 +2840,7 @@ class TestServiceLivenessSnapshotPG:
                                        pool=True,
                                        controller_pid=22,
                                        entrypoint='entry',
-                                       spec=None,
+                                       spec=_service_spec(pool=True),
                                        yaml_content='service: {}')
         with sqlalchemy.orm.Session(broker_engine) as session:
             session.execute(serve_state.services_table.insert().values(
@@ -2794,7 +2877,7 @@ class TestServiceWorkspaceBackfillPG:
                                        pool=False,
                                        controller_pid=11,
                                        entrypoint='entry',
-                                       spec=None,
+                                       spec=_service_spec(),
                                        yaml_content='service: {}',
                                        workspace=None,
                                        service_hash='incarnation-a')
@@ -3467,7 +3550,7 @@ class TestMigrationChainPG:
                 sqlalchemy.Column('lb_last_demand_snapshot', sqlalchemy.Text),
             ])
         services = sqlalchemy.Table('services', metadata, *service_columns)
-        sqlalchemy.Table(
+        versions = sqlalchemy.Table(
             'version_specs', metadata,
             sqlalchemy.Column('service_name', sqlalchemy.Text,
                               primary_key=True),
@@ -3536,6 +3619,11 @@ class TestMigrationChainPG:
         try:
             with engine.begin() as connection:
                 connection.execute(services.insert().values(name='legacy-svc'))
+                connection.execute(versions.insert().values(
+                    service_name='legacy-svc',
+                    version=1,
+                    created_at=1.0,
+                    created_by='legacy-writer'))
                 connection.execute(
                     sqlalchemy.text(
                         'CREATE TABLE alembic_version_serve_state_db '
@@ -3571,6 +3659,7 @@ class TestMigrationChainPG:
                 column['name']
                 for column in inspector.get_columns('version_specs')
             }
+            assert 'yaml_content' in version_columns
             assert 'submitted_yaml_content' in version_columns
             replica_columns = {
                 column['name'] for column in inspector.get_columns('replicas')
@@ -3598,9 +3687,17 @@ class TestMigrationChainPG:
                         'SELECT workspace FROM services WHERE name = :name'), {
                             'name': 'legacy-svc'
                         }).scalar_one()
+                version_row = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT created_at, created_by, yaml_content FROM '
+                        'version_specs WHERE service_name = :name AND '
+                        'version = 1'), {
+                            'name': 'legacy-svc'
+                        }).one()
                 connection.execute(
                     sqlalchemy.select(serve_state.replicas_table).limit(1))
             assert workspace is None
+            assert tuple(version_row) == (1.0, 'legacy-writer', None)
         finally:
             engine.dispose()
 

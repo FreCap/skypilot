@@ -318,6 +318,46 @@ def test_shared_provider_guard_blocks_launch_blocking_status(
     assert not serve_state.service_replica_launch_fence_holds(launch_context)
 
 
+def test_provider_fence_rejects_persisted_service_launch_during_hold(
+        launch_authority_database, monkeypatch):
+    """A request replayed after the maintenance rollout cannot provision."""
+    _ = launch_authority_database
+    launch_context = _launch_context(_SERVICE_NAME, _SERVICE_HASH)
+    assert serve_state.service_replica_launch_fence_holds(launch_context)
+
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+
+    assert not serve_state.service_replica_launch_fence_holds(launch_context)
+
+
+def test_provider_fence_keeps_pool_launches_available_during_hold(
+        launch_authority_database, monkeypatch):
+    engine = launch_authority_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.services_table).where(
+                serve_state.services_table.c.name == _SERVICE_NAME).values(
+                    pool=1))
+    launch_context = _launch_context(_SERVICE_NAME, _SERVICE_HASH)
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+
+    assert serve_state.service_replica_launch_fence_holds(launch_context)
+
+
+def test_provider_fence_rejects_noncanonical_pool_discriminator_during_hold(
+        launch_authority_database, monkeypatch):
+    engine = launch_authority_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.services_table).where(
+                serve_state.services_table.c.name == _SERVICE_NAME).values(
+                    pool=2))
+    launch_context = _launch_context(_SERVICE_NAME, _SERVICE_HASH)
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+
+    assert not serve_state.service_replica_launch_fence_holds(launch_context)
+
+
 def test_shared_provider_guard_blocks_deletion_and_stales_reader(
         launch_authority_database):
     engine = launch_authority_database

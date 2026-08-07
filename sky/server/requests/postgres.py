@@ -66,7 +66,9 @@ _MAX_EXPIRED_CLAIMS_PER_SWEEP = 100
 _ORPHANED_QUIESCENCE_GRACE_SECONDS = 300
 _MAX_ORPHANED_QUIESCENCE_PER_SWEEP = 100
 _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
-_INSTANCE_STALE_AFTER_SECONDS = 20
+# Public because operational safety checks outside the request backend must
+# use the same freshness boundary as the instance registry itself.
+INSTANCE_STALE_AFTER_SECONDS = 20
 _VALID_SERVER_ROLES = frozenset(
     {'all', 'api', 'executor', 'controller', 'authority-worker'})
 _CONTROLLER_LEADERSHIP_KEY = 'api-controller'
@@ -235,7 +237,7 @@ class ServerInstanceLease:
         *,
         heartbeat_interval_seconds: float = (
             _INSTANCE_HEARTBEAT_INTERVAL_SECONDS),
-        stale_after_seconds: float = _INSTANCE_STALE_AFTER_SECONDS,
+        stale_after_seconds: float = INSTANCE_STALE_AFTER_SECONDS,
     ) -> None:
         self.role = _validate_server_role(role)
         self.instance_id = ensure_server_instance_id()
@@ -405,7 +407,7 @@ def current_instance_is_ready() -> bool:
                     SERVER_INSTANCES.c.draining_at.is_(None),
                     SERVER_INSTANCES.c.heartbeat_at
                     >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
-                        seconds=_INSTANCE_STALE_AFTER_SECONDS))).scalar_one())
+                        seconds=INSTANCE_STALE_AFTER_SECONDS))).scalar_one())
 
 
 def recent_legacy_controller_consumers(quiescence_seconds: float) -> list[str]:

@@ -45,6 +45,7 @@ from sky.jobs import state as managed_job_state
 from sky.serve import auth_tokens
 from sky.serve import constants
 from sky.serve import controller_transport
+from sky.serve import maintenance
 from sky.serve import provider_phase
 from sky.serve import request_aggregator
 from sky.serve import serve_state
@@ -926,6 +927,11 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             means the caller has no revocable leadership concept (e.g. a
             single-pod filelock deployment).
     """
+    if not pool and maintenance.is_controller_hold_active():
+        logger.warning('Skipping SkyServe controller HA recovery while the '
+                       'server deployment hold is active.')
+        return
+
     # No setup recovery is needed in consolidation mode, as the API server
     # already has all runtime installed. Directly start jobs recovery here.
     # Refers to sky/templates/kubernetes-ray.yml.j2 for more details.
@@ -4683,6 +4689,10 @@ def _terminate_orphaned_service_children_impl(
 
 def terminate_services(service_names: list[str] | None, purge: bool,
                        pool: bool) -> str:
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe termination and purge are disabled while the server '
+            'controller hold is active.')
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     requested_service_names = service_names

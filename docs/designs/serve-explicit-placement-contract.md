@@ -1,12 +1,16 @@
 # SkyServe explicit placement contract
 
 _Status: transition PR #1318 is merged, released as v1.1.1135, and deployed to
-production as Helm revision 351.  Draft cleanup PR #1319's implementation
-passed 30/30 checks but remains blocked on the measured removal gates and is
-not approved to merge or deploy.  Platform pin PR #8090 was closed because
-this SkyPilot control-plane release is deployed directly with Helm.  The first
-production verification passed; the cleanup observation and inventory gates
-remain open. Created 2026-08-07; last updated 2026-08-07._
+production as Helm revision 351.  A normalization release is in progress to
+replace every fieldless or explicit-v1 PostgreSQL contract with the sole
+mirror-free v2 representation and to retire only conclusively terminal
+transition-only contracts.  Draft cleanup PR
+#1319's implementation passed 30/30 checks but remains blocked on the measured
+removal gates and is not approved to merge or deploy.  Platform pin PR #8090
+was closed because this SkyPilot control-plane release is deployed directly
+with Helm.  The first production verification passed; normalization, the
+cleanup observation window, and retained-artifact inventory remain open.
+Created 2026-08-07; last updated 2026-08-07._
 
 ## Decision summary
 
@@ -33,6 +37,23 @@ remain physical, with historical whole-GPU catalog and per-GPU price ordering,
 for the transition window only.  The stacked cleanup deletes that tuple and
 rejects its artifacts after the durable-state and client-version gates prove
 none remain.
+
+The normalization release makes that durable-state gate achievable without a
+new service version.  An operator-only PostgreSQL normalizer replaces each
+valid fieldless public contract and each valid explicit-v1 contract with the
+exact mirror-free explicit-v2 contract already understood by v1.1.1135.  New
+writes from the normalization release are v2-only.  The normalizer preserves
+the raw non-placement state and every service-version identity and runtime
+semantic while removing the transition rollback mirror.  The transition-only
+physical/per-GPU tuple is never relabeled as a public contract.  It is moved
+to an explicit non-electable retired state only
+when a strictly newer committed version exists and a dependency-complete
+locked proof shows that the old version can never be selected, routed,
+recovered, retried, or own a replica.  Retirement moves compiled YAML to a
+history-only column, clears the committed-YAML marker, and replaces only the
+legacy pickle with `pickle(None)`; the version row and recovery/cleanup
+evidence remain.  Every normalization or retirement is digest-CASed and
+recorded in a durable run ledger without retaining the legacy pickle.
 
 This design is the placement-policy subdesign of
 `docs/designs/skyserve-accelerator-compatibility.md`.  Its centralized catalog
@@ -75,6 +96,14 @@ pickles must remain restartable.
 - Remove unused default-policy registration and subclass capability tests.
 - Define exact gates for deleting legacy policy adapters and old persisted
   fields instead of leaving open-ended compatibility code.
+- Remove valid fieldless and explicit-v1 placement contracts from
+  authoritative PostgreSQL by normalizing them to explicit v2 without
+  changing YAML, version identity, replica units, logical fences, catalogs,
+  controller configuration, or runtime behavior.
+- Make v2 the sole writable and controller-loadable post-normalization
+  representation; a completed receipt can never bless fieldless or v1 bytes.
+- Retire the transition-only historical tuple only with an auditable,
+  fail-closed proof that the exact service version is terminal.
 
 ## Non-goals
 
@@ -86,8 +115,13 @@ pickles must remain restartable.
 - Reinterpreting pool `min_workers` or `max_workers` as logical GPU slots.
 - Removing request-rate, instance-aware QPS, or on-demand fallback autoscalers.
   Those are separate public contracts and need independent deprecation data.
-- Migrating a service during controller restart, exact-YAML retry, or an
-  unrelated update.
+- Changing a service version, replica unit, task YAML, or placement policy as
+  part of persistence normalization.  Ordinary controller restart,
+  exact-YAML retry, and unrelated update paths remain non-migrating.
+- Treating SQLite as a central/API-server normalization target.  The live
+  authoritative migration and its correctness proof are PostgreSQL-only.
+- Repairing, guessing, quarantining, or retiring a partial, malformed,
+  undecodable, or unknown contract.
 - Changing provider pricing, catalog contents, reservation ownership, paid
   launch authority, or scale-to-zero policy.
 
@@ -105,14 +139,16 @@ are equivalent and select no placement engine:
 | `dynamic_fallback_per_gpu` | new service | dynamic fallback | logical GPU slot | whole-GPU shapes | GPU-slot-hour | exactly one GPU/backend |
 
 One historical state is not constructible from new YAML.  The transition
-reader preserves it until the removal gates pass:
+reader preserves it until normalization either proves and records terminal
+retirement or reports it as a cleanup blocker:
 
 | Persisted state | Workload | Engine | Replica unit | Catalog | Cost order | Reserved fill |
 |---|---|---|---|---|---|---|
 | per-GPU policy without the logical marker | service | dynamic fallback | physical backend | whole-GPU shapes | GPU-slot-hour | exactly one GPU/backend |
 
 The cleanup reader rejects this historical tuple as well as every other tuple
-outside the public table above.  In particular, a pool cannot use
+outside the public table above.  The normalizer never converts it to the
+nearby logical public tuple.  In particular, a pool cannot use
 `dynamic_fallback_per_gpu`, a logical contract cannot name a pool, and the
 historical physical/per-GPU tuple is accepted only by compatibility decoding,
 not by fresh YAML or an override, during the transition window.  Historical
@@ -155,9 +191,13 @@ service-level logical semantics fence are committed in the same
 version-publication transaction.
 
 `SkyServiceSpec.__setstate__()` is a compatibility decoder/materializer, not a
-durable migration: it never rewrites or backfills committed pickle bytes.
-Exact retries continue to read the original authoritative version artifact.
-Its precedence rules are strict:
+durable migration: ordinary reads never rewrite or backfill committed pickle
+bytes.  The operator-only normalizer is the sole byte-rewrite boundary and
+uses the same resolver through an explicit raw-state interface described
+below.  New objects and intentional new-version serializations write v2;
+exact retries continue to read and acknowledge the authoritative normalized
+artifact without rewriting it.
+The decoder's precedence rules are strict:
 
 1. If all seven contract fields are absent, derive the contract from the
    persisted policy name, containing workload kind, and historical marker;
@@ -167,24 +207,37 @@ Its precedence rules are strict:
 2. If `_placement_contract_version == 1`, all other six fields and the
    rollback mirror are required.  Validate their exact tuple, require the
    workload kind to match the containing service/pool object, and require the
-   mirror to agree with the replica unit.  The transition reader also accepts
-   the historical physical/per-GPU tuple; the cleanup reader accepts only the
-   five public tuples and rejects that removed tuple.  A known public name
-   cannot disagree with retained contract fields.
+   mirror to agree with the replica unit.  The transition and normalization
+   compatibility readers accept the five public tuples plus the historical
+   physical/per-GPU tuple; the cleanup reader rejects v1 entirely.  A known
+   public name cannot disagree with retained contract fields.
 3. If `_placement_contract_version == 2`, all other six fields are required
    and the rollback mirror must be absent.  Validate the five public tuples and
-   policy-name/workload match.  The cleanup exposes a zero-argument,
-   v2-only `persisted_fields()` writer and `SkyServiceSpec.__getstate__()`
-   projects every encodable v1 artifact to v2 without mutating the source.
-   New service and version database writes use this serialization boundary;
+   policy-name/workload match.  The normalization release exposes a
+   zero-argument, v2-only `persisted_fields()` writer.  During compatibility
+   decode, `SkyServiceSpec.__setstate__()` projects supported fieldless/v1
+   input to v2 in memory; `SkyServiceSpec.__getstate__()` accepts exact v2
+   only and rejects a fieldless, v1, mirrored, or historical object.  New
+   service and version database writes use this serialization boundary;
    exact retries of an already committed row remain acknowledgement-only and
    byte preserving.  The transition reader accepts valid v2 state so the
-   cleanup release is rollback-compatible, but the transition writer emits
-   only v1.
+   normalization and cleanup releases are rollback-readable.  The transition
+   release emitted v1; the normalization release and every later writer emit
+   only v2.
 4. A partial field set, boolean masquerading as a version, unknown version,
    unknown value, invalid tuple, workload mismatch, forbidden/missing mirror,
    or v1 mirror disagreement is malformed current state and fails loudly.  It
    never falls back to legacy derivation.
+
+During the normalization release only, successful compatibility decoding of a
+supported fieldless or v1 artifact projects the in-memory object to v2 and
+removes the mirror; it does not rewrite the authoritative row.  The sole
+historical tuple remains transition-only in memory so it can be identified,
+copied by recovery code without applying newer validation, and retired.  That
+token-gated copy retains explicit v1 plus the false rollback mirror, while
+`__getstate__()` and every central write guard reject it.  Thus no
+ordinary current runtime object or new write carries a legacy public contract,
+while the raw operator path remains able to inventory old bytes exactly.
 
 Fresh pool input treats any mapping, including `{}`, as an explicit pool.
 Before a transition object is persisted, it canonicalizes that pool driver to
@@ -201,9 +254,257 @@ mapping and reject `True`, `{}`, or another representation as malformed rather
 than silently repairing it.  A fieldless legacy `{}` remains a service under
 rule 1 and is materialized as `_pool=False` in memory.
 
-The rollback mirror is written only for the transition compatibility window.
-Runtime policy reads the resolved contract and the monotonic service-level
-logical fence, not the mirror.
+The rollback mirror was written only by the transition release.  Runtime
+policy reads the resolved contract and the monotonic service-level logical
+fence, not the mirror.  Normalization removes every persisted mirror as part
+of v1-to-v2 conversion; no post-normalization write may recreate one.
+
+### PostgreSQL normalization and retirement ledger
+
+Schema revision 037 adds durable normalization-run and row-inventory ledgers;
+the version retirement columns; and a per-service requested/loaded
+normalization generation, but does not rewrite data at API startup.  A
+separately invoked module defaults to dry-run and requires an explicit,
+mutually exclusive `--apply-supported` or
+`--retire-terminal-historical` mode.  It is available only in a server process
+connected to PostgreSQL and never runs from a client or controller-local
+SQLite database.  Supported-row normalization and historical retirement are
+separate transactions and approvals: a known nonterminal historical tuple
+blocks cleanup and retirement but does not prevent safe public-row
+normalization.
+
+The normalizer uses a restricted top-level pickle projection: a custom
+`pickle.Unpickler.find_class()` maps only the exact
+`sky.serve.service_spec.SkyServiceSpec` global to a state-capture proxy while
+all other globals retain normal trusted-database decoding.  The proxy requires
+one mapping state and never calls `SkyServiceSpec.__setstate__()`.  Protocols
+4 and 5 are accepted; another top-level class, a qualified-class alias, a
+duplicate/nested service spec, or a non-mapping state is a blocker.  A shared
+`materialize_legacy_placement_contract_state()` compatibility interface
+resolves the same tuple for the ordinary decoder and normalizer; only the
+normalizer is allowed to persist its canonical v2 projection.
+Before changing state, the projection pickler must reproduce the complete
+source bytes exactly at the source protocol; any difference means a nested
+compatibility hook or nondeterministic reducer changed unrelated state and the
+row is a blocker.
+The result is serialized as an exact protocol-4 `SkyServiceSpec` reduce/state
+projection without running a class `__getstate__()`.  Key order and every
+nested object/value outside the allowed top-level keys are retained.  The
+normalizer classifies each row exactly once:
+
+- a pickled `None` placeholder remains byte-for-byte unchanged because it is no
+  contract;
+- an explicit, valid v2 public contract remains byte-for-byte unchanged;
+- a valid fieldless or explicit-v1 public tuple is rewritten to the same seven
+  v2 fields, explicit policy/pool representation, and no rollback mirror;
+- the exact fieldless or explicit-v1 historical physical/per-GPU tuple is
+  reported unchanged by supported-row normalization and is eligible only in
+  the separate terminal-retirement mode; and
+- partial fields, an unknown tuple/version/value, a class-path failure, an
+  undecodable payload, or any other object blocks the entire apply before the
+  first mutation.
+
+For every non-placeholder, non-retired version with a live `services` parent,
+the raw contract workload kind must also match the parent's exact integer
+`pool` discriminator (`0` for service, `1` for pool).  Invalid parent values or
+cross-row disagreement are blockers rather than truthiness fallbacks.  Before a
+normalization receipt is requested, both its current and quarantine-aware
+recovery rows must also agree with the parent's monotonic
+`logical_replica_semantics` fence.  This prevents a representation rewrite from
+requesting a controller reload that the durable parent fence would reject.
+
+Either apply mode is refused above an explicit dry-run row bound.  At
+`SERIALIZABLE` isolation it sets bounded PostgreSQL lock/statement timeouts,
+then acquires one transaction-scoped, process-global placement-normalizer
+advisory lock followed by
+`SHARE ROW EXCLUSIVE` table locks in this fixed order: `services`,
+`version_specs`, `replicas`, and `ephemeral_storage_cleanup_intents`.  This
+blocks all ordinary row writers while leaving status reads available.  The
+operator separately freezes Serve up/update/down requests and proves there is
+no pending retry before lock acquisition.  Apply also requires a Recreate API
+deployment, the current non-empty pod UID and `all` server role, and exactly
+one fresh API-server registry row in total.  That sole row must be ready,
+non-draining, and carry the current pod UID and server instance ID; filtering
+out a fresh draining or not-ready predecessor before counting is forbidden.  An
+operator-supplied freeze digest is recorded separately and never substitutes
+for these in-process proofs.  Apply rescans under the locks and commits all row
+changes, service generation fences, one run manifest, and one inventory entry
+for every scanned row in a single transaction.  Every update includes the
+original bytes in its compare-and-swap predicate.
+
+Historical retirement additionally uses a bounded `psutil` scan before lock
+acquisition, again under the locks, and after the cross-database postflight.
+It recognizes exact service-parent commands and the exact controller title
+`sky.serve.controller --service-name NAME --service-incarnation HASH`, where
+`setproctitle` exposes the title as the first command-line string rather than
+tokenized argv.  The title is set before controller construction.  Target
+service parents or controllers, malformed matching commands/titles, access
+errors, an over-limit scan, or a changing canonical process digest block the
+operation; disappeared processes and zombies are the only ignored races.  The
+digest binds the schema version, pod UID, sorted target service identities,
+and sorted PID/PPID/create-time/status/identity facts.  Preflight, locked, and
+postflight scans must all be empty for target processes and byte-identical.
+Retirement is available only in non-pool Serve consolidation mode, where every
+service controller is local to that sole API pod, and while the explicit
+non-pool controller hold is active.  A separate plain-column global-state scan
+must find zero cluster records under the complete
+`sky-serve-controller-` prefix, including names from older server identities.
+The typed global-state boundary applies the prefix, ordering, and `limit + 1`
+overflow check in SQL, so unrelated cluster history is never loaded and an
+over-limit namespace fails closed; stale or terminal records still block.  Its
+sorted record digest, the
+consolidation premise, the exact non-pool parent discriminator, the hold, and
+the local-process proof are retained in every retirement ledger entry.
+
+The run manifest records a UUID, normalizer/schema/release versions, start and
+completion time, pre/post canonical fleet-inventory digests, the bounded row
+count, every classification count, and the operator-supplied freeze evidence
+digest.  Each scanned-row entry records its classification, original/result
+SHA-256, changed/retired outcome, exact contract projection, and exact service
+hash/lifecycle and dependency facts.  No original pickle, YAML, controller
+configuration, or task secret is copied into either ledger.  A concurrent
+writer, changed preimage, missing row-inventory entry, incomplete manifest,
+ledger collision, or timeout aborts the whole transaction.  Rerunning after
+success must report zero pending fieldless/v1 changes and verify the completed
+manifest, every surviving v2 result digest, every intentional retirement, and
+all new rows.  The latest completed full-run manifest must cover the exact
+current `(service_name, version)` identity set; a later v2 or placeholder row
+is an explicit `untracked_current_row` mismatch until a new zero-change apply
+records it.  Spec-drift comparison uses the latest result for the exact
+`(service_name, version, service_hash, lifecycle_epoch)` owner generation and
+does not compare unrelated mutable status columns.
+
+For a supported fieldless or v1 tuple, the result pickle is a real
+`SkyServiceSpec`.  Its raw top-level mapping differs only by the explicit
+policy/pool keys, seven placement keys, and removal of the rollback mirror. The
+protocol-4 bytes of the ordered tuple of all unaffected `(key, value)` pairs
+must match before normalization and after raw-state recapture; this preserves
+key order, nested values, and aliases across unaffected keys.  The version
+number, YAML and submitted YAML,
+placement catalog, controller configuration, quarantine data, creation
+provenance, service logical fence, election pointers, active versions, and
+replica rows are not mutated.
+
+For the historical tuple, retirement atomically copies `yaml_content` to
+`retired_yaml_content`, sets `yaml_content` to SQL NULL, replaces `spec` with
+the protocol-4 bytes for `pickle(None)`, and records `retired_at`, reason, and
+run UUID.  It retains submitted YAML, provenance, placement catalog,
+controller configuration, quarantine data, and the version row.  Current and
+v1.1.1135 election/recovery/launch queries require non-NULL `yaml_content`, so
+neither binary can treat the retired row as committed.  The current
+exact-commit path also rejects `retired_at`; v1.1.1135 rejects a stale refill
+because retirement requires a strictly newer committed version.  A
+schema CHECK makes the retirement representation all-or-none: a non-NULL
+`retired_at` requires NULL `yaml_content`, non-NULL `retired_yaml_content`,
+reason, and run UUID, while a live row must have all retirement fields NULL.
+
+Retirement is allowed only when the dependency-complete predicate proves all
+of the following under the writer locks, regardless of service status or hash:
+a live `services` row exists because the offline v1.1.1135 compatibility proof
+and retained history both rely on the same-name version high-water mark; a
+strictly newer committed version exists;
+`services.current_version` is strictly greater; the version is not active; it
+owns no exact-version replica row, and the service owns no replica whose
+version is NULL or otherwise unknown; its own `quarantined_at` is NULL; it has
+no non-quarantined
+controller-applied receipt; it is not selected by the exact quarantine-aware
+recovery expression; and no bridge,
+catalog activation, in-progress retry, controller-config recovery, or cleanup
+record depends on it.  The container-image catalog must report zero exact
+service-version demands in `WARMING`, `READY`, or `FAILED` across every
+incarnation hash and target-scoped derivative; that cross-database
+snapshot is taken before and after the locked Serve transaction while requests
+are frozen.  Missing, hash-mismatched, and terminal services do not bypass
+those checks.  The same bounded pre/locked/post protocol requires zero exact
+`ProviderLaunchContentSourceV1` roots for the candidate `(service_name,
+version)` in either `api_resource_actions.immutable_spec` or
+`serve_resource_action_shadow_samples.immutable_spec`.  Both complete bounded
+stores are scanned.  Every Serve candidate is parsed through the typed
+`ServeReplicaActionSpecV1` decoder and checked against its outer indexed
+identity; a corrupted outer domain/type/name cannot hide a typed Serve root,
+while valid non-Serve API actions remain out of scope.  Each checkpoint digest
+binds the complete validated root-store snapshot, not only matching rows.  A
+malformed possibly matching row, scan overflow, nonzero root count, or changed
+   full-store digest blocks.  Shadow retention may delete a completed
+   represented root without creating an API-action root, so retirement does not
+   assume universal root retention.  Instead the candidate's live parent must
+   have the exact inert `resource_action_mode='legacy'` default and NULL mode
+   transition timestamp under the service-table writer lock.  Shadow admission
+   requires `shadow`, authoritative admission requires its separate activated
+   path, and the held consolidated controller plus zero legacy-controller
+   inventory closes the old writer path.  Thus retention may remove a root (and
+   a changed complete-store digest blocks), but no authority can create or
+   recreate a target root during the three-checkpoint proof.
+The proof deliberately treats retained terminal roots as dependencies rather
+than trying to infer that no down action, attempt, request, coverage, or shadow
+reference can still reach them.  The exact YAML cleanup projection must
+contain no legacy file/storage ownership that v1.1.1135 could strand.  New
+cleanup inventory
+reads both committed and `retired_yaml_content`, so the history-only YAML
+remains available after rollback support advances; the orphan-child-mode
+accessor uses the same history-only fallback instead of interpreting
+`pickle(None)` plus NULL live YAML as an unknown child mode.  If the versioned
+controller-configuration protocol is active for any row of the service, the
+strictly newer elected/recovery successor must carry and validate a complete
+`controller_config`, `controller_config_digest`, and
+`controller_config_snapshot_id` tuple before the historical row is eligible.
+The ledger retains all pre/post column and payload digests and the terminal
+proof, but none of the legacy pickle bytes.
+
+Normalization is semantic persistence maintenance, not a service update, and
+does not satisfy the separate production scale-to-zero YAML contract.  Apply
+sets an affected live service's requested normalization run UUID and clears
+its loaded receipt.  Before any run is requested, the deployed normalization
+reader must still start a valid supported fieldless, v1, or historical service
+so the no-rewrite Helm rollout is behavior preserving; malformed and
+placeholder selected rows fail.  Once a run is requested, every startup
+verifies from raw persisted bytes that the recovery and current live specs are
+explicit v2 and mirror-free.  A pending receipt also verifies the exact
+completed-ledger result digest, then owner-fenced CASes that same UUID into its
+durable loaded receipt with its image commit, PID/IP, boot identifier, and
+timestamp.  On later boots, an inventoried loadable row still binds its exact
+result digest and service incarnation, but not the old lifecycle-operation
+epoch: an ordinary later lifecycle lock may advance that epoch without
+changing the immutable version.  The requested UUID must still resolve to a
+well-formed completed-run manifest.  A version absent from that run is accepted
+as a later ordinary version only when its immutable `created_at` is strictly
+after the manifest's `completed_at`; an absent inventory row for a version that
+already existed when the run completed is corruption and fails closed.  A
+manifested pickled-`None` placeholder may subsequently be filled through the
+v2-only central writer: the completed check still binds that inventory
+identity to the same service incarnation, but does not compare the obsolete
+placeholder digest or lifecycle epoch.  Both cases remain subject to raw v2
+validation; any other inventoried non-loadable outcome rejects.  Pending
+acknowledgement remains exact-epoch fenced.
+Supported-row normalization may run while controllers serve because it does
+not change decoded semantics.  Historical retirement may run only after the
+Helm value `serve.controllerHold=true` has restarted the sole Recreate API pod
+with the exact `SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD=true` recovery hold,
+every controller for the affected service has been terminated, and the locked
+freeze proof shows
+no pending, applying, staged-config, retry, or locally cached mutation can
+publish.  The hold is cleared only after retirement commits; fresh
+controllers then load the successor and owner-fenced receipt.  This process
+quiescence is part of the retirement predicate rather than operator prose.
+The same explicit hold participates in the fresh database authorization at
+both admission and the terminal provider boundary: an already-persisted
+non-pool replica-launch request replayed after the Recreate restart cannot
+provision while maintenance is active.  Pool launch authorization remains
+available only when the current parent row's raw discriminator is exactly the
+integer `pool == 1`; truthy malformed values fail closed.
+All requested/loaded UUIDs and new-boot receipts must converge before the
+zero-change dry-run and legacy-event observation clock start.
+
+The cleanup release adds a pre-controller bootstrap guard: before any Serve
+controller recovery is spawned, it verifies a completed manifest, scans the
+authoritative rows with the cleanup decoder, and requires zero fieldless, v1,
+historical, malformed, or ledger-mismatched state.  A restore/import that lacks
+that proof leaves controller spawning disabled.  The restore chart/runbook must
+first deploy the normalization release or a newer v2 writer with the explicit
+controller-hold flag, run normalization, and clear the hold only after
+requested/loaded receipts
+converge.  Any later legacy decode, restore, or import invalidates the clean
+generation and resets the observation clock.
 
 The public `spot_placer` string remains in serialized task YAML.  The seven
 internal fields live only in the internal persisted `SkyServiceSpec` object;
@@ -248,13 +549,19 @@ validate and reconstruct from their primitive fields under the precedence
 rules above.  Impossible combinations fail at this boundary.  They never fall
 through to a nearby policy.
 
-The contract is immutable for a committed `(service_name, version)`.  In the
-transition, a copy that overrides neither `spot_placer` nor `pool` carries the
-exact contract forward.  In cleanup, every encodable v1 copy writes v2 and a
-historical tuple is rejected during decode.  An explicit policy or
-workload-kind override resolves a fresh contract and goes through ordinary
-validation.  The public constructor cannot accept a resolved contract; only a
-token-gated internal copy path may preserve a supported tuple.
+The contract semantics are immutable for a committed
+`(service_name, version)`.  The normalization boundary may replace only a
+fieldless or explicit-v1 encoding with its exact v2 encoding; it cannot change
+the resolved tuple.  A supported public copy that overrides neither
+`spot_placer` nor `pool` carries the exact contract forward and serializes it
+as v2.  The sole historical tuple may be copied only through the token-gated
+internal compatibility path and remains non-serializable v1 state.  After the
+cleanup gates, a historical, fieldless, or v1 tuple is rejected during decode.
+An explicit
+policy or workload-kind override resolves a fresh contract and goes through
+ordinary validation.  The public constructor cannot accept a resolved
+contract; only a token-gated internal copy path may preserve a supported
+tuple.
 
 Every consumer uses the typed access point: `SpotPlacer.validate_task()` and
 `build_catalog()` receive it before an engine exists; placer construction and
@@ -312,7 +619,10 @@ and prior warm replicas and claims have drained.
 
 ## Invariants
 
-1. A committed version never changes replica units during restart or retry.
+1. A committed version never changes contract semantics or replica units.
+   Digest-CASed fieldless/v1-to-v2 normalization is the sole permitted
+   in-place encoding rewrite and preserves its version identity and complete
+   raw non-placement state.
 2. A public policy name is resolved once; runtime consumers do not infer
    capabilities from strings, subclasses, or missing attributes.
 3. Catalog expansion, price normalization, and reserved-fill shape are
@@ -324,17 +634,38 @@ and prior warm replicas and claims have drained.
    authoritative fence.  Version publication, retry, recovery, and
    out-of-order commits compare the resolved contract to it; pickle fields can
    never clear or override it.
+   Normalization validates the current and recovery contract projections
+   against this fence before requesting a controller reload.
 6. Logical-to-physical recovery/update and logical blue-green update remain
    rejected.
 7. Pool counts remain physical and cannot select a logical contract.
+   Every live parent/version pair must also agree on exact pool versus service
+   identity; retirement is restricted to exact non-pool parents.
 8. A missing or malformed current contract fails loudly.  Compatibility
    defaults exist only in the persistence decoder.
 9. Zero-cost supply, reconciliation targets, and paid launch authority remain
    separate typed signals.  A placement refactor cannot broaden paid authority.
-10. A rollback to the immediately preceding server release can read specs
-   written by the transition release with their old logical marker intact.
+10. v1.1.1135 is an offline v2-read compatibility artifact, not a deployable
+    post-normalization rollback: it writes v1 and has no controller-hold gate.
+    The normalization release is the minimum post-apply server image.  Before
+    apply, rolling back to v1.1.1135 remains safe; after apply it is forbidden.
 11. A fresh pool persists a non-empty rollback-readable `_pool` mapping;
     fieldless `_pool={}` retains the preceding reader's service meaning.
+12. Normalization and retirement never delete or reuse a version number.
+    Historical retirement requires a strictly newer committed successor and
+    retains the old history row with NULL committed YAML, so the service's
+    `MAX(version)` and next-version identity do not change.
+13. A historical tuple with a current/active pointer, replica row,
+    non-quarantined applied receipt, or other recovery dependency is never
+    retired; one such row aborts only the separate retirement phase.
+14. Every scanned row has an inventory entry, every changed/retired row has
+    matching preimage/result evidence and exact incarnation/lifecycle proof,
+    and the run manifest covers the canonical fleet digest.  A partial ledger,
+    postimage mismatch, or incomplete controller-load receipt fails closed.
+15. The current serializer and both central version-write boundaries accept
+    only the exact `SkyServiceSpec` base type with explicit v2, mirror-free
+    state; subclass reducers cannot bypass the boundary.  The raw normalizer is
+    the sole bypass.
 
 ## Implementation and PR stack
 
@@ -356,26 +687,50 @@ The transition is behavior preserving for every row in the contract tables.
 It may merge and deploy while legacy state exists.
 
 PR #1318 merged as `95e0b41b15ad56598e06ef9cb08297815a65f662`
-and was released as v1.1.1135.  Its control-plane deployment remains a
-separate reviewed Platform change.
+and was released as v1.1.1135.  Its control plane was deployed directly with
+the reviewed Helm upgrade; no boltz-platform PR is part of this release path.
+
+### Normalization PR and release
+
+The normalization change adds revision 037's run/inventory ledgers and durable
+controller-load receipts, an explicit raw-state classifier/materializer, and
+the dry-run/two-phase apply operator command.  It does not run a pickle data
+migration during Alembic/API startup.  The release is deployed through Helm
+with the transition reader still present.  The operator then freezes Serve
+version mutations, proves an all-green bounded dry-run, applies supported
+normalization, separately reproves and retires any terminal historical row,
+restarts affected controllers, and proves receipt convergence and an
+idempotent zero-change rerun.  An exact offline v1.1.1135 artifact must read
+every normalized v2 public tuple and reject election of the retired historical
+fixture before production apply.  Because that release can write v1 and lacks
+the controller hold, it must never be deployed after apply; the normalization
+release is the minimum server rollback floor.
+
+Production baseline inventory found 155 valid fieldless public contracts,
+seven pickled-`None` placeholders, and one fieldless transition-only
+physical/per-GPU contract.  The historical row is eligible only if the
+production apply independently reproves its terminal state under lock; these
+counts are evidence, not hard-coded migration input.
 
 ### Blocked cleanup PR [#1319](https://github.com/boltz-bio/skypilot/pull/1319)
 
-The stacked cleanup removes the all-versioned-fields-absent decoder, the
-historical physical/per-GPU tuple, and dead compatibility machinery only after
-inventory proves that no fieldless physical or logical artifact and no
-historical tuple remains.  Pre-transition pickles are immutable and block this
-removal.  It writes contract v2 without a rollback mirror while continuing to
-read the five supported v1 tuples; existing immutable v1 pickle bytes are never
-rewritten in place.  Because the transition reader already accepts v2, rolling
-back one release remains safe.  It deliberately retains the public
+The stacked cleanup removes the all-versioned-fields-absent decoder, the v1
+decoder and rollback mirror, the historical physical/per-GPU tuple, and dead
+compatibility machinery only after inventory proves that no fieldless, v1, or
+historical contract remains in any authoritative or recoverable artifact.  A
+fieldless or v1 row not covered by a complete, digest-verified normalization
+ledger blocks this removal.  It writes and reads only mirror-free v2.  A
+restore of older state must run the normalization release with controller hold
+before cleanup code may recover controllers.  It deliberately retains the public
 `dynamic_fallback` physical preset required by pools.  Public policy removal is
 a separate breaking design/PR.  Keep this cleanup draft or otherwise blocked;
 do not merge it merely because no old replicas are currently READY.
 
-Transition PR #1318 and draft cleanup PR #1319 form gh-stack #1320.  Both link
-this design; the cleanup PR states the exact merge gate below and remains
-blocked until its evidence is attached.
+Transition PR #1318 and draft cleanup PR #1319 originated as gh-stack #1320.
+The cleanup branch must be rebased on the merged normalization release and
+retain its draft/blocked status.  All three changes link this design; the
+cleanup PR states the exact merge gate below and remains blocked until its
+evidence is attached.
 
 ## Compatibility, rollout, and rollback
 
@@ -397,21 +752,57 @@ blocked until its evidence is attached.
    launch authority.  Roll back on contract decode/fence failure, controller
    health failure, service commit/apply divergence, new quarantine, endpoint or
    LB identity change, replica loss, or new unauthorized paid launch.
-5. Migrate eligible physical GPU services only through an explicit rolling
+5. Deploy the normalization release with no automatic data rewrite.  Freeze
+   Serve up/update/down mutations, run the PostgreSQL dry-run, and require
+   exact expected classifications, zero malformed/unknown/blocking rows, an
+   inventory row count below the configured bound, exact freeze-evidence
+   digest, and exact v1.1.1135 rollback-read/stale-retry proof.  Apply
+   supported normalization only at `SERIALIZABLE` isolation with the
+   fixed-order bounded writer locks.  Verify its postimages, then enable the
+   Serve-controller recovery hold with `serve.controllerHold=true` and
+   terminate every affected controller.
+   Reprove that no controller process, pending/applying update, staged-config
+   publication, retry, recovery launch, or replayed persisted provider request
+   remains before invoking the separate historical retirement mode.  Verify
+   directly that the provider-boundary fence rejects a known-valid non-pool
+   launch context under the hold.  That mode must reprove its complete
+   dependency matrix under a new transaction and explicit approval.  Any
+   digest CAS miss, unknown state, missing inventory entry, or timeout rolls
+   back that complete phase; a known nonterminal historical tuple leaves
+   normalization committed but retirement blocked.  Keep the hold active
+   throughout this transaction.
+6. Clear the recovery hold and start each affected live controller under the
+   normalization release's transition-compatible decoder.  Verify
+   committed/elected/applied convergence, active versions, endpoint and LB
+   identity, replica inventory, paid launch authority, and zero decode/fence
+   errors.  Rerun the normalizer in dry-run mode and require zero changes plus
+   complete run/inventory/postimage verification and requested/loaded
+   generation receipts for every affected controller.  Start the zero-event
+   clock only after this final reload and query.
+7. Migrate eligible physical GPU services only through an explicit rolling
    update.  Require every old replica to drain and the logical bridge to
    converge before counting a service as migrated.
-6. Roll back the control plane by restoring the prior reviewed image/chart pin,
-   without a database rollback because all persistence changes are additive.
-   The dual-written logical marker preserves old-server interpretation.  A
-   service update created by the new release remains explicit YAML and does not
-   depend on a new implicit default.
-7. Cross-release proof is bidirectional and uses the exact preceding and
-   transition release artifacts/interpreters: previous writes -> transition
-   reads; transition writes -> previous reads, copies or updates, and
-   reserializes -> transition rereads; and previous writes during rollback ->
-   transition roll-forward reads.  Replica unit, YAML, catalog, reserved-fill
-   mode and shape validation, and fence must remain identical.  Same-binary
-   missing-field tests are insufficient.
+8. The normalization release is the minimum post-apply server-image rollback
+   floor.  Its v2 serializer and central write guards prevent reintroduction.
+   v1.1.1135 remains an offline read fixture only and must not be deployed
+   against the post-apply database because it can write v1 and has no
+   controller hold.  Before apply, the ordinary Helm rollback to v1.1.1135 is
+   still available.  After apply, roll back chart/config changes while pinning
+   the normalization-or-newer image, or restore the pre-apply database backup
+   before deploying v1.1.1135.  Normalized rows are mirror-free v2.
+   Historical retirement is intentionally irreversible in the live database:
+   the retained history row and strictly newer committed row preserve the
+   version high-water mark, while NULL committed YAML makes the retired row
+   invisible to old and new election/recovery readers and stale commit retries
+   fail against that successor.  Restore from a pre-apply backup is permitted
+   only through a runbook that deploys the normalization reader/writer with the
+   controller hold active and normalizes before controllers resume.  No older
+   binary may perform partial-restore orphan cleanup against a retired row.
+9. Cross-release proof uses the exact v1.1.1135 and normalization artifacts:
+   v1 writes -> normalization reads and normalizes; normalization v2 writes ->
+   offline v1.1.1135 read only; and v2 writer copy/reserialize -> v2 reread.
+   Tests do not bless a v2-to-v1 round trip.  Replica unit, YAML, catalog,
+   reserved-fill mode and shape validation, and fence remain identical.
 
 No production `serve update` may use a canonical spec that violates the Boltz
 scale-to-zero contract.  Control-plane deployment and service-policy
@@ -421,22 +812,32 @@ deployment are separate approvals and rollback units.
 
 The blocked cleanup may merge only when all are true:
 
-- Central PostgreSQL, every authoritative supported controller/local database,
-  and retained snapshot/backup/rollback-artifact inventory report no live or
-  recoverable all-versioned-fields-absent service spec (physical or logical),
-  historical physical/per-GPU contract, or removed qualified class reference.
-- No active bridge, cleanup record, retryable version, placement catalog, or
-  replica row depends on that version.
+- Central PostgreSQL and every authoritative supported controller/local
+  database report no live all-versioned-fields-absent or v1 service spec
+  (physical or logical), historical physical/per-GPU contract, or removed
+  qualified class reference.  A retained snapshot/backup containing such state
+  is classified as non-directly-recoverable and must be covered by the tested
+  hold-and-normalize-before-resume restore runbook below.
+- The PostgreSQL run manifest and row inventory cover the exact current row
+  identity set and the point-in-time canonical fleet digest; every current spec
+  matches the latest result-spec digest for its exact owner generation.  Every
+  terminal retirement includes the locked dependency proof and retired-row
+  digests; requested/loaded controller receipts converge; and a post-reload
+  dry-run reports zero pending changes, zero blockers, and zero ledger
+  mismatches.  Later mutable status/catalog columns do not invalidate an
+  immutable spec proof.
+- No bridge, cleanup record, retryable version, placement catalog, replica row,
+  resource-action root, or shadow root depends on that version.
 - All eligible GPU services have committed/applied logical versions, no
   quarantined version, and zero remaining physical replicas from migration.
 - Pools and intentionally physical services are either still supported by the
   physical preset or have completed a separately designed migration.
 - The release/CI-managed minimum compatible API version and the minimum
-  supported server, controller, and rollback image all include the transition
-  contract reader.  Pre-transition rollback images are explicitly forbidden
-  once v2 writes begin.
+  supported server, controller, and rollback image all write v2 and include
+  the clean-generation guard.  v1-writer images are explicitly forbidden once
+  supported normalization apply commits.
 - At least two consecutive production releases and 30 continuous days after
-  full transition deployment show zero legacy-decoder events and zero
+  the final normalization/reload show zero legacy-decoder events and zero
   contract/fence mismatch or mixed-version recovery errors.  Structured
   controller/API logs for
   `event=skyserve_placement_contract_decode` with
@@ -446,6 +847,12 @@ The blocked cleanup may merge only when all are true:
   maintainer and Platform on-call attach the zero-use query, all database and
   artifact inventories, release identities, and rollback drill evidence to
   the cleanup PR.
+- Every retained backup/snapshot has expired or is covered by a tested
+  transition-reader-first, normalize-before-controller-resume restore runbook.
+- The cleanup pre-controller bootstrap guard fails closed without a current
+  clean manifest/generation; the transition restore chart's controller-hold
+  mechanism is tested, and any restore/import or legacy decode durably resets
+  that generation and the zero-event observation clock.
 - The exact transition release has passed production validation for the
   generation-aware and typed paid-authority fixes tracked in the parent design.
 
@@ -466,8 +873,33 @@ Automated coverage must prove:
   marker; cleanup fixtures contain v2 and no marker; partial fields, unknown
   versions/values, invalid tuples, public-policy mismatch, and
   forbidden/missing/mismatched mirrors fail loudly;
-- an unmodified copy retains the exact contract, while an explicit policy or
-  `pool` override resolves and validates a new contract;
+- the raw-state classifier distinguishes pickled-`None`, every supported
+  fieldless public tuple, explicit v1/v2, the sole historical tuple, partial
+  state, unknown class references, undecodable bytes, and non-spec objects
+  without invoking the ordinary compatibility materializer;
+- an exact source-protocol raw projection reproduces every eligible source
+  pickle byte-for-byte before mutation; nested compatibility materialization,
+  nondeterministic reduction, or another unrelated round-trip difference
+  blocks normalization;
+- fieldless normalization changes only explicit policy/pool representation and
+  the seven placement fields; v1 normalization changes only the contract
+  version and removes the rollback mirror.  All unrelated raw state keys and
+  values, YAML columns, catalogs, controller configuration, service
+  fences/pointers, and replica rows remain identical;
+- real-PostgreSQL apply is all-or-nothing at `SERIALIZABLE` isolation under
+  fixed-order table locks and CAS races, enforces its row bound/timeouts, is
+  restart-safe, verifies its run/fleet/row/postimage digests, preserves the
+  version high-water mark through a newer successor, and reports zero pending
+  fieldless/v1 changes on an idempotent rerun;
+- the terminal-retirement matrix covers current, active, replica-owning,
+  applied non-quarantined, quarantined, superseded, missing-service,
+  terminal-service, bridge/catalog/retry/cleanup-dependent, and concurrent
+  update/down/recreate cases; only conclusively terminal historical tuples
+  with a strictly newer committed successor are retired;
+- an unmodified supported copy retains the exact contract as v2, while the
+  historical copy retains its exact contract only in memory and cannot
+  serialize; an explicit policy or `pool` override resolves and validates a
+  new contract;
 - configured and whole-GPU catalogs contain the same candidates as before;
 - machine-hour and GPU-slot-hour ordering match the previous implementations;
 - the one engine preserves zero-cost preference, bench transitions, targeted
@@ -478,17 +910,38 @@ Automated coverage must prove:
   concrete-class, replica-unit, or catalog-mode inference;
 - golden spec/task YAML serialization contains no hidden contract fields, and
   the existing status/API path continues to carry only rendered task YAML;
-- exact-release previous/new client-server and bidirectional pickle
-  write/read/copy/reserialize behavior is unchanged, with no removed qualified
-  class reference;
+- exact-release transition/normalization client-server behavior preserves
+  semantics, with no removed qualified class reference;
+- an exact offline v1.1.1135 binary reads every normalized v2 public tuple with
+  unchanged replica, catalog, cost, fill, and workload semantics and does not
+  elect a retired historical fixture; no post-apply v2-to-v1 write path is
+  supported or tested as valid;
 - fresh `pool: {}` plus `workers: N` persists and serializes exactly as
   `{'workers': N}`; the exact preceding release reads the same pool kind, size,
   and policy, its rollback reserialization round-trips through the transition
   reader unchanged, while a real fieldless legacy `_pool={}` remains a service;
-- v1-to-v2 and v2-to-v1 read/copy/reserialize rollback paths preserve exact
-  semantics for every v2-encodable v1 tuple; a frozen exact-transition
-  historical physical/per-GPU v1 artifact is rejected by cleanup, and a class
-  shim fixture (when required) never recreates a second engine;
+- every supported v1 and fieldless tuple normalizes to v2, and every supported
+  current copy/reserialization remains v2; a frozen exact-transition
+  historical physical/per-GPU v1 artifact survives only an in-memory copy,
+  fails serialization, and is retired or rejected, while a class shim fixture
+  (when required) never recreates a second engine;
+- every fresh serializer and central version-write boundary rejects fieldless,
+  v1, mirrored, or historical state, while exact retries preserve existing v2
+  bytes and the raw normalizer remains the only in-place rewrite bypass;
+- a non-pool replica request persisted before the controller-hold rollout is
+  rejected by the fresh execution/provider-boundary authority check after the
+  API pod restarts, while an exact current `pool == 1` parent remains
+  launchable and a malformed truthy discriminator is rejected;
+- every controller boot validates raw persisted v2/mirror-free bytes; pending
+  receipts also bind the exact completed-ledger result digest, and later byte
+  substitution fails even after a previously completed receipt;
+- historical retirement proves a sole fresh Recreate API pod and stable empty
+  target-process evidence before, under, and after locks, including the
+  single-string `setproctitle` representation and fail-closed malformed/access/
+  overflow cases;
+- bounded typed resource-action and shadow scans block every exact candidate
+  source root, including retained terminal roots, malformed possible matches,
+  overflow, and pre/locked/post evidence drift;
 - the public constructor and an invalid internal-copy token cannot inject the
   decode-only historical physical/per-GPU tuple;
 - the monotonic service-level logical fence rejects mismatch under
@@ -542,15 +995,52 @@ zero-cost reserved-capacity tests remain fail closed.
 - Frozen protocol-4 artifacts produced by the exact transition commit
   `aee3da9e0910d597dc33f31ee964497ced58b78c` cover both a supported logical
   per-GPU v1 contract and the removed historical physical/per-GPU v1 tuple.
-  Cleanup accepts and upgrades the former and rejects the latter.  The raw
-  SHA-256 digests are respectively
+  The normalization release accepts and upgrades the former; it leaves the
+  latter unchanged for the separate terminal-retirement protocol.  Rebased
+  cleanup accepts neither v1 artifact and rejects both.  The raw SHA-256
+  digests are respectively
   `a4c549ae75412dcff8917d29f892284745040b9a503b38f70d7cea1686acd05a`
   and `3e912f262e1498d28891d27565f7c0720a429feb1b8131887adb40d13ce2ed28`.
-- Every one of the five supported v1 public tuples passes cleanup read, copy,
-  protocol-4 reserialization, YAML-equivalence, source-nonmutation, and
-  v2-without-mirror checks.  Exact cross-worktree rollback testing passed all
-  five tuples through cleanup v2 -> transition commit `aee3da9e0` read/copy to
-  v1 -> cleanup reread/rewrite to v2.
+- An earlier cleanup prototype proved that all five supported v1 tuples retain
+  semantics when projected to mirror-free v2.  Its cross-worktree
+  v2 -> transition-read/copy -> v1 result also proves why v1.1.1135 cannot be
+  deployed after normalization.  The revised normalizer covers v1-to-v2; the
+  revised cleanup must reject v1 and rerun its full CI evidence.
+- The normalization implementation's exact mirror-free v2 serializers were
+  read successfully by an unmodified, clean v1.1.1135 worktree under Python
+  3.14.3.  Five fixtures covered service/pool without a placement engine,
+  physical dynamic service/pool, and logical per-GPU service; their SHA-256
+  digests were respectively
+  `8ec4bf9413b83151543a38044538f7b95f619cfe0ffe954b3b88e5b3ffeb7834`,
+  `16a6f9c75527e820f4a0fbbecd72907b608345f2305395fd3554ea6df55503d7`,
+  `4d09f45fb61066aed7283351a55b30743fdf5e87ab5811ca999473a0ca411da3`,
+  `8a12777f3e704bfe032a57c6ba9edc05512bd70b89aea9268c8b34538fed6a39`,
+  and
+  `5cc7c1dbd5ebe9ce135f472e0a3bdd934c47e2adec614ebf6df3fbe528c54726`.
+  Contract fields and rendered YAML were identical and none of the artifacts
+  contained the rollback mirror.
+- The same v1.1.1135 artifact was bound read-only to a real PostgreSQL
+  schema-037 fixture containing a retired v1 row and committed v2 successor.
+  Every committed/applicable/recovery/liveness/HA/launch selection chose the
+  v2 successor, the retired row materialized as terminal with `spec=None` and
+  no YAML, an actual stale `add_or_update_version()` returned
+  `STALE_VERSION` without changing any retired bytes or metadata, and the next
+  allocation preserved the high-water mark by allocating version 3.
+- Adversarial review of the exact schema-037 migration and retirement code
+  returned GO after the global controller-cluster inventory was changed to a
+  bounded SQL prefix query.  The review covered additive PostgreSQL schema,
+  foreign keys and checks, serializable locks and CAS, exact manifests,
+  NULL/orphan replica blocking, parent pool/logical/resource-mode fences, and
+  tamper-resistant retirement ledgers.
+- After the final fence hardening, the placement normalization, schema-037,
+  resource-action schema/store, bounded cluster-prefix, and broad Serve state,
+  controller, respawn, service, implementation, utility, glob, schema-contract,
+  and daemon unit suites all exited zero against local PostgreSQL.  Targeted
+  mypy over the new normalization/schema/placement modules, pylint over the
+  changed source, Helm lint, the 120-case modified deployment chart suite, and
+  `git diff --check` also passed.  Docker-backed PostgreSQL suites could not
+  start on this host because it has no Docker socket and remain mandatory in
+  CI; no SQLite substitute was used.
 - The affected Serve unit suite passes except for four AWS catalog tests whose
   only failure is the operator's expired SSO session; no login was initiated.
   Cleanup contract, persistence, controller retry/recovery, service daemon,
@@ -600,6 +1090,24 @@ zero-cost reserved-capacity tests remain fail closed.
   is expected transition-reader behavior for the pre-transition version-58
   artifact, but it directly proves that cleanup cannot remove the legacy
   reader or begin its zero-event observation window.
+- The pre-normalization PostgreSQL inventory classified 163 version payloads:
+  seven are pickled-`None` placeholders, 156 are valid fieldless contracts,
+  and none is partial, malformed, undecodable, or a removed-class reference.
+  Of the valid fieldless rows, 155 resolve to supported public tuples.  The
+  remaining `boltz-l4-fleet-test` version 2 resolves to the exact
+  transition-only physical/per-GPU tuple and was observed as non-current,
+  non-active, non-applied, replica-free, catalog-free, and without a matching
+  container-image demand or file/storage cleanup payload.  A versioned
+  controller configuration snapshot is retained, but the exact recovery
+  expression does not select it because version 51 is the strictly newer
+  committed successor.  This is baseline evidence only; the apply must
+  reprove terminality under its writer lock and frozen cross-database checks.
+- At 2026-08-07 18:35:52--18:36:02 UTC, production remained healthy at
+  v1.1.1135 with `boltz-l4-fleet` current/elected/committed/applied version 58,
+  active versions `[58]`, stable HA LB slot `a`, and the unchanged endpoint.
+  All 55 READY replicas belonged to version 58; the preceding 15 minutes had
+  zero requests, in-flight work, queued work, or rejections.  This read-only
+  snapshot authorizes no capacity launch and is not normalization evidence.
 
 Credentialed provider catalog coverage and zero-cost production smoke evidence
 remain open gates.  This is only the first transition production release, and
@@ -624,6 +1132,18 @@ removal gate are not yet attached.
    the service-level monotonic fence and exact version choice.
 6. Restore the transition release and confirm version convergence, endpoint
    continuity, absence of quarantine, and unchanged paid launch authority.
+7. With Serve mutations frozen, run the normalization dry-run against a copied
+   production PostgreSQL database.  Require exact classifications and no
+   blockers, then inject malformed, CAS-racing, active, applied, replica-owning,
+   and recovery-dependent historical rows and prove the complete apply aborts.
+8. Prove normalized v2 fixtures with the exact v1.1.1135 artifact in an offline
+   read-only harness, and prove the normalization release is v2-only across
+   fresh writes, copies, retries, controller boots, and central write paths.
+   Deploy the normalization release through Helm, repeat the dry-run, apply the
+   bounded transactions, restart affected controllers, and require a
+   zero-change ledger-verifying dry-run plus unchanged versions, endpoint/LB,
+   replica inventory, and paid-authority state.  Verify Helm rollback remains
+   available before apply and that post-apply runbooks forbid a v1-writer image.
 
 ## Open gates
 
@@ -635,13 +1155,16 @@ removal gate are not yet attached.
   open because it has not been rerun after the operator refreshed SSO for this
   deployment.
 - Production control-plane v1.1.1135 is deployed directly through Helm; closed
-  Platform PR #8090 is not part of the release path.  Rollback revision 350 and
-  its exact v1.1.1116 image were captured but a rollback drill remains open.
+  Platform PR #8090 is not part of the release path.  The existing revision-350
+  rollback is available only before normalization apply.  A post-apply rollback
+  artifact must be the normalization release or newer and still needs a drill.
 - A second consecutive production release, the retained 45-day log sink, exact
   zero-event query, and 30 continuous qualifying days remain required.
 - The Boltz fleet's canonical service YAML currently keeps warm capacity; its
   separate scale-to-zero policy must be reviewed, deployed/applied, converged,
   and drained before any service update can claim scale-to-zero compliance.
 - Service version 58 still materializes the legacy logical contract.  Its
-  separately approved migration and the legacy durable-state inventory across
-  every retained copy remain required before the zero-event window can start.
+  approved in-place normalization, controller reload, zero-change ledger
+  verification, and legacy durable-state inventory across every retained copy
+  remain required before the zero-event window can start.  The one historical
+  test-service tuple separately requires locked terminal-retirement proof.

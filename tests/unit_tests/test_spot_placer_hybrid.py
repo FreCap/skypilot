@@ -1323,7 +1323,7 @@ run: echo hi
         legacy_state = dict(task.service.__dict__)
         for field in placement_policy.CONTRACT_FIELDS:
             legacy_state.pop(field)
-        legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+        legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
         legacy = service_spec_lib.SkyServiceSpec.__new__(
             service_spec_lib.SkyServiceSpec)
         legacy.__setstate__(legacy_state)

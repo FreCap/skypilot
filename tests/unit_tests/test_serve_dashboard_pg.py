@@ -19,6 +19,7 @@ def dashboard_database(postgres_engine, monkeypatch):
     serve_state.Base.metadata.create_all(
         postgres_engine,
         tables=[
+            serve_state.placement_normalization_runs_table,
             serve_state.services_table,
             serve_state.replicas_table,
             serve_state.version_specs_table,
