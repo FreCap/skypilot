@@ -1,4 +1,53 @@
-schema_version: 1
+schema_version: 2
+removal_bundles:
+- id: serve.resource_action.contracts.022-025
+  members:
+  - PLA-M5-022
+  - PLA-M5-023
+  - PLA-M5-024
+  - PLA-M5-025
+  retained_locators:
+  - kind: path
+    path: docs/designs/durable-serve-replica-actions.md
+  - kind: path
+    path: docs/designs/provider-lifecycle-actuation.md
+  - kind: path
+    path: docs/designs/skyserve-resource-action-provider-facet.md
+  required_feature_merge: null
+  rollout_contract:
+  - id: exact_m4_post_authority_window
+    artifacts:
+    - M4
+    minimum_duration_hours: 24
+    minimum_launches: 100
+    minimum_downs: 100
+    requirements:
+    - Run the exact M4 artifact with durable Serve authority promoted for the qualified cohort.
+    - Preserve one unpromoted eligible legacy control and one excluded legacy-service control.
+    - Observe zero legacy mutation routes, unresolved crash intents, stale claims, duplicate effects, divergences, or blockers.
+  - id: exact_m5a_rollback_reupgrade
+    artifacts:
+    - M5a
+    - M4
+    - M5a
+    minimum_duration_hours: 0
+    minimum_launches: 0
+    minimum_downs: 0
+    requirements:
+    - Perform an application-binary-only rollback from exact M5a to the exact feature-aware M4 artifact under the same active successor policy, then re-upgrade to exact M5a.
+    - Keep the service authoritative; retain Serve039, policy/cohort/lease/action state, and zero eligible legacy admission or mutation throughout.
+    - Prove durable actions, attempts, claims, policy epochs, and registration handoffs survive the sequence.
+  - id: exact_m5a_steady_state_window
+    artifacts:
+    - M5a
+    minimum_duration_hours: 24
+    minimum_launches: 100
+    minimum_downs: 100
+    requirements:
+    - Run the exact M5a artifact after re-upgrade for the complete fixed observation window.
+    - Preserve the legacy controls while proving the qualified cohort cannot reach any bundled path or produce any stale claim, divergence, or blocker.
+    - Record exact image digests, merge SHAs, PostgreSQL evidence, telemetry queries, and test results.
+  evidence: {}
 coverage_gaps:
 - id: PLA-GAP-001
   milestone: M4
@@ -16490,10 +16539,9 @@ artifacts:
     operation: replica_request_cancellation
   runtime_affecting: true
   locators:
-  - kind: python_call_within
+  - kind: python_ast_pattern
     path: sky/serve/replica_managers.py
-    symbol: SkyPilotReplicaManager._terminate_replica
-    call: sdk.api_cancel
+    pattern: sdk.api_cancel(request_id)
   replacement: M5 durable Serve action cancellation runtime
   dependencies: []
   status: present
@@ -16537,10 +16585,9 @@ artifacts:
     operation: replica_request_cancellation
   runtime_affecting: true
   locators:
-  - kind: python_call_within
+  - kind: python_ast_pattern
     path: sky/serve/replica_managers.py
-    symbol: SkyPilotReplicaManager._terminate_replica
-    call: sdk.api_cancel
+    pattern: sdk.api_cancel(request_id)
   replacement: Dialect-capable durable Serve cancellation runtime or product deprecation
   dependencies: []
   status: present
@@ -16584,10 +16631,9 @@ artifacts:
     operation: replica_request_cancellation
   runtime_affecting: true
   locators:
-  - kind: python_call_within
+  - kind: python_ast_pattern
     path: sky/serve/replica_managers.py
-    symbol: SkyPilotReplicaManager._terminate_replica
-    call: sdk.api_cancel
+    pattern: sdk.api_cancel(request_id)
   replacement: Dialect-capable durable Serve cancellation runtime or product deprecation
   dependencies: []
   status: present
@@ -17242,6 +17288,233 @@ artifacts:
       - The characterization file owns no database schema.
   retained_references:
   - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M5-022
+  milestone: M5
+  introduced_by: 5ea73888bcf31e715cf097b4596e117ad47ca9ed
+  bundle: serve.resource_action.contracts.022-025
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: serve
+    store: central_postgresql
+    provider: kubernetes
+    operation: transitional_authoritative_launch_routing
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/serve/replica_mutation_router.py
+    symbol: ServeReplicaMutationRouter._route_launch_with_transitional_legacy_compatibility
+  replacement: Direct durable Serve launch action routing for the qualified exact M4 cohort
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: transitional_authoritative_launch_routing_symbol_absent
+      satisfied: false
+      evidence: []
+    - id: exact_m4_cohort_has_no_legacy_launch_mutation_callsite
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_mixed_mode_launch_handoff_crash_and_same_name_recreation_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_qualified_profile_legacy_launch_routes_for_fixed_24h_100_launch_100_down_window
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: exact_m5a_to_m4_application_rollback_and_m5a_reupgrade_verified_for_launch
+      satisfied: false
+      evidence: []
+    - id: m5a_fixed_24h_100_launch_100_down_crash_ha_window_closed_for_launch
+      satisfied: false
+      evidence: []
+    schema:
+    - id: transitional_authoritative_launch_routing_owns_no_schema
+      satisfied: true
+      evidence:
+      - The transitional launch-routing symbol owns no database schema.
+  retained_references:
+  - docs/designs/durable-serve-replica-actions.md
+  - docs/designs/provider-lifecycle-actuation.md
+  - docs/designs/skyserve-resource-action-provider-facet.md
+  evidence: {}
+  blocker: null
+- id: PLA-M5-023
+  milestone: M5
+  introduced_by: 5ea73888bcf31e715cf097b4596e117ad47ca9ed
+  bundle: serve.resource_action.contracts.022-025
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: serve
+    store: central_postgresql
+    provider: kubernetes
+    operation: transitional_authoritative_down_routing
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/serve/replica_mutation_router.py
+    symbol: ServeReplicaMutationRouter._route_down_with_transitional_legacy_compatibility
+  replacement: Direct durable Serve down and exact-incarnation cleanup routing for the qualified exact M4 cohort
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: transitional_authoritative_down_routing_symbol_absent
+      satisfied: false
+      evidence: []
+    - id: exact_m4_cohort_has_no_legacy_down_cancel_or_cleanup_mutation_callsite
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_mixed_mode_down_cancel_handoff_and_crash_conformance
+      satisfied: false
+      evidence: []
+    - id: serve_exact_incarnation_whole_service_and_failed_service_cleanup_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_qualified_profile_legacy_down_cancel_or_cleanup_routes_for_fixed_24h_100_launch_100_down_window
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: exact_m5a_to_m4_application_rollback_and_m5a_reupgrade_verified_for_down_and_cleanup
+      satisfied: false
+      evidence: []
+    - id: m5a_fixed_24h_100_launch_100_down_crash_ha_window_closed_for_down_and_cleanup
+      satisfied: false
+      evidence: []
+    schema:
+    - id: transitional_authoritative_down_routing_owns_no_schema
+      satisfied: true
+      evidence:
+      - The transitional down, cancel, and cleanup-routing symbol owns no database schema.
+  retained_references:
+  - docs/designs/durable-serve-replica-actions.md
+  - docs/designs/provider-lifecycle-actuation.md
+  - docs/designs/skyserve-resource-action-provider-facet.md
+  evidence: {}
+  blocker: null
+- id: PLA-M5-024
+  milestone: M5
+  introduced_by: 5ea73888bcf31e715cf097b4596e117ad47ca9ed
+  bundle: serve.resource_action.contracts.022-025
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: serve
+    store: central_postgresql
+    provider: kubernetes
+    operation: transitional_legacy_operation_state_read
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/serve/replica_mutation_router.py
+    symbol: ServeReplicaMutationRouter._read_transitional_legacy_operation_state
+  replacement: Durable Serve action, attempt, request, and database-clock state for the qualified exact M4 cohort
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: transitional_legacy_operation_state_reader_symbol_absent
+      satisfied: false
+      evidence: []
+    - id: exact_m4_cohort_has_no_process_local_request_retry_map_or_clock_read
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_mixed_mode_owner_handoff_crash_and_durable_state_reconstruction_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_qualified_profile_legacy_operation_state_reads_for_fixed_24h_100_launch_100_down_window
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: exact_m5a_to_m4_application_rollback_and_m5a_reupgrade_verified_for_operation_state
+      satisfied: false
+      evidence: []
+    - id: m5a_fixed_24h_100_launch_100_down_crash_ha_window_closed_for_operation_state
+      satisfied: false
+      evidence: []
+    schema:
+    - id: transitional_legacy_operation_state_reader_owns_no_schema
+      satisfied: true
+      evidence:
+      - The transitional process-local operation-state reader owns no database schema.
+  retained_references:
+  - docs/designs/durable-serve-replica-actions.md
+  - docs/designs/provider-lifecycle-actuation.md
+  - docs/designs/skyserve-resource-action-provider-facet.md
+  evidence: {}
+  blocker: null
+- id: PLA-M5-025
+  milestone: M5
+  introduced_by: 5ea73888bcf31e715cf097b4596e117ad47ca9ed
+  bundle: serve.resource_action.contracts.022-025
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: serve
+    store: central_postgresql
+    provider: kubernetes
+    operation: transitional_legacy_operation_recovery
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/serve/replica_mutation_router.py
+    symbol: ServeReplicaMutationRouter._recover_transitional_legacy_operation
+  replacement: Durable Serve dispatcher and reducer recovery for the qualified exact M4 cohort
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: transitional_legacy_operation_recovery_symbol_absent
+      satisfied: false
+      evidence: []
+    - id: exact_m4_cohort_has_no_restart_inference_or_transitional_recovery_callsite
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_restart_handoff_crash_same_name_and_failed_service_recovery_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_qualified_profile_legacy_operation_recovery_for_fixed_24h_100_launch_100_down_window
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: exact_m5a_to_m4_application_rollback_and_m5a_reupgrade_verified_for_operation_recovery
+      satisfied: false
+      evidence: []
+    - id: m5a_fixed_24h_100_launch_100_down_crash_ha_window_closed_for_operation_recovery
+      satisfied: false
+      evidence: []
+    schema:
+    - id: transitional_legacy_operation_recovery_owns_no_schema
+      satisfied: true
+      evidence:
+      - The transitional restart-inference and operation-recovery symbol owns no database schema.
+  retained_references:
+  - docs/designs/durable-serve-replica-actions.md
+  - docs/designs/provider-lifecycle-actuation.md
+  - docs/designs/skyserve-resource-action-provider-facet.md
   evidence: {}
   blocker: null
 - id: PLA-M6-001

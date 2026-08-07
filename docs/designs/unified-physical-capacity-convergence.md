@@ -2,12 +2,13 @@
 
 Status: C1 foundation implemented, verified, and retained; C2.1 and C2.2 are
 historical-complete; C2.3 was cancelled without activation and C2.4 will not
-run; the C2-only evidence scanner is retired and its exact cleanup is locally
-implemented and verified, with merge and deployment pending; no payoff gate
+run; the C2-only evidence scanner is retired and its exact cleanup normally
+merged in PR #1107 at `1edab50b5201da05544a5acd895044eddad25071`
+(tag `v1.1.1053`), with the disabled deployment verification still pending; no payoff gate
 was satisfied, and every materialized or authoritative capacity product remains
 unauthorized
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 Canonical owner: this file. Rejected materialized/active-control drafts remain
 recoverable from branch history and the review record; they are not a second
@@ -72,6 +73,54 @@ exactly `disabled` before any cleanup Pod starts; a stale `shadow` value is an
 explicit startup and rollout blocker rather than silently accepted inert
 configuration.
 
+### Forward-only continuation after retirement
+
+Retirement is not a rollback target and does not restore the scanner. The
+accepted sequence is deliberately asymmetric:
+
+1. keep capacity001 and its five empty additive tables while the retired C2
+   runtime remains absent;
+2. complete the bounded Serve resource-action M4/M5a stack for central
+   PostgreSQL, non-pool Kubernetes, and
+   `ordinary_ondemand_physical_width1_v1`, proving that durable physical-
+   generation ownership removes named legacy mutation owners;
+3. only then rewrite and adversarially review a separate bounded,
+   materialized, read-only capacity projection against the exact deployed
+   schemas before reintroducing any capacity runtime; and
+4. promote read authority one owner/service at a time, followed by separately
+   reviewed jobs and pool identity profiles. Mutation authority never follows
+   automatically from read convergence.
+
+Step 2 is not a shared-capacity projector. Its ordinary counted
+`PROVISIONING` and down-`RUNNING` replica projections stay Serve-owned and
+preserve the existing mixed weighted provider-work budget across action and
+legacy routing. With `P` equal to all action plus legacy `PROVISIONING` rows,
+`D` equal to all action plus legacy down-`RUNNING` rows, and `C` equal to the
+existing non-pool request-parallelism cap, both paths use the exact predicate
+`2P + D < 2C`; launches have weight two, downs weight one, and a row satisfying
+both predicates contributes both weights. This is a Serve-owned projection of
+already-persisted work, not a mutable capacity occupancy ledger, and no
+reservation/occupancy table or scanner is revived.
+M4's initial active authority policy approves exact M4 only. After its
+authoritative window and the normal M5a merge, an admission-closed zero-work
+monotonic rotation activates a successor approving exact M4 plus exact M5a;
+exact M5a -> exact M4 -> exact M5a binary verification and the final exact-M5a
+soak keep action authority and additive schema throughout. They are not a
+capacity coordinator or an ownership revert. Paid-capacity, reserved-fill,
+spot/fallback, cost-rebalance, and logical-width state machines remain explicit
+legacy profiles. Step 3 remains unauthorized in this file until its exact
+materialized schema, ownership, freshness, absence, rollout, compatible-binary
+recovery, and consumer contract replaces this paragraph in the canonical
+design. Even then, the first accepted product is read-only and cannot introduce
+a mutable allocation, reservation, or occupancy ledger.
+
+The archived universal B0--B8 graph is rejected, not deployed state. The
+forward path adds no universal lifecycle DAG, API008 capacity plane,
+lifecycle002 coordinator, coupled multi-schema migration transaction, shared
+mutation scheduler, or per-decision fallback. Any later proposal must preserve
+separate domain desired-state owners and prove one read-only consumer before it
+can ask for mutation or admission authority.
+
 ## Why convergence could pay off
 
 If production evidence clears a gate, the likely restructuring is a narrow
@@ -83,21 +132,25 @@ Jobs  ─┼─ owner adapters ─ physical-generation identity
 Pools ─┘                         │
                  ┌───────────────┼────────────────┐
           observation cache  action journal  occupancy ledger
+             (separately gated products; none authorized by Step 3)
 ```
 
 - A shared observation cache could deduplicate provider reads and give all
   owners one freshness/certainty model.
 - An action journal could make stop/down/retry idempotent across controller
   crashes and record which owner authorized each effect.
-- An occupancy ledger could make pool-worker assignment transactional instead
-  of inferred from mutable links.
+- A future occupancy ledger could make pool-worker assignment transactional
+  instead of inferred from mutable links, but it is not part of the accepted
+  read-only projection sequence and requires its own mutation-authority design.
 - Exact pre-effect physical identity could prevent a stale owner from acting
   on a same-name successor.
 
 Those benefits do not require one component to own Serve, jobs, and pools.
 Each workload remains the source of logical desired state. Shared code would
 own only physical-generation identity, observation, action durability, or
-occupancy, with an explicit contract between those layers.
+occupancy, with an explicit contract between those layers. The next bounded
+projection may materialize immutable read observations; it does not own a
+mutable current-occupancy balance or authorize admission from that projection.
 
 ## Payoff hypothesis and go/no-go gates
 
@@ -1533,10 +1586,12 @@ each rebase. The prior rebase's broader local evidence was:
 On the 2026-08-02 refresh, the retained capacity model/state and migration
 test set passed with `SKYPILOT_CONFIG=/dev/null`; `git diff --check` passed;
 and the repository formatter completed YAPF, mypy, pylint, dashboard lint, and
-Prettier. CI must qualify the refreshed PR head before merge.
+Prettier. PR #1107 subsequently normally merged that cleanup as
+`1edab50b5201da05544a5acd895044eddad25071`; this record does not yet contain
+its exact disabled staged-deployment evidence.
 
 This is implementation evidence only. It does not claim that the cleanup image
-has been merged or deployed; the retirement rollout checks above remain open.
+has been built or deployed; the retirement rollout checks above remain open.
 
 Before retirement, automated tests covered:
 
@@ -1606,9 +1661,11 @@ Cancelled C2.3 manual activation plan (not executed):
   existed. Its canary and restart/handoff test will not run.
 - C2.4 not run: no measurement manifest or 30-day comparison window was
   frozen, and no gate decision can claim production evidence.
-- C2 cleanup implemented locally: the exact ledger is removed and retained C1
-  tests pass. Merge and the disabled staged rollout remain pending; deployment
-  must add no schema/data deletion and must record exact live evidence here.
+- C2 cleanup normally merged in PR #1107 at
+  `1edab50b5201da05544a5acd895044eddad25071` (tag `v1.1.1053`): the exact
+  ledger is removed and retained C1 tests pass. The disabled staged rollout
+  remains pending; deployment must add no schema/data deletion and must record
+  exact live evidence here.
 
 The activated-pilot 14-day decision and 45-day removal clocks never started.
 The explicit no-go decision authorizes earlier cleanup without fabricating an

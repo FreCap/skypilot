@@ -1,5 +1,7 @@
 # SkyServe Resource-Action Provider Facet
 
+Last updated: 2026-08-07
+
 Status: bounded M0 accepted after independent adversarial review; the parent M1
 kernel and the M2 schema, cluster-identity, shadow-store, and immutable provider
 contract foundations are implemented. As of 2026-08-02, the exact three-object
@@ -18,22 +20,143 @@ not implemented. The P2a preflight-only transport, exact release/static
 manifest contracts, two-Pod self-attestation/bootstrap, fail-closed stale-row
 retirement, API tombstone verifier, and disabled-by-default Helm topology are
 implemented and locally unit/PostgreSQL/Helm verified. The merged-image dark
-rollout and cohort qualification are still pending. The exact representative
-launch spec is 60,851 bytes, above the separate 60,000-byte activation budget
-but below the 65,536-byte parser ceiling, so authority remains disabled.
-Activation evidence rejects API006 as an authority head:
-API005 is limited to legacy-controller shadow, while API007 gates
-private-handler dispatch readiness and `shadow -> authoritative`. This does
-not yet implement any of the parent design's three server-owned API007 proof
-builders or their transition/dispatch writes and does not claim M4 or
-provider-authoritative rollout. The candidate v1 artifacts are
-packaged and present in a dark ordinary-role deployment, but have not been
-accepted into or exercised by an executor cohort; the eventual
-canary-namespace, persisted 201/409, scheduler, and runtime gates remain
-incomplete.
+rollout and cohort qualification are still pending. The exact frozen V1
+representative launch spec is 60,851 bytes, above the separate 60,000-byte
+activation budget but below the 65,536-byte parser ceiling; it cannot qualify
+the required V2 envelope. The additive compact V2 capsule/config/invocation/
+plan graph, V2-only full-spec parser, typed locked-row cohort resolver, and
+exact structural full-spec goldens are now implemented and locally verified without
+changing V1. The additive V2 preflight wire/parser, disjoint `/v2/` transport,
+exact realistic and candidate-maximal structural envelope goldens, and frozen-V1
+isolation are also implemented and locally verified. The production
+authority-worker runtime now supplies the mutation-free V2 trust evaluator
+over an isolated size-one PostgreSQL pool. Its revision-one `PREPARING` store,
+complete locked trust join, initial-root/rotated-active policy distinction,
+zero-queue single flight, hard five-second transport/publication deadline, and
+typed dark response are locally unit and real-PostgreSQL verified. Missing,
+crossed, expired, saturated, corrupt, or late evidence remains fixed typed 503.
+Manager admission has no production preparation caller yet, so the valid
+branch remains unreachable outside tests and authority remains disabled.
+The native V2 launch/down seed and input codecs, launch constructor, sole
+cleanup-target rederiver/shared binding validator, down constructor, and exact
+V2 binding-schema artifact are implemented and locally focused-tested. The
+down construction root consumes a typed cleanup-rederivation input and invokes
+the sole rederiver itself; a caller cannot inject a cleanup target. The
+authoritative direct-no-effect builder and expanded authoritative handler /
+direct/fallback outcome parser, raw-invalid journal profile/classifier
+integration, shared post-materialization projection, and V2 config-access/six-
+role artifact/callable inventories are implemented and locally focused-tested.
+The finite representability inventory is only partially expanded: its accepted
+index-plus-two-shard form exists, but only three of seven boundary families are
+implemented and the final fixture/result/golden evidence does not yet exist.
+The rejected monolithic draft measured 75,247 bytes and exceeded its
+65,536-byte file contract. The accepted replacement keeps the top six-role
+inventory reference stable while using a small index, two content-addressed
+case shards, and one result file per fixture. The current 366 cases are
+provisional and only three of seven boundary families are implemented. The
+rebased repository baseline is exact API008 and Serve037: API008 owns
+generation-bound request execution-quiescence and API-instance backend /
+capability attestations, Serve035 owns multi-pool reserved fill, Serve036 owns
+versioned controller-configuration snapshots, and Serve037 owns the placement-
+normalization/retirement ledger tables, service receipts, and version-retirement
+columns. None is the M4 authority schema. The additive Serve038
+membership/authority migration and Serve039 lineage/terminal-selector migration
+are implemented and locally schema-tested. The exact `008/039/028` V2
+policy/candidate/proof codecs are implemented and locally focused-tested; the
+claim-start barrier, connection-borrowing seams, and historical settled-replay
+validator remain design-only. The frozen
+V1 renderer and existing full-spec/preflight-envelope goldens cannot be used as
+substitute V2 qualification evidence.
 
-The current bounded implementation tranche is P2a, a preflight-only cohort
-bootstrap. Its closed wire envelopes, private HTTPS transport, two-Pod
+The rebased forward-only migration lineage is exact and nonoverlapping:
+Serve038 membership/authority has `down_revision='037'`; Serve039 execution
+history/terminal selectors has `down_revision='038'`; and the stacked M5a
+closure Serve040 has `down_revision='039'`. The existing Serve035, Serve036,
+and Serve037 revisions retain their current reserved-fill, controller-
+configuration, and placement-normalization/retirement meanings; no M4 migration
+reuses any of those numbers.
+The frozen Serve034 ledger retirement bridge has only historical
+API007/Serve034 verification; its rebased cleanup-only chart ceiling and test
+matrix at exact API008/Serve037/state028 remain open before Serve038 may run.
+
+The current dark intermediate installs a V2-only `PREPARING` reference transaction
+and stateful evaluator fence. It returns only the action-kind-matched typed
+`not_representable: preflight_unavailable_or_invalid` response, and only after
+locking and revalidating the exact `ACCEPTING` cohort, absence of a nonterminal
+handoff, both accepted fresh registration leases, the same revision-one
+`PREPARING` reference, and the current unready `authority-worker` API-instance
+lease. Every absent, expired, crossed, or corrupt input remains fixed 503. The
+launch branch requires the exact typed
+`ProviderLaunchIdentityCanonicalizationContextV1` carried at
+`seed.source.identity_canonicalization.context`. While holding the service and
+reference locks, it compares the context's service name, complete resource
+identity, decision/cohort/action identity, controller-owner fence, lifecycle
+epoch, preparation revision/state, and capability commitment with the locked
+rows. The down branch requires explicit absence of that launch context and
+keeps its capability commitment reference-owned; a context on down or no
+context on launch rejects. No fallback derives launch context from ambient or
+unlocked state. The intermediate creates no capsule/spec, changes no reference,
+advertises no readiness, starts no claimant/executor, and performs no provider
+I/O; it is a trust-fence milestone, not P2b completion or action authority.
+The hard deadline covers transport and result publication. One isolated,
+mutation-free trust read may finish late if DBAPI/network cancellation is
+impossible; it has one nonblocking slot, no queue, and a request-local result
+that is permanently discarded after timeout. The server object is one-shot:
+`stop()` is terminal and recovery creates a fresh object/process, so a late
+daemon slot cannot cross transport generations. Short pool/connect/statement/
+lock/idle-transaction/TCP budgets contain responsive failures. The cumulative
+four-second monotonic guard forbids a new statement after its boundary; it is
+not a hard transaction kill, and a just-admitted statement retains its own
+3.5-second server timeout. The currently implemented pre-pool dark P2a process
+explicitly budgets a persistent ceiling of three synchronous physical
+connections: shared central state for
+authority bootstrap, `api-requests-control` for the API-instance heartbeat,
+and isolated preflight. Transient startup/migration advisory-lock `NullPool`
+sessions close when their lock ends and sit outside that persistent ceiling.
+The operational formula is `3 * authority Pod count`, or `6 * concurrently
+rendered two-member cohort count`; one live-plus-candidate rotation renders
+two pre-pool cohorts and therefore reserves 12 persistent synchronous
+connections. Once M4 enables its fixed `N`-child execution pool, the manifest-
+bound ceiling supersedes this pre-pool figure and is `3 + 2*N` per Pod.
+There is no Helm control for PostgreSQL `max_connections`, so authority cannot
+activate until the external database proves that persistent capacity and
+separate headroom for transient advisory-lock sessions.
+Activation evidence rejects API006 and API007 as current authority heads:
+API005 is limited to legacy-controller shadow, while exact API008 gates
+private-handler dispatch readiness and `shadow -> authoritative`. Its named
+backend/capability columns must prove PostgreSQL request storage and queueing
+plus execution-quiescence support; default `unknown`/false evidence fails
+closed. This does not yet implement any of the parent design's three
+server-owned API008 proof builders or their transition/dispatch writes and does not claim M4 or
+provider-authoritative rollout. The candidate provider-plan/renderer V1
+artifacts are packaged and present in a dark ordinary-role deployment, but
+have not been accepted into or exercised by an executor cohort; the eventual
+canary-namespace, persisted 201/409, scheduler, and runtime gates remain
+incomplete. The parent design's Serve038 candidate-epoch/policy binding codecs,
+immutable authority-policy epoch codecs, and Serve039 historical authority/V2
+head contracts and migrations now exist with focused local evidence. Their
+production stores and complete runtime writers, the durable pre-injection
+crash-canary intent/result store, and exact attempt-exhaustion event projection
+remain M4 gates and are not yet wired into the current action foundation.
+The already-shipped closed `ServeReplicaActionSpecV1` wrapper remains frozen
+for pre-Serve038 history and exact-034 cleanup-only tooling. The corrected M4
+contract below uses `ServeReplicaActionSpecV2`, including the parent design's
+complete service-version identity/hash and closed shadow-candidate or
+authoritative-policy binding. That V2 envelope and its V2-only live parser are
+implemented structural contracts with local evidence, not live provider-
+authority evidence; they cannot activate until the V2 preflight and every
+locked-row/runtime gate below are complete.
+The M4 Serve-side capacity prerequisite is
+`ordinary_ondemand_physical_width1_v1`: paid-capacity, reserved-fill,
+cost-rebalance, spot/fallback, and logical-replica modes remain legacy and do
+not enter private shadow or authority under this profile.
+
+P2a shipped normally in PR #1232 at merge commit
+`4c91d3345ccb5f19538c9f8376c5e7403f5644cc`, with runtime source
+`3e6d2c92c7995bf41d25cfcc31e58107860aabfe` and synchronized contract source
+`4232b9aac166d1202dd036eba8e752ab6f234640`. P2a is the forward-only
+preflight foundation, not a rollback target. Its closed wire envelopes,
+private HTTPS transport, two-Pod
 self-attestation, complete static-manifest projection, and retirement fences
 deliberately start no request executor, claim no queue row, accept no manager
 admission, construct no workload/action-provider client, and perform no
@@ -41,8 +164,10 @@ Kubernetes mutation or provider effect. Its dedicated observer only GETs its
 own Pod, owner ReplicaSet, exact Deployment, and ServiceAccount. Its initial
 evaluator may return only the typed
 `not_representable: preflight_unavailable_or_invalid` result after the cohort
-is accepted. Complete live target observation and private dispatch remain P2b
-and P3 work.
+is accepted. The next bounded implementation tranche is one complete M4
+feature PR over this foundation: qualify P2a, then complete P2b live target
+observation, P3 private dispatch, and P4 selected Serve authority. It does not
+recreate or bypass preflight and does not downgrade Serve034.
 
 Source commit `a836825ef9c219563bb2abc740707c825c26edc5` and immutable
 image digest
@@ -78,8 +203,6 @@ Authority remained disabled and absent, every action and Serve graph count was
 zero, and the four schema heads were unchanged. This proves dark packaging and
 ordinary-role deployability only; no renderer entrypoint, executor cohort,
 provider I/O, shadow comparison, or authority path was exercised.
-
-Last updated: 2026-08-03
 
 Canonical owner: this file governs only the provider-mutation and observation
 seam for `docs/designs/durable-serve-replica-actions.md`. It does not supersede
@@ -131,8 +254,9 @@ stable locator and exact observation/absence evidence below.
 - Normalize provider results into a closed outcome used by the Serve reducer.
 - Resolve lost acknowledgements by exact readback of the frozen target.
 - Make launch adoption and teardown absence explicit and testable.
-- Ensure shadow executes exactly one legacy mutation and compares the proposed
-  durable interpretation with its real result.
+- Ensure each legacy-controller shadow candidate executes exactly one legacy
+  mutation, while each selected Serve039 represented-private candidate executes
+  exactly one attested private-handler mutation; a candidate never runs both.
 
 ## Non-goals
 
@@ -154,11 +278,11 @@ ProviderLifecycleFacetV1
   normalize_plan(existing_launch_or_down_input,
                  frozen_scope_and_execution_config)
       -> ProviderLaunchNormalizationResultV1 | ProviderDownNormalizationResultV1
-  submit(spec: ServeReplicaActionSpecV1,
+  submit(spec: ServeReplicaActionSpecV2,
          durable_progress: null | ProviderLifecycleProgressV1,
          request_execution_fence)
       -> ProviderSubmissionV1
-  observe(spec: ServeReplicaActionSpecV1,
+  observe(spec: ServeReplicaActionSpecV2,
           optional_operation_id,
           durable_progress: null | ProviderLifecycleProgressV1,
           request_execution_fence)
@@ -166,15 +290,23 @@ ProviderLifecycleFacetV1
 ```
 
 `normalize_plan()` is pure and bounded over explicitly supplied read-only
-preflight values; it never opens a client or reads ambient config. In shadow,
-the existing high-level launch/down path remains the only mutation.
-`submit()` and `observe()` typed-read the complete immutable action spec; a
-normalized plan alone is never execution authority. The action kind selects
+preflight values; it never opens a client or reads ambient config. In the
+legacy-controller shadow phase, the existing high-level launch/down path
+remains the only mutation. In Serve039 private shadow, a represented V2 private
+handler instead invokes this facet as the sole provider-effect owner and never
+also enters the high-level legacy path.
+`submit()` and `observe()` call the parent contract's sole live parser,
+`serve_replica_action_spec_from_value_v2()`, and typed-read the complete
+immutable action spec; V1 or a normalized plan alone is never execution
+authority. The action kind selects
 the corresponding launch or down invocation and execution configuration from
 that spec. Before constructing a cloud or Kubernetes client, the facet verifies
-the plan/invocation hashes, frozen executor cohort, current request-execution
-fence, and every kind-specific scope and principal field. A caller cannot
-supply replacement execution configuration beside the spec.
+the embedded service-version identity hash; the plan/invocation hashes; the
+shadow-candidate or UUID authority-policy binding against the exact consumed
+dispatch context; the frozen executor cohort; the current request-execution
+fence; and every kind-specific scope and principal field. A caller cannot
+supply replacement identity, binding, or execution configuration beside the
+spec.
 Authoritative `submit()` invokes the fixed `pod_cluster_v1` object graph and
 one idempotent Skylet job submission for one request attempt through pure
 renderer/session primitives extracted from that path. Before each next effect,
@@ -194,9 +326,13 @@ precondition. Because the current generic executor otherwise requeues
 the action handler/facet catches both families and normalizes them into a closed
 typed retry/uncertain provider result inside the parent design's
 `ServeReplicaActionRequestReturnV1` before they escape. The same request ID never
-gets executor-driven retry/requeue. A later claim generation for that request
-may recover the handler, but it observes and consumes API006 progress and never
-repeats a committed effect; only the Serve reducer may admit attempt `n+1`.
+gets executor-driven retry/requeue. Handler completion, same-owner quiescent
+acknowledgement, and typed process/Pod-stale or cold-recovery fences all obey
+`ReplayPolicy.NEVER`: they terminalize the old request once. Generic lease
+expiry alone never terminalizes a claimed private request. Only the Serve reducer may
+then admit attempt `n+1`, whose new deterministic request has one
+generation-one claim and carries the settled API006 cursor without repeating a
+committed effect.
 
 The existing API request worker implementation remains the only long-lived
 executor. The canary deploys that same implementation in a dedicated
@@ -465,6 +601,32 @@ PartialLaunchCleanupBasisV1 = {
   launch_immutable_spec_sha256: Sha256,
   exact_resources_override: true
 }
+
+ServeShadowPartialLaunchCleanupBasisV1 = {
+  version: 1,
+  basis_kind: "shadow_partial_launch_cleanup",
+  source_store: "serve_resource_action_shadow_execution_history",
+  launch_decision_id: UUID,
+  launch_request_sequence: PositiveInteger,
+  launch_logical_attempt: PositiveInteger,
+  launch_resource_identity: ProviderLifecyclePlanV2.resource_identity,
+  launch_requested_target: ProviderLocatorV1,
+  launch_resources: ProviderPodResourceSnapshotV1,
+  launch_workspace_identity: ProviderWorkspaceIdentityV1,
+  launch_provider_cursor_sha256: Sha256,
+  launch_provider_progress_revision: PositiveInteger,
+  launch_quiescence_sha256: Sha256,
+  launch_outcome_sha256: Sha256,
+  launch_terminal_history_sha256: Sha256,
+  launch_execution_authority_lineage_sha256: Sha256,
+  launch_cleanup_target_sha256: Sha256,
+  launch_immutable_spec_sha256: Sha256,
+  exact_resources_override: true
+}
+
+PriorLaunchBasisV2 = CompletedLaunchBasisV1 |
+                     PartialLaunchCleanupBasisV1 |
+                     ServeShadowPartialLaunchCleanupBasisV1
 ```
 
 `PartialLaunchCleanupBasisV1` is a retained-source reference, not a truncated
@@ -488,11 +650,14 @@ the sorted union of source-launch and deterministic-down action IDs; only after
 all action keys are acquired does it lock the named source attempt. In the
 first-settlement branch the unsettled locked attempt protects its request from
 GC; admission nonlocking-reads and validates the terminal request, complete
-typed API006 cursor, and terminal handler DTO, then constructs and persists reducer-owned quiescence,
-terminalizes the source as exact `SUPERSEDED_TO_DOWN`, and inserts/adopts and
-links the down in one commit. Its lost-ack branch requires the already-settled
-attempt's retained request snapshot and source outcome/quiescence byte-for-byte
-and exact-adopts the same down/link; the original request may be GCed, while a
+typed API006 cursor, and terminal handler DTO, then constructs and persists
+reducer-owned quiescence, terminalizes the source as exact
+`SUPERSEDED_TO_DOWN`, revalidates the down row already inserted or exact-adopted
+during sorted-union acquisition, and links it in one commit. Its lost-ack branch
+requires the already-settled attempt's retained request snapshot and source
+outcome/quiescence byte-for-byte
+and revalidates the already-acquired down before exact-adopting the same link;
+the original request may be GCed, while a
 surviving row is only compared nonlocking. Both
 branches re-derive the cleanup target, require it byte-equal to the sole capsule
 copy, and verify the retained cursor hash, progress revision, quiescence hash,
@@ -511,6 +676,40 @@ down-admission transaction.
 The down handler needs none of the omitted provenance to mutate: it executes
 only the full cleanup target and current authority material frozen in its own
 capsule.
+
+The additive shadow partial basis is equally a retained-source reference, not a
+hash-only proof and not an edit to byte-frozen `PriorLaunchBasisV1`. Its source
+preimages are the settled primary-launch child, its
+`serve_resource_action_shadow_execution_history` row, exact class-17 terminal
+history, strict handler return, `ProviderShadowLifecycleProgressV1`, and
+reducer-owned `ProviderShadowLaunchSupersessionQuiescenceV1`. The source remains
+retained until the linked primary down settles. The source history stores the
+normalized successor decision/sequence and basis hash under an indexed exact-Q
+shape; the target's partial-down basis is the reciprocal typed preimage. Before
+any GC lock, indexed outgoing and reverse-incoming discovery closes exactly one
+source/target pair and constructs its per-class sorted key union; a missing
+reciprocal edge, branch, chain, cycle, or crossed basis blocks. GC may release
+and delete the pair only when both sides are independently eligible and neither
+side has a surviving request, replica/cleanup link, protected window,
+reference, or other root. It releases both references and deletes both complete
+graphs atomically or neither, never leaves one pointer/basis dangling, and never
+scans JSON or expands from one locked parent to another. A strict shadow launch result
+may use `supersede_to_down` only when its current intent has the exact origin-
+bound `ProviderShadowLaunchNoEffectResolutionV1`, or its phase is the exact
+nonintent E-only row; fallback never creates this basis. The reducer first
+constructs the deterministic target and full cleanup preflight without
+authority. Its one transaction then walks the canonical sorted source+target
+union at every applicable class--service/replica, cohorts/handoffs/leases/
+references, coverage, parents, and children/histories--before revalidating the
+source and target. Only then does it settle the source as `Q` and create/exact-adopt one normal represented
+`PRIMARY_DOWN` decision, parent/child/history `BOUND` row, deterministic private
+request/queue, reference, and replica link; request/queue classes follow the
+complete class-10 union. A crash before the commit leaves the source unsettled and
+retries; a lost acknowledgement adopts the entire byte-equal graph. No
+`LAUNCH_CLEANUP_DOWN`, API006 action/attempt, hidden provider call, or unlinked
+settlement is legal. Missing preflight, uncertain current intent, or any hash/
+UID/lineage mismatch leaves the source blocked and retained rather than
+stranding unowned cleanup.
 
 `PriorLaunchBasisV1` intentionally has no `NOT_STARTED` variant. The parent's
 reducer maintains a closed monotonic `ServeLaunchNoIoPrefixV1` in each settled
@@ -605,15 +804,18 @@ launch_requested_target: requested_target, launch_resources: resources,
 exact_resources_override: true}`; and its workspace hash is the canonical
 SHA-256 of `ProviderWorkspaceIdentityV1`.
 
-A primary down requires a full `PriorLaunchBasisV1` in its invocation and a
-full cleanup target in its execution capsule. The plan retains only their
+A frozen V1 primary down requires `PriorLaunchBasisV1`; a live V2 primary down
+requires the additive `PriorLaunchBasisV2`. Both carry the full typed basis in
+their invocation and a full cleanup target in the execution capsule. The plan retains only their
 canonical hashes, and the basis retains only the cleanup-target hash. Admission
 re-derives the target from the locked retained launch evidence, requires that
 target byte-equal to the capsule copy, and requires both retained hashes and
-both plan hashes to equal their complete validated preimages. The
-basis action ID must be the UUID derived from its
-launch identity/spec. Admission loads and locks that exact retained launch row
-and applicable attempt evidence from `source_store`, plus the exact
+both plan hashes to equal their complete validated preimages. The kind-specific
+source ID is deterministic from its launch identity/spec: action/completed
+bases use `launch_action_id`, while the shadow-partial basis uses
+`launch_decision_id` plus its exact sequence/logical attempt. Admission loads
+and locks that exact retained launch row and applicable attempt/history evidence
+from `source_store`, plus the exact
 global-user-state cluster row disposition named by the cleanup target. It
 recomputes every added hash from the full typed preimages and rejects
 caller-supplied bytes that are not equal to retained state.
@@ -621,11 +823,32 @@ caller-supplied bytes that are not equal to retained state.
 For `completed_launch`, the retained launch is terminal-successful. An API
 launch's final API006 cursor supplies the resolved target and handle; a shadow
 launch's completed child supplies the exact resolved-target observation and
-the same-UUID cluster row supplies the handle. Both must agree on cluster UUID,
-all three object UIDs, Pod UID, provider scope, and the complete re-derived
-cleanup target. The cluster row's provider block is byte-equal to
+the same-UUID cluster row supplies the handle. For a shadow source, admission
+locks that global-user-state cluster row and complete handle in the parent
+design's lock class 2 with service/version/replica identity, before cohort,
+reference, coverage, parent, action, or attempt locks. Both must agree on
+cluster UUID, all three object UIDs, Pod UID, provider scope, and the complete
+re-derived cleanup target. The cluster row's provider block is byte-equal to
 `launch_handle`; the re-derived cleanup target hash equals the basis commitment
 and its bytes equal the sole capsule copy.
+
+For every API-source down, candidate construction nonlockingly discovers the
+bounded pre-existing action conflicts and rejects a natural key already bound
+to a divergent UUID. The parent design's class 11 then walks the canonical
+UUID-sorted union of all source action IDs and the deterministic new down ID.
+At each position it locks and validates an existing source or inserts/exact-
+adopts the allowed new down; it never locks a higher UUID and later inserts a
+lower one. Only after the whole action union is acquired may it lock
+predecessor/current attempt rows in class 12. Completed, partial-launch, and
+lost-ack source paths share this acquisition primitive; none may insert the
+down before or after a separately ordered source lock.
+
+Nonlocking discovery is only an ordering input, not a conflict decision. If a
+natural-key conflict commits after discovery and wins the unique-index race,
+the transaction inspects that conflict at the deterministic new action's sorted
+position. It may adopt only the same deterministic UUID with byte-exact action
+content; a different UUID or any content drift aborts the transaction before
+attempt locks or links.
 
 `partial_launch_cleanup` is allowed only for an API-action launch that did not
 succeed and satisfies the action-wide `launch_io_started` predicate above. The
@@ -642,9 +865,11 @@ transaction never locks a higher action ID and later inserts a lower one. After
 all action keys are acquired it locks the source attempt. The first-settlement
 branch nonlocking-reads the still-retained terminal request, then constructs/
 persists quiescence and source terminal state in the same transaction that
-inserts/adopts and links the down. The lost-ack branch revalidates the already-
+revalidates the already-inserted/exact-adopted down and links it. The lost-ack
+branch revalidates the already-
 settled byte-equal request snapshot/outcome/quiescence without requiring the
-original request row and adopts that same down/link. Both revalidate every retained source
+original request row, revalidates the already-acquired down, and exact-adopts
+that same link. Both revalidate every retained source
 cursor/quiescence preimage and every cleanup-target and immutable-spec byte used
 to construct the candidate. Any mismatch rolls back the entire transaction,
 including a newly inserted down row. They derive the three-slot cleanup target
@@ -812,13 +1037,15 @@ the request fence. An E-only phase with a resolution, an intent phase without
 its exact resolution, any supersession result at `SUCCEEDED`, or a
 noncancelled provider tuple is corruption and admits no down.
 
-External `FAILED`/`CANCELLED` terminalization, a null/dropped return, or an
-invalid/mismatched terminal-`SUCCEEDED` DTO is categorically ineligible for
-quiescence and partial cleanup. It uses the parent's closed request-fallback
+External `FAILED`/`CANCELLED` terminalization or a null/dropped return is
+categorically ineligible for quiescence and partial cleanup. It uses the parent's closed request-fallback
 table: an exact non-`SUCCEEDED` cursor remains observation-first, an exact
 `SUCCEEDED` cursor commits normal provider success, a revision-zero empty
 journal retries when the action remains desired, and malformed progress
 blocks. External terminalization never supplies `N<i>` or partial handoff. The
+strict private codec converts a malformed returned DTO to fixed `FAILED` before
+persistence; a persisted invalid/mismatched nonnull terminal-`SUCCEEDED` value
+is quarantined corruption, not fallback. The
 only exception is not a provider quiescence path: when owner-fenced teardown is
 requested and the parent's exact no-I/O prefix proves the empty, newly settled,
 or retained-settled shape, the reducer constructs
@@ -881,6 +1108,39 @@ ProviderKubernetesTransportIdentityV1 = {
   tls_server_name: null | Text,
   ca_cert_der_base64: [CanonicalRfc4648Base64Text4To16384]
 }
+
+`ProviderKubernetesServerOriginV1` is constructed only from the exact selected
+kubeconfig cluster's `server` scalar by the following closed normalizer. The
+input is nonempty ASCII UTF-8 text and must begin with literal lowercase
+`https://`. It is parsed as one hierarchical absolute URI; userinfo, an empty
+host, query, fragment, backslash, control/space, non-ASCII text, and every `%`
+byte are rejected. Thus no percent decoding, Unicode/IDNA conversion, IPv6 zone
+identifier, environment expansion, or proxy/base-URL substitution occurs.
+
+The raw authority is either one bracketed IPv6 literal or an unbracketed DNS/
+IPv4 host, followed by at most one port. Brackets are mandatory and stripped
+only for IPv6; brackets on DNS/IPv4 and an unbracketed colon reject. IPv4 must
+be four canonical decimal octets with no leading zero. IPv6 is parsed as 128
+bits and rendered as lowercase RFC 5952 compressed text; IPv4-embedded IPv6 is
+rendered by the same rule. A DNS host is lowercased and must then be 1..253 ASCII
+bytes of RFC 1123 labels (1..63 each), with no empty label, underscore, leading/
+trailing hyphen, trailing dot, or `xn--` A-label. Uppercase ASCII DNS is the sole
+host spelling normalized rather than rejected. An absent port becomes integer
+443; an explicit port is canonical `[1-9][0-9]{0,4}` in 1..65535, so explicit
+443 and absence have one identity while leading-zero or signed forms reject.
+
+The source path is either empty, `/`, or an absolute sequence of nonempty ASCII
+RFC 3986 `pchar` segments. Empty and `/` both canonicalize to `path=""`.
+Otherwise repeated slashes, trailing slash, dot/dot-dot segments, percent
+escapes, and bytes outside unreserved or `!$&'()*+,;=:@` reject; a legal path is
+retained byte-for-byte. `tls_server_name` is null only when absent. When present
+it is nonempty ASCII, has no trailing dot or `xn--` label, and is normalized by
+the same lowercase RFC 1123 DNS rule; IP literals and ports are forbidden.
+Every loader (preflight, runtime, qualification, and drift recheck) calls this
+one pure function and byte-compares the resulting `{scheme,host,port,path}` and
+TLS name. Tests freeze absent/explicit 443, nondefault ports, root/prefixed paths,
+DNS case, canonical and alternate IPv6 spellings, and every rejection above on
+the minimum supported Python/Kubernetes client versions.
 
 ProviderRepoArtifactRefV1 = {
   repo_path: Text,
@@ -1128,8 +1388,9 @@ may be appended once after UID commitment; it can never be removed, partially
 committed, or changed.
 
 `request_body` is the exact nonsecret CoreV1 body sent by the session and is
-bounded together with the complete action spec to 65,536 canonical UTF-8
-bytes. The fixed renderer may contain only its reviewed nonsecret runtime env
+bounded together with the complete live `ServeReplicaActionSpecV2` to 65,536
+canonical UTF-8 bytes. The fixed renderer may contain only its reviewed
+nonsecret runtime env
 entries plus one caller-derived replica-ID entry; arbitrary task/caller env is
 not accepted. Any Secret/config-map reference, projected token, credential,
 private key, raw user YAML, or unbounded field rejects. Both body and requested
@@ -1459,6 +1720,180 @@ four-stage sequence. In stage 3 the staged constructor invokes
 `body_validate` before `request_normalize`; the latter consumes the typed
 validated-body transient and does not invoke the validator a second time. This
 staged constructor is required before a renderer artifact can be accepted.
+
+### Native V2 construction and inventory ownership
+
+The V1 seed, input, constructor, and config-access inventory above are frozen
+Serve034 history. A live M4 launch does not construct a V1 capsule and replace
+its cohort, serialize through a V1 value, or call a V1 staged constructor. Its
+closed pre-object values are instead:
+
+```text
+ProviderKubernetesExecutionCapsuleSeedV2 = {
+  version: 2,
+  implementation_contract: "kubernetes_serve_prebooted_runtime_v1",
+  executor_cohort: ProviderAuthorityWorkerCohortReferenceV1,
+  config_projection: ProviderKubernetesConfigProjectionV1,
+  config_projection_sha256: Sha256,
+  scope: ProviderKubernetesScopeV1,
+  principals: ProviderKubernetesPrincipalsV1,
+  prerequisites: ProviderKubernetesPrerequisiteInventoryV1,
+  request_identity: ProviderKubernetesRequestIdentityV1,
+  resources: ProviderKubernetesResourceContractV1,
+  renderer: ProviderKubernetesRendererV1,
+  post_provision: ProviderKubernetesPostProvisionV1,
+  endpoint: ProviderKubernetesEndpointContractV1,
+  scheduling: ProviderKubernetesSchedulingContractV1,
+  storage: ProviderKubernetesStorageContractV1,
+  metadata: ProviderKubernetesMetadataContractV1,
+  security: ProviderKubernetesSecurityContractV1,
+  topology: ProviderPodTopologyV1,
+  mutation_contract: ProviderKubernetesLaunchMutationContractV1
+}
+
+ProviderKubernetesRendererInputV2 = {
+  version: 2,
+  contract: "validated_launch_spec_v2",
+  resource_identity: ProviderResourceIdentityV1,
+  sky_cluster_name: Text,
+  sky_cluster_record_uuid: UUID,
+  name_basis: ProviderWorkloadNameBasisV1,
+  seed: ProviderKubernetesExecutionCapsuleSeedV2,
+  retained_source: ProviderLaunchContentSourceV1
+}
+
+ProviderKubernetesDownExecutionCapsuleInputV2 = {
+  version: 2,
+  implementation_contract: "kubernetes_serve_exact_cleanup_v1",
+  executor_cohort: ProviderAuthorityWorkerCohortReferenceV1,
+  config_projection: ProviderKubernetesConfigProjectionV1,
+  config_projection_sha256: Sha256,
+  scope: ProviderKubernetesScopeV1,
+  principals: ProviderKubernetesPrincipalsV1,
+  prerequisites: ProviderKubernetesPrerequisiteInventoryV1,
+  mutation_contract: ProviderKubernetesDownMutationContractV1
+}
+```
+
+The V2 seed key set is exactly the displayed completed
+`ProviderKubernetesExecutionCapsuleV2` key set minus `objects`; the renderer
+input has exactly the eight displayed keys. The down input has exactly the nine
+displayed `ProviderKubernetesDownExecutionCapsuleV2` keys minus
+`cleanup_target` and `cleanup_target_sha256`; those two fields may come only
+from the rederiver below. The compact cohort reference is the
+only cohort value in either persisted value. The complete parsed
+`ProviderAuthorityWorkerCohortV2` is a separate transient argument to context
+validation and construction.
+`validate_provider_kubernetes_renderer_input_v2(renderer_input,
+resolved_cohort)` and
+`validate_provider_kubernetes_execution_capsule_context_v2(capsule,
+resolved_cohort)` call
+`validate_locked_action_spec_cohort_v2()`, then perform every seed-internal,
+cohort/Namespace/principal, request-identity, source, topology, resource,
+scheduling, storage, metadata, security, runtime-artifact, normalization, and
+object-plan comparison required by the V1 seed and completed-capsule validators,
+with the full cohort supplied externally rather than embedded. A structurally
+valid V2 seed or capsule that has not passed that contextual validator remains
+non-authoritative.
+The down peer is named
+`validate_provider_kubernetes_down_execution_capsule_context_v2(capsule,
+resolved_cohort, rederived_cleanup_target)` and requires its third argument to
+be byte-equal to the capsule target.
+
+Only the complete V2 preflight evaluator constructs either input. It derives the
+compact reference from the canonical identity of the resolved cohort rather
+than accepting a reference from the request. It copies `resource_identity`,
+the target's three naming fields, and retained launch source from the validated
+`ProviderLaunchPreflightSeedV2`; fills the capsule seed only from the
+kind-specific live preflight results; and requires the request's config
+projection, request identity, source, resources, topology, target Namespace,
+and replica identity to equal their seed/input projections before artifact
+resolution. For down it fills the nine-key input from kind-specific live
+preflight results, constructs the exact typed completed/partial cleanup-
+rederivation input from locked retained preimages, and passes that input to the
+down construction root.
+Recovery repeats either projection and must reproduce the same
+canonical input. No manager, transport decoder, fixture loader, or stored
+capsule can provide replacement renderer-input fields.
+
+`sky/serve/resource_action_renderer.py` and its exact nine public V1 functions
+remain sealed. Native construction lives in the separate
+`sky/serve/resource_action_renderer_v2.py` module. Its root
+`construct_provider_kubernetes_execution_capsule_v2(renderer_input,
+resolved_cohort)` performs the same nonrecursive validate -> resolve -> render
+-> body-validate -> request-normalize -> object-plan -> append -> contextual-
+revalidate order directly over V2 types. It returns
+`ProviderKubernetesExecutionCapsuleV2` and may not instantiate, parse, or call a
+constructor for `ProviderKubernetesExecutionCapsuleV1`,
+`ProviderKubernetesExecutionCapsuleSeedV1`, or
+`ProviderKubernetesRendererInputV1`. The V2 down root
+`construct_provider_kubernetes_down_execution_capsule_v2(down_input,
+resolved_cohort, cleanup_rederivation_input)` invokes
+`rederive_provider_kubernetes_cleanup_target_v2()` internally, constructs
+`ProviderKubernetesDownExecutionCapsuleV2` directly from only that output, has
+no renderer input, and performs its full external cohort/scope/principal /
+prerequisite/cleanup context validation without constructing a V1 down
+capsule. A cleanup target is never a direct construction-root argument.
+
+The V2 cohort owns two new top-level package artifacts and does not widen a V1
+artifact in place:
+
+- `sky/serve/resource_action_artifacts/provider_authority_v2/artifact_inventory.json`
+  has contract `provider_authority_artifact_inventory_v2`. Its ordered roles
+  are exactly `outer_template`, `node_fragment`, `binding_schema`,
+  `config_access_inventory`, `admitted_object_normalization`, and
+  `representability_case_inventory`. The first, second, and fifth roles may point to
+  the byte-identical shipped V1 leaf artifacts because their schema contracts
+  and rendered object leaves remain V1. The third points only to
+  `sky/serve/resource_action_artifacts/kubernetes_renderer_v2/binding_schema.json`:
+  it has schema ID
+  `skypilot.serve.prebooted-direct-pod.bindings.v2`, the same closed 17 binding
+  names/pointers/transforms/targets, and exact
+  `input_contract="validated_launch_spec_v2"`; the V1 binding schema hardcodes
+  `validated_launch_spec_v1` and is invalid V2 evidence. The fourth points only
+  to
+  `sky/serve/resource_action_artifacts/kubernetes_renderer_v2/config_access_inventory.json`;
+  its schema ID is
+  `skypilot.serve.prebooted-direct-pod.config-access-inventory.v2`, and it
+  inventories all four pure roots named below, their complete internal call
+  graph, every explicit typed input root, and every allowed pointer (including
+  exact zero-access declarations). The sixth points only to the closed
+  representability case-index specified below; that index then
+  content-addresses exactly two bounded explicit shards. Neither index nor
+  shard contains fixture references, rendered values, or result hashes. All
+  six top-level paths are distinct and every role has an exact size/hash
+  binding; startup/preflight compare every capsule renderer reference with the
+  first five roles byte-for-byte and validate the sixth role's complete
+  index/shard closure.
+- `sky/serve/resource_action_artifacts/provider_authority_v2/callable_inventory.json`
+  has contract `provider_authority_callable_inventory_v2`. `handlers` remains
+  the exact four-name handler/result-codec registry used by the claim filter;
+  it does not silently become a renderer inventory. A separate ordered
+  `pure_entrypoints` array has exactly four roles:
+  `launch_capsule_constructor`, `down_capsule_constructor`,
+  `cleanup_target_rederiver`, and `representability_enumerator`, each with one
+  importable module/qualname pair. Their exact qualified callables are,
+  respectively,
+  `sky.serve.resource_action_renderer_v2.construct_provider_kubernetes_execution_capsule_v2`,
+  `sky.serve.resource_action_renderer_v2.construct_provider_kubernetes_down_execution_capsule_v2`,
+  `sky.serve.resource_action_cleanup_v2.rederive_provider_kubernetes_cleanup_target_v2`,
+  and
+  `sky.serve.resource_action_representability.enumerate_provider_resource_action_representability_v2`.
+  Runtime projects both arrays from the actual
+  registry/imports and requires canonical byte equality with the installed
+  artifact. The V2 config-access inventory, not this top-level callable list,
+  owns the complete internal call/access graph reachable from all four pure
+  roots, including renderer leaves, cleanup binding/rederivation helpers, and
+  representability case dispatch.
+
+The V2 static manifest binds these two V2 inventories. A V2 cohort may not
+point at `provider_authority_v1/renderer_artifact_inventory.json`, use the V1
+config-access inventory, or claim V2 construction from the four-handler-only V1
+callable inventory. The immutable image/source qualification, installed bytes,
+V2 artifact inventory, V2 callable inventory, capsule renderer references, and
+native V2 config-access inventory must all agree before a complete response is
+representable. This is an additive V2 boundary; it does not rename or mutate
+the five shipped leaf formats.
 
 ### Packaged candidate renderer artifact formats
 
@@ -2418,6 +2853,93 @@ matching launch cleanup target, complete or partial, in the new down execution
 capsule and stores its hash in the indexed plan. A conflicting second value is
 corruption and cannot replace the first.
 
+Live V2 code has one construction boundary for that value. The public pure root
+`sky.serve.resource_action_cleanup_v2.rederive_provider_kubernetes_cleanup_target_v2()`
+accepts no caller-supplied cleanup target. Its sole input union is:
+
+```text
+ProviderKubernetesCleanupClusterRowObservationV2 = {
+  version: 2,
+  cluster_name: Text,
+  cluster_record_uuid: UUID,
+  disposition: "exact_handle" | "not_found",
+  handle: ProviderKubernetesHandleV1 | null,
+  observed_at: UtcTimestamp
+}
+
+ProviderKubernetesCompletedCleanupRederivationInputV2 = {
+  version: 2,
+  source: "completed_launch",
+  basis: CompletedLaunchBasisV1,
+  source_object_plans: [ProviderKubernetesObjectPlanV1],  # exact three
+  cluster_row: ProviderKubernetesCleanupClusterRowObservationV2
+}
+
+ProviderKubernetesPartialCleanupRederivationInputV2 = {
+  version: 2,
+  source: "partial_launch_cleanup",
+  basis: PartialLaunchCleanupBasisV1,
+  source_object_plans: [ProviderKubernetesObjectPlanV1],  # exact three
+  source_progress: ProviderLifecycleProgressV1,
+  source_progress_revision: PositiveInteger,
+  source_quiescence: ProviderLaunchSupersessionQuiescenceV1,
+  cluster_row: ProviderKubernetesCleanupClusterRowObservationV2
+}
+
+ProviderKubernetesShadowPartialCleanupRederivationInputV2 = {
+  version: 2,
+  source: "shadow_partial_launch_cleanup",
+  basis: ServeShadowPartialLaunchCleanupBasisV1,
+  source_object_plans: [ProviderKubernetesObjectPlanV1],  # exact three
+  source_progress: ProviderShadowLifecycleProgressV1,
+  source_progress_revision: PositiveInteger,
+  source_quiescence: ProviderShadowLaunchSupersessionQuiescenceV1,
+  source_terminal_history: ProviderShadowRequestTerminalHistoryV2,
+  cluster_row: ProviderKubernetesCleanupClusterRowObservationV2
+}
+```
+
+The cluster observation requires a nonnull byte-equal same-UUID handle exactly
+for `exact_handle` and null exactly for locked NotFound; its timestamp is the
+preparation-frozen target `observed_at`. The completed basis supplies the
+complete resolved target and launch handle. The action partial input supplies
+the exact API006 cursor/revision and reducer-owned quiescence. The shadow
+partial input instead supplies the exact class-10 history cursor/revision,
+shadow quiescence, and class-17 receipt; no parser accepts one source shape as
+the other.
+
+The cleanup-rederivation input is a transient typed join of separately bounded
+retained preimages. It is never one wire value, database value, rendered
+capsule, or provider request, so its aggregate canonical encoding does not use
+the generic 65,536-byte stored/wire-object ceiling; a candidate-maximal partial
+input may exceed that ceiling. Every child retains its existing closed parser
+and byte bound, the union has an exact key set and exactly three plans, and the
+rederived cleanup target and every persisted/wire result remain subject to
+their unchanged bounds. This narrow aggregate exemption cannot relax the
+60,000-byte qualification budget or any 65,536-byte capsule/envelope limit.
+
+It reconstructs all three `ProviderKubernetesCleanupObjectV1` entries from the
+source plans plus committed UID/allocation evidence, then constructs the sole
+`ProviderKubernetesCleanupTargetV1`. It reads no database, clock, Kubernetes
+client, ambient config, or supplied target; transaction adapters own those
+reads and pass only the typed preimages. Rederivation never refreshes
+`observed_at`.
+
+`validate_provider_kubernetes_cleanup_target_binding_v2()` is the one shared
+pure basis/target binding leaf used by the V2 preflight-seed decoder, down-
+capsule constructor, preflight response validator, and rederiver. No duplicate
+V2 binding implementation remains in the action or V2 wire module. The frozen
+V1 graph may retain its existing V1-local validator for Serve034 history and
+cleanup; it is not imported or called as live V2 construction authority. The optimistic
+manager preparation, complete preflight evaluation, locked down admission, and
+immediate pre-I/O reauthorization all call the same rederiver; the last three
+byte-compare its output with the sole seed/capsule copy and recompute the basis,
+cleanup-target, plan, and capsule hashes. Only the transaction adapters may
+assert that a source row or NotFound observation was locked. Static tests may
+parse fixture targets, but no other production function may construct a live
+V2 cleanup target. This is the cleanup rederivation boundary covered by the
+V2 callable and config-access inventories above.
+
 For `pod_cluster_v1`, every resolved or partial object collection contains
 exactly three role-keyed entries in canonical order
 `head_ssh_service, head_service, head_pod`; sequence and role must match that
@@ -2605,7 +3127,74 @@ ProviderDownProgressV1 = one of:
    delete_target: ProviderKubernetesDeleteTargetV1,
    absence_observation: ProviderLifecycleObservationV1,
    handle_removal: ProviderClusterRecordRemovalEvidenceV1}
+
+ProviderShadowLaunchEffectClaimV1 = {
+  version: 1,
+  decision_id: UUID,
+  request_sequence: PositiveInteger,
+  logical_attempt: PositiveInteger,
+  request_role: "PRIMARY_LAUNCH",
+  request_id: UUID,
+  request_execution_generation: 1,
+  worker_attestation: ProviderAuthorityWorkerAttemptAttestationV1,
+  worker_attestation_sha256: Sha256
+}
+
+ProviderShadowLaunchCommittedEffectEvidenceV1 =
+  the exact closed ProviderLaunchCommittedEffectEvidenceV1 union with every
+  recursive ProviderLaunchEffectClaimV1 leaf replaced by
+  ProviderShadowLaunchEffectClaimV1
+
+ProviderShadowLaunchProgressV1 =
+  the exact closed ProviderLaunchProgressV1 phase union with every
+  ProviderLaunchEffectClaimV1 leaf and every
+  ProviderLaunchCommittedEffectEvidenceV1 child recursively replaced by the
+  two shadow types above
+
+ProviderShadowLifecycleProgressV1 = {
+  version: 1,
+  cursor: ProviderShadowLaunchProgressV1 | ProviderDownProgressV1,
+  worker_attestation: null | ProviderAuthorityWorkerAttemptAttestationV1
+}
+
+ProviderShadowLaunchNoEffectResolutionV1 =
+  the exact closed ProviderLaunchNoEffectResolutionV1 union with both
+  intent_origin and resolution_origin replaced by
+  ProviderShadowLaunchEffectClaimV1
+
+ProviderShadowLaunchEffectQuiescenceV1 =
+  the exact closed ProviderLaunchEffectQuiescenceV1 union with every recursive
+  action claim/committed-evidence/no-effect leaf replaced by its shadow sibling
+
+ProviderShadowLaunchSupersessionQuiescenceV1 = {
+  version: 1,
+  launch_decision_id: UUID,
+  launch_request_sequence: PositiveInteger,
+  launch_logical_attempt: PositiveInteger,
+  request_id: UUID,
+  request_terminal_state: "SUCCEEDED",
+  active_claim: false,
+  shadow_handler_terminal_result_sha256: Sha256,
+  launch_provider_cursor_sha256: Sha256,
+  effects: [ProviderShadowLaunchEffectQuiescenceV1],
+  settled_at: UtcTimestamp
+}
 ```
+
+The `the exact closed ... replaced` notation above is a schema definition, not
+a permissive runtime generic. It preserves every key, discriminator, phase,
+effect sequence, evidence body, list bound, and hash rule of the named action
+type and substitutes only the recursively named identity leaf. Generated strict
+parsers have separate concrete shadow classes and cross-reject action-shaped
+origins. Shadow origin order is lexicographic
+`(logical_attempt, request_sequence, request_execution_generation)`. A carried
+origin point-loads the retained predecessor child plus execution history; a
+later claim may exact-adopt committed evidence but can never resolve an older
+claim's intent as no-effect. The Skylet submission key remains the real
+`decision_id`/`would_be_action_id`, never an invented action attempt. Down has
+no action-origin leaf and may reuse its structural cursor only under the
+shadow-context validator, which binds the parent, child, invocation, history,
+and current worker authority.
 
 `ProviderKubernetesHandleV1.cluster_name_on_cloud` is byte-equal to the
 enclosing requested target's nonnull
@@ -2733,10 +3322,10 @@ resolved target, intended/committed handle, job identity, and absence evidence
 cannot be erased or changed; only the permitted unknown-to-committed and
 allocation-append transitions exist. Provider failure does not invent a
 `BLOCKED` cursor phase: the typed attempt/action outcome blocks while retaining
-the last safe cursor. The envelope's worker attestation is attempt-scoped. A
-newer fenced request execution generation may replace it; within one generation
-only the write-once `after: null -> exact identity` completion is legal. A
-carried cursor can have null attestation before the new request is claimed, but
+the last safe cursor. The envelope's worker attestation is attempt-scoped. Its
+request has exactly one generation-one claim, within which only the write-once
+`after: null -> exact identity` completion is legal. A carried cursor in a new
+attempt can have null attestation before that request is claimed, but
 every pre-I/O intent and post-I/O evidence commit requires the current exact
 attestation and its per-effect revalidation. This snapshot is a recovery
 cursor, not a queue, lease, or generic child workflow.
@@ -2771,12 +3360,14 @@ max-plus-one. Provider code never widens, wraps, or resets that counter.
 Provider-authoritative admission runs a pure size enumerator before creating a
 request or permitting provider I/O. The immediate pre-I/O check reruns that
 same versioned enumerator before the first intent/watermark commit. It uses the
-exact frozen launch/cohort preimages plus every exact live registered worker
+exact frozen V2 action/preflight/cohort preimages plus every exact live
+registered worker
 identity and claim/attempt-attestation preimage eligible at that check; only
 still-unknown response-derived leaves and the reachable five-effect origin
-schedule are maximized. It then canonical-renders every v1 launch progress
-shape, every handler no-effect
-resolution/return shape, and every reducer-built quiescence shape. Every
+schedule are maximized. It canonical-renders every launch and down progress
+shape, every complete/not-representable preflight envelope, every handler no-
+effect resolution/return shape, every reducer-built quiescence/outcome, and
+every enclosing V2 capsule/config/invocation/plan/spec shape. Every
 rendered object, not merely its PostgreSQL JSONB stored rendering, must be at
 most 65,536 canonical UTF-8 bytes. Any leaf still lacking a finite protocol
 bound makes the candidate unrepresentable. Oversize or unbounded candidates
@@ -2785,40 +3376,3305 @@ provider-I/O watermark or intent is committed; runtime truncation, origin
 elision, hash-only substitution, and late terminal-result dropping are
 forbidden.
 
-The checked-in golden fixture manifest has both `realistic` and
-`candidate_maximal` members for each of these exact cases:
+The byte ceiling is not a case count. In particular, `65,536` always means the
+maximum canonical UTF-8 bytes for one rendered value or one packaged contract
+file including its required final LF; it never means 65,536 fixtures. Runtime
+and CI use a deliberately one-way bounded artifact DAG. The sixth role of the
+top V2 artifact inventory still points at the existing cohort-bound path
+`provider_authority_v2/representability_case_inventory.json`, but that file is
+now the small closed index below rather than a monolithic `cases` array:
+
+```text
+ProviderResourceActionRepresentabilityCaseInventoryIndexV2 = {
+  version: 2,
+  contract: "provider_resource_action_representability_case_inventory_index_v2",
+  profile: "pod_cluster_v1",
+  shards: [{
+    ordinal: 0 | 1,
+    first_case_sequence: NonnegativeInteger,
+    last_case_sequence: NonnegativeInteger,
+    case_count: PositiveInteger,
+    artifact: ProviderRepoArtifactRefV1
+  }]  # exactly ordinal 0 then 1
+}
+
+ProviderResourceActionRepresentabilityCaseInventoryShardV2 = {
+  version: 2,
+  contract: "provider_resource_action_representability_case_inventory_shard_v2",
+  profile: "pod_cluster_v1",
+  ordinal: 0 | 1,
+  cases: [{
+    sequence: ContiguousNonnegativeInteger,
+    case_id: Text,
+    dispatch_kind: "authoritative_action" | "shadow_candidate",
+    action_kind: "launch" | "down",
+    boundary: "complete_preflight" | "linked_admission" |
+              "claimed_execution" | "pre_io" |
+              "terminalization" | "settlement" |
+              "owner_fenced_transition",
+    payload_kind: "preflight_request" | "preflight_response" |
+                  "cohort" | "worker_identity" |
+                  "attempt_attestation" | "renderer_input" |
+                  "rendered_body" | "cleanup_target" |
+                  "execution_capsule" | "execution_config" |
+                  "invocation" | "plan" | "action_spec" |
+                  "request_input" | "dispatch_membership" |
+                  "execution_authority" |
+                  "terminal_authority_selector" |
+                  "authority_fence_operation" | "progress" |
+                  "no_effect_resolution" | "request_return" |
+                  "quiescence" | "action_outcome" |
+                  "shadow_progress" |
+                  "shadow_request_return" | "shadow_terminal_history" |
+                  "shadow_terminal_commitment" |
+                  "shadow_settlement_commitment" | "shadow_projection" |
+                  "shadow_fallback_evidence" | "shadow_outcome" |
+                  "shadow_retry_decision" | "shadow_observation" |
+                  "shadow_effect_trace" | "shadow_partial_down_basis"
+  }]
+}
+
+ProviderResourceActionRepresentabilityGoldenResultsV2 = {
+  version: 2,
+  contract: "provider_resource_action_representability_golden_results_v2",
+  fixture_name: "realistic" | "candidate_maximal",
+  mode: "current" | "candidate_maximal",
+  case_inventory: ProviderRepoArtifactRefV1,
+  results: [{case_sequence, canonical_byte_count, sha256}]
+}
+
+ProviderResourceActionRepresentabilityGoldenManifestV2 = {
+  version: 2,
+  contract: "provider_resource_action_representability_goldens_v2",
+  artifact_inventory: ProviderRepoArtifactRefV1,
+  case_inventory: ProviderRepoArtifactRefV1,
+  fixture_sets: [
+    {name: "realistic",
+     input: ProviderRepoArtifactRefV1,
+     results: ProviderRepoArtifactRefV1},
+    {name: "candidate_maximal",
+     input: ProviderRepoArtifactRefV1,
+     results: ProviderRepoArtifactRefV1}
+  ]
+}
+```
+
+The index has exactly two descriptors. Their artifact paths are exactly
+`provider_authority_v2/representability_case_inventory/000.json` and
+`provider_authority_v2/representability_case_inventory/001.json`; no alternate
+path or third shard is legal. For the current provisional 366-row set, shard 0
+is exactly sequences `0..182` and shard 1 exactly `183..365`, with 183 rows in
+each. The count is not qualification evidence: only three of seven boundary
+families are implemented, and a final generated-byte audit may change the
+semantic set only after this design, both ranges, and every affected hash are
+updated and re-reviewed.
+
+Each shard's `cases` is nonempty and fully expanded: ranges, regular
+expressions, implicit Cartesian products, and "all enum values" instructions
+are invalid artifact bytes. Concatenation in descriptor order has global
+sequences exactly `0..len(concatenated_cases)-1`, globally unique case IDs, exact descriptor
+ranges/counts, and exact canonical equality to the production enumerator's
+ordered `(case_id, dispatch_kind, action_kind, boundary, payload_kind)` code
+tuple. The index contains no fixture references, payload bytes, result counts,
+or result hashes.
+
+The index, both shards, both fixture inputs, both result files, and the golden
+manifest are packaged canonical JSON artifacts, each independently at most
+65,536 bytes including exactly one final LF. Their loader opens the fixed
+package root once and descriptor-reads each literal descendant without a
+name-based reopen; it rejects absolute paths, `..`, symlinks, non-regular
+files, duplicate descriptors, path substitution, byte/hash mismatch,
+noncanonical JSON/LF bytes, changed descriptor identity, and unreferenced shard
+files. Validation never trusts a path supplied by an artifact outside the two
+closed literal sets.
+
+The separate CI-only golden manifest is exactly
+`sky/serve/resource_action_artifacts/provider_authority_v2/representability_goldens.json`.
+It is generated only after the final V2 artifact-inventory hash exists and is
+not referenced by the cohort static manifest, artifact inventory, callable
+inventory, case index/shards, capsule, or preflight request. Its
+`artifact_inventory` reference must equal the final V2 inventory and its
+`case_inventory` reference must equal that inventory's sixth role.
+The `realistic` input path is exactly
+`sky/serve/resource_action_artifacts/provider_authority_v2/representability/realistic.json`;
+the `candidate_maximal` input path is the same directory's
+`candidate_maximal.json`. Their result paths are exactly the same directory's
+`realistic.results.json` and `candidate_maximal.results.json`. Each result file
+binds its matching fixture name/mode and final case-index reference and contains
+exactly one result for every globally concatenated case in sequence order and
+no other result. Those inputs and results are CI-only, not runtime authority.
+Consequently the graph is acyclic: V2 artifact inventory -> case index -> two
+shards; later golden manifest -> final artifact inventory/case index plus the
+two fixture/result pairs. No cohort-bound artifact points back to the goldens.
+
+The projector input is not an open mapping. The production module defines this
+closed boundary-discriminated union:
+
+```text
+ProviderResourceActionRepresentabilityConstructionV2 =
+  {action_kind: "launch",
+   renderer_input: ProviderKubernetesRendererInputV2,
+   execution_capsule: ProviderKubernetesExecutionCapsuleV2} |
+  {action_kind: "down",
+   capsule_input: ProviderKubernetesDownExecutionCapsuleInputV2,
+   cleanup_rederivation_input:
+       ProviderKubernetesCompletedCleanupRederivationInputV2 |
+       ProviderKubernetesPartialCleanupRederivationInputV2 |
+       ProviderKubernetesShadowPartialCleanupRederivationInputV2,
+   rederived_cleanup_target: ProviderKubernetesCleanupTargetV1,
+   execution_capsule: ProviderKubernetesDownExecutionCapsuleV2}
+
+ProviderResourceActionPreflightRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "complete_preflight",
+  dispatch_kind: "authoritative_action" | "shadow_candidate",
+  action_kind: "launch" | "down",
+  request: ProviderAuthorityPreflightRequestV2,
+  candidate_complete_response: ProviderAuthorityPreflightResponseV2,
+  construction: ProviderResourceActionRepresentabilityConstructionV2,
+  accepted_memberships: [ProviderAuthorityWorkerAcceptedExecutionMembershipV2]
+}
+
+ProviderResourceActionRequestTerminalSnapshotV2 = {
+  request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+  request_finished_at: UtcTimestamp,
+  active_claim: false,
+  request_execution_generation: 0 | 1,
+  request_worker_id: null,
+  handler_name: "serve_resource_action_launch" |
+                "serve_resource_action_down",
+  request_return: null | ServeReplicaActionRequestReturnV1,
+  request_return_sha256: null | Sha256
+}
+
+# Cross-field rules: terminalization clears the complete API007-defined claim triple under API008,
+# so request_worker_id is null even when generation is positive. The immutable
+# selector instead captures the exact pre-update claim worker. A successful
+# authoritative handler return requires that nonnull selector worker and its
+# request/generation/worker attestation to equal the return.
+
+ProviderResourceActionAttemptTerminalAuthoritySelectorV2 = {
+  version: 2,
+  action_id: UUID,
+  attempt: PositiveInteger,
+  request_id: UUID,
+  request_input_sha256: Sha256,
+  request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+  request_execution_generation: 0 | 1,
+  authority_worker_instance_id: null | UUID,
+  worker_instance_id: null | UUID,  # process-unique API claim owner
+  handler_name: "serve_resource_action_launch" |
+                "serve_resource_action_down",
+  authority_disposition: "NO_SUCCESSFUL_CLAIM_START" | "LINEAGE",
+  lineage_generation: null | PositiveInteger,
+  terminal_cause: "HANDLER_RETURN" | "REQUEST_FAILED" |
+                  "REQUEST_CANCELLED" |
+                  "CLAIM_START_NOT_REPRESENTABLE" |
+                  "CLAIM_REAUTHORIZATION_FAILED" |
+                  "TERMINAL_BEFORE_CLAIM_START",
+  request_finished_at: UtcTimestamp
+}
+
+# The parent table is exhaustive: HANDLER_RETURN/LINEAGE/SUCCEEDED;
+# REQUEST_FAILED/LINEAGE/FAILED; REQUEST_CANCELLED/LINEAGE/CANCELLED;
+# CLAIM_START_NOT_REPRESENTABLE/NO_SUCCESSFUL_CLAIM_START/FAILED; or
+# CLAIM_REAUTHORIZATION_FAILED/LINEAGE/FAILED; or
+# TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START/(FAILED|CANCELLED).
+# No other state/disposition/cause tuple parses.
+
+ProviderResourceActionReducerAttemptSnapshotV2 = {
+  action_id: UUID,
+  attempt: PositiveInteger,
+  request_id: UUID,
+  request_terminal_snapshot:
+      null | ProviderResourceActionRequestTerminalSnapshotV2,
+  terminal_authority_selector:
+      null | ProviderResourceActionAttemptTerminalAuthoritySelectorV2,
+  request_input_sha256: Sha256,
+  mutation_boundary: "NOT_STARTED" | "INTENT_COMMITTED" |
+                     "SUBMITTED_OR_AMBIGUOUS" | "SETTLED",
+  provider_io_boundary: "NOT_STARTED" | "INTENT_COMMITTED" |
+                        "SUBMITTED_OR_AMBIGUOUS",
+  provider_progress_revision: NonnegativeInteger,
+  provider_progress: null | ProviderLifecycleProgressV1,
+  provider_progress_sha256: null | Sha256,
+  provider_operation_id: null | Text,
+  typed_outcome: null | ServeReplicaActionOutcomeV1,
+  typed_outcome_sha256: null | Sha256,
+  settled_at: null | UtcTimestamp,
+  historical_authority: [  # 0..RESOURCE_ACTION_ATTEMPT_AUTHORITY_KEYS_MAX_V2
+    ProviderResourceActionExecutionAuthorityLineageV2
+  ]
+}
+
+ProviderResourceActionReducerHistoryProjectionV2 = {
+  version: 2,
+  action_id: UUID,
+  action_kind: "launch" | "down",
+  action_revision: NonnegativeInteger,
+  action_current_attempt: NonnegativeInteger,
+  action_last_result: null | ServeReplicaActionOutcomeV1,
+  action_last_result_sha256: null | Sha256,
+  locked_predecessor: null | ProviderResourceActionReducerAttemptSnapshotV2,
+  locked_current: null | ProviderResourceActionReducerAttemptSnapshotV2,
+  launch_no_io_prefix: null | ServeLaunchNoIoPrefixV1,
+  supersession_quiescence:
+      null | ProviderLaunchSupersessionQuiescenceV1
+}
+
+ProviderResourceActionPreMaterializationActionSnapshotV2 = {
+  action_id: UUID,
+  domain: "serve",
+  resource_type: "replica",
+  resource_identity: ResourceActionIdentityV1,
+  desired_generation: PositiveInteger,
+  action_kind: "launch" | "down",
+  immutable_spec: ServeReplicaActionSpecV2,
+  immutable_spec_sha256: Sha256,
+  kernel_state: "READY",
+  current_attempt: NonnegativeInteger,
+  next_attempt_at: UtcTimestamp,
+  last_result: null | ServeReplicaActionOutcomeV1,
+  last_result_sha256: null | Sha256,
+  terminal_disposition: null,
+  terminal_at: null,
+  revision: PositiveInteger
+}
+
+ProviderResourceActionClaimHandoffFenceV2 = {
+  version: 2,
+  cohort_id: Text,
+  cohort_revision: PositiveInteger,
+  registration_set_revision: PositiveInteger,
+  nonterminal_handoff_id: null,
+  completed_cold_recovery_id: null | UUID,
+  checked_at: UtcTimestamp
+}
+
+ProviderResourceActionReferenceSnapshotV2 = {
+  version: 2,
+  decision_id: UUID,
+  cohort_id: Text,
+  service_hash: UUID,
+  replica_incarnation: UUID,
+  desired_generation: PositiveInteger,
+  action_kind: "launch" | "down",
+  controller_owner_fence: Text,
+  lifecycle_epoch: PositiveInteger,
+  preparation_capability_sha256: Sha256,
+  reference_state: "ACTION_ACTIVE",
+  revision: PositiveInteger
+}
+
+ProviderShadowCandidateReferenceSnapshotV2 = {
+  version: 2,
+  decision_id: UUID,
+  cohort_id: Text,
+  service_hash: UUID,
+  replica_incarnation: UUID,
+  desired_generation: PositiveInteger,
+  action_kind: "launch" | "down",
+  controller_owner_fence: Text,
+  lifecycle_epoch: PositiveInteger,
+  preparation_capability_sha256: Sha256,
+  reference_state: "SHADOW_ACTIVE",
+  revision: PositiveInteger,
+  created_at: UtcTimestamp,
+  bound_at: UtcTimestamp,
+  released_at: null
+}
+
+ProviderResourceActionApiInstanceSnapshotV2 = {
+  version: 2,
+  instance_id: UUID,  # process-unique claim owner; not the Pod UID
+  authority_worker_instance_id: UUID,
+  role: "authority-worker",
+  pod_name: Text,
+  pod_uid: UUID,
+  pod_ip: Text,
+  server_version: Text,
+  started_at: UtcTimestamp,
+  heartbeat_at: UtcTimestamp,
+  draining_at: null,
+  ready: true,
+  health_detail: {
+    phase: "authority-ready-v2",
+    boot_nonce: UUID,
+    authority_worker_instance_id: UUID,
+    execution_owner_sha256: Sha256,
+    pool_generation: PositiveInteger
+  },
+  supported_handlers: [
+    "serve_resource_action_down", "serve_resource_action_launch",
+    "serve_shadow_candidate_down", "serve_shadow_candidate_launch"
+  ],
+  supported_payload_versions:
+      ProviderResourceActionPrivatePayloadVersionInventoryV1
+}
+
+ProviderResourceActionApiInstanceBootstrapSnapshotV2 = {
+  version: 2,
+  instance_id: UUID,
+  authority_worker_instance_id: UUID,
+  role: "authority-worker",
+  pod_name: Text,
+  pod_uid: UUID,
+  pod_ip: Text,
+  server_version: Text,
+  started_at: UtcTimestamp,
+  heartbeat_at: UtcTimestamp,
+  draining_at: null,
+  ready: false,
+  health_detail: {
+    phase: "authority-bootstrap-v2",
+    boot_nonce: UUID,
+    authority_worker_instance_id: UUID,
+    execution_owner_sha256: null,
+    pool_generation: 0
+  },
+  supported_handlers: [
+    "serve_resource_action_down", "serve_resource_action_launch",
+    "serve_shadow_candidate_down", "serve_shadow_candidate_launch"
+  ],
+  supported_payload_versions:
+      ProviderResourceActionPrivatePayloadVersionInventoryV1
+}
+
+The V2 authority API health machine is closed. The only `(phase, ready,
+draining_at, execution_owner_sha256)` shapes are bootstrap
+`("authority-bootstrap-v2", false, null, null)`, bound-but-unwarmed
+`("authority-bound-v2", false, null, Sha256)`, ready
+`("authority-ready-v2", true, null, Sha256)`, transient rewarming
+`("authority-rewarming-v2", false, null, Sha256)`, and draining
+`("authority-draining-v2", false, UtcTimestamp, Sha256)`. The instance/stable
+IDs, Pod name/UID/IP, role, version, stored `started_at`, boot nonce, handlers,
+and payload inventory are immutable. Insert/exact-adopt creates bootstrap;
+BIND/SUPERSEDE atomically changes bootstrap to bound with the installed owner
+hash and `pool_generation=1`; completed initial eager warming changes bound to
+ready without changing that generation. A typed current-owner pool-failure CAS
+changes ready to rewarming while incrementing `pool_generation` exactly one; a
+successful full-pool quiesce/rebuild/warm CAS changes that same generation back
+to ready. Permanent withdrawal changes bound, ready, or rewarming to draining
+without changing the generation. Heartbeat may only advance `heartbeat_at` while repeating
+the current shape, and every row requires
+`started_at <= heartbeat_at < clock_timestamp() + interval '1 second'` plus
+freshness `clock_timestamp() < heartbeat_at + interval '20 seconds'` at an
+authority commit gate. No missing-row recreation, ready/draining recovery edge,
+or other phase/generation edge is legal. Every current-owner API validation
+requires the exact phase matrix below and, in bound/ready/rewarming/draining,
+`health_detail.execution_owner_sha256 == lease.execution_owner_sha256`, plus
+the scalar/JSON/API process and stable-Pod/start equalities.
+
+The phase matrix is exact. Initial activation reads bound rows. Normal same-owner
+lease RENEW accepts bound, ready, rewarming, or draining. A new claim, claim
+renewal, claim-start, progress/pre-I/O CAS, provider effect, or handler return
+requires ready. Handoff OPEN requires a ready survivor and a bootstrap candidate;
+survivor acknowledgement requires ready; completion requires that same ready
+survivor plus the bound candidate. Cold recovery reads either historical owner-
+bound phase for old rows and changes both candidates bootstrap to bound. Initial
+or replacement warming is bound to ready; pool recovery alone is ready to
+rewarming to ready. Same-owner or typed UID/process terminal closure may validate
+the exact historical bound/ready/rewarming/draining owner phase, while revocation
+or removal accepts those same owner-bound phases. GC accepts any unready phase
+only after its independent stale-and-rootless program. Bootstrap never renews,
+claims, acknowledges, terminalizes a generation-one request as its owner, or
+revokes an owned lease. A typed supersession/cold-recovery transaction may lock
+a bootstrap candidate while closing only the prior owners' requests before the
+candidate becomes bound.
+
+Pool recovery is a fenced current-process protocol, not a health toggle. Initial
+bound warm failures remain bound and claimless. A failure after ready locks
+cohort -> handoff -> current lease -> API row and commits ready-to-rewarming with
+generation + 1 before killing/joining the full pool. Claims and effects use that
+same prefix and require ready. The supervisor closes every already-committed
+current-owner request through its exact post-claim-failure or pending-intent
+owner-ack path, rebuilds and proves the fixed distinct-child set, then a second
+prefix transaction requires zero active rows owned by the process and commits
+rewarming-to-ready at the same generation. Lost acknowledgement adopts only the
+exact phase/generation/owner bytes. Failure stays unready or exits the container;
+draining never returns.
+
+ProviderResourceActionPrivatePayloadVersionInventoryV1 = {
+  "pydantic-json": {minimum: 1, maximum: 1}
+}
+
+ProviderResourceActionRequestClaimSnapshotV2 = {
+  version: 2,
+  request_id: UUID,
+  status: "RUNNING",
+  request_execution_generation: 1,
+  authority_worker_instance_id: UUID,
+  worker_instance_id: UUID,  # equals api_instance.instance_id
+  claim_token_sha256: Sha256,
+  controller_generation: null,
+  lease_expires_at: UtcTimestamp,
+  heartbeat_at: UtcTimestamp,
+  cancel_requested_at: null,
+  cancel_acknowledged_at: null,
+  delivery_state: "claimed",
+  claim_generation: 1,
+  queue_priority: 0
+}
+
+ProviderResourceActionDispatchMembershipV2 = {
+  version: 2,
+  registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  accepted_membership: ProviderAuthorityWorkerAcceptedExecutionMembershipV2,
+  handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+  reference: ProviderResourceActionReferenceSnapshotV2,
+  api_instance: ProviderResourceActionApiInstanceSnapshotV2,
+  request_claim: ProviderResourceActionRequestClaimSnapshotV2
+}
+
+ProviderShadowCandidateDispatchMembershipV2 = {
+  version: 2,
+  registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  accepted_membership: ProviderAuthorityWorkerAcceptedExecutionMembershipV2,
+  handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+  reference: ProviderShadowCandidateReferenceSnapshotV2,
+  api_instance: ProviderResourceActionApiInstanceSnapshotV2,
+  request_claim: ProviderResourceActionRequestClaimSnapshotV2
+}
+
+ProviderExecutionAuthorityProofV2 = {
+  version: 2,
+  schema_heads: AuthoritySchemaHeadsV2,
+  service_hash: UUID,
+  policy_epoch: UUID,
+  policy_sha256: Sha256,
+  authority_binding_sha256: Sha256,
+  policy_admission_state: "OPEN" | "DRAINING",
+  policy_admission_revision: PositiveInteger,
+  action_id: UUID,
+  action_kind: "launch" | "down",
+  immutable_spec_sha256: Sha256,
+  resolved_cohort: ProviderAuthorityWorkerCohortV2,
+  registration_set_sha256: Sha256,
+  cohort_id: Text,
+  deployment_uid: Text,
+  reference_revision: PositiveInteger,
+  api_instance_started_at: UtcTimestamp,
+  api_instance_heartbeat_at: UtcTimestamp,
+  preflight_request_sha256: Sha256,
+  preflight_response_sha256: Sha256,
+  representability_case_inventory_sha256: Sha256
+}
+
+ProviderShadowExecutionAuthorityProofV2 = {
+  version: 2,
+  schema_heads: AuthoritySchemaHeadsV2,
+  service_hash: UUID,
+  candidate_since: UtcTimestamp,
+  decision_id: UUID,
+  request_sequence: PositiveInteger,
+  logical_attempt: PositiveInteger,
+  request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+  action_kind: "launch" | "down",
+  immutable_spec_sha256: Sha256,
+  invocation_sha256: Sha256,
+  resolved_cohort: ProviderAuthorityWorkerCohortV2,
+  registration_set_sha256: Sha256,
+  cohort_id: Text,
+  deployment_uid: Text,
+  reference_revision: PositiveInteger,
+  api_instance_started_at: UtcTimestamp,
+  api_instance_heartbeat_at: UtcTimestamp,
+  preflight_request_sha256: Sha256,
+  preflight_response_sha256: Sha256,
+  representability_case_inventory_sha256: Sha256
+}
+
+ProviderResourceActionExecutionAuthorityLineageV2 = {
+  version: 2,
+  action_id: UUID,
+  attempt: PositiveInteger,
+  request_id: UUID,
+  request_input_sha256: Sha256,
+  request_execution_generation: 1,
+  authority_worker_instance_id: UUID,
+  worker_instance_id: UUID,  # process-unique API claim owner
+  claim_token_sha256: Sha256,
+  controller_generation: null,
+  service_hash: UUID,
+  policy_epoch: UUID,
+  policy_sha256: Sha256,
+  authority_binding_sha256: Sha256,
+  policy_admission_state: "OPEN" | "DRAINING",
+  policy_admission_revision: PositiveInteger,
+  cohort_id: Text,
+  cohort_revision: PositiveInteger,
+  registration_set_revision: PositiveInteger,
+  worker_lease_revision: PositiveInteger,
+  reference_revision: PositiveInteger,
+  api_instance_started_at: UtcTimestamp,
+  api_instance_heartbeat_at: UtcTimestamp,
+  dispatch_membership: ProviderResourceActionDispatchMembershipV2,
+  dispatch_membership_sha256: Sha256,
+  execution_authority: ProviderExecutionAuthorityProofV2,
+  execution_authority_sha256: Sha256,
+  authorized_at: UtcTimestamp
+}
+
+The shadow membership/proof pair is a closed action-free sibling, not a
+nullable action proof. Its reference is exactly `SHADOW_ACTIVE`; its decision,
+sequence, logical attempt, primary role, kind, spec/invocation, cohort,
+Deployment, API process/stable owner, request claim, and fresh preflight bytes
+cross-equal the locked parent/child/history/request graph. It contains no policy
+epoch, action attempt, API006 progress, or cleanup-child union member. The
+canonical shadow execution-lineage hash is computed over exactly
+`{version:1, decision_id, request_sequence, request_id,
+request_input_sha256, request_execution_generation,
+authority_worker_instance_id, worker_instance_id, claim_token_sha256,
+dispatch_membership_sha256, execution_authority_sha256, authorized_at}` in that
+field order. It is historical identity, not a row or bearer capability, and is
+stored only after both independently bounded proof/hash pairs validate.
+
+`OPEN` is the sole admission state for creating a new authoritative reference/
+action root. A private-shadow decision carries no authority-policy tuple and is
+instead admitted only while the locked service remains `shadow` under the exact
+current candidate epoch/binding and accepted cohort activation proof. `OPEN |
+DRAINING` is the closed current-execution union only for an action and
+`ACTION_ACTIVE` reference already byte-bound to that exact policy before its
+admission-state CAS. Such bound work may create its deterministic current-
+attempt request as continuation history--including attempt one after an action
+was admitted but before any request existed--then claim, claim-start, checkpoint, perform
+provider I/O, and return so rotation can drain. That retry materialization must
+preserve the existing action/reference/policy binding and may not create a new
+authoritative reference/action or independent request root. The proof
+records the current state/revision. `CLOSED | SUPERSEDED` authorizes no current
+execution, and no `DRAINING` proof can admit a new authority root.
+
+Every V2 claim-token hash in the request snapshot, lineage, selector context,
+handoff fence, or cold-recovery fence is exactly lowercase
+`SHA256(canonical-lowercase-UUID-text encoded as UTF-8)`. Hashing UUID binary,
+canonical JSON, uppercase text, or any alternate token spelling is invalid.
+The authority-worker Helm template injects nonempty `POD_IP` from the
+`status.podIP` downward-API field alongside Pod name/namespace/UID; the API
+instance writer persists that exact canonical IP. Before publishing request
+readiness it uses a fresh random `SKYPILOT_API_SERVER_INSTANCE_ID` for this
+Python/container start, binds it to the stable Pod-UID authority worker through
+the exact lease V2 execution owner, and writes exactly `ready=true`, null
+`draining_at`, and the closed health detail above. Reusing the Pod UID as the
+API instance ID is invalid. The claimed-execution reader
+requires those exact values; the historical `preflight-only` shape remains
+bootstrap-only and cannot satisfy V2 dispatch.
+
+ProviderResourceActionAdmissionRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "linked_admission",
+  dispatch_kind: "authoritative_action",
+  action_kind: "launch" | "down",
+  request: ProviderAuthorityPreflightRequestV2,
+  complete_response: ProviderAuthorityPreflightResponseV2,
+  locked_action: ProviderResourceActionPreMaterializationActionSnapshotV2,
+  registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+  accepted_memberships: [ProviderAuthorityWorkerAcceptedExecutionMembershipV2],
+  accepted_api_instances: [ProviderResourceActionApiInstanceSnapshotV2],
+      # exactly two, index-aligned with accepted_memberships
+  database_now: UtcTimestamp,
+  next_attempt: PositiveInteger,
+  deterministic_request_id: UUID,
+  request_input: ResourceActionRequestInputV1,
+  request_input_sha256: Sha256,
+  reducer_history: ProviderResourceActionReducerHistoryProjectionV2
+}
+
+ProviderResourceActionPostMaterializationActionSnapshotV2 = {
+  action_id: UUID,
+  domain: "serve",
+  resource_type: "replica",
+  resource_identity: ResourceActionIdentityV1,
+  desired_generation: PositiveInteger,
+  action_kind: "launch" | "down",
+  immutable_spec: ServeReplicaActionSpecV2,
+  immutable_spec_sha256: Sha256,
+  kernel_state: "QUEUED",
+  current_attempt: PositiveInteger,
+  next_attempt_at: null,
+  last_result: null | ServeReplicaActionOutcomeV1,
+  last_result_sha256: null | Sha256,
+  terminal_disposition: null,
+  terminal_at: null,
+  revision: PositiveInteger
+}
+
+ProviderResourceActionPostMaterializationProjectionV2 = {
+  version: 2,
+  action: ProviderResourceActionPostMaterializationActionSnapshotV2,
+  attempt: ProviderResourceActionReducerAttemptSnapshotV2,
+  request_input: ResourceActionRequestInputV1,
+  request_input_sha256: Sha256,
+  reducer_history: ProviderResourceActionReducerHistoryProjectionV2
+}
+
+ProviderResourceActionClaimedExecutionRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "claimed_execution",
+  dispatch_kind: "authoritative_action",
+  action_kind: "launch" | "down",
+  action_id: UUID,
+  stored_spec: ServeReplicaActionSpecV2,
+  resolved_cohort: ProviderAuthorityWorkerCohortV2,
+  accepted_membership: ProviderAuthorityWorkerAcceptedExecutionMembershipV2,
+  attempt: PositiveInteger,
+  request_id: UUID,
+  request_execution_generation: 1,
+  current_progress: null | ProviderLifecycleProgressV1,
+  worker_attestation: ProviderAuthorityWorkerAttemptAttestationV1,
+  database_now: UtcTimestamp,
+  lineage_disposition: "candidate_insert" | "stored_adoption",
+  execution_authority_lineage:
+      ProviderResourceActionExecutionAuthorityLineageV2,
+  reducer_history: ProviderResourceActionReducerHistoryProjectionV2
+}
+
+ProviderResourceActionPreIoRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "pre_io",
+  dispatch_kind: "authoritative_action",
+  action_kind: "launch" | "down",
+  action_id: UUID,
+  stored_spec: ServeReplicaActionSpecV2,
+  resolved_cohort: ProviderAuthorityWorkerCohortV2,
+  accepted_membership: ProviderAuthorityWorkerAcceptedExecutionMembershipV2,
+  attempt: PositiveInteger,
+  request_id: UUID,
+  request_execution_generation: 1,
+  current_progress: null | ProviderLifecycleProgressV1,
+  worker_attestation: ProviderAuthorityWorkerAttemptAttestationV1,
+  execution_authority_lineage:
+      ProviderResourceActionExecutionAuthorityLineageV2,
+  reducer_history: ProviderResourceActionReducerHistoryProjectionV2
+}
+
+ProviderShadowLinkedAdmissionPermanentFailureV2 = {
+  failure_kind: "unbounded" | "oversized" | "unsupported",
+  case_sequence: NonnegativeInteger,
+  case_id: Text,
+  payload_kind: Text,
+  mode: "current" | "candidate_maximal",
+  canonical_byte_count: null | PositiveInteger
+}
+
+ProviderShadowLinkedAdmissionFallbackCommitmentV1 = {
+  version: 1,
+  operation_id: UUID,
+  decision_id: UUID,
+  deterministic_request_id: UUID,
+  initial_admission_source_sha256: Sha256,
+  production_failure: ProviderShadowLinkedAdmissionPermanentFailureV2,
+  production_failure_sha256: Sha256,
+  committed_at: UtcTimestamp
+}
+
+ProviderShadowLinkedAdmissionFallbackReceiptV1 = {
+  commitment: ProviderShadowLinkedAdmissionFallbackCommitmentV1,
+  commitment_sha256: Sha256
+}
+
+ProviderShadowLinkedAdmissionFallbackProgressCommitmentV1 = one of:
+  {version: 1,
+   progress_kind: "LEGACY_PRE_SUBMIT",
+   decision_id: UUID,
+   fallback_operation_id: UUID,
+   progress_operation_id: UUID,
+   fallback_commitment_sha256: Sha256,
+   first_request_sequence: 1,
+   first_child_invocation_sha256: Sha256,
+   first_child_admitted_at: UtcTimestamp,
+   parent_revision_at_progress: PositiveInteger,
+   reference_revision_at_progress: PositiveInteger,
+   progressed_at: UtcTimestamp}
+  {version: 1,
+   progress_kind: "TERMINAL_NO_CALL_RELEASE",
+   decision_id: UUID,
+   fallback_operation_id: UUID,
+   progress_operation_id: UUID,
+   fallback_commitment_sha256: Sha256,
+   terminal_parent_phase: "ABANDONED_PRE_SUBMIT",
+   capacity_release_operation_id: UUID,
+   parent_revision_at_progress: PositiveInteger,
+   released_reference_revision: PositiveInteger,
+   progressed_at: UtcTimestamp}
+
+ProviderShadowLinkedAdmissionFallbackProgressReceiptV1 = {
+  commitment: ProviderShadowLinkedAdmissionFallbackProgressCommitmentV1,
+  commitment_sha256: Sha256
+}
+
+# `initial_admission_source_sha256` names the complete canonical bytes of the
+# exact `initial_candidate_insert` source, including its original database
+# time, preflight, accepted memberships/API instances, and request input. The
+# failure hash names the adjacent complete typed failure. This deliberately
+# permanent, bounded commitment is the only information discarded by the
+# PENDING_SELECTION/PREPARING -> LEGACY_CONTROLLER/SHADOW_ACTIVE transition;
+# it permits an unknown-commit caller retaining the original root to distinguish
+# exact adoption from a different legal winner after mutable authority rows
+# advance. A hash without this typed commitment row is never adoption evidence.
+
+ProviderShadowRepresentedParentSnapshotV2 = {
+  version: 2,
+  decision_id: UUID,
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  replica_id: NonnegativeInteger,
+  replica_incarnation: UUID,
+  desired_generation: PositiveInteger,
+  action_kind: "launch" | "down",
+  resource_identity: ResourceActionIdentityV1,
+  immutable_spec: ServeReplicaActionSpecV2,
+  immutable_spec_sha256: Sha256,
+  provider_plan: ProviderLifecyclePlanV2,
+  provider_plan_sha256: Sha256,
+  profile_eligibility: "ELIGIBLE",
+  execution_route: "PENDING_SELECTION" | "LEGACY_CONTROLLER" |
+                   "PRIVATE_API_REQUEST",
+  private_fallback_reason: null | "linked_admission_not_representable",
+  private_fallback_evidence:
+      null | ProviderShadowLinkedAdmissionFallbackCommitmentV1,
+  private_fallback_evidence_sha256: null | Sha256,
+  phase: "PENDING" | "RUNNING",
+  legacy_projection: null,
+  legacy_projection_sha256: null,
+  proposed_projection: null,
+  proposed_projection_sha256: null,
+  parity_class: "PENDING",
+  revision: PositiveInteger,
+  created_at: UtcTimestamp,
+  updated_at: UtcTimestamp,
+  completed_at: null
+}
+
+ProviderShadowCompletedParentProjectionV2 = {
+  version: 2,
+  decision_id: UUID,
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  replica_id: NonnegativeInteger,
+  replica_incarnation: UUID,
+  desired_generation: PositiveInteger,
+  action_kind: "launch" | "down",
+  resource_identity: ResourceActionIdentityV1,
+  immutable_spec: ServeReplicaActionSpecV2,
+  immutable_spec_sha256: Sha256,
+  provider_plan: ProviderLifecyclePlanV2,
+  provider_plan_sha256: Sha256,
+  profile_eligibility: "ELIGIBLE",
+  execution_route: "LEGACY_CONTROLLER" | "PRIVATE_API_REQUEST",
+  private_fallback_reason: null | "linked_admission_not_representable",
+  private_fallback_evidence:
+      null | ProviderShadowLinkedAdmissionFallbackCommitmentV1,
+  private_fallback_evidence_sha256: null | Sha256,
+  phase: "COMPLETE",
+  legacy_projection: ServeShadowProjectionV1,
+  legacy_projection_sha256: Sha256,
+  proposed_projection: ServeShadowProjectionV1,
+  proposed_projection_sha256: Sha256,
+  parity_class: "MATCH" | "IDENTITY_MISMATCH" |
+                "PLACEMENT_MISMATCH" | "SUBMISSION_CERTAINTY_MISMATCH" |
+                "OPERATION_ID_MISMATCH" | "RETRY_MISMATCH" |
+                "OBSERVATION_MISMATCH" | "TERMINAL_MISMATCH" |
+                "UNSUPPORTED_PROVIDER_PROFILE",
+  revision: PositiveInteger,
+  created_at: UtcTimestamp,
+  updated_at: UtcTimestamp,
+  completed_at: UtcTimestamp
+}
+
+ProviderShadowParentSnapshotV2 =
+    ProviderShadowRepresentedParentSnapshotV2 |
+    ProviderShadowCompletedParentProjectionV2
+
+`PENDING_SELECTION` is legal only on a `PENDING` parent with all three fallback
+members null and no descendant. Successful initial linked admission atomically changes
+it to `PRIVATE_API_REQUEST/RUNNING`; permanent pre-write representability
+fallback atomically changes it to
+`LEGACY_CONTROLLER/RUNNING/linked_admission_not_representable`. Ordinary legacy
+parents use `LEGACY_CONTROLLER` with all three fallback members null. A fallback
+legacy parent requires the nonnull reason plus one hash-valid typed commitment;
+`PRIVATE_API_REQUEST` requires all three null. `PRIVATE_API_REQUEST` and
+`LEGACY_CONTROLLER` cross-require private-history and legacy child shapes,
+respectively; no transition between them is legal after the first child exists.
+
+ProviderShadowRawExecutionHistorySnapshotV2 =
+    the exact flat storage projection of ProviderShadowExecutionHistoryV1 with
+    `provider_progress` replaced by
+    `provider_progress_raw: null | CanonicalJsonObject`. The outer row must
+    still have valid identity, handler, request/input, the immutable nonnull
+    `preflight_request`/`preflight_request_sha256` and
+    `preflight_response`/`preflight_response_sha256` pairs, enum, counter,
+    authority-bundle, strict provider-effect-trace/hash pair,
+    terminal-receipt, return, settlement, timestamp, and
+    per-column 65,536-byte/lowercase-hash shapes. It deliberately does not
+    require the raw progress object to decode as
+    ProviderShadowLifecycleProgressV1 or to agree with its declared hash,
+    revision, watermark, or operation ID.
+
+ProviderShadowJournalClassificationV2 = one of:
+  {journal_class: "not_started_empty",
+   typed_progress: null}
+  {journal_class: "valid_nonterminal" | "valid_succeeded",
+   typed_progress: ProviderShadowLifecycleProgressV1}
+  {journal_class: "invalid",
+   typed_progress: null}
+
+The sole raw-shadow-journal classifier consumes the raw snapshot and produces
+exactly this union. Execution admission, claim authorization, progress, pre-I/O,
+and handler return accept only a strict ProviderShadowExecutionHistoryV1 and
+therefore cannot run on `invalid`. Terminalization, settlement, settled replay,
+retention, and GC accept the raw storage snapshot; `X` preserves the raw bytes
+and declared hash/revision in place while storing only bounded fallback/outcome
+children. An invalid outer identity/authority/settlement shape remains
+quarantined corruption and is not the typed `invalid` journal case.
+
+For an `X` settlement, `candidate_settled_history` byte-copies the raw progress
+object, declared hash/revision, watermark, and operation ID and changes only the
+independently derived terminal-receipt/settlement fields. That output is parsed
+as `ProviderShadowRawExecutionHistorySnapshotV2`, never forced through the
+strict progress codec and never normalized. Every other executable or settled
+history must strict-decode. Once the classifier returns `invalid`, the exact
+historical-origin source list is empty: raw fragments that resemble an origin
+are never parsed or accepted as authority, and `X` blocks with no successor.
+
+ProviderShadowBoundChildProjectionV2 = {
+  version: 2,
+  decision_id: UUID,
+  request_sequence: PositiveInteger,
+  logical_attempt: PositiveInteger,
+  request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+  action_kind: "launch" | "down",
+  planned_execution_kind: "private_api_request",
+  phase: "REQUEST_BOUND",
+  request_id: UUID,
+  invocation: ProviderLifecycleInvocationV2,
+  invocation_sha256: Sha256,
+  immutable_payload_sha256: Sha256,
+  provider_operation_id: null,
+  actual_outcome: null,
+  actual_outcome_sha256: null,
+  proposed_outcome: null,
+  proposed_outcome_sha256: null,
+  retry_decision: null,
+  retry_decision_sha256: null,
+  pre_observation: null,
+  pre_observation_sha256: null,
+  post_observation: null,
+  post_observation_sha256: null,
+  legacy_effect_trace: null,
+  legacy_effect_trace_sha256: null,
+  divergence_class: null,
+  admitted_at: UtcTimestamp,
+  request_bound_at: UtcTimestamp,
+  completed_at: null,
+  updated_at: UtcTimestamp
+}
+
+ProviderShadowCompletedChildProjectionV2 = {
+  version: 2,
+  decision_id: UUID,
+  request_sequence: PositiveInteger,
+  logical_attempt: PositiveInteger,
+  request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+  action_kind: "launch" | "down",
+  planned_execution_kind: "private_api_request",
+  phase: "COMPLETE",
+  request_id: UUID,
+  invocation: ProviderLifecycleInvocationV2,
+  invocation_sha256: Sha256,
+  immutable_payload_sha256: Sha256,
+  provider_operation_id: null | Text,
+  actual_outcome: ServeShadowCandidateOutcomeV1,
+  actual_outcome_sha256: Sha256,
+  proposed_outcome: ServeShadowCandidateOutcomeV1,
+  proposed_outcome_sha256: Sha256,
+  retry_decision: ServeShadowRetryDecisionV1,
+  retry_decision_sha256: Sha256,
+  pre_observation: null | ProviderLifecycleObservationV1,
+  pre_observation_sha256: null | Sha256,
+  post_observation: null | ProviderLifecycleObservationV1,
+  post_observation_sha256: null | Sha256,
+  legacy_effect_trace: LegacyProviderEffectTraceV1,
+  legacy_effect_trace_sha256: Sha256,
+  divergence_class: "MATCH" | "IDENTITY_MISMATCH" |
+                    "PLACEMENT_MISMATCH" |
+                    "SUBMISSION_CERTAINTY_MISMATCH" |
+                    "OPERATION_ID_MISMATCH" | "RETRY_MISMATCH" |
+                    "OBSERVATION_MISMATCH" | "TERMINAL_MISMATCH" |
+                    "UNSUPPORTED_PROVIDER_PROFILE",
+  admitted_at: UtcTimestamp,
+  request_bound_at: UtcTimestamp,
+  completed_at: UtcTimestamp,
+  updated_at: UtcTimestamp
+}
+
+ProviderShadowChildSnapshotV2 = ProviderShadowBoundChildProjectionV2 |
+                                ProviderShadowCompletedChildProjectionV2
+
+PROVIDER_SHADOW_HISTORICAL_ORIGINS_MAX_V2 = 13  # 2 * 5 effects + 3
+
+ProviderShadowSettlementReceiptV1 = {
+  commitment: ProviderShadowSettlementCommitmentV1,
+  commitment_sha256: Sha256
+}
+
+ProviderShadowHistoricalOriginSourceV2 = {
+  origin: ProviderShadowLaunchEffectClaimV1,
+  completed_child: ProviderShadowCompletedChildProjectionV2,
+  settled_history: ProviderShadowExecutionHistoryV1,
+      # strict SETTLED, never X/raw-invalid
+  terminal_history: ProviderShadowRequestTerminalHistoryV2,
+  settlement_receipt: ProviderShadowSettlementReceiptV1,
+  retained_terminal_request: null | ProviderShadowRequestTerminalSnapshotV2
+}
+
+# Each boundary extracts every distinct *prior-request* shadow origin recursively
+# reachable from its current cursor, handler return, no-effect/quiescence
+# evidence, and immediate predecessor. An origin whose decision/sequence/
+# generation equals the enclosing current request is validated directly against
+# the current child/history/attestation and excluded from this list. The prior
+# origins are sorted by the declared order and require this exact 0..13 list: no
+# duplicate, missing, or extra source is legal. Every source
+# point-loads and cross-validates the retained child/history/terminal receipt/
+# settlement receipt. The settlement commitment must bind the same identity,
+# terminal-history hash, settle time, and every locally present successor key.
+# The store-owned same-transaction relational integrity scan validates the
+# remaining original settlement component without embedding an unbounded or
+# recursively expanding graph in this DTO. Request GC
+# changes only the nullable request snapshot.
+
+ProviderShadowCandidateServiceSnapshotV2 = {
+  version: 2,
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  resource_action_mode: "shadow",
+  candidate_since: UtcTimestamp,
+  candidate_epoch: UUID,
+  qualification_policy_sha256: Sha256,
+  qualification_binding_sha256: Sha256,
+  controller_owner_fence: Text,
+  lifecycle_epoch: PositiveInteger
+}
+
+ProviderShadowPreparingReferenceSnapshotV2 =
+    ProviderShadowCandidateReferenceSnapshotV2 with `reference_state`,
+    `bound_at`, and `released_at` replaced by exactly {
+  reference_state: "PREPARING",
+  bound_at: null,
+  released_at: null
+}
+
+ProviderShadowReleasedReferenceSnapshotV2 =
+    ProviderShadowCandidateReferenceSnapshotV2 with `reference_state` and
+    `released_at` replaced by exactly {
+  reference_state: "RELEASED",
+  released_at: UtcTimestamp
+}
+
+ProviderShadowCompletePreflightSourceV2 = {
+  request: ProviderAuthorityPreflightRequestV2,
+  complete_response: ProviderAuthorityPreflightResponseV2
+}
+
+ProviderShadowGenerationZeroRequestQueueSnapshotV2 = {
+  request_id: UUID,
+  request_input: ResourceActionRequestInputV1,
+  request_input_sha256: Sha256,
+  handler_name: "serve_shadow_candidate_launch" |
+                "serve_shadow_candidate_down",
+  private_route: ResourceActionPrivateRouteV1,
+  request_status: "PENDING",
+  request_execution_generation: 0,
+  request_worker_id: null,
+  claim_token_sha256: null,
+  controller_generation: null,
+  claim_lease_expires_at: null,
+  heartbeat_at: null,
+  cancel_requested_at: null,
+  cancel_acknowledged_at: null,
+  delivery_state: "queued",
+  claim_generation: 0,
+  queue_priority: 0,
+  schedule_type: "long",
+  replay_policy: "NEVER",
+  retryable: false,
+  ignore_return_value: false,
+  created_at: UtcTimestamp,
+  updated_at: UtcTimestamp
+}
+
+ProviderShadowAdmissionInsertionProjectionV2 = {
+  version: 2,
+  post_insert_parent: ProviderShadowRepresentedParentSnapshotV2,
+      # exact PRIVATE_API_REQUEST/RUNNING descendant at insertion revision
+  inserted_child: ProviderShadowBoundChildProjectionV2,
+  inserted_history: ProviderShadowExecutionHistoryV1,
+      # exact BOUND insertion bytes
+  inserted_request: ProviderShadowGenerationZeroRequestQueueSnapshotV2,
+  post_insert_reference: ProviderShadowCandidateReferenceSnapshotV2
+}
+
+ProviderShadowRetryPredecessorSourceV2 = {
+  completed_child: ProviderShadowCompletedChildProjectionV2,
+  settled_history: ProviderShadowRawExecutionHistorySnapshotV2,
+  terminal_history: ProviderShadowRequestTerminalHistoryV2,
+  settlement_receipt: ProviderShadowSettlementReceiptV1,
+  retained_terminal_request: null | ProviderShadowRequestTerminalSnapshotV2,
+  historical_shadow_origins: [ProviderShadowHistoricalOriginSourceV2]
+}
+
+ProviderShadowAdmissionRequestDescendantV2 = one of:
+  {descendant_kind: "bound_queued",
+   generation_zero: ProviderShadowGenerationZeroRequestQueueSnapshotV2,
+   claim: null,
+   terminal_request: null,
+   terminal_history: null}
+  {descendant_kind: "authorized_running",
+   generation_zero: null,
+   claim: ProviderResourceActionRequestClaimSnapshotV2,
+   terminal_request: null,
+   terminal_history: null}
+  {descendant_kind: "terminal_request_present",
+   generation_zero: null,
+   claim: null,
+   terminal_request: ProviderShadowRequestTerminalSnapshotV2,
+   terminal_history: ProviderShadowRequestTerminalHistoryV2}
+  {descendant_kind: "terminal_request_gced",
+   generation_zero: null,
+   claim: null,
+   terminal_request: null,
+   terminal_history: ProviderShadowRequestTerminalHistoryV2}
+
+ProviderShadowAdmissionStoredDescendantV2 = {
+  parent: ProviderShadowParentSnapshotV2,
+  child: ProviderShadowChildSnapshotV2,
+  history: ProviderShadowRawExecutionHistorySnapshotV2,
+  settlement_receipt: null | ProviderShadowSettlementReceiptV1,
+  reference: ProviderShadowCandidateReferenceSnapshotV2 |
+             ProviderShadowReleasedReferenceSnapshotV2,
+  request_descendant: ProviderShadowAdmissionRequestDescendantV2,
+  historical_shadow_origins: [ProviderShadowHistoricalOriginSourceV2]
+}
+
+# `settlement_receipt` is nonnull exactly when `history.phase=SETTLED` and is
+# null for BOUND/AUTHORIZED descendants. When nonnull it cross-binds the same
+# decision/sequence, terminal-history hash, stored settle time, and every
+# locally available successor key. A same-transaction store-owned relational
+# scan validates the remaining settlement component; this bounded descendant
+# does not attempt to embed or reconstruct an unbounded recursive graph.
+# Missing or crossed permanent evidence is corruption; a later insertion/
+# adoption cannot treat it as an earlier phase. The same rule applies to every
+# settled retry-predecessor source above.
+
+ProviderShadowAdmissionSourceV2 = one of:
+  {admission_disposition: "initial_candidate_insert",
+   candidate_service: ProviderShadowCandidateServiceSnapshotV2,
+   reference_before: ProviderShadowPreparingReferenceSnapshotV2,
+   locked_parent: ProviderShadowRepresentedParentSnapshotV2,
+       # exact PENDING_SELECTION/PENDING parent
+   predecessor: null,
+   preflight: ProviderShadowCompletePreflightSourceV2,
+   registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+   handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+   accepted_memberships:
+       [ProviderAuthorityWorkerAcceptedExecutionMembershipV2],
+   accepted_api_instances: [ProviderResourceActionApiInstanceSnapshotV2],
+       # exactly two and index-aligned
+   database_now: UtcTimestamp,
+   deterministic_request_id: UUID,
+   request_input: ResourceActionRequestInputV1,
+   request_input_sha256: Sha256}
+  {admission_disposition: "retry_candidate_insert",
+   candidate_service: ProviderShadowCandidateServiceSnapshotV2,
+   reference_before: ProviderShadowCandidateReferenceSnapshotV2,
+   locked_parent: ProviderShadowRepresentedParentSnapshotV2,
+       # exact PRIVATE_API_REQUEST/RUNNING parent
+   predecessor: ProviderShadowRetryPredecessorSourceV2,
+   preflight: ProviderShadowCompletePreflightSourceV2,
+   registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+   handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+   accepted_memberships:
+       [ProviderAuthorityWorkerAcceptedExecutionMembershipV2],
+   accepted_api_instances: [ProviderResourceActionApiInstanceSnapshotV2],
+       # exactly two and index-aligned
+   database_now: UtcTimestamp,
+   deterministic_request_id: UUID,
+   request_input: ResourceActionRequestInputV1,
+   request_input_sha256: Sha256}
+  {admission_disposition: "stored_adoption",
+   stored_descendant: ProviderShadowAdmissionStoredDescendantV2}
+
+ProviderShadowAdmissionRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "linked_admission",
+  dispatch_kind: "shadow_candidate",
+  action_kind: "launch" | "down",
+  source: ProviderShadowAdmissionSourceV2,
+  candidate_projection: ProviderShadowAdmissionInsertionProjectionV2
+}
+
+ProviderShadowInitialAdmissionSourceV2 =
+    the exact `initial_candidate_insert` member of
+    ProviderShadowAdmissionSourceV2
+
+ProviderShadowLinkedAdmissionFallbackAbsenceV2 = {
+  child: true,
+  execution_history: true,
+  private_correlation: true,
+  deterministic_request: true,
+  deterministic_queue: true,
+  fallback_progress_receipt: true
+}
+
+ProviderShadowLegacyFallbackFirstAttemptDescendantV2 = {
+  decision_id: UUID,
+  request_sequence: 1,
+  logical_attempt: 1,
+  request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+  action_kind: "launch" | "down",
+  planned_execution_kind: "api_request" | "legacy_direct_down",
+  phase: "PRE_SUBMIT" | "REQUEST_BOUND" | "COMPLETE" |
+         "ABANDONED_PRE_SUBMIT" | "REQUEST_ASSOCIATION_UNKNOWN",
+  legacy_request_id: null | Text,
+  invocation: ServeShadowAttemptInvocationV1,
+  invocation_sha256: Sha256,
+  provider_operation_id: null | Text,
+  actual_outcome: null | ServeReplicaActionOutcomeV1,
+  actual_outcome_sha256: null | Sha256,
+  proposed_outcome: null | ServeReplicaActionOutcomeV1,
+  proposed_outcome_sha256: null | Sha256,
+  retry_decision: null | ServeShadowRetryDecisionV1,
+  retry_decision_sha256: null | Sha256,
+  pre_observation: null | ProviderLifecycleObservationV1,
+  pre_observation_sha256: null | Sha256,
+  post_observation: null | ProviderLifecycleObservationV1,
+  post_observation_sha256: null | Sha256,
+  legacy_effect_trace: null | LegacyProviderEffectTraceV1,
+  legacy_effect_trace_sha256: null | Sha256,
+  divergence_class: null | "MATCH" | "IDENTITY_MISMATCH" |
+                    "PLACEMENT_MISMATCH" |
+                    "SUBMISSION_CERTAINTY_MISMATCH" |
+                    "OPERATION_ID_MISMATCH" | "RETRY_MISMATCH" |
+                    "OBSERVATION_MISMATCH" | "TERMINAL_MISMATCH" |
+                    "UNSUPPORTED_PROVIDER_PROFILE",
+  admitted_at: UtcTimestamp,
+  request_bound_at: null | UtcTimestamp,
+  completed_at: null | UtcTimestamp,
+  updated_at: UtcTimestamp
+}
+
+# The first child is parent-kind-matched and obeys the complete durable legacy
+# phase/nullability CHECK. It can never be a cleanup child, a private outcome
+# codec, or a later logical attempt; those shapes cannot witness first progress.
+
+ProviderShadowFallbackTerminalParentSnapshotV2 =
+    the same immutable identity/spec/plan/fallback fields as
+    ProviderShadowCompletedParentProjectionV2, with
+    execution_route: "LEGACY_CONTROLLER",
+    phase: "ABANDONED_PRE_SUBMIT" | "AMBIGUOUS",
+    legacy_projection/proposed_projection and their hashes either both complete
+        or both null according to the durable parent CHECK,
+    parity_class: "ABANDONED" | "AMBIGUOUS",
+    completed_at: UtcTimestamp
+
+ProviderShadowFallbackParentDescendantSnapshotV2 =
+    ProviderShadowParentSnapshotV2 |
+    ProviderShadowFallbackTerminalParentSnapshotV2
+
+ProviderShadowLinkedAdmissionPrivateDescendantAbsenceV2 = {
+  execution_history: true,
+  private_correlation: true,
+  deterministic_request: true,
+  deterministic_queue: true
+}
+
+ProviderShadowLinkedAdmissionFallbackGcAbsenceV2 = {
+  decision_id: UUID,
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  replica_id: NonnegativeInteger,
+  replica_incarnation: UUID,
+  desired_generation: PositiveInteger,
+  coverage: true,
+  parent: true,
+  all_children: true,
+  execution_history: true,
+  private_correlation: true,
+  deterministic_request: true,
+  deterministic_queue: true,
+  live_replica_links: true,
+  cleanup_intent: true,
+  reference:
+      {reference_disposition: "released",
+       released_reference: ProviderShadowReleasedReferenceSnapshotV2} |
+      {reference_disposition: "absent", exact_reference_absent: true}
+}
+
+ProviderShadowLinkedAdmissionFallbackReceiptApplicabilityV2 = one of:
+  {applicability: "retained_advanced_graph",
+   progress_receipt:
+       ProviderShadowLinkedAdmissionFallbackProgressReceiptV1,
+   stored_parent: ProviderShadowFallbackParentDescendantSnapshotV2,
+   stored_reference: ProviderShadowCandidateReferenceSnapshotV2 |
+                     ProviderShadowReleasedReferenceSnapshotV2,
+   first_legacy_attempt:
+       null | ProviderShadowLegacyFallbackFirstAttemptDescendantV2,
+   private_descendant_absence:
+       ProviderShadowLinkedAdmissionPrivateDescendantAbsenceV2}
+  {applicability: "typed_graph_gced",
+   progress_receipt:
+       ProviderShadowLinkedAdmissionFallbackProgressReceiptV1,
+   graph_absence: ProviderShadowLinkedAdmissionFallbackGcAbsenceV2}
+
+ProviderShadowLinkedAdmissionFallbackSourceV2 = one of:
+  {fallback_disposition: "new_fallback",
+   initial_admission_source: ProviderShadowInitialAdmissionSourceV2,
+   operation_id: UUID,
+   production_failure: ProviderShadowLinkedAdmissionPermanentFailureV2,
+   locked_absence: ProviderShadowLinkedAdmissionFallbackAbsenceV2}
+  {fallback_disposition: "stored_adoption",
+   caller_initial_admission_source: ProviderShadowInitialAdmissionSourceV2,
+   caller_operation_id: UUID,
+   caller_production_failure:
+       ProviderShadowLinkedAdmissionPermanentFailureV2,
+   stored_parent: ProviderShadowRepresentedParentSnapshotV2,
+       # exact original LEGACY_CONTROLLER/RUNNING fallback post-state
+   stored_reference: ProviderShadowCandidateReferenceSnapshotV2,
+       # exact original SHADOW_ACTIVE fallback post-state
+   locked_absence: ProviderShadowLinkedAdmissionFallbackAbsenceV2,
+   stored_receipt: ProviderShadowLinkedAdmissionFallbackReceiptV1}
+  {fallback_disposition: "receipt_only_adoption",
+   caller_initial_admission_source: ProviderShadowInitialAdmissionSourceV2,
+   caller_operation_id: UUID,
+   caller_production_failure:
+       ProviderShadowLinkedAdmissionPermanentFailureV2,
+   stored_receipt: ProviderShadowLinkedAdmissionFallbackReceiptV1,
+   applicability:
+       ProviderShadowLinkedAdmissionFallbackReceiptApplicabilityV2}
+
+ProviderShadowLinkedAdmissionFallbackProjectionV2 = one of:
+  {fallback_result: "NEWLY_COMMITTED" | "EXACT_ADOPTED_GRAPH",
+   post_fallback_parent: ProviderShadowRepresentedParentSnapshotV2,
+       # exact original LEGACY_CONTROLLER/RUNNING fallback projection
+   post_fallback_reference: ProviderShadowCandidateReferenceSnapshotV2,
+   fallback_receipt: ProviderShadowLinkedAdmissionFallbackReceiptV1}
+  {fallback_result: "EXACT_ADOPTED_RECEIPT",
+   post_fallback_parent: null,
+   post_fallback_reference: null,
+   fallback_receipt: ProviderShadowLinkedAdmissionFallbackReceiptV1}
+  {fallback_result: "LOST_RACE",
+   post_fallback_parent: null,
+   post_fallback_reference: null,
+   fallback_receipt: null}
+
+ProviderShadowLinkedAdmissionFallbackInputV2 = {
+  source: ProviderShadowLinkedAdmissionFallbackSourceV2,
+  candidate_projection: ProviderShadowLinkedAdmissionFallbackProjectionV2
+}
+
+# For `new_fallback`, the validator reruns the complete enumerator and
+# deterministic-first-failure selector against the initial source, requires the
+# exact production failure and locked absences, and derives the permanent
+# commitment, permanent receipt, and both state transitions. `committed_at` equals the source's
+# database time; the operation/decision/request IDs and both adjacent canonical
+# hashes must cross-equal. Retryable drift cannot inhabit this DTO. For
+# graph `stored_adoption`, the validator hashes the caller's retained original
+# source and failure, validates the stored parent's commitment, permanent
+# receipt, exact original RUNNING/LEGACY_CONTROLLER parent and SHADOW_ACTIVE
+# reference post-state, all-descendant absences, and progress-receipt absence,
+# and returns
+# `EXACT_ADOPTED_GRAPH` only on complete equality. That result still releases
+# the decision-keyed idempotent same-cell signal; the first-child CAS prevents
+# duplicate provider entry after an acknowledgement-lost signal. Once a legal legacy child,
+# parent completion, reference release, or any other graph advancement occurs,
+# graph adoption is no longer the right source. The store—not its caller—then
+# selects `receipt_only_adoption` only after the permanent progress receipt
+# cross-validates either the retained first transition descendant or the exact
+# typed-GC absence proof. `LEGACY_PRE_SUBMIT` requires the named first child;
+# `TERMINAL_NO_CALL_RELEASE` requires it null and the exact terminal parent /
+# released-reference transition. The store validates later legacy rows through
+# their typed relational readers without embedding an unbounded inventory in
+# this DTO. Receipt-only adoption compares the same caller preimage directly
+# with the permanent fallback receipt;
+# it returns no parent/reference and never resurrects either. A different
+# internally legal commitment is `LOST_RACE`; a malformed, hash-invalid,
+# partial, or crossed stored state is corruption. Mutable cohort/API advancement
+# after commit is irrelevant to adoption because it is not substituted for the retained root.
+# Candidate projection fields are outputs, never evidence.
+
+ProviderShadowAuthorizationSourceV2 = one of:
+  {authorization_disposition: "candidate_authorization",
+   history_before: ProviderShadowExecutionHistoryV1}
+      # strict BOUND source; no authorization/projection fields are present
+  {authorization_disposition: "stored_adoption",
+   stored_authorized_history: ProviderShadowExecutionHistoryV1}
+      # strict AUTHORIZED source written by an earlier candidate transaction
+
+ProviderShadowAuthorizationProjectionV2 = {
+  authorized_history: ProviderShadowExecutionHistoryV1
+      # strict AUTHORIZED projection, including the builder-derived
+      # dispatch membership, execution proof, lineage hash, and timestamp
+}
+
+ProviderShadowClaimedExecutionRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "claimed_execution",
+  dispatch_kind: "shadow_candidate",
+  action_kind: "launch" | "down",
+  candidate_service: ProviderShadowCandidateServiceSnapshotV2,
+  reference: ProviderShadowCandidateReferenceSnapshotV2,
+  stored_preflight: ProviderShadowCompletePreflightSourceV2,
+  stored_parent: ProviderShadowRepresentedParentSnapshotV2,
+  stored_child: ProviderShadowBoundChildProjectionV2,
+  source: ProviderShadowAuthorizationSourceV2,
+  resolved_cohort: ProviderAuthorityWorkerCohortV2,
+  registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+  accepted_membership: ProviderAuthorityWorkerAcceptedExecutionMembershipV2,
+  api_instance: ProviderResourceActionApiInstanceSnapshotV2,
+  request_claim: ProviderResourceActionRequestClaimSnapshotV2,
+  current_progress: null | ProviderShadowLifecycleProgressV1,
+  historical_shadow_origins: [ProviderShadowHistoricalOriginSourceV2],
+  worker_attestation: ProviderAuthorityWorkerAttemptAttestationV1,
+  database_now: UtcTimestamp,
+  candidate_projection: ProviderShadowAuthorizationProjectionV2
+}
+
+ProviderShadowNextRepresentabilityBoundaryV2 = one of:
+  {boundary_kind: "progress",
+   next_progress: ProviderShadowLifecycleProgressV1,
+   next_effect_trace: LegacyProviderEffectTraceV1,
+   request_return: null}
+  {boundary_kind: "handler_return",
+   next_progress: null | ProviderShadowLifecycleProgressV1,
+   next_effect_trace: LegacyProviderEffectTraceV1,
+   request_return: ServeShadowCandidateRequestReturnV1}
+
+ProviderShadowPreIoRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "pre_io",
+  dispatch_kind: "shadow_candidate",
+  action_kind: "launch" | "down",
+  candidate_service: ProviderShadowCandidateServiceSnapshotV2,
+  reference: ProviderShadowCandidateReferenceSnapshotV2,
+  stored_preflight: ProviderShadowCompletePreflightSourceV2,
+  stored_parent: ProviderShadowRepresentedParentSnapshotV2,
+  stored_child: ProviderShadowBoundChildProjectionV2,
+  authorized_history: ProviderShadowExecutionHistoryV1,
+  resolved_cohort: ProviderAuthorityWorkerCohortV2,
+  registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+  accepted_membership: ProviderAuthorityWorkerAcceptedExecutionMembershipV2,
+  api_instance: ProviderResourceActionApiInstanceSnapshotV2,
+  request_claim: ProviderResourceActionRequestClaimSnapshotV2,
+  current_progress: null | ProviderShadowLifecycleProgressV1,
+  historical_shadow_origins: [ProviderShadowHistoricalOriginSourceV2],
+  worker_attestation: ProviderAuthorityWorkerAttemptAttestationV1,
+  database_now: UtcTimestamp
+}
+
+ProviderShadowRequestTerminalSnapshotV2 = {
+  request_id: UUID,
+  request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+  request_finished_at: UtcTimestamp,
+  request_execution_generation: 0 | 1,
+  active_claim: false,
+  request_worker_id: null,
+  claim_token_sha256: null,
+  controller_generation: null,
+  claim_lease_expires_at: null,
+  heartbeat_at: null,
+  cancel_requested_at: null | UtcTimestamp,
+  cancel_acknowledged_at: null | UtcTimestamp,
+  handler_name: "serve_shadow_candidate_launch" |
+                "serve_shadow_candidate_down",
+  request_return: null | ServeShadowCandidateRequestReturnV1,
+  request_return_sha256: null | Sha256
+}
+
+ProviderShadowGenerationOneTerminalRequestSourceV2 = {
+  version: 2,
+  request_id: UUID,
+  status: "RUNNING",
+  request_execution_generation: 1,
+  authority_worker_instance_id: UUID,
+  worker_instance_id: UUID,
+  claim_token_sha256: Sha256,
+  controller_generation: null,
+  lease_expires_at: UtcTimestamp,
+  heartbeat_at: UtcTimestamp,
+  cancel_requested_at: null | UtcTimestamp,
+  cancel_acknowledged_at: null,
+  delivery_state: "claimed",
+  claim_generation: 1,
+  queue_priority: 0,
+  schedule_type: "long",
+  replay_policy: "NEVER",
+  retryable: false,
+  ignore_return_value: false,
+  created_at: UtcTimestamp,
+  updated_at: UtcTimestamp,
+  request_input: ResourceActionRequestInputV1,
+  request_input_sha256: Sha256,
+  private_route: ResourceActionPrivateRouteV1
+}
+
+ProviderResourceActionGenerationOneTerminalRequestSourceV2 = {
+  version: 2,
+  request_id: UUID,
+  status: "RUNNING",
+  request_execution_generation: 1,
+  authority_worker_instance_id: UUID,
+  worker_instance_id: UUID,
+  claim_token_sha256: Sha256,
+  controller_generation: null,
+  lease_expires_at: UtcTimestamp,
+  heartbeat_at: UtcTimestamp,
+  cancel_requested_at: null | UtcTimestamp,
+  cancel_acknowledged_at: null,
+  delivery_state: "claimed",
+  claim_generation: 1,
+  queue_priority: 0,
+  schedule_type: "long",
+  replay_policy: "NEVER",
+  retryable: false,
+  ignore_return_value: false,
+  created_at: UtcTimestamp,
+  updated_at: UtcTimestamp,
+  request_input: ResourceActionRequestInputV1,
+  request_input_sha256: Sha256,
+  private_route: ResourceActionPrivateRouteV1
+}
+
+ProviderShadowAuthorityFenceClaimPreimageV2 = {
+  request_before: ProviderShadowGenerationOneTerminalRequestSourceV2,
+  history_before: ProviderShadowRawExecutionHistorySnapshotV2,
+      # exact BOUND or AUTHORIZED; never SETTLED
+  prior_lease_expires_at: UtcTimestamp
+}
+
+ProviderResourceActionAuthorityFenceClaimPreimageV2 = {
+  request_before: ProviderResourceActionGenerationOneTerminalRequestSourceV2,
+  action_id: UUID,
+  attempt: PositiveInteger,
+  handler_name: "serve_resource_action_launch" |
+                "serve_resource_action_down",
+  request_input: ResourceActionRequestInputV1,
+  request_input_sha256: Sha256,
+  locked_attempt: ProviderResourceActionRawAttemptSnapshotV2,
+  prior_cancel_requested_at: null | UtcTimestamp,
+  prior_lease_expires_at: UtcTimestamp
+}
+
+ProviderAuthorityFenceClaimPreimageV2 = one of:
+  {claim_kind: "resource_action",
+   action_claim: ProviderResourceActionAuthorityFenceClaimPreimageV2,
+   shadow_claim: null}
+  {claim_kind: "shadow_candidate",
+   action_claim: null,
+   shadow_claim: ProviderShadowAuthorityFenceClaimPreimageV2}
+
+ProviderAuthorityFenceCommitmentClaimV2 = one of:
+  {claim_kind: "resource_action",
+   request_id: UUID,
+   handler_name: "serve_resource_action_launch" |
+                 "serve_resource_action_down",
+   action_id: UUID,
+   attempt: PositiveInteger,
+   request_input_sha256: Sha256,
+   execution_generation: 1,
+   claim_owner_api_instance_id: UUID,
+   claim_token_sha256: Sha256,
+   prior_cancel_requested_at: null | UtcTimestamp,
+   preterminal_attempt_sha256: Sha256}
+  {claim_kind: "shadow_candidate",
+   request_id: UUID,
+   handler_name: "serve_shadow_candidate_launch" |
+                 "serve_shadow_candidate_down",
+   decision_id: UUID,
+   request_sequence: PositiveInteger,
+   request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+   immutable_payload_sha256: Sha256,
+   request_input_sha256: Sha256,
+   execution_generation: 1,
+   claim_owner_api_instance_id: UUID,
+   claim_token_sha256: Sha256,
+   prior_cancel_requested_at: null | UtcTimestamp,
+   preterminal_history_sha256: Sha256}
+
+# The two preterminal hashes have one closed domain. For an action claim,
+# `preterminal_attempt_sha256` is SHA-256 of the canonical JSON bytes of the
+# exact locked `ProviderResourceActionRawAttemptSnapshotV2` after its bounded
+# outer-storage validation. For a shadow claim,
+# `preterminal_history_sha256` is SHA-256 of the canonical JSON bytes of the
+# exact locked `ProviderShadowRawExecutionHistorySnapshotV2` after the same
+# outer-storage validation. Request creation/update/heartbeat/lease-expiry
+# times and every terminal output are outside both snapshots; the independently
+# retained cancellation intent is the only request-time semantic in this
+# commitment. No strict cursor decode, normalization, or caller-selected
+# subset may replace either raw snapshot hash.
+
+ProviderAuthorityFenceCommitmentProjectionV2 = one of:
+  {version: 2,
+   fence_kind: "stale_owner",
+   operation_id: UUID,  # origin_revoking_handoff_id
+   origin_revoking_handoff_id: UUID,
+   authority_worker_instance_id: UUID,
+   lease_generation: PositiveInteger,
+   prior_lease_revision: PositiveInteger,
+   terminal_lease_revision: PositiveInteger,
+   claims: SortedList<ProviderAuthorityFenceCommitmentClaimV2>}
+  {version: 2,
+   fence_kind: "cold_recovery",
+   operation_id: UUID,  # recovery_id
+   recovery_id: UUID,
+   authority_worker_instance_id: UUID,
+   pod_uid: UUID,
+   prior_lease_state: "ACTIVE" | "REVOKED",
+   lease_generation: PositiveInteger,
+   prior_lease_revision: PositiveInteger,
+   terminal_lease_revision: PositiveInteger,
+   preserved_revocation_reason: null | "STALE_HANDOFF",
+   preserved_revocation_owner_id: null | UUID,
+   claims: SortedList<ProviderAuthorityFenceCommitmentClaimV2>}
+  {version: 2,
+   fence_kind: "process_supersession",
+   operation_id: UUID,
+   supersession_id: UUID,
+   cohort_id: Text,
+   authority_worker_instance_id: UUID,
+   source_lease_generation: PositiveInteger,
+   source_lease_revision: PositiveInteger,
+   committed_lease_generation: PositiveInteger,
+   committed_lease_revision: PositiveInteger,
+   prior_api_instance_id: UUID,
+   current_api_instance_id: UUID,
+   prior_execution_owner_sha256: Sha256,
+   current_execution_owner_sha256: Sha256,
+   container_supersession_proof_sha256: Sha256,
+   claims: SortedList<ProviderAuthorityFenceCommitmentClaimV2>}
+
+# The sole fence-commitment projector strips operation/fence completion time,
+# request created/updated/heartbeat/lease-expiry timestamps, completed fence
+# outcomes, terminal requests, selectors/receipts, terminal events, and every
+# hash of those outputs. It preserves cancellation intent because that changes
+# terminal semantics. The resulting canonical projection—not the full
+# preterminal or completed operation—is the commitment hash domain.
+
+ProviderShadowAuthorityFenceOperationPreimageV2 = one of:
+  {fence_kind: "stale_owner",
+   operation:
+       ProviderAuthorityWorkerStaleAuthorityFenceV2 with `request_claims`
+       replaced by SortedList<ProviderAuthorityFenceClaimPreimageV2>}
+  {fence_kind: "cold_recovery",
+   operation:
+       ProviderAuthorityWorkerColdRecoveryFenceV2 with `request_claims`
+       replaced by SortedList<ProviderAuthorityFenceClaimPreimageV2>}
+  {fence_kind: "process_supersession",
+   operation:
+       ProviderAuthorityWorkerProcessSupersessionV1 with `request_claims` and
+       `request_claims_sha256` replaced by
+       SortedList<ProviderAuthorityFenceClaimPreimageV2> and its Sha256}
+
+# This is the complete locked, preterminal operation view. It contains no
+# terminal request, action selector, shadow receipt, event, completed-claim
+# hash, or other projector output. The final fence operation is derived from it
+# by replacing every preimage claim with its completed V2 fence claim. Thus the
+# commitment projector is acyclic even though completed fence rows embed receipts.
+
+ProviderShadowTerminalHistoricalApiInstanceSnapshotV2 =
+    the exact flat projection of one retained `authority-worker` API-instance
+    row in owner phase `authority-bound-v2`, `authority-ready-v2`,
+    `authority-rewarming-v2`, or `authority-draining-v2`. It preserves the
+    immutable process/stable IDs, boot/owner hash, start/heartbeat/drain times,
+    supported handlers/payload inventory, and pool generation, but imposes no
+    current readiness or freshness requirement.
+
+ProviderShadowTerminalHistoricalOwnerSourceV2 = {
+  api_instance: ProviderShadowTerminalHistoricalApiInstanceSnapshotV2
+}
+
+ProviderShadowTerminalWinnerSourceV2 = one of:
+  {winner_kind: "handler_return",
+   generation_zero: null,
+   generation_one: ProviderShadowGenerationOneTerminalRequestSourceV2,
+   terminal_state: "SUCCEEDED",
+   trusted_mode: "PRIVATE_HANDLER_RETURN",
+   request_return: ServeShadowCandidateRequestReturnV1,
+   fixed_failure_code: null,
+   prior_cancel_requested_at: null}
+  {winner_kind: "post_claim_failure",
+   generation_zero: null,
+   generation_one: ProviderShadowGenerationOneTerminalRequestSourceV2,
+   terminal_state: "FAILED",
+   trusted_mode: "PRIVATE_POST_CLAIM_FAILURE" |
+                 "CLAIM_REAUTHORIZATION_FAILED",
+   request_return: null,
+   fixed_failure_code: "private_handler_failed" |
+                       "provider_authority_reauthorization_failed",
+   prior_cancel_requested_at: null}
+  {winner_kind: "owner_acknowledged_cancellation",
+   generation_zero: null,
+   generation_one: ProviderShadowGenerationOneTerminalRequestSourceV2,
+   terminal_state: "CANCELLED",
+   trusted_mode: "OWNER_ACK_CANCEL",
+   request_return: null,
+   fixed_failure_code: null,
+   prior_cancel_requested_at: UtcTimestamp}
+  {winner_kind: "owner_quiesced_lease_loss",
+   generation_zero: null,
+   generation_one: ProviderShadowGenerationOneTerminalRequestSourceV2,
+   terminal_state: "CANCELLED",
+   trusted_mode: "OWNER_QUIESCED_LEASE_LOSS",
+   request_return: null,
+   fixed_failure_code: null,
+   prior_cancel_requested_at: null | UtcTimestamp}
+  {winner_kind: "terminal_before_claim_start",
+   generation_zero: null | ProviderShadowGenerationZeroRequestQueueSnapshotV2,
+   generation_one: null | ProviderShadowGenerationOneTerminalRequestSourceV2,
+   terminal_state: "FAILED" | "CANCELLED",
+   trusted_mode: "TERMINAL_BEFORE_CLAIM_START",
+   request_return: null,
+   fixed_failure_code: null | "private_request_failed_before_claim",
+   prior_cancel_requested_at: null | UtcTimestamp}
+  {winner_kind: "claim_start_not_representable",
+   generation_zero: null,
+   generation_one: ProviderShadowGenerationOneTerminalRequestSourceV2,
+   terminal_state: "FAILED",
+   trusted_mode: "CLAIM_START_NOT_REPRESENTABLE",
+   request_return: null,
+   fixed_failure_code: "provider_authority_not_representable_at_claim",
+   prior_cancel_requested_at: null}
+  {winner_kind: "authority_fence_cancellation",
+   generation_zero: null,
+   generation_one: ProviderShadowGenerationOneTerminalRequestSourceV2,
+   terminal_state: "CANCELLED",
+   trusted_mode: "STALE_OWNER_FENCE" | "COLD_RECOVERY_FENCE" |
+                 "PROCESS_SUPERSESSION_FENCE",
+   request_return: null,
+   fixed_failure_code: null,
+   prior_cancel_requested_at: null | UtcTimestamp,
+   fence_operation_preimage:
+       ProviderShadowAuthorityFenceOperationPreimageV2,
+   fenced_claim_preimage: ProviderShadowAuthorityFenceClaimPreimageV2}
+
+# The two nullable generation sources in terminal_before_claim_start are XOR.
+# Handler return and post-claim failure require strict AUTHORIZED history.
+# Claim-start-not-representable and terminal-before-claim-start require strict
+# BOUND history. OWNER_ACK_CANCEL, OWNER_QUIESCED_LEASE_LOSS, and each typed
+# fence accept BOUND or AUTHORIZED: BOUND deterministically derives
+# TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START, while AUTHORIZED derives
+# REQUEST_CANCELLED/SHADOW_EXECUTION. OWNER_ACK_CANCEL requires a byte-equal
+# nonnull request cancellation intent. OWNER_QUIESCED_LEASE_LOSS and each typed
+# fence preserve a null intent or acknowledge the exact nonnull one. The fence
+# claim must be the unique byte-equal member of the enclosing typed operation;
+# caller-selected terminal cause/disposition is not a field.
+
+ProviderShadowTerminalCommitmentV1 = {
+  version: 1,
+  request_id: UUID,
+  request_input_sha256: Sha256,
+  immutable_payload_sha256: Sha256,
+  handler_name: "serve_shadow_candidate_launch" |
+                "serve_shadow_candidate_down",
+  request_execution_generation: 0 | 1,
+  authority_worker_instance_id: null | UUID,
+  worker_instance_id: null | UUID,
+  claim_token_sha256: null | Sha256,
+  winner_kind: "handler_return" | "post_claim_failure" |
+               "owner_acknowledged_cancellation" |
+               "owner_quiesced_lease_loss" |
+               "terminal_before_claim_start" |
+               "claim_start_not_representable" |
+               "authority_fence_cancellation",
+  trusted_mode: "PRIVATE_HANDLER_RETURN" |
+                "PRIVATE_POST_CLAIM_FAILURE" |
+                "CLAIM_START_NOT_REPRESENTABLE" |
+                "CLAIM_REAUTHORIZATION_FAILED" |
+                "OWNER_ACK_CANCEL" | "OWNER_QUIESCED_LEASE_LOSS" |
+                "TERMINAL_BEFORE_CLAIM_START" |
+                "STALE_OWNER_FENCE" | "COLD_RECOVERY_FENCE" |
+                "PROCESS_SUPERSESSION_FENCE",
+  terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+  request_return_sha256: null | Sha256,
+  fixed_failure_code: null | "private_handler_failed" |
+                      "provider_authority_reauthorization_failed" |
+                      "private_request_failed_before_claim" |
+                      "provider_authority_not_representable_at_claim",
+  prior_cancel_requested_at: null | UtcTimestamp,
+  fence_operation_kind: null | "stale_owner" | "cold_recovery" |
+                        "process_supersession",
+  fence_operation_id: null | UUID,
+  fence_operation_commitment:
+      null | ProviderAuthorityFenceCommitmentProjectionV2,
+  fence_operation_commitment_sha256: null | Sha256
+}
+
+# The production terminal builder derives this independently bounded canonical
+# commitment from the trusted winner source. It omits database-owned finish
+# time and transient lease/heartbeat deadlines, but preserves every value that
+# distinguishes the caller's intended winner after request/evidence GC. Its
+# closed validator enforces the exact winner/mode/state/nullability matrix. For
+# a typed fence it stores and hashes the acyclic time-free commitment projection
+# derived from the preterminal operation, never the completed operation that
+# embeds this receipt.
+
+ProviderShadowTerminalNewWriteSourceV2 = {
+  terminalization_disposition: "new_terminal_write",
+  candidate_service: ProviderShadowCandidateServiceSnapshotV2,
+  reference: ProviderShadowCandidateReferenceSnapshotV2,
+  stored_parent: ProviderShadowRepresentedParentSnapshotV2,
+  stored_child: ProviderShadowBoundChildProjectionV2,
+  committed_history: ProviderShadowRawExecutionHistorySnapshotV2,
+      # exact BOUND or AUTHORIZED source; SETTLED rejects
+  historical_shadow_origins: [ProviderShadowHistoricalOriginSourceV2],
+  historical_owner: null | ProviderShadowTerminalHistoricalOwnerSourceV2,
+      # null exactly for a generation-zero winner; required for generation one
+  terminal_winner: ProviderShadowTerminalWinnerSourceV2,
+  database_now: UtcTimestamp
+}
+
+ProviderShadowTerminalStoredAdoptionSourceV2 = {
+  terminalization_disposition: "stored_adoption",
+  caller_terminal_winner: ProviderShadowTerminalWinnerSourceV2,
+  stored_terminal_history: ProviderShadowRequestTerminalHistoryV2,
+  retained_terminal_request: null | ProviderShadowRequestTerminalSnapshotV2,
+  stored_completed_fence_operation:
+      null | ProviderAuthorityWorkerStaleAuthorityFenceV2 |
+             ProviderAuthorityWorkerColdRecoveryFenceV2 |
+             ProviderAuthorityWorkerProcessSupersessionV1
+}
+
+ProviderShadowTerminalizationSourceV2 =
+    ProviderShadowTerminalNewWriteSourceV2 |
+    ProviderShadowTerminalStoredAdoptionSourceV2
+
+ProviderShadowTerminalizationProjectionV2 = one of:
+  {terminalization_result: "NEWLY_TERMINALIZED",
+   terminal_request: ProviderShadowRequestTerminalSnapshotV2,
+   terminal_history: ProviderShadowRequestTerminalHistoryV2,
+   completed_fence_operation:
+       null | ProviderAuthorityWorkerStaleAuthorityFenceV2 |
+              ProviderAuthorityWorkerColdRecoveryFenceV2 |
+              ProviderAuthorityWorkerProcessSupersessionV1}
+  {terminalization_result: "EXACT_ADOPTED",
+   terminal_request: null | ProviderShadowRequestTerminalSnapshotV2,
+   terminal_history: ProviderShadowRequestTerminalHistoryV2,
+   completed_fence_operation:
+       null | ProviderAuthorityWorkerStaleAuthorityFenceV2 |
+              ProviderAuthorityWorkerColdRecoveryFenceV2 |
+              ProviderAuthorityWorkerProcessSupersessionV1}
+  {terminalization_result: "LOST_RACE",
+   terminal_request: null,
+   terminal_history: null,
+   completed_fence_operation: null}
+
+ProviderShadowTerminalizationRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "terminalization",
+  dispatch_kind: "shadow_candidate",
+  action_kind: "launch" | "down",
+  source: ProviderShadowTerminalizationSourceV2,
+  candidate_projection: ProviderShadowTerminalizationProjectionV2
+}
+
+ProviderShadowCoverageSnapshotV2 = {
+  decision_id: UUID,
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  replica_id: NonnegativeInteger,
+  replica_incarnation: UUID,
+  desired_generation: PositiveInteger,
+  action_kind: "launch" | "down",
+  normalizer_contract_version: 1,
+  normalization_outcome: "REPRESENTABLE",
+  not_representable_reason: null,
+  worker_cohort_ref_id: UUID,
+  candidate_epoch: UUID,
+  qualification_policy_sha256: Sha256,
+  qualification_binding_sha256: Sha256,
+  admitted_at: UtcTimestamp
+}
+
+ProviderShadowHistoricalCandidateBindingV2 = {
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  candidate_epoch: UUID,
+  qualification_policy_sha256: Sha256,
+  qualification_binding_sha256: Sha256,
+  admitted_at: UtcTimestamp
+}
+
+# This historical binding is projected byte-for-byte from immutable retained
+# coverage. It deliberately has no current service mode, owner, lifecycle
+# epoch, or elected-version field, so a completed settlement remains adoptable
+# after a later shadow-to-authoritative promotion. It cannot authorize a new
+# write or successor.
+
+ProviderShadowSuccessorKeyAbsenceV2 = {
+  child: true,
+  execution_history: true,
+  private_correlation: true,
+  deterministic_request: true,
+  deterministic_queue: true
+}
+
+ProviderShadowRetainedCapacityAllocationSnapshotV2 = {
+  capacity_profile: ServeActionCapacityProfileV1,
+  capacity_profile_sha256: Sha256,
+  replica_is_spot: false,
+  planned_capacity: 1,
+  reserved_fill: false,
+  is_zero_cost: false,
+  paid_capacity_pool_key: null,
+  cost_rebalance_for_replica_id: null,
+  unknown_capacity_replacement: false
+}
+
+ProviderShadowSameParentSuccessorConstructionSourceV2 = {
+  successor_disposition: "same_parent_new",
+  successor_kind: "retry_same_plan" | "observe_same_plan",
+  candidate_service: ProviderShadowCandidateServiceSnapshotV2,
+  active_reference: ProviderShadowCandidateReferenceSnapshotV2,
+  complete_preflight: ProviderShadowCompletePreflightSourceV2,
+  registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+  accepted_memberships:
+      [ProviderAuthorityWorkerAcceptedExecutionMembershipV2],
+  accepted_api_instances: [ProviderResourceActionApiInstanceSnapshotV2],
+      # both arrays have exactly two index-aligned members
+  deterministic_request_id: UUID,
+  request_input: ResourceActionRequestInputV1,
+  request_input_sha256: Sha256,
+  locked_absence: ProviderShadowSuccessorKeyAbsenceV2
+}
+
+ProviderShadowPartialDownReplicaTransitionSourceV2 = {
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  replica_id: NonnegativeInteger,
+  replica_incarnation: UUID,
+  source_desired_generation: PositiveInteger,
+  target_desired_generation: PositiveInteger,
+      # exactly source_desired_generation + 1; overflow rejects
+  source_launch_coverage_id: UUID,
+  source_launch_sample_id: UUID,
+  source_launch_status: "PROVISIONING" | "STARTING" | "READY" |
+                        "NOT_READY" | "FAILED" | "FAILED_INITIAL_DELAY" |
+                        "FAILED_PROBING" | "FAILED_PROVISION" |
+                        "PREEMPTED" | "UNKNOWN",
+  target_down_coverage_id_before: null,
+  target_down_sample_id_before: null,
+  target_cleanup_intent_before: null,
+  retained_capacity_allocation:
+      ProviderShadowRetainedCapacityAllocationSnapshotV2,
+  retained_capacity_allocation_sha256: Sha256
+}
+
+# The retained-capacity pair is the complete typed, independently locked M4
+# width-one allocation projection already attached to this replica. The hash is
+# recomputed from the adjacent object; a hash-only source is invalid. Partial
+# down preserves both bytes until down settlement; it never synthesizes,
+# releases, or reallocates physical capacity while creating the cleanup root.
+
+ProviderShadowPartialDownReplicaTransitionProjectionV2 = {
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  replica_id: NonnegativeInteger,
+  replica_incarnation: UUID,
+  desired_generation: PositiveInteger,
+  replica_status: "SHUTTING_DOWN",
+  down_shadow_coverage_id: UUID,
+  down_shadow_sample_id: UUID,
+  retained_capacity_allocation:
+      ProviderShadowRetainedCapacityAllocationSnapshotV2,
+  retained_capacity_allocation_sha256: Sha256
+}
+
+ProviderShadowPartialDownTargetConstructionSourceV2 = {
+  successor_disposition: "partial_down_new",
+  successor_kind: "partial_down",
+  candidate_service: ProviderShadowCandidateServiceSnapshotV2,
+  target_replica:
+      ProviderShadowPartialDownReplicaTransitionSourceV2,
+  target_reference_before: ProviderShadowPreparingReferenceSnapshotV2,
+  target_complete_preflight:
+      ProviderResourceActionPreflightRepresentabilityInputV2,
+  registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  handoff_fence: ProviderResourceActionClaimHandoffFenceV2,
+  accepted_memberships:
+      [ProviderAuthorityWorkerAcceptedExecutionMembershipV2],
+  accepted_api_instances: [ProviderResourceActionApiInstanceSnapshotV2],
+      # both arrays have exactly two index-aligned members
+  deterministic_target_decision_id: UUID,
+  deterministic_target_request_id: UUID,
+  target_request_input: ResourceActionRequestInputV1,
+  target_request_input_sha256: Sha256,
+  target_absence: {
+    coverage: true,
+    parent: true,
+    child: true,
+    execution_history: true,
+    private_correlation: true,
+    deterministic_request: true,
+    deterministic_queue: true,
+    replica_down_links: true
+  }
+}
+
+ProviderShadowPartialDownTargetInsertionProjectionV2 = {
+  target_coverage: ProviderShadowCoverageSnapshotV2,
+  target_replica:
+      ProviderShadowPartialDownReplicaTransitionProjectionV2,
+  target_admission: ProviderShadowAdmissionInsertionProjectionV2,
+  source_partial_down_link: {
+    partial_down_decision_id: UUID,
+    partial_down_request_sequence: PositiveInteger,
+    partial_down_basis_sha256: Sha256
+  }
+}
+
+ProviderShadowPartialDownReplicaDescendantSnapshotV2 = one of:
+  {replica_disposition: "present",
+   service_name: Text,
+   service_hash: UUID,
+   service_incarnation: UUID,
+   replica_id: NonnegativeInteger,
+   replica_incarnation: UUID,
+   desired_generation: PositiveInteger,
+   row_disposition: "retained",
+   replica_status: "SHUTTING_DOWN" | "FAILED_CLEANUP" | "UNKNOWN",
+   down_shadow_coverage_id: UUID,
+   down_shadow_sample_id: UUID,
+   retained_capacity_allocation:
+       ProviderShadowRetainedCapacityAllocationSnapshotV2,
+   retained_capacity_allocation_sha256: Sha256}
+  {replica_disposition: "absent_after_down",
+   service_name: Text,
+   service_hash: UUID,
+   service_incarnation: UUID,
+   replica_id: NonnegativeInteger,
+   replica_incarnation: UUID,
+   desired_generation: PositiveInteger,
+   row_disposition: "removed",
+   replica_status: null,
+   down_shadow_coverage_id: UUID,
+   down_shadow_sample_id: UUID,
+   exact_replica_incarnation_absent: true,
+   live_replica_links_absent: true,
+   cleanup_intent_absent: true}
+
+ProviderShadowStoredPartialDownTargetSourceV2 = {
+  target_coverage: ProviderShadowCoverageSnapshotV2,
+  target_replica: ProviderShadowPartialDownReplicaDescendantSnapshotV2,
+  target_admission_descendant: ProviderShadowAdmissionStoredDescendantV2,
+  reciprocal_target_source_binding: {
+    source_decision_id: UUID,
+    source_request_sequence: PositiveInteger,
+    source_partial_down_basis_sha256: Sha256
+  }
+}
+
+# The stored target is a legal descendant source, never the initial-insert
+# output. Its immutable coverage/admission times and retained source cleanup
+# basis reconstruct the original target insertion; its replica may have
+# advanced through the closed down lifecycle or be proved absent after a
+# completed removal, and its request may be authorized, terminal, settled, or
+# GCed. The absent arm is validated against the completed target outcome,
+# immutable coverage, reciprocal source-Q binding, original settlement
+# commitment, and exact absence of the incarnation, live links, and cleanup
+# intent; it never invents a `REMOVED` replica status or row. All surviving
+# link/identity/capacity bytes remain equal.
+
+ProviderShadowStoredSuccessorAdoptionSourceV2 = one of:
+  {successor_disposition: "stored_successor_adoption",
+   successor_kind: "retry_same_plan" | "observe_same_plan",
+   stored_successor: ProviderShadowAdmissionStoredDescendantV2,
+   stored_partial_down_target: null}
+  {successor_disposition: "stored_successor_adoption",
+   successor_kind: "partial_down",
+   stored_successor: null,
+   stored_partial_down_target:
+       ProviderShadowStoredPartialDownTargetSourceV2}
+
+ProviderShadowSettlementNewSuccessorSourceV2 =
+    ProviderShadowSameParentSuccessorConstructionSourceV2 |
+    ProviderShadowPartialDownTargetConstructionSourceV2
+
+ProviderShadowSettlementSuccessorSourceV2 =
+    ProviderShadowSettlementNewSuccessorSourceV2 |
+    ProviderShadowStoredSuccessorAdoptionSourceV2
+
+ProviderShadowSettlementSuccessorProjectionV2 = one of:
+  {successor_kind: "retry_same_plan" | "observe_same_plan",
+   same_parent_admission: ProviderShadowAdmissionInsertionProjectionV2,
+   partial_down_target: null}
+  {successor_kind: "partial_down",
+   same_parent_admission: null,
+   partial_down_target:
+       ProviderShadowPartialDownTargetInsertionProjectionV2}
+
+ProviderShadowSettlementCommitmentV1 = {
+  version: 1,
+  operation_id: UUID,
+  decision_id: UUID,
+  request_sequence: PositiveInteger,
+  request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+  terminal_history_sha256: Sha256,
+  new_write_source_sha256: Sha256,
+  settlement_projection_sha256: Sha256,
+  successor_kind: null | "retry_same_plan" | "observe_same_plan" |
+                  "partial_down",
+  successor_decision_id: null | UUID,
+  successor_request_sequence: null | PositiveInteger,
+  settled_at: UtcTimestamp
+}
+
+# `new_write_source_sha256` names the canonical bytes of the complete original
+# `ProviderShadowSettlementNewWriteSourceV2`, including operation ID and its one
+# database time. `settlement_projection_sha256` names only the complete adjacent
+# `ProviderShadowSettlementProjectionV2`; that projection never embeds this
+# commitment, so the graph is acyclic. Successor identity is null exactly for a
+# null kind and otherwise equals the projection's inserted child. This compact
+# permanent commitment contains no mutable service/replica/API/request row and
+# no raw provider cursor bytes. It is sufficient for a caller retaining its
+# original source/projection to distinguish exact adoption from another legal
+# winner after request and evidence GC.
+
+ProviderShadowSettlementProjectionV2 = {
+  version: 2,
+  settlement_basis: "HANDLER_RETURN" | "REQUEST_FALLBACK",
+  reduction_disposition: "S" | "R" | "U" | "B" | "Q" |
+                         "P0" | "O" | "X",
+  request_return: null | ServeShadowCandidateRequestReturnV1,
+  request_return_sha256: null | Sha256,
+  fallback_evidence: null | ServeShadowCandidateRequestFallbackEvidenceV1,
+  actual_outcome: ServeShadowCandidateOutcomeV1,
+  actual_outcome_sha256: Sha256,
+  proposed_outcome: ServeShadowCandidateOutcomeV1,
+  proposed_outcome_sha256: Sha256,
+  retry_decision: ServeShadowRetryDecisionV1,
+  retry_decision_sha256: Sha256,
+  post_settlement_parent: ProviderShadowParentSnapshotV2,
+  completed_child: ProviderShadowCompletedChildProjectionV2,
+  candidate_settled_history: ProviderShadowRawExecutionHistorySnapshotV2,
+  partial_down_basis: null | ServeShadowPartialLaunchCleanupBasisV1,
+  successor_kind: null | "retry_same_plan" | "observe_same_plan" |
+                  "partial_down",
+  successor_projection:
+      null | ProviderShadowSettlementSuccessorProjectionV2
+}
+
+ProviderShadowSettlementNewWriteSourceV2 = {
+  settlement_disposition: "new_settlement",
+  operation_id: UUID,
+  candidate_service: ProviderShadowCandidateServiceSnapshotV2,
+  active_reference: ProviderShadowCandidateReferenceSnapshotV2,
+  locked_coverage: ProviderShadowCoverageSnapshotV2,
+  locked_parent: ProviderShadowRepresentedParentSnapshotV2,
+      # exact PRIVATE_API_REQUEST/RUNNING source
+  locked_child: ProviderShadowBoundChildProjectionV2,
+  locked_history: ProviderShadowRawExecutionHistorySnapshotV2,
+      # exact terminal but not SETTLED source
+  terminal_history: ProviderShadowRequestTerminalHistoryV2,
+  retained_terminal_request: null | ProviderShadowRequestTerminalSnapshotV2,
+  historical_shadow_origins: [ProviderShadowHistoricalOriginSourceV2],
+  successor_source: null | ProviderShadowSettlementNewSuccessorSourceV2,
+  database_now: UtcTimestamp
+}
+
+ProviderShadowSettlementStoredAdoptionSourceV2 = {
+  settlement_disposition: "stored_adoption",
+  caller_new_write_source: ProviderShadowSettlementNewWriteSourceV2,
+  historical_candidate_binding: ProviderShadowHistoricalCandidateBindingV2,
+  stored_reference: ProviderShadowCandidateReferenceSnapshotV2 |
+                    ProviderShadowReleasedReferenceSnapshotV2,
+  stored_coverage: ProviderShadowCoverageSnapshotV2,
+  stored_parent: ProviderShadowParentSnapshotV2,
+  stored_child: ProviderShadowCompletedChildProjectionV2,
+  stored_history: ProviderShadowRawExecutionHistorySnapshotV2,
+      # exact SETTLED source
+  terminal_history: ProviderShadowRequestTerminalHistoryV2,
+  retained_terminal_request: null | ProviderShadowRequestTerminalSnapshotV2,
+  historical_shadow_origins: [ProviderShadowHistoricalOriginSourceV2],
+  successor_source: null | ProviderShadowStoredSuccessorAdoptionSourceV2,
+  stored_settlement_commitment: ProviderShadowSettlementCommitmentV1,
+  stored_settlement_commitment_sha256: Sha256
+}
+
+ProviderShadowSettlementComponentGcAbsenceV2 = {
+  decision_id: UUID,
+  service_name: Text,
+  service_hash: UUID,
+  service_incarnation: UUID,
+  replica_id: NonnegativeInteger,
+  replica_incarnation: UUID,
+  desired_generation: PositiveInteger,
+  coverage: true,
+  parent: true,
+  all_children: true,
+  all_execution_histories: true,
+  private_correlations: true,
+  deterministic_requests: true,
+  deterministic_queues: true,
+  live_replica_links: true,
+  cleanup_intent: true,
+  reference:
+      {reference_disposition: "released",
+       released_reference: ProviderShadowReleasedReferenceSnapshotV2} |
+      {reference_disposition: "absent", exact_reference_absent: true}
+}
+
+ProviderShadowSettlementGcAbsenceV2 = {
+  source_component: ProviderShadowSettlementComponentGcAbsenceV2,
+  component_peer: one of:
+      {component_relation: "ordinary",
+       q_settlement_receipt: null,
+       peer_absence: null}
+      {component_relation: "outgoing_Q",
+       q_settlement_receipt: ProviderShadowSettlementReceiptV1,
+       peer_absence: ProviderShadowSettlementComponentGcAbsenceV2}
+      {component_relation: "incoming_Q",
+       q_settlement_receipt: ProviderShadowSettlementReceiptV1,
+       peer_absence: ProviderShadowSettlementComponentGcAbsenceV2}
+}
+
+# Component relation is parent-graph-wide, not inferred from the replayed
+# receipt. `outgoing_Q` binds the unique permanent Q settlement receipt in this
+# parent to the absent primary-down peer; `incoming_Q` binds the unique
+# reverse-indexed source receipt to this absent target. `ordinary` requires no
+# incoming or outgoing Q receipt for any child in the parent. The store checks
+# the partial unique source-parent index on `decision_id` and partial unique
+# reverse-target index on `(successor_decision_id,
+# successor_request_sequence)`, rather than scanning retry history, and rejects
+# a second/crossed peer. Same-parent retry/observe children are covered by
+# `all_children` in the one source component. Typed GC always deletes a Q pair
+# atomically, so no arm permits one absent and one retained side.
+
+ProviderShadowSettlementReceiptAdoptionSourceV2 = {
+  settlement_disposition: "receipt_only_adoption",
+  caller_new_write_source: ProviderShadowSettlementNewWriteSourceV2,
+  stored_settlement_commitment: ProviderShadowSettlementCommitmentV1,
+  stored_settlement_commitment_sha256: Sha256,
+  graph_absence: ProviderShadowSettlementGcAbsenceV2
+}
+
+ProviderShadowSettlementSourceV2 =
+    ProviderShadowSettlementNewWriteSourceV2 |
+    ProviderShadowSettlementStoredAdoptionSourceV2 |
+    ProviderShadowSettlementReceiptAdoptionSourceV2
+
+ProviderShadowSettlementCandidateV2 = one of:
+  {settlement_result:
+       "NEWLY_SETTLED" | "EXACT_ADOPTED_GRAPH" |
+       "EXACT_ADOPTED_RECEIPT",
+   settlement_projection: ProviderShadowSettlementProjectionV2,
+   settlement_commitment: ProviderShadowSettlementCommitmentV1,
+   settlement_commitment_sha256: Sha256}
+  {settlement_result: "LOST_RACE",
+   settlement_projection: null,
+   settlement_commitment: null,
+   settlement_commitment_sha256: null}
+
+# `new_settlement` may produce only `NEWLY_SETTLED`.
+# `stored_adoption` may produce only `EXACT_ADOPTED_GRAPH` or `LOST_RACE`.
+# `receipt_only_adoption` may produce only `EXACT_ADOPTED_RECEIPT` or
+# `LOST_RACE`. A malformed, hash-invalid, partial, or crossed graph/commitment
+# is corruption and cannot inhabit any candidate result.
+
+ProviderShadowSettlementRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "settlement",
+  dispatch_kind: "shadow_candidate",
+  action_kind: "launch" | "down",
+  source: ProviderShadowSettlementSourceV2,
+  candidate_projection: ProviderShadowSettlementCandidateV2
+}
+
+ProviderResourceActionDirectActionSnapshotV2 = {
+  action_id: UUID,
+  resource_identity: ResourceActionIdentityV1,
+  action_revision: NonnegativeInteger,
+  action_current_attempt: NonnegativeInteger,
+  kernel_state: "READY" | "QUEUED" | "BLOCKED",
+  action_last_result: null | ServeReplicaActionOutcomeV1,
+  action_last_result_sha256: null | Sha256
+}
+
+ProviderResourceActionDirectNoEffectBuilderInputV2 = {
+  version: 2,
+  action: ProviderResourceActionDirectActionSnapshotV2,
+  locked_predecessor: null | ProviderResourceActionReducerAttemptSnapshotV2,
+  locked_current: null | ProviderResourceActionReducerAttemptSnapshotV2,
+  request_row_disposition:
+      "not_applicable" | "retained_terminal" | "garbage_collected",
+  retained_terminal_request:
+      null | ProviderResourceActionRequestTerminalSnapshotV2,
+  cancelled_at: UtcTimestamp
+}
+
+ProviderResourceActionDirectTransitionRepresentabilityInputV2 = {
+  version: 2,
+  boundary: "owner_fenced_transition",
+  dispatch_kind: "authoritative_action",
+  action_kind: "launch",
+  builder_input: ProviderResourceActionDirectNoEffectBuilderInputV2,
+  candidate_outcome: ServeReplicaActionOutcomeV1
+}
+
+ProviderResourceActionRawAttemptSnapshotV2 = {
+  action_id: UUID,
+  attempt: PositiveInteger,
+  request_id: UUID,
+  request_terminal_snapshot:
+      null | ProviderResourceActionRequestTerminalSnapshotV2,
+  terminal_authority_selector:
+      null | ProviderResourceActionAttemptTerminalAuthoritySelectorV2,
+  request_input_sha256: Sha256,
+  mutation_boundary: "NOT_STARTED" | "INTENT_COMMITTED" |
+                     "SUBMITTED_OR_AMBIGUOUS" | "SETTLED",
+  provider_io_boundary: "NOT_STARTED" | "INTENT_COMMITTED" |
+                        "SUBMITTED_OR_AMBIGUOUS",
+  provider_progress_revision: NonnegativeInteger,
+  provider_progress_raw: null | CanonicalJsonObject,
+  provider_progress_sha256: null | Sha256,
+  provider_operation_id: null | Text,
+  typed_outcome: null | ServeReplicaActionOutcomeV1,
+  typed_outcome_sha256: null | Sha256,
+  settled_at: null | UtcTimestamp,
+  historical_authority: [  # 0..RESOURCE_ACTION_ATTEMPT_AUTHORITY_KEYS_MAX_V2
+    ProviderResourceActionExecutionAuthorityLineageV2
+  ]
+}
+
+ProviderResourceActionRawReducerHistoryProjectionV2 = {
+  version: 2,
+  action_id: UUID,
+  action_kind: "launch" | "down",
+  action_revision: NonnegativeInteger,
+  action_current_attempt: PositiveInteger,
+  action_last_result: null | ServeReplicaActionOutcomeV1,
+  action_last_result_sha256: null | Sha256,
+  locked_predecessor: null | ProviderResourceActionReducerAttemptSnapshotV2,
+  locked_current: ProviderResourceActionRawAttemptSnapshotV2,
+  launch_no_io_prefix: null | ServeLaunchNoIoPrefixV1,
+  supersession_quiescence:
+      null | ProviderLaunchSupersessionQuiescenceV1
+}
+
+ProviderResourceActionRawInvalidJournalClassifierInputV2 = {
+  version: 2,
+  action_kind: "launch" | "down",
+  reducer_history: ProviderResourceActionRawReducerHistoryProjectionV2
+}
+
+ProviderResourceActionV2ReductionAuthorityContext = {
+  version: 2,
+  stored_spec: ServeReplicaActionSpecV2,
+  resolved_cohort: ProviderAuthorityWorkerCohortV2,
+  historical_authority: [  # 0..RESOURCE_ACTION_REDUCTION_AUTHORITY_KEYS_MAX_V2
+    ProviderResourceActionExecutionAuthorityLineageV2
+  ]
+}
+
+RESOURCE_ACTION_PROVIDER_EFFECTS_MAX_V2 = 5
+RESOURCE_ACTION_ATTEMPT_AUTHORITY_KEYS_MAX_V2 =
+    2 * RESOURCE_ACTION_PROVIDER_EFFECTS_MAX_V2 + 3  # 13
+RESOURCE_ACTION_REDUCTION_AUTHORITY_KEYS_MAX_V2 =
+    2 * RESOURCE_ACTION_ATTEMPT_AUTHORITY_KEYS_MAX_V2 + 2  # 28
+
+ProviderResourceActionRawFallbackReductionInputV2 = {
+  version: 2,
+  action_kind: "launch" | "down",
+  authority_context: ProviderResourceActionV2ReductionAuthorityContext,
+  journal_classifier_input:
+      ProviderResourceActionRawInvalidJournalClassifierInputV2
+}
+
+ProviderResourceActionRepresentabilityInputV2 =
+  ProviderResourceActionPreflightRepresentabilityInputV2 |
+  ProviderResourceActionAdmissionRepresentabilityInputV2 |
+  ProviderResourceActionClaimedExecutionRepresentabilityInputV2 |
+  ProviderResourceActionPreIoRepresentabilityInputV2 |
+  ProviderShadowAdmissionRepresentabilityInputV2 |
+  ProviderShadowClaimedExecutionRepresentabilityInputV2 |
+  ProviderShadowPreIoRepresentabilityInputV2 |
+  ProviderShadowTerminalizationRepresentabilityInputV2 |
+  ProviderShadowSettlementRepresentabilityInputV2 |
+  ProviderResourceActionDirectTransitionRepresentabilityInputV2
+
+ProviderResourceActionRepresentabilityFixtureInputV2 = {
+  version: 2,
+  launch: {
+    complete_preflight: ProviderResourceActionPreflightRepresentabilityInputV2,
+    linked_admission: ProviderResourceActionAdmissionRepresentabilityInputV2,
+    claimed_execution:
+        ProviderResourceActionClaimedExecutionRepresentabilityInputV2,
+    pre_io: ProviderResourceActionPreIoRepresentabilityInputV2
+  },
+  down: {
+    complete_preflight: ProviderResourceActionPreflightRepresentabilityInputV2,
+    linked_admission: ProviderResourceActionAdmissionRepresentabilityInputV2,
+    claimed_execution:
+        ProviderResourceActionClaimedExecutionRepresentabilityInputV2,
+    pre_io: ProviderResourceActionPreIoRepresentabilityInputV2
+  },
+  down_cleanup_preflight_cases: [
+    ProviderResourceActionPreflightRepresentabilityInputV2
+  ],
+  authoritative_history_cases: [
+    ProviderResourceActionAdmissionRepresentabilityInputV2 |
+    ProviderResourceActionClaimedExecutionRepresentabilityInputV2 |
+    ProviderResourceActionPreIoRepresentabilityInputV2
+  ],
+  shadow: {
+    launch: {
+      complete_preflight: ProviderResourceActionPreflightRepresentabilityInputV2,
+      linked_admission: ProviderShadowAdmissionRepresentabilityInputV2,
+      claimed_execution: ProviderShadowClaimedExecutionRepresentabilityInputV2,
+      pre_io: ProviderShadowPreIoRepresentabilityInputV2,
+      terminalization: ProviderShadowTerminalizationRepresentabilityInputV2,
+      settlement: ProviderShadowSettlementRepresentabilityInputV2
+    },
+    down: {
+      complete_preflight: ProviderResourceActionPreflightRepresentabilityInputV2,
+      linked_admission: ProviderShadowAdmissionRepresentabilityInputV2,
+      claimed_execution: ProviderShadowClaimedExecutionRepresentabilityInputV2,
+      pre_io: ProviderShadowPreIoRepresentabilityInputV2,
+      terminalization: ProviderShadowTerminalizationRepresentabilityInputV2,
+      settlement: ProviderShadowSettlementRepresentabilityInputV2
+    },
+    history_cases: [
+      ProviderShadowAdmissionRepresentabilityInputV2 |
+      ProviderShadowClaimedExecutionRepresentabilityInputV2 |
+      ProviderShadowPreIoRepresentabilityInputV2 |
+      ProviderShadowTerminalizationRepresentabilityInputV2 |
+      ProviderShadowSettlementRepresentabilityInputV2
+    ]
+  },
+  direct_transition_cases: [
+    ProviderResourceActionDirectTransitionRepresentabilityInputV2
+  ]
+}
+```
+
+The twenty primary roots contain one complete-preflight, linked-admission,
+claim-start, and immediate pre-I/O root per action kind and dispatch kind, plus
+one shadow terminalization and settlement root per action kind.
+Every authoritative admission/claim/pre-I/O spec has exactly
+`binding_kind="authoritative_action"`; every shadow root has exactly
+`binding_kind="shadow_candidate"` and is projected through its parent, primary
+child, and one-to-one execution history rather than API006 action history. Every
+linked-admission root carries the exact complete locked V2 registration set and
+the exact null-nonterminal-handoff/completed-cold-recovery fence; the aligned
+membership revision/hash alone is never enough to reconstruct either object.
+Every
+`accepted_memberships` array contains exactly the two
+accepted, fresh-lease members in ascending Pod-UID order. At linked admission,
+`accepted_api_instances` contains exactly two fresh ready snapshots in that same
+order and `database_now` is the one PostgreSQL clock read from the locked
+materialization transaction. Each API snapshot's process/stable-Pod/start/owner
+hash is byte-equal to its membership lease execution owner, and its heartbeat is
+fresh at that clock. All repeated action kinds, cohort
+references, worker registrations, action or decision IDs, deterministic request
+IDs, attempts or request sequences, execution generations, capsules, specs,
+progress, and attestations
+must be byte-equal to their enclosing typed source. Claim-start and pre-I/O
+`resolved_cohort` is the exact locked V2 row named by the stored capsule's
+compact `(cohort_id, cohort_identity_sha256)` reference; the accepted member
+validates against it, and a common stable-identity projector requires the
+V1-shaped API006 attempt attestation to be byte-equal to the V2 membership
+identity on every immutable field. This evidence projection does not select
+V1 ownership or permit a V1 live spec. The complete evaluator
+constructs the preflight root only after native construction and before
+serializing its candidate complete response. The locked authoritative
+materialization transaction constructs the admission root from that exact
+response, the full
+locked `READY` action/spec/hash/identity/generation/revision/due-time/terminal
+shape, and the attempt/request identity, full canonical request input, and hash
+it is about to materialize. The action ID/kind/spec and all reducer-history
+action fields must be byte-equal to that locked action. Before either row is
+inserted, the admission enumerator calls the
+same pure production
+`project_provider_resource_action_post_materialization_v2(
+ProviderResourceActionAdmissionRepresentabilityInputV2) ->
+ProviderResourceActionPostMaterializationProjectionV2` used by the V2
+materializer. From the locked pre-insert admission root, that projector
+exact-simulates the sole successful insert transition: action revision plus
+one, `kernel_state=QUEUED`, `action_current_attempt=next_attempt`, cleared next-
+attempt time, and a nonterminal `locked_current` with the deterministic request
+ID/input hash, null operation/outcome/settlement, both boundaries at
+`NOT_STARTED`, and either the production-derived inherited retry seed at
+revision one or a fresh null cursor at revision zero. It preserves the exact
+settled immediate predecessor and rejects any different action/current/
+predecessor shape. The full request input must hash to the declared input hash
+and carry the same action/attempt/request/kind-specific private handler and
+pristine queue state. The materializer constructs every deterministic action,
+attempt, request, and queue column from that projection and byte-compares those
+committed columns to it before returning success. Database-owned admitted /
+updated timestamps are intentionally not projection fields and retain their
+ordinary transaction semantics. The hypothetical projection remains pre-write
+sizing evidence, never durable claim or execution authority.
+
+The admission enumerator then derives a closed hypothetical pre-I/O root for
+each accepted worker from that worker's exact aligned API snapshot, the one
+`database_now`, and the projected post-materialization history and
+evaluates every future progress/return/reducer case. Only the exact candidate
+graph, resolved response cohort, projected history/retry seed, deterministic
+request identity/hash, and code-owned response and renewal-successor
+attestation profiles participate. The frozen request-generation profile is
+exactly `PROVIDER_RESOURCE_ACTION_REQUEST_GENERATIONS_V2 = (1,)`: a
+`ReplayPolicy.NEVER` request has one claim, and any recovery is attempt `n+1`
+with a different request. No maximum-BIGINT or same-request replacement
+generation is fabricated. This is an early
+representability optimization for those exact two members, not authority for a
+future replacement member. For each case both workers are checked and the
+deterministic largest result (canonical length, then hash) is retained; either
+worker being oversized rejects admission.
+
+The private-shadow linked-admission evaluator uses the same two index-aligned
+accepted memberships/API snapshots and one PostgreSQL `database_now`. Its sole
+production projector takes the locked represented parent plus complete
+preflight and derives the primary `private_api_request` child, deterministic
+generation-zero request/input/hash, and `BOUND` history. Initial candidate
+insert requires parent `PENDING_SELECTION/PENDING` and exact-simulates the one
+transaction that commits parent `PRIVATE_API_REQUEST/RUNNING`, child
+`REQUEST_BOUND`, request/queue/correlation,
+`SHADOW_ACTIVE`, and history revision one. Retry candidate insert requires the
+same already-`RUNNING` parent, exact settled immediate predecessor/retry
+authorization, and the next contiguous sequence/logical attempt; it inserts the
+new child/history/request/queue/correlation graph atomically without changing
+parent identity. Initial and retry construction each starts from its independent
+source arm; neither may use the candidate projection as evidence. The accepted
+API snapshots are the exact class-14 rows locked and revalidated after the
+complete class-10 prefix and before the new request/queue keys at classes
+15-16. Their keys derive only from already-locked lease-owner scalars, so the
+transaction never reaches backward.
+
+Stored adoption starts instead from a legal stored descendant. The builder
+reconstructs the immutable insertion projection and original database times
+from its parent/child/history/reference and request descendant, then requires
+those reconstructed insertion bytes to equal the candidate projection. It does
+not compare a mutable descendant phase to the initial phase. The closed request
+descendants are generation-zero bound/queued, generation-one authorized/running,
+terminal with retained request, and settled terminal with the request already
+GCed; the parent/child/history and immutable class-17 receipt cross-validate the
+selected arm. Its exact historical-origin list is empty for a fresh initial
+cursor and re-proves every prior-request origin carried by an inherited retry
+cursor. The same adoption contract applies to initial admission and every
+`R`/`U`/`P0`/`O`/`Q` successor admission. A partial or crossed descendant is
+corruption, never permission to insert missing members. The
+projected child role/kind/spec/invocation/request/hash must cross-equal the
+parent. Its real row has exactly the projected decision/sequence/logical-
+attempt/role, `private_api_request`, `REQUEST_BOUND`, request ID, invocation/
+hash, null operation/outcome/retry/observation/effect/divergence fields,
+`admitted_at=request_bound_at=database_now`, and null `completed_at`; the child
+table has no revision field. The materializer constructs and byte-compares every
+one of those columns, not only its invocation. The history has a wholly null authority/settlement bundle plus only
+the exact empty or inherited retry seed. Before any private request is inserted,
+the enumerator derives each accepted member's hypothetical dispatch membership,
+shadow authority proof, authorized-history candidate, progress/return/fallback/
+outcome domain, and terminal receipt from its aligned API snapshot. Either
+member or any independently stored JSON child exceeding 65,536 bytes rejects
+the private candidate before any private graph is written.
+
+That rejection cannot strand the already counted slot. Retryable lock,
+membership, freshness, or artifact drift leaves the parent
+`PENDING_SELECTION/PENDING` and reference `PREPARING` and retries from fresh
+evidence. A deterministic complete enumerator result of unbounded, oversized,
+or unsupported is permanent. Under the same full 1-16 prefix, the fallback
+projector proves the exact initial source and zero child/history/correlation/
+deterministic-request/queue descendants, then atomically changes only parent to
+`LEGACY_CONTROLLER/RUNNING/linked_admission_not_representable` and reference to
+`SHADOW_ACTIVE`. It writes no private graph. Its result and original database
+time are exact-adoptable from those two durable descendants. Only after commit
+does the decision owner signal the one same-cell legacy worker; a crash before
+signal is recovered from the stored full invocation under the ordinary proved-
+no-`PRE_SUBMIT` legacy handshake. Once any private descendant exists, fallback
+is permanently illegal. Thus no path signals both mutation owners or silently
+releases capacity.
+
+Every authoritative generation-one request claim, including one by a rolling
+replacement or cold-recovery member selected before the request was claimed,
+must next
+run the `claimed_execution` boundary before invoking the handler and before any
+lineage, attestation, progress, return, or result write. From the one
+consolidated lock program it constructs the exact claim root and the candidate
+Serve039 lineage. For `candidate_insert`, the sole production lineage builder
+uses the root's one PostgreSQL `database_now` for `authorized_at` and every
+same-transaction checked-at field; the root validator reruns that builder and
+requires byte equality. For `stored_adoption`, it parses the immutable row,
+validates that the stable action/request/generation/token key and canonical
+hashes are exact, replays its proof at its stored `authorized_at`, and requires
+every retained locked row to be a legal historical descendant. That predicate
+may accept a retained revocation, handoff, reference release, or policy close
+solely to validate immutable lineage; it grants no current execution. A second
+predicate must independently prove the same live generation/token, exact-
+current process owner, fresh accepted membership/lease/API instance, an
+`ACTIVE/(OPEN | DRAINING)` policy, the exact already-bound `ACTION_ACTIVE`
+reference, and no blocking handoff. `DRAINING` is accepted only when that
+action/reference predates and remained byte-bound across the admission-state
+CAS; it never admits or binds new work. It never remints timestamps,
+compares the row to a fresh time-dependent candidate, or overwrites it. The evaluator
+measures both separately stored lineage JSON children, the exact starting
+attestation, and all code-owned legal before/after renewal-successor profiles.
+Only after historical validation, representability, and that distinct current-
+execution predicate all pass may the transaction exact-insert/adopt lineage and
+let the handler run. Membership handoff/cold-recovery qualification evaluates the
+same candidate-member profiles before accepting a replacement, and claim-start
+is still the final per-generation barrier.
+
+Claim-start rejection distinguishes whether authority already linearized. For
+a candidate insert with no lineage, if the root is unbounded, oversized, or
+drifted, the worker does not release first. While it still owns the exact
+token/generation fence, one class-15, class-16, then class-17 transaction on the
+same consolidated connection revalidates request and queue, writes the fixed
+bounded `provider_authority_not_representable_at_claim` terminal error, and
+clears the active-claim fields while preserving both the stable authority-
+worker ID and process claim-owner ID in history. It atomically inserts/exact-
+adopts the
+`NO_SUCCESSFUL_CLAIM_START`/`CLAIM_START_NOT_REPRESENTABLE` terminal selector,
+without invoking the handler or writing lineage/progress/return. If that CAS
+loses, it writes nothing. This exact shape has no provider I/O and later reduces
+through the no-I/O `P0` path even though its generation is positive. No
+provider-originated or candidate-sized bytes enter the error.
+
+For `stored_adoption`, the existing exact lineage is historical truth. A failed
+current-successor or representability replay therefore never emits
+`NO_SUCCESSFUL_CLAIM_START` and never deletes or overwrites lineage. Under the
+same token/generation CAS it terminalizes `FAILED` with the fixed bounded
+`provider_authority_reauthorization_failed` error and a
+`LINEAGE`/`CLAIM_REAUTHORIZATION_FAILED` selector naming that row. Reduction
+uses the actual retained journal and outcome evidence; it may classify no-I/O
+only when those bytes prove it, and it never assumes `P0` from the rejection.
+An unequal or unparseable stored lineage is corruption, not a reauthorization
+failure: it writes no terminal selector or request state and blocks for
+operator repair. In either branch a lost CAS writes nothing, and no rejected
+path invokes the handler or performs new provider I/O.
+The claimed handler separately constructs the `pre_io` root from the locked
+stored rows, exact current membership, immutable lineage, current progress, and
+current attestation immediately before its first intent/watermark commit. No
+transport value, artifact, fixture, caller-supplied mapping, or prior boundary
+root can replace fields at a later boundary. Strict fixture parsing uses the
+same DTO validators but grants no live authority.
+
+Every private-shadow generation-one claim runs the disjoint claimed-execution
+root under the parent lock program before handler invocation. Its source and
+candidate projection are disjoint. Candidate authorization requires the source
+history to be strict `BOUND`; the sole builder uses the root's independently
+loaded candidate-service row, active reference, byte-equal immutable complete
+preflight retained in history, `database_now`, actual request claim, and selected
+full registration set, handoff fence, accepted membership, and API snapshot to
+derive the dispatch membership, authority
+proof, lineage hash, authorization time, and complete `AUTHORIZED` history.
+Only that history is output. The validator reruns the builder and the
+transaction commits only the one `BOUND -> AUTHORIZED` CAS.
+The root's canonical `historical_shadow_origins` list must equal every distinct
+origin recursively reachable from the inherited/current cursor. Each origin is
+proved by its retained completed predecessor child, strict settled history, and
+permanent receipt; the builder cannot invent an older worker/effect claim.
+
+Stored adoption instead supplies one strict persisted `AUTHORIZED` history as
+source and output. It validates the proof at its stored authorization time
+against the independent service/reference/preflight and stable request identity,
+then separately proves current claim token/generation, ready process owner,
+full current registration set/handoff fence, accepted lease/API membership,
+and no blocking handoff. It never accepts root-
+supplied membership/proof/lineage fields, remints authorization time, or compares
+the stored row to a fresh time-dependent candidate. Action-shaped membership or
+lineage values cross-reject at parse time.
+
+A candidate-authorization representability failure leaves history `BOUND` and,
+under the still-owned request/queue fence, terminalizes the request `FAILED`
+with fixed bounded error and a `TERMINAL_BEFORE_CLAIM_START/
+NO_SUCCESSFUL_CLAIM_START` shadow receipt fixed to `FAILED`, generation one,
+the exact claim-owner pair, and null lineage. The terminal receipt has a null
+current authority bundle; settlement then classifies the retained raw `BOUND`
+journal through the exhaustive `P0`/`O`/`S`/`X` table. A fresh empty first
+attempt is normally `P0`; an inherited valid nonterminal retry/observation seed
+is normally `O`; a retained valid success is `S`; malformed progress is `X`.
+The rejection itself never chooses `P0`. A failure while adopting an existing `AUTHORIZED` history never erases
+it: it terminalizes with `REQUEST_FAILED/SHADOW_EXECUTION`, retains the lineage
+hash, and reduces from the actual journal. A malformed/crossed history is
+quarantined without terminal mutation. Lost-CAS paths write nothing.
+
+Immediately before each next progress/intent or terminal return, the shadow
+handler constructs `ProviderShadowPreIoRepresentabilityInputV2` from the locked
+candidate service, active reference, history-retained complete preflight,
+parent/child, same full registration-set/handoff/membership/API/request
+authority, immutable authorized
+history, current shadow progress, attestation, and one database time. The
+dispatch membership, execution proof, and lineage hash are loaded only from the
+authorized history and cross-validated against those independent current rows;
+they are not parallel root fields. The same exact historical-origin extraction
+also includes origins reachable from the next handler-return/no-effect branch.
+It carries
+no future result or scenario selector. The nonempty unique code constant
+`PROVIDER_SHADOW_REPRESENTABILITY_SCENARIOS_V2`, its applicability classifier,
+and fixed-signature production-builder dispatch are AST-inventoried against the
+case inventory as one surface. For every scenario applicable to the exact root,
+`build_provider_shadow_next_representability_boundary_v2()` synthesizes the
+closed `ProviderShadowNextRepresentabilityBoundaryV2`: progress covers every
+legal next cursor, while handler return carries only the now-known strict return
+and final progress. It cannot invent the later database-owned terminal receipt,
+fallback, reducer outcome, quiescence, or successor. Neither a
+fixture nor a caller supplies the scenario ID or output. Live linked admission
+enumerates all future reachable scenarios; claim-start repeats them for the
+actual member; immediate pre-I/O/return classifies the actual code path and
+reruns every remaining applicable output. The builder must reproduce every
+candidate child byte and each JSON child is sized independently. Unknown,
+inapplicable, or oversized bytes block before the next intent; a prior boundary
+cannot authorize them.
+
+Terminalization and settlement are separate representability boundaries because
+their bytes do not exist while the request claim is live. After locking the
+request, a new-write terminalizer constructs the root from the immutable route,
+full locked preterminal request/queue state, independent candidate-service /
+active-reference / running-parent / bound-child evidence, raw `BOUND` or
+`AUTHORIZED` history, one trusted terminal-winner source, the independently
+locked historical API-instance for every generation-one
+winner, and one database
+clock read. The production builder derives the finish time as the greatest of
+that clock and every request terminal lower-bound field, derives the typed
+permanent terminal commitment, terminal request, and receipt, and returns them
+only as `candidate_projection`. The validator reruns the complete generation/
+owner/disposition/cause/lineage/return/failure/fence matrix before class-17
+insertion. The process ID comes from the locked request and historical API row;
+the stable ID comes from that immutable API row's Pod UID/health owner fields
+and must cross-equal history and any typed fence member. No class-5 lease lock
+is taken by ordinary terminalization. They are not trusted merely because the winner
+DTO repeats them. No caller supplies cause, disposition, finish time, receipt, or
+terminal output as source. Handler/failure terminalization likewise verifies the
+exact historical-origin list reachable from the retained cursor and strict
+return; a receipt cannot bless an invented predecessor claim.
+
+An unknown-commit retry uses the stored-adoption source: the caller's original
+time-free trusted winner, the permanent typed receipt, and the terminal request
+only when it still exists, plus the completed fence operation only when that
+typed operation is retained. The builder hashes the caller winner into the same
+typed commitment. Exact equality returns `EXACT_ADOPTED` and reuses the stored
+finish time; a different internally legal commitment returns `LOST_RACE`; a
+crossed receipt is corruption. After request and evidence GC the receipt alone
+still distinguishes those results. Adoption never requires the service to
+remain shadow, resurrects a graph, appends an event, or remints a timestamp.
+Any nonnull completed-fence output is byte-equal to the stored operation; it is
+never reconstructed from the receipt commitment.
+
+Later, under the
+class-1-through-10 reducer locks, the settlement builder consumes that immutable
+receipt and retained terminal request, if present, to construct
+`ProviderShadowSettlementCandidateV2`; the root validator reruns the raw-
+journal classifier, strict return/fallback, literal S/R/U/B/Q/P0/O/X outcome, projections,
+retry decision, `SETTLED` history, and optional successor graph byte-for-byte.
+It also recomputes the exact canonical historical-origin set from the raw
+history/return/quiescence and point-validates every supplied retained source;
+`Q` cannot manufacture a predecessor effect claim.
+Fixtures supply only source roots; neither candidate receipt nor settlement
+projection is accepted unless the corresponding production builder reproduces
+it exactly. Request GC after settlement changes only the nullable retained-
+request input and cannot change the immutable receipt or projection.
+The same atomic write inserts one permanent class-17 settlement commitment. It
+hashes the complete original new-write source and the separate complete
+settlement projection, records the operation/current/optional-successor
+identities and original settle time, and is itself canonically hashed. It has no
+FK to the deletable evidence graph. A store-owned, caller-unselectable
+discovery/lock gate chooses mutable-graph adoption only for one complete
+retained current/successor graph and chooses receipt-only adoption only for the
+exact parent-wide ordinary, outgoing-Q, or incoming-Q GC proof. Both Q
+components must be absent under the permanent reciprocal receipt/index
+binding; no retained-peer arm exists. A partial, crossed, or unexpectedly retained graph is corruption and
+cannot bypass validation through the receipt arm. Mutable-graph stored adoption
+validates the receipt as well as every graph byte and returns only
+`EXACT_ADOPTED_GRAPH` on complete equality. After evidence GC, receipt-only
+adoption rebuilds the projection from the caller-retained original source,
+hashes both, and returns only `EXACT_ADOPTED_RECEIPT` on complete commitment
+equality. A different internally legal commitment returns the null-bearing
+`LOST_RACE` arm; malformed/crossed bytes are corruption. A new write returns
+only `NEWLY_SETTLED`. No source disposition can inhabit another success arm.
+The receipt cannot reconstruct provider evidence or authorize a new successor.
+For a new terminal write the parent/child/history types enforce the legal
+running/request-bound/bound-or-authorized source. Receipt-only adoption needs
+no mutable source descendant beyond its exact typed-GC absence proof. When the
+terminal request is retained it must prove
+the entire API007-defined claim triple under API008,
+controller generation, lease expiry, and heartbeat were cleared. Cancellation
+request/acknowledgement are both null or preserve the exact prior intent with a
+nonnull acknowledgement equal to finish time; every crossed pair rejects.
+The settlement projection's complete parent and child carry every stored
+projection/outcome/retry/observation/effect/divergence JSON/hash pair, operation
+ID, phase, and timestamp. They must equal the candidate actual/proposed
+outcomes, fallback evidence, and
+`SETTLED` history and are byte-compared to every column written by the atomic
+reducer; a phase-only completion marker is insufficient. Settled replay accepts
+only that exact complete graph, including after the request becomes absent.
+The candidate projection carries actual and proposed outcomes separately and
+both pairs byte-equal the completed child's corresponding columns. Actual is
+derived from the strict handler return or terminal fallback and is the sole
+mutation/retry authority; proposed is independently built by the frozen
+comparison reducer. Their mismatch is retained as the exact bounded divergence
+class and is promotion-blocking, never permission to choose the proposed state.
+The stored `reduction_disposition` preserves the literal authoritative
+classifier. Handler classes are `S/R/U/B/Q`; request-fallback classes are
+`P0/O/S/X`. They are never normalized into one another. The following table is
+the exhaustive settlement mapping; `RC` and `D` are the exact retry class and
+delay from the handler `R` tuple, and "max" means
+`logical_attempt == RESOURCE_ACTION_MAX_ATTEMPT_V1`:
+
+| source | exact actual provider tuple | stored disposition | retry decision `(decision, class, delay)` | parent phase | successor |
+|---|---|---|---|---|---|
+| handler `S` | `S` | `S` | `(terminal, null, null)` | `COMPLETE` | none |
+| handler `R`, below max | exact `R` | `R` | `(retry_same_plan, RC, D)` | `RUNNING` | `retry_same_plan` linked admission |
+| handler `R`, max | same exact `R` | `R` | `(block, null, null)` | `COMPLETE` | none |
+| handler `U`, below max | exact `U` | `U` | `(observe, observation_required, 60)` | `RUNNING` | `observe_same_plan` linked admission |
+| handler `U`, max | same exact `U` | `U` | `(block, null, null)` | `COMPLETE` | none |
+| handler `B` | exact `B` | `B` | `(block, null, null)` | `COMPLETE` | none |
+| launch handler `Q` | exact `Q` | `Q` | `(terminal, null, null)` | `COMPLETE` | `partial_down` linked admission |
+| fallback `P0`, below max | exact `P0` | `P0` | `(retry_same_plan, transient, 60)` | `RUNNING` | `retry_same_plan` linked admission |
+| fallback `P0`, max | same exact `P0` | `P0` | `(block, null, null)` | `COMPLETE` | none |
+| fallback `O`, below max | exact `O` | `O` | `(observe, observation_required, 60)` | `RUNNING` | `observe_same_plan` linked admission |
+| fallback `O`, max | same exact `O` | `O` | `(block, null, null)` | `COMPLETE` | none |
+| fallback `S` | exact `S` | `S` | `(terminal, null, null)` | `COMPLETE` | none |
+| fallback `X` | exact `X` | `X` | `(block, null, null)` | `COMPLETE` | none |
+
+`replan_new_generation` is unreachable in Serve039 shadow settlement. Attempt
+exhaustion changes only the parent/successor/retry-decision projection; it never
+rewrites the literal actual outcome or stored disposition. Proposed outcome is
+comparison evidence only and cannot select any row in this table.
+`post_settlement_parent` remains the exact `RUNNING` parent whenever a same-plan
+retry/observation successor is created; it is the complete parent for terminal
+`S`/`B`/`Q`, fallback `X`, or attempt exhaustion with no successor.
+`successor_kind` is `retry_same_plan` exactly for below-max `R`/`P0`,
+`observe_same_plan` exactly for below-max `U`/`O`, `partial_down` exactly for
+`Q`, and null for `S`/`B`/`X` and exhausted `R`/`U`/`P0`/`O`; the successor-
+projection is nonnull exactly for the three nonnull kinds and its child role/
+kind/retry decision must match. Its facts never originate in that projection.
+For a new settlement the outer root supplies either the source-only
+`same_parent_new` arm or the source-only `partial_down_new` arm. Neither arm may
+contain a completed child, settled history, post-settlement parent, target
+coverage/parent, or any other value this transaction is about to write. The one
+pure `project_shadow_settlement_with_successor_v2()` first derives the current
+completed child, `SETTLED` history, literal outcome, and post-parent as local
+values; only then may it pass that internal predecessor to the ordinary linked-
+admission projector. That local value never becomes DTO evidence.
+
+For retry/observe, the source declares the active reference, complete
+preflight, full registration set/handoff fence, aligned memberships/API rows,
+deterministic request input, and exact absence of every next-request key. The
+combined projector emits the ordinary same-parent insertion graph. For `Q`,
+the source instead declares the independently locked replica/capacity snapshot,
+PREPARING target reference, complete down preflight/construction, full
+authority set, deterministic target identities/input, and exact absence of
+target coverage, parent, descendants, request, queue, correlation, and replica
+down links. It internally derives the target PENDING_SELECTION parent, then the
+final linked-admission graph, and emits one
+`ProviderShadowPartialDownTargetInsertionProjectionV2` containing target
+coverage, the exact replica-link/status/generation transition, final parent/
+child/history/request/reference graph, and reciprocal source Q link. The
+retained capacity allocation is byte-preserved, never released or reallocated
+by admission.
+
+Stored replay is disjoint. Its source supplies the caller-retained original
+new-write root separately from the already-settled current graph, plus either
+the complete stored same-parent successor or the complete
+stored partial-down *descendant*, including immutable coverage, the current
+present replica/capacity or exact post-removal absence proof, reciprocal links,
+and a legal admission descendant whose
+request/reference/history may already be authorized, terminal, settled,
+released, or request-GCed. It never supplies the initial insertion projection
+as source. The immutable target coverage/admission timestamps and source
+cleanup basis reconstruct those original insertion bytes. The current service
+may already be authoritative: stored replay uses only the mode-independent
+historical candidate binding projected from retained coverage and cannot create
+a new write. The builder hashes the caller root to distinguish its operation/
+source from the stored winner, while current descendants independently prove
+that winner's graph. It returns exact adoption only when caller source,
+commitment, whole source/target graph, and all original database times reproduce
+the candidate projection. A different internally legal caller commitment is a
+lost race; a partial, crossed, or second target is corruption; no replay inserts
+a missing member. Tests cover commit-before-ack followed by both target
+advancement (including real replica-row removal) and source-service promotion
+before exact adoption.
+Once typed evidence GC removes that complete graph, the disjoint
+`receipt_only_adoption` source carries the caller-retained original new-write
+root and the permanent stored settlement commitment. The candidate carries the
+caller-retained projection plus that byte-equal commitment. Recomputed source,
+projection, terminal-history, successor-identity, operation, and time hashes
+must all match; no current service/reference/request/evidence row is required.
+This is exact acknowledgement recovery only, not graph resurrection.
+
+Settlement cannot rely on an earlier source-only size pass for a newly created
+graph. Before `R`, `U`, fallback `P0`/`O`, or any other legal retry writes a
+successor, its sorted-lock transaction validates that complete source-only arm
+and every future progress/return/fallback/outcome case for the derived child.
+Before `Q` writes its normal primary-down target, the source+target sorted-union
+transaction validates the complete target-construction arm in addition to the
+shadow partial basis, cleanup rederivation, and complete down preflight. Only a
+complete combined projection may commit source settlement plus successor graph;
+not-representable or drift writes neither side. Exact lost-ack adoption uses the
+stored-source arm and reruns the same projector against every committed byte.
+
+The direct-transition root is constructed only inside the owner-fenced Serve
+teardown transaction. Its validator reruns the sole production builder from
+the exact locked input and requires the candidate outcome to be byte-equal; it
+never accepts a proof kind, prefix, provider tuple, or outcome chosen by a
+caller. The outer candidate must parse as the direct-no-effect basis and every
+other outer basis rejects. The action snapshot, predecessor/current snapshots,
+request-row disposition/retained terminal snapshot, prefix hashes, and one
+database cancellation time cross-bind exactly as the parent direct builder
+contract requires. Every materialized attempt also carries its immutable
+terminal-authority selector; request-GC removes only the transient request
+snapshot, never that selector. Lineage presence alone is not provider-I/O
+evidence. It has no current worker/cohort field. The seven direct fixture roots are,
+exactly: unmaterialized; terminal-request-unsettled at one link and maximum
+count; retained-settled with a present request at one link and maximum count;
+and retained-settled with a garbage-collected request at one link and maximum
+count. Every materialized structural-maximum root uses terminal state
+`CANCELLED`, null request return, and the corresponding longest legal fixed
+error shape; `SUCCEEDED` is the equal-length terminal-state tie but sorts after
+the manifest's explicit `CANCELLED` choice only as a negative/nonmaximal test,
+while `FAILED` is shorter. Production transition tests separately exercise all
+three legal terminal states and prove each classifies to the same structural
+scenario and is no larger than its fixed maximum. A classifier derives that
+scenario from the typed builder input and must match exactly one code-owned row.
+
+The reducer-history projection is built only from the action, immediate
+predecessor, current-attempt, and retained-request rows already required by the
+boundary's lock program; it is not a caller-supplied history scan. Hash/null
+fields are recomputed from their adjacent typed values. Its action revision and
+each attempt's `request_input_sha256` are exact locked durable values, never
+synthesized. A nonnull terminal-request snapshot additionally retains the
+  exact execution generation, cleared null process worker, and kind-derived private
+handler name; its terminal selector retains the pre-update claim worker, and
+when a return exists the selector/lineage worker equals its nested terminal
+attestation. At linked admission
+for `next_attempt=1`, `action_current_attempt=0`, both locked attempt members,
+both action-result members, `launch_no_io_prefix`, and
+`supersession_quiescence` are null. For `next_attempt>1`,
+`action_current_attempt=next_attempt-1`, `locked_predecessor.attempt` equals
+that value, the predecessor is settled with its exact immutable outcome,
+retained progress, and terminal-authority selector, and `locked_current` is
+null. Its terminal-request snapshot is byte-equal when retained and null
+exactly after legal settled-request GC; neither shape changes the selector or
+historical authority.
+At pre-I/O, `locked_current.attempt=attempt` and is byte-equal to the current
+locked attempt; `locked_predecessor` is null exactly for attempt one and
+otherwise names settled attempt `attempt-1` with the exact immutable values
+used to materialize the current attempt. The top-level no-I/O prefix and
+quiescence are null unless present in the exact action/latest or predecessor
+outcome, in which case they are byte-equal. This supplies every known retry,
+fallback, retained-request, no-I/O-prefix, quiescence, and historical-outcome
+byte to `current` mode without loading unrelated older attempts; those older
+immutable outcomes were size-gated when they were committed.
+
+Every terminal attempt has exactly one immutable Serve039
+`terminal_authority_selector`; a nonterminal attempt has none. While the API
+request row exists, its terminal state/time/generation/input/handler must be
+byte-equal to the selector, and its cleared process worker must be null. The
+selector's stable authority-worker and process-owner IDs instead equal the
+terminalizer's locked pre-update claim/lease pair and, when present, the
+lineage/typed-return pair. After settled request GC, the transient
+`request_terminal_snapshot` is null but the selector remains and is the sole
+generation/worker/cause lookup. A `LINEAGE` selector names the exact matching
+historical row; `NO_SUCCESSFUL_CLAIM_START` names none and is legal only for the
+fixed claim-start rejection or any terminalization that won before successful
+claim-start. Missing, crossed, mutable, or multiple selectors block reduction
+and GC.
+
+The selector is written by the generic central request-terminalization core on
+the caller-owned connection, not only by the private handler. After
+nonauthorizing discovery, every generation-one private terminal transaction
+locks the claimed process API-instance row before request/queue and derives the
+stable authority-worker ID from that row's canonical Pod UID; the route carries
+no worker identity. Handler modes cross-check lineage/return, claim-start modes
+cross-check their already-held lease/API context, owner-ack modes cross-check
+the same-fence API mapping, and recovery modes cross-check the enclosing old-
+owner lease/API evidence. Generation zero has both IDs null. A caller-supplied
+stable ID or current-member lookup is never authority. A generation-zero path
+whose class-15 reread observes a concurrent generation-one claim aborts without
+mutation, releases, and restarts from class-14 owner discovery; it never locks
+the API row backward or creates a null-owner generation-one receipt. The
+opposite ordering commits either the generation-zero terminal receipt or the
+generation-one claim. Its call-site
+inventory covers typed completion, strict-codec failure, owner-acknowledged
+kill/cancel, precondition/startup/recovery, leadership, reservation, and any
+new terminal path. The expired-claim reaper is separately inventoried to skip
+every claimed V2 private row and writes no selector. A terminal V2 request
+without an exact selector rolls back
+and fails closed. That core uses one PostgreSQL timestamp scalar for both the
+request and selector finish time. Before the update it captures both the stable
+authority-worker ID and process claim-owner ID in the selector whenever
+execution generation is one, then clears the
+complete API007-defined request claim triple under API008 plus controller-generation and heartbeat;
+generation zero captures both IDs as null. Tests exercise the real API008 claim
+constraint and cover handler success/failure, strict return encoding failure,
+explicit cancellation, owner-quiesced lease loss, typed UID/process fences,
+and generic expired-claim private skipping.
+
+Historical authority is a closed projection, not an arbitrary list. The five-
+effect schedule gives one attempt at most 13 unique keys: two origin keys per
+effect plus one progress-envelope attestation, one terminal-selector, and one
+typed-outcome key. The current/predecessor reduction union is at most 28 after
+adding one action-last-result and one raw-invalid terminal-selector slot.
+`extract_provider_resource_action_authority_keys_v2()` reads only those exact
+typed slots. Every `LINEAGE` terminal selector contributes its named generation
+whether or not the request row/progress remains parseable; a
+`NO_SUCCESSFUL_CLAIM_START` selector contributes no key. The extractor
+deduplicates by `(action_id, attempt,
+request_execution_generation)`, and sorts by action UUID bytes, attempt, then
+generation. Each attempt list equals its exact extractor result and the outer
+`ProviderResourceActionV2ReductionAuthorityContext.historical_authority` equals
+the sorted union across the bounded input. Missing, extra, duplicate, unsorted,
+over-bound, crossed-request, or hash-unequal rows reject. Empty is legal for the
+exact pristine nonterminal shape with null selector and no terminal/effect /
+attestation evidence. Once terminal, empty is legal only when the immutable
+selector proves `NO_SUCCESSFUL_CLAIM_START`, whether generation zero or the
+sole generation one assigned before terminalization/claim-gate rejection; any
+other named authority key requires its exact immutable row.
+
+One primary history cannot stand for mutually exclusive locked states. The
+ordered authoritative-history bank therefore contains full admission or
+pre-I/O roots for every code-owned applicability-equivalence class, including
+fresh attempt one, retry with its immediate settled predecessor in both
+retained-request and legally garbage-collected-request shapes, and inherited
+effect adoption into the later attempt's new sole-generation-one request,
+maximum-attempt exhaustion,
+every fallback journal class, and every distinct known prefix/quiescence shape.
+`classify_provider_resource_action_history_scenario_v2()` derives the one
+literal scenario from the root; it cannot rewrite history or accept a selector.
+Its ordered code constant
+`PROVIDER_RESOURCE_ACTION_HISTORY_SCENARIOS_V2` is a nonempty tuple of unique
+literal scenario IDs. The fixture bank must classify to that tuple exactly in
+order, with one root per row and no missing, duplicate, or extra root; repository
+AST inventory freezes the classifier keys and tuple as one surface.
+Live admission/pre-I/O evaluates only rows reachable from its exact root, and a
+later retry is measured by its own later admission transaction.
+
+Fallback `X` is valid stored output from invalid raw journal bytes, so it is
+positive representability evidence rather than a malformed-output test. Its
+linked-admission projector receives the normal full authoritative admission
+root and first consumes
+`project_provider_resource_action_post_materialization_v2()`. For each
+sealed code-owned raw-invalid profile, a second production projector exact-
+simulates only the reachable request-terminal/journal mutation from that post-
+insert state and derives a complete
+`ProviderResourceActionRawFallbackReductionInputV2`; no raw scenario is a top-
+level fixture/live root. Its nested classifier input has one
+authority: its action is the projected `QUEUED` action with incremented
+revision/current attempt, it retains that projection's typed predecessor, and
+it replaces only the projection's current snapshot with the sole raw current
+attempt. The current attempt equals `action_current_attempt`; predecessor is
+null exactly for attempt one and otherwise is the exact settled attempt-1; the
+current request is terminal and unclaimed; action/request/kind/input hashes
+and every prefix field cross-bind; and its raw progress/hash pair and terminal-
+authority selector are exact. For linked-admission measurement, the outer
+reduction input repeats the candidate spec/resolved cohort and constructs one
+hypothetical immutable lineage plus `LINEAGE` selector for each accepted
+member. Its API start/heartbeat, Pod IP, server version, boot nonce, ready-health
+bytes, and `authorized_at` come only from the aligned locked snapshot and
+`database_now`; compact cohort, action/kind, request/generation/worker, and input hashes
+cross-bind byte-for-byte. Both accepted workers are projected independently. A
+live reduction instead loads its immutable terminal selector and the exact
+historical lineage it names; it never selects current accepted membership.
+The journal classifier core consumes only the nested raw history, while the
+real fallback reducer must consume the entire V2 reduction input through the
+same explicit authority-context wrapper used by live persistence; neither may
+recover a spec, cohort, or member ambiently. The production-profile test
+inventory carries the exact bounded raw attempt bytes and hash. Each profile
+either fails the production `ProviderLifecycleProgressV1` parser or parses
+successfully and fails exactly one production hash, revision, action-context,
+operation-ID, or watermark/progress invariant. The sealed profile tuple covers
+every `invalid` classifier branch, with AST dispatch equality and runtime branch
+instrumentation preventing an unmeasured branch. In every case the production
+journal classifier returns exactly `invalid` and the real V2 fallback reducer
+constructs the measured `X` outcome. The fixture cannot
+name `X` or a raw profile directly. The nonempty unique
+`PROVIDER_RESOURCE_ACTION_RAW_INVALID_JOURNAL_PROFILES_V2` tuple and its builder
+dispatch are AST-inventoried as one surface. Linked admission evaluates all of
+those profiles as future response states before request insertion; an actual
+reduction still validates the exact bounded outcome before persistence.
+
+The finite mutable-attestation domain is code-owned rather than inferred from
+fixtures. `PROVIDER_AUTHORITY_ATTESTATION_SUCCESSOR_PROFILES_V2` is an ordered,
+nonempty tuple with exactly these four literal profiles:
+`current_before_after_null`, `current_before_after_closed`,
+`maximal_mutable_before_after_null`, and
+`maximal_mutable_before_after_closed`. The current profile preserves the exact
+live Pod/ReplicaSet/Deployment resource versions and `observed_at`; the maximal
+mutable profile substitutes only the resource-version leaves with exact legal
+1,024-byte NFC text maxima. Canonical timestamps are fixed-width, so size mode
+does not fabricate a future clock: it preserves the root's legal `observed_at`,
+and a closed-after projector uses the boundary's exact nondecreasing database
+time.
+It never changes namespace/name/UID/owner, generation, template, image,
+ServiceAccount, artifact, callable, or handler identity. All identity text is
+already bounded by the production codecs: Kubernetes names are at most 253
+UTF-8 bytes, other text/resource-version/UID leaves are at most 1,024 UTF-8
+bytes, generations are signed-int64 positive integers, and timestamps have the
+fixed canonical UTC representation.
+
+For either before profile, the closed after profile is the unique legal
+`ProviderAuthorityWorkerAttemptAttestationV1` successor: every identity field
+is byte-equal to `before` and only `observed_at` may advance; the null profile
+keeps `after=null`. Within one request execution generation no other transition
+exists. Admission evaluates the current and maximal mutable profiles for each
+of its two accepted members as an early optimization. Claim-start evaluates the
+exact current live `before` plus both legal after states and the maximal legal
+successor-before pair before persisting lineage or invoking the handler.
+Handoff and cold-recovery qualification run the same candidate-member profiles
+before accepting replacement membership. Immediate pre-I/O starts from the
+persisted exact attestation and evaluates only its legal null/closed remainder.
+The tuple, builder dispatch, and every profile consumer are one AST-inventoried
+surface; no fixture may invent another before/after value or maximize an
+arbitrary frozen field.
+
+Each case ID maps to exactly one fixed-signature case projector and one
+code-owned applicability predicate in the enumerator's sealed dispatch table;
+they receive only the exact
+`ProviderResourceActionRepresentabilityInputV2` selected by the case's
+`dispatch_kind`, `action_kind`, and `boundary`, plus the enumerator-owned mode `current` or
+`candidate_maximal`.
+There is no artifact-supplied argument object, payload preimage, free-form
+selector, artifact path, callable name, or code expression. The repository AST
+inventory requires the dispatch keys and projected ordered case rows to be
+identical to the applicability keys and the globally concatenated shard rows,
+so adding or changing a legal variant requires a new explicit case ID and both
+result rows. Thus the complete cross-dispatch case cardinality is exactly
+`len(cases)` and the two result files jointly contain exactly twice that value;
+the small manifest contains only refs and neither design repeats a manually
+maintained number that can drift. The pure enumerator projects its actual
+ordered `(case_id, dispatch_kind, action_kind, boundary, payload_kind)` tuple and
+requires canonical equality with the index-ordered shard concatenation before measuring either a fixture or
+live input. Applicability is derived only from the typed root. Common rows
+apply at their named boundary. Handler and fallback rows apply only when the
+exact kind-specific history and production journal classifier can reach them;
+direct rows apply only to `owner_fenced_transition` and its one classified
+legal builder-input shape. A down complete-preflight root applies exactly one cleanup-target
+row: `completed_launch`, or the unique literal case returned
+by `classify_provider_kubernetes_partial_cleanup_rederivation_input_v2()` after
+the sole rederiver counts nonnull committed-object UIDs and the Pod's retained
+server allocations, or the corresponding unique shadow-partial case returned
+by the shadow-input classifier for a private-shadow `Q`. Mutually exclusive launch histories are not fabricated
+from one live root, and their inapplicability is neither an error nor evidence
+for that action.
+
+The two referenced fixture inputs are descriptor-read and size/hash-verified.
+The realistic fixture is evaluated only in `current` mode and the candidate-
+maximal fixture only in `candidate_maximal` mode; each live boundary instead
+evaluates both modes. Each contains the twenty primary roots plus four ordered
+banks: the complete down-cleanup bank (completed launch, every literal legal
+API006 partial-cleanup case, then every literal legal shadow-partial cleanup
+case); the full authoritative-history bank; the full shadow-history bank; and
+the seven direct-transition roots. Every cleanup member is a full typed preflight root and must replay the
+sole cleanup rederiver and corrected down-capsule constructor byte-for-byte.
+No artifact supplies a target override, history rewrite, proof-kind selector,
+or hand-authored outcome. Across the twenty primary roots and all four banks, the
+CI aggregator requires every global case to have at least one applicable
+production input. For each case and mode it evaluates every
+applicable root, rejects if any result is oversized, and emits the deterministic
+maximum result by canonical byte length and then SHA-256. A missing case fails;
+distinct completed/partial roots need not render byte-equal results. Golden
+counts and hashes are CI evidence only; live preflight, admission, claim-start,
+pre-I/O, and direct-transition checks substitute their exact typed roots and render both modes for every
+applicable reachable case rather than trusting fixture byte counts. Linked
+admission evaluates its own rows plus all descendant `pre_io` rows before
+action-attempt or shadow-child/request insertion; immediate pre-I/O reruns the latter with the actual
+claim generation, cursor, operation ID, member, and attestation. The owner-
+fenced transition call runs before outcome/capacity/release writes. Across the
+seven boundary kinds every case reachable by that immutable action, shadow graph, or transition is
+evaluated; an unknown or empty/missing boundary slice, or an applicable
+projector that cannot render, is a hard failure.
+`current` preserves every known live byte; `candidate_maximal` preserves those
+same bytes and substitutes only the declared finite maxima for values still
+unknown at that boundary. Either oversize mode rejects.
+
+The fully expanded case tuple contains separate payload rows, with both
+`realistic` and `candidate_maximal` results, for each of these semantics:
 
 - all phase-table rows: three `CREATE_INTENT` roles, one/two/three-slot
   `OBJECTS_PARTIAL`, `OBJECTS_EXACT` through both Pod edges, `HANDLE_INTENT`,
   `HANDLE_COMMITTED`, `RUNTIME_READY`, `JOB_INTENT`, `JOB_COMMITTED`,
   `JOB_RUNNING`, `ENDPOINT_RESOLVED`, and `SUCCEEDED`;
+- all down rows: `TARGET_RESOLVED`; each legal delete-order
+  `DELETE_INTENT`/`DELETE_PARTIAL` prefix; `ABSENCE_EXACT`;
+  `HANDLE_REMOVE_INTENT` with exact-handle and already-absent inputs;
+  `HANDLE_REMOVED` for both legal removal dispositions; and `SUCCEEDED`;
+- launch and down V2 preflight request, complete response, each kind-matched
+  not-representable reason, capsule, config, invocation, plan, and full action
+  spec, including every eligible live worker/attempt-attestation projection;
+- for each launch/down kind, the linked-admission canonical request input and,
+  for each accepted member, its hypothetical claim's separately rendered
+  `dispatch_membership` and `execution_authority` lineage children; the actual
+  claimed-execution root's two children; and the immutable pre-I/O lineage's
+  same two children. Each child has its own case row, byte count, and hash. The
+  transient enclosing lineage DTO is never treated as one stored/wire JSON
+  value and cannot hide an oversized child;
+- for each launch/down kind, exactly the ordered
+  `PROVIDER_RESOURCE_ACTION_TERMINAL_SELECTOR_PROFILES_V2`: handler-return /
+  lineage / succeeded; request-failed / lineage / failed; request-cancelled /
+  lineage / cancelled; claim-start-not-representable / no-successful-claim-
+  start / failed; claim-reauthorization-failed / lineage / failed; and the four
+  terminal-before-claim-start / no-successful-claim-start variants formed by
+  `FAILED | CANCELLED` crossed only with generation-zero/both-IDs-null or
+  generation-one/both-IDs-nonnull. No profile constructor accepts a free cause,
+  disposition, state, generation, or worker. The tuple, applicability map,
+  constructor dispatch, exhaustive parent state table, AST inventory, and both
+  golden modes are one surface; an illegal pair is a negative parser test, not
+  a representability row. These profiles are measured at linked admission and
+  revalidated at reduction/direct transition before persistence or GC;
+- for each private-shadow launch/down kind, the represented parent, primary
+  child/invocation, canonical request input, `BOUND` history, and both accepted
+  workers' hypothetical dispatch-membership, authority-proof, lineage-hash, and
+  `AUTHORIZED` history children at linked admission; the actual selected
+  worker's same children at claim-start and pre-I/O. Empty attempt-one and exact
+  inherited-retry-seed histories are separate scenarios. Parent, child, and
+  history row projections are typed scenario inputs only, never enclosing
+  payload-result rows. Their actual spec/plan/invocation, membership, authority,
+  progress, return, receipt, fallback, outcome, retry, observation, and effect-
+  trace JSON leaves are each independently bounded and hashed. Every completed
+  parent additionally emits two distinct `shadow_projection` payload rows: its
+  stored actual/legacy projection and its stored proposed projection. The
+  aggregate SQL join is never a payload row;
+- every shadow launch/down phase and origin/evidence/no-effect substitution,
+  including same-claim commit/adoption, later logical-attempt adoption, every
+  E-only and legal `E* + N<i>` quiescence, handler `S` and every reachable
+  `R`/`U`/`B`, launch-only `Q`, fallback `P0`/`O`/`S`/`X`, and maximum logical-
+  attempt blocking. `Q` additionally measures the normalized successor edge,
+  `ServeShadowPartialLaunchCleanupBasisV1`, shadow cleanup rederivation input,
+  and the complete normal `PRIMARY_DOWN` preflight/admission graph; it never
+  invents `LAUNCH_CLEANUP_DOWN`;
+- the complete private-shadow terminal-receipt matrix: handler return;
+  request failed; owner-acknowledged cancellation; owner-quiesced lease loss
+  with absent/present prior intent; claim-start not representable; terminal-
+  before-claim-start; and each stale-owner/cold-recovery/process-supersession
+  fence, including mixed action+shadow batches at one and maximum inventory,
+  with
+  generation-zero/null-owner and generation-one/exact-owner shapes only where
+  the parent matrix permits them, `SHADOW_EXECUTION` plus nonnull lineage exactly
+  for an authorized history, and `NO_SUCCESSFUL_CLAIM_START` plus null lineage
+  exactly before authorization. Each receipt has a separate
+  `shadow_terminal_commitment` case containing the acyclic time-free fence
+  commitment projection derived from the preterminal source;
+  tests prove the completed fence operation never enters its own hash domain.
+  Request-present, request-GCed, and later evidence-GCed exact adoption plus a
+  different legal lost-race commitment are separate terminalization cases. Each
+  receipt is paired with the strict handler return or raw-journal fallback, the resulting `ServeShadowCandidateOutcomeV1`,
+  final execution-history `SETTLED` projection, retry decision, child `COMPLETE`
+  projection, permanent `shadow_settlement_commitment`, and request-present/
+  request-GC/evidence-GC retention shape;
+- the resolved cohort, each eligible worker identity and attempt attestation,
+  native V2 renderer input, each of the three rendered/validated request
+  bodies, and every completed or legal partial cleanup target used by those
+  enclosing rows;
 - `call_not_entered` for sequences 0-4; CoreV1 422 for failing sequences 0-2;
-  cluster-row `rolled_back/not_found` and the one typed different-UUID conflict;
-  Skylet `schema_rejected` plus same-key conflict in each allowed terminal job
-  state;
+  the indivisible cluster-row `rolled_back + not_found` tuple and the one typed
+  `conflict_no_write + different_identity_conflict`/different-UUID exact
+  handle; one Skylet `schema_rejected`/NotFound row plus same-key conflict in
+  each of the `SUCCEEDED`, `FAILED`, and `BLOCKED` retained job states;
 - reducer quiescence for every nonsuccessful phase-table row, including every
   E-only post-effect/read-only row and every legal `E* + N<i>` intent row, plus
-  explicit rejection of `SUCCEEDED`, E-only-with-N, intent-without-N, and
-  wrong-claim N; same-claim created/submitted/inserted commits, same-claim
-  adoption, later-generation adoption, generation reset across attempts, and
-  rejection of a retry-local no-effect resolution for an inherited intent;
+  same-claim created/submitted/inserted commits, same-claim adoption, later-
+  attempt adoption, and the explicit new-request generation zero-to-one reset
+  across attempts;
 - the parent's complete handler/outcome cross-field cases: domain success `S`;
   every revision-zero, nonintent, and current-intent error-category mapping to
-  `R`/`U`/`B`, including maximal bounded code/message/retry leaves and every
-  invalid cross-combination; supersession `Q` for E-only and E+N; all three
-  unmaterialized, terminal-request-unsettled, and retained-settled direct
-  `CANCELLED_NO_EFFECT` bases, including retained request present/GC; request-
+  `R`/`U`/`B`, including maximal bounded code/message/retry leaves;
+  supersession `Q` for E-only and E+N; the unique count-zero unmaterialized
+  direct `CANCELLED_NO_EFFECT` basis plus the positive one-link and maximum-
+  count terminal-request-unsettled and retained-settled bases, including
+  retained request present/GC, all owned by `owner_fenced_transition`; request-
   terminal fallback `P0`, `O`, external-cursor `S`, and corruption `X`, for
-  each compatible terminal request state and missing/invalid-return reason.
-  Direct fixtures cover empty, one-link, and maximum-integer-count rolling no-
-  I/O prefixes, immutable historical attempt outcomes, immediate-link tamper,
-  inherited cursor, and crossed-predecessor rejection. Maximum-attempt fixtures
+  each compatible terminal request state and missing-return/fixed-failure reason;
+  malformed nonnull return is a negative codec/quarantine case, not a fallback row.
+  Direct fixtures cover only those legal basis/prefix pairs, immutable
+  historical attempt outcomes, and the exact null revision-zero journal.
+  Maximum-attempt fixtures
   also cover the parent's exact exhaustion reduction for handler `R`/`U` and
-  fallback `P0`/`O`, including no max-plus-one request and direct-teardown
-  precedence.
+  fallback `P0`/`O`, including no max-plus-one request. Direct-teardown
+  precedence is transition coverage over the same maximum-count direct
+  outcome bytes, not a duplicate representability payload row.
 
-Each fixture records case ID, payload kind, canonical byte count, and SHA-256;
-the `candidate_maximal` member is not a synthetic protocol-wide fill of every
+The enumerator is not allowed to hand-author a value that the live reducer
+cannot produce. Before freezing this tuple, the production progress module
+must implement the parent-specified
+`ServeReplicaActionDirectNoEffectCancellationV1`, direct-cancellation outcome,
+and one closed authoritative outer outcome parser discriminating
+handler/direct/fallback bases. The direct builder alone constructs the count-zero, appended, or
+retained prefix under the exact proof variant and enforces direct-teardown
+precedence. The existing pre-038 provider-result-only shadow codec remains
+readable historical evidence, not an alias for this outer parser. Private P3
+shadow remains disabled until the specified parent/child/history/progress,
+terminalization, S/R/U/B/Q plus P0/O/S/X settlement, and same-inventory boundary
+family are implemented and verified against actual shadow rows.
+
+The same production module must support V2 immutable specs through the exact
+`ProviderResourceActionV2ReductionAuthorityContext`, containing the stored V2
+spec, resolved V2 cohort, and only the immutable historical-authority rows named
+by the bounded progress/outcome/terminal slice. Frozen V1
+parsing/validation remains unchanged. V2 reduction
+validates the compact capsule reference against that context and compares each
+V1-shaped API006 attestation with the stable worker projection frozen in its
+named lineage row; it
+never falls through the V1 spec parser or resolves a cohort ambiently. Public
+V1 reducer wrappers and V2 authority-context wrappers share the same pure
+reducer cores. The response projectors call only these production DTOs,
+progress/no-effect builders, and reducer cores. They preserve every locked
+root byte and synthesize only bounded future response leaves; every projected
+value must round-trip its production parser.
+
+The `journal_class=invalid` fallback is the one deliberate ordering exception
+to attestation comparison: its V2 wrapper first validates the stored spec's
+compact cohort reference against the exact resolved cohort, binds the terminal
+selector execution generation and worker ID to its immutable lineage row when
+one exists, and classifies the raw
+journal before attempting domain progress parsing. Because invalid bytes may
+contain no parseable attestation, that branch must not require a stable
+attestation projection. Every non-invalid V2 journal continues to require the
+normal V1-shaped-attestation-to-historical-lineage comparison. The linked-admission `X`
+projector passes the full admission root, candidate lineage/context, and derived
+post-materialization raw history through this same production wrapper.
+
+All seven direct-cancellation payloads are owned by
+`owner_fenced_transition` and measured from the exact locked production-builder
+input before the one atomic outcome/capacity/release write. They are not
+worker admission or pre-I/O descendants. A separate maximum-attempt direct-
+precedence row is forbidden because it would serialize the same payload.
+Likewise, the no-effect tuple has exactly five call-not-entered, three CoreV1
+422, two cluster-row, and four Skylet semantic rows; splitting one literal
+proof tuple or crossing schema rejection with an inapplicable durable job state
+does not create a renderable case.
+
+Only canonically valid renderable values appear in `cases`; every row therefore
+has a byte count and hash. Negative parser/transition coverage--including
+`SUCCEEDED` quiescence, E-only-with-N, intent-without-N, wrong-claim N,
+retry-local resolution of an inherited intent, invalid handler/result cross-
+combinations, immediate-link tamper, and crossed-predecessor inputs--remains an
+exhaustive test inventory but is not miscounted as a representability payload.
+
+The previously generated 375-row intermediate is rejected: it contains five
+invalid direct basis/prefix Cartesian rows, three invalidly split/crossed no-
+effect rows, a duplicate direct-precedence payload, and assumes one down root
+can represent all mutually exclusive cleanup histories. It also fabricates
+mutually exclusive reducer histories from one root, maps direct teardown onto
+worker boundaries, and hand-authors fallback `X` without the raw-invalid
+production classifier. Removing its known duplicate/impossible rows would
+yield the current provisional 366 rows only before the required generated-byte
+audit of the phase/E-only/E+N quiescence families. The accepted provisional
+index records that derived count and exact `0..182` / `183..365` shard ranges;
+it is not authority evidence because only three of seven boundary families are
+implemented. No cardinality is final or may be copied as a separately
+maintained assertion into a callable inventory, static manifest, fixture, or
+golden. Final index/shard counts must be regenerated from the exact audited
+production rows and this design re-reviewed if they change.
+
+The `candidate_maximal` fixture is not a synthetic protocol-wide fill of every
 `Text` leaf. It keeps the selected frozen spec/cohort and complete live
 registered worker/attempt-attestation preimages byte-exact, substitutes declared
 maxima only for runtime response values not known at admission, and uses the
@@ -2831,6 +6687,24 @@ explicit leaf bound before implementation; passing is not assumed. The
 companion's request-return envelope and final action outcome are
 included in the terminal/quiescence measurements, so fitting the cursor alone
 does not pass this gate.
+
+The current rebased PR head does not yet contain the final V2 case index/two
+shards, CI golden manifest/two result files/fixture set, or complete production
+enumerator. The preserved continuation checkpoint has a provisional 366-row
+set and only three of seven boundary families implemented. The existing
+full-spec/preflight-envelope goldens and those partial rows are inputs to this
+work, not a substitute for the fully expanded inventory and post-inventory
+evidence above.
+Because the native V2 config-access reference and V2 static-manifest inventory
+change capsule and preflight bytes, final post-cutover goldens must be
+regenerated and must still pass the unchanged 60,000-byte outer and
+65,536-byte per-value budgets. Existing hashes cannot be relabeled as final V2
+qualification evidence.
+Authority therefore remains disabled until the cohort-bound case index and
+both shards, the acyclic CI-only golden manifest, two result files, and two
+exact fixture preimages, the
+inventoried enumerator, and the complete-preflight, authoritative-admission,
+immediate-pre-I/O, and owner-fenced-transition calls land and pass together.
 
 ## Submission journal
 
@@ -3266,10 +7140,11 @@ A crash before either final `SUCCEEDED` commit is recovered by observation and
 monotonic progress adoption; the reducer cannot infer success from an earlier
 phase.
 
-In shadow, the expected cluster-record UUID is carried through the real
-`sdk.down()` request, `core.down()`, and legacy backend teardown. In authority,
-the action handler supplies it directly to the extracted fail-closed cluster
-row/session seam. Both reload the cluster row and check the UUID after acquiring
+In legacy-controller shadow, the expected cluster-record UUID is carried
+through the real `sdk.down()` request, `core.down()`, and legacy backend
+teardown. In selected Serve039 private shadow and in authority, the respective
+private handler supplies it directly to the extracted fail-closed cluster
+row/session seam. Every arm reloads the cluster row and checks the UUID after acquiring
 its resource lock, immediately before any provider delete or state-row removal.
 An earlier name lookup is not a fence: if a same-name successor appears while
 teardown waits for the lock, the post-lock mismatch returns conflict and no
@@ -3293,8 +7168,11 @@ never wraps or manufactures a max-plus-one attempt.
 
 ## Shadow protocol
 
-Shadow has one mutation owner: the existing legacy launch/down thread. The
-durable path receives the same frozen decision inputs but does not submit.
+Shadow has exactly one mutation owner per candidate. Before private selection,
+the existing legacy launch/down thread mutates and the durable projection only
+observes. For a represented Serve039 private candidate, the private handler is
+the sole mutator and the legacy call is suppressed. The two arms are disjoint;
+neither candidate performs both mutations.
 
 For every eligible decision in a service's shadow window, one logical parent
 is committed with replica/capacity or teardown intent before the legacy enqueue.
@@ -3416,10 +7294,13 @@ immediately before the call. Each `logical_attempt` has exactly one
 `PRIMARY_LAUNCH` or `PRIMARY_DOWN` child and zero or more
 `LAUNCH_CLEANUP_DOWN` children. The latter records an internal cleanup
 `sdk.down()` performed between legacy launch retries under the launch parent;
-it is not a separately admitted logical down action. A child stores
-`planned_execution_kind` (`api_request` or `legacy_direct_down`), the real
-request ID when returned, actual/proposed outcomes, retry decision, pre/post
-observation, provider correlation, and bounded divergence.
+it is not a separately admitted logical down action. A retained legacy-
+controller child stores `planned_execution_kind` exactly `api_request |
+legacy_direct_down`. A represented primary child instead stores exactly
+`private_api_request`, has one same-key Serve039 execution-history row, and uses
+the kind-matched private handler; cleanup can never use that value. Every child
+also stores the real request ID when returned, actual/proposed outcomes, retry
+decision, pre/post observation, provider correlation, and bounded divergence.
 
 Only a proven pre-call path may be abandoned. Once SDK request creation is
 entered, failure to receive or bind its ID is
@@ -3441,12 +7322,190 @@ begins. No synthetic request ID may be created for a direct call.
 The replica's launch/down shadow links retain the corresponding parent and all
 children while the replica or a cleanup intent exists. An authoritative down
 of a shadow-launched replica must revalidate the completed launch child's
-`ResolvedProviderTargetV1`, exact-read the same-UUID global-user-state cluster
-row and its full `ProviderKubernetesHandleV1`, and copy both typed preimages and
-their hashes into `PriorLaunchBasisV1`; missing, hash-only, or name-only
-evidence is not eligible.
+`ResolvedProviderTargetV1`, lock/read the same-UUID global-user-state cluster
+row and its full `ProviderKubernetesHandleV1` in class 2, and copy both typed
+preimages and their hashes into `PriorLaunchBasisV1`; missing, hash-only, or
+name-only evidence is not eligible.
 
 ## Eligibility and activation
+
+Before a provider lifecycle profile is considered, Serve must project this
+closed capacity prerequisite from the persisted service version, effective task
+resources, and live replica rows:
+
+```text
+ServeActionCapacityProfileV1 = {
+  version: 1,
+  profile: "ordinary_ondemand_physical_width1_v1",
+  pool: false,
+  replica_unit: "physical_backend",
+  planned_capacity: 1,
+  node_count: 1,
+  use_spot: false,
+  accelerator: null,
+  spot_placer: null,
+  reserved_capacity_fill: false,
+  cost_rebalance: false,
+  dynamic_ondemand_fallback: false,
+  base_ondemand_fallback_replicas: 0
+}
+```
+
+An absent dynamic on-demand fallback normalizes to false and an absent base
+fallback normalizes to zero. The predicate additionally requires every live or
+provisionally admitted replica, and the immutable service-version spec that
+created it, to project the same profile. Each such row has
+exact-Boolean `ReplicaInfo.is_spot=false`, `planned_capacity=1`,
+`reserved_fill=false`, `is_zero_cost=false`,
+`paid_capacity_pool_key=null`,
+`cost_rebalance_for_replica_id=null`, and
+`unknown_capacity_replacement=false`. Paid placement has no independent
+service flag, so `spot_placer=null` is the mandatory paid-capacity exclusion;
+checking only `cost_rebalance=false` is insufficient. The physical replica-unit
+check is independent of the scalar width check, so a capacity-aware logical
+configuration remains ineligible even when its current GPU width happens to be
+one.
+
+This is a Serve admission prerequisite, not a fact inferred from successful
+provider normalization and not a new field in `ProviderLifecyclePlanV1`.
+`PrivateShadowActivationProofV2` and `AuthoritativePromotionProofV2` bind its
+canonical bytes and the parent design's complete
+`ServeServiceVersionSpecIdentityV1` for the elected version and each live
+replica's creating version. Missing, null, non-Boolean, or true `is_spot` is
+ineligible even when the current service version says `use_spot=false`. Serve checks it before
+creating a `PREPARING` reference and rechecks it under the service lock
+immediately before private-shadow or authoritative admission. A service update
+that would leave the profile is rejected before version/spec commit while the
+service is in `shadow` or `authoritative`; there is no silent demotion and no
+legacy provider fallback after authority. A capacity-ineligible service remains
+explicitly legacy and creates no preparation, reference, coverage, private
+request, or action row. Paid-capacity, reserved-fill, cost-rebalance,
+spot/fallback, accelerator, multi-node, and logical-width authority require a
+later named capacity profile, a separately reviewed transaction/lock contract,
+and a provider-profile update where the execution shape changes.
+
+The parent design also owns the exact trust-source preimage below. This facet
+constructs no weaker provider-local substitute:
+
+```text
+QualifiedResourceActionRolePodTemplateV1 = {
+  version: 1,
+  contract: "qualified_resource_action_role_pod_template_v1",
+  template_json: Text
+      # exact compact UTF-8 canonical JSON for the normalized raw
+      # apps/v1 Deployment.spec.template value
+}
+
+QualifiedResourceActionRoleDeploymentV1 = {
+  version: 1,
+  role: "api" | "ordinary-executor" | "controller",
+  namespace: Text,
+  deployment_name: Text,
+  deployment_uid: Text,
+  generation: PositiveInteger,
+  observed_generation: PositiveInteger,  # exactly generation
+  desired_replicas: PositiveInteger,
+  updated_replicas: PositiveInteger,      # exactly desired_replicas
+  ready_replicas: PositiveInteger,        # exactly desired_replicas
+  available_replicas: PositiveInteger,    # exactly desired_replicas
+  unavailable_replicas: 0,
+  pod_template: QualifiedResourceActionRolePodTemplateV1,
+  pod_template_sha256: Sha256,
+  oci_manifest_digest: "sha256:" + 64LowerHex,
+  source_commit: 40LowerHex,
+  artifact_inventory_sha256: Sha256
+}
+
+ResourceActionDeploymentInventoryV1 = {
+  version: 1,
+  contract: "resource_action_deployment_inventory_v1",
+  deployments: [QualifiedResourceActionRoleDeploymentV1]
+      # exactly API, ordinary-executor, controller in role order
+}
+
+ResourceActionRequiredCrashCanaryInventoryV1 = {
+  version: 1,
+  contract: "resource_action_crash_canary_inventory_v1",
+  requirements: [{sequence: 1..20,
+                  boundary_id: ResourceActionCrashCanaryBoundaryV1}]
+      # exact ordered closed enum from parent fault categories 1..20
+}
+
+ResourceActionCandidateBindingV2 = {
+  version: 2,
+  qualification_policy_sha256: Sha256,
+  schema_heads: AuthoritySchemaHeadsV2,
+  deployment_inventory: ResourceActionDeploymentInventoryV1,
+  deployment_inventory_sha256: Sha256,
+  deployment_selection: ApprovedAuthorityDeploymentSelectionV1,
+  deployment_selection_sha256: Sha256,
+  selected_cohort: ApprovedAuthorityCohortArtifactV1,
+  selected_cohort_sha256: Sha256,
+  capacity_profile: ServeActionCapacityProfileV1,
+  capacity_profile_sha256: Sha256,
+  elected_version_identity: ServeServiceVersionSpecIdentityV1,
+  elected_version_identity_sha256: Sha256,
+  live_replica_identity_inventory: HashedCanonicalObjectV1,
+  required_crash_canary_inventory:
+      ResourceActionRequiredCrashCanaryInventoryV1,
+  required_crash_canary_inventory_sha256: Sha256
+}
+```
+
+The Pod-template wrapper is not an opaque caller hash. It canonically embeds
+the normalized raw JSON at the live `apps/v1` Deployment's `/spec/template`:
+exact `metadata/spec` top-level fields, only labels/annotations and optional
+null `creationTimestamp` in metadata, null/absent annotations normalized to an
+empty object, no controller-owned `pod-template-hash`, and the complete Pod spec.
+The tree uses exact JSON types/NFC text/signed-int64 integers, bounded depth and
+member count, no duplicate keys or aliases, and globally unique container names.
+The parent design defines its exact canonical encoding and wrapper-hash rule;
+YAML, typed-client defaults, ReplicaSet transforms, and Pod runtime fields are
+not interchangeable preimages.
+
+The deployment builder proves every current ready Pod has the role's exact
+policy-approved artifact, but excludes mutable Pod names and UIDs from the
+binding so same-template replacement does not reset qualification. Deployment
+UID/generation/template/status, the exact selected cohort static seed/handler/
+claim contracts, elected and live-replica version/capacity identities, and the
+20-boundary checked-in crash requirement artifact are bound. Its repository
+bytes use the existing exact canonical-payload-plus-one-LF artifact convention;
+the typed canonical payload hash is bound. Every redundant hash is recomputed
+and the candidate object's canonical SHA-256 is
+`qualification_binding_sha256`. Missing policy projection or any partial,
+drifted, mutable/tag-only, or caller-provided preimage fails closed before this
+facet can prepare or dispatch provider work.
+
+Delegated hashed inventories use the parent contract's strict recursive JSON
+validator, including exact scalar/container types, signed-int64 integers,
+depth/member bounds, and rejection of aliases and cycles. Candidate construction
+retains an immutable canonical snapshot of its live-replica inventory;
+serialization and every policy validation revalidate and compare against that
+snapshot, so mutation rejects even after recomputing the delegated inner hash.
+
+The exact policy payload is a qualification-time artifact because its final
+M4 commit/digests do not yet exist. The chart defaults to an empty reference,
+no projection, and closed loader failure; a later reviewed qualification change
+adds exact canonical bytes and repo path/size/hash without itself activating
+authority. The chart reserves the policy annotation names, volume name, and
+the fixed path's complete normalized mount ancestry even while empty. Mount
+paths are POSIX-cleaned before exact/ancestor/descendant comparison, including
+trailing/repeated slashes and dot/parent segments, so configurable Pod extras
+cannot pre-stage a competing trust source.
+Old `--reuse-values` releases may lack either the whole `resourceActions` object
+or only the new `qualificationPolicy` key; those two absent states alone resolve
+to the exact empty path/zero-size/empty-hash triple and render no projection.
+An explicit null/non-object, partial object, extra key, or drifted nonempty
+reference still rejects, so backward compatibility never supplies authority.
+The typed contracts, crash golden, exact loader, and projection boundary are
+implemented prerequisites only. No provider preflight, admission, transition,
+promotion, dispatch, or provider I/O consumes them in this tranche.
+
+“No paid/reserved DML” applies only to M4 eligibility, proof, action admission,
+and action reduction. An excluded decision releases every service/version/
+replica SQL lock before it calls `LegacyServeReplicaMutationAdapter`; that
+adapter retains the existing paid-capacity/reserved-fill DML and lock protocol.
+The handoff and a concurrent capacity-lock holder are required race tests.
 
 A lifecycle profile is authoritative only when checked-in contract tests prove:
 
@@ -3460,7 +7519,8 @@ A lifecycle profile is authoritative only when checked-in contract tests prove:
 - exact absence/readback for down;
 - same-name replacement discrimination;
 - bounded redaction; and
-- no provider-specific queue, lease, due scanner, or retry loop.
+- no provider-specific work queue, action-execution lease, due scanner, or
+  retry loop; a claimless registration-liveness lease may not schedule work.
 
 The first candidate profile is `pod_cluster_v1`; it is not accepted for
 authority merely because this name appears in a stored plan. During M2 it stays
@@ -3488,13 +7548,22 @@ The previously implemented flattened object also used `version: 1`, but it was
 a local pre-authority scaffold introduced only on the unmerged feature branch:
 its introducing commits are contained by no tag or remote branch other than
 `origin/feat/serve-resource-actions-m1a`, and it has never been released or
-deployed. The contract below is the first deployable v1 wire shape and replaces
-that scaffold in place. There is no dual reader, backfill, or
-optional-execution-config form.
+deployed. The contract below is the first deployable
+`ProviderLifecycleInvocationV1` inner wire shape and replaces that scaffold in
+place. It remains byte-frozen inside historical `ServeReplicaActionSpecV1`.
+The live M4 wrapper uses the separately versioned
+`ProviderLifecycleInvocationV2` graph defined below; there is no
+version-dispatching execution reader, backfill, or optional-execution-config
+form.
 
-The one-time first-deployment gate keeps every API, worker, and controller on
-the proven baseline image while the additive migrations reach API007,
-Serve034, and global-user-state 028. In one consistent read-only PostgreSQL
+The original P2a first-deployment gate reached API007/Serve034 and remains
+historical evidence. The rebased M4 pre-migration gate keeps every API, worker,
+and controller on one proven baseline image while the additive migrations
+reach exact API008, Serve037, and global-user-state 028; it exact-reflects the
+frozen Serve033/034 action catalog plus the unrelated Serve035 reserved-fill
+and Serve036 controller-configuration additions and the Serve037 placement-
+normalization/retirement tables, columns, PostgreSQL checks, and foreign keys.
+In one consistent read-only PostgreSQL
 snapshot it then requires zero Serve replica rows in `api_resource_actions`,
 their attempts and correlated `api_requests`; zero rows in all six Serve033
 sample, represented-attempt, coverage, coverage-attempt, worker-cohort, and
@@ -3505,14 +7574,16 @@ schema heads, and baseline digest are retained as rollout evidence before API
 rollout begins.
 
 An unexpected/missing revision or table, nonzero row/link, nonlegacy service,
-or mixed writer image aborts rollout before a new v1 reader or writer runs.
+or mixed writer image aborts rollout before a new closed invocation reader or
+writer runs.
 Application code never rewrites, reinterprets, or purges an old row. If one is
-found, v1 remains frozen and the feature requires either v2 or a separately
-reviewed offline canonical migration; new-shape v1 cannot coexist with old-
-shape v1. An encountered flattened row fails the closed parser and blocks
-promotion/recovery. Canonical invocation, plan, and wrapper hashes and their
-golden fixtures change; deterministic launch/down action UUIDs do not, because
-they derive only from logical resource identity and action kind.
+found, the closed current invocation V1 remains frozen and the V2 action
+envelope rejects it; the feature requires a separately versioned invocation or
+reviewed offline canonical migration. A new invocation shape cannot masquerade
+as V1. An encountered flattened row fails the closed parser and blocks
+promotion/recovery. Canonical invocation, plan, and action-wrapper hashes and
+their golden fixtures change; deterministic launch/down action UUIDs do not,
+because they derive only from logical resource identity and action kind.
 
 ```text
 ProviderLaunchLifecycleInvocationV1 = {
@@ -3543,9 +7614,11 @@ ProviderLifecycleInvocationV1 =
 
 The `ParentSpec` symbol in the child-only schema below is exactly `self` in the
 zero-argument method
-`ServeReplicaActionSpecV1.launch_cleanup_down_invocation(self)`. The method
+`ServeReplicaActionSpecV2.launch_cleanup_down_invocation(self)`. The method
 first requires `ParentSpec.invocation` to be a primary launch and receives no
 replacement target, workspace, basis, config, or other argument.
+The byte-frozen V1 helper remains available only to the exact-034 historical
+reader; no live M4 cleanup calls it or accepts its parent as provider authority.
 
 ServeLegacyLaunchCleanupDownInvocationV1 = {
   version: 1,
@@ -4412,6 +8485,20 @@ ProviderAuthorityWorkerPodTemplateBindingV1 = {
   manifest_hash_placeholder: "$MANIFEST_SHA256"
 }
 
+ProviderAuthorityWorkerRuntimeCapacityV1 = {
+  version: 1,
+  worker_process_count: PositiveInteger,          # 1..16
+  supervisor_sync_engine_namespaces:
+      ["api-requests-control", "authority-preflight", "shared"],
+  supervisor_max_connections_per_namespace: 1,
+  supervisor_persistent_connection_budget: 3,
+  child_sync_engine_namespaces: ["api-requests-control", "shared"],
+  child_max_connections_per_namespace: 1,
+  child_persistent_connection_budget: 2,
+  pod_persistent_connection_ceiling: PositiveInteger
+      # exactly 3 + 2 * worker_process_count
+}
+
 ProviderAuthorityWorkerCohortManifestV1 = {
   version: 1,
   cohort_id: Text,
@@ -4438,6 +8525,113 @@ ProviderAuthorityWorkerCohortV1 = {
   deployment_uid: Text,
   service_account_uid: Text
 }
+
+# Additive M4 types; every unlisted key and field type is byte-for-byte the V1
+# leaf above. V1 remains cleanup/history-only and is never reinterpreted.
+ProviderAuthorityWorkerPodTemplateReleaseInputsV2 =
+    ProviderAuthorityWorkerPodTemplateReleaseInputsV1 with exactly {
+  version: 2,
+  command: ["tini", "--"],
+  args: ["python", "-m", "sky.server.server", "--deploy", "--host",
+         "0.0.0.0", "--role", "authority-worker", "--role-health-port",
+         health_port, "--authority-preflight-port", preflight_port],
+  downward_api_fields: [
+    {env: "SKYPILOT_POD_NAME", field_path: "metadata.name"},
+    {env: "SKYPILOT_POD_NAMESPACE", field_path: "metadata.namespace"},
+    {env: "SKYPILOT_POD_UID", field_path: "metadata.uid"},
+    {env: "POD_IP", field_path: "status.podIP"}
+  ],
+  runtime_capacity: ProviderAuthorityWorkerRuntimeCapacityV1,
+  runtime_capacity_sha256: Sha256,
+  literal_env: [  # exact ascending closed V1 set plus these six bindings
+    {name: "SKYPILOT_API_REQUEST_BACKEND", value: "postgres"},
+    {name: "SKYPILOT_API_SERVER_ROLE", value: "authority-worker"},
+    {name: "SKYPILOT_AUTHORITY_CHILD_MAX_CONNECTIONS_PER_NAMESPACE",
+     value: DecimalIntegerText},
+    {name: "SKYPILOT_AUTHORITY_CHILD_PERSISTENT_CONNECTION_BUDGET",
+     value: DecimalIntegerText},
+    {name: "SKYPILOT_AUTHORITY_POD_CONNECTION_CEILING",
+     value: DecimalIntegerText},
+    {name: "SKYPILOT_AUTHORITY_PROCESS_COUNT", value: DecimalIntegerText},
+    {name: "SKYPILOT_AUTHORITY_SUPERVISOR_MAX_CONNECTIONS_PER_NAMESPACE",
+     value: DecimalIntegerText},
+    {name: "SKYPILOT_AUTHORITY_SUPERVISOR_PERSISTENT_CONNECTION_BUDGET",
+     value: DecimalIntegerText},
+    {name: "SKYPILOT_RELEASE_NAME", value: Text},
+    {name: "SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE",
+     value: "/etc/skypilot/resource-action-authority/auth/tokens"},
+    {name: "SKYPILOT_STATE_DB_MIGRATION_MODE", value: "verify"}
+  ]
+}
+
+ProviderAuthorityWorkerPodTemplateBindingV2 = {
+  version: 2,
+  contract: "authority_worker_pod_template_v2",
+  projector_artifact_sha256: Sha256,
+  release_inputs: ProviderAuthorityWorkerPodTemplateReleaseInputsV2,
+  expected_template_sha256: Sha256,
+  manifest_hash_annotation_json_pointer:
+      "/metadata/annotations/skypilot.co~1resource-action-manifest-sha256",
+  manifest_hash_placeholder: "$MANIFEST_SHA256"
+}
+
+ProviderAuthorityWorkerCohortManifestV2 = {
+  version: 2,
+  cohort_id: Text,
+  namespace: Text,
+  deployment_name: Text,
+  service_account_name: Text,
+  container_name: "skypilot-authority-worker",
+  image: ProviderOCIImageQualificationV1,
+  pod_template_contract: ProviderRepoArtifactRefV1,
+  pod_template_binding: ProviderAuthorityWorkerPodTemplateBindingV2,
+  artifact_inventory: ProviderRepoArtifactRefV1,
+  callable_inventory: ProviderRepoArtifactRefV1,
+  runtime_capacity: ProviderAuthorityWorkerRuntimeCapacityV1,
+  runtime_capacity_sha256: Sha256,
+  claim_contract: "frozen_action_cohort_join_v2",
+  handler_allowlist: ["serve_shadow_candidate_launch",
+                      "serve_shadow_candidate_down",
+                      "serve_resource_action_launch",
+                      "serve_resource_action_down"]
+}
+
+ProviderAuthorityWorkerCohortV2 = {
+  version: 2,
+  manifest: ProviderAuthorityWorkerCohortManifestV2,
+  manifest_sha256: Sha256,
+  deployment_uid: Text,
+  service_account_uid: Text
+}
+
+The V2 manifest requires the exact new V2 Pod-template projector artifact and
+binding; a V1 projector/binding or a V2 top-level wrapper around V1 release
+inputs rejects. The manifest and release-input runtime-capacity objects and
+hashes are byte-equal. Their six environment values are the canonical decimal
+renderings of `N`, supervisor per-namespace limit `1`, supervisor derived budget
+`3`, child per-namespace limit `1`, child derived budget `2`, and `3 + 2*N`;
+every other value, missing/extra
+entry, or `N` outside 1..16 rejects at chart rendering, manifest load, Pod-
+template projection, bootstrap, and readiness. No runtime default or CPU-based
+pool sizing exists. Its fixed `tini` parent makes Python termination end the main
+container process, and the fourth downward field is the sole source of the
+authority API row's `pod_ip`. The projector, chart, release preflight, static
+manifest, live Pod-template normalizer, and post-build OCI qualification all
+compare these exact V2 bytes before Serve039 owner binding or readiness. The
+supervisor installs an immutable synchronous-engine allowlist of exactly
+`api-requests-control`, `authority-preflight`, and normalized `shared`; each
+spawned child independently installs exactly `api-requests-control` and
+`shared`. Both call `db_utils.set_max_connections(1)` before any engine exists,
+the preflight special factory remains `pool_size=1, max_overflow=0`, and a
+process-local `db_utils.get_engine()` guard rejects an unlisted sync namespace,
+any async engine, a changed limit, or late policy installation. Readiness
+introspects all cache keys and QueuePools and rejects a pool whose size is not
+one or whose overflow is nonzero. Real-PostgreSQL qualification holds every
+allowed checkout simultaneously and observes exactly the persistent high-water
+ceiling `3 + 2*N` at both `N=1` and `N=16`; hidden namespaces and a second
+checkout are negative tests. Transient startup/migration advisory-lock
+`NullPool` sessions require separately provisioned headroom and do not enter the
+persistent ceiling.
 
 ProviderKubernetesControllerOwnerV1 = {
   api_version: "apps/v1",
@@ -4476,11 +8670,8 @@ ProviderAuthorityWorkerRegistrationV1 = {
   pod_ready: true,
   deployment_spec_replicas: 2,
   deployment_status_observed_generation: PositiveInteger,
-  deployment_status_replicas: 2,
-  deployment_updated_replicas: 2,
   deployment_ready_replicas: 2,
   deployment_available_replicas: 2,
-  deployment_unavailable_replicas: 0,
   registered_at: UtcTimestamp
 }
 
@@ -4490,6 +8681,1798 @@ ProviderAuthorityWorkerRegistrationSetV1 = {
   workers: [ProviderAuthorityWorkerRegistrationV1]
 }
 
+ProviderAuthorityWorkerIdentityV2 = {
+  version: 2,
+  namespace: Text,
+  pod_name: Text,
+  pod_uid: UUID,
+  pod_resource_version: Text,
+  pod_service_account_name: Text,
+  pod_controller_owner: ProviderKubernetesControllerOwnerV1,
+  replica_set_name: Text,
+  replica_set_uid: Text,
+  replica_set_resource_version: Text,
+  replica_set_controller_owner: ProviderKubernetesControllerOwnerV1,
+  deployment_name: Text,
+  deployment_uid: Text,
+  deployment_generation: PositiveInteger,
+  deployment_observed_generation: PositiveInteger,
+  pod_template_contract_sha256: Sha256,
+  image: ProviderAuthorityWorkerImageV1,
+  service_account_uid: Text,
+  artifact_inventory_sha256: Sha256,
+  callable_inventory_sha256: Sha256,
+  handler_allowlist_sha256: Sha256,
+  observed_at: UtcTimestamp
+}
+
+ProviderAuthorityWorkerRegistrationV2 = {
+  version: 2,
+  worker_instance_id: UUID,
+  worker: ProviderAuthorityWorkerIdentityV2,
+  pod_ready: true,
+  registered_at: UtcTimestamp
+}
+
+RESOURCE_ACTION_WORKER_REGISTRATION_LEASE_RENEW_SECONDS_V1 = 20
+RESOURCE_ACTION_WORKER_REGISTRATION_LEASE_TTL_SECONDS_V1 = 60
+RESOURCE_ACTION_WORKER_FENCE_MAX_REQUEST_CLAIMS_V1 = 64
+RESOURCE_ACTION_WORKER_FENCE_MAX_REQUEST_CLAIMS_JSON_BYTES_V1 = 24_576
+RESOURCE_ACTION_WORKER_FENCE_MAX_CANONICAL_BYTES_V1 = 30_720
+RESOURCE_ACTION_WORKER_COLD_FENCES_MAX_CANONICAL_BYTES_V1 = 65_536
+RESOURCE_ACTION_WORKER_FENCE_MAX_REQUEST_CLAIMS_V2 = 16
+RESOURCE_ACTION_WORKER_FENCE_MAX_REQUEST_CLAIMS_JSON_BYTES_V2 = 24_576
+RESOURCE_ACTION_WORKER_FENCE_MAX_CANONICAL_BYTES_V2 = 30_720
+RESOURCE_ACTION_WORKER_COLD_FENCES_MAX_CANONICAL_BYTES_V2 = 65_536
+RESOURCE_ACTION_WORKER_PROCESS_SUPERSESSION_MAX_CANONICAL_BYTES_V1 = 65_536
+AUTHORITY_WORKER_CONTAINER_SUPERSESSION_PROOF_MAX_AGE_SECONDS_V1 = 300
+
+ProviderAuthorityWorkerLeaseV1 = {
+  version: 1,
+  worker_instance_id: UUID,
+  generation: PositiveInteger,
+  state: "ACTIVE" | "REVOKED",
+  renewal_registration: ProviderAuthorityWorkerRegistrationV2,
+  renewal_registration_sha256: Sha256,
+  renewed_at: UtcTimestamp,
+  expires_at: UtcTimestamp,
+  revoked_at: null | UtcTimestamp,
+  revocation_reason: null | "STALE_HANDOFF" | "CANDIDATE_ABANDONED" |
+                            "COHORT_COLD_RECOVERY" |
+                            "COHORT_REMOVAL",
+  revocation_owner_id: null | UUID,
+  last_operation_id: UUID,
+  last_operation_kind: "INSERT" | "RENEW" | "REVOKE",
+  revision: PositiveInteger
+}
+
+ProviderAuthorityWorkerExecutionOwnerV1 = {
+  version: 1,
+  authority_worker_instance_id: UUID,  # stable Pod UID / Serve lease key
+  api_instance_id: UUID,               # fresh per start; unequal to stable ID
+  pod_name: Text,
+  pod_uid: UUID,
+  pod_resource_version: Text,
+  container_name: "skypilot-authority-worker",
+  container_id: Text,
+  container_restart_count: NonnegativeInteger,
+  container_started_at: UtcTimestamp,
+  observed_at: UtcTimestamp,
+  api_instance_started_at: UtcTimestamp
+}
+
+# Every typed read requires
+# authority_worker_instance_id == pod_uid != api_instance_id.
+
+ProviderAuthorityWorkerLeaseV2 = ProviderAuthorityWorkerLeaseV1 + {
+  version: 2,
+  execution_owner: ProviderAuthorityWorkerExecutionOwnerV1,
+  execution_owner_sha256: Sha256,
+  execution_owner_api_instance_id: UUID,
+  last_operation_kind: "INSERT" | "RENEW" | "REVOKE" |
+                       "BIND_EXECUTION_OWNER" |
+                       "SUPERSEDE_EXECUTION_OWNER"
+}
+
+ProviderAuthorityWorkerContainerSupersessionProofV1 = {
+  version: 1,
+  authority_worker_instance_id: UUID,
+  pod_name: Text,
+  pod_uid: UUID,
+  prior_api_instance_id: UUID,
+  current_api_instance_id: UUID,
+  prior_container_id: Text,
+  prior_container_restart_count: NonnegativeInteger,
+  current_container_id: Text,
+  current_container_restart_count: PositiveInteger,
+  current_container_started_at: UtcTimestamp,
+  pod_resource_version: Text,
+  observed_at: UtcTimestamp
+}
+
+ProviderAuthorityWorkerDeploymentSnapshotV2 = {
+  version: 2,
+  deployment_name: Text,
+  deployment_uid: Text,
+  deployment_resource_version: Text,
+  deployment_generation: PositiveInteger,
+  deployment_observed_generation: PositiveInteger,
+  pod_template_contract_sha256: Sha256,
+  deployment_strategy: "RollingUpdate",
+  deployment_max_surge: 0,
+  deployment_max_unavailable: 1,
+  deployment_spec_replicas: 2,
+  deployment_status_replicas: 2,
+  deployment_updated_replicas: 2,
+  deployment_ready_replicas: 2,
+  deployment_available_replicas: 2,
+  deployment_unavailable_replicas: 0,
+  observed_at: UtcTimestamp
+}
+
+ProviderAuthorityWorkerRegistrationSetV2 = {
+  version: 2,
+  cohort_identity_sha256: Sha256,
+  revision: PositiveInteger,
+  deployment_snapshot: null | ProviderAuthorityWorkerDeploymentSnapshotV2,
+  workers: [ProviderAuthorityWorkerRegistrationV2]
+}
+
+ProviderAuthorityWorkerAcceptedExecutionMembershipV2 = {
+  version: 2,
+  registration: ProviderAuthorityWorkerRegistrationV2,
+  registration_set_revision: PositiveInteger,
+  registration_set_sha256: Sha256,
+  lease: ProviderAuthorityWorkerLeaseV2
+}
+
+ProviderAuthorityWorkerStableIdentityProjectionV1 = {
+  version: 1,
+  namespace: Text,
+  pod_name: Text,
+  pod_uid: UUID,
+  pod_service_account_name: Text,
+  pod_controller_owner: ProviderKubernetesControllerOwnerV1,
+  replica_set_name: Text,
+  replica_set_uid: Text,
+  replica_set_controller_owner: ProviderKubernetesControllerOwnerV1,
+  deployment_name: Text,
+  deployment_uid: Text,
+  deployment_generation: PositiveInteger,
+  deployment_observed_generation: PositiveInteger,
+  pod_template_contract_sha256: Sha256,
+  image: ProviderAuthorityWorkerImageV1,
+  service_account_uid: Text,
+  artifact_inventory_sha256: Sha256,
+  callable_inventory_sha256: Sha256,
+  handler_allowlist_sha256: Sha256
+}
+
+project_stable_worker_identity_v1(
+  ProviderAuthorityWorkerIdentityV1 | ProviderAuthorityWorkerIdentityV2
+) -> ProviderAuthorityWorkerStableIdentityProjectionV1
+
+Every manifest parser recomputes the static-seed hash, the exact NUL-delimited
+derivation preimage from the parent design, its full SHA-256, both derived
+names, and service-account/name equality. It rejects a field-by-field valid but
+crossed seed or derivation. The shipped V1 identity, registration, and
+registration-set codecs above are immutable. V1 requires
+each worker's Deployment generation, observed generation, and registration
+status-observed generation to be equal; its spec/ready/available counts are
+all two; and the Pod is Ready. A readable V1 set has one or two registrations
+sorted by strictly ascending distinct Pod UID; only the exact two-member shape
+could historically be `ACCEPTING`. Set validation additionally requires every
+member to carry one identical tuple of Deployment resourceVersion, generation,
+observed generation, and registration status-observed generation. Thus
+registrations from different Deployment resourceVersions cannot form one V1
+acceptance set. V1 registration and set
+rows remain readable only to retire or audit historical rows; no Serve038
+registry writer emits or rewrites them, and they cannot satisfy cohort
+activation, `/readyz`, preflight, or an action claim. The byte-frozen V1
+identity remains the execution-local before/after type inside the shipped
+`ProviderAuthorityWorkerAttemptAttestationV1`; its Deployment resourceVersion
+is same-process provenance only and grants no membership or readiness. Runtime
+stable projection of that V1 identity fails closed unless its textual Pod UID
+is one canonical UUID; history/retirement decoding does not require projection.
+
+Because V1 predates registration leases, its sole live retirement program runs
+before Serve038 at exact Serve037 through the frozen Serve034 action contract:
+the shipped stale-`REGISTERING` edge plus
+M4's cleanup-only accepted bridge. It writes only shipped lifecycle/revision /
+`state_changed_at`, preserves the V1 registration bytes/hash and every
+`RELEASED` or terminal carrier byte-for-byte, and uses the current-chart
+tombstone removal plus surviving API exact-NotFound verifier to reach
+`RETIRED`. The action catalog through Serve037 has no
+`removal_authorized_at`, registration lease, handoff, or cold-recovery row.
+
+Serve038 admits only exact numeric-V1 `RETIRED` history with null
+`removal_authorized_at` and a nonnull truthful `retired_at == state_changed_at`.
+Every V1
+`REMOVAL_AUTHORIZED -> RETIRED` exact-NotFound edge must finish under exact
+Serve037 before migration; any V1 nonterminal state, V1 terminal row with a
+nonnull removal-authorization time or null/mismatched retirement time,
+malformed version token, or mixed old writer
+blocks 038 before DDL or stamping. Migration neither copies nor invents a V1
+removal timestamp. V1 cannot be selected, registered, renewed, claimed, rolled
+back, handed off, cold-recovered, or undergo another lifecycle edge after 038.
+
+Serve038's replacement cohort CHECK requires exact numeric registration-set
+version `2` for every `REGISTERING | ACCEPTING | DRAINING` row plus null
+`removal_authorized_at` before removal; exact equality to `state_changed_at` in
+`REMOVAL_AUTHORIZED`; and preservation through `RETIRED`, where nonnull
+`retired_at == state_changed_at >= removal_authorized_at`. The sole exception is
+an already-`RETIRED` exact numeric-V1 row whose `removal_authorized_at` is null
+and whose nonnull `retired_at == state_changed_at`; all three remain immutable.
+Every new V2 transition requires nonnull truthful removal and retirement times.
+Version `3`, missing/null/string, numeric `1.0`/`2.0`, every post-038 V1 write,
+and every V1 terminal row outside that exact grandfather shape fail the physical
+and typed contracts.
+
+Serve038 registry membership uses only V2. Every V2 registration proves a
+current Ready Pod and its Pod -> ReplicaSet -> Deployment UID owner chain. Each
+worker's image, ServiceAccount, owner chain, and template contract must equal
+the cohort. Once the set-level snapshot is nonnull, its Deployment name, UID,
+generation, observed generation, and template contract must equal each worker's
+corresponding fields; the per-Pod identity contains no Deployment
+resourceVersion. A `REGISTERING` set has one or two workers and a null snapshot.
+On an exact active-policy-bound Serve039 or Serve040 fresh anchor, each
+registration insert/append atomically
+creates its generation/revision-one ACTIVE lease with a nonnull owner/hash/
+normalized-process triple, locks the named bootstrap API row after that lease,
+and changes it to exact bound phase with the owner hash. Lost acknowledgement
+adopts the anchor, same-stable-identity lease lineage, and exact bound API phase /
+boot identity together. Only a retained pre-039 lease may begin owner-null, and
+it must complete typed `BIND_EXECUTION_OWNER` before activation; a new post-039
+INSERT can never use that exception. Only after both anchor registrations and
+their separate fresh ACTIVE leases exist does the activation transaction lock
+them, then both rows named by their normalized current execution owners in
+canonical process-ID order, rechecking owner JSON/scalar/API stable-Pod/start
+equality, and construct the installed
+registrations from the exact lease renewal-registration bytes after stable-
+projection equality to those anchors. Each API row has its own process UUID,
+binds `pod_uid` to the matching stable authority-worker/Pod UUID, and has a
+fresh heartbeat plus exact bound phase and owner hash through commit;
+`ready=true` is not required and cannot be published before acceptance. Before the short transaction, the API
+verifier reads and hashes the final Deployment snapshot. The same no-I/O CAS
+validates and installs that bounded fresh snapshot while changing the cohort to
+`ACCEPTING`. Immediately before commit, fresh PostgreSQL time must still precede
+both registration-lease and API-instance expiries and keep both registrations plus the snapshot
+inside the fixed bound; otherwise activation rolls back and rereads.
+`ACCEPTING` and `DRAINING` require exactly two workers and a nonnull snapshot.
+That snapshot requires generation equal to observed generation,
+status total/updated/ready/available all two, unavailable zero, and the frozen
+template hash. Its resourceVersion may advance when status or a one-at-a-time
+replacement changes without invalidating an otherwise current survivor. The
+initial one-member V2 `REGISTERING` cohort and embedded set both start at
+revision one. Every later legal V2 cohort write, including registration append,
+activation, handoff or cold-recovery completion, rollback, and lifecycle-only
+transitions, advances both revisions by exactly one and preserves their
+equality; lease renewal and handoff-table-only transitions advance neither.
+Unknown commit outcome adopts only the exact expected before/after revisions,
+state, canonical bytes, and hashes. For an anchor insert/append it also requires
+the immutable anchor's same-stable-identity lease lineage: at generation one,
+the exact insert operation ID and registration bytes; afterward, an `ACTIVE`
+generation/revision-equal descendant reached only by legal `RENEW`, initial
+`BIND_EXECUTION_OWNER`, or retained `SUPERSEDE_EXECUTION_OWNER` transitions
+with the same stable projection. Every owner change must resolve through the
+exact process-supersession chain. A
+registration's `worker_instance_id` is exactly the canonical UUID value of its
+Pod UID. It is the stable Serve membership/lease identity and cannot be reused
+by a replacement Pod UID; a non-UUID authority Pod UID fails startup before
+registration. It is deliberately distinct from the request claim owner's
+`SKYPILOT_API_SERVER_INSTANCE_ID`, which is a fresh random UUID for each Python/
+container start, is unequal to the stable Pod UUID, and is inherited only by
+that start's children. Authority-worker API-instance registration uses
+`INSERT` plus exact adoption, never the generic upsert. A conflict adopts only
+the same UUID/role/Pod name/UID/IP/version/supported-handler/supported-payload/
+bootstrap-health bytes; the stored database `started_at` is read and becomes
+the sole `api_instance_started_at` bound into the execution owner. Unequal
+bytes hard-fail. Subsequent heartbeat advances only `heartbeat_at` while
+repeating the closed state bytes. Only typed bind/supersede, completed initial
+eager warm, current-owner pool-failure `ready -> rewarming`, successful full-
+pool recovery `rewarming -> ready`, and permanent withdrawal may change phase,
+readiness, draining time, owner hash, or pool generation; each uses the exact
+phase matrix and CAS above. It never recreates a missing row. After any
+owner bind, a missing row is a retention violation and causes fail-stop. A separate
+lease row is authorized only for an exact member of
+the current V2 `REGISTERING | ACCEPTING | DRAINING` set or the exact candidate
+of the cohort's unique `OPEN | READY` handoff. Initial insertion and every
+renewal lock cohort -> relevant nonterminal handoff -> lease -> its normalized
+current execution-owner API row in the global order, recheck that authorization
+and lifecycle, and require the renewing caller process UUID to equal the owner
+JSON/scalar while the row repeats the same stable Pod, stored start identity,
+role/inventories and remains fresh through commit. It then writes one fresh self-read
+V2 registration/hash while advancing only generation, renewal time, expiry,
+and lease-row revision. A normal renewal must preserve the complete execution
+owner byte-for-byte; only the retained bind/supersession protocols below may
+change it. The renewal registration must recompute the same worker
+instance and stable identity as the authorizing registration, and its worker
+`observed_at` must be no later than database `renewed_at` and within the fixed
+five-minute bound. Lease existence confers no claim or effect authority before
+accepted membership.
+The only additional insertion authorization is for the exact two locked cold-
+recovery candidates inside the same atomic membership CAS. They have no
+registration lease before it and cannot renew unless that commit makes them
+accepted members.
+Leases are mutable rows separate from immutable registration-set bytes; renewal
+cannot change a registration-set hash or an in-flight attempt attestation. An
+accepted-membership object is valid only when its registration is byte-equal to
+the member at the named current V2 set revision/hash and its same-instance lease
+is fresh. For preflight, claim, and every effect,
+the stable instance ID derived from the V1 attempt/preflight identity must equal
+the accepted V2 stable instance ID, the attestation's canonical process UUID
+must equal the exact-current execution-owner/request/queue/API chain, and
+`project_stable_worker_identity_v1(v1_identity)` must be byte-equal to
+`project_stable_worker_identity_v1(v2_registration.worker)`. Pod, ReplicaSet,
+and Deployment resourceVersions plus `observed_at` are intentionally outside
+that cross-version projection; each version still validates those fields in
+its own live-read contract. No V1-only field can substitute for the V2 set and
+fresh V2 lease whose execution owner is exact-current.
+
+Serve039 adds nullable execution-owner/hash columns plus the normalized
+`execution_owner_api_instance_id` scalar without changing the
+shipped V1 lease codec. Historical V1 rows keep all three null. Before first V2
+private admission, each accepted ACTIVE lease is upgraded under a zero-private-
+request inventory to `ProviderAuthorityWorkerLeaseV2`: one cohort -> handoff ->
+lease -> bootstrap API-instance transaction installs the exact current owner,
+advances lease generation/revision by one, and records
+`BIND_EXECUTION_OWNER`. Bind is an owner-changing renewal: an expired but still
+`ACTIVE` source is legal, and the one commit uses
+`GREATEST(clock_timestamp(), source.renewed_at, owner.container_started_at,
+owner.observed_at, api_instance.started_at,
+new_renewal_registration.worker.observed_at)` to write a fresh self-read
+renewal registration, `renewed_at`, 60-second expiry, and the owner/hash/scalar
+triple while changing the API row from bootstrap to bound. Immediately before
+commit, the owner observation remains inside the fixed five-minute identity
+bound, the API row remains inside its 20-second heartbeat window, and PostgreSQL
+time precedes the new lease expiry; otherwise it rolls back and rereads.
+Readiness and child warming require that fresh committed descendant. A post-039
+new lease includes its owner at `INSERT` under the same bootstrap-row, operation-
+time, phase-transition, and final freshness contract.
+Normal `RENEW` and every revocation preserve the owner/hash/normalized-process-
+scalar triple; owner replacement by
+ordinary upsert/heartbeat is corruption. Claim SQL locks the stable member's
+lease and requires `execution_owner.api_instance_id` to equal the process-
+unique caller API row, while owner Pod UID/stable ID equals the accepted member.
+Lineage, terminal receipts, and fences carry both identities. Thus a late old
+process fails its request CAS even though the stable Pod remains accepted.
+
+For a locked active private request `r`,
+`private_request_terminal_lower_bound(r)` is exactly
+`GREATEST(r.created_at, r.updated_at,
+COALESCE(r.heartbeat_at, '-infinity'::timestamptz),
+COALESCE(r.cancel_requested_at, '-infinity'::timestamptz))`. A multi-request
+operation takes the greatest of those values, omitting the request term for an
+empty inventory. Discovery snapshots every named column and the locked suffix
+requires byte equality. All private finish, cancel-acknowledgement, and receipt
+times are at least that bound even if the database clock moves backward.
+
+A same-Pod Python restart is not repaired by lease expiry. The chart's fixed
+`tini -- python ...` topology makes Python exit terminate the container; a
+supported next process therefore has a new Kubernetes container ID and larger
+restart count. It starts `/bootstrapz` only, mints a fresh API instance UUID,
+starts no claimant/pool, and exact-reads its named current container from the
+same Pod UID. If its API ID already equals the lease owner it may exact-adopt a
+lost acknowledgement. If the API ID differs while container ID is unchanged,
+it cannot prove quiescence and exits the container; two supervisors in one
+container can never supersede one another. Otherwise it constructs the closed
+container-supersession proof: same stable worker/Pod/name, different nonempty
+container IDs, strictly larger restart count, current named container exactly
+Running, current start time/Pod resourceVersion, and a fresh bounded
+observation. Kubernetes' one-current-container-per-name invariant then proves
+the prior container and all its child processes are gone; boot UUID or stale
+heartbeat alone never does.
+The proof and current owner are one observation:
+`current_container_started_at <= observed_at`, both fields plus container ID,
+restart count, Pod/resourceVersion and stable ID are byte-equal, and
+`current_api_row.started_at == current_owner.api_instance_started_at`. The
+proposed supersession time is no earlier than those three timestamps. At the
+final locked precommit check, proof/owner observation is neither future nor more
+than the fixed 300 seconds old, the current API row remains inside its fixed
+20-second heartbeat window, and PostgreSQL time precedes the new lease expiry.
+A boundary wait beyond any window rolls back and obtains new evidence.
+
+Nonlocking discovery uses `LIMIT 17` over every active row owned by the prior
+API UUID, without filtering by handler/route/correlation marker, generation,
+status, or queue validity. It rejects rather than truncates the 17th row, enforces the
+24,576-byte request-list and 65,536-byte enclosing supersession ceilings, and
+then requires every row to closed-validate as a legal generation-one `PENDING |
+RUNNING` claimed request/queue shape before constructing its arm-specific
+terminal receipt. Generation two, `WAITING`, crossed/missing queue state, or a
+partial private marker blocks the entire transition. The locked requery repeats the
+same max-plus-one and byte checks before any commit. One
+retryable transaction locks cohort and resolves the exact nonterminal
+membership protocol; inserts the complete immutable process-supersession evidence;
+locks the stable lease; locks prior and current API rows in UUID order; locks
+all requests by request ID and then all queues by request ID; reconstructs the
+inventory; and runs the common lineage -> action-selector -> shadow-history ->
+event terminal batch. Every old request becomes `CANCELLED` under its original
+token/generation/owner through the trusted `PROCESS_SUPERSESSION_FENCE` mode,
+never requeued. An action claim with committed lineage gets exactly
+`REQUEST_CANCELLED/LINEAGE/CANCELLED`; an action claim assigned generation one
+before claim-start gets exactly
+`TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START/CANCELLED`, and the
+terminalizer never creates its missing lineage. A shadow claim with an
+`AUTHORIZED` history gets exact generation-one
+`REQUEST_CANCELLED/SHADOW_EXECUTION/CANCELLED` history with the stored lineage
+hash; a still-`BOUND` claim gets
+`TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START/CANCELLED` with a null
+hash. The same
+transaction advances lease
+generation/revision exactly one, installs the current owner, records the reused
+operation ID with `SUPERSEDE_EXECUTION_OWNER`, and leaves cohort/registration-
+set revision unchanged. The prior API row may be stale or unready but must
+equal the prior owner's process UUID, stable Pod identity, and stored start
+time. The current row must be a fresh, unready, nondraining, bootstrap-only
+`authority-worker` for the same Pod name/UID/IP, with the new UUID/start time,
+the fixed private handler/payload inventory, and zero claims. Both rows,
+owners, and the container proof cross-equal; malformed or crossed evidence
+rejects. Supersession may consume an expired but still `ACTIVE` source and is
+an owner-changing renewal. Its one proposed operation time is the greatest of
+PostgreSQL time, source `renewed_at`, proof/current-owner container start and
+observation, current API `started_at`, new renewal-registration worker
+`observed_at`, and every affected request terminal lower
+bound. Locked revalidation repeats all source/API/request bytes and bounds; the
+same commit refreshes the self-read renewal registration, `renewed_at`, and
+60-second expiry, installs the owner/hash/scalar triple, and uses that time for
+the process row, request finishes, cancellation acknowledgements, and receipts.
+It also changes the current API row from bootstrap to bound in that commit.
+The supersession row requires committed generation/
+revision equal source + one; both scalar API IDs to equal their embedded owners
+and container proof; stable worker/Pod equality throughout; canonical request-
+list hash; `completed_at` equal every request finish time; and exact receipt
+hashes. Unknown outcome adopts only the
+entire immutable row, terminal receipts, and current lease operation; any drift
+blocks. Unique prior and current API-instance indexes prevent branches or boot
+reuse. A lease whose last operation is `SUPERSEDE_EXECUTION_OWNER` resolves its
+ID directly through unique `(cohort_id, operation_id)` and must equal that row's
+committed counters, stable worker, current owner/hash/scalar, and time. After a
+later renewal, the lease's current process scalar has at most one indexed
+`current_api_instance_id` tip; if present that tip validates directly, and if
+absent the process is the insert/bind owner. Unique prior/current indexes plus
+the frozen writer induction reject branches, gaps, and reuse in O(1); readers
+never walk an unbounded process chain. Only after commit/readback may the process warm all fixed children and
+publish claim readiness.
+
+Unknown INSERT/BIND/SUPERSEDE outcomes adopt the API phase as part of the joined
+proof. Bootstrap plus unchanged source means uncommitted and permits full retry.
+A commit requires the same UUID/immutable boot bytes, exact bound phase/stable
+ID/execution-owner hash, unready/nondraining shape, only a legal fresh heartbeat
+advance, and the exact lease operation; supersession additionally requires the
+process row and every request/receipt/event. A documented same-owner legal lease
+descendant may be adopted without rewriting the API row. Unequal phase/hash/
+identity or partial evidence blocks, and retry never resets bound to bootstrap
+or repeats terminal mutation.
+
+The compatibility matrix is closed. Without a nonterminal handoff, the lease
+must be an ACTIVE current `REGISTERING | ACCEPTING | DRAINING` member. During
+`OPEN | READY`, only the ACTIVE survivor or the exact ACTIVE candidate lease may
+supersede; the handoff anchors stay stable-Pod evidence and subsequent
+acknowledgement/completion reads the lease's new exact-current owner. The
+revoked stale member, unrelated Pod, and terminal candidate reject. Cohort
+locking serializes cold recovery: supersession-first makes the recovery's
+owner/lease snapshot drift and forces exact reread or UID-proof rejection;
+cold-recovery-first revokes an old lease and makes supersession reject. A cold
+candidate has no lease before commit and therefore cannot supersede; a restarted
+bootstrap supplies a fresh API row to a newly constructed recovery input.
+
+If a live supervisor loses request-lease authority, it first withdraws
+readiness/stops claiming, signals and joins every owned future/process, and then
+terminalizes each still-matching claim under the trusted
+`OWNER_QUIESCED_LEASE_LOSS` mode. If database proof cannot commit, it exits the
+container after killing the pool so the next container start uses the retained
+supersession protocol. Lease time alone never permits a third party to close
+the work. Process-supersession history is permanent while any lease, API row,
+request, lineage, terminal receipt, action/shadow evidence, cohort/reference,
+or rollout proof can name either owner.
+Generic API-instance GC excludes `authority-worker`. A Serve-owned typed job
+reciprocally retains the API-instance row while the
+indexed normalized execution-owner scalar of any ACTIVE or REVOKED lease, any
+active API request, action lineage or selector, either worker-ID column of any
+retained `AUTHORIZED | SETTLED` shadow execution history, shadow terminal
+history, or either scalar process-supersession ID names that API UUID. A `BOUND`
+shadow history has null worker IDs. Mandatory normalized receipts cover
+handoff/cold JSON entries, so GC never reverse-scans JSON and the generic layer
+never imports/reflects Serve039. The job serializes on the exact class-13
+`authority-worker-v2` cursor. Each finite epoch persists the high-water result
+of the exact-role `ORDER BY instance_id DESC LIMIT 1` query, advances in UUID
+order, and wraps only after reaching that bound; `MAX(uuid)` is forbidden
+because PostgreSQL 14 does not provide it. At most 128 targets plus one epoch-
+start and one epoch-completion cursor transaction run per pass. Rows inserted, newly eligible, newly rootless, or
+temporarily locked behind the cursor are revisited in the next finite epoch.
+Indexed root-absence checks are discovery-only prefilters, so a rooted first
+page cannot starve later rows.
+
+Each target transaction locks cursor then API row, requires `ready=false` and
+`heartbeat_at <= clock_timestamp() - interval '5 minutes'`, repeats the exact
+role/health predicate, and point-queries every indexed root. It retains a
+changed, malformed, raced-to-rooted, or blocked row and deletes only an exact
+rootless row; either ordinary result atomically advances the cursor with one
+operation ID/revision/time. Unknown commit adopts that operation or a legal
+successor, while database failure is closed. The cursor has no FK, is not a
+root, and may name a deleted row. Every root-creating writer, including BIND and
+supersession, locks the same API row and revalidates existence before commit;
+read-only root probes acquire no earlier-class row lock. Root absence, expiry,
+or loss of readiness alone is not deletion authority, and heartbeat never
+recreates a missing row.
+The request lookup uses the existing process-first active-claim index. Any
+authority-worker-owned active row outside the exact four private shapes is a
+retention root plus blocking corruption, never an ordinary-row filter miss.
+
+`REGISTERING` permits no in-place member replacement. If the surviving API
+verifier proves exact UID-qualified absence of either anchor in a one- or two-
+member set before activation, one transaction locks cohort -> handoff slot ->
+all leases -> references, proves the cohort was never accepted and has zero
+handoff/reference/private/action/effect evidence, revokes every ACTIVE lease
+with `COHORT_REMOVAL`, and moves directly to `REMOVAL_AUTHORIZED` using one
+PostgreSQL timestamp. Every such lease has null `revocation_owner_id`, preserves
+its nullable or nonnull execution-owner/hash/normalized-process-scalar triple
+exactly, records
+`last_operation_kind=REVOKE`, and has `revoked_at ==
+cohort.removal_authorized_at`. Serve038 adds that nullable column to the shipped
+cohort table; it is null before removal, set exactly once on entry to
+`REMOVAL_AUTHORIZED`, and preserved through `RETIRED`, whose `state_changed_at`
+and `retired_at` remain truthful. Lease expiry,
+unready state, deletion timestamp, or name-only evidence cannot authorize this
+edge. Exact Deployment/ServiceAccount NotFound later commits `RETIRED`, and a
+fresh suffix/cohort is required.
+
+```
+
+One-at-a-time V2 membership replacement is a Serve038 PostgreSQL protocol, not
+a blind rewrite of the registration-set JSON:
+
+```text
+ProviderAuthorityWorkerPodUidAbsenceProofV1 = one of:
+  {version: 1,
+   disposition: "not_found",
+   namespace: Text,
+   pod_name: Text,
+   expected_absent_pod_uid: UUID,
+   current_pod_uid: null,
+   current_pod_resource_version: null,
+   observed_at: UtcTimestamp}
+  {version: 1,
+   disposition: "same_name_different_uid",
+   namespace: Text,
+   pod_name: Text,
+   expected_absent_pod_uid: UUID,
+   current_pod_uid: UUID,  # unequal to expected_absent_pod_uid
+   current_pod_resource_version: Text,
+   observed_at: UtcTimestamp}
+
+ProviderAuthorityWorkerStaleAuthorityFenceV1 = {
+  version: 1,
+  origin_revoking_handoff_id: UUID,
+  stale_worker_instance_id: UUID,
+  stale_lease_generation: PositiveInteger,
+  prior_stale_lease_revision: PositiveInteger,
+  revoked_stale_lease_revision: PositiveInteger,
+  request_claims: SortedList<{  # 0..64; whole list <= 24,576 canonical bytes
+    request_id: UUID,
+    execution_generation: PositiveInteger,
+    claim_token_sha256: Sha256,
+    prior_lease_expires_at: UtcTimestamp,
+    fenced_delivery_state: "queued"
+  }>,
+  fenced_at: UtcTimestamp
+}
+
+ProviderAuthorityWorkerColdRecoveryFenceV1 = {
+  version: 1,
+  recovery_id: UUID,
+  worker_instance_id: UUID,
+  pod_uid: UUID,
+  prior_lease_state: "ACTIVE" | "REVOKED",
+  lease_generation: PositiveInteger,
+  prior_lease_revision: PositiveInteger,
+  terminal_lease_revision: PositiveInteger,
+  preserved_revocation_reason: null | "STALE_HANDOFF",
+  preserved_revocation_owner_id: null | UUID,
+  request_claims: SortedList<{  # 0..64; whole list <= 24,576 canonical bytes
+    request_id: UUID,
+    execution_generation: PositiveInteger,
+    claim_token_sha256: Sha256,
+    prior_lease_expires_at: UtcTimestamp,
+    fenced_delivery_state: "queued"
+  }>,
+  fenced_at: UtcTimestamp
+}
+
+# V1 queued fences remain readable pre-039 history but cannot authorize M4.
+# M4 uses terminal V2 fences so ReplayPolicy.NEVER is never overridden.
+ProviderShadowExecutionHistoryV1 = {
+  version: 1,
+  decision_id: UUID,
+  request_sequence: PositiveInteger,
+  request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+  request_id: UUID,
+  handler_name: "serve_shadow_candidate_launch" |
+                "serve_shadow_candidate_down",
+  immutable_payload_sha256: Sha256,
+  request_input_sha256: Sha256,
+  preflight_request: ProviderAuthorityPreflightRequestV2,
+  preflight_request_sha256: Sha256,
+  preflight_response: ProviderAuthorityPreflightResponseV2,
+  preflight_response_sha256: Sha256,
+  phase: "BOUND" | "AUTHORIZED" | "SETTLED",
+  request_execution_generation: null | 1,
+  authority_worker_instance_id: null | UUID,
+  worker_instance_id: null | UUID,
+  claim_token_sha256: null | Sha256,
+  dispatch_membership:
+      null | ProviderShadowCandidateDispatchMembershipV2,
+  dispatch_membership_sha256: null | Sha256,
+  execution_authority: null | ProviderShadowExecutionAuthorityProofV2,
+  execution_authority_sha256: null | Sha256,
+  execution_authority_lineage_sha256: null | Sha256,
+  authorized_at: null | UtcTimestamp,
+  provider_io_boundary: "NOT_STARTED" | "INTENT_COMMITTED" |
+                        "SUBMITTED_OR_AMBIGUOUS",
+  provider_progress_revision: NonnegativeInteger,
+  provider_progress: null | ProviderShadowLifecycleProgressV1,
+  provider_progress_sha256: null | Sha256,
+  provider_operation_id: null | Text,
+  provider_effect_trace: LegacyProviderEffectTraceV1,
+  provider_effect_trace_sha256: Sha256,
+  request_return: null | ServeShadowCandidateRequestReturnV1,
+  request_return_sha256: null | Sha256,
+  terminal_history_sha256: null | Sha256,
+  settlement_basis: null | "HANDLER_RETURN" | "REQUEST_FALLBACK",
+  reduction_disposition: null | "S" | "R" | "U" | "B" | "Q" |
+                               "P0" | "O" | "X",
+  partial_down_decision_id: null | UUID,
+  partial_down_request_sequence: null | PositiveInteger,
+  partial_down_basis_sha256: null | Sha256,
+  revision: PositiveInteger,
+  created_at: UtcTimestamp,
+  updated_at: UtcTimestamp,
+  settled_at: null | UtcTimestamp
+}
+
+ProviderShadowRequestTerminalHistoryV2 = {
+  version: 2,
+  decision_id: UUID,
+  request_sequence: PositiveInteger,
+  request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+  request_id: UUID,
+  immutable_payload_sha256: Sha256,
+  request_input_sha256: Sha256,
+  handler_name: "serve_shadow_candidate_down" |
+                "serve_shadow_candidate_launch",
+  request_terminal_state: "SUCCEEDED" | "FAILED" | "CANCELLED",
+  request_execution_generation: 0 | 1,
+  authority_worker_instance_id: null | UUID,
+  worker_instance_id: null | UUID,  # process-unique API claim owner
+  authority_disposition: "NO_SUCCESSFUL_CLAIM_START" | "SHADOW_EXECUTION",
+  execution_authority_lineage_sha256: null | Sha256,
+  terminal_cause: "HANDLER_RETURN" | "REQUEST_FAILED" |
+                  "REQUEST_CANCELLED" | "TERMINAL_BEFORE_CLAIM_START",
+  terminal_winner: ProviderShadowTerminalCommitmentV1,
+  terminal_winner_sha256: Sha256,
+  request_return_sha256: null | Sha256,
+  request_finished_at: UtcTimestamp
+}
+
+The history projection is the typed view of the one-to-one class-10 Serve039
+row, not a second serialized enclosing value. Every JSON/hash child is parsed,
+hashed, and bounded independently at 65,536 canonical UTF-8 bytes. `BOUND` has
+the immutable nonnull complete preflight request/response pairs, the wholly
+null authority and settlement bundles, the exact empty or inherited retry-seed
+progress shape, and an empty provider-effect trace. `AUTHORIZED` has generation one, distinct
+stable/process IDs, token hash, both proof/hash pairs, lineage hash, and
+authorization time, with no settlement fields. `SETTLED` retains that complete
+authority bundle or the wholly null pre-claim-start bundle and has the exact
+terminal-receipt hash, basis, reduction, and settlement time. Handler basis has
+the exact nonnull shadow return pair; fallback has it null. The three partial-
+down fields are all nonnull exactly for launch `Q`, point to one normal
+represented primary-down history, and otherwise are all null. Identity,
+request, handler, immutable hashes, progress revision/hash, terminal receipt,
+return, effect trace, and outcome cross-validate against the retained
+parent/child/request. Every pre-I/O CAS appends the exact planned effect with a
+null response before the call and every post-I/O CAS resolves only that same
+entry; no later cursor can erase or reconstruct an earlier response. The strict
+handler return binds `final_provider_effect_trace_sha256`, and settlement copies
+that byte-equal trace into the completed child's `legacy_effect_trace` pair.
+Crash-after-call-before-checkpoint therefore retains the truthful null-response
+ambiguous entry rather than inventing a transport result;
+action-shaped lineage, return, progress, or outcome values reject.
+The named strict `ProviderShadowExecutionHistoryV1` reader covers `BOUND`,
+`AUTHORIZED`, and non-`X` `SETTLED` rows. A literal `X` settled row uses the
+layered raw snapshot above so its malformed bounded progress evidence survives;
+all outer identity, effect-trace, receipt, return, and settlement fields remain
+strict.
+
+ProviderAuthorityWorkerTerminalFenceClaimV2 = one of:
+  {claim_kind: "resource_action",
+   request_id: UUID,
+   handler_name: "serve_resource_action_down" |
+                 "serve_resource_action_launch",
+   action_id: UUID,
+   attempt: PositiveInteger,
+   request_input_sha256: Sha256,
+   execution_generation: 1,
+   claim_owner_api_instance_id: UUID,
+   claim_token_sha256: Sha256,
+   prior_lease_expires_at: UtcTimestamp,
+   prior_cancel_requested_at: null | UtcTimestamp,
+   fence_outcome: "TERMINAL_CANCELLED",
+   request_finished_at: UtcTimestamp,
+   terminal_selector_sha256: Sha256,
+   shadow_terminal_history: null,
+   shadow_terminal_history_sha256: null}
+| {claim_kind: "shadow_candidate",
+   request_id: UUID,
+   handler_name: "serve_shadow_candidate_down" |
+                 "serve_shadow_candidate_launch",
+   decision_id: UUID,
+   request_sequence: PositiveInteger,
+   request_role: "PRIMARY_LAUNCH" | "PRIMARY_DOWN",
+   immutable_payload_sha256: Sha256,
+   execution_generation: 1,
+   claim_owner_api_instance_id: UUID,
+   claim_token_sha256: Sha256,
+   prior_lease_expires_at: UtcTimestamp,
+   prior_cancel_requested_at: null | UtcTimestamp,
+   fence_outcome: "TERMINAL_CANCELLED",
+   request_finished_at: UtcTimestamp,
+   terminal_selector_sha256: null,
+   shadow_terminal_history: ProviderShadowRequestTerminalHistoryV2,
+   shadow_terminal_history_sha256: Sha256}
+
+ProviderAuthorityWorkerStaleAuthorityFenceV2 = {
+  version: 2,
+  origin_revoking_handoff_id: UUID,
+  stale_worker_instance_id: UUID,
+  stale_lease_generation: PositiveInteger,
+  prior_stale_lease_revision: PositiveInteger,
+  revoked_stale_lease_revision: PositiveInteger,
+  request_claims: SortedList<
+      ProviderAuthorityWorkerTerminalFenceClaimV2>,  # 0..16, request-ID order
+  fenced_at: UtcTimestamp
+}
+
+ProviderAuthorityWorkerColdRecoveryFenceV2 = {
+  version: 2,
+  recovery_id: UUID,
+  worker_instance_id: UUID,
+  pod_uid: UUID,
+  prior_lease_state: "ACTIVE" | "REVOKED",
+  lease_generation: PositiveInteger,
+  prior_lease_revision: PositiveInteger,
+  terminal_lease_revision: PositiveInteger,
+  preserved_revocation_reason: null | "STALE_HANDOFF",
+  preserved_revocation_owner_id: null | UUID,
+  request_claims: SortedList<
+      ProviderAuthorityWorkerTerminalFenceClaimV2>,  # 0..16, request-ID order
+  fenced_at: UtcTimestamp
+}
+
+ProviderAuthorityWorkerProcessSupersessionV1 = {
+  version: 1,
+  supersession_id: UUID,
+  cohort_id: Text,
+  authority_worker_instance_id: UUID,
+  operation_id: UUID,
+  source_lease_generation: PositiveInteger,
+  source_lease_revision: PositiveInteger,
+  committed_lease_generation: PositiveInteger,
+  committed_lease_revision: PositiveInteger,
+  prior_api_instance_id: UUID,
+  current_api_instance_id: UUID,
+  prior_execution_owner: ProviderAuthorityWorkerExecutionOwnerV1,
+  prior_execution_owner_sha256: Sha256,
+  current_execution_owner: ProviderAuthorityWorkerExecutionOwnerV1,
+  current_execution_owner_sha256: Sha256,
+  container_supersession_proof:
+      ProviderAuthorityWorkerContainerSupersessionProofV1,
+  container_supersession_proof_sha256: Sha256,
+  request_claims: SortedList<
+      ProviderAuthorityWorkerTerminalFenceClaimV2>,  # 0..16, request-ID order
+  request_claims_sha256: Sha256,
+  completed_at: UtcTimestamp
+}
+
+ProviderAuthorityWorkerCandidateZeroEffectProofV1 = {
+  version: 1,
+  candidate_worker_instance_id: UUID,
+  candidate_pod_uid: UUID,
+  accepted_membership_count: 0,
+  live_request_claim_count: 0,
+  attempt_attestation_count: 0,
+  provider_progress_count: 0,
+  provider_operation_count: 0,
+  provider_effect_count: 0,
+  observed_at: UtcTimestamp
+}
+
+V1 queued fences are read-only pre-039 history and retain their V1 64/24,576/
+30,720/65,536 bounds plus max-plus-one `LIMIT 65`; they cannot authorize a live
+handoff, recovery, claim, or replay after Serve039. Every live Serve039 handoff
+or cold-recovery fence uses the V2 constants: at most 16 request claims, at most
+24,576 canonical bytes for the list, 30,720 for one complete fence, and 65,536
+for the exact-two cold-fence array. V2 discovery queries `LIMIT 17` over every
+active row owned by the fenced authority process with no handler/marker/
+generation/status/queue filter, then requires every row to be exactly one of the
+four private routes with the legal claim/queue shape. An ordinary-looking,
+unmarked, crossed, or malformed row is blocking corruption and cannot disappear
+through a filter. It sorts by
+request UUID bytes, and rejects cardinality or any nested/enclosing canonical-
+byte overflow before any handoff/recovery/lease/revocation write. The locked
+requery uses the same max-plus-one rule and rolls the whole transaction back on
+overflow or drift. Truncation, pagination, a hash-only substitute, and partial
+fencing are forbidden; typed decoding rejects any retained over-limit list or
+envelope. On overflow the verifier writes nothing, observes no new stale claim,
+lets the per-request generic quiescence terminalizer reduce ordinary expired
+claims, and retries fresh discovery; a cancellation-pending claim still requires
+owner acknowledgement, a UID-qualified V2 recovery fence, or the container-
+qualified process-supersession fence. Persistent overflow
+is a recovery blocker, never permission to discard claims.
+Checked-in generated maximal action-only, shadow-only, and mixed 16-entry
+fixtures must fit all three V2 byte ceilings and exact-two enclosure, while
+one-byte/text-max and 17-entry negatives reject. The manifest-bound fixed pool
+and API-instance-serialized claim cap make overflow unreachable from valid live
+state rather than a normal liveness mechanism.
+The enclosing process-supersession DTO is separately limited to 65,536
+canonical bytes and has its own maximal 16-entry action/shadow/mixed goldens;
+its owner/proof objects do not consume the smaller request-list ceiling.
+
+The V2 claim union is closed over the complete four-handler inventory. Each
+entry claim-owner API UUID equals the enclosing stable worker lease's current
+execution owner (or the supersession row's prior owner); that owner's stable
+worker/Pod UUID equals the enclosing stale/cold/process worker. The action
+selector or shadow history repeats both exact IDs, and `request_finished_at`
+equals the enclosing stale/cold `fenced_at` or process-supersession
+`completed_at`. Nonlocking discovery includes
+the exact request, queue, private route/correlation, reconstructed immutable
+request input, and any action lineage/selector or shadow-history candidate
+needed to construct the complete entry before the earlier-class evidence row
+is inserted. After locking all requests and then all queues, the batch core
+reconstructs every byte and requires exact equality; a concurrent claim-start,
+terminalization, cancellation-intent, or correlation change rolls the whole
+handoff/recovery/process-supersession transaction back.
+
+Every locked source is active and claimed at generation one with the entry's
+claim-owner API UUID, token hash, lease expiry, cancel-request timestamp, null cancel-
+acknowledgement, and claimed queue generation one. An action arm exact-binds
+handler/kind/action/attempt/input, has no shadow object/hash, and hashes the
+exact Serve039 terminal-selector row that the batch writes. A shadow arm exact-
+binds handler/kind/decision/sequence/role/invocation hash, has a null action selector,
+and embeds the exact `ProviderShadowRequestTerminalHistoryV2` row written by the
+same batch, fixed to `CANCELLED`, generation one, and both nonnull stable/process
+IDs. If the committed class-10 history nonlockingly read after locking the
+class-15 request is `AUTHORIZED`, the receipt is exactly
+`REQUEST_CANCELLED/SHADOW_EXECUTION` with its byte-equal nonnull execution-
+lineage hash. If it is still `BOUND`, the receipt is exactly
+`TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START` with a null lineage hash.
+No other phase/disposition is legal; its hash is SHA-256 of that row's canonical
+bytes. The
+cancel-request timestamp is either null or nonnull and snapshotted exactly;
+nonnull acknowledgement on any active source and null-request/non-null-ack are
+blocking corruption. The
+general DTO additionally requires generation zero with both IDs null or
+generation one with both IDs nonnull and exactly the disposition/state/cause/
+lineage-hash matrix in the parent design.
+For every V2 handoff, cold-recovery, or process-supersession batch, a nonnull
+`prior_cancel_requested_at` is preserved on the terminal request and
+`cancel_acknowledged_at` is set to the enclosing `fenced_at`/`completed_at`
+only after the UID/container proof establishes quiescence. If the prior field
+is null, both cancellation fields remain null. A terminal row with a retained
+unacknowledged intent is invalid. Each enclosing time includes every affected
+`private_request_terminal_lower_bound`; same-owner acknowledgement uses exactly
+`GREATEST(clock_timestamp(), private_request_terminal_lower_bound(request))`,
+and an unclaimed generation-zero cancellation uses
+`GREATEST(clock_timestamp(), created_at, updated_at)` for its equal requested,
+acknowledged, terminal-updated, finished, and receipt times; exact replay
+validates that equality.
+No request,
+action/attempt, or shadow decision/sequence key may repeat. The store first
+key-share-locks all named action lineages in canonical lineage-key order, then
+inserts/adopts action selectors in action/attempt order, then shadow histories
+in decision/sequence order. Only after all class-17 receipts succeed does the
+generic batch allocate terminal events. Request GC retains an action until its
+attempt is settled and selector validates. It retains a shadow request until
+its represented child is `COMPLETE`, same-key execution history is `SETTLED`,
+and the exact terminal receipt, settlement basis, final progress, outcome/hash,
+and copied return/hash relationships cross-validate; a fallback has a null
+return pair and a handler basis has the exact nonnull pair. These are nonlocking
+point reads after the class-15 request lock, never a backward class-10 lock. The
+immutable handoff/cold/process evidence is an additional cross-check, never the sole
+normal shadow completion record.
+
+Same-process quiescence is also closed. `OWNER_ACK_CANCEL` is singleton-only and
+requires prior cancellation intent; `OWNER_QUIESCED_LEASE_LOSS` is singleton-
+only and permits prior intent or none. Both require the same locked generation-
+one historical owner and write `CANCELLED`: action lineage maps to
+`REQUEST_CANCELLED/LINEAGE`, pre-claim-start maps to
+`TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START`, and shadow maps to the
+corresponding `REQUEST_CANCELLED` or `TERMINAL_BEFORE_CLAIM_START` history.
+Lineage is never fabricated. Prior intent is preserved and acknowledged at the
+one finish time; without intent, legal only for lease loss, both cancellation
+fields stay null. Terminal updated/finished/receipt/acknowledgement times are one
+exact lower-bounded database scalar. No-intent lease-loss action reduction uses
+the retained journal table (`P0`/`O`/`S`/`X`) and can create only attempt `n+1`,
+never replay the request; pending intent still grants no provider evidence, and
+shadow uses its distinct progress/history contract.
+
+The parent terminal store's singleton/batch receipts are tagged
+`NEWLY_TERMINALIZED | EXACT_ADOPTED`; the outer terminal result additionally
+has `LOST_RACE`, while missing/crossed durable evidence is blocking
+`PRIVATE_TERMINAL_CORRUPTION`. Retry first discovers the request plus its unique
+selector/shadow history. A terminal generation-one request derives and locks the
+historical process API row from that receipt at class 14 before locking the
+request; generation zero starts at class 15. It requires no queue and first
+closed-validates request/route/input/handler/state/generation/owner/cause/
+lineage/cancellation/updated/finish/event bytes as one internally consistent
+legal terminal winner, reusing persisted time and appending nothing. Equality to
+the caller's original trusted context returns `EXACT_ADOPTED`; a different
+closed legal winner for the same immutable request returns `LOST_RACE` with no
+receipt or write. Only missing, crossed, or internally inconsistent evidence is
+`PRIVATE_TERMINAL_CORRUPTION`; a valid owner acknowledgement, UID handoff/cold
+fence, process supersession, or owner-lease-loss winner is not corruption.
+Handoff/cold/process unknown outcomes adopt only the whole
+immutable operation plus every terminal request, receipt, and event; partial
+mixing is corruption. Commit-boundary tests for handler success/failure, owner
+cancel, claim-start rejection, and one-request recovery prove one finish,
+receipt, and event with no reminted timestamp. Handler-versus-owner-ack and
+handler-versus-UID/process-fence tests cover the losing handler retry after both
+acknowledged and unknown winner commits.
+For an otherwise same active claim, newly nonnull unacknowledged cancellation
+intent makes handler success/failure return typed `LOST_RACE`. While that exact
+owner remains live, only its quiesced owner-ack/lease-loss path closes the intent;
+after owner death, the typed UID-qualified handoff/cold fence or container-
+qualified process-supersession fence may close it. Both intent/handler lock
+orders are tested and intent is never reclassified as corruption or overwritten
+by success.
+
+serve_resource_action_worker_registration_leases = {
+  cohort_id: Text REFERENCES serve_resource_action_worker_cohorts(cohort_id),
+  worker_instance_id: UUID,
+  pod_uid: UUID,
+  generation: PositiveInteger,
+  state: "ACTIVE" | "REVOKED",
+  renewal_registration: ProviderAuthorityWorkerRegistrationV2,
+  renewal_registration_sha256: Sha256,
+  execution_owner: null | ProviderAuthorityWorkerExecutionOwnerV1,
+  execution_owner_sha256: null | Sha256,
+  execution_owner_api_instance_id: null | UUID,
+  renewed_at: UtcTimestamp,
+  expires_at: UtcTimestamp,
+  revoked_at: null | UtcTimestamp,
+  revocation_reason: null | "STALE_HANDOFF" | "CANDIDATE_ABANDONED" |
+                            "COHORT_COLD_RECOVERY" |
+                            "COHORT_REMOVAL",
+  revocation_owner_id: null | UUID,
+  last_operation_id: UUID,
+  last_operation_kind: "INSERT" | "RENEW" | "REVOKE" |
+                       "BIND_EXECUTION_OWNER" |
+                       "SUPERSEDE_EXECUTION_OWNER",
+  revision: PositiveInteger,
+  PRIMARY KEY (cohort_id, worker_instance_id),
+  UNIQUE (cohort_id, pod_uid),
+  CHECK (worker_instance_id = pod_uid AND generation > 0 AND revision > 0 AND
+         expires_at = renewed_at + INTERVAL '60 seconds' AND
+         ((execution_owner IS NULL AND execution_owner_sha256 IS NULL AND
+           execution_owner_api_instance_id IS NULL) OR
+          (execution_owner IS NOT NULL AND
+           execution_owner_sha256 IS NOT NULL AND
+           execution_owner_api_instance_id IS NOT NULL AND
+           CASE WHEN jsonb_typeof(execution_owner) = "object" THEN
+             execution_owner_api_instance_id::text =
+                 execution_owner ->> "api_instance_id" AND
+             worker_instance_id::text =
+                 execution_owner ->> "authority_worker_instance_id" AND
+             pod_uid::text = execution_owner ->> "pod_uid" AND
+             execution_owner_api_instance_id != worker_instance_id
+           ELSE FALSE END IS TRUE)) AND
+         (last_operation_kind NOT IN
+              ("BIND_EXECUTION_OWNER", "SUPERSEDE_EXECUTION_OWNER") OR
+          execution_owner IS NOT NULL) AND
+         ((state = "ACTIVE" AND revision = generation AND revoked_at IS NULL AND
+          revocation_reason IS NULL AND revocation_owner_id IS NULL AND
+          ((generation = 1 AND last_operation_kind = "INSERT") OR
+           (generation > 1 AND last_operation_kind IN
+               ("RENEW", "BIND_EXECUTION_OWNER",
+                "SUPERSEDE_EXECUTION_OWNER")))) OR
+         (state = "REVOKED" AND revision = generation + 1 AND
+          revoked_at >= renewed_at AND
+          revoked_at IS NOT NULL AND revocation_reason IS NOT NULL AND
+          last_operation_kind = "REVOKE" AND
+          ((revocation_reason = "COHORT_REMOVAL" AND
+            revocation_owner_id IS NULL) OR
+           (revocation_reason IN ("STALE_HANDOFF", "CANDIDATE_ABANDONED",
+                                  "COHORT_COLD_RECOVERY") AND
+            revocation_owner_id IS NOT NULL))))),
+  INDEX (cohort_id, expires_at) WHERE state = "ACTIVE",
+  UNIQUE (execution_owner_api_instance_id)
+    WHERE execution_owner_api_instance_id IS NOT NULL
+}
+
+serve_resource_action_worker_registration_handoffs = {
+  cohort_id: Text REFERENCES serve_resource_action_worker_cohorts(cohort_id),
+  handoff_id: UUID,
+  predecessor_handoff_id: null | UUID,
+  chain_sequence: PositiveInteger,
+  stale_fence_disposition:
+      "NEWLY_REVOKED" | "ADOPTED_ABANDONED_PREDECESSOR",
+  source_cohort_revision: PositiveInteger,
+  source_cohort_state: "ACCEPTING" | "DRAINING",
+  source_registration_set_revision: PositiveInteger,
+  source_registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  source_registration_set_sha256: Sha256,
+  stale_worker_instance_id: UUID,
+  stale_pod_name: Text,
+  stale_pod_uid: UUID,
+  survivor_worker_instance_id: UUID,
+  survivor_pod_uid: UUID,
+  candidate_worker_instance_id: UUID,
+  candidate_pod_name: Text,
+  candidate_pod_uid: UUID,
+  stale_uid_absence_proof: ProviderAuthorityWorkerPodUidAbsenceProofV1,
+  stale_uid_absence_proof_sha256: Sha256,
+  stale_authority_fence: ProviderAuthorityWorkerStaleAuthorityFenceV1 |
+                         ProviderAuthorityWorkerStaleAuthorityFenceV2,
+  stale_authority_fence_sha256: Sha256,
+  candidate_registration: ProviderAuthorityWorkerRegistrationV2,
+  candidate_registration_sha256: Sha256,
+  survivor_registration: null | ProviderAuthorityWorkerRegistrationV2,
+  survivor_registration_sha256: null | Sha256,
+  handoff_state: "OPEN" | "READY" | "COMPLETED" | "ABANDONED",
+  final_registration_set: null | ProviderAuthorityWorkerRegistrationSetV2,
+  final_registration_set_sha256: null | Sha256,
+  final_registration_set_revision: null | PositiveInteger,
+  final_deployment_snapshot: null | ProviderAuthorityWorkerDeploymentSnapshotV2,
+  final_deployment_snapshot_sha256: null | Sha256,
+  committed_cohort_revision: null | PositiveInteger,
+  candidate_absence_proof: null | ProviderAuthorityWorkerPodUidAbsenceProofV1,
+  candidate_absence_proof_sha256: null | Sha256,
+  survivor_absence_proof: null | ProviderAuthorityWorkerPodUidAbsenceProofV1,
+  survivor_absence_proof_sha256: null | Sha256,
+  candidate_zero_effect_proof:
+      null | ProviderAuthorityWorkerCandidateZeroEffectProofV1,
+  candidate_zero_effect_proof_sha256: null | Sha256,
+  abandonment_reason: null | "candidate_absent_zero_effect" |
+                              "both_members_lost_cold_recovery_required",
+  revision: PositiveInteger,
+  opened_at: UtcTimestamp,
+  fenced_at: UtcTimestamp,
+  survivor_acknowledged_at: null | UtcTimestamp,
+  terminal_at: null | UtcTimestamp,
+  PRIMARY KEY (cohort_id, handoff_id),
+  FOREIGN KEY (cohort_id, predecessor_handoff_id) REFERENCES
+      serve_resource_action_worker_registration_handoffs(cohort_id, handoff_id),
+  CHECK (predecessor_handoff_id IS NULL OR
+         predecessor_handoff_id != handoff_id),
+  CHECK ((stale_fence_disposition = "NEWLY_REVOKED" AND
+          predecessor_handoff_id IS NULL AND chain_sequence = 1) OR
+         (stale_fence_disposition = "ADOPTED_ABANDONED_PREDECESSOR" AND
+          predecessor_handoff_id IS NOT NULL AND chain_sequence > 1)),
+  UNIQUE (cohort_id, predecessor_handoff_id)
+      WHERE predecessor_handoff_id IS NOT NULL,
+  UNIQUE (cohort_id, source_cohort_revision, chain_sequence),
+  UNIQUE (cohort_id) WHERE handoff_state IN ("OPEN", "READY"),
+  UNIQUE (cohort_id, candidate_pod_uid)
+}
+
+serve_resource_action_worker_registration_cold_recoveries = {
+  cohort_id: Text REFERENCES serve_resource_action_worker_cohorts(cohort_id),
+  recovery_id: UUID,
+  source_cohort_revision: PositiveInteger,
+  source_cohort_state: "ACCEPTING" | "DRAINING",
+  source_registration_set_revision: PositiveInteger,
+  source_registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  source_registration_set_sha256: Sha256,
+  old_uid_absence_proofs:
+      SortedList<ProviderAuthorityWorkerPodUidAbsenceProofV1>,  # exact two
+  old_uid_absence_proofs_sha256: Sha256,
+  old_authority_fences:
+      SortedList<ProviderAuthorityWorkerColdRecoveryFenceV1 |
+                 ProviderAuthorityWorkerColdRecoveryFenceV2>,  # exact two/same version
+  old_authority_fences_sha256: Sha256,
+  final_registration_set: ProviderAuthorityWorkerRegistrationSetV2,
+  final_registration_set_sha256: Sha256,
+  final_registration_set_revision: PositiveInteger,
+  final_deployment_snapshot: ProviderAuthorityWorkerDeploymentSnapshotV2,
+  final_deployment_snapshot_sha256: Sha256,
+  committed_cohort_revision: PositiveInteger,
+  completed_at: UtcTimestamp,
+  PRIMARY KEY (cohort_id, recovery_id),
+  UNIQUE (cohort_id, source_cohort_revision)
+}
+
+serve_resource_action_worker_process_supersessions = {
+  cohort_id: Text REFERENCES serve_resource_action_worker_cohorts(cohort_id),
+  supersession_id: UUID,
+  authority_worker_instance_id: UUID,
+  operation_id: UUID,
+  source_lease_generation: PositiveInteger,
+  source_lease_revision: PositiveInteger,
+  committed_lease_generation: PositiveInteger,
+  committed_lease_revision: PositiveInteger,
+  prior_api_instance_id: UUID,
+  current_api_instance_id: UUID,
+  prior_execution_owner: ProviderAuthorityWorkerExecutionOwnerV1,
+  prior_execution_owner_sha256: Sha256,
+  current_execution_owner: ProviderAuthorityWorkerExecutionOwnerV1,
+  current_execution_owner_sha256: Sha256,
+  container_supersession_proof:
+      ProviderAuthorityWorkerContainerSupersessionProofV1,
+  container_supersession_proof_sha256: Sha256,
+  request_claims: SortedList<
+      ProviderAuthorityWorkerTerminalFenceClaimV2>,
+  request_claims_sha256: Sha256,
+  completed_at: UtcTimestamp,
+  PRIMARY KEY (cohort_id, supersession_id),
+  UNIQUE (cohort_id, operation_id),
+  UNIQUE (prior_api_instance_id),
+  UNIQUE (current_api_instance_id),
+  CHECK (supersession_id = operation_id AND
+         source_lease_generation > 0 AND source_lease_revision > 0 AND
+         source_lease_generation = source_lease_revision AND
+         committed_lease_generation = source_lease_generation + 1 AND
+         committed_lease_revision = source_lease_revision + 1 AND
+         prior_api_instance_id != current_api_instance_id AND
+         prior_api_instance_id != authority_worker_instance_id AND
+         current_api_instance_id != authority_worker_instance_id AND
+         jsonb_typeof(prior_execution_owner) = "object" AND
+         jsonb_typeof(current_execution_owner) = "object" AND
+         jsonb_typeof(container_supersession_proof) = "object" AND
+         jsonb_typeof(request_claims) = "array" AND
+         jsonb_array_length(request_claims) <= 16 AND
+         CASE WHEN jsonb_typeof(prior_execution_owner) = "object" AND
+                        jsonb_typeof(current_execution_owner) = "object" AND
+                        jsonb_typeof(container_supersession_proof) = "object"
+              THEN prior_api_instance_id::text =
+                       prior_execution_owner ->> "api_instance_id" AND
+                   current_api_instance_id::text =
+                       current_execution_owner ->> "api_instance_id" AND
+                   authority_worker_instance_id::text =
+                       prior_execution_owner ->> "authority_worker_instance_id" AND
+                   authority_worker_instance_id::text =
+                       current_execution_owner ->> "authority_worker_instance_id" AND
+                   authority_worker_instance_id::text =
+                       prior_execution_owner ->> "pod_uid" AND
+                   authority_worker_instance_id::text =
+                       current_execution_owner ->> "pod_uid" AND
+                   authority_worker_instance_id::text =
+                       container_supersession_proof ->> "authority_worker_instance_id" AND
+                   prior_api_instance_id::text =
+                       container_supersession_proof ->> "prior_api_instance_id" AND
+                   current_api_instance_id::text =
+                       container_supersession_proof ->> "current_api_instance_id"
+              ELSE FALSE END IS TRUE),
+  INDEX (cohort_id, authority_worker_instance_id, completed_at)
+}
+
+serve_resource_action_api_instance_gc_cursors = {
+  cursor_name: "authority-worker-v2",
+  sweep_epoch: NonnegativeInteger,
+  sweep_upper_bound_instance_id: null | UUID,
+  after_instance_id: null | UUID,
+  revision: PositiveInteger,
+  last_operation_id: UUID,
+  updated_at: UtcTimestamp,
+  PRIMARY KEY (cursor_name),
+  CHECK (cursor_name = "authority-worker-v2"),
+  CHECK ((sweep_upper_bound_instance_id IS NULL AND
+          after_instance_id IS NULL) OR
+         (sweep_upper_bound_instance_id IS NOT NULL AND
+          (after_instance_id IS NULL OR
+           after_instance_id <= sweep_upper_bound_instance_id)))
+}
+```
+
+The process row has exactly its restrictive cohort foreign key. That parent is
+already locked at class 3 before the class-4 insert. Lease, API-instance,
+request, queue, lineage, selector, and shadow-history relations are deliberately
+not foreign keys: implicit parent locks would violate the later explicit class-
+5/14/15/16/17 order. Typed validation cross-checks them under those locks.
+
+The GC cursor has no foreign key and is the class-13 predecessor of its class-14
+API target. Its UUIDs are keyset markers, not retained identities, and may name
+a missing row. First use creates the exact singleton at epoch zero with null
+markers, revision one, a caller-minted operation UUID, and PostgreSQL time;
+concurrent creation adopts any valid scheduling successor. The row grants no
+deletion authority.
+
+The three Deployment rollout fields are closed wire members. Both maxima are
+JSON integers: `Recreate`, crossed values, Boolean/numeric aliases, and
+percentage strings reject. Live V2 uses the V2 PodTemplate binding; the V1
+binding remains readable only as immutable pre-039 audit history and cannot
+authorize a V2 candidate, lease, claim, or effect.
+The physical JSONB columns remain additive unions only so retained pre-039 V1
+history can still be decoded. A handoff/cold-recovery row has one fence version
+throughout; mixed exact-two cold arrays reject. At Serve039 activation every
+nonterminal handoff is absent and the exact full-table `EXISTS` audit under
+policy/cohort locks proves zero request or delivery rows for all four private
+handlers in every state. Its fixed 60-second statement timeout/read failure
+blocks activation. No pre-039 pristine,
+claimed, or terminal private row is grandfathered. All new handoff/recovery
+writes use V2, and no V1 fence can authorize membership, terminalization,
+claiming, reduction, or readiness. A retained terminal V1 row is audit-only.
+
+Serve039 runs one explicit migration transaction. Initial reflection accepts
+only exact 038 or exact complete 039 at an old stamp; partial 039 fails before
+mutation. Exact 038 takes `ACCESS EXCLUSIVE` on the existing writer prefix:
+policy epochs (class 2) -> cohorts (class 3) -> handoffs (class 4) -> leases
+(class 5) -> cohort refs (class 6) -> shadow parents (class 9) -> shadow
+children (class 10). It cannot lock
+a not-yet-created 039 relation. Exact-complete-039 old-stamp adoption instead
+uses one merged global schedule: policy epochs (class 2); cohorts (class 3);
+handoffs and process-supersession history in canonical relation order (class
+4); leases (class 5); refs (class 6); shadow parents (class 9); shadow children
+and execution history in canonical relation order (class 10); the API-GC cursor
+(class 13); then lineage,
+action selectors, shadow terminal history, shadow admission-fallback history,
+shadow admission-fallback-progress history, and shadow settlement history in canonical relation order
+(class 17). It never appends an earlier-class new relation after the 038 prefix.
+Under the retained schedule it re-
+audits, performs owner-triple ALTER/CHECK/index, adds/backfills the shadow-parent
+route plus fallback-evidence pair under the temporary
+`LEGACY_CONTROLLER` server default and exact CHECK/NOT-NULL program, replaces
+the child execution-kind CHECK, creates process, FK-free GC cursor, lineage, selector, shadow
+execution history, shadow terminal history, then FK-free shadow admission-
+fallback history, FK-free shadow admission-fallback-progress history, and
+FK-free shadow settlement history with its source-parent and reverse-target
+partial unique indexes as applicable, post-reflects,
+and stamps. It
+holds the schedule throughout. The process table has only its cohort FK and the
+migration performs no API-lineage DDL; API008 remains an independent runtime
+gate. Activation/old-image rollback uses the same timeout-bounded full-table
+audit. Lock timeout is
+fully transactional. An exact complete 039 catalog at an old stamp adopts only
+when all nine new relations are empty and every lease owner/hash/scalar is null;
+the parent columns/CHECK/default must be exact and every retained parent must be
+ordinary `LEGACY_CONTROLLER` with its complete fallback triple null. Nonempty
+or incompatible partial state fails. The controlled full-table private-
+handler audit remains exclusively in the independent runtime activation/rollback
+gate; migration and stamp adoption never query API-lineage state. Bidirectional
+038-writer/DDL lock-order tests are mandatory.
+
+Stacked M5a PR #1240 also ships the dormant PostgreSQL-only Serve040 revision
+and one 039/040-aware image; it does not mutate the 039 catalog during the
+rollback matrix. After every active authoritative service has rotated at 039
+to the exact one-set `ROLLBACK_EVIDENCE_CLOSURE` policy, the database has zero
+bound action/private-shadow work and zero services in shadow, and all roles /
+cohorts attest that M5a image, the server-owned target gate may run 040. The
+gated target call alone registers the typed one-shot Serve040
+`on_version_apply` callback through `safe_alembic_upgrade()` and online
+`env.py`; the private registration binds a server-minted operation ID plus the
+exact `serve_db` 039 -> 040 step, and the revision rejects a missing, direct,
+offline, wrong-step, or duplicate registration before mutation. The migration
+takes the advisory lock, discovers and locks every controller-owner /
+service fence in canonical class-1/2 order, takes class-2 policy-table `ACCESS
+EXCLUSIVE`, locks every active closure-policy row/freezes its successor key, then takes
+class-9 shadow-parent `ACCESS EXCLUSIVE`; revalidates that whole gate; exact-
+reflects default-bearing 039; drops only the `execution_route` server default;
+post-reflects the otherwise identical catalog; and leaves a closed one-shot
+handoff in the current `MigrationContext` while retaining every lock. After the
+revision function returns, Alembic's `HeadMaintainer` advances 039 -> 040; the
+registered callback then runs before outer commit on that identical connection
+and transaction. It requires the exact step/heads/handoff, re-reads actual
+`008/040/028`, recomputes the post-catalog hash, and revalidates the locked
+service/predecessor inventory. For each service in canonical order it constructs
+its distinct closure-predecessor-bound catalog proof, supersedes the prelocked
+closure row, and inserts/exact-adopts the closed one-set head-040
+`SCHEMA_HEAD_ADVANCE` successor. It consumes the handoff and revalidates the
+whole successor set without committing or releasing a lock; the outer Alembic
+transaction commits the DDL, version row, and policies together only after
+`env.py`, still inside `context.begin_transaction()`, asserts that the exact
+registration ran once and the handoff was consumed. Updating the
+predecessor before inserting the successor preserves
+the one-ACTIVE/service unique constraint. No backward lock is acquired because every class-2 table/
+row lock precedes class 9. Failure leaves complete 039 unchanged; an unknown
+commit adopts only complete 040 plus the full closed successor set, and no
+committed physical/policy-head mismatch is legal. The M5a image re-attests
+every process/cohort at actual 040 and reopens only under
+exact policy/physical-head equality. It never downgrades, re-adds the default,
+changes a route value, or admits M4 after rollback closure. Tests cover both
+the initial #1240 Serve039/default-present catalog and the final
+Serve040/default-absent catalog, every migration/writer lock direction, failure
+on each side of DDL/stamp/policy activation, and forward-only recovery.
+
+One shared `serve038_worker_state_check_constraints()` SQLAlchemy factory owns
+the physical worker-table constraints in fresh metadata and migration DDL; the
+catalog inspector compares every named normalized expression. Its exact
+families are:
+
+- `serve038_worker_lease_closed_shape_ck`: closed state/counter/operation/owner,
+  60-second TTL, revoke-time, ID equality, renewal-registration JSON-object and
+  at-most-65,536-byte stored rendering, and lowercase-hash shape;
+- `serve038_worker_handoff_scalar_lineage_ck`: closed enums, positive/equal
+  source revisions, worker/Pod equalities and identity distinctness,
+  `opened_at=fenced_at`, and disposition/predecessor/sequence shape;
+- `serve038_worker_handoff_pairing_state_ck`: every JSON/hash pair, root/array
+  type, DTO-specific stored-size bound, lowercase hash, and exact OPEN/READY/
+  COMPLETED/two-ABANDONED revision/nullability shapes;
+- `serve038_worker_handoff_terminal_revision_ck`: final/embedded/committed
+  source+1 relations, final snapshot pairing, conditional survivor absence, and
+  terminal/ack timestamp nullability; and
+- `serve038_worker_cold_required_json_ck` plus
+  `serve038_worker_cold_revision_shape_ck`: source enum, positive/equal source
+  revisions, required JSON/hash/root/size shapes, exact-two absence/fence/final-
+  worker arrays, and final/embedded/committed source+1 relations.
+
+Serve039 does not rewrite the shipped Serve038 factory. Its migration replaces
+only the lease operation CHECK with named
+`serve039_worker_lease_execution_owner_ck`, preserving every old clause while
+adding triple-null bounded JSON/hash/scalar owner columns and the two V2
+operation kinds. The scalar must equal the decoded owner's API instance ID and
+has a partial unique index. Null owner remains legal only for retained pre-039 history and the short
+zero-private-row binding gate; every live V2 accepted/candidate lease requires
+the exact nonnull V2 owner. Typed transitions require `BIND` only from null and
+`SUPERSEDE` only with the matching immutable supersession row; ordinary
+`RENEW`/`REVOKE` preserve the owner/hash/normalized-process-scalar triple.
+Fresh/upgrade catalog tests compare the
+normalized replacement expression and prove the Serve038 downgrade is refused.
+The separately named replacement shadow-child CHECK admits exactly
+`api_request | legacy_direct_down | private_api_request`; the private value
+requires `PRIMARY_LAUNCH | PRIMARY_DOWN`, `REQUEST_BOUND | COMPLETE`, and a
+nonnull request ID/bind time, while `LAUNCH_CLEANUP_DOWN` rejects it. The
+execution-history FK and typed writer/reader enforce the cross-table one-to-one
+existence rule: exactly one history for a private child and none for either
+legacy execution kind.
+The separate named `serve039_worker_process_supersession_ck` owns the process
+row's positive/equal source counters, exact committed-source-plus-one
+relations, distinct process IDs, JSON root and at-most-16 list shape, lowercase
+hash shapes, and stored-rendering byte ceilings. Typed validation additionally
+requires both owner objects, their scalar IDs, the stable lease/Pod ID, the
+container proof, every receipt, and the one completion timestamp to cross-bind;
+the locked stable-lease transition rejects a candidate API UUID already present
+in either process-ID column, except exact adoption of this operation.
+
+Every JSON predicate uses a two-valued `CASE`/`IS TRUE`, so missing, wrong-type,
+or JSON-null data fails instead of passing CHECK through SQL NULL. SQL owns all
+row-local shapes; typed codecs additionally recompute canonical hashes and byte
+bounds, align nested workers/proofs, and validate cross-row lease/handoff/cohort
+relations under locks.
+
+All typed JSON values and their hashes are byte-checked on every transition;
+the source, candidate identity/registration, and stale-UID proof are immutable
+from insert, while candidate/survivor terminal absence evidence is immutable
+after its one write.
+Lease insert is exactly generation/revision one. An `ACTIVE` lease has a hash-
+valid fresh self-read V2 renewal registration, null revocation fields,
+`renewal_registration.registered_at == renewed_at`,
+`renewal_registration.worker.observed_at <= renewed_at`, and
+`expires_at == renewed_at + 60 seconds`. A normal renewal uses
+`GREATEST(clock_timestamp(), source.renewed_at,
+new_renewal_registration.worker.observed_at)` and renews every 20 seconds by CAS from its exact
+generation/revision, advancing both by exactly one and replacing only the
+registration/hash and times while preserving the execution-owner/hash/
+normalized-process-scalar triple; neither
+constant is configurable. Only the retained bind/process-supersession programs
+change that owner and advance both counters once under their distinct operation
+kind. Revocation
+preserves generation, registration/hash and renewal/expiry times, advances
+revision by exactly one, and writes database `revoked_at >= renewed_at` plus one
+closed reason. `STALE_HANDOFF | CANDIDATE_ABANDONED` requires the exact handoff
+ID as `revocation_owner_id`, `COHORT_COLD_RECOVERY` requires the recovery ID,
+and `COHORT_REMOVAL` requires a null `revocation_owner_id`; all revocations
+preserve the separate execution-owner/hash/normalized-process-scalar triple
+byte-for-byte. `REVOKED` is
+terminal and cannot renew.
+Every joined handoff, cold-recovery, abandonment, or lifecycle transaction that
+inserts, renews, or revokes a lease computes its single operation timestamp as
+the `GREATEST` of PostgreSQL time, affected prior lease renewal times, every new
+or renewed registration worker observation, prior cohort state time when that
+state changes, every affected private-request terminal lower bound when requests
+terminalize, and owner/proof/API start-observation terms when ownership changes.
+Where global lock order requires immutable
+class-4 handoff or class-3 cold-recovery evidence to be inserted before class-5
+lease locks, the lease terms
+come from complete nonlocking snapshots and the later class-5 suffix requires
+each snapshot plus proposed registration/request byte, generation, revision,
+and timestamp term to remain exact; drift rolls the
+uncommitted evidence back. All rows written by that operation reuse the same
+value. A backward wall-clock step therefore cannot violate
+`revoked_at >= renewed_at`, including two-member cold recovery and cohort
+removal.
+The closed SQL and typed row invariant is: `ACTIVE` means
+`revision == generation`, null revocation fields, and `INSERT` exactly at
+generation one or one of the V2-legal `RENEW | BIND_EXECUTION_OWNER |
+SUPERSEDE_EXECUTION_OWNER` operations thereafter; `REVOKED` means
+`revision == generation + 1`, `REVOKE`, a nonnull revoke time/reason, and the
+reason-specific owner shape above. Every malformed combination is rejected on
+write and on typed read rather than normalized. `STALE_HANDOFF |
+CANDIDATE_ABANDONED` owner IDs resolve to exact same-cohort immutable handoffs;
+`COHORT_COLD_RECOVERY` owner IDs resolve to exact same-cohort immutable cold-
+recovery rows. Neither owner row may be deleted while a lease names it. An unknown insert, renewal, or revocation result adopts only exact expected
+`last_operation_id/kind`, state, generation, revision, registration/hash,
+execution-owner/hash/normalized-process-scalar triple,
+revocation fields, and server-timestamp relationships. The caller mints the
+operation UUID before its first attempt and reuses it; it never guesses
+`clock_timestamp()`. A later valid renewal may supersede an unknown renewal but
+is reported as supersession rather than false adoption; insertion is then
+proved by ancestry, while revocation is terminal. The stale-fence transaction
+revokes the stale lease; valid abandonment revokes the candidate lease. Lease
+existence or freshness without accepted set membership grants nothing.
+The source registration-set revision equals its embedded revision and
+`source_cohort_revision`; `source_cohort_state` equals the locked
+`ACCEPTING | DRAINING` cohort state, and neither lifecycle state nor revision
+may change while the handoff is `OPEN | READY`. Its workers are
+exactly the named stale and survivor stable instances. Every authority worker
+instance ID is byte-equal to its canonical Pod UID; its distinct currently
+accepted process API-instance ID comes only from the exact lease execution
+owner. Handoff/cold recovery lock those current process API rows and enumerate
+claims by their IDs; they never treat the stable Pod UUID as a request owner. The
+candidate is not either source member, the absence proof's
+namespace/name/stale UID equal the stale registration, and the candidate and
+survivor evidence equal their named IDs and UIDs. The stale-authority fence
+contains the preserved lease generation, prior ACTIVE revision, and post-revoke
+revision equal to prior + one, plus every locked live claim in request-ID order;
+for `NEWLY_REVOKED` the lease records `STALE_HANDOFF`, this handoff ID, and
+`revoked_at=fenced_at`, while the fence's origin ID is also this handoff. An
+adopting handoff copies that fence byte-for-byte and the immutable lease retains
+`revocation_owner_id == origin_revoking_handoff_id`, which resolves to the root
+handoff. The new `predecessor_handoff_id` names the immediate chain tip and
+equals the origin only at sequence two. Validation is O(1): exact-read the immediate
+predecessor and directly read the same-cohort root named by the copied origin,
+compare source/fence/sequence invariants, and rely on unique predecessor/
+sequence induction; never walk an unbounded ancestor chain. For `NEWLY_REVOKED`, handoff `fenced_at` equals the
+embedded fence time and lease `revoked_at`. For an adopting handoff the embedded
+origin time stays old, while its new `opened_at=fenced_at` uses one fresh
+database time only as evidence metadata. Raw wall-clock values may repeat or
+regress and never order a chain; `chain_sequence` and state CASes define
+causality.
+`NEWLY_REVOKED` uses `ProviderAuthorityWorkerStaleAuthorityFenceV2` and changes
+every listed request/queue claim to a terminal `CANCELLED` request under
+`stale_authority_fence.fenced_at`; it never requeues a `ReplayPolicy.NEVER`
+request. The transaction reconstructs each exact selector, stores its canonical
+hash in the fence entry, clears the complete claim, deletes the delivery, and
+later requires the selector row to hash byte-equal. The adopting branch makes
+no second request mutation and instead validates that immutable terminal fence
+plus zero current stale claims. In either branch no unlisted claim remains
+owned by that instance. The reducer later settles each old attempt and alone
+may create attempt `n+1`. A completed final set contains
+exactly the two current ACTIVE lease renewal registrations in canonical order.
+Each is ID-equal and stable-projection-equal to its immutable post-fence
+survivor or candidate anchor; resourceVersions, `observed_at`, and
+`registered_at` may advance only through the validated lease renewal contract.
+The final set's embedded
+revision equals `final_registration_set_revision`, and its hash equals the
+stored final hash. `final_registration_set_revision ==
+committed_cohort_revision == source_registration_set_revision + 1 ==
+source_cohort_revision + 1`. Its snapshot is byte-equal to the separately
+hashed final snapshot, and completion preserves `source_cohort_state`.
+The OPEN insert has `opened_at == fenced_at`; later transition timestamps are
+diagnostic metadata and need not compare monotonically across transactions.
+The `OPEN -> READY -> COMPLETED` revision/state CASes, exact handoff ID/sequence
+in the acknowledgement, and fresh bounded evidence establish causality.
+Abandonment has null survivor time only when it leaves `OPEN`.
+At `OPEN`, candidate registration/hash are byte-equal to the initial candidate
+lease renewal-registration/hash; registration `registered_at`, lease
+`renewed_at`, and row `opened_at=fenced_at` use the same database time, and the
+lease is generation/revision one with `last_operation_kind=INSERT`. Candidate
+abandonment revokes that lease with `CANDIDATE_ABANDONED`, this handoff ID,
+`last_operation_kind=REVOKE`, and `lease.revoked_at == handoff.terminal_at`.
+Lost-ack adoption verifies every immutable handoff equality plus the candidate
+API row's exact bound phase, immutable boot/stable identity, and owner hash. It
+accepts the candidate lease either at that exact generation/revision-one insert
+(including the caller's operation ID) or as a valid same-stable-identity ACTIVE
+descendant through only legal renewal/process-supersession transitions.
+Bootstrap plus unchanged source proves an uncommitted attempt; partial bound /
+lease/handoff evidence blocks. A terminally superseded handoff is reported as
+such.
+The only nonterminal enrichment is the one write-once survivor registration on
+`OPEN -> READY`. `COMPLETED` requires all final fields, a byte-equal final
+snapshot, and null abandonment fields; `OPEN -> ABANDONED` is exactly revision
+two and `READY -> ABANDONED` exactly revision three and requires null final fields,
+write-once candidate absence/zero-effect pairs, and a nonnull reason. The
+survivor absence pair is nonnull exactly for
+`both_members_lost_cold_recovery_required` and is an exact UID-qualified proof;
+lease expiry or health state is insufficient. No other state
+edge exists. Handoff rows are retained with registration history and cannot be
+garbage-collected while a registration-lease owner, successor self-FK, cold-
+recovery preserved owner, action, attempt, request, cohort reference, policy
+epoch, or rollout evidence row can name them, their cohort, or their worker
+instances. Every such owner ID must resolve by typed read to the exact same-
+cohort handoff; the JSON cold-fence owner cannot bypass origin retention.
+
+`NEWLY_REVOKED` requires null predecessor and `chain_sequence=1`. A chained
+`ADOPTED_ABANDONED_PREDECESSOR` requires its nonnull predecessor to be the exact
+immediately prior terminal same-cohort `NEWLY_REVOKED |
+ADOPTED_ABANDONED_PREDECESSOR` handoff with reason
+`candidate_absent_zero_effect`, an
+identical source set, stale identity, stale-UID absence proof, and stale-
+authority fence. The stale lease retains the recorded generation and exact
+post-revoke revision, a locked scan finds zero current stale claims, the accepted survivor
+and both its registration and API server-instance leases remain fresh, and the
+new candidate is distinct. The new row has
+`chain_sequence == predecessor.chain_sequence + 1`; under the cohort lock, the
+typed writer requires that predecessor to be the greatest-sequence unadopted
+terminal tip for the retained source/fence. The partial unique predecessor
+index rejects a second adopter or an older-row branch, and the scoped
+source-revision/sequence unique key rejects duplicate roots or positions. A predecessor with survivor absence, nonzero or
+unknown candidate effect, changed membership, or any unequal fence cannot be
+adopted. Chaining may repeat while the same survivor remains fresh; the
+immediate self-FK, immutable insert, unique predecessor, and consecutive
+positive sequence prohibit dangling, branching, cross-cohort, or cyclic
+provenance without depending on wall-clock ordering. Full-set cold recovery is
+reserved for exact absence of both accepted members.
+
+The exact replacement sequence is:
+
+1. `maxSurge=0,maxUnavailable=1` removes one old Pod and starts one candidate.
+   The candidate serves `/livez` and `/bootstrapz` and becomes Kubernetes-ready
+   on `/bootstrapz`, but keeps application `/readyz=false`, advertises no
+   claimant, rejects action preflight, and cannot acquire an API request. It
+   self-attests and submits only its own fresh V2 identity; before `OPEN` there
+   is no candidate registration lease to orphan or renew.
+2. The surviving API-role handoff verifier independently exact-GETs the stale
+   Pod name and obtains one of the two proofs above; candidate-supplied absence
+   is not trusted. `deletionTimestamp`, a terminating Pod, an expired lease, or
+   a name-only observation is not absence. Exact HTTP NotFound or the same name
+   with a different current UID is required. Nonlocking discovery also reads the
+   bounded stale request-then-queue inventory and current lease snapshots needed
+   for an optimistic closed fence.
+
+   The PostgreSQL transaction validates the proof, locks the cohort/source V2
+   set, and requires membership exactly stale plus survivor. From the complete
+   discovered stale/survivor lease snapshots it computes the proposed logical
+   operation time as `GREATEST(clock_timestamp(), stale.renewed_at,
+   survivor.renewed_at,
+   candidate_registration.worker.observed_at,
+   candidate_execution_owner.container_started_at,
+   candidate_execution_owner.observed_at, candidate_api_instance.started_at,
+   <every discovered private_request_terminal_lower_bound>)`, omitting the last
+   term for an empty inventory. For adoption it
+   exact-reads and validates the immutable terminal predecessor/root before any
+   later-class lock. With one database time it first inserts the complete
+   `OPEN` handoff at class 4. It then visits stale, survivor, and absent candidate
+   registration-lease keys in canonical order at class 5: locks both accepted
+   rows, requires each locked row to remain byte-, generation-, and revision-
+   equal to its discovered snapshot, requires the survivor ACTIVE and fresh,
+   rechecks the candidate key
+   absent before inserting its generation/revision-one lease, and requires the
+   stale row ACTIVE for `NEWLY_REVOKED` or exact terminal `STALE_HANDOFF` for
+   adoption. The new branch stages the stale revocation; adoption preserves it.
+
+   Only then does it lock the stale lease's prior execution-owner API row, the
+   survivor lease's current execution-owner API row, and the candidate's
+   process-unique bootstrap API row in UUID order and require the survivor and
+   candidate rows fresh. It revalidates the candidate's immutable boot/stable
+   identity and stages bootstrap-to-bound with the inserted lease's exact owner
+   hash in the same transaction; no commit can expose the candidate lease with a
+   bootstrap/null-hash API row. It then locks all discovered request rows in
+   request-ID order and only then all
+   corresponding queue rows in request-ID order. It reruns the
+   bounded stale inventory under those locks, requires exact equality/no
+   unlisted claim, and invokes the one borrowed batch core. That core
+   terminalizes all locked requests `CANCELLED`, deletes all locked queues,
+   key-share-locks every named action lineage in canonical lineage-key order,
+   inserts/exact-adopts action selectors in `(action_id, attempt)` order,
+   inserts/exact-adopts shadow terminal histories in
+   `(decision_id, request_sequence)` order, and only then allocates terminal
+   events in request-ID order. An action arm with lineage uses
+   `REQUEST_CANCELLED/LINEAGE`; an action arm without lineage uses
+   `TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START`; a shadow arm writes
+   exact `REQUEST_CANCELLED/SHADOW_EXECUTION` for an `AUTHORIZED` history or
+   `TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START` for `BOUND`, with the
+   corresponding nonnull/null lineage hash. The batch uses only the trusted
+   `STALE_OWNER_FENCE` mode, never creates missing lineage, never calls the
+   scalar terminalizer, and never requeues the old request. Any drift,
+   including generic terminalization that does not hold the cohort lock, rolls
+   back the earlier uncommitted handoff/lease/revocation; no earlier lock class
+   is acquired after this suffix and no Kubernetes/provider I/O occurs under
+   SQL locks. Immediately before commit, fresh PostgreSQL time must still be
+   before survivor/candidate registration and API lease expiries, with every
+   registration/Kubernetes proof inside its fixed bound; a wait past TTL rolls
+   back. A lost result adopts
+   the exact immutable handoff, the candidate API row's exact bound phase/boot /
+   stable identity/owner hash, plus the candidate lease either at its exact
+   generation/revision-one insert (including the caller's operation ID) or as a
+   valid same-stable-identity ACTIVE descendant through only legal renewal/
+   process-supersession transitions. Bootstrap plus unchanged source is an
+   uncommitted attempt and permits a full retry; partial or unequal joined
+   evidence blocks. A terminally
+   superseded handoff is reported as such, not falsely adopted as `OPEN`. After commit, only that unique handoff
+   candidate may renew; the lease still grants no claim or effect. No Kubernetes
+   or provider I/O occurs while those SQL locks are held.
+3. Nonlocking claim discovery grants nothing. The authority-claim transaction
+   first locks the exact cohort and its nonterminal handoff, then the claimant
+   registration lease, its normalized current execution-owner API row, request,
+   and queue rows in the
+   global order; opening a handoff takes the same prefix. This prevents a
+   statement snapshot taken before `OPEN` from
+   claiming after the fence. The claim query requires the claimant's stable
+   authority-worker/Pod UUID to be in the currently accepted V2 set, that
+   stable lease's execution owner to equal the caller's process API-instance
+   UUID, both leases to be fresh against PostgreSQL `clock_timestamp()`, and
+   that stable member not be the stale member of
+   an `OPEN` or `READY` handoff. Therefore the fenced stale Pod and the
+   not-yet-member candidate cannot claim; the accepted survivor may continue.
+   `OPEN | READY` also rejects every new `PREPARING` cohort reference while
+   already-bound work remains recoverable.
+   The same predicates are rechecked when an existing claim renews and before
+   every handler effect.
+4. After exact-reading `(handoff_id, chain_sequence, revision=1, state=OPEN)`,
+   the survivor independently rereads its complete live Pod -> ReplicaSet ->
+   Deployment chain and compares the exact handoff source. One
+   transaction locks cohort -> handoff -> survivor lease -> that lease's
+   normalized current execution-owner API row. The acknowledging caller process
+   UUID must equal the owner JSON/scalar; the row's stable Pod/start identity and
+   freshness are revalidated. It renews the lease from the fresh V2 registration
+   with one acknowledgement time equal to
+   `GREATEST(clock_timestamp(), source_lease.renewed_at,
+   fresh_registration.worker.observed_at)` while preserving the owner triple,
+   writes the exact same registration/hash once as
+   the survivor acknowledgement, and changes `OPEN -> READY` by CAS. The candidate cannot fabricate or
+   proxy the survivor acknowledgement. The acknowledgement names that exact
+   handoff ID/sequence; the state CAS and bounded fresh proof establish causal
+   order without comparing wall clocks. If the survivor is absent or cannot
+   attest after observing OPEN, this cohort cannot complete the handoff.
+5. Only after observing exact `READY` does the candidate read the final
+   Deployment snapshot. It must be the same frozen Deployment/template and
+   report generation equal to observed generation, exactly two desired,
+   updated, ready, and available Pods, and zero unavailable Pods. A final
+   PostgreSQL transaction relocks the cohort, registration set, handoff, both
+   registration leases, both current execution-owner API server-instance rows
+   in process-UUID order, and a zero-current-stale-claim inventory in the
+   global order; revalidates every retained terminal receipt named by the stale
+   fence, the zero-claim result, fresh
+   survivor/candidate leases, exact two-Pod owner chains, and absence proof;
+   constructs the two final registrations from the exact current lease renewal
+   registration bytes after stable-projection equality with the immutable
+   handoff anchors;
+   atomically replaces only the stale membership with the candidate, advances
+   the cohort and V2 set revisions and sole set-level Deployment snapshot, and
+   changes the handoff to `COMPLETED` with the byte-equal separately hashed
+   final set and snapshot. It does not repeat the OPEN transaction's request
+   mutations or recreate deleted queues. Immediately before
+   commit, fresh PostgreSQL time must still precede both registration/API lease
+   expiries and keep every Pod/Deployment/absence proof within its fixed bound;
+   drift or a wait past TTL rolls back and retries.
+6. The candidate exact-reads/adopts `COMPLETED`, eagerly warms every fixed child,
+   then performs a bound-to-ready CAS that locks cohort -> any nonterminal
+   handoff -> its accepted stable lease -> the lease's normalized current-owner
+   API row. It requires caller process UUID == owner JSON/scalar, exact bound
+   phase with `health_detail.execution_owner_sha256 ==
+   lease.execution_owner_sha256`, stable Pod/start identity and freshness, and
+   the stable candidate still in the matching accepted V2 set. Only that CAS or
+   exact same-process adoption enables `/readyz`, preflight, and claims; a
+   superseded process fails after warming. A lost acknowledgement at any
+   CAS is recovered by exact `(cohort_id, handoff_id, revision, state, hashes)`
+   readback; it is never repaired by replaying an insert or membership rewrite.
+7. `OPEN` or `READY` may become `ABANDONED` only after the API verifier obtains
+   an exact candidate-UID absence proof outside SQL. The no-I/O transaction
+   locks cohort -> nonterminal handoff -> candidate registration lease, then
+   the row named by that lease's normalized current execution owner, requiring
+   owner JSON/scalar/API stable-Pod/start equality, then all candidate request rows in request-ID
+   order, and then all corresponding queue rows in request-ID order if present. Every
+   legal candidate claim, attempt, progress, provider-operation, and effect
+   writer first needs that held prefix, so fail-closed scans of those later
+   classes construct the closed zero-effect proof under the locks. Using one
+   PostgreSQL timestamp, the CAS sets
+   `candidate_zero_effect_proof.observed_at == handoff.terminal_at ==
+   candidate_lease.revoked_at`, records `last_operation_kind=REVOKE`, writes both
+   immutable proof/hash pairs, and terminally revokes the lease while changing
+   the handoff to `ABANDONED`. An unknown result exact-reads this joined terminal
+   evidence; no earlier zero-effect scan is replayable. The
+   candidate may be deliberately terminated first, but a merely unhealthy or
+   terminating candidate is insufficient. Once completed, its loss is a new
+   replacement, never abandonment of the old handoff.
+8. Loss of both previously accepted members before `COMPLETED` has no survivor
+   acknowledgement path. The API verifier pre-reads exact UID-qualified
+   survivor and candidate absence proofs, then the same locked transaction and
+   database-time join constructs the candidate zero-effect proof and the handoff is
+   retained as `ABANDONED` with
+   `both_members_lost_cold_recovery_required`; recovery then uses the full-set
+   same-cohort protocol below. Candidate self-attestation alone never
+   reconstructs the old cohort's accepted membership.
+9. Full-set cold recovery applies only to the same immutable cohort in
+   `ACCEPTING | DRAINING` with exactly two V2 members and no `OPEN | READY`
+   handoff. Any interrupted single-member handoff must first complete or reach
+   its exact terminal `ABANDONED` proof. Two replacement Pods remain
+   bootstrap-only and submit distinct fresh identities but have no registration
+   leases or claims. The surviving API verifier independently proves exact UID-
+   qualified absence of both accepted Pods, exact owner chains for both
+   candidates, and an unchanged Deployment UID/generation/template/image/
+   ServiceAccount with one fresh two-ready/two-available snapshot. Both
+   candidate API-instance rows are fresh bootstrap rows at transaction entry and
+   remain fresh through the atomic bound-phase commit.
+10. Nonlocking discovery first reads both complete old lease snapshots and the bounded
+    old request-then-queue inventories. One PostgreSQL transaction locks the
+    cohort and empty nonterminal-handoff slot. It computes the proposed logical
+    operation time as `GREATEST(clock_timestamp(), old_lease_1.renewed_at,
+    old_lease_2.renewed_at,
+    candidate_1_registration.worker.observed_at,
+    candidate_2_registration.worker.observed_at,
+    <both candidate execution-owner container start/observation and API start terms>,
+    <every discovered private_request_terminal_lower_bound>)`, omitting the
+    request term for an empty inventory. With that one database timestamp it
+    fully constructs and inserts the immutable recovery row—source/proofs,
+    optimistic fences, two candidate registrations, final set/snapshot, and
+    terminal revisions—before any later-class lock. It then visits all old and
+    absent candidate lease keys in canonical order at class 5, locks each old
+    row, requires its bytes, generation, and revision to equal the discovered
+    snapshot, and rechecks each candidate key absent before inserting both generation/
+    revision-one ACTIVE leases, and stages each legal old transition. For an
+    ACTIVE old lease its cold-recovery fence records the prior revision and
+    revokes the lease at exactly revision + 1 with `COHORT_COLD_RECOVERY` and
+    this recovery ID. An already-
+    REVOKED old member is admissible only when its exact retained
+    `STALE_HANDOFF` owner/fence proves the same member; its terminal lease bytes
+    are preserved and its cold fence requires zero current claims. Any other
+    prior state or uncertain evidence rejects.
+    For ACTIVE, preserved-revocation fields are null, terminal lease revision is
+    prior + 1, the claim list exhaustively covers request and queue mutations,
+    and `fence.fenced_at == lease.revoked_at == recovery.completed_at`; the
+    lease records `COHORT_COLD_RECOVERY`, this recovery ID, and
+    `last_operation_kind=REVOKE`. For already REVOKED, terminal revision equals
+    prior, preserved reason/owner equal the exact `STALE_HANDOFF` origin, all
+    lease bytes/timestamps remain unchanged, claims are empty, and `fenced_at ==
+    recovery.completed_at` is a fresh audit time rather than a second revoke.
+11. Only after the evidence row and every class-5 change are staged does that
+    transaction lock the two old leases' execution-owner API rows and the two
+    candidate bootstrap API rows in UUID order, require both candidate rows
+    fresh, revalidate both immutable boot/stable identities, and stage each
+    bootstrap-to-bound transition with its inserted lease's exact owner hash.
+    No commit can expose either candidate lease with a bootstrap/null-hash API
+    row. It then locks every
+    discovered old request row in request-ID order and only then every
+    corresponding queue row in request-ID order. It reruns both bounded
+    inventories and requires exact equality/no unlisted claim. A dedicated
+    borrowed batch-terminalization core updates every request and deletes every
+    queue, key-share-locks all named action lineages in canonical lineage-key
+    order, inserts/exact-adopts all action selectors in canonical
+    `(action_id, attempt)` order, inserts/exact-adopts all shadow terminal
+    histories in `(decision_id, request_sequence)` order, and only after the
+    entire class-17 set is valid allocates/emits all class-18 operational events
+    in request-ID order. The batch uses only `COLD_RECOVERY_FENCE`, maps action
+    arms with/without lineage to `REQUEST_CANCELLED/LINEAGE` or
+    `TERMINAL_BEFORE_CLAIM_START/NO_SUCCESSFUL_CLAIM_START`, writes exact
+    `REQUEST_CANCELLED` histories for shadow arms, never creates missing
+    lineage, and never loops through the scalar terminalizer. It applies the V2
+    terminal-cancelled fences atomically. Drift—including generic request terminalization that does not
+    hold the cohort lock—rolls back every earlier uncommitted insert/update.
+    Immediately before commit, fresh PostgreSQL time must still precede both
+    candidate registration/API lease expiries and every candidate/absence/
+    snapshot proof must remain in its fixed bound; a wait past TTL rolls back.
+    It then updates the already-locked cohort/final V2 set by exactly one
+    revision without changing lifecycle state and commits membership, claims,
+    leases, and evidence atomically; no earlier class is acquired after the
+    suffix. Each candidate registration `registered_at`, lease
+    `renewed_at`, and recovery `completed_at` is that time, and each lease has
+    `last_operation_kind=INSERT`. The final set is exactly the two candidates;
+    old action specs, attempt identity/payload/progress, request payloads, and
+    cohort references are unchanged, while each old request becomes terminal,
+    its claim is cleared, its queue row is deleted, and its selector is appended
+    exactly as fenced. Old attempts become reducer-eligible; only their later
+    `n+1` requests can be claimed by the new members. No cross-cohort transfer,
+    same-request requeue, or legacy route is created.
+12. A lost result adopts only the exact `(cohort_id, recovery_id,
+    source_revision, committed_revision, evidence hashes)` row plus matching
+    cohort/final-set evidence, each candidate API row's exact bound phase/boot /
+    stable identity/owner hash, and each candidate lease either at the recorded
+    generation/revision-one insert or as a valid same-stable-identity ACTIVE
+    descendant through only legal renewal/process-supersession transitions.
+    Bootstrap rows plus unchanged source prove an uncommitted attempt and permit
+    a full retry; partial or unequal joined evidence blocks. A
+    later membership change is reported as
+    supersession, never repaired by replay. Candidates enable `/readyz` and claims only after that
+    exact read. Candidate loss before commit writes nothing; loss after commit
+    is a new ordinary replacement or cold recovery. If the immutable Deployment
+    UID/template no longer exists, cold recovery rejects. The chart must retain
+    it while bound work exists; only a zero-bound-work retirement may create a
+    new cohort.
+
+The cold row's source cohort, set, and embedded-set revisions are equal. Its two
+canonical source workers align one-for-one with the sorted UID-absence proofs
+and cold fences; crossed worker/proof arrays reject. The final cohort/set/
+embedded revisions all equal source + 1, and the final set is exactly the two
+candidate lease registrations plus the separately byte-equal hashed snapshot.
+
+Cold-recovery rows are immutable evidence inserted only while the exact cohort
+row is locked; they are never independently row-locked and add no late lock
+class after request/queue rows. Their unique source-revision key plus the cohort
+CAS serializes insert/adoption. They are permanent membership history while any
+registration lease owner, action, attempt, request, reference, policy, rollout
+evidence, or registration history can name the recovery, cohort, or an old/new
+worker instance.
+
+```text
+
 ProviderAuthorityWorkerAttemptAttestationV1 = {
   request_id: UUID,
   request_execution_generation: PositiveInteger,
@@ -4498,6 +10481,18 @@ ProviderAuthorityWorkerAttemptAttestationV1 = {
   before: ProviderAuthorityWorkerIdentityV1,
   after: null | ProviderAuthorityWorkerIdentityV1
 }
+
+In every Serve039/V2 use, `request_worker_id` remains the frozen V1 text field
+but must be the one canonical lowercase hyphenated UUID rendering. Its parsed
+UUID must equal the locked request and claimed queue `worker_instance_id`, the
+lineage and terminal-selector process owner, the accepted lease's
+`execution_owner_api_instance_id` and embedded `api_instance_id`, and the locked
+API-instance row. This equation is rechecked at claim-start, every progress
+checkpoint, immediately before every provider I/O, after each effect, and on
+handler return. Separately, the stable projection of both `before` and nonnull
+`after` equals the lease/registration `authority_worker_instance_id == pod_uid`.
+The process UUID is never compared to or substituted for that stable Pod UUID;
+a prior process after same-Pod supersession cannot attest for the successor.
 
 ProviderKubernetesRequestIdentityV1 = {
   cleaned_user: Text,
@@ -5128,8 +11123,10 @@ The eligible runtime consumes the explicit object rather than consulting that
 inventory as a source of defaults. Controller preparation and the executor
 immediately before mutation both recalculate the inventory/template/callable
 fingerprints and require the approved cohort deployment UID,
-service-account UID, and image digest. Each execution additionally records its
-typed `ProviderAuthorityWorkerAttemptAttestationV1`. Using downward-API
+service-account UID, and image digest. Each Serve038 execution records the
+byte-frozen `ProviderAuthorityWorkerAttemptAttestationV1` as execution-local
+before/after provenance and separately requires current V2 membership. Using
+downward-API
 name/namespace/UID, it exact-reads its Pod, requires its sole controller owner
 to be the byte-equal typed ReplicaSet, then requires that ReplicaSet's sole
 controller owner to be the byte-equal frozen Deployment. Pod,
@@ -5140,20 +11137,29 @@ qualification must map the OCI manifest to the expected OCI config digest; a
 CRI `imageID` is never blindly equated with a manifest digest. The handler
 requires `worker_identity.image.qualification` to be byte-equal to the frozen
 cohort manifest's image, and requires its runtime identity to map back through
-that same artifact. The handler claim-fenced-writes `claimed_cursor_sha256` and `before`
-after claim and before the first mutating external effect. Immediately before
+that same artifact. The stable instance ID derived from its V1 identity and its
+stable identity projection must equal the V2 registration joined by the request
+claim, while canonical `request_worker_id` equals the exact-current request/
+queue/lineage/lease/API process-owner chain. That registration's separate lease
+and current owner API row must still be fresh. The handler
+claim-fenced-writes `claimed_cursor_sha256` and `before` after claim and before
+the first mutating external effect. Immediately before
 every CoreV1 or Skylet effect it
 re-reads the full Pod -> ReplicaSet -> Deployment chain and requires every
 identity field except the fresh `observed_at` to be byte-equal to `before`.
 Immediately after every effect it re-reads the same chain: the first such read
 fills `after` write-once, and later reads must equal that stored identity except
 for a later `observed_at`. The before/after identity fields must equal each
-other, and final success requires nonnull `after`. Within one execution
-generation the attestation can change only from `after=null` to that one exact
-post-effect identity. A new execution generation may replace the attempt-scoped
-attestation, bind it to the carried cursor, and reconcile that cursor, but it
-cannot repeat a committed effect. An unattested worker rejects; a replacement
-Pod in the same frozen cohort may recover.
+other, and final success requires nonnull `after`. Within the generation-one
+claim the attestation can change only from `after=null` to that one exact
+post-effect identity. A new action attempt clears the attempt-scoped
+attestation, binds its new generation-one claim to the carried cursor, and may
+reconcile that cursor, but cannot repeat a committed effect. An unattested
+worker rejects; a replacement Pod in the same frozen cohort can recover work
+only after the old request is terminalized by the typed handoff/cold-recovery
+fence, the reducer settles it, and a new attempt passes fresh membership claim
+predicates. A
+bootstrap-only candidate cannot recover work.
 
 The values-level cohort `id` is only a version suffix `S`: a lowercase
 DNS-label of at most 42 characters. Each authority installation has one
@@ -5175,6 +11181,22 @@ nonterminal authoritative action or private shadow request/coverage attempt
 references its resolved cohort identity. Template/image changes therefore
 create a new cohort instead of invalidating in-flight launch or down recovery.
 
+Each normal Serve038 live cohort values entry also requires the exact string
+`manifestContract: provider_authority_worker_cohort_v2`. The chart deliberately
+does not expose a numeric manifest-version selector: Helm normalizes integral
+YAML/JSON numbers before template evaluation, so lexical `2` and `2.0` cannot be
+distinguished reliably. Only that closed string contract may cause the chart to
+render numeric `manifest.version=2` with
+`claim_contract=frozen_action_cohort_join_v2`; missing, numeric, or alternate
+discriminators fail closed. The one-time Serve034 `deselect` retirement phase
+accepts only the previously shipped cohort values shape with this discriminator
+absent and renders the byte-frozen numeric V1 manifest, V1 join contract, and
+`Recreate` Deployment strategy. Supplying any discriminator in that phase is an
+error, and `tombstone` renders no live cohort workload. The closed values schema
+rejects the obsolete `manifestVersion` spelling. This is a values/render
+boundary only; the persisted and wire manifest versions remain strict numeric
+integers.
+
 `claimed_cursor_sha256` is null exactly when the request claimed a fresh
 attempt whose provider progress was null; otherwise it equals the canonical
 hash of the cursor read under that claim. The first intent may create the
@@ -5190,25 +11212,26 @@ inventing an effect. Any generation that does emit an effect must persist
 
 Before action-specific preparation, the controller selects only the rendered
 active manifest whose complete resolved identity is registered as `ACCEPTING`
-in the Serve033 worker-cohort registry. A suffix-only PostgreSQL transaction
-locks that cohort and inserts or exactly adopts the decision's nonexecuting
+with an accepted V2 registration set in the Serve038 worker-cohort registry.
+The shipped Serve033 V1 projection remains retirement/history-only. In the
+suffix of a transaction already holding/revalidating owner -> service -> active
+policy, PostgreSQL locks that cohort, rejects any nonterminal handoff, locks
+both accepted registration leases in instance order, proves both leases fresh,
+and inserts or exactly adopts the decision's nonexecuting
 `PREPARING` retention reference, then releases every lock before the network
 preflight. The authority-worker cohort created its registry identity during
 rollout by self-attesting the same projected static manifest plus its live
-Deployment and ServiceAccount UIDs. Both Pods first become
-`/bootstrapz`-Ready. The first process that then observes the exact Deployment
-with spec/status-total/updated/ready/available replicas all two, unavailable
-zero, and one generation /
-resourceVersion inserts one registration for its own Pod/owner chain. The peer
-reads that row after insert conflict, observes the same Deployment snapshot,
-and compare-and-swap appends its own distinct registration; neither GETs the
-peer Pod. The resulting pair is sorted by Pod UID. Only the typed two-worker
-gate, including a final same-snapshot Deployment read, changes it to
-`ACCEPTING`. Lost insert/append/promotion acknowledgements exact-read and adopt
-the committed row/revision. The
-action-specific preflight response's `resolved_cohort` must be
-byte-equal to that registry identity. The reference authorizes no claim or I/O;
-it only prevents retirement while prepared work is unadmitted.
+Deployment and ServiceAccount UIDs. The first worker inserts `REGISTERING`; each
+distinct ready Pod exactly adopts the immutable identity and appends its closed
+V2 registration evidence. Only the typed two-worker V2 set plus its sole final
+set-level Deployment snapshot changes it to `ACCEPTING`. Lost insert, append,
+and promotion acknowledgements exact-read and adopt only the committed bytes
+and revision. The action-specific
+preflight response's `resolved_cohort` must be byte-equal to that registry
+identity. Its V2 worker identity must be byte-equal to a
+fresh member of the current accepted V2 set that is not blocked by an `OPEN` or
+`READY` handoff. The reference authorizes no claim or I/O; it
+only prevents retirement while prepared work is unadmitted.
 
 Because a remote Serve controller cannot attest executor-local config or an
 in-cluster target, preparation uses this closed synchronous protocol:
@@ -5290,16 +11313,114 @@ ProviderAuthorityPreflightResponseV1 =
   ProviderDownAuthorityPreflightResponseV1
 ```
 
-Registration workers are canonically sorted by distinct Pod UID. A
-`REGISTERING` row permits one or two current entries; `ACCEPTING` requires
-exactly two. Every worker identity must match the row's complete cohort,
-manifest/artifact/callable/handler hashes, Deployment observed generation, and
-ServiceAccount UID. Registration evidence must be fresh against PostgreSQL time
-at the transition: both each registration's `registered_at` and its embedded
-worker identity's `observed_at` must be at or before the transaction's fresh
-`clock_timestamp()` and no more than five minutes old. This server-owned bound
-is not configurable in M2/M3. Unknown, stale, duplicate, unready, or mixed
-evidence cannot activate the cohort.
+That complete V1 graph and the `/v1/` transport are the byte-frozen Serve034
+preflight/retirement baseline only. They cannot prepare or return evidence for
+a live M4 action. M4 adds the following closed graph; a V1 request, manifest,
+cohort, worker identity, capsule, or response never dispatches through it:
+
+```text
+ProviderLaunchPreflightSeedV2 = {
+  version: 2,
+  resource_identity: ProviderLifecyclePlanV2.resource_identity,
+  workspace: Text,
+  source: ProviderLaunchSourceV1,
+  requested_target: ProviderLocatorV1,
+  requested_cloud: "kubernetes",
+  context_mode: "in_cluster",
+  target_namespace: Text,
+  resources: ProviderPodResourceSnapshotV1,
+  topology: ProviderPodTopologyV1,
+  replica_id: NonnegativeInteger,
+  retry_until_up: Boolean,
+  request_identity: ProviderKubernetesRequestIdentityV1,
+  config_projection: ProviderKubernetesConfigProjectionV1
+}
+
+ProviderDownPreflightSeedV2 = {
+  version: 2,
+  resource_identity: ProviderLifecyclePlanV2.resource_identity,
+  workspace: Text,
+  requested_target: ProviderLocatorV1,
+  prior_launch_basis: PriorLaunchBasisV2,
+  prior_launch_basis_sha256: Sha256,
+  cleanup_target: ProviderKubernetesCleanupTargetV1,
+  cleanup_target_sha256: Sha256,
+  context_mode: "in_cluster",
+  config_projection: ProviderKubernetesConfigProjectionV1
+}
+
+ProviderLifecyclePreflightSeedV2 =
+  ProviderLaunchPreflightSeedV2 | ProviderDownPreflightSeedV2
+
+ProviderAuthorityPreflightRequestV2 = {
+  version: 2,
+  contract: "provider_kubernetes_preflight_v2",
+  action_kind: "launch" | "down",
+  nonce: UUID,
+  seed: ProviderLifecyclePreflightSeedV2,
+  expected_cohort_manifest: ProviderAuthorityWorkerCohortManifestV2,
+  request_sha256: Sha256
+}
+
+ProviderLaunchAuthorityPreflightResponseV2 = {
+  version: 2,
+  contract: "provider_kubernetes_preflight_v2",
+  action_kind: "launch",
+  nonce: UUID,
+  request_sha256: Sha256,
+  disposition: "complete" | "not_representable",
+  reason: null | ProviderLaunchNotRepresentableReasonV1,
+  resolved_cohort: null | ProviderAuthorityWorkerCohortV2,
+  execution_capsule: null | ProviderKubernetesExecutionCapsuleV2,
+  executor_policy_proof: null | ProviderPolicyBoundaryProofV1,
+  worker_identity: null | ProviderAuthorityWorkerIdentityV2
+}
+
+ProviderDownAuthorityPreflightResponseV2 = {
+  version: 2,
+  contract: "provider_kubernetes_preflight_v2",
+  action_kind: "down",
+  nonce: UUID,
+  request_sha256: Sha256,
+  disposition: "complete" | "not_representable",
+  reason: null | ProviderDownNotRepresentableReasonV1,
+  resolved_cohort: null | ProviderAuthorityWorkerCohortV2,
+  execution_capsule: null | ProviderKubernetesDownExecutionCapsuleV2,
+  executor_policy_proof: null | ProviderPolicyBoundaryProofV1,
+  worker_identity: null | ProviderAuthorityWorkerIdentityV2
+}
+
+ProviderAuthorityPreflightResponseV2 =
+  ProviderLaunchAuthorityPreflightResponseV2 |
+  ProviderDownAuthorityPreflightResponseV2
+```
+
+The V1 leaf types intentionally reused inside V2 above do not encode the
+cohort, worker membership, Deployment strategy, or enclosing protocol
+version; their canonical behavior is unchanged. The additive V2 preflight
+request/response parsers, serializer, `/v2/` endpoint, and exact bounded
+transport goldens are an immediate activation gate. Until they are deployed,
+the implementation must keep linked M4 authority disabled rather than route a
+V2 action through the existing V1 transport.
+
+V2 registration workers are canonically sorted by distinct Pod UID and have
+distinct worker-instance IDs. `REGISTERING` requires one or two workers and a
+null snapshot; `ACCEPTING` and `DRAINING` require exactly two and the sole
+nonnull set-level snapshot. Every worker identity must match the row's complete
+cohort, manifest/artifact/callable/handler hashes, Deployment UID/generation/
+template, and ServiceAccount UID. No V2 worker identity stores the Deployment
+resourceVersion. At initial `REGISTERING -> ACCEPTING`, a handoff or cold-
+recovery final membership CAS, and `DRAINING -> ACCEPTING` rollback, every
+installed registration's `registered_at` and embedded
+worker `observed_at`, plus the installed snapshot's `observed_at`, are at or
+before that transaction's fresh `clock_timestamp()` and no more than five
+minutes old, and every installed member's separate lease expires after that
+same timestamp. After that transition, renewable lease freshness and the live V1
+stable-projection check gate preflight, claim, renewal, and effects; aging the
+immutable registration evidence alone does not rewrite the set. Unknown, V1-
+set, duplicate, unready, mixed, expired-lease, projection-mismatched, active-
+handoff-stale, null-snapshot accepting, nonnull-snapshot registering, or status-
+not-2/2 evidence cannot activate the cohort, answer preflight, or claim work.
 
 Only `complete` has all four evidence fields; only `not_representable` has a
 reason and all four evidence fields null. The `action_kind` discriminator
@@ -5368,10 +11489,14 @@ exact canonical bytes/size/hash; neither side performs a runtime ConfigMap GET.
 A complete
 response's `resolved_cohort.manifest` must be byte-equal to the request's
 manifest, and its `manifest_sha256` must recompute from those bytes. The
-authenticated worker identity must prove that the serving Pod is owned by the
-returned Deployment UID and runs under the returned ServiceAccount UID. The
-execution capsule's `executor_cohort` must equal the returned resolved cohort.
-Any mismatch is not representable and is never normalized away.
+authenticated V2 worker identity must be byte-equal to a registration in the
+exact current accepted V2 set; that instance's separate lease must be fresh and
+it cannot be the stale member of an `OPEN` or `READY` handoff. The accepted
+set's final V2 Deployment snapshot, rather than a per-Pod Deployment
+resourceVersion, supplies the rollout fence. The execution capsule's compact
+`executor_cohort` ID and identity hash must equal the returned typed V2
+cohort's recomputed ID and canonical hash. Any mismatch is not representable
+and is never normalized away.
 
 The installed `pod_template_contract` is the qualified pure builder/projector
 implementation and closed schema; it is not treated as a generic expected
@@ -5417,14 +11542,17 @@ manifest hash.
 The controller may use generated UIDs as preparation/execution evidence only
 from this authenticated live response. The registry copy is a retention and
 equality fence; it cannot populate a response or execution capsule. The
-controller uses the returned UIDs only in the same bounded preparation cell and
-freezes the complete resolved cohort into an admitted action or private shadow
-record. The response is bound to its nonce, request hash, action kind, and
-expected manifest and cannot be replayed for another preparation.
+controller uses the returned UIDs only in the same bounded preparation cell.
+It freezes only the compact cohort ID/hash reference into an admitted action
+or private shadow record; the complete resolved V2 cohort remains in its
+permanently retained registry row and transient V2 response. The response is
+bound to its nonce, request hash, action kind, and expected manifest and cannot
+be replayed for another preparation.
 
-The exact endpoint is
-`POST https://<full-name>-authority-preflight.<release-namespace>.svc:46583/internal/resource-actions/v1/kubernetes/preflight`,
-where `<full-name>` is the Helm chart's rendered full name (for the current
+The live M4 endpoint is
+`POST https://<full-name>-authority-preflight.<release-namespace>.svc:46583/internal/resource-actions/v2/kubernetes/preflight`.
+The otherwise identical `/v1/` endpoint remains Serve034 retirement-only.
+Here `<full-name>` is the Helm chart's rendered full name (for the current
 test release, `skypilot-ha-authority-preflight.skypilot-ha.svc`).
 It is served by a read-only extension of the authority executor's role-health
 supervisor, not public FastAPI and not a request handler. The endpoint imports
@@ -5733,7 +11861,8 @@ measured candidate window, the narrow legacy-owned path deliberately adopts
 the same renderer/prebooted runtime/job seam; services outside that closed
 cohort keep the original legacy path.
 
-The Serve adapter's immutable action spec is the closed object:
+The Serve adapter retains this already-shipped closed V1 wrapper unchanged for
+pre-Serve038 history and exact-034 cleanup-only tooling:
 
 ```text
 ServeReplicaActionSpecV1 = {
@@ -5742,6 +11871,135 @@ ServeReplicaActionSpecV1 = {
   invocation: ProviderLifecycleInvocationV1
 }
 ```
+
+V1 has no service-version identity or candidate/policy binding and therefore
+cannot authorize M4 admission, dispatch, recovery, or provider I/O. Its exact
+class, canonical bytes, hash goldens, and
+`ServeReplicaActionSpecV1.from_value()` parser remain frozen; no field is added
+and no V1 row is reinterpreted.
+
+The parent design owns the following exact M4 values, reproduced here as the
+provider-facet input contract:
+
+```text
+ServeServiceVersionSpecIdentityV1 = {
+  version: 1,
+  service_name: Text,
+  service_incarnation: UUID,
+  service_version: PositiveInteger,
+  effective_service_config_sha256: Sha256,
+  effective_task_config_sha256: Sha256,
+  capacity_profile: ServeActionCapacityProfileV1,
+  provider_profile: "pod_cluster_v1"
+}
+
+ShadowCandidateActionBindingV1 = {
+  version: 1,
+  binding_kind: "shadow_candidate",
+  candidate_epoch: UUID,
+  qualification_policy_sha256: Sha256,
+  qualification_binding_sha256: Sha256
+}
+
+AuthoritativeActionPolicyBindingV1 = {
+  version: 1,
+  binding_kind: "authoritative_action",
+  policy_epoch: UUID,
+  policy_sha256: Sha256,
+  authority_binding_sha256: Sha256
+}
+
+ServeReplicaActionAdmissionBindingV1 =
+  ShadowCandidateActionBindingV1 | AuthoritativeActionPolicyBindingV1
+
+ServeReplicaActionSpecV2 = {
+  version: 2,
+  service_version_spec_identity: ServeServiceVersionSpecIdentityV1,
+  service_version_spec_identity_sha256: Sha256,
+  admission_binding: ServeReplicaActionAdmissionBindingV1,
+  provider_plan: ProviderLifecyclePlanV2,
+  invocation: ProviderLifecycleInvocationV2
+}
+```
+
+The compact live graph is exactly:
+
+```text
+ProviderAuthorityWorkerCohortReferenceV1 = {
+  version: 1,
+  cohort_id: Text,
+  cohort_identity_sha256: Sha256
+}
+
+ProviderKubernetesExecutionCapsuleV2 =
+  ProviderKubernetesExecutionCapsuleV1 with version 2 and
+  executor_cohort: ProviderAuthorityWorkerCohortReferenceV1
+
+ProviderKubernetesDownExecutionCapsuleV2 =
+  ProviderKubernetesDownExecutionCapsuleV1 with version 2 and
+  executor_cohort: ProviderAuthorityWorkerCohortReferenceV1
+
+ProviderKubernetesExecutionConfigV2 =
+  ProviderKubernetesExecutionConfigV1 with version 2 and the V2 launch capsule
+
+ProviderKubernetesDownExecutionConfigV2 =
+  ProviderKubernetesDownExecutionConfigV1 with version 2 and the V2 down capsule
+
+ProviderLaunchLifecycleInvocationV2 =
+  ProviderLaunchLifecycleInvocationV1 with version 2 and
+  launch.execution_config: ProviderKubernetesExecutionConfigV2
+
+ProviderDownInvocationV2 =
+  ProviderDownInvocationV1 with
+  prior_launch_basis: PriorLaunchBasisV2 and
+  execution_config: ProviderKubernetesDownExecutionConfigV2
+
+ProviderDownLifecycleInvocationV2 =
+  ProviderDownLifecycleInvocationV1 with version 2 and
+  down: ProviderDownInvocationV2
+
+ProviderLifecycleInvocationV2 =
+  ProviderLaunchLifecycleInvocationV2 | ProviderDownLifecycleInvocationV2
+
+ProviderLifecyclePlanV2 = the version-2 closed plan binding only
+ProviderLifecycleInvocationV2
+```
+
+This is deliberately not an edit to any V1 nested type. Only the additive V2
+preflight response defined above may carry the complete V2 cohort transiently;
+the persisted V2 capsule carries only the compact reference. A parsed reference
+is non-authorizing. After the caller locks and parses the named permanent row as
+`ProviderAuthorityWorkerCohortV2`, the authority module's sole typed resolver
+`validate_locked_action_spec_cohort_v2()` recomputes that object's canonical
+hash and proves exact ID/hash equality. The structural action module exposes no
+scalar or V1-cohort convenience that can claim a lock or manufacture V2
+authority. Every live V2 boundary repeats the typed resolution under its
+documented lock order; no unlocked hash lookup or V1 fallback is permitted.
+
+Every V2 payload member is immutable and covered by the complete action-spec
+hash. The embedded identity hash is recomputed, and the existing plan/
+invocation byte-equality, action-ID, action-kind, target, and
+`request_payload_sha256 == invocation.sha256` invariants still apply. A private
+shadow parent accepts only `ShadowCandidateActionBindingV1`, byte-equal to the
+locked candidate/coverage tuple. An authoritative action accepts only
+`AuthoritativeActionPolicyBindingV1`, byte-equal to its `ACTION_ACTIVE`
+reference. Action admission requires the locked `ACTIVE/OPEN` policy row;
+materialization, claim, provider-context, pre-I/O, and recovery instead require
+the same frozen tuple under locked `ACTIVE/(OPEN | DRAINING)` current
+execution. `CLOSED | SUPERSEDED` is accepted only by historical validation and
+reduction, not execution. Its `policy_epoch` is an opaque
+`uuid.UUID` in Python, canonical lowercase hyphenated UUID text in JSON, and
+native PostgreSQL `UUID`; an integer, numeric string, sequence, policy
+revision, or noncanonical spelling rejects.
+
+The sole live provider parser is
+`serve_replica_action_spec_from_value_v2()`. Manager admission, private request
+materialization, claim resolution, provider-context loading, immediate pre-I/O
+reauthorization, submit/observe, recovery, and reduction call it and reject V1
+before creating or advancing a reference, request, attempt, watermark, or
+provider effect. An optional version-dispatching inspection reader grants no
+execution authority. Serve038's zero-action/shadow migration precondition
+means no live V1 row needs a dual reader, backfill, or V2 reconstruction.
 
 Every installed-package artifact path is normalized relative to the fixed
 package root, contains no empty, dot, parent, absolute, or platform-separator
@@ -5819,7 +12077,7 @@ ParentSpec.provider_plan.request_payload_sha256`. This child-only value
 deliberately has no `PriorLaunchBasisV1` and no current down execution config:
 it observes the
 existing legacy cleanup between launch retries and grants no replay or provider
-authority. It cannot appear in `ServeReplicaActionSpecV1`, a primary child,
+authority. It cannot appear in live `ServeReplicaActionSpecV2`, a primary child,
 coverage admission, or either authoritative handler. Static role, path, name,
 and request-body parity comes only from the parent launch capsule; runtime UID
 parity is proven by the causally scoped evidence rule above. Any extra ambient
@@ -5895,7 +12153,7 @@ silently reorder a noncanonical input:
   empty-only, not unordered extension points.
 
 Before linked represented admission is enabled, checked-in realistic launch and
-down golden fixtures must include the observed 1,036-byte `boltz-test` CA scalar,
+down golden fixtures must include the observed 1,039-byte `boltz-test` CA scalar,
 three complete requested/semantic object bodies, the full kind-specific
 principal/authorization inventory, and all 12 prerequisite role records. The
 launch golden additionally includes the exact five-role endpoint projection,
@@ -5904,7 +12162,7 @@ Deployment projections. Down goldens contain none of those launch-only
 endpoint/runtime/job fields, and insertion of any one rejects. Tests separately
 cover completed-launch down and every legal partial-launch down, including
 maximal committed-cleanup and legal null-slot/null-handle shapes. They record
-each full `ServeReplicaActionSpecV1` byte length, require
+each full live `ServeReplicaActionSpecV2` byte length, require
 it to be at most 60,000 bytes (preserving at least 5,536 bytes of rollout
 headroom), and still enforce the absolute 65,536-byte parser bound. Failure is
 `NOT_REPRESENTABLE`; no truncation, compression, or unverified external
@@ -5922,19 +12180,21 @@ down, and realistic/candidate-maximal full-spec goldens prove the revised shape
 is at most 60,000 bytes and capped preflight request/response goldens satisfy
 their independent 65,536-byte transport limits.
 
-The P2a Helm-derived complete static cohort makes the current representative
-launch spec exactly 60,851 bytes. That remains parseable but deliberately fails
-this activation gate; P2a may deploy only dark and must not raise the
-60,000-byte budget. Before P2b linked represented admission, replace the
+The P2a Helm-derived complete static cohort makes the current frozen V1
+representative launch spec exactly 60,851 bytes. That remains parseable but
+deliberately fails this activation gate and cannot qualify the larger V2
+envelope; P2a may deploy only dark and must not raise the 60,000-byte budget.
+Before P2b linked represented admission, replace the
 capsule's 5,241-byte complete cohort with a closed compact durable reference
 containing only `version`, `cohort_id`, and `cohort_identity_sha256`. The
 complete cohort is already permanently retained in
 `serve_resource_action_worker_cohorts`. Admission must lock that row, recompute
 the canonical identity hash, and require exact equality before it materializes
-or dispatches a request. The measured 231-byte reference projects the
-representative fixture to approximately 55,841 bytes, but checked-in exact
-realistic and candidate-maximal goldens must prove the unchanged 60,000-byte
-gate; the estimate is not qualification.
+or dispatches a request. The measured 231-byte reference projects the frozen
+V1 representative fixture to approximately 55,841 bytes. That estimate omits
+the required V2 service-version identity/hash and admission binding and is not
+qualification; checked-in exact realistic and candidate-maximal V2 goldens
+must prove the unchanged 60,000-byte gate.
 
 The `source` object contains a `content` reference to an immutable retained
 `version_specs` row plus the closed server-effective identity proof;
@@ -5987,11 +12247,13 @@ condition. It has no path to `sdk.launch()` before approval. Preparation and
 the wait hold no SQL transaction, database row lock, resources-file lock, or
 logical-state lock and use a separate bounded pool from provider submission.
 
-When an existing provider slot is available, the manager performs the parent
-design's short service -> replica -> capacity -> cohort -> reference ->
-coverage -> optional-parent transaction. Before signaling it requires the
-same-ID `PREPARING` reference and writes
-`worker_cohort_ref_id=decision_id`; mismatch or rollback leaves no approval.
+When an ordinary counted provider slot is available, the manager performs the
+parent design's short service -> replica -> cohort -> handoff -> registration-
+leases -> reference -> coverage -> optional-parent transaction. It takes no
+paid-capacity, reserved-fill, or
+logical-capacity lock. Before signaling it requires the same-ID `PREPARING`
+reference and atomically writes `worker_cohort_ref_id=decision_id`; mismatch or
+rollback leaves no approval. Reference activation is branch-specific below.
 For a legacy-SDK represented or not-representable branch, that same transaction
 changes the reference to `SHADOW_ACTIVE`, and it signals only after commit or
 exact lost-commit readback. A not-representable approval carries coverage and
@@ -6001,13 +12263,20 @@ represented child or coverage-only attempt `PRE_SUBMIT` before SDK request
 creation.
 
 For the private represented branch, the capacity transaction deliberately
-leaves the reference `PREPARING` and signals nothing. The narrow follow-up
+leaves the reference `PREPARING`, writes the parent as
+`PENDING_SELECTION/PENDING`, and signals nothing. The narrow follow-up
 materializer locks the complete graph and atomically creates/exact-adopts the
-represented child, deterministic request, queue delivery, private correlation,
-binds the child to that ID and `REQUEST_BOUND`, and commits the
-`SHADOW_ACTIVE` transition. Only its commit or exact lost-ack adoption
+represented child, preflight-bearing `BOUND` history with empty effect trace,
+deterministic request, queue delivery, private correlation, binds the child to
+that ID and `REQUEST_BOUND`, changes the parent to
+`PRIVATE_API_REQUEST/RUNNING`, and commits the sole `SHADOW_ACTIVE` transition.
+Only its commit or exact lost-ack adoption
 lets the SafeThread enter its wait state. A crash in between leaves no claimable
 request and recovery can exact-adopt or safely retain `PREPARING`.
+Permanent enumerator rejection instead exact-adopts the declared
+`LEGACY_CONTROLLER/RUNNING` fallback transition after proving zero private
+descendants, then signals the same-cell legacy worker; retryable drift leaves
+selection pending.
 Construction/start of a PREPARING worker is
 not mutation enqueue; release of this gate is the enforceable provider
 boundary.
@@ -6020,8 +12289,10 @@ has no private request or cross-process executable input.
 The live worker uses the same in-memory request object and retained identity
 proof until SDK request admission, but object identity is not a distributed
 authority. Across HTTP the
-durable contract is the full stored `ServeReplicaActionSpecV1`, including the
-frozen execution config, scope, invocation, and retrievable references. Generic
+durable contract is the full stored `ServeReplicaActionSpecV2`, including the
+service-version identity/hash, shadow-candidate or authoritative-policy
+binding, frozen execution config, scope, invocation, and retrievable
+references. Generic
 request/HTTP bytes and credentials are not persisted or hashed. After process
 loss, represented recovery reconstructs from the retained source and must
 reproduce the entire stored spec/invocation byte-for-byte. A
@@ -6076,7 +12347,7 @@ P1 leaf verification evidence on 2026-08-01: the pure closed Kubernetes
 transport, scope, and scope-read DTOs pass literal canonical-byte/hash,
 round-trip, closed-shape, scalar/list/object-bound, semantic tuple-order,
 namespace/service-account consistency, and failed-read discriminator tests.
-The 16,384-byte CA scalar ceiling covers the 1,036-byte canonical DER base64
+The 16,384-byte CA scalar ceiling covers the 1,039-byte canonical DER base64
 observed on `boltz-test`; independent adversarial re-review accepted the leaf.
 This does not claim live URL or X.509 normalization, preflight, execution-config
 closure, or representability authority.
@@ -6341,6 +12612,18 @@ it does not prove this provider facet.
 
 ### P2b: live shadow observation
 
+- The native V2 seed/input, launch/down constructors, and sole cleanup-target
+  rederiver are implemented. First finish the final V2 six-role artifact and
+  callable inventories and fully expanded representability case inventory /
+  enumerator plus CI-only post-inventory goldens. The exact
+  repository call inventory must reject any V1 construction/conversion root or
+  duplicate cleanup builder, and both content-addressed fixture sets must pass
+  before complete preflight or represented admission is reachable.
+- Gate entry to provider preparation on the exact
+  `ordinary_ondemand_physical_width1_v1` Serve projection, then recheck its
+  elected `ServeServiceVersionSpecIdentityV1` and each live replica's bound
+  creating-version identity under the service/version locks at admission. A failed gate
+  stays wholly legacy and creates no preparation or evidence graph.
 - Capture the actual serialized CoreV1 and Skylet effect trace through its
   closed create/delete/typed-submit union, not merely the high-level legacy
   request/result.
@@ -6361,17 +12644,18 @@ it does not prove this provider facet.
 ### P3: request-handler integration
 
 - Add a narrow represented-only PostgreSQL admission primitive that locks
-  service -> replica -> cohort -> reference -> coverage -> parent -> represented
-  attempt and atomically materializes and binds the sole private PR #1070
-  request/queue row before changing
+  owner -> service/replica -> cohort -> handoff -> both leases -> reference ->
+  coverage -> parent -> represented attempt/history -> both API rows -> request
+  -> queue and atomically materializes and binds the sole private PR #1070
+  request/queue row plus `BOUND` history before changing
   `PREPARING -> SHADOW_ACTIVE`. It validates the exact service owner/epoch,
   active accepted cohort, immutable request body, deterministic request ID,
   and write-once compatibility association before queue visibility.
   `NOT_REPRESENTABLE` coverage remains same-cell legacy SDK work and cannot
   create a private request. Do not broaden the legacy SDK request binder.
-  Within that transaction the represented child advances from `PRE_SUBMIT` to
+  Within that transaction the represented child is inserted directly as
   committed `REQUEST_BOUND` with the deterministic request ID and bind
-  timestamp. Claim SQL joins the exact parent/child, route sequence, request-ID
+  timestamp; no private `PRE_SUBMIT` state exists. Claim SQL joins the exact parent/child, route sequence, request-ID
   equality, private correlation, and active reference; an unbound child is
   never claimable.
 - Give the private payload a legal public Pydantic field with serialization
@@ -6379,11 +12663,60 @@ it does not prove this provider facet.
   durable request JSON with aliases while handler kwargs use the public field
   name. The PostgreSQL claim predicate must observe exactly the underscore
   alias.
-- Add the journal-before-I/O mutation boundary to that action-correlated
-  request.
-- Add API006 monotonic provider progress and persist partial object UIDs/specs,
-  exact handle, runtime, job intent/ID, endpoint, operation IDs, and typed
-  outcomes under existing request claim fences.
+- Before claimant startup, install the complete Serve039 boundary: lease owner /
+  hash/normalized-process columns, process supersessions, execution lineage,
+  action selectors, one-to-one shadow execution histories, and shadow terminal
+  histories; exact PostgreSQL target /
+  old-stamp behavior; and the same-engine three-method terminal-store composition
+  in every API/Uvicorn/controller/authority-supervisor and spawned-child root.
+  Private claim and terminal predicates accept only generation zero or one,
+  cancellation intent closes only through quiesced owner acknowledgement, and
+  multi-request terminal work uses only homogeneous stale-owner, process-
+  supersession, or cold-recovery batches with the exact 16/16/32 bounds and
+  operation/fence partition contract.
+- Make authority API registration INSERT-plus-exact-adoption with a per-boot
+  nonce and database-owned start time; implement the closed bootstrap -> bound ->
+  ready -> rewarming -> ready and owner-bound -> draining health transitions,
+  with heartbeat-only CAS; and give Serve
+  the sole typed GC for historical `authority-worker` rows. Bind every new post-
+  039 lease/owner in the same commit as bootstrap -> bound, retain bound API
+  identity in lost-ACK adoption, and revalidate row existence against concurrent
+  GC before BIND or supersession can commit.
+- Run one fixed eagerly warmed no-burst LONG process pool per authority
+  supervisor, with distinct child PIDs and the manifest-frozen connection budget.
+  Implement current-process-only normal RENEW and survivor acknowledgement,
+  same-container rejection, `SUPERSEDE_EXECUTION_OWNER` from an exact Kubernetes
+  container-incarnation proof, the process-fenced common terminal batch, and
+  stable-Pod/process/API/request equality at claim-start, every progress and pre-
+  I/O CAS, each effect, and return. No bootstrap or prior process can renew,
+  acknowledge, warm to ready, claim, or attest for the current owner.
+- Make bootstrap a permanent runtime phase: bind `/livez`, `/bootstrapz`, and
+  the authenticated preflight transport; self-attest two distinct V2 worker
+  registrations; persist the sole final Deployment snapshot; promote the
+  cohort to `ACCEPTING`; complete static manifest/transport/principal/claim/
+  RBAC readiness; then expose `/readyz`, resolve cohort-bound claim
+  configuration, and start/advertise the existing request claimant.
+  `/bootstrapz`, not `/readyz`, is the Kubernetes readiness probe. The
+  preflight transport returns unavailable until the serving worker is a fresh
+  member of the accepted V2 set. Target- and kind-specific
+  preflight runs only after one manager creates its exact `PREPARING`
+  reference; it cannot be a startup gate and is bound into admission and the
+  one-request dispatch proof. Startup alone creates no
+  action/reference/request/queue row and performs no provider effect.
+- Add journal-before-I/O mutation boundary to action-correlated requests.
+- Register strict request-result codecs for
+  `serve_shadow_candidate_launch` and `serve_shadow_candidate_down`, matching
+  the fail-closed authoritative-handler rule: null, default-encoded,
+  wrong-kind, extra-key, or hash-invalid success payloads terminalize failed.
+  Ordinary request codecs remain unchanged.
+- Implement the specified one-to-one shadow execution-history store and closed
+  `ProviderShadowLifecycleProgressV1` projection for partial object UIDs/specs,
+  exact handle, runtime, job intent/ID, endpoint, operation IDs, strict return,
+  fallback, and typed outcome under the represented child/private-request claim
+  fences. It reuses only the explicitly closed pure substitutions and never
+  fabricates an API006 action/attempt row. P3 cannot complete until that canonical
+  store and its same-inventory linked-admission/claim/pre-I/O representability
+  gates are implemented and verified.
 - Carry the exact provider cursor from attempt `n` to `n+1`, clear/recompute
   only the attempt-scoped attestation envelope, and reject any crossed-boundary
   gap or regression.
@@ -6398,6 +12731,22 @@ it does not prove this provider facet.
   preflight endpoint, dark Helm versioned authority-worker Deployments/Service/
   RBAC/NetworkPolicy resources, active/frozen cohort claim join, and the closed
   handler claim filter.
+- Implement the PostgreSQL `OPEN -> READY -> COMPLETED` worker-registration
+  handoff and its `ABANDONED` branch exactly as specified above. Replacement
+  candidates remain bootstrap-only and claimless; the old UID is fenced only
+  after exact absence, the survivor must re-attest after that fence, and the
+  final set-level Deployment snapshot and membership replacement commit
+  atomically. Losing both accepted members uses the same-cohort full-set cold-
+  recovery transaction so frozen work remains claimable.
+- For authoritative actions, consume the parent design's one-request
+  `PrivateDispatchReadinessProofV2` at claim-start and insert/exact-adopt its
+  Serve039 lineage before handler invocation; every first/later progress
+  watermark validates that immutable key. For private shadow, consume the
+  disjoint dispatch membership/authority proof at claim-start and exact-adopt
+  `BOUND -> AUTHORIZED` in the same-key execution history before handler
+  invocation; every progress/pre-I/O CAS validates that immutable lineage. A
+  shadow-activation proof or cached readiness result is never reusable dispatch
+  authority.
 - Implement Skylet submit/readback idempotency by action UUID plus its fsynced
   job/start-outbox and launcher run-token state machine; remove every SSH/
   generic-execute fallback from the candidate.
@@ -6407,12 +12756,31 @@ it does not prove this provider facet.
 
 ### P4: selected Serve authority
 
-- Enable one eligible service/profile after the parent design's gates.
+- Enable one service only while its locked service version, every live replica,
+  and the promotion proof all satisfy
+  `ordinary_ondemand_physical_width1_v1`, and only after the parent design's
+  server-minted proof establishes at least 86,400 seconds, 100 clean represented
+  launch graphs, 100 clean represented down graphs, zero divergence/blockers,
+  and the complete crash/HA inventory. No caller or service setting may lower
+  these floors.
+- Require every crash boundary to have a durable pre-injection `STARTED`
+  intent, no unresolved or tainting run, and at least one exact `PASS`; a later
+  pass never erases `FAIL`/`ABANDONED` in the candidate epoch.
 - Require the exact provider block in endpoint lookup, same-UID Pod IP refresh,
   and both warm-standby load-balancer slots' connectivity smoke.
-- Preserve per-service fallback only for services that never promoted.
-- Delete duplicate provider retry/observation ownership from the eligible
-  Serve path after soak.
+- Preserve per-service fallback only for services that never promoted. Reject a
+  shadow/authoritative service update that enables spot placement, on-demand
+  fallback, paid or reserved capacity, cost-rebalance, accelerators, multi-node
+  resources, or logical replica semantics; never demote or route an
+  authoritative action to legacy.
+- Keep the four named eligible-path transition seams throughout M4. Their
+  already-authored stacked M5a child, not P4, deletes duplicate provider retry/
+  observation ownership only after the exact-M4 post-authority gate passes.
+- Before promotion, install the parent design's admission-closed authority-
+  policy rotation machinery. The initial policy has one exact M4 deployment set
+  named as both elected and rollback; an exact merged M5a set enters a two-set
+  successor policy only after claim-disabled role/cohort attestation, the full
+  16-selection mixed-compatibility suite, and an empty nonterminal inventory.
 
 ## Tests
 
@@ -6608,8 +12976,19 @@ Contract tests must cover:
   modes, and equal before/after hashes but grants no authority; only the
   enclosing launch/down config binds its controller/executor slot and all
   projection/capsule/subject hashes to co-located preimages;
-- registration sets require ascending unique worker Pod UIDs and reject both a
-  permuted list and duplicate UID;
+- the shipped V1 identity/registration/set goldens retain their exact per-Pod
+  Deployment resourceVersion bytes and remain readable for retirement/history,
+  but V1 registration/set activation, `/readyz`, preflight authority, and claim
+  authority reject. The V1 identity remains valid only as execution-local
+  preflight/attempt provenance whose stable projection and derived instance ID
+  exactly match current V2 membership; its Deployment resourceVersion alone
+  never grants authority;
+  V2 registration sets require ascending unique worker Pod UIDs and distinct
+  instance IDs and reject both a permuted list and either duplicate. Their sole
+  final Deployment snapshot is set-level, advances independently from per-Pod
+  attestations, and rejects a crossed UID/generation/template, unequal
+  generation/observed-generation, expired lease, or non-2/2 status without
+  requiring or permitting per-Pod Deployment resourceVersions;
 - realistic launch/down golden specs exercise their complete kind-specific
   inventories and observed CA size, record their canonical byte counts, retain
   5,536 bytes of headroom, and reject a one-byte-over-budget variant without
@@ -6636,8 +13015,8 @@ Contract tests must cover:
   Deployment chain, with exact owner kinds and byte-equal embedded name/UID
   fields plus rejection of swapped/direct/crossed owners; the first effect fills
   one write-once post-attestation, later effects match it, and a replacement
-  execution generation binds a new attestation to the carried cursor without
-  replaying a committed effect;
+  action attempt binds its generation-one attestation to the carried cursor
+  without replaying a committed effect;
 - crash before intent and before/after every object, progress, handle, runtime,
   job-intent/job-ID, endpoint, operation-ID, and response boundary;
 - lost launch acknowledgement followed by exact adoption;
@@ -6701,10 +13080,30 @@ Contract tests must cover:
   preflight state;
 - static-manifest mismatch, Deployment-owner UID mismatch, ServiceAccount UID
   mismatch, registry identity mismatch, and execution-capsule cohort mismatch;
+- the exact-M4 cleanup-only/API008-Serve037-state028 pre-migration gate,
+  which exact-reflects and preserves the frozen Serve034 release-ledger
+  subcatalog plus the unrelated Serve035/036/037 additions, including the
+  exact placement-normalization/retirement tables, columns, PostgreSQL checks,
+  and foreign keys,
+  implements accepted-V1 `ACCEPTING -> DRAINING -> REMOVAL_AUTHORIZED`,
+  deselects every V1 cohort, uses current-chart tombstone removal followed by
+  surviving-API NotFound verification to retire it, and proves zero work /
+  nonterminal V1 state; any carrier blocks;
+  old V1 append, renew, registration, `REGISTERING -> ACCEPTING`, and
+  `DRAINING -> ACCEPTING` writes racing retirement either land
+  before its locked CAS or affect zero rows, and the Serve038 V2-only
+  nonterminal CHECK rejects missing/null/string/`2.0` and every stale V1 write;
+  terminal-shape tests reject version `3`, missing/null/string, and numeric
+  `1.0`/`2.0` outside the exact V1/V2 branches;
 - Helm render/install/upgrade tests for dark-by-default immutable versioned
   two-replica authority cohorts, active-cohort preflight selection, frozen-
-  cohort claim joins, `REGISTERING` plus two distinct ready adopters before
-  `ACCEPTING`, digest pins, namespace-local Secrets/static-manifest mounts,
+  cohort claim joins, `REGISTERING` plus two distinct V2 ready adopters and the
+  required null snapshot before the final set-level snapshot and `ACCEPTING`,
+  `/bootstrapz` -> `ACCEPTING` ->
+  `/readyz`, `maxSurge=0`/`maxUnavailable=1`, and replacement preserving the
+  fresh survivor while advancing only the set-level Deployment snapshot,
+  digest pins,
+  namespace-local Secrets/static-manifest mounts,
   release-namespace worker/Service selectors, two frozen LB Deployment
   selectors with distinct explicit ServiceAccounts and exact GET-only evidence,
   separate canary workload namespace, ClusterIP Service, NetworkPolicy, exact
@@ -6713,27 +13112,168 @@ Contract tests must cover:
   controller rollout/current-chart compatible-image rollback, and separately
   gated versioned authority-cohort add/switch/drain/retirement tests while both
   cohorts remain claimable;
+- handoff tests cover both exact stale-UID absence variants and reject a
+  deletion timestamp, terminating same-UID Pod, expired lease, and name-only
+  proof; every SQL lock/claim race; candidate bootstrap without preflight,
+  `/readyz`, or claims; stale-claim generation fencing; post-fence survivor
+  self-attestation and rejection of pre-fence, candidate-forged, stale, or lost
+  acknowledgement; final snapshot drift; atomic stale-to-candidate membership
+  replacement; exact lost-ack adoption at every CAS; candidate loss before and
+  after `READY`; `ABANDONED` only with exact candidate absence and zero claim,
+  attempt, progress, operation, and effect evidence; refusal to abandon after
+  any such evidence; chained-candidate loss; and double accepted-member loss
+  atomically cold-recovering two new members in the same cohort with both old
+  claims fenced, plus exact lost-ack adoption and rejection of any changed
+  Deployment UID/template;
 - API006 -> API007 migration preserves every existing request, queue, action,
   attempt, and server-instance row while widening only the named role CHECK;
   downgrade rejects any remaining `authority-worker` instance; ordinary API007
   roles remain operational before Serve033 and exclude all four private names;
   authority startup against Serve032 or an incomplete private-handler inventory
-  fails before a queue claim;
-- atomic `PREPARING -> SHADOW_ACTIVE|ACTION_ACTIVE` binding with admission;
+  fails before a queue claim. API007 -> API008 migration tests separately prove
+  the exact execution-quiescence columns, writer capability defaults, retained
+  requests/claims, and fail-closed rejection of `unknown`/false API-instance
+  attestations;
+- Serve039 migration/constraint tests cover exact-038 writer/DDL contention,
+  partial and old-stamp catalogs without an API-lineage migration dependency,
+  literal merged old-stamp relation order and both class-4-process/class-10-
+  shadow contention directions,
+  fresh anchor/handoff/cold INSERT plus API bootstrap-to-bound atomicity, the
+  retained pre-039 owner-null BIND exception, and every null/crossed/malformed
+  owner JSON/hash/scalar, stable/process ID, start-time, and process-row proof;
+- Serve038 migration tests start from the exact Serve037 placement-
+  normalization/retirement catalog with both empty and valid nonempty ledgers,
+  preserve every table/column/check/foreign key/row byte-for-byte, and race the
+  Serve037 normalizer's `services -> version_specs -> replicas ->
+  ephemeral_storage_cleanup_intents` table-lock program against the M4
+  `services -> version_specs -> replicas` DDL prefix in both directions without
+  a reverse acquisition or deadlock;
+- authority API-instance tests cover insert lost-ACK and database-owned-start
+  adoption, equal retry, forced UUID collision by unequal boot nonce or immutable
+  inventory, deletion/no recreation, every legal and illegal health edge,
+  heartbeat-only CAS, wrong owner hash, and bound-to-ready versus supersession.
+  `ready -> rewarming` races claim-start and immediate pre-I/O in both lock
+  orders; its generation increments exactly once, lost-ACK exact-adopts, and a
+  stale generation cannot ABA-adopt. Initial warm failure, repeated rewarm
+  failure, no draining recovery, and an unmarked ordinary-looking active owner
+  that blocks rewarming are mandatory cases.
+  Current-owner RENEW and survivor acknowledgement pass; bootstrap, prior,
+  stale, wrong-phase, noncanonical process UUID, or crossed stable/process/API /
+  request attestations reject at claim-start, progress, pre-I/O, effect, and
+  return. Identity-proof cases include future time, the exact 300-second boundary
+  and one tick beyond it, lock-wait expiry, and backward database clocks;
+- process/runtime tests prove one eagerly warmed no-burst LONG pool with distinct
+  child PIDs and frozen connection budgets; simultaneous supervisors and same-
+  container replacement reject; a larger restart count/new container may
+  supersede an expired-but-ACTIVE source; and lost-ACK, historical process-ID
+  reuse, late-prior writes, and handoff/cold races preserve one current owner.
+  An unmarked ordinary-looking active owner separately blocks supersession,
+  handoff, cold recovery, claim-cap admission, and terminalization. Exact
+  manifest widths `N=1` and `N=16` prove the physical `3 + 2*N` PostgreSQL
+  high-water; zero/17, environment or manifest-hash drift, a hidden/duplicate
+  engine namespace, and a wrong QueuePool size or overflow reject readiness.
+  Mixed action/shadow/pending-cancellation inventories at 0/16/17 exercise the
+  homogeneous process batch, both action selector branches, exact shadow history,
+  one terminal `updated_at`/finish/ack/receipt time, and no missing-lineage insert;
+- terminal-store composition tests cover every API, Uvicorn, controller,
+  authority-supervisor, and spawned-child root; unequal database registration;
+  generation-zero/one-only claim and cancellation predicates; mixed-mode/time /
+  operation/fence batch rejection; exact whole-operation adoption at every
+  commit boundary; no partially terminal sibling; and handler-versus-owner-ack /
+  UID/process-fence winners in both lock orders, including losing-handler retry
+  after an unknown winner commit and after request plus Serve-evidence GC.
+  Receipt-only shadow adoption compares the typed permanent commitment without
+  requiring current service/API/event state. Mixed action/shadow fence tests
+  derive the time-free commitment projection from receipt-free claims, prove
+  completed receipts/events/times/TTLs are outside its hash domain, and reject
+  every recursive/crossed projection. OWNER_ACK_CANCEL,
+  OWNER_QUIESCED_LEASE_LOSS, STALE_OWNER_FENCE, COLD_RECOVERY_FENCE, and
+  PROCESS_SUPERSESSION_FENCE each cross `BOUND` and `AUTHORIZED` shadow history
+  and derive the exact pre-claim versus execution receipt without a caller cause.
+  Owner-quiesced lease-loss cases cross action /
+  shadow, lineage/pre-claim-start, and null/pending intent, prove exact CANCELLED
+  receipts/timestamps, and cover `P0`/`O`/`S`/`X` plus attempt-`n+1` without same-
+  request replay. Serve-owned API-row GC
+  separately tests fresh versus stale rootless bootstrap, ACTIVE/REVOKED lease,
+  any active request including malformed state, lineage, selector, shadow, and
+  both process-ID roots; exact cursor initialization, finite high-water epochs,
+  128/129 leading rooted or raced-blocked rows, restart/wrap/lost-ACK, inserts
+  before and after the cursor, a locked row, and a missing cursor target;
+  generic-GC exclusion; heartbeat/delete and BIND or
+  SUPERSEDE/delete in both lock orders with existence revalidation; and no row
+  recreation;
+- atomic route-specific binding—legacy shadow or authoritative admission may
+  bind `SHADOW_ACTIVE|ACTION_ACTIVE`, while selected-private capacity admission
+  leaves `PREPARING` and its one linked transaction performs the sole
+  `SHADOW_ACTIVE` CAS—plus permanent fallback and exact adoption. Fallback
+  cases cover new commit, every pre/post-commit cut, immediate graph adoption
+  with progress-receipt absence and idempotent signaling, atomic progress-
+  receipt insertion with the first legacy PRE_SUBMIT or terminal no-call
+  release, retained-advanced and typed-GC receipt-only adoption after
+  membership/API advancement, explicit rejection of caller-selected receipt-
+  only at the unsignaled post-state, a different operation/source/failure lost
+  race, hash/evidence crossing, missing/crossed progress receipt, and every
+  partial descendant;
   active-cohort switches between preflight/admission; retirement between zero-
   reference discovery/admission; stale preparation owners; a nonterminal
   private shadow request; missing/unreadable/malformed references; rollback
   from `DRAINING` with the exact Deployment; and removal only after
   `REMOVAL_AUTHORIZED`, with the surviving API verifier retaining only the
   derived tombstone GETs until exact NotFound commits `RETIRED`;
-- concurrent ordinary, paid-capacity, and reserved-fill admission at the cap,
-  commit-before-signal recovery, release/admission and owner-handoff races, and
-  exact loser/no-artifact and no-double-release assertions from the parent;
-- shadow records every eligible candidate, executes one legacy high-level
-  mutation, captures the closed effect-body union with exactly three creates
-  plus one typed job submission (or three UID-preconditioned deletes), and
-  rejects arbitrary job JSON or a missing/extra/mismatched effect; and
-- absence of any new provider queue, worker lease, or domain retry scheduler.
+- mixed action/legacy and launch/down width-one admission at the shared weighted
+  cap, per-service down-cap enforcement, commit-before-signal recovery,
+  release/admission and owner-handoff races, and exact loser/no-artifact and
+  no-double-release assertions from the parent;
+- profile and update/admission races prove that missing, non-Boolean, or true
+  `ReplicaInfo.is_spot`, nonnull `spot_placer` (including
+  a current scalar width of one and explicit `cost_rebalance=false`),
+  `reserved_capacity_fill`, spot/on-demand fallback, accelerator or multi-node
+  resources, logical replica mode, `planned_capacity != 1`,
+  `reserved_fill=true`, `is_zero_cost=true`, an unknown-capacity replacement,
+  or nonnull paid-pool/cost-rebalance replica attribution creates no
+  preparation, coverage, request, or action artifact. Shadow and authoritative
+  updates reject before spec commit, and action paths perform no DML against
+  paid-capacity or reserved-fill tables; after all SQL locks release, the
+  excluded adapter still performs its existing paid/reserved DML under a
+  concurrent capacity-lock fixture;
+- crash qualification commits `STARTED` before any fault, retains incomplete
+  and tainting evidence, and cannot hide `FAIL`/`ABANDONED` with a later pass;
+  the pre-M5a gate requires a fixed exact-M4 86,400-second window with at least
+  100 clean launch and 100 clean down graphs and exact-zero eligible legacy
+  route, unresolved crash intent, stale claim, duplicate effect, divergence,
+  or blocker;
+  claim-disabled exact-M5a staging, the complete 16-selection mixed suite, and
+  the admission-closed policy rotation preserve all-M4 rollback and all-M5a re-
+  upgrade without legacy routing. Policy physical/parser negatives reject zero
+  or three deployment sets; omitted, duplicate, or outside-set selections; and
+  elected/rollback hashes crossed between sets. Only the all-elected selection
+  accrues soak qualification; mixed and all-rollback intervals do not;
+  a distinct post-re-upgrade exact-M5a/Serve039 window repeats those duration/
+  count/exact-zero gates and the complete crash/HA matrix before rollback
+  closure. Serve040 tests then require permanent CLOSED closure policies and
+  global zero shadow/bound work, acquire every owner/service/policy lock before
+  the parent DDL lock, reject direct/offline/missing/wrong callback execution,
+  prove the revision leaves a byte-exact pre/post-catalog handoff and every lock
+  live, prove Alembic advances its version row before the same-connection /
+  same-transaction callback reads actual 040 and builds each predecessor-bound
+  proof, supersede-before-insert to preserve one ACTIVE policy, and
+  accept only an atomic complete default-free catalog/stamp/successor set.
+  Callback or post-run unconsumed-handoff failure rolls back DDL, version row,
+  and policy writes together.
+  Wrong reason/head, premature target, partial set, M4 artifact, or revision-one
+  OPEN successor rejects; fresh 040 process/cohort attestations precede reopen,
+  and a second final exact-M5a/Serve040 86,400-second/100+100 crash/HA window
+  repeats every exact-zero gate;
+- legacy-controller shadow records every provider candidate inside the exact
+  capacity cohort around its one legacy high-level mutation; private represented
+  shadow instead materializes one private request whose handler is the sole
+  effect owner, captures the closed effect-body union with exactly three creates
+  plus one typed job submission (or three UID-preconditioned deletes), never
+  also invokes the legacy mutation, and rejects arbitrary job JSON or a
+  missing/extra/mismatched effect; and
+- absence of any new provider-work queue, action-execution lease, or domain
+  retry scheduler. The registration-liveness lease above grants no execution
+  authority and cannot become a second work scheduler.
 
 The isolated HA smoke test kills API/controller/authority-worker pods at every
 mutation/progress boundary and asserts one logical action, one request per
@@ -6743,19 +13283,107 @@ paths, and no false teardown completion.
 ## Deployment and rollback
 
 Provider changes ship dark, then shadow, then per-service authoritative. The
-blocking migration job must converge all three independent additive
-heads—global-user-state 028, Serve034, and API005 for legacy-only shadow; API007
-(including the API006 progress substrate) is the required API head before any
-private-handler shadow, provider dispatch, or authority. API007 activation
+blocking M4 migration job must first converge all three independent additive
+heads—global-user-state 028, Serve039 after Serve038 first validates exact
+Serve037, preserves the Serve033/034 action foundation plus the unrelated
+Serve035/036/037 additions, including the placement-normalization/retirement
+catalog and any valid nonempty normalization/retirement evidence without
+rewriting it, and installs membership/policy state, and API005 for
+legacy-only shadow; exact API008 (including the API006 progress substrate and
+API007 role/claim foundation) is required before any private-handler shadow,
+provider dispatch, or authority. API008 activation
 uses the parent design's distinct server-owned proof, exact-reads the three
 actual Alembic heads and accepted cohort under the transition transaction, and
+requires the named PostgreSQL request storage/queue identifiers and
+`execution_quiescence_capable=true` on every counted API-instance row, and
 never trusts caller-supplied revision strings alone. There is
 no cross-lineage Alembic dependency. No provider profile is enabled globally by
-schema migration. Application rollback retains all three heads and
+schema migration. The same merged M5a image later supports exact Serve039 and
+Serve040, but 040 is reachable only through the parent design's server-gated
+rollback-closure/head-advance protocol. Application rollback retains all three heads and
 uses only a compatible image that preserves nonnull cluster-record UUIDs as
 write-once commitments and preserves nonterminal shadow/action state. It does
 not run provider compensation or schema down. After first authority, rollback
 to a pre-action-aware image is unsupported.
+
+An older additive-schema-tolerant image may be exercised only in the explicit
+pre-owner dark rollback: a locked inventory must prove zero nonnull lease owner/
+hash/normalized-process-scalar triples; zero process-supersession, lineage,
+action-selector, shadow-terminal-history, shadow-admission-fallback-history,
+shadow-admission-fallback-progress-history, and shadow-settlement-history rows;
+zero request/delivery rows in
+every state for all four private handlers; and no V2 candidate, dispatch,
+action, activation, or admission evidence. The first post-039 lease INSERT/BIND
+that stores an owner triple closes this window even with zero actions.
+Thereafter, while the physical head remains 039, rollback is restricted to a
+policy-approved Serve039/process-aware M4 or M5a image that preserves owner triples and process/terminal history, implements the
+same cancellation, same-Pod supersession, handoff, and cold-recovery batches,
+never derives/remints a process UUID from the stable Pod UID, closes admissions,
+and drains/resumes the exact durable inventory without demotion or state loss.
+A pre-039 image fails the startup/chart gate. After the 040 stamp, M4 is
+durably absent from the one-set policy and only the exact 039/040-aware M5a
+artifact or a qualified forward fix is eligible; no image may downgrade the
+head or re-add the default.
+
+The post-rotation rollback matrix binds an owner under the two-set successor,
+walks all 16 approved M4/M5a role/cohort selections, rolls to the all-M4
+rollback selection, same-Pod restarts mixed action/shadow/pending-cancel
+inventories at 0/16/blocked-17, performs handoff and full cold recovery, then
+re-upgrades to all-M5a at exact Serve039. Owner/process/lineage/selector/shadow bytes remain
+stable, each request terminalizes once, and late old processes reject
+throughout. Before that first rotation the one-set M4 policy permits no older
+post-owner binary; an incident freezes admission and uses exact M4 or a forward
+fix.
+
+The normal M5a merge remains blocked until the canary's exact merged M4 digest
+has held authority for at least 86,400 seconds with at least 100 clean
+represented launch graphs and 100 clean represented down graphs, the complete
+crash/HA matrix, and zero eligible legacy route, unresolved crash intent,
+stale claim, duplicate provider effect, divergence, or blocker. This gate does
+not rotate policy or weaken ownership; it only authorizes merging the already-
+stacked cleanup source.
+
+After authority, a future exact image is not silently added to that compatible
+set. The parent M4 Serve038-backed policy-epoch protocol at live Serve039 first
+attests the exact merged
+artifact in claim-disabled role Pods and a new immutable cohort, moves the
+canary policy `OPEN -> DRAINING -> CLOSED`, proves zero bound work, and
+atomically activates a successor `OPEN` policy whose rollback set is exact M4,
+whose elected set is exact M5a, and whose compatibility inventory is the full
+16-selection Cartesian product. The staged M5a rollout, exact-M4 application
+rollback, and exact-M5a re-upgrade never demote the service or invoke legacy
+provider mutation. A fresh
+post-re-upgrade exact-M5a/Serve039 window then runs for at least 86,400 seconds and at
+least 100 clean represented launch graphs plus 100 clean represented down
+graphs, with the full crash/HA matrix and zero eligible legacy route,
+unresolved crash intent, stale claim, duplicate provider effect, divergence,
+or blocker.
+Only then does #1240 rotate every authoritative service to the permanently
+closed one-set `ROLLBACK_EVIDENCE_CLOSURE` policy, require zero shadow services
+and zero bound work globally, and authorize the distinct Serve040 transaction.
+That transaction locks every owner/service and closure-policy row before
+shadow-parent class 9, exact-reflects the default-bearing 039 catalog, drops
+only the `execution_route='LEGACY_CONTROLLER'` server default, post-reflects,
+and leaves the closed pre/post-catalog/predecessor handoff in the Alembic
+context. Alembic then advances the version row to 040 and its registered
+same-connection/same-transaction callback re-reads actual 040, builds each
+predecessor-bound catalog proof, supersedes the closure row, and inserts the
+closed head-advance successor before the outer commit. It commits the complete
+catalog/version/policy set atomically; callback or unconsumed-handoff failure
+rolls all three back, no physical-040/head-039 state is committed, and
+acknowledgement-loss adopts only the complete 040 set. The same M5a image
+restarts/re-attests every role/
+cohort at actual head 040 and only then reopens. Retained 039 histories remain
+readable but grant no new authority.
+A second final exact-M5a/Serve040 window independently runs for at least 86,400
+seconds, 100 clean launch graphs, 100 clean down graphs, the complete crash/HA
+matrix, and zero eligible legacy route, unresolved crash intent, stale claim,
+duplicate effect, divergence, or blocker.
+No M4 rollback, schema downgrade, service demotion, or ownership
+reversion exists after closure. Any later image change reuses
+`COMPATIBLE_IMAGE_ROTATION` with byte-equal predecessor/actual/successor head
+040 and a newly attested finite compatibility set; it never repeats the 039
+closure/head-advance reasons.
 
 The renderer-body change is also a same-v1 atomic cutover. Keep representation
 and every provider route disabled while all potential readers/writers move to
@@ -7003,11 +13631,13 @@ first removal upgrade or appear as a tombstone for the deletion upgrade, but
 absence from both inventories rejects.
 
 The release-input schema above is also the complete environment contract: five
-literal entries, one database-Secret entry, and the three ordered downward-API
-entries, with no additional resource-field or ambient environment injection.
-The runtime derives `SKYPILOT_API_SERVER_INSTANCE_ID` internally from the
-validated `SKYPILOT_POD_UID` before acquiring its lease; it is not a fourth
-downward-API entry. Manifest, qualification, and TLS paths are fixed code
+literal entries, one database-Secret entry, and four ordered downward-API
+entries (the existing Pod name/namespace/UID plus `POD_IP=status.podIP`), with no additional resource-field or
+ambient environment injection.
+The runtime mints a fresh random `SKYPILOT_API_SERVER_INSTANCE_ID` internally
+for this Python/container start after validating `SKYPILOT_POD_UID`; it never
+derives one from the Pod UID and it is not a fifth downward-API entry. Child
+processes inherit that exact value. Manifest, qualification, and TLS paths are fixed code
 constants rather than extra environment variables.
 Each retirement tombstone is a previously rendered cohort ID; the chart derives
 its two fixed names and rejects arbitrary name overrides. Operational removal
@@ -7067,7 +13697,8 @@ template across the switch. A frozen worker learns only its own full cohort ID
 from its immutable manifest, never the current active suffix.
 
 A full derived cohort ID permanently binds its static manifest plus Deployment and
-ServiceAccount UIDs. An upgrade never changes those fields in place: it adds a
+ServiceAccount UIDs. An upgrade never changes those fields in place. The
+shipped P2a Serve033 registration flow adds a
 new cohort. Both Pods first become `/bootstrapz`-Ready. The first process that
 then observes one exact Deployment generation/resourceVersion at
 spec/status-total/updated/ready/available replicas all two and unavailable zero
@@ -7137,18 +13768,170 @@ P3 exists it only keeps frozen old requests eligible for per-dispatch proof.
 P2a treats Pod/Deployment replacement as a new cohort; claim readiness remains
 false until P3's rolling protocol is implemented.
 
-Moving active selection away does not remove the old cohort. The typed
-retirement helper first locks it and commits `DRAINING`, which rejects new
+Before applying Serve038, the exact M4 image runs a cleanup-only entrypoint at
+actual API008/Serve037/state028 with its migration ceiling held at 037 and all
+executors/private routes disabled. After the current chart deselects each P2a
+cohort, this no-DDL bridge supplies the missing typed accepted-V1 path:
+cohort/reference locking, exact zero-carrier proof,
+`ACCEPTING -> DRAINING -> REMOVAL_AUTHORIZED`, the frozen Serve034 tombstone
+protocol at the exact Serve037 head, and lost-CAS adoption. The current-chart tombstone upgrade removes
+only the exact Deployment/ServiceAccount, so every old Pod is gone before the
+surviving API verifier proves both NotFound results and commits `RETIRED`. The gate proves zero action/reference work, zero
+nonterminal V1 cohort, and zero live/fresh authority-worker server instance. A
+racing V1 append/renew/registration or shipped `REGISTERING -> ACCEPTING` /
+`DRAINING -> ACCEPTING` CAS linearizes on the cohort lock, landing
+before the next bridge CAS or affecting zero later-lifecycle rows.
+Serve038 installs the V2-only nonterminal CHECK above while holding the cohort
+DDL lock; a stale old-binary V1 write therefore fails physically after the
+migration. Every post-038 chart rejects an authority-worker artifact without
+exact-038 capability, and rollback to a pre-038 P2a writer is unsupported.
+
+M4's Serve038 authority-state migration preserves those V1 rows as retirement-
+only history and registers a fresh V2 cohort suffix. The P2a version-1 static
+manifest, `frozen_action_cohort_join_v1` claim contract, Deployment-snapshot
+parser, and exact `Recreate` strategy remain readable only for that Serve034
+cleanup/retirement history. The fresh Serve038 cohort uses a distinct
+version-2 static manifest, exact claim contract
+`frozen_action_cohort_join_v2`,
+`ProviderAuthorityWorkerDeploymentSnapshotV2`, and exact `RollingUpdate`
+strategy with integer `maxSurge=0` and integer `maxUnavailable=1`. V1 and V2
+manifest/snapshot/claim parsers do not accept one another; a crossed version or
+strategy rejects before cohort selection, dispatch proof minting, `/readyz`, or
+claim advertisement. Each V2 worker first
+serves `/livez` and `/bootstrapz`, binds the
+authenticated preflight transport, self-attests its projected manifest/live
+owner chain, and becomes Kubernetes-ready only on `/bootstrapz`; action
+preflight remains unavailable until accepted V2 membership. The first inserts a
+`REGISTERING` Serve038 identity with its own V2 registration; the peer exact-
+reads/adopts that identity and compare-and-swap appends only its own distinct V2
+anchor registration. Each insertion transaction also creates or exact-adopts
+that member's ACTIVE lease, and later renewal follows the global lock order. A
+lost acknowledgement adopts the immutable anchor plus its same-stable-
+identity lease lineage: exact insert operation ID/bytes at generation one, or
+a valid ACTIVE generation/revision-equal descendant through only legal renewal,
+initial owner binding, or retained process-supersession transitions thereafter.
+Both `REGISTERING` shapes keep `deployment_snapshot=null`.
+Neither process reads or invents its peer Pod. A final set-level Deployment read
+after both attestations and the typed V2 two-worker transaction replaces the
+anchors with the exact current lease renewal-registration bytes, atomically
+fills that field, and changes the cohort to `ACCEPTING`; the final resourceVersion is
+not required to equal any per-Pod owner-chain observation because V2 stores it
+only at set level.
+
+The bounded 2026-08-03 runtime implementation reaches this initial membership
+boundary and no farther. Its static entrypoint and the actual Helm
+migration-hook release preflight accept only exact numeric V1 or V2 manifest
+contracts. The hook preserves the frozen Serve034 V1 path and sends only exact
+V2 manifests to an additive typed release-ledger writer. It descriptor-reads
+and parses every projected manifest exactly once, using the same bytes for
+numeric dispatch and typed durable preflight. The retained-row decoder checks
+both raw inventory types and individual/combined 256-entry bounds before any
+hashing, iteration, or manifest decode. Before registration,
+the V2 store locks and fully validates the release row's typed canonical
+uniform-version list, hashes, sorted/unique/bounded/disjoint inventories,
+immutable identities, revision/timestamps, and permanent suffix binding.
+
+The runtime selects the additive V2 coordinator only for an exact parsed V2
+type. V2 performs bounded-time four-GET self/owner-chain projection, initial
+insert/adoption, peer append, own-lease renewal, fresh final set-level
+Deployment projection, and the existing PostgreSQL two-member activation
+transaction. A shared stop gate linearizes every mutating store call and local
+acceptance publication: a read-only observer/store read may outlive the bounded
+join, but it cannot write or publish after `stop()` returns. Crossing this gate
+first relies on transaction-local PostgreSQL
+`statement_timeout=5000ms` and `lock_timeout=3000ms` before locking; the engine
+also bounds pool checkout and connection establishment at 15 seconds each.
+`stop()` then gives the whole gate 30 seconds and errs toward fail-stop if pool
+plus connection setup exhaust that budget. If a DBAPI/network blackhole
+defeats those graceful limits, this dedicated role invokes nonreturning
+`os._exit(70)`, so OS connection close rolls back uncommitted work and stop
+cannot return into a possible late commit/adoption; otherwise its ten-second
+tail join leaves 20 seconds of the 60-second Pod grace for the remaining role
+shutdown. The production role exact-type filters V2 out of the retained V1
+evaluator and passes V2 only to the isolated, zero-queue locked trust reader.
+It never starts the request executor, keeps the API-instance lease unready, and
+advertises no claim. Without a production manager caller for the `PREPARING`
+writer, live V2 requests still receive canonical typed 503; tests with the
+exact durable trust join receive only typed unavailable. Membership acceptance
+and that response authorize no action, request, effect, or provider call.
+Atomic preparation/admission, claim readiness, handoff/cold-recovery runtime,
+and retirement/rollback orchestration remain open gates.
+
+Lost insert/append/promotion acknowledgement is resolved by exact row/revision
+read, never blind replay. Static cohort/transport/principal/claim/RBAC checks
+then enable `/readyz` and the existing claimant; target- and kind-specific
+preflight remains per decision. Own renewal failure or manifest/owner drift
+clears that process's `/readyz` and stops its new claims, claim renewals, and
+effects. Peer expiry stops new `PREPARING` references but does not strand
+already-bound work: a fresh accepted survivor may claim or renew that work
+while the durable handoff proceeds. Subsequent
+`maxSurge=0,maxUnavailable=1` replacement uses only the durable handoff protocol
+above: bootstrap-only candidate, exact stale-UID absence, stale-instance claim
+fence and `OPEN`, post-fence survivor acknowledgement and `READY`, then one
+atomic accepted-membership/final-snapshot commit and `COMPLETED`. The survivor
+does not attest a Deployment resourceVersion; the sole fresh set-level snapshot
+does. `ABANDONED` requires candidate absence plus zero-effect proof, and loss
+of both accepted members uses full-set same-cohort cold recovery. Template,
+image, or Deployment UID change creates a new cohort only while retaining any
+old bound-work cohort unchanged; it cannot transfer or strand frozen work.
+New launch/down
+preparations first create a `PREPARING` reference under that `ACCEPTING`
+identity and then freeze the same resolved cohort returned by preflight.
+Kubernetes `/bootstrapz` readiness during `REGISTERING` proves only the
+self-attestation/health contract; `/readyz` remains false. `ACCEPTING` plus
+active selection gates creation of new
+`PREPARING` references, not claims. The existing queue claim predicate binds
+each worker's own immutable cohort, stable accepted V2 registration membership
+plus its fresh exact-current execution lease/API process membership, and
+an existing `SHADOW_ACTIVE` or `ACTION_ACTIVE` reference. It excludes the stale
+instance in any `OPEN` or `READY` handoff and every nonmember candidate. It
+remains enabled for an otherwise valid cohort in either `ACCEPTING` or
+`DRAINING`, independent of later active selection, so activation has no
+readiness cycle and frozen old work remains recoverable.
+
+Moving active selection away does not remove the old cohort. Every lifecycle
+edge computes `GREATEST(clock_timestamp(), locked_prior.state_changed_at,
+<every affected locked lease.renewed_at>)`, omitting the lease terms only when
+the edge affects no lease, writes it to `state_changed_at`, and uses the same
+value for removal authorization and lease revocation. This preserves the shipped
+`state_changed_at >= created_at` CHECK under wall-clock regression. The typed
+retirement helper first locks cohort -> nonterminal-handoff slot -> both
+accepted registration leases, rejects
+`OPEN | READY` and any currently accepted member with a terminal
+`STALE_HANDOFF`-revoked lease, and commits `DRAINING`, which rejects new
 preparation references while existing preparation, private-shadow, and action
-references remain claimable. After all active references release, one
-transaction locks the cohort and its references, performs fail-closed
+references remain claimable. A separate exceptional
+`ACCEPTING -> REMOVAL_AUTHORIZED` edge is legal only for unresolved terminal-
+stale membership when one transaction continues through references in the
+global order, proves the complete locked zero-non-`RELEASED`-reference/zero-work inventory and
+the same fail-closed defensive scans used for removal, terminally revokes the
+survivor, and sets `removal_authorized_at`. It permits no rollback, cold
+recovery, or later handoff; no unmarked retirement-only `DRAINING` state exists.
+After all
+active references release, one
+transaction locks cohort -> nonterminal handoffs -> every registration lease ->
+references in the global order, rejects `OPEN | READY`, performs fail-closed
 nonlocking defensive reads over authoritative action specs/attempts/requests,
-Serve parent/child evidence, and private shadow requests/coverage attempts, and
-commits `REMOVAL_AUTHORIZED`. Unknown, malformed, inaccessible, cross-identity,
+Serve parent/child evidence, private shadow requests/coverage attempts, and V2
+handoffs, terminally revokes every remaining ACTIVE registration lease, and
+commits `REMOVAL_AUTHORIZED` atomically using one PostgreSQL timestamp. Every
+`COHORT_REMOVAL` lease has null `revocation_owner_id`, preserves its execution-
+owner/hash/normalized-process-scalar triple exactly, records
+`last_operation_kind=REVOKE`, and
+`revoked_at == cohort.removal_authorized_at`. The write-once removal time is
+preserved when `RETIRED` later advances `state_changed_at`. Renewal rechecks lifecycle under the
+cohort lock and rejects from that point forward. An `OPEN` or `READY` handoff is
+an active reference and must reach `COMPLETED` or valid `ABANDONED` first. Unknown,
+malformed, inaccessible, cross-identity,
 or ambiguously decoded state counts as a reference. Only then may the current
-chart remove the Deployment and ServiceAccount; exact NotFound commits
-`RETIRED` without rescanning terminal historical carriers because the durable
-`REMOVAL_AUTHORIZED` state is the authorization fence. Removal moves their exact names into
+chart remove the Deployment and ServiceAccount. The surviving API-role verifier
+then obtains and hashes exact Deployment/ServiceAccount NotFound outside SQL; a
+short no-I/O cohort -> handoff -> leases -> references transaction revalidates
+`REMOVAL_AUTHORIZED`, exact tombstone names, zero non-`RELEASED` references,
+byte-equal retained `RELEASED` history, and both proofs
+before one CAS commits `RETIRED`, setting `retired_at == state_changed_at ==
+GREATEST(clock_timestamp(), removal_authorized_at)` so wall-clock regression
+cannot wedge the edge. Removal moves their exact names into
 `authorityWorker.retirementTombstones`; the surviving API-role retirement
 verifier keeps tombstone-scoped release-namespace GET permission, performs the
 NotFound checks, then locks the stable release row before the cohort and
@@ -7158,11 +13941,27 @@ live first and rejects the stale NotFound result, or sees `RETIRED` and rejects
 recreation. A later chart upgrade prunes the permission. The removed
 worker/ServiceAccount is never the verifier. A
 prepared-but-unadmitted decision therefore pins its old cohort, as do private
-shadow requests and nonterminal actions. Rollback may change
-`DRAINING -> ACCEPTING` only in the transaction that replaces registration
-evidence with two current Pod attestations while the exact Deployment,
-ServiceAccount, qualified image, and manifest still exist; a retired ID is
-never recreated.
+shadow requests and nonterminal actions. Before rollback, the API verifier reads
+and hashes the exact Deployment, ServiceAccount, both Pod owner chains, and one
+final snapshot. `DRAINING -> ACCEPTING` is a no-I/O transaction that locks
+cohort -> handoff -> both registration leases -> both rows named by their
+normalized current execution owners, rechecks owner JSON/scalar/API stable-Pod/
+start equality, and replaces registration
+evidence with one current V2 set containing the exact two current ACTIVE lease
+renewal-registration bytes after stable equality to the membership anchors and
+its sole final Deployment snapshot. Both registration and API server-instance
+leases are fresh and the exact
+renewal bytes and snapshot satisfy the common five-minute bound against that
+transaction's one fresh PostgreSQL timestamp; it validates the pre-read exact
+Deployment, ServiceAccount, qualified image, and manifest and rejects any
+`OPEN | READY` handoff or accepted member with a terminal `STALE_HANDOFF` lease.
+Immediately before commit, fresh PostgreSQL time rechecks both registration/API
+expiries and all proof bounds; drift or a wait past TTL rolls back.
+The source stays `DRAINING` until a chained handoff completes. In contrast,
+`DRAINING -> REMOVAL_AUTHORIZED` remains legal under its exact zero-reference
+proof over non-`RELEASED` rows: it revokes the survivor, retires the incomplete membership, and permits
+no future handoff;
+a retired ID is never recreated.
 
 Claim filtering is by a closed server-owned handler allowlist plus frozen
 cohort predicate in the existing queue query. For action requests the query
@@ -7174,7 +13973,8 @@ matching private shadow/resource-action handlers; ordinary normal executors
 exclude them, and every cohort excludes unrelated public handlers. A
 missing/mixed allowlist, unknown cohort, mutable cohort manifest, or handler
 inventory blocks shadow-window collection and authority. This adds no request
-class, queue row type, claim token, heartbeat, or lease.
+class, queue row type, claim token, heartbeat, or request/action-execution
+lease; the separate registration-liveness lease grants no work authority.
 
 Before either branch, the SQL predicate requires the exact registered private
 payload type `sky.server.requests.payloads:ResourceActionPrivateRequestBodyV1`,
@@ -7191,13 +13991,19 @@ cross-decision, or cross-Deployment reference rejects the claim.
 API-request revision 007 only admits `authority-worker` as a durable
 `api_server_instances.role`; it changes no queue or request shape and preserves
 ordinary API006 rows. General-role query construction excludes the four private
-names without a Serve import or Serve033 relation, while authority startup
-requires the exact registered handler inventory and resolves its immutable
-cohort identity against Serve033 before P3 may call `executor.start()` or start
-queue workers. P2a's health/preflight listeners and bootstrap coordinator start
-before registration and never start that executor. The role therefore
-fails closed on an API007/Serve032 mixed deployment, and ordinary API007
-executors remain operational during the staged Serve033 rollout.
+names without a Serve import or Serve relation. P2a's health/preflight
+listeners and bootstrap coordinator resolve their preflight-only V1 identity
+against Serve033, start before registration, and never start the executor. M4
+authority startup additionally requires exact API008 with the built-in
+PostgreSQL request storage/queue backend attestations and execution-quiescence
+capability, plus the exact registered handler inventory,
+and resolves its immutable V2 cohort identity and fresh leases against Serve038
+plus its execution-authority lineage/head contract against the exact active
+policy-bound Serve039, or policy-bound Serve040 after the gated M5a advance,
+before P3 may call `executor.start()` or start queue workers. The role therefore
+fails closed on an API007/Serve032 P2a deployment and on any live private/M4 deployment
+without exact policy/physical-head equality, while ordinary API007/008 executors remain operational
+through both staged Serve migrations.
 
 P2a renders only the release-namespace self-attestation Role/Binding needed to
 GET Pods and ReplicaSets for the worker's owner chain plus the exact versioned
@@ -7283,27 +14089,77 @@ absence result through a public API.
   provider-authoritative route disabled until the remaining gates below are
   implemented and verified; immutable specs, progress, and codecs alone do not
   authorize provider I/O. Private shadow transition requires
-  `PrivateShadowActivationProofV1`; every live dispatch must atomically consume
-  `PrivateDispatchReadinessProofV1`; authority promotion separately requires
-  `AuthoritativePromotionProofV1`. The pure readiness predicate does not
-  itself enable a route.
-- Merge, build, and dark-verify the implemented P2a slice before enabling a
-  cohort: the six closed wire envelopes, strict TLS/purpose-token transport,
+  `PrivateShadowActivationProofV2`; every live authoritative dispatch must
+  consume `PrivateDispatchReadinessProofV2` at claim-start and persist/exact-
+  adopt Serve039 lineage; authority promotion separately requires
+  `AuthoritativePromotionProofV2`. Private-shadow dispatch remains disabled
+  until its now-specified one-to-one history/progress/return/reduction and same-
+  inventory representability contracts are implemented and verified. The pure readiness predicate does not
+  itself enable a route. The V2-only live parser, native V2 seed/input and
+  launch/down constructors, and sole cleanup rederiver are implemented. The
+  remaining code gate also includes the Serve039 lease-owner/process/lineage /
+  selector/shadow-history migration and separate metadata, PostgreSQL-versus-
+  SQLite target routing, exact API boot/health lifecycle and Serve-owned GC,
+  fixed warmed supervisor/process pool, post-039 INSERT/BIND, current-owner
+  RENEW/acknowledgement, process supersession, generation-only cancellation and
+  terminal batches, stable/process attestation, V2 policy/candidate/proof family,
+  same-engine connection-borrowing API006 seams, claim-start lineage and lost-
+  ACK adoption, bounded historical reduction, and settled-replay validation.
+  The representability code gate includes the authoritative direct-no-
+  effect proof/outcome builder, expanded authoritative handler/direct/fallback
+  parser, raw-invalid profile/classifier integration, shared exact post-
+  materialization projector, final V2 artifact/callable inventories, and
+  finite case inventory/enumerator plus acyclic CI-only goldens.
+  Repository inventory must
+  prove that admission,
+  materialization, claim, provider-context, submit/observe, pre-I/O, recovery,
+  and reducer boundaries reject V1 before any artifact or effect; V1 remains
+  explicit history/cleanup-only parsing.
+- Build an image from exact P2a merge
+  `4c91d3345ccb5f19538c9f8376c5e7403f5644cc`, deploy it dark, and live-
+  qualify it before enabling a cohort: the six closed wire envelopes, strict
+  TLS/purpose-token transport,
   `/bootstrapz` versus `/readyz` split, complete projected manifest,
   Pod/ReplicaSet/Deployment/ServiceAccount observer, PostgreSQL-clock two-Pod
   registration, and post-build OCI qualification. The role starts no queue
   executor and its only accepted response remains typed not-representable. P2a
-  includes same-Pod lease renewal; Pod-replacement/rolling registration remains
-  a P3 gate.
+  includes same-Pod stable-registration refresh only; that is not Serve039
+  current-process owner RENEW. Process-owner bind/supersession and the exact
+  process/API/GC/concurrency suite remain P3 merge gates. The one-set M4 policy
+  has only exact-M4 idempotent redeploy recovery; any new forward-fix binary
+  first requires a qualified successor two-set policy. The distinct
+  all-M5a -> all-M4 -> all-M5a binary rollback matrix runs under the later
+  two-set successor. Pod-replacement /
+  rolling registration.
 - Before the first enabled P2a cohort, implement and live-verify the retained
   release/database anchor above across first-enable crashes, empty values,
   backend/Secret changes, missing Secret, rollback, and ordinary uninstall.
   Keep `resourceActions.authorityWorker.enabled=false` until that gate passes.
-- Before P2b linked represented admission, replace each capsule's full cohort
-  with the locked permanent-row compact reference above and restore every
-  realistic/candidate-maximal full action spec to at most 60,000 bytes. The
-  current exact 60,851-byte launch fixture is an activation blocker; do not
-  increase either the qualification budget or parser ceiling.
+- The additive V2 capsules now use only the compact permanent-row reference,
+  and the authority module owns the typed V2 cohort resolver. Exact structural
+  full-spec
+  goldens are 56,994 bytes for realistic launch, 56,977 for the alternate
+  admitted launch binding, 45,045 for completed down, and 48,560 for the
+  selected candidate-maximal partial down; candidate-maximal keeps admitted
+  frozen inputs byte-exact and maximizes only declared runtime-derived
+  evidence. Their respective SHA-256 values are
+  `7d680f846c37326330903064bc210fb73a67e6b7625b1614b17ce9df6feea733`,
+  `7392f6792ec560ce4a99884b9bc2dd6ac83a4a5925a936ace27de8fcf458891e`,
+  `f638480d05f9283a52c7b1075ab2df9a1a3a8280890f9e01fa10053d3277c82d`,
+  and
+  `b66dabb27ec6f8cb7fff670bf8a1975228741ea80b8aea2c87cd822dd901c796`.
+  A valid nested graph using the generic 1,024-byte workspace maximum
+  renders 62,047 bytes and is rejected by the unchanged 60,000-byte outer
+  qualification gate. The additive V2 preflight parser/transport is complete
+  structural input. Before P2b linked admission, freeze the final V2
+  inventories and prove every live boundary resolves its reference against the
+  parsed locked V2 row, runs the applicable external-context validator, invokes
+  the already-implemented sole cleanup rederiver, and passes the exact finite
+  representability case tuple.
+  Regenerate the full-spec and envelope goldens after binding the V2
+  inventories; the baseline counts and hashes above cannot qualify that
+  changed graph. The exact 60,851-byte frozen V1 launch remains history, not a V2
+  qualification result; do not increase either budget.
 - Exact inventory of existing providers that can propagate a stable
   cluster-record UUID/incarnation before launch; multi-node/compound launch is
   ineligible until all effects have one exact observable target contract.
@@ -7328,10 +14184,10 @@ absence result through a public API.
   proof sequence, preparation/counted-slot gate, and exact partial
   UID-qualified adoption/deletion. Neither execution config currently has a
   runtime consumer capable of provider mutation.
-- Before the live Kubernetes normalizer is implemented, freeze exact server-URL
-  decomposition and rejection rules, including host, default-port, path, IPv6,
-  IDNA, and percent-encoding handling. The pure transport DTO intentionally
-  does not invent those source-normalization rules.
+- Implement the frozen server-URL normalizer above as the sole kubeconfig-
+  server decomposition path and run its DNS/default-port/path/IPv4/IPv6/IDNA /
+  percent-encoding golden matrix before enabling the live Kubernetes
+  normalizer. The pure transport DTO accepts only its canonical output.
 - After P2a, implement the complete live preflight evaluator and same-client runtime
   admission/session, including current-scope drift checks, artifact loading,
   principal/authorization proofs, and the exact request-handler dispatcher.
@@ -7352,13 +14208,18 @@ absence result through a public API.
 - The dark API -> ordinary executor -> controller rollout/current-chart
   rollback is complete. Still open are rendered and live verification of the
   dedicated authority-worker Helm
-  versioned-cohort contract, `REGISTERING`/two-ready-Pod activation,
+  versioned-cohort contract and the implemented Serve038 V2
+  `REGISTERING`/two-ready-Pod/set-level-snapshot activation; runtime
+  `OPEN`/`READY`/`COMPLETED`/`ABANDONED` replacement remains unimplemented,
   release-namespace worker/Service/RBAC/projections, two distinct frozen LB
   Deployments and explicit ServiceAccounts, separate canary workload namespace,
   purpose-specific TLS/token transport, exact same-client facade and
   RBAC/access-review matrices, controller-only preflight network path,
   frozen-cohort claim routing/retention, surviving-API tombstone verification,
-  two-Pod attestation, and a later authority-cohort rollout/rollback with
-  nonterminal references pinned to their cohort.
-- A measured complete-shadow window and minimum volume for launch, retry,
-  ambiguity, and down.
+  two-Pod attestation, candidate/stale/survivor fault injection, and a later
+  authority-cohort rollout/rollback with nonterminal references pinned to their
+  cohort.
+- A measured complete-shadow window of at least 86,400 seconds, at least 100
+  clean represented launch graphs and 100 clean represented down graphs, zero
+  divergence/blockers, and the complete crash/HA inventory. A server policy
+  may raise but never lower these floors.

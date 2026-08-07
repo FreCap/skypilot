@@ -31,6 +31,14 @@ active ordinary-worker gate. M5-S0b1a1 remains the next M5 gate and is still
 subject to its separate public-package authority; no coordinated-worker
 capability or runtime is active.
 
+The bounded Serve P2a preflight-only authority cohort and Serve034 release
+ledger shipped normally in PR #1232 at merge commit
+`4c91d3345ccb5f19538c9f8376c5e7403f5644cc`. They remain forward-only,
+disabled authority infrastructure pending exact dark qualification. The
+remaining Serve M4 tranche layers Serve038 membership, Serve039 history, and
+P2b/P3/P4 on that foundation;
+it neither recreates the preflight cohort nor rolls Serve034 back.
+
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
 here.
@@ -43,6 +51,26 @@ execution lease. References below to migrating Serve onto the proposed generic
 M3 action lease are superseded for central SkyServe launch/down; the broader
 provider ownership, placement, volume, cluster, jobs, image, and SQLite
 compatibility program remains owned here.
+
+Last updated: 2026-08-03. The bounded Serve slice now separates M5a
+eligible-path removal from M5b global retirement. PR #1191 merged only the
+behavior-preserving isolation. One complete M4 feature PR must prove the
+central-PostgreSQL, consolidated, non-pool Kubernetes path with
+`ServeActionCapacityProfileV1` exactly
+`ordinary_ondemand_physical_width1_v1`; its immediately stacked M5a PR may
+remove only that path's legacy fallback after an exact-M4 authoritative
+24-hour/100-launch-graph/100-down-graph/crash window. M4's initial authority
+policy approves exact M4 only. After that window and the normal M5a merge, a
+zero-nonterminal-work monotonic policy rotation approves exact M4 and exact
+M5a; exact-M5a deployment, exact-M4 application rollback, exact-M5a re-upgrade,
+and a final exact-M5a 24-hour/100-launch/100-down crash/HA soak must pass before
+the removal-evidence closure PR. Exact-incarnation non-pool whole-service
+cleanup and failed-service purge are included in M4/M5a. Paid capacity,
+reserved fill, spot/preemptible capacity, placement fallback or failover, and
+logical width other than one are excluded capacity profiles that require
+separate M5b-or-later design and qualification. Pools, orphan cleanup,
+SQLite/non-consolidated stores, and global deletion of the shared compatibility
+runtime also remain M5b here.
 
 ## Summary
 
@@ -72,8 +100,9 @@ convert an ambiguous provider mutation into success.
 
 Every milestone is independently deployable to the isolated `skypilot-ha`
 release in Kubernetes context `boltz-test`. The final migration removes the
-legacy paths listed in the removal ledger after objective usage and rollback
-gates close.
+legacy paths listed in the removal ledger after objective usage and the
+documented forward-rollout, compatible-binary recovery, and evidence gates
+close. It never restores an ownership path that has become authoritative.
 
 ## Current State
 
@@ -7236,7 +7265,100 @@ after its observation carries identity and scope and its shared effect owner is
 fenced. Until then, preserving a visible limitation is safer than silently
 widening legacy authority.
 
-### M5: Serve and pools
+### M5: Serve compatibility and pools
+
+The historical executable manifest permits milestone labels `M0` through `M7`
+only, so its `PLA-M5-*` IDs remain stable. Semantically they are split:
+
+- **M5a — eligible Serve path:** only the central-PostgreSQL, consolidated,
+  non-pool service covered by the companion M4 design and classified by
+  `ServeActionCapacityProfileV1` as exactly
+  `ordinary_ondemand_physical_width1_v1`. Its cleanup removes the authoritative
+  route to process-local launch/down threads, request maps, and retry clocks.
+  Exact-incarnation non-pool whole-service cleanup and failed-service purge are
+  admission sources in this slice and must route each exact eligible replica
+  through the same durable action owner. Excluded services retain
+  `LegacyServeReplicaMutationAdapter`. Global symbol absence is not its gate.
+  M4 preserves the one global weighted provider-work budget across action and
+  legacy launches/downs and intentionally routes eligible whole-service and
+  failed-service cleanup through its durable admission boundary before M5a
+  removes the transitional wrappers. In this cross-design notation, `P` is all
+  action plus legacy replicas projected `PROVISIONING`, `D` is all action plus
+  legacy replicas with down status `RUNNING`, and `C` is the existing non-pool
+  request-parallelism cap. Both routes evaluate the exact pre-admission
+  predicate `2P + D < 2C`; a launch consumes weight two, a down consumes weight
+  one, a row satisfying both predicates contributes both weights, and
+  terminal/no-I/O reduction releases the persisted weight exactly once. The
+  existing launch-before-down order and 64-running-down per-service cap remain
+  unchanged. M4 and M5a do not create a second action-only allowance.
+- **M5b — global compatibility retirement:** pools, orphan teardown,
+  SQLite/local/non-consolidated stores, every unsupported provider profile,
+  paid-capacity claims, reserved-fill launches, spot/preemptible resources,
+  placement fallback or failover, logical width other than one, and deletion
+  of `_LegacyReplicaMutationRuntime`, its proxies, and its characterization
+  test. Each excluded capacity profile requires a separate exact design,
+  atomic admission/release proof, rollout, and removal review. The
+  exact-incarnation whole-service and failed-service call sites remain M5a for
+  the eligible profile; their excluded-profile branches remain behind the
+  adapter. `PLA-GAP-005`, `PLA-M5-016`, and `PLA-M5-019`--`PLA-M5-021` belong
+  here.
+
+The pool `M5-S*` labels below are therefore M5b relative to the bounded Serve
+stack. They remain unchanged to preserve already merged schema, rollout, and
+ledger references. A successful non-pool Serve canary cannot satisfy any pool
+or global-runtime gate.
+
+None of the existing `PLA-M5-001`--`PLA-M5-021` rows can be marked removed by
+that one canary. Rows 001--003, 011, 014, and 017--018 name broad/provider- or
+service-global owners; 004--006, 008--010, and 012--013 are SQLite/local
+stores; 007 is orthogonal status transport; 015--016 are pools; and 019--021
+are global compatibility-runtime deletion. The M4 PR must introduce exact
+temporary authoritative router/fallback symbols and new bounded removal rows:
+022 for `_route_launch_with_transitional_legacy_compatibility`, 023 for
+`_route_down_with_transitional_legacy_compatibility`, 024 for
+`_read_transitional_legacy_operation_state`, and 025 for
+`_recover_transitional_legacy_operation`. Only those new rows may gate M5a,
+and only for `ordinary_ondemand_physical_width1_v1`; they must not depend on
+`ChildWorkloadActuatorV1`, `PLA-GAP-005`/`006`, pool rows, SQLite rows, or
+removal of `LegacyServeReplicaMutationAdapter`. Rows 019--021 remain global
+M5b.
+
+Rows 022--025 are one atomic executable removal bundle, not four independently
+mergeable cleanups. While their future symbols are absent and `planned`, all
+four rows have `introduced_by: null` and the bundle has
+`required_feature_merge: null`. One M4 source commit introduces all four
+symbols together. A later commit in the same M4 PR atomically moves all four
+rows to `present` and gives them the identical `introduced_by` value naming
+that earlier runtime-introducing source commit; no commit attempts to embed its
+own hash. The bundle still cannot guess a future merge SHA. Only after M4
+normally merges may a descendant evidence commit set the bundle's single
+`required_feature_merge` to that exact normal M4 merge. The checker must prove
+the introducing source commit is an ancestor of that feature merge and must
+reject per-member provenance or state drift. At terminal status all members
+share one removal source head, exact-head CI result, normal M5a merge,
+deployment tuple, and rollout evidence. The pre-merge M5a gate is a fixed
+24-hour/100-launch/100-down exact-zero legacy-route, unresolved-crash-intent,
+stale-claim, duplicate-effect, divergence, and blocker window that begins only after the
+exact M4 canary is authoritative and covers manager scale, update replacement,
+launch cancel, whole-service cleanup, failed-service purge, and recovery under
+one policy/spec/profile epoch.
+
+M4 also ships the Serve035 monotonic authority-policy epoch protocol. The
+initial active policy names exact M4 artifacts only. Once the post-M4
+authoritative window above and exact-head M5a CI pass, M5a may normally merge.
+Only then can its exact merge digest be attested in claim-disabled staging.
+Admissions and fresh claims move `OPEN -> DRAINING -> CLOSED`; bound work drains
+to zero, and one service-locked transaction supersedes the immutable M4-only
+policy with a successor `ACTIVE/OPEN` policy approving both exact M5a and the
+exact feature-aware M4 application-rollback artifact. This is a monotonic
+policy rotation: it never demotes the service, restores legacy mutation
+ownership, edits the predecessor policy, or rolls schema back. The rollout
+then performs exact M5a -> exact M4 -> exact M5a under that same successor
+policy, followed by a new exact-M5a 24-hour/100-launch/100-down crash/HA soak
+covering every listed source with zero eligible legacy routing. That final
+window starts after the exact-M5a re-upgrade and cannot reuse counts from the
+post-M4 window or the rollback/re-upgrade exercise. Only the later
+evidence-closure PR may atomically mark the four-member bundle `removed`.
 
 - shadow `ChildWorkloadObservationV1` against current replica job-status
   polling before shared child launch or teardown is reachable;
@@ -12487,6 +12609,28 @@ verified human summary. Every manifest row has a stable
 - the only retained-reference allowlist, recorded evidence, any external
   blocker, and the final removal commit and deployment proof.
 
+Manifest schema version 2 also has a required top-level `removal_bundles`
+collection for changes that must contract atomically. Each bundle binds an
+exact member set, retained semantic locators, one nullable
+`required_feature_merge`, one rollout contract, and shared terminal evidence.
+`PLA-M5-022`--`PLA-M5-025` are one such bundle. While its symbols are absent
+and its rows are `planned`, every `introduced_by` and
+`required_feature_merge` is null. One source commit introduces all four
+symbols; a later commit in the same M4 PR atomically advances the members and
+records that earlier source commit as their identical `introduced_by`. Only a
+later descendant commit, after the normal M4 merge exists, may set
+`required_feature_merge` to that merge. From `gating` onward, and for every
+terminal transition, the checker rejects independent member state or evidence.
+Each completed rollout stage has one closed evidence mapping with ordered exact
+artifact merge SHAs and OCI digests, the active authority-policy SHA-256,
+database-observed UTC start/completion times, clean launch/down graph counts,
+and exact-zero eligible-legacy-route, unresolved-crash-intent, and duplicate-
+effect counts plus retained evidence locators. The checker resolves every Git
+SHA, computes the minimum duration, enforces the declared count floors, and
+requires every stage at terminal status; free-form success text is not rollout
+proof. For bundled newly introduced seams it also proves every member locator
+is absent in the introducing source commit's parent and present in that commit.
+
 Known inventory that cannot yet be assigned safely to an executable removal
 row is never omitted. It is recorded under the required top-level
 `coverage_gaps` list with a stable `PLA-GAP-NNN` ID, exact candidate symbols,
@@ -12974,6 +13118,13 @@ Each stacked commit follows this gate:
     forward fix or drain plus permanent destruction of every affected worker,
     never an in-place old-image rollback.
 
+The M5 restriction in step 12 applies to the fenced pooled-worker coordination
+subprogram. The bounded non-pool Serve M5a stack uses its companion design's
+separate monotonic authority-policy protocol: it may roll application binaries
+between exact artifacts approved by the active successor policy, but never
+changes `authoritative`, rolls schema back, restores legacy mutation ownership,
+or reuses a destroyed pooled-worker identity.
+
 No deployment result is inferred from a successful image push or Helm command.
 The final live revision is re-read after monitoring. Until the health endpoint
 contains a stamped commit, source identity is proven by the immutable image
@@ -12998,6 +13149,14 @@ identity evidence.
   but image rollback is permitted only after the current-image preflight proves
   every `placement_attempt_fence` is null.
 - New schema is expand-first. Old readers ignore new tables and columns.
+- Bounded Serve M5a promotion/cleanup is forward-only in ownership. Its initial
+  policy approves exact M4 only; after M4's authoritative window and the normal
+  M5a merge, an admission-closed, zero-nonterminal-work service-locked rotation
+  activates an immutable successor policy approving exact M4 and exact M5a.
+  Exact-M5a -> exact-M4 -> exact-M5a rollout verification and the final
+  exact-M5a 24-hour/100-launch/100-down soak keep additive heads and action
+  authority throughout; they never restore the removed routing seam and are
+  not the coordinated pooled-worker in-place rollback prohibited above.
 - Mutation ownership switches behind a server-side gate and can return to the
   old writer only before the new writer performs an irreversible action.
 - Ownership epochs are independent rows keyed by domain, dependency-closed
