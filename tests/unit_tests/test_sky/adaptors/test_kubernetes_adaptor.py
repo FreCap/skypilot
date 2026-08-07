@@ -445,7 +445,7 @@ def test_provider_calls_share_verified_client_concurrently(
 def test_unleased_overlap_cannot_borrow_active_fence(monkeypatch, tmp_path):
     """A raw worker without the caller lease fails closed during overlap."""
     _install_physical_fence_capture(monkeypatch, tmp_path)
-    context = 'phx-context'
+    context = 'unleased-active-overlap-context'
 
     with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -465,7 +465,7 @@ def test_unleased_overlap_cannot_borrow_active_fence(monkeypatch, tmp_path):
 def test_unleased_overlap_fails_closed_while_fence_initializes(
         monkeypatch, tmp_path):
     """Ambient callers cannot race the capture-before-publication window."""
-    context = 'phx-context'
+    context = 'unleased-initializing-overlap-context'
     capture_started = threading.Event()
     release_capture = threading.Event()
     initializer_errors = []
