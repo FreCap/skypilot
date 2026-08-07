@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { CircularProgress } from '@mui/material';
 import { useRouter } from 'next/router';
 import { Card } from '@/components/ui/card';
@@ -40,9 +40,17 @@ import { JobLogViewer } from '@/components/job-log-viewer';
 import { ControllerLogsSection } from '@/components/controller-logs-section';
 import { JobInfoSection } from '@/components/job-info-section';
 
+function clampRouteIndex(index, itemCount) {
+  if (!Number.isInteger(index) || index < 0 || index >= itemCount) {
+    return 0;
+  }
+  return index;
+}
+
 function JobDetails() {
   const router = useRouter();
   const { job: jobId, tab } = router.query;
+  const jobRouteKey = Array.isArray(jobId) ? jobId[0] : jobId;
   const { jobData, loading, refreshJobData } = useSingleManagedJob(jobId);
   const poolsData = useManagedJobPools(jobData?.jobs, jobId);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -90,6 +98,7 @@ function JobDetails() {
   // Telemetry task selection for job groups
   const [telemetryTaskIndex, setTelemetryTaskIndex] = useState(0);
   const TELEMETRY_EXPANDED_KEY = 'skypilot-jobs-telemetry-expanded';
+  const activeJobIdRef = useRef(jobRouteKey);
 
   // Check Grafana availability on mount
   useEffect(() => {
@@ -192,8 +201,22 @@ function JobDetails() {
     setRefreshControllerLogsFlag((prev) => prev + 1);
   };
 
-  // Get all tasks for this job (supports multi-task jobs) - computed early for telemetry
-  const allTasksForTelemetry = useMemo(() => {
+  // Keep route-owned UI state scoped to the current job. The render path uses
+  // default selections immediately on a route change, while the effects below
+  // synchronize the backing state after the new route commits.
+  useEffect(() => {
+    if (activeJobIdRef.current !== jobRouteKey) {
+      activeJobIdRef.current = jobRouteKey;
+      setSelectedTaskIndex(0);
+      setTelemetryTaskIndex(0);
+      setSelectedNode('all');
+      setLogNodes([]);
+      setLogExtractedLinks({});
+    }
+  }, [jobRouteKey]);
+
+  // Get all tasks for this job (supports multi-task jobs)
+  const allTasks = useMemo(() => {
     return (
       jobData?.jobs?.filter((item) => String(item.id) === String(jobId)) || []
     );
@@ -201,7 +224,7 @@ function JobDetails() {
 
   // Determine which tasks have telemetry (Kubernetes, not pool, has cluster_name_on_cloud)
   const tasksWithTelemetry = useMemo(() => {
-    return allTasksForTelemetry.map((task, index) => ({
+    return allTasks.map((task, index) => ({
       index,
       task,
       hasMetrics:
@@ -209,26 +232,59 @@ function JobDetails() {
         !task.pool &&
         task.cluster_name_on_cloud,
     }));
-  }, [allTasksForTelemetry]);
+  }, [allTasks]);
 
   const hasAnyTaskWithTelemetry = tasksWithTelemetry.some((t) => t.hasMetrics);
+  const ownsRouteState = activeJobIdRef.current === jobRouteKey;
+  const currentSelectedTaskIndex = clampRouteIndex(
+    ownsRouteState ? selectedTaskIndex : 0,
+    allTasks.length
+  );
+  const currentTelemetryTaskIndex = clampRouteIndex(
+    ownsRouteState ? telemetryTaskIndex : 0,
+    allTasks.length
+  );
+  const currentSelectedNode = ownsRouteState ? selectedNode : 'all';
+  const currentLogNodes = useMemo(
+    () => (ownsRouteState ? logNodes : []),
+    [ownsRouteState, logNodes]
+  );
+  const currentLogExtractedLinks = useMemo(
+    () => (ownsRouteState ? logExtractedLinks : {}),
+    [ownsRouteState, logExtractedLinks]
+  );
+
+  useEffect(() => {
+    if (selectedTaskIndex !== currentSelectedTaskIndex) {
+      setSelectedTaskIndex(currentSelectedTaskIndex);
+    }
+  }, [currentSelectedTaskIndex, selectedTaskIndex]);
+
+  useEffect(() => {
+    if (telemetryTaskIndex !== currentTelemetryTaskIndex) {
+      setTelemetryTaskIndex(currentTelemetryTaskIndex);
+    }
+  }, [currentTelemetryTaskIndex, telemetryTaskIndex]);
+
+  useEffect(() => {
+    if (
+      currentSelectedNode !== 'all' &&
+      !currentLogNodes.includes(currentSelectedNode)
+    ) {
+      setSelectedNode('all');
+    }
+  }, [currentLogNodes, currentSelectedNode]);
 
   // Get the currently selected task for telemetry
-  const telemetryTask =
-    allTasksForTelemetry[telemetryTaskIndex] || allTasksForTelemetry[0];
+  const telemetryTask = allTasks[currentTelemetryTaskIndex] || allTasks[0];
 
   // Get cluster name for telemetry from selected task
   const telemetryClusterName =
-    telemetryTask?.cluster_name_on_cloud ||
-    allTasksForTelemetry[0]?.cluster_name_on_cloud;
+    telemetryTask?.cluster_name_on_cloud || allTasks[0]?.cluster_name_on_cloud;
 
   if (!router.isReady) {
     return <div>Loading...</div>;
   }
-
-  // Get all tasks for this job (supports multi-task jobs)
-  const allTasks =
-    jobData?.jobs?.filter((item) => String(item.id) === String(jobId)) || [];
 
   // Use the first task for main details display
   const detailJobData = allTasks.length > 0 ? allTasks[0] : null;
@@ -338,7 +394,7 @@ function JobDetails() {
                     allTasks={allTasks}
                     poolsData={poolsData}
                     links={enhancedJobData?.links}
-                    logExtractedLinks={logExtractedLinks}
+                    logExtractedLinks={currentLogExtractedLinks}
                   />
                 </div>
               </Card>
@@ -507,7 +563,7 @@ function JobDetails() {
                         onValueChange={(value) =>
                           setSelectedTaskIndex(parseInt(value, 10))
                         }
-                        value={String(selectedTaskIndex)}
+                        value={String(currentSelectedTaskIndex)}
                       >
                         <SelectTrigger
                           aria-label="Task"
@@ -530,7 +586,7 @@ function JobDetails() {
                     )}
                     <Select
                       onValueChange={(value) => setSelectedNode(value)}
-                      value={selectedNode}
+                      value={currentSelectedNode}
                     >
                       <SelectTrigger
                         aria-label="Node"
@@ -540,7 +596,7 @@ function JobDetails() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="all">All Nodes</SelectItem>
-                        {logNodes.map((node) => (
+                        {currentLogNodes.map((node) => (
                           <SelectItem key={node} value={node}>
                             {node.charAt(0).toUpperCase() + node.slice(1)}
                           </SelectItem>
@@ -607,8 +663,11 @@ function JobDetails() {
                 </div>
                 <div className="p-4">
                   <JobLogViewer
+                    key={jobRouteKey || 'managed-job-logs'}
                     jobData={
-                      isMultiTask ? allTasks[selectedTaskIndex] : detailJobData
+                      isMultiTask
+                        ? allTasks[currentSelectedTaskIndex]
+                        : detailJobData
                     }
                     activeTab="logs"
                     setIsLoadingLogs={setIsLoadingLogs}
@@ -616,8 +675,10 @@ function JobDetails() {
                     isLoadingLogs={isLoadingLogs}
                     isLoadingControllerLogs={isLoadingControllerLogs}
                     refreshFlag={refreshLogsFlag}
-                    selectedTaskIndex={isMultiTask ? selectedTaskIndex : null}
-                    selectedNode={selectedNode}
+                    selectedTaskIndex={
+                      isMultiTask ? currentSelectedTaskIndex : null
+                    }
+                    selectedNode={currentSelectedNode}
                     onNodesExtracted={setLogNodes}
                     onLinksExtracted={setLogExtractedLinks}
                   />
@@ -631,7 +692,7 @@ function JobDetails() {
                 clusterNameOnCloud={telemetryClusterName}
                 displayName={
                   isMultiTask
-                    ? `${telemetryTask?.task || telemetryTask?.name || detailJobData.name} (Task ${telemetryTaskIndex})`
+                    ? `${telemetryTask?.task || telemetryTask?.name || detailJobData.name} (Task ${currentTelemetryTaskIndex})`
                     : telemetryTask?.task ||
                       telemetryTask?.name ||
                       detailJobData.name
@@ -652,7 +713,7 @@ function JobDetails() {
                       onValueChange={(value) =>
                         setTelemetryTaskIndex(parseInt(value, 10))
                       }
-                      value={String(telemetryTaskIndex)}
+                      value={String(currentTelemetryTaskIndex)}
                     >
                       <SelectTrigger
                         onClick={(e) => e.stopPropagation()}
