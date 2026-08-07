@@ -19,6 +19,7 @@ from sky.serve import serve_utils
 from sky.serve.server import controller_proxy as serve_controller_proxy
 from sky.server import common
 from sky.server import config as server_config
+from sky.server import constants as server_constants
 from sky.server import middleware_utils
 from sky.server.auth import loopback
 from sky.server.auth import user_registration
@@ -224,6 +225,11 @@ class BasicAuthMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     """Middleware to handle HTTP Basic Auth."""
 
     async def dispatch(self, request: fastapi.Request, call_next):
+        if server_constants.is_unauthenticated_public_request(
+                request.method, request.url.path):
+            request.state.anonymous_user = True
+            return await call_next(request)
+
         # If a previous middleware already authenticated the user, pass through
         if request.state.auth_user is not None:
             return await call_next(request)
@@ -295,6 +301,11 @@ class BearerTokenMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         X-Skypilot-Auth-Mode header. The auth proxy should either validate the
         auth or set the header X-Skypilot-Auth-Mode: token.
         """
+        if server_constants.is_unauthenticated_public_request(
+                request.method, request.url.path):
+            request.state.anonymous_user = True
+            return await call_next(request)
+
         # If a previous middleware already authenticated the user, pass through
         if request.state.auth_user is not None:
             return await call_next(request)
@@ -520,6 +531,11 @@ class AuthProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
             logger.debug('AuthProxyMiddleware disabled via configuration')
 
     async def dispatch(self, request: fastapi.Request, call_next):
+        if server_constants.is_unauthenticated_public_request(
+                request.method, request.url.path):
+            request.state.anonymous_user = True
+            return await call_next(request)
+
         if not self.config.enabled:
             return await call_next(request)
 

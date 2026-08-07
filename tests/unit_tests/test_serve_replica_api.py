@@ -35,10 +35,13 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert execution_quiescence_version == 70
     pricing_version = (server_constants.MIN_SERVE_DASHBOARD_PRICING_API_VERSION)
     assert pricing_version == 71
+    public_capacity_version = (server_constants.MIN_PUBLIC_CAPACITY_API_VERSION)
+    assert public_capacity_version == 72
     assert (server_constants.MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION
             < server_constants.API_VERSION)
     assert execution_quiescence_version < pricing_version
-    assert server_constants.API_VERSION == pricing_version
+    assert pricing_version < public_capacity_version
+    assert server_constants.API_VERSION == public_capacity_version
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():

@@ -65,6 +65,13 @@ _DEFAULT_USER_BLOCKLIST = [{
 # endpoint NOT on this list is denied for viewers, including any new
 # endpoints added in the future.
 _DEFAULT_VIEWER_ALLOWLIST = [
+    # --- Public reads ---
+    {
+        # This route is also available to unauthenticated callers. Keep an
+        # explicit viewer decision so the route inventory remains fail-closed.
+        'path': '/api/v1/public/capacity',
+        'method': 'GET'
+    },
     # --- Authentication / session ---
     {
         'path': '/users/role',
