@@ -1163,6 +1163,75 @@ def test_get_job_cancellation_state_rows_use_latest_task_only(
     assert counts['n'] == 1, counts
 
 
+def test_get_job_cancellation_state_rows_preserve_duplicate_nonterminal_latest_task(  # pylint: disable=line-too-long
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    _set_controller_process(engine, active_job, 101, 1001.5)
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert(), [{
+            'spot_job_id': active_job,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': state.ManagedJobStatus.RUNNING.value,
+        }, {
+            'spot_job_id': active_job,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': state.ManagedJobStatus.SUCCEEDED.value,
+        }])
+
+    with _count_sql_statements(engine) as counts:
+        rows = state._fetch_job_cancellation_state_rows(
+            [active_job, active_job])
+
+    assert rows == [(active_job, 0, state.ManagedJobStatus.RUNNING.value,
+                     'team-a')]
+    assert counts['n'] == 1, counts
+
+
+def test_get_job_cancellation_states_preserve_duplicate_nonterminal_latest_task(  # pylint: disable=line-too-long
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    _set_controller_process(engine, active_job, 101, 1001.5)
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert(), [{
+            'spot_job_id': active_job,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': state.ManagedJobStatus.RUNNING.value,
+        }, {
+            'spot_job_id': active_job,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': state.ManagedJobStatus.SUCCEEDED.value,
+        }])
+
+    with _count_sql_statements(engine) as counts:
+        snapshots = state.get_job_cancellation_states([active_job, active_job])
+
+    assert snapshots == {
+        active_job: state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                               'team-a'),
+    }
+    assert counts['n'] == 1, counts
+
+
 def test_get_job_cancellation_states_chunking_preserves_snapshots(
         _mock_managed_jobs_db_conn, monkeypatch):
     engine = _mock_managed_jobs_db_conn
