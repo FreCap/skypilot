@@ -71,8 +71,9 @@ When spot replicas are available, SkyServe will automatically switch back to usi
 Cost-aware multi-GPU placement
 ------------------------------
 
-For a heterogeneous ``resources.any_of`` fleet, set ``spot_placer`` to
-``dynamic_fallback_per_gpu`` to fill the lowest-cost active machine shape by
+For a heterogeneous GPU ``resources.any_of`` fleet with per-GPU concurrency,
+``dynamic_fallback_per_gpu`` is the primary placement policy. It fills the
+lowest-cost active machine shape by
 hourly price divided by accelerator count. SkyPilot keeps selecting that shape
 until a launch failure temporarily benches its exact location, then falls
 through to the next-cheapest active candidate. Benched locations become
@@ -107,8 +108,9 @@ instance-shape lists. Configured cloud and region constraints still apply.
           accelerators: L4
           use_spot: true
 
-``dynamic_fallback`` continues to compare raw hourly machine prices. Use the
-per-GPU policy only when each configured GPU contributes one equivalent serving
+``dynamic_fallback`` continues to compare raw hourly machine prices and count
+physical backends; pools use that physical-worker contract. Use the per-GPU
+policy when each configured GPU contributes one equivalent serving
 slot. The policy automatically makes ``min_replicas``, ``max_replicas``, and
 the autoscaler target count logical GPU slots, while the selected physical
 backend shape stays internal to SkyServe. A positive integer
@@ -126,9 +128,9 @@ to discover additional shapes.
 
 .. note::
 
-    Upgrade the SkyPilot API server and service controllers before updating an
-    existing service to ``dynamic_fallback_per_gpu``. Older controllers do not
-    recognize the new opt-in placer name.
+    Controllers that predate ``dynamic_fallback_per_gpu`` do not recognize the
+    policy. Before updating an existing service, make sure the SkyPilot API
+    server and service controllers run a release that supports it.
 
 Cost-aware replacement
 ----------------------

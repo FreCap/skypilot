@@ -15,7 +15,19 @@ from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
 from sky.container_images import models as container_image_models
+from sky.serve import placement_policy
+from sky.serve import service_spec as service_spec_lib
 from sky.serve import spot_placer
+
+
+def _physical_contract():
+    return placement_policy.resolve_fresh_contract(
+        placement_policy.SPOT_HEDGE_PLACER, pool=False)
+
+
+def _logical_contract():
+    return placement_policy.resolve_fresh_contract(
+        placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
 
 
 class TestCentralPlacementCatalog:
@@ -150,7 +162,9 @@ run: echo hi
                 '_get_possible_location_from_task',
                 side_effect=AssertionError(
                     'persisted catalog load must not enumerate providers')):
-            placer = spot_placer.SpotPlacer(task, placement_catalog=catalog)
+            placer = spot_placer.SpotPlacer(task,
+                                            _physical_contract(),
+                                            placement_catalog=catalog)
 
         assert placer.cost_per_hour(paid) == 0.2
         assert placer.zero_cost_locations() == [reserved]
@@ -326,7 +340,10 @@ run: echo hi
                             lambda cloud, workspace: {})
 
         placer = spot_placer.DynamicFallbackSpotPlacer(
-            task, placement_catalog=catalog, workspace='default')
+            task,
+            _physical_contract(),
+            placement_catalog=catalog,
+            workspace='default')
 
         # The immutable version catalog remains intact, but every runtime
         # placement/reserved-fill view contains eligible locations only.
@@ -381,7 +398,10 @@ run: echo hi
         monkeypatch.setattr(spot_placer.skypilot_config, 'get_workspace_cloud',
                             _workspace_cloud)
         placer = spot_placer.DynamicFallbackSpotPlacer(
-            task, placement_catalog=catalog, workspace='research')
+            task,
+            _physical_contract(),
+            placement_catalog=catalog,
+            workspace='research')
 
         with mock.patch.object(spot_placer.skypilot_config,
                                'safe_reload_config') as reload_config:
@@ -446,7 +466,10 @@ run: echo hi
             if cloud == cloud_name.lower() else {})
 
         placer = spot_placer.DynamicFallbackSpotPlacer(
-            task, placement_catalog=catalog, workspace='research')
+            task,
+            _physical_contract(),
+            placement_catalog=catalog,
+            workspace='research')
 
         assert placer.known_locations() == []
         assert placer.active_locations() == []
@@ -475,8 +498,9 @@ def hybrid_placer():
 
 
 def _make_per_gpu_placer(costs):
-    placer = spot_placer.CapacityAwareDynamicFallbackSpotPlacer.__new__(
-        spot_placer.CapacityAwareDynamicFallbackSpotPlacer)
+    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
+        spot_placer.DynamicFallbackSpotPlacer)
+    placer._placement_contract = _logical_contract()
     placer.location2status = {
         location: spot_placer.LocationStatus.ACTIVE for location in costs
     }
@@ -874,7 +898,7 @@ class TestProvisionTimeoutWarning:
         warning = mock.MagicMock()
         monkeypatch.setattr(spot_placer.logger, 'warning', warning)
 
-        spot_placer.DynamicFallbackSpotPlacer(task)
+        spot_placer.DynamicFallbackSpotPlacer(task, _physical_contract())
 
         warning.assert_not_called()
         assert get_timeout.call_args.kwargs['override_configs'] == task_override
@@ -1287,6 +1311,24 @@ run: echo hi
         k8s_resource._accelerators = {  # pylint: disable=protected-access
             'A100': gpu_count
         }
+
+        with pytest.raises(ValueError, match='one-GPU Kubernetes fill shapes'):
+            serve_utils.validate_service_task(task, pool=False)
+
+    def test_historical_physical_per_gpu_contract_still_requires_one_gpu(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        task = self._task([('ctx-a', 'A100', 2)], logical=True)
+        assert task.service is not None
+        legacy_state = dict(task.service.__dict__)
+        for field in placement_policy.CONTRACT_FIELDS:
+            legacy_state.pop(field)
+        legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+        legacy = service_spec_lib.SkyServiceSpec.__new__(
+            service_spec_lib.SkyServiceSpec)
+        legacy.__setstate__(legacy_state)
+        assert legacy.placement_contract.is_legacy_physical_per_gpu
+        task.set_service(legacy)
 
         with pytest.raises(ValueError, match='one-GPU Kubernetes fill shapes'):
             serve_utils.validate_service_task(task, pool=False)

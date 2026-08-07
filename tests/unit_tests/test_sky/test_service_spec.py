@@ -5,6 +5,7 @@ import pytest
 
 import sky
 from sky.serve import constants as serve_constants
+from sky.serve import placement_policy
 from sky.serve import serve_utils
 from sky.serve import service_spec
 
@@ -18,6 +19,8 @@ def test_default_min_replicas_is_zero():
 def test_old_pickled_spec_backfills_non_pool_interface():
     spec = service_spec.SkyServiceSpec.from_yaml_config({})
     state = spec.__dict__.copy()
+    for field in placement_policy.CONTRACT_FIELDS:
+        state.pop(field)
     state.pop('_pool')
     restored = object.__new__(service_spec.SkyServiceSpec)
 

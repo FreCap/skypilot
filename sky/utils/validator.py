@@ -9,6 +9,11 @@ import jsonschema
 
 def case_insensitive_enum(validator, enums, instance, schema):
     del validator, schema  # Unused.
+    # Leave non-string rejection to the schema's type validator.  Custom
+    # validators are still invoked for sibling keywords when a type does not
+    # match, including while evaluating nullable anyOf branches.
+    if not isinstance(instance, str):
+        return
     if instance.lower() not in [enum.lower() for enum in enums]:
         yield jsonschema.ValidationError(
             f'{instance!r} is not one of {enums!r}')

@@ -6,7 +6,7 @@ def get_service_schema():
     # To avoid circular imports, only import when needed.
     # pylint: disable=import-outside-toplevel
     from sky.serve import load_balancing_policies
-    from sky.serve import spot_placer
+    from sky.serve import placement_policy
     return {
         '$schema': 'https://json-schema.org/draft/2020-12/schema',
         'type': 'object',
@@ -210,10 +210,14 @@ def get_service_schema():
                     # Pools count physical workers, so the logical per-GPU
                     # placer is intentionally excluded.
                     'spot_placer': {
-                        'type': 'string',
-                        'case_insensitive_enum': [
-                            spot_placer.SPOT_HEDGE_PLACER
-                        ],
+                        'anyOf': [{
+                            'type': 'null',
+                        }, {
+                            'type': 'string',
+                            'case_insensitive_enum': [
+                                placement_policy.SPOT_HEDGE_PLACER
+                            ],
+                        }],
                     },
                 },
             },
@@ -431,9 +435,13 @@ def get_service_schema():
                         'minimum': 0,
                     },
                     'spot_placer': {
-                        'type': 'string',
-                        'case_insensitive_enum': list(
-                            spot_placer.SPOT_PLACERS.keys())
+                        'anyOf': [{
+                            'type': 'null',
+                        }, {
+                            'type': 'string',
+                            'case_insensitive_enum': list(
+                                placement_policy.SUPPORTED_SPOT_PLACERS),
+                        }],
                     },
                     'upscale_delay_seconds': {
                         'type': 'number',

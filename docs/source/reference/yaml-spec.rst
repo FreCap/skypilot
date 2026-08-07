@@ -1702,10 +1702,12 @@ Describes how SkyServe autoscales your service based on the QPS (queries per sec
         max_replicas: 5
         target_qps_per_replica: 10
 
-For async multi-GPU services, the ``dynamic_fallback_per_gpu`` spot placer
-automatically changes these public replica counts to logical GPU slots. All
-other placement strategies keep the historical meaning of one replica per
-physical SkyServe backend. This unit is an internal consequence of the placer,
+For async multi-GPU concurrency services, ``dynamic_fallback_per_gpu`` is the
+primary spot placer. It automatically changes these public replica counts to
+logical GPU slots. ``dynamic_fallback`` and all other placement strategies keep
+the historical meaning of one replica per physical SkyServe backend. Job pools
+that use cost-aware placement therefore use ``dynamic_fallback``; pools may
+also omit ``spot_placer``. This unit is an internal consequence of the placer,
 not a separate user setting.
 
 The per-GPU placer currently supports the local async router's

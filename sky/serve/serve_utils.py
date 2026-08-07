@@ -1496,7 +1496,7 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
         resource for resource in task.resources if resource.use_spot
     ]
     has_spot_placer = (task.service is not None and
-                       task.service.spot_placer is not None)
+                       task.service.placement_contract.enabled)
     # A spot placer may manage a heterogeneous set that mixes spot cloud
     # entries with non-spot reserved-capacity entries (e.g. a zero-cost
     # Kubernetes pool): each launch is pinned to its location's spot-ness.
@@ -1559,13 +1559,14 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                           isinstance(gpu_count, (int, float)))
             is_finite = is_numeric and math.isfinite(float(gpu_count))
             is_whole = is_finite and float(gpu_count).is_integer()
-            if (task.service.uses_logical_replicas and
+            if (task.service.placement_contract.
+                    requires_single_gpu_reserved_fill and
                 (not is_whole or float(gpu_count) != 1.0)):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
-                        'dynamic_fallback_per_gpu with '
+                        'The per-GPU placement contract with '
                         'reserved_capacity_fill requires one-GPU Kubernetes '
-                        'fill shapes so broker slots equal logical slots. '
+                        'fill shapes so broker slots equal placement slots. '
                         f'Got {gpu_name}:{gpu_count!r}.')
             if not is_whole or float(gpu_count) < 1:
                 with ux_utils.print_exception_no_traceback():
@@ -1587,13 +1588,15 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     'reserved_capacity_fill requires one GPU count within '
                     'each Kubernetes context; got context widths '
                     f'{inconsistent_contexts}.')
-        if (task.service.uses_logical_replicas and pool_widths and
+        if (task.service.placement_contract.requires_single_gpu_reserved_fill
+                and pool_widths and
                 any(widths != {1} for widths in pool_widths.values())):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
-                    'dynamic_fallback_per_gpu with reserved_capacity_fill '
+                    'The per-GPU placement contract with '
+                    'reserved_capacity_fill '
                     'requires one-GPU Kubernetes fill shapes so broker slots '
-                    'equal logical slots.')
+                    'equal placement slots.')
 
     # Validate the placer contract without enumerating providers. The final
     # policy-mutated task gets one complete catalog immediately before its
@@ -1609,7 +1612,7 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     '`use_ondemand_fallback` is only supported '
                     'for spot resources. Please explicitly specify '
                     '`use_spot: true` in resources for on-demand fallback.')
-        if (task.service.spot_placer is not None and
+        if (task.service.placement_contract.enabled and
                 not requested_resources.use_spot and not spot_resources):
             # Non-spot entries are fine under a placer as the reserved
             # zero-cost tier of a mixed set — but a placer over a set with

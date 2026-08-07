@@ -18,6 +18,7 @@ from unittest import mock
 
 from spot_placer_test_utils import make_location
 
+from sky.serve import placement_policy
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_allocation as allocation
 from sky.serve import spot_placer
@@ -40,8 +41,11 @@ def _make_zero_cost_placer(benched_at=None):
     Skips __init__ (task-based discovery) and wires only the state the
     launchability views read, mirroring spot_placer_test_utils.make_placer.
     """
-    placer = spot_placer.CapacityAwareDynamicFallbackSpotPlacer.__new__(
-        spot_placer.CapacityAwareDynamicFallbackSpotPlacer)
+    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
+        spot_placer.DynamicFallbackSpotPlacer)
+    placer._placement_contract = (  # pylint: disable=protected-access
+        placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
     locations = [_K8S_A100_80GB, _K8S_A100]
     placer.location2status = {
         location: spot_placer.LocationStatus.ACTIVE for location in locations
@@ -282,6 +286,9 @@ class TestPaidTierProbeThrottleIsCorrect:
                                  cloud_name='AWS')
         placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
             spot_placer.DynamicFallbackSpotPlacer)
+        placer._placement_contract = (  # pylint: disable=protected-access
+            placement_policy.resolve_fresh_contract(
+                placement_policy.SPOT_HEDGE_PLACER, pool=False))
         placer.location2status = {
             aws_spot: spot_placer.LocationStatus.PREEMPTED
         }
