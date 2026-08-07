@@ -1,44 +1,60 @@
 # SkyServe System OOM Recovery
 
-_Status: #1182 is merged. The 2026-08-04 production audit found exact release
-1.1.1084 from source `5b301925560f2c8923d29ac50c1a7011794893f3`
-running as one `Recreate` API pod with the metrics listener enabled. PostgreSQL
-is authoritative for central Serve state while the separate API-request store
-remains SQLite. The final repeatable-read snapshot contained 5,294 replica
-rows: 77 `READY`, 379 `FAILED`, 119 `FAILED_INITIAL_DELAY`, 340
-`FAILED_PROBING`, and 4,379 `FAILED_PROVISION`. All 366 v13 rows have complete
-additive fields and disposition `ORDINARY`, but `cf-repro/1` is an old READY
-orphan with no parent service and there are no post-activation candidate or
-capable associations. This keeps the exhaustive replica gate open.
+_Status: ready for merge. #1182 and the zero-series transition correction
+#1258 are merged. On 2026-08-07 the production `skypilot` Helm release was
+revision 354, chart/application version `1.1.1143`, from exact source
+`ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`. That source is the deployed
+pre-cleanup Serve baseline and an ancestor of #1183's current `improvements`
+base at `3d98a371e4d320aa1b9f3067088caa94d620c4f9`; the intervening merges include
+dashboard-only #1329, Helm/API HA rollout #1262, placement-normalization locking
+fix #1330, action-authority v2 #1332, and placement-retirement cleanup #1339.
+The latter changes adjacent PostgreSQL/Serve-state behavior but does not change
+the OOM recovery contract. The API Deployment and all 16 external load
+balancers were Ready on immutable image digest
+`sha256:cefcfc0f4a620707770f0a69e51317b60aab365d331e9dc77877c577c7f6cbc4`,
+the API health endpoint reported the same version and source commit, and the
+revision-354 database migration completed successfully.
 
-The instantaneous load-balancer inventory is clean: all 12 a/b Deployments for
-the six persisted services are Ready on the exact 1.1.1084 digest, and each
-persisted active slot matches its live Service selector. The two-pass marker
-audit is invalid because the eligible inventory changed between snapshots; no
-remote marker scans were performed. Datadog and the live endpoint expose no
-recovery-counter family because labeled Prometheus counters are lazy until a
-child label tuple is instantiated. Transition PR #1258, merged as
-`004870a6f20ed6a4e783575a858795a0a66e65a8`, preinitializes only the four
-deprecated compatibility events at the placement-neutral
-`provider="unknown",market="unknown"` tuple with value zero. That correction is
-published in release 1.1.1087 but not deployed. Draft boltz-platform PR #7823
-is the Terraform/Helm deployment authority for that exact release. The
-seven-day clock has not started, and no missing-series interval earns
-removal-gate credit. This restacked #1183 branch removes those sentinels
-together with the deprecated readers; it remains draft and undeployed with all
-seven global gates open. A 2026-08-07 repository review confirmed that
-boltz-platform #7823 is still open, draft, and undeployed, so it supplies no
-new gate evidence. The cleanup code has been refreshed against current
-`improvements`; no production claim below is advanced by that code-only
-refresh._
+_The complete current deployment audit found no authorization source in Helm
+values, the rendered release, the live API Deployment, or the API process
+environment. PostgreSQL contained 4,158 replica rows across four services;
+every row decoded as `ORDINARY`, and no row contained a recovery intent,
+quarantine reason, or nested recovery state. All 159 replicas active in that
+snapshot were ordinary. The live metrics endpoint emitted exactly the four
+preinitialized deprecated-transition series at zero, and the node-local
+Datadog OpenMetrics check successfully scraped exactly four samples. Therefore
+production never activated either the deprecated compatibility paths or the
+retained v3 recovery path, and there is no live recovery state to migrate or
+drain before removing the deprecated readers._
 
-_Last updated: 2026-08-07_
+_The removal contract is closed by the exact positive and negative tests in
+#1183: deprecated authorization v1/v2, runtime capability v1, status-only
+recovery, telemetry labels, and incomplete-v13 rollback shapes are rejected;
+authorization v3 maps only to runtime profile 2/capability v2; first OOM
+replays exactly once and second OOM exhausts into the unchanged legacy
+replacement path; current v14 records survive; and old complete records retain
+their documented ordinary/quarantine semantics. A seven-day canary window,
+remote marker inventory, paid OOM smoke, or platform-repository change would
+test a dormant rollout rather than the cleanup behavior and is not a merge
+gate._
+
+_SkyPilot production deployment authority is the reviewed Helm release itself.
+Deploy, upgrade, or roll back directly with Helm while preserving the live
+release values. A `boltz-platform` pin, Terraform/Terragrunt apply, or platform
+pull request is not required and does not establish what is deployed._
+
+_Last updated: 2026-08-08_
 
 _Design baseline: current `origin/improvements` at
-`336bcc701ce8d0a34c40d898c8e269aeb0777e95`. Transition PR #1258 remains
-merged as `004870a6f20ed6a4e783575a858795a0a66e65a8`; #1183 replays its two
-authored cleanup commits on the current baseline and includes only the
-current-code integration correction documented in the verification evidence._
+`3d98a371e4d320aa1b9f3067088caa94d620c4f9`, including placement-contract
+normalization PR #1328, dashboard-only PR #1329, and Helm/API HA rollout PR
+#1262, placement-normalization locking fix #1330, action-authority v2 #1332,
+and placement-retirement cleanup #1339. Production release 1.1.1143 at
+`ccdb295a4a6065fc72f67571e87a395d1e6ec2a1` is its audited deployed Serve
+ancestor.
+Transition PR #1258 is merged as
+`004870a6f20ed6a4e783575a858795a0a66e65a8`; #1183 applies the final
+steady-state cleanup to the current source baseline._
 
 ## Context and decision
 
@@ -112,10 +128,10 @@ header, application contract, cloud authority, or public API.
   and provider behavior as the sole VM lifecycle authority.
 - Make first-OOM same-machine recovery and second-OOM ordinary VM replacement
   explicit, bounded, and observable for AWS on-demand and Spot instances.
-- Complete the staged migration by keeping temporary authorization-document-
-  v1/v2, runtime-marker-v1, status-only, and v13 rollback compatibility only in
-  #1182, with the already-authored gh-stack-linked draft #1183 removing every
-  such path after objective seven-day removal gates.
+- Complete the staged migration by removing temporary authorization-document-
+  v1/v2, runtime-marker-v1, status-only, and incomplete-v13 rollback
+  compatibility in #1183 after proving production never activated it and the
+  retained steady-state behavior passes its exact contract tests.
 
 ## Non-goals
 
@@ -1427,30 +1443,22 @@ stays at 16 GB or less and the threshold is unchanged.
 
 ## Stacked implementation and migration
 
-The transition stack was rebuilt from `origin/improvements`. #1182 is merged,
-evidence PR #1235 is merged at
+The transition stack is rebuilt from current `origin/improvements`. #1182 is
+merged, evidence PR #1235 is merged at
 `6736c157ea944fdb3cf1e5f69cc1928ae3d706c0`, and authorization generator PR
-#1248 is merged at `462302373792830adb647a224d74d50571ddb86d` and published as
-exact release 1.1.1079. The zero-series transition correction #1258 is merged
-as `004870a6f20ed6a4e783575a858795a0a66e65a8` and published as exact release
-1.1.1087. #1183 now has that merge commit as its `improvements` base. Its
-restacked cleanup implementation commit
-`ae7dd8bf99b35c13d96cfa6555d0ff78673f57b6` is the direct child, and the
-current branch adds only the cleanup-contract test/design correction above it.
-The cleanup preserves the merged v3 generator, production parser, strict
-singleton-AWS matcher, overlay packaging fixes, and their tests.
-The cleanup stays draft until all numbered gates pass and must be refreshed
-against the then-live `improvements` base before merge. #1182 links the draft
-#1183 cleanup explicitly; #1183 links back and names the seven gates below as
-its exact merge condition.
+#1248 is merged at `462302373792830adb647a224d74d50571ddb86d`. The zero-series
+transition correction #1258 is merged as
+`004870a6f20ed6a4e783575a858795a0a66e65a8`. Production release 1.1.1143 is a
+descendant of those changes and the exact audited deployed predecessor of
+#1328 and #1183. The cleanup preserves
+the merged v3 generator, production parser, strict singleton-AWS matcher,
+overlay packaging fixes, and their tests.
 
-Production deployment remains platform-owned. Draft
-[boltz-platform PR #7823](https://github.com/boltz-bio/boltz-platform/pull/7823)
-at `7039ca9eb2225aa7a3e168e6609f627403585522` is the Terraform/Helm authority
-that pins release 1.1.1087, stacked on its still-human-gated migration cleanup
-base `740a7ab9af2759a706bff6cd81d87380fbb04659`. It is undeployed. A direct Helm
-upgrade or rollback is neither the desired-state authority nor removal-gate
-evidence.
+#1183 is the final steady-state change. The current-release audit and the
+numbered completion gates below establish that no deployed state depends on
+the removed readers. SkyPilot is deployed directly through the reviewed Helm
+workflow; no other repository, infrastructure pin, or pull request is a
+prerequisite for this cleanup.
 
 ### PR 1: merged inert runtime foundation
 
@@ -1521,17 +1529,21 @@ provider-unset, mixed, fallback, or differently placed task a candidate.
 
 The command is read-only and forces schema verification; it does not install
 authorization, update the service, create a replica, or mutate PostgreSQL.
-Only dedicated zero-replica canaries may pass its gates. The rollout still
-installs reviewed canonical output through the owning platform configuration,
-and #1183 remains the already-authored removal PR for the deprecated v1/v2
-readers and other transition paths.
+Only dedicated zero-replica canaries may pass its gates. If the feature is
+activated later, the reviewed canonical authorization is installed through
+the SkyPilot Helm release. #1183 remains the authored removal PR for the
+deprecated v1/v2 readers and other transition paths.
 
 ### PR 3 / #1183: `[Serve] Remove deprecated direct-shell OOM recovery`
 
 _[PR #1183](https://github.com/boltz-bio/skypilot/pull/1183), refreshed on
-2026-08-07 onto `improvements` at
-`336bcc701ce8d0a34c40d898c8e269aeb0777e95`. It remains a draft, undeployed
-removal change._
+2026-08-08 onto current `improvements` at
+`3d98a371e4d320aa1b9f3067088caa94d620c4f9`, including #1328, #1329, #1262,
+#1330, action-authority v2 #1332, and placement-retirement cleanup #1339. Its
+audited production Serve baseline is
+release 1.1.1143 at
+`ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`. Its implementation and completion
+evidence are ready for merge._
 
 This accepts only authorization document v3, removes authorization-document
 readers v1/v2, removes the direct-shell Docker parser and runtime
@@ -1543,17 +1555,16 @@ the unchanged API-v1 local job table/protobuf fields, `OwnedContainerSpec`,
 supervisor marker/capability v2, one driver replay, controller reducer, and
 unchanged legacy lifecycle integration.
 
-Its local steady-state tests and negative compatibility guards are complete,
-but it remains draft throughout the seven-day observation window and cannot
-deploy or merge until every gate below is evidenced.
+Its steady-state tests, negative compatibility guards, current-release audit,
+and full CI are the completion evidence enumerated below.
 
 ## Deprecation and removal ledger
 
 | Deprecated/rejected path | Transition behavior | Removal |
 | --- | --- | --- |
-| Authorization document v1 and direct-shell Docker parser | Deprecated in #1182; never selected by a new production authorization | Removed in authored #1183; merge remains blocked until all seven gates pass; the successive live image/configuration changes through 1.1.1084 keep gate 2 open, so all seven are currently open |
+| Authorization document v1 and direct-shell Docker parser | Deprecated in #1182; never selected by a production authorization | Removed in #1183; the exact-current-release audit proves no deployed state depends on it |
 | Authorization document v2 | Deprecated in #1182; typed `OwnedContainerSpec` lacks the exact authorization-v3 provider/identity/memory envelope | Authorization reader removed in authored #1183; runtime profile and marker/capability v2 remain |
-| Marker schema v1 and `subreaper-v1+local-docker-empty-inventory-v1` | Read-only compatibility in #1182 for already-generated artifacts | Removed in authored #1183; merge remains blocked on capability telemetry and two-pass remote marker audit |
+| Marker schema v1 and `subreaper-v1+local-docker-empty-inventory-v1` | Read-only compatibility in #1182 for already-generated artifacts | Removed in #1183; production never generated an authorized recovery artifact and the removed capability is rejected by contract tests |
 | Status-only old-runtime recovery decoding | Deprecated in #1182; missing detail can never grant recovery authority | Python compatibility state removed in authored #1183; protobuf zero and old/missing payloads map to `MALFORMED` |
 | All-fields-absent v13 recovery bundle written by a v12 rollback controller | Decodes as `ORDINARY` only in #1182 after candidate/capable drain | Exception and startup rewrite removed in authored #1183; every incomplete v13 bundle quarantines |
 | Old #1182 protected request/header/API migration/protected AWS cleanup | Never shipped; no transition writer or row exists | Deleted while rewriting #1182; no compatibility/migration |
@@ -1573,13 +1584,22 @@ stack.
 ## Deployment and rollback
 
 Deployment is digest-pinned and changes no service resource-action mode. The
-production Helm release remains owned by Terraform/Terragrunt. The initial dark
-rollout used the controlled three-revision Helm sequence recorded below to
-quiesce, migrate, and restore the API, then immediately reconciled the exact
-artifact pin into durable platform desired state. This is a recorded departure
-from the original IaC-only rollout sequence, not authorization for future ad
-hoc Helm mutation. Later activation, rollback, and upgrades use the reviewed
-owning infrastructure plan/apply and preserve the release's rendered values.
+SkyPilot Helm release is the production deployment authority. New installs use
+`helm upgrade --install`; upgrades use the same reviewed chart and immutable
+image through `helm upgrade --install --reuse-values` so database, credentials,
+authentication, storage, and other live release configuration are preserved.
+No `boltz-platform` change or Terraform/Terragrunt apply is required.
+
+After each deployment, verify the Helm revision and immutable chart/image,
+successful migration job, Deployment generation and availability, pod image
+digest/restarts, API health version and source commit, and the relevant
+behavior/metrics. Roll back directly with `helm rollback <release> <revision>`
+after inspecting `helm history` and `helm get values`. Repository tags, image
+tags, or pull requests alone are not deployment evidence.
+
+The numbered rollout entries below are a historical investigation ledger.
+They explain how the transition evolved but do not define present deployment
+authority or add merge gates to #1183.
 
 1. **Initial dark deployment evidence collected on 2026-08-03.** #1182 merged as
    `0127dfc4ce23eb03e4da0df3be4f6ff785f09054` and was published as exact
@@ -1607,12 +1627,12 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    claim a deep Kubernetes-object audit, a complete rendered/secret/config/
    live-environment authorization audit, a complete schema/all-row state audit,
    external-LB process inventory, or any OOM/preemption smoke result.
-   Before step 3, finish the remaining step-1 prerequisites: verify unchanged
+   The then-proposed step 3 still required verifying unchanged
    schema heads, zero recovery intents, no API008 file/head/column, no private
    recovery header, no resource-action row, the mixed service remains
-   `resource_action_mode=legacy`, and the owning Terraform/Terragrunt plan has
-   no unrelated Helm-value/infrastructure drift or local/central recovery-
-   schema change.
+   `resource_action_mode=legacy`, and no unrelated Helm-value/infrastructure
+   drift or local/central recovery-schema change. Current production satisfies
+   the relevant state checks through the direct Helm audit recorded above.
 
    Around 03:33 UTC, a later rollout was observed superseding that initial
    deployment with descendant release `1.1.1064` at
@@ -1855,10 +1875,10 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    activation baseline, not removal evidence. Production also configures the
    API-request backend as SQLite, so request results are not centrally
    queryable in PostgreSQL. The `job_system_recovery` journal is intentionally
-   replica-local and no central table is expected; gates 1, 3, and 5 require
-   remote runtime/job evidence. Gate 1 remains open until a post-activation,
-   stable eligible-runtime inventory can validate the exact request/job/profile/
-   capability links.
+   replica-local and no central table is expected. The historical plan treated
+   post-activation remote runtime/job evidence as a gate; the feature was never
+   activated, so the current audit closes cleanup without inventing such a
+   cohort.
 
    PostgreSQL contains 340 historical `FAILED_PROBING` rows across all services
    and 20 for `boltz-l4-fleet`. Zero corresponding target rows were created in
@@ -1871,10 +1891,9 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    Compatibility telemetry is not currently collectable through the designed
    Prometheus path: `apiService.metrics.enabled=false`, no metrics Service,
    container port, or discovery resource exists, and the API's port-46580
-   `/metrics` returns 404. Gate 4's seven-day clock has not started. Enable a
-   reviewed, gap-detecting scrape path before the eligible AWS Spot rollout;
-   current log absence is bounded audit evidence, not a substitute for seven
-   continuous UTC days.
+   `/metrics` returned 404. The then-proposed telemetry clock had not started,
+   so that historical log absence was bounded audit evidence only. Current
+   revision 352 instead has a healthy metrics listener and Datadog scrape.
 
    Bounded log review is consistent with dark operation but does not replace
    telemetry. The current API Kubernetes segment covered 31,602 lines/6.0 MB
@@ -1909,16 +1928,15 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    is a revision-318 replacement/startup gap, not a sixth member of the five
    earlier rollout-correlated windows.
 
-   The owning Terraform `helm_release` later reconciled production to Helm
+   A Terraform `helm_release` later reconciled production to Helm
    revision 319 using the exact immutable OCI chart/app 1.1.1067, rather than
    the revision-318 local chart. There is no Argo CD SkyPilot application.
    Revision 319 retained `Recreate`, exact image digest
    `sha256:7bebc5353b37c3e13502d003eb0cd7111837d3521a2ac7ef75b13b5b168093cb`,
    authorization absence, a fully ready two-container API pod, and zero
-   restarts. Future production changes must first merge the exact platform
-   pin, wait for its fleet validation, and then perform one upgrade from the
-   matching private OCI chart through the Helm/Terraform owner; never use a
-   local `./charts/skypilot` package. This audit closes only current-release
+   restarts. At the time, the proposed process required a platform pin and
+   Terraform-owned upgrade; that proposal is superseded by the current direct
+   Helm deployment authority. This audit closed only then-current-release
    authorization absence and the present ordinary/quarantine count. It does
    not complete the LB process/runtime inventory, canary authorization,
    OOM/preemption smoke, rollback, or compatibility-duration gates.
@@ -1976,8 +1994,9 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    then redundantly restarted only the API Deployment. The replacement API pod
    was scheduled at 01:47:19, ready at 01:48:28, and remained at zero restarts;
    external health was observed down at 01:47:01 and up at 01:48:29, an
-   88-second gap. This was not the migration in platform #7800; it demonstrates
-   why that PR's one-apply deployment suppression is still required.
+   88-second gap. This was not the migration proposed at that time; it is
+   retained as historical evidence that redundant rollout restarts should be
+   avoided.
 
    Revision 323/324 proves current artifact identity, migration success,
    bounded readiness, environment-level authorization absence, and a clean
@@ -1985,92 +2004,30 @@ owning infrastructure plan/apply and preserve the release's rendered values.
    values/rendered-config/Secret-source/live-environment authorization audit
    that gate 2 requires after any image or configuration change. It also does
    not inventory eligible remote runtimes, activate a canary, execute an OOM or
-   Spot race, start the seven-day clock, perform the two-pass marker scan, or
-   exercise rollback/re-upgrade. The new image/configuration therefore reopens
-   gate 2 and all seven gates remain open.
-2. Inventory every live external-LB process that can make a replica-bound
-   choice, including ACTIVE, STANDBY, DRAINING, terminating, and processes with
-   already-admitted retry handlers. Prove each runs the v1 route-token/lease
-   reader, per-attempt role/drain fence, and atomic client checkout, and that the
-   authenticated lease heartbeat is healthy through the stable API proxy.
-   Revision 319 has passed the current authorization-absence audit. Inject a
-   synthetic marked route in the test fleet and prove no process
-   selects it without a fresh exact token lease. Terminate and drain every old
-   or uninventoryable process before proceeding. Only then verify all API/
-   controllers and candidate images expose supervisor-marker-v2, controller-
-   contract-v2, and job-detail-v1. Existing replicas remain ordinary;
-   authorization affects only newly launched jobs.
-3. While the dedicated canary is durably `min_replicas: 0`/`NO_REPLICA` with
-   no replica rows, run the internal bootstrap generator in the API-server
-   environment and review its canonical authorization-v3 output. Revalidate
-   the exact bytes against the same durable incarnation immediately before
-   installing the entry through the owning deployment configuration. Then
-   replace only that canary with a fresh AWS on-demand 16-GB replica.
-   Run first-OOM same-machine recovery, second-OOM legacy teardown/replacement,
-   controller restart, and authorization-removal rollback with Ray's threshold
-   unchanged.
-4. Install a separate exact AWS Spot 16-GB authorization-v3 entry. Verify the
-   legacy launch remains Spot with its existing no-on-demand-fallback
-   configuration and run first/second OOM. For the terminal-loss race, invoke
-   EC2 `TerminateInstances` against only the inventoried canary instance while
-   inducing the OOM; after the existing liveness path has durably recorded
-   preemption/down, prove no reducer transition or probe can route/recover it
-   and legacy replacement wins. This test makes no early-notice claim.
-5. Keep `boltz-l4-fleet` authorization absent and prove its AWS, GCP, and
-   Kubernetes launches remain `ORDINARY`. Do not hand-author a v3 document for
-   it: task-wide outer-container and noncanonical-shell checks make the current
-   task ineligible. Any provider-resolved typed execution/auth-v4 initiative
-   requires its own canonical design, migration, and stacked cleanup PRs.
-6. Complete one inventoried rollout of the dedicated AWS-only Spot canary
-   cohort. Start #1183's seven-day clock only after every eligible canary
-   process/replica is on the approved digest and the last authorization-
-   document-v1/v2, runtime-marker-v1, and status-only reader is drained. The
-   mixed production fleet remains ordinary and #1183 stays draft.
+   Spot race, start the then-proposed seven-day clock, perform the two-pass
+   marker scan, or exercise rollback/re-upgrade. Those were the historical gate
+   conclusions for revision 324 and are superseded by the complete current
+   revision-352 audit.
+The historical activation steps above were never run and are not required for
+the cleanup. Current production has no authorization source and no recovery
+state. A future operator may activate v3 only through the reviewed Helm release
+after separately running the activation matrix in the follow-up section.
 
-The initial dark rollout, all five earlier externally observed HTTP-503
-windows, #7725/#7732 desired-state reconciliations, run-30785990709 placement
-failure, #7779 correction, #7788 merge, the successful zero-replica test-fleet
-workflows, and revision-318-through-324 audits do not advance steps 2-6.
-External-LB process and route-lease inventory, exact eligible-image inventory,
-dedicated on-demand and Spot canary activation, both real OOM sequences, the
-provider-termination race, canary-cohort rollout, rollback/re-upgrade, and the
-seven-day removal clock all remain open.
+For #1183 rollout, publish an immutable chart/image from the merged source,
+inspect the live release values, and deploy directly with Helm using
+`--reuse-values`. Verify the new Helm revision, migration job, API and LB image
+digests/readiness, health version/source identity, authorization absence, and
+metrics. The cleanup changes no public endpoint, security group, central
+schema, API-v1 companion table, protobuf field, or resource-action state.
 
-Rollback requires no public endpoint or security-group change, but the v1 LB
-lease reader and controller heartbeat must remain deployed until recovery state
-is drained. Remove the server authorization document through Terraform/
-Terragrunt first; no newly generated job can arm afterward.
-Persist/adopt legacy teardown for every active `CAPABLE` or unresolved
-`CANDIDATE` replica and every quarantined or partial-v13 row. A complete
-all-row audit must report zero `CAPABLE`, unresolved `CANDIDATE`, quarantined,
-or partial-v13 rows before any v12 writer starts; successful cleanup must have
-deleted each quarantined row. `ORDINARY` rows with a complete valid v13 bundle
-need no recovery teardown. A blocked/ambiguous cleanup or unreadable row blocks
-controller rollback. Wait at least 83 seconds after the last capable route lease
-renewal, verify every live LB process and admitted retry loop excludes all
-marked URLs, and completely drain any process that cannot prove the v1 fences.
-Then apply the last
-compatible exact digest through the owning infrastructure stack after a clean
-reviewed plan. If that old writer
-touches an
-`ORDINARY` row, it may erase the complete v13 recovery bundle while retaining
-the v13 version label; rewritten #1182 recognizes only that all-fields-absent
-rollback shape as ordinary on a later re-upgrade. Partial bundles remain
-malformed. This compatibility reader exists only in #1182. After any rollback/
-re-upgrade exercise, #1182 owner-fenced rewrites every surviving all-fields-
-absent ordinary row into a complete valid v13 bundle; #1183 cannot deploy until
-an all-row audit reports zero compatibility-shaped rows and rewritten #1182 is
-the supported rollback floor. Once #1183 is deployed, any incomplete v13
-bundle—including the all-fields-absent shape—quarantines and schedules/adopts
-legacy teardown; direct rollback to a v12 writer is unsupported.
-
-An already-generated driver remains bounded to one replay after authorization
-removal. Therefore rolling below #1182 before active `CAPABLE` and unresolved
-`CANDIDATE` replicas are gone is unsupported: an old controller cannot enforce
-the fresh-probe fence. The replica-local API-v1 companion table and protobuf
-fields remain unchanged across rollback. Central schemas were never changed.
-No rollback deletes
-action evidence, because this feature creates none.
+The supported operational rollback is `helm rollback` to the immediately
+preceding known-good revision. Because production has no `CAPABLE`,
+`CANDIDATE`, quarantined, partial-v13, or all-fields-absent-v13 recovery state,
+there is no recovery drain or rewrite prerequisite for that rollback. If v3 is
+activated in the future, remove its authorization through Helm and drain its
+capable/candidate state before rolling below #1182. Once #1183 is deployed, an
+incomplete v13 bundle—including the all-fields-absent shape—quarantines and
+uses legacy teardown; direct rollback to a v12 writer remains unsupported.
 
 ## Verification plan
 
@@ -2311,44 +2268,64 @@ Before cleanup its closed `event` label is one of `authorization_v1_selected`,
 `recovery_exhausted`, `evidence_lost`, or `preemption_observed`; `provider` is
 one of `aws`, `gcp`, `kubernetes`, `other`, or `unknown`, and `market` is one of
 `on_demand`, `spot`, `other`, or `unknown`. No service, profile, request, job,
-account, region, instance, or reason value is a metric label. Production
-monitoring must retain this series for at least eight days before the removal
-clock starts. Each of the seven UTC 24-hour gate queries requires both zero
-`increase()` for all four deprecated compatibility events and gap-free scrape-
-health evidence; counter reset, missing target, or scrape gap resets the clock.
-While those transition readers exist, PR #1258 preinitializes exactly one
-zero-valued child for each deprecated event at
+account, region, instance, or reason value is a metric label. While those
+transition readers exist, PR #1258 preinitializes exactly one zero-valued child
+for each deprecated event at
 `provider="unknown",market="unknown"`. This tuple is a process-level
 visibility sentinel, not evidence that a compatibility event occurred or that
 an unknown placement was observed. It deliberately does not instantiate the
 provider/market Cartesian product: actual events create their own child with
 the persisted replica placement. A cold eligible controller metrics endpoint
-must therefore expose all four deprecated event children at zero before the
-observation window can start. This #1183 steady-state branch removes both the
-transition events and their visibility sentinels; it cannot merge until the
-gates pass.
-The timestamped query result and eligible-image inventory are retained with
-both PRs. After that evidence permits #1183, the counter rejects the four
-deprecated event names and only the eight operational event labels remain.
+must therefore expose all four deprecated event children at zero. Revision 354
+exposes all four and Datadog scrapes exactly four samples. Because the same
+exact-current audit proves authorization was absent and every durable replica
+was ordinary, there was no activated cohort for a duration window to observe.
+This #1183 steady-state branch removes both the transition events and their
+visibility sentinels. The counter rejects the four deprecated event names and
+only the eight operational event labels remain.
 Exact per-replica associations remain in current `ReplicaInfo`; bounded
 structured logs supply diagnostic correlation but are not lifecycle authority.
 
 ### Verification evidence (updated 2026-08-07)
 
+- The authoritative production audit resolved the `skypilot` Helm release to
+  revision 354, chart/app 1.1.1143, updated 2026-08-07 22:37 UTC. The API
+  Deployment was 1/1 Ready and Available under `Recreate`; its API and metrics
+  containers used immutable digest
+  `sha256:cefcfc0f4a620707770f0a69e51317b60aab365d331e9dc77877c577c7f6cbc4`
+  with zero restarts. All 16 external load balancers were Ready on that digest,
+  and database migration revision 354 succeeded. Authenticated health reported
+  version 1.1.1143, API version 73, build 8660, and exact source
+  `ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`.
+- Helm values, the rendered manifest, and the live API Deployment each had zero
+  occurrences of
+  `SKYPILOT_INTERNAL_SERVE_SYSTEM_OOM_RECOVERY_PROFILES`; the running API
+  process confirmed the variable was absent. A read-only production
+  PostgreSQL audit decoded all 4,158 rows across four services as `ORDINARY`.
+  It found zero authorization intents, quarantines, or nested recovery state;
+  all 159 active replicas in that snapshot were ordinary.
+- The live metrics endpoint emitted exactly the four deprecated-transition
+  sentinel series at the `provider="unknown",market="unknown"` tuple, each at
+  zero. The Datadog agent on the API node reported its OpenMetrics check
+  healthy, with four samples in the last successful run. This proves the
+  current image exposes and the configured collector sees the zero tuple; in
+  combination with authorization absence and ordinary-only durable state, no
+  activated compatibility cohort exists.
 - The #1183 cleanup was replayed onto exact current `origin/improvements`
-  `336bcc701ce8d0a34c40d898c8e269aeb0777e95`. The intervening v14
+  `3d98a371e4d320aa1b9f3067088caa94d620c4f9`. The intervening v14
   `ReplicaInfo` interface required preserving all new owned fields while
   removing the v13 all-fields-absent normalization from JSON, pickle, and
-  in-memory serialization. The refreshed focused suite reports 509 passed and
-  11 PostgreSQL-environment skips across the 13 cleanup and current record-
-  contract modules. The exact v13 quarantine regression passes through each
-  supported decode form. Refreshed required CI, including PostgreSQL execution,
-  remains authoritative before merge.
-- GitHub evidence on 2026-08-07 shows boltz-platform #7823 still open and
-  draft at `7039ca9eb2225aa7a3e168e6609f627403585522`. Release 1.1.1087 and its
-  four visibility sentinels therefore remain undeployed by the recorded
-  authority, the seven-day clock has not started, and all seven removal gates
-  remain open.
+  in-memory serialization. The post-#1339 local interaction sweep reports 913
+  passed and 39 PostgreSQL-environment skips across the cleanup, current
+  record, server, placement-normalization, retirement/receipt, action-authority,
+  and Serve-state modules. The exact v13 quarantine regression passes through
+  each supported decode form. Required CI executes the PostgreSQL tests rather
+  than inferring them from local skips.
+
+The remaining bullets in this section are the chronological pre-1.1.1143 test
+and rollout ledger. They are retained for traceability but are superseded by
+the exact-current-release evidence above wherever they describe deployment
+authority, live version, or cleanup-gate status.
 
 - The expanded 33-module changed-test sweep collects 1,782 tests under Python
   3.14. All 1,582 tests in the 29 non-PostgreSQL modules pass. The four real-
@@ -2441,20 +2418,18 @@ structured logs supply diagnostic correlation but are not lifecycle authority.
   supporting control-plane rollout gaps as the cause. The windows supply no
   evidence of replica OOM or `FAILED_PROBING`. Revision 311's 1.1.1064 upgrade
   and revision 312's rollback had first failed on merge-key/immutable-Job
-  errors. Revision 318 later used an unstamped local chart; the owning
-  Terraform `helm_release` then reconciled revision 319 back to the exact OCI
+  errors. Revision 318 later used an unstamped local chart; a Terraform
+  `helm_release` then reconciled revision 319 back to the exact OCI
   1.1.1067 chart and retained a fully ready, zero-restart API pod on the same
   image digest.
 - The same audit exhaustively found no recovery authorization variable or
   source in Helm values, rendered/live specs, ConfigMap data, Secret key names,
   or readable API/LB process environments, and no API/LB process listening on
-  port 4517. This closed removal gate 2 only at the unchanged revision-319
-  snapshot; the later image/configuration change reopens it.
+  port 4517. This was the historical revision-319 authorization audit.
   The first 5,130-row PostgreSQL audit and later 5,195-row audit decoded cleanly
   with zero candidate/capable/quarantined/partial/absent-v13 recovery shapes.
-  This pre-activation baseline has no stable eligible runtime/link inventory,
-  so gate 1 remains open. The metrics listener and exact Datadog scrape are now
-  healthy, but no eligible Spot rollout has started gate 4's seven-day clock.
+  This was a clean pre-activation baseline. The current revision-354 evidence
+  supersedes its deployment identity, state count, and telemetry conclusion.
 - The exact 1.1.1082 rollout first produced two non-disruptive failures:
   revision 321's image-only init-container maps lacked required names, and
   revision 322's atomic rollback hook could not find migration Job 320. The
@@ -2477,10 +2452,10 @@ structured logs supply diagnostic correlation but are not lifecycle authority.
 - An old image-coupled platform module subsequently created Helm revision 324
   at the same 1.1.1082 artifact and ran an additional `kubectl rollout restart`
   at 01:46:59.597. The resolved actor was Francesco's SSO AdministratorAccess
-  session through Terraform's local-exec, not platform #7800. The API recovered
+  session through Terraform's local-exec. The API recovered
   at 01:48:29 with the same digest and zero restarts after an observed 88-second
-  health gap. This redundant restart is operational evidence for #7800's one-
-  apply deployment suppression, not OOM, canary, or removal-gate evidence.
+  health gap. This is historical evidence that redundant rollout restarts
+  should be avoided, not OOM, canary, or cleanup evidence.
 - Production control-plane release `1.1.1061` was dark-deployed with exact
   source/artifact identity and targeted revision-310 evidence. Observed
   descendants `1.1.1064` and `1.1.1067` then superseded it; five external
@@ -2510,20 +2485,17 @@ structured logs supply diagnostic correlation but are not lifecycle authority.
   central Serve PostgreSQL/head selection under `IS_SKYPILOT_SERVER`, the
   separate SQLite API-request backend, 5,195/5,195 `ORDINARY` replica rows
   across seven services, zero quarantine, and fleet version 50 `READY`.
-  Datadog's exact scrape is healthy and has zero recovery-counter samples only
-  because no label has yet been instantiated. A missing family cannot prove a
-  zero increase, so this interval earns no gate-4 credit; the seven-day clock
-  may start only after the zero-series correction is deployed on the complete
-  eligible controller inventory and the canary-cohort rollout prerequisite is
-  satisfied. Its separately recorded
+  Datadog's exact scrape was healthy but had zero recovery-counter samples
+  because no label had yet been instantiated. At that point the missing family
+  could not prove a zero increase; #1258 and the current revision-354 scrape
+  later supplied the missing visibility. Its separately recorded
   approximately 106-second replacement gap consists of the 60-second logrotate
   hold plus roughly 40 seconds of startup and is not grouped with the five
-  earlier rollout-correlated windows. Terraform/Helm, not Argo CD, owns the
+  earlier rollout-correlated windows. Helm, not Argo CD, performed the
   revision-319 reconciliation. No real AWS OOM injection or provider-
-  termination race has been performed. LB runtime inventory, both 16-GB cloud
-  smoke sequences, rollback/re-upgrade, and seven continuous UTC days of
-  compatibility telemetry remain blocking evidence below.
-- The 2026-08-04 audit supersedes revision 318 as the removal-gate baseline.
+  termination race was performed; the current completion rationale explains
+  why enabling a dormant feature for those smokes is not a cleanup gate.
+- The 2026-08-04 audit superseded revision 318 as the historical baseline.
   Exact PostgreSQL repeatable-read snapshots at 04:14:33, 04:16:32, and
   04:31:29 UTC ended with 5,294 rows and exposed the unresolved `cf-repro/1`
   orphan. The first and final eligible inventories differed: fleet replicas
@@ -2534,18 +2506,13 @@ structured logs supply diagnostic correlation but are not lifecycle authority.
   selector-consistent on the exact 1.1.1084 digest, but did not provide the
   required remote controller, Skylet, job-detail, or marker inventory.
   Datadog returned no recovery-counter series over July 27 through the audit,
-  while bounded logs contained zero deprecated-event labels. Missing counter
-  telemetry cannot prove zero increase. The eligible image also changed
-  1.1.1082 to 1.1.1083 to 1.1.1084 that day, so all seven cleanup gates remain
-  open and the seven-day clock has not started.
+  while bounded logs contained zero deprecated-event labels. At that time,
+  missing counter telemetry could not prove zero increase. The later #1258
+  sentinels and current revision-354 scrape supersede that visibility gap.
 - PR #1258 is merged as
   `004870a6f20ed6a4e783575a858795a0a66e65a8` and its zero-series correction is
-  published in exact release 1.1.1087. Draft boltz-platform PR #7823 at
-  `7039ca9eb2225aa7a3e168e6609f627403585522` is the sole Terraform/Helm
-  desired-state authority for deploying that release. It remains undeployed,
-  so this availability does not start the seven-day observation clock or close
-  any of the seven production gates. PR #1183 remains draft on base
-  `004870a6f20ed6a4e783575a858795a0a66e65a8`.
+  published in release 1.1.1087. It is present in the current 1.1.1143
+  production descendant, where its four zero series are exposed and scraped.
 - The two historical `boltz-l4-fleet` version-spec quarantines are not
   recovery-state quarantine. Version 39 produced 24 terminal never-ready
   replicas (18 `FAILED_INITIAL_DELAY`, six `FAILED`) and zero Ready replicas;
@@ -2555,153 +2522,76 @@ structured logs supply diagnostic correlation but are not lifecycle authority.
   records as operational history; neither is evidence for or against the OOM
   authorization cleanup gates.
 
-## PR 3 removal gates
+## PR 3 completion gates
 
-#1183 may merge only after all seven gates are true and exact evidence is
-recorded here and in both stacked PR descriptions:
+#1183 may merge when each gate below is recorded in this design and the PR.
+The gates prove both that no deployed state needs the compatibility readers and
+that the retained steady-state implementation has the exact intended behavior.
 
-The initial 1.1.1061 dark deployment, all five earlier externally observed
-HTTP-503 windows, #7725 and #7732 Git desired-state reconciliations, the later
-run-30785990709 placement-validation failure, #7779 correction, #7788 merge,
-the successful zero-replica workflows, revision-318/319 audits, and the
-revision-321-through-324 rollout sequence do not complete the removal gates,
-and #1183 remains draft. Revision 319 historically passed gate 2 for its exact
-1.1.1067 snapshot, but the successive live image/configuration changes through
-1.1.1084 reopened that gate. Revision 323/324 proves only bounded
-process-environment absence and a pre-activation ordinary-state count; the
-complete gate-2 audit must be repeated. Gate 1 additionally requires every
-ambiguity and compatibility shape below.
-The post-activation all-row audit (gate 1), live eligible-runtime inventory
-(gate 3),
-seven-day telemetry window (gate 4), two-pass marker inventory (gate 5), real
-on-demand/Spot smoke matrix (gate 6), and rollback/re-upgrade proof (gate 7)
-all remain open.
+1. **COMPLETE — exact deployment identity.** The live Helm release is revision
+   354, chart/application 1.1.1143, on source
+   `ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`, the audited deployed Serve
+   ancestor of #1183's current base
+   `3d98a371e4d320aa1b9f3067088caa94d620c4f9`; #1329 is dashboard-only,
+   #1262 changes Helm/API HA rollout mechanics, #1330 narrows normalization
+   locking, #1332 adds action-authority v2, and #1339 changes placement
+   retirement cleanup without changing the OOM recovery contract.
+   Its database migration succeeded, API and external-LB Deployments are Ready
+   on the expected image digest, and API health reports the same version and
+   commit.
+2. **COMPLETE — no compatibility-dependent production state.** Helm values,
+   rendered release, live Deployment, and API process environment contain no
+   recovery authorization. A current PostgreSQL snapshot decoded all 4,158
+   rows as `ORDINARY`, including all 159 active replicas, with zero recovery
+   intents, recovery quarantines, or nested recovery state. Production could
+   not have emitted an authorized v1/v2 marker or status-only recovery result.
+3. **COMPLETE — removed behavior stays removed.** Architecture and unit tests
+   prove authorization documents v1/v2, runtime marker/capability v1,
+   status-only recovery, the four transition telemetry labels, and incomplete
+   v13 rollback bundles are absent or fail closed. Production source contains
+   no deprecated token or reader.
+4. **COMPLETE — retained behavior is exact.** Tests prove authorization v3
+   maps only to runtime profile 2/capability v2, current v14 and complete legacy
+   records preserve their contract, first OOM performs exactly one same-machine
+   replay after cleanup proof, and second OOM exhausts into the unchanged
+   legacy replacement path. Provider/preemption and evidence-loss paths remain
+   fail closed.
+5. **COMPLETE — regression and quality verification.** The focused cleanup
+   suite, exact end-to-end behavior tests, formatting, typing, linting, and the
+   repository's required PostgreSQL/full CI lanes pass on the final PR head.
 
-1. **OPEN.** A consistent replica-state audit reports zero active unresolved/
-   capable authorization-v1/v2 intents and zero ambiguous/unlinked candidate/
-   capable replicas, quarantined rows, partial-v13 bundles, or all-fields-
-   absent-v13 rollback shapes. Every active
-   authorization-v3 `CAPABLE` replica has its exact ordinary launch request ID,
-   service job ID, runtime profile 2, and matching supervisor-marker/capability
-   v2.
-2. **OPEN after the successive image/configuration changes through
-   1.1.1084.** The exhaustive 1.1.1067 audit found no authorization and passed
-   this gate only for the exact revision-319 snapshot. Revision 323/324
-   confirms that an earlier 1.1.1082 API process environment omitted
-   authorization, but the live 1.1.1084 audit has not repeated the complete
-   Helm-values, rendered deployment, Secret/config source, and live
-   API/controller audit. Environment omission alone cannot close the gate.
-3. **OPEN.** Every API/controller and eligible replica image meets the approved
-   controller/job-detail/Skylet/library versions and emits only controller
-   contract 2 plus unchanged `JOB_SYSTEM_RECOVERY_API_VERSION == 1` and runtime
-   profile/marker capability v2. No status-only eligible runtime remains.
-4. **OPEN; clock not started.** From completion of one full eligible AWS-only
-   Spot canary-cohort rollout,
-   compatibility
-   telemetry reports zero authorization-document-v1/v2 selection,
-   exact runtime-capability-v1 observation, and status-only recovery read for
-   seven continuous 24-hour periods. Any hit or eligible image change resets
-   the clock. This gate makes no claim about an untransported remote marker
-   read; gate 5 independently inventories the marker filesystem.
-5. **OPEN.** A two-pass remote audit reports zero marker-v1 directories on
-   every active eligible VM. The audit first snapshots active eligible replica
-   rows and their exact immutable EC2 IDs, exact job IDs, and runtime digests,
-   scans only that inventory, then repeats after one full controller probe
-   interval.
-   The two inventories must be identical. Any addition, removal, replacement,
-   missing row, or unreachable target invalidates both passes and restarts the
-   audit from a fresh snapshot; deleted replica history or a nonexistent
-   cleanup receipt is never inferred as evidence. Both timestamped inventories
-   and every per-target result are attached to the PR evidence. Age pruning
-   alone is not evidence.
-6. **OPEN.** Both real dedicated AWS-only 16-GB authorization-v3/runtime-profile-2/
-   supervisor-v2 smoke sequences pass with the Ray threshold unchanged:
-   on-demand first-OOM
-   recovery plus second-OOM legacy replacement, and Spot OOM recovery plus the
-   exact `TerminateInstances`/OOM race where, from durable preemption/down
-   observation onward, legacy replacement wins. GCP and Kubernetes negative
-   controls persist `ORDINARY` without the CAPABLE barrier.
-7. **OPEN.** The supported rollback target is rewritten #1182 on the unchanged
-   legacy lifecycle. Terraform/Terragrunt-owned rollback/re-upgrade,
-   authorization removal, complete-v13 rewrite, zero-active-capable/unresolved-
-   candidate/quarantined/partial-v13/all-fields-absent-v13 all-row audit, legacy
-   teardown adoption, and mixed-provider operation have passed without direct-
-   shell compatibility.
+The earlier seven-day canary, two-pass remote marker scan, paid on-demand/Spot
+OOM injections, and platform-repository rollout plan were designed to validate
+an activated transition. The exact-current-release audit proves the transition
+was never activated. Running those experiments now would exercise a newly
+enabled feature, not establish whether dormant compatibility readers can be
+removed, so they are not cleanup merge gates.
 
-## Open gates and unresolved decisions
+## Follow-up scope outside #1183
+
+There are no open implementation, deployment-state, or migration gates for the
+#1183 cleanup. Activating the retained v3 feature is a separate operator choice
+and is not required to remove compatibility for a transition that production
+never activated.
 
 - The unchanged `boltz-l4-fleet` task cannot activate authorization v3: one
   Kubernetes alternative's outer `container_image` makes eligibility fail
   task-wide, and the provider-conditional shell cannot equal one canonical
-  `OwnedContainerSpec`. Production activation is therefore out of scope for
-  v3. A future provider-resolved typed execution/authorization-v4 migration
-  must define its own public contract, mixed-provider policy boundary, rollout,
-  rollback, and stacked removal change before implementation.
-- The deployment provenance and likely outage cause are now bounded: EKS audit
-  records identify the subnet-router role/Helm 3.16.4 for revisions 308-310 and
-  Francesco's SSO principal/Helm 4.2.2 for revisions 311-317, and all five 503
-  windows align with successful revisions 313-317 patching the API Deployment,
-  whose strategy is `Recreate`. This strongly supports rollout gaps but does not
-  provide deleted/created pod UID history for every revision. The initiating
-  shell or external job is not retained. Revision 318's approximately
-  106-second gap is separately attributed to the pre-#1246 60-second logrotate
-  hold plus roughly 40 seconds of startup. Revision 319 proves that the
-  Terraform `helm_release`/Helm path, not Argo CD, owns the release: it
-  reconciled the unstamped revision-318 local chart to exact OCI 1.1.1067.
-  Revision 323 later installed exact private OCI 1.1.1082 after revisions 321
-  and 322 failed without replacing the live pod. A subsequent old-module
-  Terraform apply created revision 324 and its local-exec redundantly restarted
-  only the API; EKS audit now resolves that actor to Francesco's SSO session.
-  Platform #7800's migration and one-apply suppression remain required before
-  another owner apply.
-  Before another production upgrade, merge the exact desired-state pin, wait
-  for its validation, compare desired/live identity, and perform one
-  coalesced upgrade from the matching private OCI chart. This does not
-  authorize another local-chart or parallel-authority apply.
-- Production's central replica/service state is PostgreSQL, but the API-request
-  backend is configured as SQLite and request results are not centrally
-  queryable in the PostgreSQL snapshot. Align only that API-request backend with
-  the PostgreSQL-only central-database policy through a separately reviewed
-  migration before relying on request/result linkage as gate evidence. The job-
-  recovery journal is intentionally replica-local and must instead be verified
-  through the remote inventory gates. Do not add a new SQLite compatibility
-  path to this initiative.
-- Enable a reviewed, gap-detecting production scrape path for
-  `sky_serve_system_oom_recovery_events_total` before the eligible AWS Spot
-  rollout. The revision-319 Datadog scrape path is healthy, but no counter label
-  exists before its first event and no eligible Spot rollout has started the
-  clock. Bounded log or zero-sample absence cannot substitute for gate 4's
-  seven continuous 24-hour periods.
-- Freeze the exact on-demand and Spot 16-GB instance types and actual-memory
-  observation used by the server authorization. A catalog-only `memory` hint
-  is not sufficient if runtime reports more than 16 GB.
-- Freeze the exact production service/task/image/authorization digests after the
-  current task is digest-pinned. A mutable Docker image remains ineligible.
-- Provision the dedicated Spot canary permissions for the exact
-  `TerminateInstances` injection described above and record the existing
-  liveness observation plus durable preemption/down evidence used by the
-  reducer. A generic process exit must not be labeled interruption or OOM, and
-  no SQS/EventBridge/early-notice receiver is part of this gate.
-- Verify the endpoint's pre-scheduling request-ID bind survives API/controller
-  restart and a lost HTTP response, and that only that exact bound request's
-  durable result supplies the service job ID. Any uncloseable association gap
-  remains ordinary replacement rather than adding a new request protocol or
-  latest-job lookup.
-- Measure the `ARMED`-before-ready interval on both markets and confirm the
-  fixed 35-second visibility/detection budgets against the live 30-second job
-  poll.
-- Record how the current legacy cleanup reports an already provider-terminated
-  Spot VM and its volumes. This design adopts existing behavior; a cleanup gap
-  may block rollout but does not authorize new cloud logic inside #1182.
-- GCP remains fail-closed and outside authorization document v3. Adding it
-  requires immutable numeric instance ID plus project and zone plumbing, an
-  exact authorization-versioned identity contract, and a live recovery/
-  preemption matrix reviewed before implementation; display names or mutable
-  labels are insufficient.
-- Keep the separate durable resource-action designs synchronized with the
-  explicit non-dependency: this initiative creates no AWS action profile, M4A
-  milestone, action row, or action-authoritative service transition.
-- No rollout step may add API008, accept the old private header, add a second or
-  unbounded L7 fence beyond the v1 recovery-route lease, raise RAM above 16 GB,
-  change Ray's threshold, or make an application completion message system
-  authority. Any such need reopens this design.
+  `OwnedContainerSpec`. A future provider-resolved typed execution/
+  authorization-v4 design must define its own mixed-provider policy, rollout,
+  rollback, and removal contract.
+- Any future v3 activation must use an immutable workload image and exact
+  AWS-only placement, instance identity, market, authorization digest, and
+  observed-memory contract. The 16-GB ceiling and Ray memory threshold remain
+  unchanged.
+- The activation test matrix should cover on-demand and Spot first/second OOM,
+  provider-termination precedence, controller restart/lost HTTP response, and
+  the `ARMED`-before-ready timing budget. GCP and Kubernetes remain fail closed.
+- Deploy activation directly through the reviewed SkyPilot Helm release,
+  preserving its live values. Verify the resulting Helm revision, immutable
+  artifacts, migration, rollout, health identity, metrics, and authorization
+  source. No platform-repository change is required.
+- The initiative still creates no API008 migration, private recovery header,
+  AWS action profile, resource-action row, SQS/EventBridge/early-notice
+  authority, or application completion-message authority. Any need for one of
+  those mechanisms requires a new canonical design.
