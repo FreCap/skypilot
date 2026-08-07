@@ -57,7 +57,23 @@ function pool(name, resources) {
   return {
     name,
     requested_resources_str: resources,
+    pool_yaml: '',
+    entrypoint: '',
     replica_info: [],
+  };
+}
+
+function worker(replicaId, status = 'READY', overrides = {}) {
+  return {
+    replica_id: replicaId,
+    launched_at: 1700000000 + replicaId,
+    cloud: 'AWS',
+    region: 'us-east-1',
+    resources_str: `resources-${replicaId}`,
+    status,
+    version: '1',
+    used_by: [],
+    ...overrides,
   };
 }
 
@@ -302,5 +318,65 @@ describe('PoolDetailPage request ownership', () => {
     expect(await screen.findByText('recovered')).toBeInTheDocument();
     expect(dashboardCache.invalidate).toHaveBeenCalledTimes(2);
     expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+  });
+
+  it('resets route-owned pagination, history, and YAML state', async () => {
+    const poolAWorkers = Array.from({ length: 11 }, (_, index) =>
+      worker(index + 1)
+    );
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        pools: [
+          {
+            ...pool('pool-a', 'resources-a'),
+            pool_yaml: 'metadata:\n  name: pool-a-yaml-marker\n',
+            replica_info: poolAWorkers,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        pools: [
+          {
+            ...pool('pool-b', 'resources-b'),
+            pool_yaml: 'metadata:\n  name: pool-b-yaml-marker\n',
+            replica_info: [
+              worker(101, 'READY', { resources_str: 'pool-b-ready' }),
+              worker(102, 'FAILED_PROBING', {
+                resources_str: 'pool-b-failed',
+              }),
+            ],
+          },
+        ],
+      });
+
+    const view = render(<PoolDetailPage />);
+    await screen.findByText('resources-1');
+
+    const nextPageButton = view.container
+      .querySelector('svg.chevron-right')
+      ?.closest('button');
+    expect(nextPageButton).not.toBeNull();
+    fireEvent.click(nextPageButton);
+    expect(await screen.findByText('resources-11')).toBeInTheDocument();
+    expect(screen.getByText(/11\s*–\s*11 of 11/)).toBeInTheDocument();
+
+    const showHistoryToggle = screen.getByRole('checkbox');
+    expect(showHistoryToggle).not.toBeChecked();
+    fireEvent.click(showHistoryToggle);
+    expect(showHistoryToggle).toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: /show pool yaml/i }));
+    expect(screen.getByText('pool-a-yaml-marker')).toBeInTheDocument();
+
+    router.query.pool = 'pool-b';
+    view.rerender(<PoolDetailPage />);
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('pool-b-ready')).toBeInTheDocument();
+    expect(screen.getByText(/1\s*–\s*1 of 1/)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox')).not.toBeChecked();
+    expect(screen.queryByText('pool-b-failed')).not.toBeInTheDocument();
+    expect(screen.queryByText('pool-b-yaml-marker')).not.toBeInTheDocument();
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 });

@@ -216,6 +216,11 @@ export default function PoolDetailPage() {
       activePoolNameRef.current = poolName;
       setPoolData(null);
       setError(null);
+      setCurrentPage(1);
+      setShowFailedWorkers(false);
+      setIsPoolYamlExpanded(false);
+      setIsPoolYamlCopied(false);
+      setIsEntrypointCopied(false);
     }
     fetchPoolData();
     return () => {
