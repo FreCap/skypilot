@@ -3016,6 +3016,59 @@ class TestServiceStatusEndpointSnapshot:
             info.handle.assert_called_once_with(
                 cluster_records[info.cluster_name])
 
+    def test_service_status_tolerates_missing_cluster_record_in_snapshot(self):
+        replicas_and_handles = [self._replica(f'r-{i}') for i in (1, 2)]
+        replicas = [info for info, _ in replicas_and_handles]
+        cluster_records = {
+            replicas[0].cluster_name: {
+                'launched_at': 1,
+                'handle': replicas_and_handles[0][1],
+            },
+        }
+        endpoint_calls = []
+
+        def _get_endpoints(cluster, port, **kwargs):
+            endpoint_calls.append((cluster, port, kwargs))
+            return {port: f'{cluster}.svc:{port}'}
+
+        record = {
+            'name': 'svc-a',
+            'pool': False,
+            'version': 1,
+        }
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_service_from_name',
+                return_value=record), \
+             mock.patch('sky.serve.serve_utils.serve_state.get_replica_infos',
+                        return_value=replicas), \
+             mock.patch('sky.serve.serve_utils.global_user_state.'
+                        'get_clusters_from_names',
+                        return_value=cluster_records) as mock_clusters, \
+             mock.patch('sky.serve.replica_managers.global_user_state.'
+                        'get_cluster_from_name',
+                        side_effect=AssertionError(
+                            'per-replica cluster reread used')), \
+             mock.patch('sky.serve.replica_managers.backend_utils.'
+                        'get_endpoints',
+                        side_effect=_get_endpoints):
+            status = serve_utils._get_service_status(
+                'svc-a',
+                pool=False,
+                with_yaml=False,
+                with_target_num_replicas=False)
+
+        assert status is not None
+        mock_clusters.assert_called_once_with(['r-1', 'r-2'])
+        assert [replica['endpoint'] for replica in status['replica_info']
+               ] == ['http://r-1.svc:8080', None]
+        assert endpoint_calls == [
+            ('r-1', 8080, {
+                'cluster_record': cluster_records['r-1']
+            }),
+        ]
+        replicas[0].handle.assert_called_once_with(cluster_records['r-1'])
+        replicas[1].handle.assert_not_called()
+
     def test_v2_status_group_uses_one_uid_read_for_all_replicas(self):
         replicas_and_handles = [
             self._v2_replica(f'r-{index}') for index in (1, 2)
