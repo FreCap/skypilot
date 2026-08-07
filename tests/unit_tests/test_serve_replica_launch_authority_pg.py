@@ -1,5 +1,6 @@
 """Real-PostgreSQL tests for SkyServe replica-launch authority guards."""
 # pylint: disable=protected-access,redefined-outer-name,unused-import
+# pylint: disable=unexpected-keyword-arg
 
 import concurrent.futures
 import contextlib
@@ -17,6 +18,7 @@ from sky import global_user_state
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import service_spec
 from sky.utils import locks
 from sky.utils.db import db_utils
 
@@ -32,8 +34,20 @@ _REPLACEMENT_CONTROLLER_IP = '10.0.0.2'
 _WAIT_TIMEOUT_SECONDS = 10
 
 
+def _service_spec() -> service_spec.SkyServiceSpec:
+    return service_spec.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=0,
+        readiness_timeout_seconds=5,
+        endpoint_probe_interval_seconds=1,
+        lb_stream_timeout_seconds=10,
+        min_replicas=1,
+        lb_high_availability=False,
+    )
+
+
 @pytest.fixture
-def launch_authority_database(postgres_engine, monkeypatch):
+def launch_authority_database(postgres_engine, monkeypatch):  # noqa: F811
     """Install an isolated real PostgreSQL database as the Serve database."""
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
@@ -63,7 +77,7 @@ def _seed_service(engine: sqlalchemy.engine.Engine, service_name: str,
         connection.execute(serve_state.version_specs_table.insert().values(
             service_name=service_name,
             version=1,
-            spec=pickle.dumps(None),
+            spec=pickle.dumps(_service_spec()),
             yaml_content='service: v1\n',
             controller_config=config,
             controller_config_digest=config_digest,
@@ -74,10 +88,10 @@ def _seed_service(engine: sqlalchemy.engine.Engine, service_name: str,
 def _controller_config_snapshot(
         service_name: str,
         version: int) -> serve_state.ControllerConfigSnapshot:
-    config = f'config-for-{service_name}-v{version}'.encode('utf-8')
+    config = f'config-for-{service_name}-v{version}'.encode()
     digest = hashlib.sha256(config).hexdigest()
     snapshot_id = hashlib.sha256(
-        f'snapshot-for-{service_name}-v{version}'.encode('utf-8')).hexdigest()
+        f'snapshot-for-{service_name}-v{version}'.encode()).hexdigest()
     return config, digest, snapshot_id
 
 
@@ -103,7 +117,7 @@ def _commit_version(service_name: str,
     return serve_state.add_or_update_version(
         service_name,
         version,
-        typing.cast(typing.Any, None),
+        _service_spec(),
         f'service: v{version}\n',
         ha_recovery_script=(
             f'#!/bin/sh\n{constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER}\n'),
@@ -126,7 +140,7 @@ def _create_service(service_name: str, service_hash: str) -> bool:
         pool=False,
         controller_pid=_REPLACEMENT_CONTROLLER_PID,
         entrypoint='python app.py',
-        spec=typing.cast(typing.Any, None),
+        spec=_service_spec(),
         yaml_content='service: v1\n',
         controller_ip=_REPLACEMENT_CONTROLLER_IP,
         service_hash=service_hash,
