@@ -1984,6 +1984,43 @@ def test_cleanup_worker_services_for_token_reads_only_requested_token_records(
     assert cleaned_records == [('owner-a', 'worker-a'), ('owner-a', 'worker-b')]
 
 
+def test_cleanup_worker_services_for_token_skips_cancel_if_worker_record_disappeared(
+        monkeypatch):
+    batch_coordinator = _make_coordinator()
+    record = {
+        'coordinator_token': 'owner-a',
+        'worker_cluster': 'worker-a',
+        'worker_job_name': 'batch-worker-1-owner-a',
+        'worker_job_id': None,
+        'launch_request_id': None,
+    }
+    queued_jobs = [
+        types.SimpleNamespace(job_id=17, job_name=record['worker_job_name'])
+    ]
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(return_value=[record]))
+    monkeypatch.setattr(coordinator.sdk, 'queue',
+                        mock.Mock(return_value='queue-worker-a'))
+    get = mock.Mock(return_value=queued_jobs)
+    cancel = mock.Mock()
+    remove_record = mock.Mock()
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_job_id',
+                        mock.Mock(return_value=False))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove_record)
+
+    batch_coordinator._cleanup_worker_services_for_token('owner-a')
+
+    get.assert_called_once_with('queue-worker-a')
+    cancel.assert_not_called()
+    remove_record.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ('invalid_snapshot', 'error_type', 'error_match'),
     [(None, TypeError, 'Queue snapshot for worker-a returned None'),
@@ -3237,6 +3274,46 @@ async def test_superseded_cleanup_reuses_queue_snapshot_on_same_cluster(
             1, batch_coordinator._worker_token, 'worker-a', worker_job_id=18),
     ],
                                    any_order=True)
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_skips_cancel_if_worker_record_disappeared_before_persist(
+        monkeypatch):
+    batch_coordinator = _make_coordinator()
+    record = {
+        'coordinator_token': batch_coordinator._worker_token,
+        'worker_cluster': 'worker-a',
+        'worker_job_name': 'batch-worker-1-owner-a',
+        'worker_job_id': None,
+        'launch_request_id': None,
+    }
+    queued_jobs = [
+        types.SimpleNamespace(job_id=17, job_name=record['worker_job_name'])
+    ]
+    queue = mock.Mock(return_value='queue-worker-a')
+    get = mock.Mock(return_value=queued_jobs)
+    cancel = mock.Mock()
+    remove_record = mock.Mock()
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(return_value=[record]))
+    monkeypatch.setattr(coordinator.sdk, 'queue', queue)
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_job_id',
+                        mock.Mock(return_value=False))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove_record)
+
+    await batch_coordinator.handle_superseded(timeout=1)
+
+    queue.assert_called_once_with('worker-a', skip_finished=True)
+    assert get.call_args_list
+    assert get.call_args_list[0] == mock.call('queue-worker-a')
+    cancel.assert_not_called()
+    remove_record.assert_not_called()
 
 
 @pytest.mark.asyncio
