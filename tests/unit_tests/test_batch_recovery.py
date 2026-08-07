@@ -1332,35 +1332,57 @@ def test_cancel_contains_thread_start_failure(monkeypatch):
         'worker-b': 18,
         'worker-c': 19,
     })
-    shutdowns = []
+    events = []
 
     def _shutdown_worker(cluster_name, worker_job_id=None):
-        shutdowns.append((cluster_name, worker_job_id))
+        events.append(f'shutdown:{cluster_name}:{worker_job_id}')
 
     class _FailingThread:
         """Defers shutdown to join and simulates thread exhaustion."""
 
         starts = 0
 
-        def __init__(self, target, args=()):
+        def __init__(self, target, args=(), kwargs=None):
             self._target = target
             self._args = args
+            self._kwargs = kwargs or {}
 
         def start(self):
             type(self).starts += 1
+            events.append(f'start:{self._args[1]}:{self._args[2]}')
             if type(self).starts == 2:
                 raise RuntimeError('cannot start new thread')
 
         def join(self):
-            self._target(*self._args)
+            events.append(f'join:{self._args[1]}:{self._args[2]}')
+            self._target(*self._args, **self._kwargs)
+
+    class _ContextStub:
+        """Runs the provided target inline for deterministic testing."""
+
+        def run(self, fn, *args):
+            fn(*args)
+
+    def _copy_context():
+        return _ContextStub()
 
     monkeypatch.setattr(batch_coordinator, '_shutdown_worker', _shutdown_worker)
     monkeypatch.setattr(coordinator.threading, 'Thread', _FailingThread)
+    monkeypatch.setattr(coordinator.contextvars, 'copy_context', _copy_context)
 
     with mock.patch.object(coordinator.logger, 'warning') as log_warning:
         batch_coordinator.cancel()
 
-    assert shutdowns == [('worker-b', 18), ('worker-a', 17), ('worker-c', 19)]
+    assert events == [
+        'start:worker-a:17',
+        'start:worker-b:18',
+        'start:worker-c:19',
+        'shutdown:worker-b:18',
+        'join:worker-a:17',
+        'shutdown:worker-a:17',
+        'join:worker-c:19',
+        'shutdown:worker-c:19',
+    ]
     log_warning.assert_called_once_with(
         'Failed to start shutdown thread for %s; shutting down '
         'synchronously: %s', 'worker-b', mock.ANY)
