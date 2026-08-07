@@ -231,6 +231,7 @@ class BatchCoordinator:
         """
         workers_snapshot = self._begin_cleanup()
         shutdown_threads = []
+        synchronous_fallbacks: list[tuple[str, int]] = []
         for cluster_name, worker_job_id in workers_snapshot:
             try:
                 thread_ctx = contextvars.copy_context()
@@ -243,9 +244,11 @@ class BatchCoordinator:
                 logger.warning(
                     'Failed to start shutdown thread for %s; shutting down '
                     'synchronously: %s', cluster_name, e)
-                self._cancel_worker(cluster_name, worker_job_id)
+                synchronous_fallbacks.append((cluster_name, worker_job_id))
             else:
                 shutdown_threads.append(shutdown_thread)
+        for cluster_name, worker_job_id in synchronous_fallbacks:
+            self._cancel_worker(cluster_name, worker_job_id)
         for shutdown_thread in shutdown_threads:
             shutdown_thread.join()
 
