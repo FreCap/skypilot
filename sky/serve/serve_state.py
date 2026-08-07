@@ -30,8 +30,7 @@ from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
 from sky.serve import serve_state_schema
-from sky.serve.lb_cutover_state import (
-    lb_cutover_kubernetes_guard as _lb_cutover_kubernetes_guard)
+from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
 from sky.serve.serve_statuses import ReplicaStatus
 from sky.serve.serve_statuses import ServiceStatus
 from sky.server.requests import postgres_schema as request_postgres_schema
@@ -2072,7 +2071,7 @@ get_lb_demand_handoff = lb_cutover_state.get_lb_demand_handoff
 mark_lb_demand_handoff_complete = (
     lb_cutover_state.mark_lb_demand_handoff_complete)
 clear_lb_demand_handoff = lb_cutover_state.clear_lb_demand_handoff
-lb_cutover_kubernetes_guard = _lb_cutover_kubernetes_guard
+lb_cutover_kubernetes_guard = _lb_guard
 abort_lb_cutover_preparation = (lb_cutover_state.abort_lb_cutover_preparation)
 
 
