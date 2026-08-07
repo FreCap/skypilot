@@ -937,10 +937,15 @@ class SkyServeLoadBalancer:
         """Whether one sample is valid for bounded LB-local admission."""
         if not self._system_recovery_route_is_available_locked(url):
             return False
-        if url not in self._replica_free_slots:
+        if (url not in self._replica_occupancy or
+                url not in self._replica_total_slots or
+                url not in self._replica_free_slots):
             return False
-        if (self._occupancy_sample_generation.get(url)
-                != self._occupancy_dispatch_generation.get(url, 0) and
+        sample_generation = self._occupancy_sample_generation.get(url)
+        if sample_generation is None:
+            return False
+        if (sample_generation != self._occupancy_dispatch_generation.get(
+                url, 0) and
                 self._occupancy_pending_reservations.get(url, 0) <= 0):
             return False
 
@@ -2456,12 +2461,6 @@ class SkyServeLoadBalancer:
         if url in self._occupancy_explicitly_disabled_urls:
             self._occupancy_disable_pending.add(url)
         dispatch_generation = self._occupancy_dispatch_generation
-        sample_generation = self._occupancy_sample_generation
-        if not sample_generation and self._replica_occupancy:
-            sample_generation.update({
-                sampled_url: dispatch_generation.get(sampled_url, 0)
-                for sampled_url in self._replica_occupancy
-            })
         dispatch_generation[url] = dispatch_generation.get(url, 0) + 1
 
         pending = self._occupancy_pending_reservations

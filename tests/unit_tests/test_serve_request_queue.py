@@ -2,11 +2,13 @@
 # pylint: disable=protected-access
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Callable
 import json
 from typing import Any
 from unittest import mock
 
 import fastapi
+from load_balancer_test_utils import publish_current_occupancy_snapshot
 import pytest
 from starlette import datastructures
 
@@ -50,6 +52,16 @@ def _request_with_headers(
     request = _request()
     request.headers = datastructures.Headers(raw=raw_headers)
     return request
+
+
+async def _wait_until(predicate: Callable[[], bool],
+                      timeout_seconds: float = 1) -> None:
+
+    async def _poll() -> None:
+        while not predicate():  # noqa: ASYNC110
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(_poll(), timeout=timeout_seconds)
 
 
 def _make_spec(**kwargs: Any) -> service_spec_lib.SkyServiceSpec:
@@ -258,11 +270,48 @@ def test_async_occupancy_clamps_dispatch_limit():
                   use_async_occupancy=True)
     urls = ['http://worker-0:8000', 'http://worker-1:8000']
     lb._load_balancing_policy.set_ready_replicas(urls)
-    lb._replica_total_slots = {urls[0]: 1, urls[1]: 1}
-    lb._replica_free_slots = {urls[0]: 0, urls[1]: 1}
+    publish_current_occupancy_snapshot(lb,
+                                       occupancy={
+                                           urls[0]: 1,
+                                           urls[1]: 0,
+                                       },
+                                       total_slots={
+                                           urls[0]: 1,
+                                           urls[1]: 1,
+                                       },
+                                       free_slots={
+                                           urls[0]: 0,
+                                           urls[1]: 1,
+                                       })
     assert lb._request_queue_limits() == (1, 6)
     lb._replica_free_slots = {}
     assert lb._request_queue_limits() == (0, 6)
+
+
+def test_async_occupancy_requires_complete_local_sample_contract():
+    lb = _make_lb(min_size=0, size_per_replica=3, use_async_occupancy=True)
+    url = 'http://worker:8000'
+    lb._load_balancing_policy.set_ready_replicas([url])
+    lb._replica_occupancy = {url: 0}
+    lb._replica_total_slots = {url: 1}
+    lb._replica_free_slots = {url: 1}
+
+    assert lb._request_queue_limits()[0] == 0
+    lb._occupancy_pending_reservations = {url: 1}
+    assert lb._request_queue_limits()[0] == 0
+    lb._occupancy_pending_reservations = {}
+    lb._occupancy_sample_generation = {url: 0}
+    assert lb._request_queue_limits()[0] == 0
+    lb._occupancy_sample_time = {url: load_balancer.time.monotonic()}
+    assert lb._request_queue_limits()[0] == 0
+    lb._occupancy_sample_role_epoch = {url: lb._occupancy_role_epoch}
+    assert lb._request_queue_limits()[0] == 1
+
+    lb._replica_occupancy = {}
+    assert lb._request_queue_limits()[0] == 0
+    lb._replica_occupancy = {url: 0}
+    lb._replica_total_slots = {}
+    assert lb._request_queue_limits()[0] == 0
 
 
 def test_async_occupancy_sizes_queue_by_probed_slots():
@@ -275,8 +324,19 @@ def test_async_occupancy_sizes_queue_by_probed_slots():
     four_gpu = 'http://four-gpu:8000'
     unknown = 'http://unknown:8000'
     lb._load_balancing_policy.set_ready_replicas([one_gpu, four_gpu, unknown])
-    lb._replica_total_slots = {one_gpu: 1, four_gpu: 4}
-    lb._replica_free_slots = {one_gpu: 1, four_gpu: 4}
+    publish_current_occupancy_snapshot(lb,
+                                       occupancy={
+                                           one_gpu: 0,
+                                           four_gpu: 0,
+                                       },
+                                       total_slots={
+                                           one_gpu: 1,
+                                           four_gpu: 4,
+                                       },
+                                       free_slots={
+                                           one_gpu: 1,
+                                           four_gpu: 4,
+                                       })
 
     assert lb._request_queue_limits() == (5, 15)
     lb._request_queue_config = {
@@ -303,14 +363,10 @@ def test_logical_queue_size_uses_plan_but_dispatch_requires_observation():
 
     assert lb._request_queue_limits() == (0, 12)
 
-    lb._replica_occupancy = {url: 0}
-    lb._replica_total_slots = {url: 4}
-    lb._replica_free_slots = {url: 4}
-    lb._occupancy_sample_generation = {url: 0}
-    lb._occupancy_sample_time = {url: load_balancer.time.monotonic()}
-    lb._occupancy_sample_role_epoch = {
-        url: lb._occupancy_role_epoch,
-    }
+    publish_current_occupancy_snapshot(lb,
+                                       occupancy={url: 0},
+                                       total_slots={url: 4},
+                                       free_slots={url: 4})
     assert lb._request_queue_limits() == (4, 12)
 
     lb._occupancy_sample_time[url] -= (
@@ -366,8 +422,7 @@ def test_fast_ack_multi_slot_reservations_fill_and_resume_exactly():
         assert lb._request_queue_limits()[0] == 0
 
         fifth = asyncio.create_task(lb._proxy_with_retries(_request()))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         assert running == capacity
 
         # Completing one child does not help until the aggregate endpoint
@@ -421,11 +476,13 @@ def test_instance_aware_routing_fills_one_and_four_gpu_replicas():
                     'gpu_count': '4'
                 },
             })
-            lb._replica_occupancy = {one_gpu: 0, four_gpu: 0}
-            lb._replica_total_slots = dict(capacities)
-            lb._replica_free_slots = dict(capacities)
-            lb._occupancy_dispatch_generation = {one_gpu: 0, four_gpu: 0}
-            lb._occupancy_sample_generation = {one_gpu: 0, four_gpu: 0}
+            publish_current_occupancy_snapshot(lb,
+                                               occupancy={
+                                                   one_gpu: 0,
+                                                   four_gpu: 0
+                                               },
+                                               total_slots=capacities,
+                                               free_slots=capacities)
             lb._occupancy_declared_urls = {one_gpu, four_gpu}
             policy.set_occupancy({one_gpu: 0, four_gpu: 0})
 
@@ -472,8 +529,10 @@ def test_unassigned_admissions_close_selection_scheduling_gap():
                       use_async_occupancy=True)
         url = 'http://two-slots:8000'
         lb._load_balancing_policy.set_ready_replicas([url])
-        lb._replica_total_slots = {url: 2}
-        lb._replica_free_slots = {url: 2}
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={url: 0},
+                                           total_slots={url: 2},
+                                           free_slots={url: 2})
         requests = [_request() for _ in range(3)]
 
         assert await lb._acquire_request_slot(requests[0]) is True
@@ -482,8 +541,7 @@ def test_unassigned_admissions_close_selection_scheduling_gap():
         assert lb._request_queue_limits()[0] == 2
 
         third = asyncio.create_task(lb._acquire_request_slot(requests[2]))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         assert not third.done()
 
         await lb._release_request_slot(requests[0])
@@ -509,11 +567,10 @@ def test_slow_proxy_does_not_hold_reservation_locks():
         url = 'http://four-slots:8000'
         lb._load_balancing_policy.set_ready_replicas([url])
         lb._occupancy_declared_urls = {url}
-        lb._replica_occupancy = {url: 0}
-        lb._replica_total_slots = {url: 4}
-        lb._replica_free_slots = {url: 4}
-        lb._occupancy_dispatch_generation = {url: 0}
-        lb._occupancy_sample_generation = {url: 0}
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={url: 0},
+                                           total_slots={url: 4},
+                                           free_slots={url: 4})
         first_started = asyncio.Event()
         release_first = asyncio.Event()
         second_started = asyncio.Event()
@@ -532,7 +589,7 @@ def test_slow_proxy_does_not_hold_reservation_locks():
 
         lb._proxy_request_to = _proxy
         first = asyncio.create_task(lb._proxy_with_retries(_request()))
-        await first_started.wait()
+        await asyncio.wait_for(first_started.wait(), timeout=1)
         second = asyncio.create_task(lb._proxy_with_retries(_request()))
         await asyncio.wait_for(second_started.wait(), timeout=1)
         assert (await second).status_code == 202
@@ -554,11 +611,10 @@ def test_policy_swap_during_attempt_preserves_pending_capacity():
                       use_async_occupancy=True)
         lb._load_balancing_policy.set_ready_replicas([url])
         lb._occupancy_declared_urls = {url}
-        lb._replica_occupancy = {url: 0}
-        lb._replica_total_slots = {url: 2}
-        lb._replica_free_slots = {url: 2}
-        lb._occupancy_dispatch_generation = {url: 0}
-        lb._occupancy_sample_generation = {url: 0}
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={url: 0},
+                                           total_slots={url: 2},
+                                           free_slots={url: 2})
         first_started = asyncio.Event()
         release_first = asyncio.Event()
         calls = 0
@@ -574,7 +630,7 @@ def test_policy_swap_during_attempt_preserves_pending_capacity():
 
         lb._proxy_request_to = _proxy
         first = asyncio.create_task(lb._proxy_with_retries(_request()))
-        await first_started.wait()
+        await asyncio.wait_for(first_started.wait(), timeout=1)
         with lb._client_pool_lock:
             lb._apply_routing_spec({
                 'load_balancing_policy_name': 'instance_aware_least_load',
@@ -618,11 +674,14 @@ def test_retriable_rejection_keeps_admitted_slot_until_next_selection():
                       use_async_occupancy=True)
         lb._load_balancing_policy.set_ready_replicas([first_url, second_url])
         lb._occupancy_declared_urls = {first_url, second_url}
-        lb._replica_occupancy = {first_url: 0, second_url: 0}
-        lb._replica_total_slots = {first_url: 1, second_url: 1}
-        lb._replica_free_slots = {first_url: 1, second_url: 1}
-        lb._occupancy_dispatch_generation = {first_url: 0, second_url: 0}
-        lb._occupancy_sample_generation = {first_url: 0, second_url: 0}
+        slots = {first_url: 1, second_url: 1}
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={
+                                               first_url: 0,
+                                               second_url: 0
+                                           },
+                                           total_slots=slots,
+                                           free_slots=slots)
         lb._load_balancing_policy.set_occupancy({first_url: 0, second_url: 0})
         request = _request()
         request.is_disconnected = mock.AsyncMock(return_value=False)
@@ -670,11 +729,14 @@ def test_enabling_occupancy_queue_mid_request_does_not_leak_admission():
         lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 8890)
         lb._load_balancing_policy.set_ready_replicas([first_url, second_url])
         lb._occupancy_declared_urls = {first_url, second_url}
-        lb._replica_occupancy = {first_url: 0, second_url: 0}
-        lb._replica_total_slots = {first_url: 1, second_url: 1}
-        lb._replica_free_slots = {first_url: 1, second_url: 1}
-        lb._occupancy_dispatch_generation = {first_url: 0, second_url: 0}
-        lb._occupancy_sample_generation = {first_url: 0, second_url: 0}
+        slots = {first_url: 1, second_url: 1}
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={
+                                               first_url: 0,
+                                               second_url: 0
+                                           },
+                                           total_slots=slots,
+                                           free_slots=slots)
         lb._load_balancing_policy.set_occupancy({first_url: 0, second_url: 0})
         request = _request()
         request.is_disconnected = mock.AsyncMock(return_value=False)
@@ -736,11 +798,14 @@ def test_live_queue_mode_toggle_preserves_retry_ownership(
                       use_async_occupancy=initial_occupancy)
         lb._load_balancing_policy.set_ready_replicas([first_url, second_url])
         lb._occupancy_declared_urls = {first_url, second_url}
-        lb._replica_occupancy = {first_url: 0, second_url: 0}
-        lb._replica_total_slots = {first_url: 1, second_url: 1}
-        lb._replica_free_slots = {first_url: 1, second_url: 1}
-        lb._occupancy_dispatch_generation = {first_url: 0, second_url: 0}
-        lb._occupancy_sample_generation = {first_url: 0, second_url: 0}
+        slots = {first_url: 1, second_url: 1}
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={
+                                               first_url: 0,
+                                               second_url: 0
+                                           },
+                                           total_slots=slots,
+                                           free_slots=slots)
         request = _request()
         request.is_disconnected = mock.AsyncMock(return_value=False)
         attempts = []
@@ -1228,15 +1293,13 @@ def test_aggregate_free_slot_does_not_admit_incompatible_request():
         request = _request()
         setattr(request, '_skyserve_compatible_accelerators', ('A100',))
         acquire = asyncio.create_task(lb._acquire_request_slot(request, 50))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         assert not acquire.done()
         assert lb._active_request_count == 0
         acquire.cancel()
         with pytest.raises(asyncio.CancelledError):
             await acquire
-        while lb._waiting_request_count:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 0)
 
     asyncio.run(_run())
 
@@ -1278,8 +1341,7 @@ def test_empty_fleet_records_compatibility_demand_before_admission():
         ])
         request.body = mock.AsyncMock(return_value=b'')
         proxy = asyncio.create_task(lb._proxy_with_retries(request))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         assert lb._request_aggregator.request_history_snapshot() is None
         assert lb._request_queue_profiles() == [{
             'priority': 50,
@@ -1391,8 +1453,7 @@ def test_strict_priority_with_fifo_ties():
             task = asyncio.create_task(
                 lb._acquire_request_slot(_request(), priority))
             queued.append((name, task))
-            while lb._waiting_request_count != len(queued):
-                await asyncio.sleep(0)
+            await _wait_until(lambda: lb._waiting_request_count == len(queued))
 
         await _enqueue('low', 1)
         await _enqueue('high-first', 100)
@@ -1402,18 +1463,16 @@ def test_strict_priority_with_fifo_ties():
         order = []
         await lb._release_request_slot()
         for _ in queued:
-            while True:
-                completed = [(name, task)
-                             for name, task in queued
-                             if task.done() and name not in order]
-                if completed:
-                    assert len(completed) == 1
-                    name, task = completed[0]
-                    assert await task is True
-                    order.append(name)
-                    await lb._release_request_slot()
-                    break
-                await asyncio.sleep(0)
+            await _wait_until(lambda: any(
+                task.done() and name not in order for name, task in queued))
+            completed = [(name, task)
+                         for name, task in queued
+                         if task.done() and name not in order]
+            assert len(completed) == 1
+            name, task = completed[0]
+            assert await task is True
+            order.append(name)
+            await lb._release_request_slot()
 
         assert order == ['high-first', 'high-second', 'medium', 'low']
         assert lb._active_request_count == 0
@@ -1432,8 +1491,7 @@ def test_late_higher_priority_registration_uses_existing_capacity():
         lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
         lb._active_request_count = 1
         low = asyncio.create_task(lb._acquire_request_slot(_request(), 1))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
 
         # Model capacity becoming available immediately before registration,
         # while its normal notification is still waiting to take the scheduler
@@ -1464,8 +1522,7 @@ def test_priority_is_non_preemptive():
         low_request = _request()
         assert await lb._acquire_request_slot(low_request, 1) is True
         high = asyncio.create_task(lb._acquire_request_slot(_request(), 100))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         assert not high.done()
         await lb._release_request_slot(low_request)
         assert await high is True
@@ -1484,8 +1541,7 @@ def test_full_queue_does_not_evict_lower_priority_waiter():
         lb._load_balancing_policy.set_ready_replicas(['http://worker:8000'])
         lb._active_request_count = 1
         low = asyncio.create_task(lb._acquire_request_slot(_request(), 1))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
 
         with pytest.raises(fastapi.HTTPException) as exc:
             await lb._acquire_request_slot(_request(), 100)
@@ -1563,8 +1619,7 @@ def test_waiter_wakes_when_dispatch_slot_released():
         lb._active_request_count = 1
         request = _request()
         waiter = asyncio.create_task(lb._acquire_request_slot(request))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         await lb._release_request_slot()
         assert await waiter is True
         assert lb._waiting_request_count == 0
@@ -1590,8 +1645,7 @@ def test_controller_capability_rollback_backfills_waiting_demand_once():
         ])
         request.body = mock.AsyncMock(return_value=b'')
         proxy = asyncio.create_task(lb._proxy_with_retries(request))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         assert lb._request_aggregator.request_history_snapshot() is None
 
         lb._set_queued_compatibility_demand_support(False)
@@ -1616,8 +1670,7 @@ def test_occupancy_probe_wakes_waiter():
         lb._load_balancing_policy.set_ready_replicas([url])
         request = _request()
         waiter = asyncio.create_task(lb._acquire_request_slot(request))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
 
         async def _free_slot(session, replica_url):
             del session
@@ -1664,8 +1717,7 @@ def test_timeout_and_cancellation_remove_waiters():
             'timeout_seconds': 1,
         }
         waiter = asyncio.create_task(lb._acquire_request_slot(request))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
@@ -1717,8 +1769,7 @@ def test_waiter_keeps_priority_timeout_selected_at_admission():
                 lb, '_request_queue_timeout',
                 wraps=lb._request_queue_timeout) as timeout_resolver:
             waiter = asyncio.create_task(lb._acquire_request_slot(request))
-            while lb._waiting_request_count != 1:
-                await asyncio.sleep(0)
+            await _wait_until(lambda: lb._waiting_request_count == 1)
             lb._request_queue_config = {
                 **(lb._request_queue_config or {}),
                 'timeout_seconds_by_priority': [{
@@ -1836,8 +1887,7 @@ def test_disconnect_racing_slot_notification_does_not_dispatch():
         lb._proxy_with_retries_inner = mock.AsyncMock()
 
         waiter = asyncio.create_task(lb._proxy_with_retries(request))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         request.is_disconnected.return_value = True
         await lb._release_request_slot()
 
@@ -1869,11 +1919,10 @@ def test_cancellation_after_grant_reclaims_slot():
 
         request.is_disconnected.side_effect = _is_disconnected
         waiter = asyncio.create_task(lb._acquire_request_slot(request, 100))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
 
         await lb._release_request_slot()
-        await disconnect_check_started.wait()
+        await asyncio.wait_for(disconnect_check_started.wait(), timeout=1)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
@@ -1899,8 +1948,7 @@ def test_draining_waiter_is_rejected_without_dispatch():
         with mock.patch.object(load_balancer,
                                '_REQUEST_QUEUE_DISCONNECT_POLL_SECONDS', 0.001):
             waiter = asyncio.create_task(lb._proxy_with_retries(request))
-            while lb._waiting_request_count != 1:
-                await asyncio.sleep(0)
+            await _wait_until(lambda: lb._waiting_request_count == 1)
             lb._begin_draining()
             with pytest.raises(fastapi.HTTPException) as exc:
                 await waiter
@@ -1936,10 +1984,9 @@ def test_drain_racing_slot_notification_does_not_dispatch():
         lb._proxy_with_retries_inner = mock.AsyncMock()
 
         waiter = asyncio.create_task(lb._proxy_with_retries(request))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         await lb._release_request_slot()
-        await disconnect_check_started.wait()
+        await asyncio.wait_for(disconnect_check_started.wait(), timeout=1)
         lb._begin_draining()
         finish_disconnect_check.set()
 
@@ -1965,11 +2012,10 @@ def test_repeated_cancellation_cannot_leak_admission_count():
         url = 'http://worker:8000'
         lb._load_balancing_policy.set_ready_replicas([url])
         lb._occupancy_declared_urls = {url}
-        lb._replica_occupancy = {url: 0}
-        lb._replica_total_slots = {url: 1}
-        lb._replica_free_slots = {url: 1}
-        lb._occupancy_dispatch_generation = {url: 0}
-        lb._occupancy_sample_generation = {url: 0}
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={url: 0},
+                                           total_slots={url: 1},
+                                           free_slots={url: 1})
         started = asyncio.Event()
         never = asyncio.Event()
 
@@ -1981,7 +2027,7 @@ def test_repeated_cancellation_cannot_leak_admission_count():
 
         lb._proxy_request_to = _proxy
         task = asyncio.create_task(lb._proxy_with_retries(_request()))
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=1)
         condition = lb._request_queue_condition
         assert condition is not None
         async with condition:
@@ -2031,10 +2077,9 @@ def test_repeated_cancellation_still_wakes_envelope_waiter():
 
         lb._proxy_request_to = _proxy
         active = asyncio.create_task(lb._proxy_with_retries(_request()))
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=1)
         waiter = asyncio.create_task(lb._proxy_with_retries(_request()))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         condition = lb._request_queue_condition
         assert condition is not None
         async with condition:
@@ -2070,8 +2115,10 @@ def test_capacity_reports_request_queue_state():
                       use_async_occupancy=True)
         url = 'http://worker:8000'
         lb._load_balancing_policy.set_ready_replicas([url])
-        lb._replica_total_slots = {url: 1}
-        lb._replica_free_slots = {url: 1}
+        publish_current_occupancy_snapshot(lb,
+                                           occupancy={url: 0},
+                                           total_slots={url: 1},
+                                           free_slots={url: 1})
         lb._waiting_request_count = 2
         lb._queue_depth = 3
         lb._queue_depth_by_priority = {0: 2, 50: 1}
@@ -2109,10 +2156,9 @@ def test_proxy_handler_queues_until_first_request_completes():
 
         lb._proxy_with_retries_inner = _proxy
         first = asyncio.create_task(lb._proxy_with_retries(_request()))
-        await first_started.wait()
+        await asyncio.wait_for(first_started.wait(), timeout=1)
         second = asyncio.create_task(lb._proxy_with_retries(_request()))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         assert call_count == 1
         release_first.set()
         assert (await first).status_code == 200
@@ -2130,8 +2176,7 @@ def test_disabling_queue_releases_existing_waiters():
         lb = _make_lb()
         request = _request()
         waiter = asyncio.create_task(lb._acquire_request_slot(request))
-        while lb._waiting_request_count != 1:
-            await asyncio.sleep(0)
+        await _wait_until(lambda: lb._waiting_request_count == 1)
         lb._apply_routing_spec({'request_queue': None})
         await lb._notify_request_queue()
         assert await waiter is True
@@ -2264,7 +2309,7 @@ def test_body_buffer_cancellation_releases_partial_reservation():
         request = _BlockingRequest([])
         task = asyncio.create_task(
             lb._request_body(request))  # type: ignore[arg-type]
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=1)
         assert lb._waiting_request_body_bytes == 2
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
