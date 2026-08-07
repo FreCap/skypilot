@@ -797,27 +797,36 @@ def get_latest_task_id_status(
 
 def get_job_controller_processes(
         job_ids: list[int]) -> dict[int, ControllerPidRecord]:
-    """Return controller process records for the requested jobs."""
+    """Return controller process records for the requested jobs.
+
+    Dedupes repeated ids and chunks large batches so scheduler scans and
+    multi-job submissions do not depend on one oversized ``IN (...)`` query.
+    """
     if not job_ids:
         return {}
 
+    unique_job_ids = list(dict.fromkeys(job_ids))
     engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.execute(
-            sqlalchemy.select(
-                job_info_table.c.spot_job_id, job_info_table.c.controller_pid,
-                job_info_table.c.controller_pid_started_at).where(
-                    job_info_table.c.spot_job_id.in_(job_ids))).fetchall()
-
     records: dict[int, ControllerPidRecord] = {}
-    for job_id, pid, started_at in rows:
-        if pid is None:
-            continue
-        if pid < 0:
-            # Between #7051 and #7847, the controller pid was negative to
-            # indicate a controller process that can handle multiple jobs.
-            pid = -pid
-        records[job_id] = ControllerPidRecord(pid=pid, started_at=started_at)
+    with orm.Session(engine) as session:
+        for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+            chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+            rows = session.execute(
+                sqlalchemy.select(
+                    job_info_table.c.spot_job_id,
+                    job_info_table.c.controller_pid,
+                    job_info_table.c.controller_pid_started_at).where(
+                        job_info_table.c.spot_job_id.in_(chunk))).fetchall()
+            for job_id, pid, started_at in rows:
+                if pid is None:
+                    continue
+                if pid < 0:
+                    # Between #7051 and #7847, the controller pid was
+                    # negative to indicate a controller process that can
+                    # handle multiple jobs.
+                    pid = -pid
+                records[job_id] = ControllerPidRecord(pid=pid,
+                                                      started_at=started_at)
     return records
 
 
