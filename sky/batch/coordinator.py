@@ -497,13 +497,21 @@ class BatchCoordinator:
             if worker_job_id is None:
                 return True, None
             worker_job_id = int(worker_job_id)
-            within_deadline, _, _ = await _run_call(
+            within_deadline, succeeded, persisted = await _run_call(
                 'worker job ID persistence',
                 managed_job_state.record_batch_worker_job_id,
                 self._managed_job_id, record['coordinator_token'],
                 record['worker_cluster'], worker_job_id)
             if not within_deadline:
                 return False, None
+            if not succeeded:
+                return True, None
+            if not persisted:
+                logger.info(
+                    'Skipping superseded Batch cleanup for %s on %s '
+                    'after its durable worker record disappeared',
+                    record['worker_job_name'], record['worker_cluster'])
+                return True, None
             return True, worker_job_id
 
         within_deadline, succeeded, records = await _run_call(
@@ -1239,9 +1247,15 @@ class BatchCoordinator:
         if worker_job_id is None:
             return None
         worker_job_id = int(worker_job_id)
-        managed_job_state.record_batch_worker_job_id(
+        persisted = managed_job_state.record_batch_worker_job_id(
             self._managed_job_id, record['coordinator_token'],
             record['worker_cluster'], worker_job_id)
+        if not persisted:
+            logger.info(
+                'Skipping Batch worker cleanup for %s on %s after its '
+                'durable record disappeared', record['worker_job_name'],
+                record['worker_cluster'])
+            return None
         return worker_job_id
 
     def _cancel_worker_record(
