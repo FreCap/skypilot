@@ -239,6 +239,88 @@ def _merge_fresh_target_into_downscale_hold(
     return result
 
 
+def _bound_materialized_reassignment_target(
+    *,
+    adopted_target: dict[str, int],
+    desired_target: dict[str, int],
+    reassignment_source_by_accelerator: dict[str, int],
+    reassignment_destination_by_accelerator: dict[str, int],
+    configured_cards: list[str],
+    final_target: int,
+) -> dict[str, int]:
+    """Build a full target whose only deficits come from proven sources.
+
+    An aggregate downscale hold can combine old exact-card slots with a fresh
+    compatibility-owned subset.  A backed reassignment of that fresh subset
+    must not consume an unrelated held slot merely because it appears first
+    in configured-card order.  This helper starts from the complete adopted
+    map, adds ordinary overprovision padding, then creates destination
+    deficits by removing only the explicitly identified fresh source units.
+    The actuation revalidator still decides whether materialized destination
+    supply is sufficient; this helper grants no cold-launch authority.
+    """
+    maps = (adopted_target, desired_target, reassignment_source_by_accelerator,
+            reassignment_destination_by_accelerator)
+    configured = set(configured_cards)
+    if (isinstance(final_target, bool) or not isinstance(final_target, int) or
+            final_target < 0 or
+            any(set(values) - configured for values in maps) or any(
+                isinstance(count, bool) or not isinstance(count, int) or
+                count < 0 for values in maps for count in values.values()) or
+            sum(desired_target.values()) != final_target or
+            sum(adopted_target.values()) > final_target or
+            any(count > adopted_target.get(card, 0)
+                for card, count in reassignment_source_by_accelerator.items())
+            or any(count > desired_target.get(card, 0) for card, count in
+                   reassignment_destination_by_accelerator.items())):
+        return {}
+
+    target = {
+        card: int(adopted_target.get(card, 0)) for card in configured_cards
+    }
+    remaining = final_target - sum(target.values())
+    for card in configured_cards:
+        if remaining <= 0:
+            break
+        added = min(remaining, max(0,
+                                   desired_target.get(card, 0) - target[card]))
+        target[card] += added
+        remaining -= added
+    if remaining != 0:
+        return {}
+
+    destination_deficit = {
+        card: max(
+            0,
+            reassignment_destination_by_accelerator.get(card, 0) -
+            target[card]) for card in configured_cards
+    }
+    movable = sum(destination_deficit.values())
+    removed = 0
+    for card in configured_cards:
+        if removed >= movable:
+            break
+        source_available = min(
+            reassignment_source_by_accelerator.get(card, 0),
+            max(
+                0, target[card] -
+                reassignment_destination_by_accelerator.get(card, 0)))
+        count = min(source_available, movable - removed)
+        target[card] -= count
+        removed += count
+
+    to_place = removed
+    for card in configured_cards:
+        if to_place <= 0:
+            break
+        count = min(to_place, destination_deficit[card])
+        target[card] += count
+        to_place -= count
+    if to_place != 0 or sum(target.values()) != final_target:
+        return {}
+    return {card: count for card, count in target.items() if count > 0}
+
+
 def _revalidate_actuation_target(
     *,
     adopted_target: dict[str, int],

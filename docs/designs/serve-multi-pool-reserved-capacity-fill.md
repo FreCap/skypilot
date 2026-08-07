@@ -7,12 +7,13 @@ replay PR #1272, launch-guard race PR #1274, and exact-card/provider-phase/
 workspace corrective PR #1275 and phase-scope hotfix #1280 are merged and
 deployed. Durable-round bootstrap PR #1278 is merged but not yet deployed.
 Live PHX canaries proved H200 scheduling, zero-cost accounting, and hub-to-PHX
-connectivity, but also exposed that `serve update` retained the controller's
-east-only config snapshot. The atomic config-refresh rollout, production fleet
-update, sustained live verification, and compatibility-cleanup merge gates
-remain open.
+connectivity. A later live refill cycle exposed two corrective invariants now
+implemented here: an identity-stable pool retains non-launching shelter across
+a forward service-generation transition, and a downscale-held actuator may
+reuse materialized compatible supply only for the fresh owned source subset.
+Sustained live verification and compatibility-cleanup merge gates remain open.
 
-Last updated: 2026-08-05
+Last updated: 2026-08-07
 
 Canonical owner: this file. The implementation, rollout evidence, and the
 stacked compatibility-removal change must stay synchronized with this
@@ -803,10 +804,27 @@ service fence, invalidate sibling rounds already driven in that poll, and let
 the next configured heartbeat re-add the edge in an endless generation-churn
 loop. Protocol v1 retains its legacy claim-removal behavior.
 
-If driving one protocol-v2 round raises or times out, that edge publishes
-feed zero, launch grant zero, and no epoch. It may retain only its prior
-same-generation, same-physical-UID grant, clipped to the current edge cap, as
-non-launching `shelter_grant`; a peer pool's successful round remains usable.
+If driving one protocol-v2 round raises or times out, that edge publishes feed
+zero, launch grant zero, and no epoch. It may retain only its prior grant from
+the same pool key and physical UID, at the same or an older service generation,
+clipped to the current edge cap, as non-launching `shelter_grant`; a peer
+pool's successful round remains usable. A future prior generation, changed UID,
+or absent pool carries nothing. The complete-map swap removes deleted edges,
+while the UID prevents a replacement physical cluster from inheriting shelter.
+Thus a headroom or policy change may invalidate all launch authority without
+turning a transient first-round provider timeout into destructive teardown of
+healthy holdings.
+
+Consecutive failed forward generations may relay that same shelter, but each
+relay is non-increasing and re-clipped to the current edge cap; shrinking to
+zero cannot regrow when a later cap expands. This is an intentional
+availability-first failure mode for already-materialized zero-cost holdings:
+it can delay their retirement while provider proof remains unavailable, but it
+cannot authorize a launch. Disabling fill or losing the live placer withdraws
+the claim and clears the process-local pool map even when the durable removal
+must be retried. A later same-key re-add therefore starts with zero shelter.
+Malformed live or restored protocol, generation, physical UID, composite pool
+identity, cap, feed, grant, shelter, or epoch supplies no edge authority.
 
 Round freshness is conditional on generation equality. If the caller's claim
 generation is absent or differs from `claim_generations` in an otherwise fresh
@@ -824,9 +842,25 @@ optional service-specific exact-card feed, timestamp, grant, and epoch. The
 poller publishes a complete map atomically;
 free-slot increase damping, staleness, occupancy debit, and emission-time
 spending run independently per pool. A service-generation change atomically
-invalidates every old pool feed. A pool remains at feed zero until a round
-carrying that exact generation arrives, and its local grant is always clamped
-to its edge cap.
+invalidates every old pool feed and launch grant. A pool remains at feed zero
+until a round carrying that exact generation arrives, and its local grant is
+always clamped to its edge cap. Non-launching shelter is independent: on a
+failed first round, an unchanged pool key and physical UID may carry the older
+shelter forward as described above. A complete-map edge removal and an
+operator disable are lifecycle boundaries: both delete its process-local
+shelter, so re-creation cannot inherit the removed claim's entitlement.
+Live ingestion and dynamic restore accept authority only when the composite v2
+key is canonical and its physical UID, finite timestamp no more than one stale
+window in the future, and nonempty Kubernetes location set form one exact
+identity. Every edge uses one context;
+every location has one positive whole-GPU shape; the location cards exactly
+cover the key's canonical cards at one width; and any shaped feed is a subset
+of those cards. A complete map uses each context once and keeps accelerator
+sets pairwise disjoint for aliases of one physical UID. Any live feed or grant
+also carries a positive epoch. Invalid live snapshots are rejected; invalid
+restored edges are omitted, while a cross-edge or mixed-generation restore
+conflict drops the complete map instead of choosing authority by serialized
+order.
 
 Existing aggregate `fill_free_slots`, `fill_snapshot_age`, and `fill_target`
 status fields remain compatibility projections. Additive per-pool status is
@@ -1278,6 +1312,17 @@ Automated coverage must include:
   authority without edge deletion, generation churn, or sibling invalidation;
 - per-pool grant, feed, damping, staleness, phantom, bench, epoch, cache, and
   removal isolation;
+- a service-generation advance followed by one pool's provider timeout: the
+  unchanged pool/physical UID retains clipped shelter while grant, feed, and
+  epoch stay zero, the healthy sibling advances independently, and the live
+  production shape suppresses every prior-generation H200 fill victim without
+  suppressing paid victims or emitting a failed-pool launch;
+- repeated failed generations monotonically clip shelter, complete-map removal
+  and disable/re-enable reset it to zero, and malformed live or dynamic-state
+  authority is rejected;
+- downscale-held backed reassignment uses only materialized supply and only the
+  fresh no-supply source subset, preserving unrelated held exact-card retries
+  and restoring same-card cold authority if the alternative supply vanishes;
 - committed measured-capacity dissemination to two independent pollers sharing
   one fresh round, with one provider query and identical exact-pool/card bench
   release for both controllers;

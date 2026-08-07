@@ -18,6 +18,7 @@ from unittest import mock
 
 from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -1308,6 +1309,273 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             dict(
                 _scale_ups(retry)
                 [0].target.cold_launch_authority_by_accelerator), {'L40S': 1})
+
+    def test_downscale_hold_reuses_materialized_compatible_supply(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=10,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=900,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        autoscaler.target_num_replicas = 5
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 5}
+        autoscaler._logical_adopted_paid_target_by_accelerator = {'L4': 5}
+        autoscaler._snap_target_on_next_recompute = False
+
+        paid_l4 = [
+            _replica(replica_id, card='L4') for replica_id in range(1, 6)
+        ]
+        zero_cost_h200 = [
+            _replica(replica_id, card='H200', reserved_fill=True)
+            for replica_id in range(6, 8)
+        ]
+        for info in paid_l4:
+            info.is_zero_cost = False
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                1.0)
+        for info in zero_cost_h200:
+            info.is_zero_cost = True
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                0.0)
+        replicas = [*paid_l4, *zero_cost_h200]
+        _report(
+            autoscaler,
+            in_flight={info.replica_id: 0 for info in replicas},
+            observed_slots={info.replica_id: 1 for info in replicas},
+            queue_depth=2,
+            queued_profiles=[self._profile(50, ['L4', 'H200'], 2)],
+            compatibility_complete=True,
+        )
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            decisions = _decisions(autoscaler, replicas)
+
+        # Aggregate hysteresis still holds five slots, and the public demand
+        # map remains unchanged. The private actuator may nevertheless use
+        # the two already-running H200 slots for the two units of fresh,
+        # explicitly compatible demand; this authorizes no cold H200 launch.
+        self.assertEqual(autoscaler._raw_target_num_replicas, 2)
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 5})
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator, {
+            'L4': 3,
+            'H200': 2,
+        })
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+        self.assertEqual(_scale_ups(decisions), [])
+        scale_down_targets = [
+            decision.target
+            for decision in decisions
+            if decision.operator == _SCALE_DOWN
+        ]
+        self.assertEqual(
+            sorted(target.replica_id for target in scale_down_targets), [4, 5])
+        self.assertTrue(
+            all(
+                dict(target.target_capacity_by_accelerator) == {
+                    'L4': 3,
+                    'H200': 2,
+                } for target in scale_down_targets))
+
+    def test_downscale_hold_backed_move_preserves_unrelated_exact_cards(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=10,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=900,
+        )
+        autoscaler.set_configured_accelerator_shapes({
+            'L40S': 1,
+            'L4': 1,
+            'H200': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {'L40S': 3}
+        autoscaler._logical_adopted_paid_target_by_accelerator = {'L40S': 3}
+        autoscaler._snap_target_on_next_recompute = False
+
+        held_l40s = [
+            _replica(replica_id, card='L40S') for replica_id in range(1, 4)
+        ]
+        fresh_l4 = _replica(4, card='L4')
+        zero_cost_h200 = _replica(5, card='H200', reserved_fill=True)
+        for info in [*held_l40s, fresh_l4]:
+            info.is_zero_cost = False
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                1.0)
+        zero_cost_h200.is_zero_cost = True
+        zero_cost_h200.handle.return_value.launched_resources.get_cost.return_value = (
+            0.0)
+        replicas = [*held_l40s, fresh_l4, zero_cost_h200]
+
+        def report(current_replicas, generation):
+            _report(
+                autoscaler,
+                in_flight={info.replica_id: 0 for info in current_replicas},
+                observed_slots={
+                    info.replica_id: 1 for info in current_replicas
+                },
+                queue_depth=1,
+                queued_profiles=[self._profile(50, ['L4', 'H200'], 1)],
+                compatibility_complete=True,
+                generation=generation,
+            )
+
+        report(replicas, 1)
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L40S': 2,
+            'L4': 1,
+        })
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator, {
+            'L40S': 2,
+            'H200': 1,
+        })
+        scale_down_ids = sorted(decision.target.replica_id
+                                for decision in decisions
+                                if decision.operator == _SCALE_DOWN)
+        self.assertEqual(scale_down_ids, [3, 4])
+
+        # If the materialized alternative and the redundant paid source both
+        # disappear, the fresh slot returns to its original L4 placement and
+        # only that one slot regains cold launch authority. The two unrelated
+        # held L40S slots remain untouched throughout.
+        remaining = held_l40s[:2]
+        report(remaining, 2)
+        with mock.patch.object(autoscalers.time, 'time', return_value=121.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=121.0):
+            retry = _decisions(autoscaler, remaining)
+
+        retry_target = _scale_ups(retry)[0].target
+        self.assertEqual(dict(retry_target.target_capacity_by_accelerator), {
+            'L40S': 2,
+            'L4': 1,
+        })
+        self.assertEqual(
+            dict(retry_target.cold_launch_authority_by_accelerator), {'L4': 1})
+
+    def test_generation_advance_failure_shelters_prior_h200_fill(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=40,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=300,
+            reserved_capacity_fill=True,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        autoscaler.target_num_replicas = 17
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 17}
+        autoscaler._logical_adopted_paid_target_by_accelerator = {'L4': 17}
+        autoscaler._snap_target_on_next_recompute = False
+
+        phx_uid = 'phx-cluster-uid'
+        phx_location_key = {
+            'cloud': 'Kubernetes',
+            'region': 'phx-research-context',
+            'zone': None,
+            'accelerators': {
+                'H200': 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        }
+        phx_location = spot_placer.Location.from_pickleable(phx_location_key)
+        phx_pool = reserved_capacity_broker.make_pool_key(
+            'phx-research-context',
+            'H200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid=phx_uid)
+        autoscaler.collect_reserved_capacity_pools({
+            phx_pool: {
+                'protocol_version': reserved_capacity_broker.PROTOCOL_V2,
+                'pool_key': phx_pool,
+                'physical_cluster_uid': phx_uid,
+                'service_generation': 2,
+                'edge_cap': 17,
+                'zero_cost_location_keys': [phx_location_key],
+                'free_slots': 0,
+                'free_slots_by_accelerator': None,
+                'grant': 0,
+                'shelter_grant': 17,
+                'grant_epoch': None,
+                'timestamp': 100.0,
+            }
+        })
+
+        paid_l4 = [
+            _replica(replica_id, card='L4') for replica_id in range(1, 18)
+        ]
+        prior_h200_fill = [
+            _replica(replica_id, card='H200', reserved_fill=True)
+            for replica_id in range(101, 118)
+        ]
+        for info in paid_l4:
+            info.is_zero_cost = False
+            info.get_spot_location.return_value = None
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                1.0)
+        for info in prior_h200_fill:
+            info.is_zero_cost = True
+            info.get_spot_location.return_value = phx_location
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                0.0)
+            info.reserved_fill_pool_key = phx_pool
+            info.reserved_fill_service_generation = 1
+            info.reserved_fill_physical_cluster_uid = phx_uid
+        replicas = [*paid_l4, *prior_h200_fill]
+        _report(
+            autoscaler,
+            in_flight={info.replica_id: 0 for info in replicas},
+            observed_slots={info.replica_id: 1 for info in replicas},
+            queue_depth=1,
+            queued_profiles=[self._profile(50, ['L4', 'H200'], 1)],
+            compatibility_complete=True,
+        )
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1)
+        self.assertEqual(autoscaler.target_num_replicas, 17)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 17})
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator, {
+            'L4': 16,
+            'H200': 1,
+        })
+        self.assertEqual(autoscaler.fill_target, 17)
+        self.assertEqual(_scale_ups(decisions), [])
+        scale_down_ids = [
+            decision.target.replica_id
+            for decision in decisions
+            if decision.operator == _SCALE_DOWN
+        ]
+        self.assertEqual(scale_down_ids, [17])
+        self.assertTrue(
+            set(scale_down_ids).isdisjoint(
+                info.replica_id for info in prior_h200_fill))
 
     def test_smaller_fresh_demand_reassigns_only_nonheld_slots(self):
         autoscaler = _make_autoscaler(

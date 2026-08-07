@@ -1247,6 +1247,29 @@ class TestPollerClaimLifecycle(unittest.TestCase):
         autoscaler = _make_autoscaler(fill=True)
         placer = mock.Mock()
         placer.zero_cost_locations.return_value = []
+        pool_key = reserved_capacity_broker.make_pool_key(
+            'research-ctx',
+            'a100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='research-uid')
+        snapshot = {
+            pool_key: {
+                'protocol_version': 2,
+                'pool_key': pool_key,
+                'physical_cluster_uid': 'research-uid',
+                'service_generation': 1,
+                'edge_cap': 1,
+                'zero_cost_location_keys': [_K8S_KEY],
+                'free_slots': 1,
+                'free_slots_by_accelerator': {
+                    'a100': 1
+                },
+                'grant': 1,
+                'grant_epoch': 1,
+                'timestamp': time.time(),
+            }
+        }
+        autoscaler.collect_reserved_capacity_pools(snapshot)
         cycles = {'n': 0}
 
         def _sleep(_seconds):
@@ -1275,6 +1298,30 @@ class TestPollerClaimLifecycle(unittest.TestCase):
         # Withdrawn exactly once on the disable transition, not re-spammed
         # on every subsequent disabled cycle.
         remove_claim.assert_called_once_with('svc')
+        self.assertEqual(autoscaler._fill_pool_states, {})
+
+        # Re-enabling starts a new claim lifecycle. If its first generation
+        # misses a round, the deliberately removed edge supplies no shelter.
+        autoscaler.reserved_capacity_fill = True
+        shelter = autoscaler.get_reserved_capacity_pool_shelter_grant(
+            pool_key,
+            service_generation=2,
+            physical_cluster_uid='research-uid',
+            edge_cap=1)
+        failed = snapshot[pool_key] | {
+            'service_generation': 2,
+            'free_slots': 0,
+            'free_slots_by_accelerator': None,
+            'grant': 0,
+            'shelter_grant': shelter,
+            'grant_epoch': None,
+        }
+        autoscaler.collect_reserved_capacity_pools({pool_key: failed})
+        state = autoscaler._fill_pool_states[pool_key]
+        self.assertEqual(state.shelter_grant, 0)
+        self.assertEqual(state.grant, 0)
+        self.assertEqual(state.free_slots, 0)
+        self.assertIsNone(state.grant_epoch)
 
     def test_cycle_failure_after_enable_still_withdraws_on_disable(self):
         # A broker cycle can die AFTER upserting its claim (e.g. the
@@ -1321,6 +1368,52 @@ class TestPollerClaimLifecycle(unittest.TestCase):
         # instead of ghosting until the TTL.
         self.assertEqual(remove_claim.call_count, 2)
         remove_claim.assert_called_with('svc')
+
+    def test_failed_claim_removal_clears_local_shelter_and_retries(self):
+        autoscaler = _make_autoscaler(fill=False)
+        pool_key = reserved_capacity_broker.make_pool_key(
+            'research-ctx',
+            'a100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='research-uid')
+        autoscaler.collect_reserved_capacity_pools({
+            pool_key: {
+                'protocol_version': 2,
+                'pool_key': pool_key,
+                'physical_cluster_uid': 'research-uid',
+                'service_generation': 1,
+                'edge_cap': 1,
+                'zero_cost_location_keys': [_K8S_KEY],
+                'free_slots': 0,
+                'free_slots_by_accelerator': None,
+                'grant': 1,
+                'grant_epoch': 1,
+                'timestamp': time.time(),
+            }
+        })
+        placer = mock.Mock()
+        sleeps = {'count': 0}
+
+        def _sleep(_seconds):
+            sleeps['count'] += 1
+            if sleeps['count'] >= 2:
+                raise self._Stop()
+
+        with mock.patch.object(
+                reserved_capacity.reserved_capacity_broker,
+                'remove_claim',
+                side_effect=[RuntimeError('transient removal failure'),
+                             None]) as remove_claim, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=_sleep):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer,
+                                              service_name='svc')
+
+        self.assertEqual(remove_claim.call_count, 2)
+        self.assertEqual(autoscaler._fill_pool_states, {})
 
 
 class TestMultiPoolBrokerCycle(unittest.TestCase):
@@ -1434,7 +1527,11 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         self.assertEqual(set(autoscaler.info()['fill_by_pool']),
                          {edges[0]['pool_key'], edges[1]['pool_key']})
 
-    def _assert_one_pool_round_failure_isolated(self, *, lock_timeout: bool):
+    def _assert_one_pool_round_failure_isolated(self,
+                                                *,
+                                                lock_timeout: bool,
+                                                advance_generation: bool = False
+                                               ):
         east = spot_placer.Location.from_pickleable(
             dict(_K8S_KEY, region='east-context'))
         phx_key = dict(_K8S_KEY, region='phx-context')
@@ -1460,10 +1557,12 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
             snapshot_time=now,
             protocol_version=2,
             service_generation=1)
+        next_generation = 2 if advance_generation else 1
         phx_next = dataclasses.replace(phx_allocation,
                                        round_id=2,
                                        epoch=6,
-                                       snapshot_time=now + 1)
+                                       snapshot_time=now + 1,
+                                       service_generation=next_generation)
         outcomes = iter((east_allocation, phx_allocation, 'fail', phx_next))
         real_run_round = reserved_capacity_broker.run_round_if_stale
 
@@ -1496,7 +1595,7 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
                                return_value=None), \
              mock.patch.object(reserved_capacity_broker,
                                'replace_claim_set',
-                               return_value=1), \
+                               side_effect=[1, next_generation]), \
              mock.patch.object(reserved_capacity_broker,
                                'run_round_if_stale',
                                side_effect=_run_round):
@@ -1517,15 +1616,15 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
             physical_cluster_uid='phx-uid')
         east_state = autoscaler._fill_pool_states[east_pool]
         phx_state = autoscaler._fill_pool_states[phx_pool]
-        # The failed edge keeps only non-launching shelter from the prior
-        # exact generation.  The healthy peer independently advances.
+        # The failed edge keeps only non-launching shelter from the same
+        # physical pool. The healthy peer independently advances.
         self.assertEqual(east_state.shelter_grant, 1)
         self.assertEqual(east_state.grant, 0)
         self.assertEqual(east_state.free_slots, 0)
         self.assertIsNone(east_state.grant_epoch)
         self.assertEqual(phx_state.shelter_grant, 1)
         self.assertEqual(phx_state.grant, 1)
-        self.assertEqual(phx_state.free_slots, 1)
+        self.assertEqual(phx_state.free_slots, 0 if advance_generation else 1)
         self.assertEqual(phx_state.grant_epoch, 6)
 
         east_row = _replica(1, east.to_pickleable())
@@ -1542,13 +1641,23 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
             decision.target[_POOL_KEY] for decision in _ups(decisions) if
             isinstance(decision.target, dict) and decision.target.get(_FILL_KEY)
         ]
-        self.assertEqual(fill_pools, [phx_pool])
+        # A generation change restarts increase damping, so even the healthy
+        # pool needs a second matching observation before it may launch.
+        self.assertEqual(fill_pools, [] if advance_generation else [phx_pool])
 
     def test_failed_round_preserves_only_pool_local_shelter(self):
         self._assert_one_pool_round_failure_isolated(lock_timeout=False)
 
     def test_round_lock_timeout_preserves_only_pool_local_shelter(self):
         self._assert_one_pool_round_failure_isolated(lock_timeout=True)
+
+    def test_generation_advance_failure_preserves_pool_local_shelter(self):
+        # Demand/headroom changes advance the service generation before the
+        # provider round runs. A transient failure on that first round must
+        # invalidate launch authority without authorizing a healthy pool's
+        # existing replicas to be culled.
+        self._assert_one_pool_round_failure_isolated(lock_timeout=False,
+                                                     advance_generation=True)
 
 
 class TestStaleSnapshot(unittest.TestCase):
@@ -1883,7 +1992,105 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         ], [])
         self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
 
-    def test_shelter_carry_requires_exact_generation_and_uid_and_clips(self):
+    def test_live_snapshot_rejects_malformed_pool_authority(self):
+        v1_pool = reserved_capacity_broker.make_pool_key('east-context', 'l4')
+        noncanonical_pool = self.east_pool.replace('"l4"', '"L4"')
+        cross_context_l4 = self.phx.to_pickleable() | {
+            'accelerators': {
+                'L4': 1
+            }
+        }
+        cases = {
+            'malformed-key': ('not-json', None, None),
+            'v1-key': (v1_pool, None, None),
+            'noncanonical-key': (noncanonical_pool, None, None),
+            'uid-mismatch':
+                (self.east_pool, 'physical_cluster_uid', 'replacement-uid'),
+            'boolean-feed': (self.east_pool, 'free_slots', True),
+            'string-grant': (self.east_pool, 'grant', '2'),
+            'negative-shelter': (self.east_pool, 'shelter_grant', -1),
+            'boolean-epoch': (self.east_pool, 'grant_epoch', True),
+            'zero-epoch': (self.east_pool, 'grant_epoch', 0),
+            'missing-live-epoch': (self.east_pool, 'grant_epoch', None),
+            'wrong-card-location': (self.east_pool, 'zero_cost_location_keys',
+                                    [self.phx.to_pickleable()]),
+            'non-kubernetes-location':
+                (self.east_pool, 'zero_cost_location_keys',
+                 [self.east.to_pickleable() | {
+                     'cloud': 'AWS'
+                 }]),
+            'empty-context-location':
+                (self.east_pool, 'zero_cost_location_keys',
+                 [self.east.to_pickleable() | {
+                     'region': ''
+                 }]),
+            'multiple-context-locations':
+                (self.east_pool, 'zero_cost_location_keys',
+                 [self.east.to_pickleable(), cross_context_l4]),
+            'wrong-card-feed': (self.east_pool, 'free_slots_by_accelerator', {
+                'h200': 2
+            }),
+            'nan-timestamp': (self.east_pool, 'timestamp', float('nan')),
+            'infinite-timestamp': (self.east_pool, 'timestamp', float('inf')),
+            'far-future-timestamp':
+                (self.east_pool, 'timestamp', time.time() + 1e6),
+        }
+        for name, (pool_key, field, value) in cases.items():
+            with self.subTest(name=name):
+                snapshot = self._snapshots()[self.east_pool]
+                snapshot['pool_key'] = pool_key
+                if pool_key != self.east_pool:
+                    snapshot['physical_cluster_uid'] = 'east-uid'
+                if field is not None:
+                    snapshot[field] = value
+                autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+                with self.assertRaises(ValueError):
+                    autoscaler.collect_reserved_capacity_pools(
+                        {pool_key: snapshot})
+
+    def test_live_snapshot_rejects_overlapping_complete_map_edges(self):
+        combined_pool = reserved_capacity_broker.make_pool_key(
+            'ignored-context', ('h200', 'l4'),
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='east-uid')
+        combined = self._snapshots()[self.east_pool]
+        combined.update({
+            'pool_key': combined_pool,
+            'zero_cost_location_keys': [
+                self.phx.to_pickleable(),
+                self.phx.to_pickleable() | {
+                    'accelerators': {
+                        'L4': 1
+                    }
+                },
+            ],
+            'free_slots': 0,
+            'free_slots_by_accelerator': None,
+        })
+        l4 = self._snapshots()[self.east_pool]
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+
+        with self.assertRaises(ValueError):
+            autoscaler.collect_reserved_capacity_pools({
+                combined_pool: combined,
+                self.east_pool: l4,
+            })
+
+        duplicate_context = self._snapshots()[self.phx_pool]
+        duplicate_context['zero_cost_location_keys'] = [
+            self.east.to_pickleable() | {
+                'accelerators': {
+                    'H200': 1
+                }
+            }
+        ]
+        with self.assertRaises(ValueError):
+            autoscaler.collect_reserved_capacity_pools({
+                self.east_pool: l4,
+                self.phx_pool: duplicate_context,
+            })
+
+    def test_shelter_carry_allows_forward_generation_same_uid_and_clips(self):
         autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
         autoscaler.collect_reserved_capacity_pools(self._snapshots())
 
@@ -1898,13 +2105,91 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                 self.east_pool,
                 service_generation=2,
                 physical_cluster_uid='east-uid',
-                edge_cap=2), 0)
+                edge_cap=1), 1)
         self.assertEqual(
             autoscaler.get_reserved_capacity_pool_shelter_grant(
                 self.east_pool,
                 service_generation=1,
                 physical_cluster_uid='replacement-uid',
                 edge_cap=2), 0)
+        self.assertEqual(
+            autoscaler.get_reserved_capacity_pool_shelter_grant(
+                'removed-pool',
+                service_generation=2,
+                physical_cluster_uid='east-uid',
+                edge_cap=2), 0)
+        self.assertEqual(
+            autoscaler.get_reserved_capacity_pool_shelter_grant(
+                self.east_pool,
+                service_generation=2,
+                physical_cluster_uid='east-uid',
+                edge_cap=0), 0)
+
+        autoscaler.collect_reserved_capacity_pools(
+            self._snapshots(generation=2))
+        self.assertEqual(
+            autoscaler.get_reserved_capacity_pool_shelter_grant(
+                self.east_pool,
+                service_generation=1,
+                physical_cluster_uid='east-uid',
+                edge_cap=2), 0)
+
+    def test_removed_then_readded_edge_carries_no_shelter(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        autoscaler.collect_reserved_capacity_pools(self._snapshots())
+
+        generation_two = self._snapshots(generation=2)
+        generation_two.pop(self.east_pool)
+        autoscaler.collect_reserved_capacity_pools(generation_two)
+
+        shelter = autoscaler.get_reserved_capacity_pool_shelter_grant(
+            self.east_pool,
+            service_generation=3,
+            physical_cluster_uid='east-uid',
+            edge_cap=2)
+        self.assertEqual(shelter, 0)
+        readded = self._snapshots(generation=3, east_feed=0, phx_feed=0)
+        readded[self.east_pool].update({
+            'grant': 0,
+            'shelter_grant': shelter,
+            'grant_epoch': None,
+            'free_slots_by_accelerator': None,
+        })
+        autoscaler.collect_reserved_capacity_pools(readded)
+        state = autoscaler._fill_pool_states[self.east_pool]
+        self.assertEqual(state.shelter_grant, 0)
+        self.assertEqual(state.grant, 0)
+        self.assertEqual(state.free_slots, 0)
+        self.assertIsNone(state.grant_epoch)
+
+    def test_repeated_failed_generations_clip_and_never_regrow_shelter(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        autoscaler.collect_reserved_capacity_pools(self._snapshots())
+
+        for generation, edge_cap, expected in ((2, 1, 1), (3, 0, 0), (4, 2, 0)):
+            shelter = autoscaler.get_reserved_capacity_pool_shelter_grant(
+                self.east_pool,
+                service_generation=generation,
+                physical_cluster_uid='east-uid',
+                edge_cap=edge_cap)
+            self.assertEqual(shelter, expected)
+            failed = self._snapshots(generation=generation,
+                                     east_feed=0,
+                                     phx_feed=0)
+            failed = {self.east_pool: failed[self.east_pool]}
+            failed[self.east_pool].update({
+                'edge_cap': edge_cap,
+                'grant': 0,
+                'shelter_grant': shelter,
+                'grant_epoch': None,
+                'free_slots_by_accelerator': None,
+            })
+            autoscaler.collect_reserved_capacity_pools(failed)
+            state = autoscaler._fill_pool_states[self.east_pool]
+            self.assertEqual(state.shelter_grant, expected)
+            self.assertEqual(state.grant, 0)
+            self.assertEqual(state.free_slots, 0)
+            self.assertIsNone(state.grant_epoch)
 
     def test_dynamic_restore_shelters_holdings_but_authorizes_no_feed(self):
         old = _make_autoscaler(min_replicas=1, max_replicas=5)
@@ -1995,6 +2280,155 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         decisions = restored._apply_reserved_capacity_fill(rows, ordinary)
         self.assertEqual(len(_downs(decisions)), 1)
         self.assertEqual(_ups(decisions), [])
+
+    def test_dynamic_restore_carries_clipped_shelter_into_failed_generation(
+            self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=5)
+        old.collect_reserved_capacity_pools(self._snapshots())
+        restored = _make_autoscaler(min_replicas=0, max_replicas=5)
+        restored.load_dynamic_states(old.dump_dynamic_states())
+
+        shelter = restored.get_reserved_capacity_pool_shelter_grant(
+            self.east_pool,
+            service_generation=2,
+            physical_cluster_uid='east-uid',
+            edge_cap=1)
+        failed = self._snapshots(generation=2, east_feed=0, phx_feed=0)
+        failed = {self.east_pool: failed[self.east_pool]}
+        failed[self.east_pool].update({
+            'edge_cap': 1,
+            'grant': 0,
+            'shelter_grant': shelter,
+            'grant_epoch': None,
+            'free_slots_by_accelerator': None,
+        })
+        restored.collect_reserved_capacity_pools(failed)
+
+        state = restored._fill_pool_states[self.east_pool]
+        self.assertEqual(state.shelter_grant, 1)
+        self.assertEqual(state.grant, 0)
+        self.assertEqual(state.free_slots, 0)
+        self.assertIsNone(state.grant_epoch)
+
+    def test_dynamic_restore_rejects_malformed_pool_authority(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=5)
+        old.collect_reserved_capacity_pools(self._snapshots())
+        cases = {
+            'zero-generation': ('service_generation', 0),
+            'negative-generation': ('service_generation', -1),
+            'boolean-generation': ('service_generation', True),
+            'string-generation': ('service_generation', '1'),
+            'wrong-protocol': ('protocol_version', 1),
+            'uid-mismatch': ('physical_cluster_uid', 'replacement-uid'),
+            'boolean-edge-cap': ('edge_cap', True),
+            'wrong-card-location':
+                ('zero_cost_location_keys', [self.phx.to_pickleable()]),
+            'nan-snapshot-time': ('snapshot_time', float('nan')),
+            'missing-snapshot-time': ('snapshot_time', None),
+            'far-future-snapshot-time': ('snapshot_time', time.time() + 1e6),
+            'multiple-context-locations': ('zero_cost_location_keys', [
+                self.east.to_pickleable(),
+                self.phx.to_pickleable() | {
+                    'accelerators': {
+                        'L4': 1
+                    }
+                },
+            ]),
+        }
+        for name, (field, value) in cases.items():
+            with self.subTest(name=name):
+                dumped = old.dump_dynamic_states()
+                dumped['reserved_capacity_fill_state']['pools'][
+                    self.east_pool][field] = value
+                restored = _make_autoscaler(min_replicas=0, max_replicas=5)
+                restored.load_dynamic_states(dumped)
+                self.assertNotIn(self.east_pool, restored._fill_pool_states)
+                self.assertEqual(
+                    restored.get_reserved_capacity_pool_shelter_grant(
+                        self.east_pool,
+                        service_generation=2,
+                        physical_cluster_uid='east-uid',
+                        edge_cap=2), 0)
+
+    def test_dynamic_restore_drops_complete_map_on_edge_conflict(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=5)
+        old.collect_reserved_capacity_pools(self._snapshots())
+
+        duplicate_context = old.dump_dynamic_states()
+        duplicate_context['reserved_capacity_fill_state']['pools'][
+            self.phx_pool]['zero_cost_location_keys'] = [
+                self.east.to_pickleable() | {
+                    'accelerators': {
+                        'H200': 1
+                    }
+                }
+            ]
+        restored = _make_autoscaler(min_replicas=0, max_replicas=5)
+        restored.load_dynamic_states(duplicate_context)
+        self.assertEqual(restored._fill_pool_states, {})
+
+        overlap = old.dump_dynamic_states()
+        pools = overlap['reserved_capacity_fill_state']['pools']
+        phx = pools.pop(self.phx_pool)
+        combined_pool = reserved_capacity_broker.make_pool_key(
+            'ignored-context', ('h200', 'l4'),
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='east-uid')
+        phx.update({
+            'physical_cluster_uid': 'east-uid',
+            'zero_cost_location_keys': [
+                self.phx.to_pickleable(),
+                self.phx.to_pickleable() | {
+                    'accelerators': {
+                        'L4': 1
+                    }
+                },
+            ],
+        })
+        pools[combined_pool] = phx
+        restored = _make_autoscaler(min_replicas=0, max_replicas=5)
+        restored.load_dynamic_states(overlap)
+        self.assertEqual(restored._fill_pool_states, {})
+
+        mixed_generation = old.dump_dynamic_states()
+        mixed_generation['reserved_capacity_fill_state']['pools'][
+            self.phx_pool]['service_generation'] = 2
+        restored = _make_autoscaler(min_replicas=0, max_replicas=5)
+        restored.load_dynamic_states(mixed_generation)
+        self.assertEqual(restored._fill_pool_states, {})
+
+    def test_disabling_fill_clears_shelter_before_reenable(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        autoscaler.collect_reserved_capacity_pools(self._snapshots())
+
+        autoscaler.update_version(
+            2, _spec(min_replicas=0, max_replicas=5, fill=False),
+            serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(autoscaler._fill_pool_states, {})
+        autoscaler.update_version(
+            3, _spec(min_replicas=0, max_replicas=5, fill=True),
+            serve_utils.DEFAULT_UPDATE_MODE)
+        self.assertEqual(
+            autoscaler.get_reserved_capacity_pool_shelter_grant(
+                self.east_pool,
+                service_generation=2,
+                physical_cluster_uid='east-uid',
+                edge_cap=2), 0)
+
+    def test_disabled_autoscaler_does_not_restore_shelter(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=5)
+        old.collect_reserved_capacity_pools(self._snapshots())
+        restored = _make_autoscaler(min_replicas=0, max_replicas=5, fill=False)
+
+        restored.load_dynamic_states(old.dump_dynamic_states())
+
+        self.assertEqual(restored._fill_pool_states, {})
+        self.assertEqual(
+            restored.get_reserved_capacity_pool_shelter_grant(
+                self.east_pool,
+                service_generation=2,
+                physical_cluster_uid='east-uid',
+                edge_cap=2), 0)
 
     def test_dynamic_restore_invalid_shelter_grant_fails_closed(self):
         old = _make_autoscaler(min_replicas=0, max_replicas=5)

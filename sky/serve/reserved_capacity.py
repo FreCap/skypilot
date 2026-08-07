@@ -1896,11 +1896,13 @@ def _broker_cycle_v2(
             # whose fresh-round path deliberately skipped `_query_pool`.
             _record_allocation_observation(placer, spec.locations, allocation)
         # A lock timeout or other transient round miss must not cull existing
-        # fill from this one pool.  Carry only the last real exact-generation
-        # grant as scale-down shelter.  Live launch authority still fails
-        # closed: feed and grant are zero and no epoch is replayed.  The exact
-        # generation/UID lookup also prevents an old incarnation from
-        # sheltering a removed/re-added edge.
+        # fill from this one pool. Carry only the last real grant from the
+        # same physical pool as scale-down shelter, including across a forward
+        # service-generation transition. Live launch authority still fails
+        # closed: feed and grant are zero and no epoch is replayed. The pool
+        # key/UID lookup prevents a replacement physical cluster from
+        # inheriting the shelter, and a removed edge is absent from the
+        # autoscaler's atomically replaced pool map.
         shelter_grant = (autoscaler.get_reserved_capacity_pool_shelter_grant(
             spec.pool_key,
             service_generation=generation,
@@ -2027,8 +2029,15 @@ def poller_loop(
                     # ghost for the whole claim TTL. Once per disable
                     # transition (idempotent; also drops our cached
                     # allocation), not re-spammed every cycle.
-                    reserved_capacity_broker.remove_claim(
-                        service_name, **fence_kwargs)
+                    try:
+                        reserved_capacity_broker.remove_claim(
+                            service_name, **fence_kwargs)
+                    finally:
+                        # Claim removal is a hard lifecycle boundary for local
+                        # shelter too. If the durable write fails, the next
+                        # poll retries it, but a later re-enable must never
+                        # inherit shelter from the deliberately withdrawn edge.
+                        autoscaler.collect_reserved_capacity_pools({})
                     claim_may_exist = False
             except Exception as e:  # pylint: disable=broad-except
                 logger.error('Error in reserved-capacity poller: '
