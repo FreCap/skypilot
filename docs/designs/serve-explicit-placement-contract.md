@@ -1,10 +1,12 @@
 # SkyServe explicit placement contract
 
-_Status: transition PR #1318 is merged and released as v1.1.1135.  Draft
-cleanup PR #1319 is 30/30 green but remains blocked on the measured removal
-gates and is not approved to merge or deploy.  Platform pin PR #8090 is
-CI-green and awaiting its required review; production deployment and cleanup
-removal gates remain open. Created 2026-08-07; last updated 2026-08-07._
+_Status: transition PR #1318 is merged, released as v1.1.1135, and deployed to
+production as Helm revision 351.  Draft cleanup PR #1319's implementation
+passed 30/30 checks but remains blocked on the measured removal gates and is
+not approved to merge or deploy.  Platform pin PR #8090 was closed because
+this SkyPilot control-plane release is deployed directly with Helm.  The first
+production verification passed; the cleanup observation and inventory gates
+remain open. Created 2026-08-07; last updated 2026-08-07._
 
 ## Decision summary
 
@@ -521,10 +523,11 @@ zero-cost reserved-capacity tests remain fail closed.
   fence-test defect; test-only PR #1322 isolated those contexts and merged as
   `fdfc2eb972ebab97add9226fa3cbf41b5792ad49`.  All nine exact-SHA workflows
   then passed, including 13/13 Python and optimizer jobs.
-- Draft cleanup PR #1319 passes 30/30 checks at exact head
-  `90492de86202322a0391333648f6f327365d4b90`.  Its mandatory Unit Tests job
-  ran the repository's real-PostgreSQL suites and finished with 15,407 passed,
-  one xfailed test, and no failed test.
+- Draft cleanup PR #1319's exact implementation head
+  `b5f7bd9638ba48964d0909bb5645c2f36c4131b3` passed 30/30 checks before the
+  evidence-only design update.  Its mandatory Unit Tests job ran the
+  repository's real-PostgreSQL suites and finished with 15,409 passed, one
+  xfailed test, and no failed test.
 - The exact unmodified v1.1.1132 source at
   `ab5ec55b89a8c576e20e6ea27cf240e88134bb64` read transition fixed-pool
   pickles, preserved pool size and policy through copy/protocol-4
@@ -561,18 +564,48 @@ zero-cost reserved-capacity tests remain fail closed.
   passed and no SQLite substitute was added.
 - YAPF/isort, mypy over 887 source files, pylint, and `git diff --check` pass on
   both the transition and cleanup trees.
-- Platform pin PR #8090 selects v1.1.1135 and exact transition commit
-  `95e0b41b15ad56598e06ef9cb08297815a65f662`.  Its checks are terminal with
-  22 successful and 34 intentionally skipped checks, but it has zero reviews
-  and GitHub correctly blocks the merge pending required Platform approval.
-- The latest read-only production snapshot remains on service version 58 and
-  reports `READY` with 49/51 replicas while a new replica starts.  This proves
-  continuity of the existing deployment only; it is not transition-release
-  production validation.
+- Platform pin PR #8090 was closed without merge and its branch deleted at the
+  operator's direction.  SkyPilot control-plane releases use a direct Helm
+  upgrade and do not require a boltz-platform PR.
+- At 2026-08-07 17:46 UTC, the production `skypilot/skypilot` release on the
+  explicit `gitops-hub-rainier` context upgraded from rollback revision 350
+  (`1.1.1116`, commit `cca1f1a8de83d284d884dc4d16e03ad66dadcb52`) to
+  revision 351 with the exact v1.1.1135 chart and image digests above.  A
+  server-side dry run preceded the apply.  The upgrade reused all live values
+  and supplied the complete two-element init-container array with only its
+  image fields changed; normalized non-image values before and after have the
+  identical SHA-256
+  `339b27d73779e49ddc741416a7f06e71f72abef8b5904df0f331dde9bafe3139`.
+- The PostgreSQL migration hook succeeded.  The replacement API pod became
+  Ready with zero restarts, both credential init containers exited zero, and
+  the API, logrotate, migration, GCP-init, and Azure-init image references all
+  resolved to v1.1.1135.  The external API reported healthy at exact commit
+  `95e0b41b15ad56598e06ef9cb08297815a65f662`; bounded startup-log inspection
+  found no traceback, fatal, panic, unhandled-exception, or startup/migration
+  failure pattern.
+- No `sky serve update` was run.  Existing service `boltz-l4-fleet` version 58
+  remained `READY` and retained endpoint
+  `http://k8s-skypilot-skypilot-d260f5c163-17791f5150791ad6.elb.us-east-1.amazonaws.com:30001`.
+  Its elastic replica count changed from 59/89 immediately before the rollout
+  to 73/78 after controller recovery; this count is observational and not a
+  fixed-capacity assertion.
+- Controller recovery tied its new L4 launches to a version-58 logical target,
+  explicit per-accelerator cold-launch authority, measured demand, and the
+  bounded global paid-capacity admission window.  The resulting public-cloud
+  replicas reported Spot resources; no ordinary on-demand candidate was
+  observed.
+- A bounded sample of the last 5,000 controller-log lines contained 128
+  `event=skyserve_placement_contract_decode outcome=legacy_materialized`
+  events for the logical service contract and no rejected decode event.  This
+  is expected transition-reader behavior for the pre-transition version-58
+  artifact, but it directly proves that cleanup cannot remove the legacy
+  reader or begin its zero-event observation window.
 
 Credentialed provider catalog coverage and zero-cost production smoke evidence
-remain open gates; the evidence above does not satisfy any cleanup-removal
-observation window.
+remain open gates.  This is only the first transition production release, and
+the 30-day observation clock has not started because legacy materialization is
+nonzero and the retained log sink and exact zero-event query required by the
+removal gate are not yet attached.
 
 ## Manual test plan
 
@@ -594,18 +627,21 @@ observation window.
 
 ## Open gates
 
-- Draft cleanup PR #1319 is authored in stack #1320; every removal gate above
-  remains unmet, so it is not approved to merge or deploy.
+- Draft cleanup PR #1319 is authored in stack #1320.  Its first production
+  rollout check passed, but the remaining removal gates are unmet, so it is not
+  approved to merge or deploy.
 - Transition and cleanup GitHub CI, including the mandatory real-PostgreSQL
   lane, completed successfully.  Credentialed AWS catalog coverage remains
-  open because the operator SSO session is expired; no login was initiated.
-- Production control-plane release artifacts are published.  Platform pin PR
-  #8090 is CI-green but requires Platform approval before merge and rollout.
-- Production apply remains human-owned and additionally requires the protected
-  deployment environment, approved identity/context, and exact pre-rollout
-  rollback identity to be verified.
+  open because it has not been rerun after the operator refreshed SSO for this
+  deployment.
+- Production control-plane v1.1.1135 is deployed directly through Helm; closed
+  Platform PR #8090 is not part of the release path.  Rollback revision 350 and
+  its exact v1.1.1116 image were captured but a rollback drill remains open.
+- A second consecutive production release, the retained 45-day log sink, exact
+  zero-event query, and 30 continuous qualifying days remain required.
 - The Boltz fleet's canonical service YAML currently keeps warm capacity; its
   separate scale-to-zero policy must be reviewed, deployed/applied, converged,
   and drained before any service update can claim scale-to-zero compliance.
-- Legacy durable-state inventory and the compatibility-window evidence needed
-  to unblock removal are not yet complete.
+- Service version 58 still materializes the legacy logical contract.  Its
+  separately approved migration and the legacy durable-state inventory across
+  every retained copy remain required before the zero-event window can start.
