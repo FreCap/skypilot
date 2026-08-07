@@ -1,9 +1,10 @@
 """Durable repository for external load balancer cutover state."""
 
+from collections.abc import Iterator
 import contextlib
 import json
 import time
-from typing import Any, Iterator
+from typing import Any
 
 import sqlalchemy
 from sqlalchemy import orm

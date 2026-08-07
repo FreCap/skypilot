@@ -1818,7 +1818,7 @@ class ReplicaManager:
         self._uptime: float | None = None
         self._update_mode = serve_utils.DEFAULT_UPDATE_MODE
         self._is_pool = False
-        self._spot_placer: Optional['SpotPlacerType'] = None
+        self._spot_placer: spot_placer.SpotPlacer | None = None
         self._lb_in_flight_report: tuple[float, dict[str, int], set[str] | None,
                                          set[str], set[str],
                                          str | None] | None = None

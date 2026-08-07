@@ -2289,7 +2289,7 @@ def get_orphaned_service_child_mode(service_name: str) -> bool | None:
             return None
     for spec_bytes, yaml_content in version_rows:
         try:
-            spec = typing.cast('Optional[service_spec.SkyServiceSpec]',
+            spec = typing.cast('service_spec.SkyServiceSpec | None',
                                pickle.loads(spec_bytes))
             if spec is not None:
                 modes.add(bool(spec.pool))
