@@ -48,12 +48,15 @@ _replica_is_retiring_card_supply = (
     autoscaler_compatibility._replica_is_retiring_card_supply)  # pylint: disable=protected-access
 _merge_fresh_target_into_downscale_hold = (
     autoscaler_compatibility._merge_fresh_target_into_downscale_hold)  # pylint: disable=protected-access
+_bound_materialized_reassignment_target = (
+    autoscaler_compatibility._bound_materialized_reassignment_target)  # pylint: disable=protected-access
 _revalidate_actuation_target = (
     autoscaler_compatibility._revalidate_actuation_target)  # pylint: disable=protected-access
 for _compatibility_helper in (
         _allocate_compatibility_target,
         _replica_is_retiring_card_supply,
         _merge_fresh_target_into_downscale_hold,
+        _bound_materialized_reassignment_target,
         _revalidate_actuation_target,
 ):
     _compatibility_helper.__module__ = __name__
@@ -79,6 +82,9 @@ _COST_REBALANCE_STATE_MAX_ENTRIES = 256
 # sub-epsilon remainder here exactly as the compatibility allocator's
 # demand_epsilon already does.
 _SLOT_CONVERSION_EPSILON = 1e-9
+_RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS = (
+    constants.RESERVED_CAPACITY_POLL_INTERVAL_SECONDS *
+    constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
 
 
 @dataclasses.dataclass
@@ -100,9 +106,9 @@ class _PoolFillState:
     snapshot_time: float | None = None
     # Scale-down protection is deliberately separate from live launch
     # authority.  A transient broker-round failure may carry the last real
-    # same-generation grant here while clearing grant/feed/epoch, so existing
-    # pool-local fill is not culled and no new launch can replay stale
-    # authority.
+    # grant from the same physical pool here while clearing grant/feed/epoch,
+    # so a service-generation transition cannot cull existing pool-local fill
+    # and no new launch can replay stale authority.
     shelter_grant: int = 0
     grant: int = 0
     grant_epoch: int | None = None
@@ -614,22 +620,29 @@ class Autoscaler:
         self.reserved_fill_utilization_gate = bool(
             spec.reserved_fill_utilization_gate)
         with self._fill_pool_state_lock:
-            # A service update may add/remove/reorder pool edges and therefore
-            # advance the authoritative service generation. Preserve location
-            # identity for scale-down shelter, but invalidate all old feed
-            # until the poller publishes the new complete generation.
-            for pool_state in self._fill_pool_states.values():
-                pool_state.free_slots = 0
-                pool_state.last_raw_free_slots = None
-                # Shelter-only until the next exact-generation heartbeat:
-                # preserve only the last real broker entitlement. Zero feed
-                # cannot authorize a launch under it, while widening the grant
-                # to edge_cap would let an update shelter holdings that a peer
-                # had already been granted.
-                pool_state.shelter_grant = min(pool_state.shelter_grant,
-                                               pool_state.edge_cap)
-                pool_state.grant = 0
-                pool_state.grant_epoch = None
+            if not self.reserved_capacity_fill:
+                # Disabling fill deliberately withdraws every edge. Do not
+                # leave a process-local shelter that a later re-enable could
+                # relay across a failed first round for a newly created claim.
+                self._fill_pool_states = {}
+            else:
+                # A service update may add/remove/reorder pool edges and
+                # therefore advance the authoritative service generation.
+                # Preserve location identity for scale-down shelter, but
+                # invalidate all old feed until the poller publishes the new
+                # complete generation.
+                for pool_state in self._fill_pool_states.values():
+                    pool_state.free_slots = 0
+                    pool_state.last_raw_free_slots = None
+                    # Shelter-only until the next exact-generation heartbeat:
+                    # preserve only the last real broker entitlement. Zero
+                    # feed cannot authorize a launch under it, while widening
+                    # the grant to edge_cap would let an update shelter
+                    # holdings that a peer had already been granted.
+                    pool_state.shelter_grant = min(pool_state.shelter_grant,
+                                                   pool_state.edge_cap)
+                    pool_state.grant = 0
+                    pool_state.grant_epoch = None
             self._refresh_legacy_fill_projection_locked()
         self.cost_rebalance = bool(spec.cost_rebalance)
         self.cost_rebalance_min_savings_fraction = float(
@@ -778,6 +791,58 @@ class Autoscaler:
         self._fill_service_generation = int(service_generation)
         self._fill_physical_cluster_uid = physical_cluster_uid
 
+    @staticmethod
+    def _parse_reserved_fill_pool_locations(
+        identity: reserved_capacity_broker.PoolIdentity,
+        raw_location_keys: Any,
+    ) -> list[spot_placer.Location]:
+        """Parse an exact v2 pool location set or reject all authority."""
+        if not isinstance(raw_location_keys, list) or not raw_location_keys:
+            raise ValueError('Protocol-v2 pool snapshots require a nonempty '
+                             'location-key list.')
+        locations: list[spot_placer.Location] = []
+        cards: set[str] = set()
+        contexts: set[str] = set()
+        widths: set[int] = set()
+        for key in raw_location_keys:
+            try:
+                location = spot_placer.Location.from_pickleable(key)
+            except (AssertionError, KeyError, TypeError, ValueError) as error:
+                raise ValueError('Protocol-v2 pool snapshot contains a '
+                                 'malformed location key.') from error
+            if location is None or str(location.cloud).lower() != 'kubernetes':
+                raise ValueError('Protocol-v2 pool locations must resolve to '
+                                 'Kubernetes.')
+            if not isinstance(location.region, str) or not location.region:
+                raise ValueError('Protocol-v2 pool locations require a '
+                                 'nonempty Kubernetes context.')
+            accelerators = location.accelerators
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                raise ValueError('Protocol-v2 pool locations require one '
+                                 'exact accelerator shape.')
+            raw_card, raw_count = next(iter(accelerators.items()))
+            if (not isinstance(raw_card, str) or not raw_card or
+                    isinstance(raw_count, bool) or
+                    not isinstance(raw_count, (int, float)) or
+                    not math.isfinite(float(raw_count)) or
+                    not float(raw_count).is_integer() or raw_count <= 0):
+                raise ValueError('Protocol-v2 pool locations require a '
+                                 'positive whole accelerator count.')
+            card = raw_card.casefold()
+            if card not in identity.gpu_names:
+                raise ValueError('Protocol-v2 pool location accelerator does '
+                                 'not match its composite pool key.')
+            cards.add(card)
+            contexts.add(location.region)
+            widths.add(int(raw_count))
+            locations.append(location)
+        if (cards != set(identity.gpu_names) or len(contexts) != 1 or
+                len(widths) != 1):
+            raise ValueError('Protocol-v2 pool locations must exactly cover '
+                             'their composite cards in one context and at one '
+                             'GPU width.')
+        return locations
+
     def collect_reserved_capacity_pools(
         self,
         pool_snapshots: dict[str, dict[str, Any]],
@@ -792,22 +857,52 @@ class Autoscaler:
         """
         parsed: dict[str, _PoolFillState] = {}
         generations: set[int] = set()
+        seen_contexts: set[str] = set()
+        cards_by_physical_uid: dict[str, set[str]] = {}
         for map_key, snapshot in pool_snapshots.items():
             pool_key = str(snapshot.get('pool_key', map_key))
             if pool_key != map_key:
                 raise ValueError('Reserved-fill pool snapshot key mismatch: '
                                  f'{map_key!r} != {pool_key!r}.')
-            protocol_version = int(snapshot.get('protocol_version', 0))
-            if protocol_version != 2:
+            try:
+                identity = reserved_capacity_broker.parse_pool_identity(
+                    pool_key)
+            except (TypeError, ValueError) as error:
+                raise ValueError('Reserved-fill pool snapshot has a malformed '
+                                 f'pool key {pool_key!r}.') from error
+            if identity.protocol_version != 2:
+                raise ValueError('Multi-pool snapshots require a protocol-v2 '
+                                 f'pool key, got {pool_key!r}.')
+            canonical_pool_key = reserved_capacity_broker.make_pool_key(
+                '',
+                identity.gpu_names,
+                protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                physical_cluster_uid=identity.physical_cluster_uid)
+            if pool_key != canonical_pool_key:
+                raise ValueError('Protocol-v2 pool snapshot key must be '
+                                 f'canonical, got {pool_key!r}.')
+            protocol_version = snapshot.get('protocol_version', 0)
+            if (isinstance(protocol_version, bool) or
+                    not isinstance(protocol_version, int) or
+                    protocol_version != 2):
                 raise ValueError('Multi-pool snapshots require reserved-fill '
                                  f'protocol 2, got {protocol_version!r}.')
-            generation = int(snapshot['service_generation'])
-            if generation < 1:
+            generation = snapshot['service_generation']
+            if (isinstance(generation, bool) or
+                    not isinstance(generation, int) or generation < 1):
                 raise ValueError('Reserved-fill service generation must be '
                                  'positive under protocol 2.')
             generations.add(generation)
-            edge_cap = max(0, int(snapshot['edge_cap']))
-            raw_free = max(0, int(snapshot.get('free_slots', 0)))
+            edge_cap = snapshot['edge_cap']
+            if (isinstance(edge_cap, bool) or not isinstance(edge_cap, int) or
+                    edge_cap < 0):
+                raise ValueError('Reserved-fill edge cap must be a '
+                                 'non-negative integer under protocol 2.')
+            raw_free = snapshot.get('free_slots', 0)
+            if (isinstance(raw_free, bool) or not isinstance(raw_free, int) or
+                    raw_free < 0):
+                raise ValueError('Protocol-v2 free-slot feed must be a '
+                                 'non-negative integer.')
             raw_free_by_accelerator = snapshot.get('free_slots_by_accelerator')
             free_by_accelerator: dict[str, int] | None = None
             if raw_free_by_accelerator is not None:
@@ -830,19 +925,60 @@ class Autoscaler:
                 if sum(free_by_accelerator.values()) != raw_free:
                     raise ValueError('Protocol-v2 exact-card feed must sum to '
                                      'its aggregate free-slot feed.')
-            grant = max(0, min(edge_cap, int(snapshot.get('grant', 0))))
-            shelter_grant = max(
-                0, min(edge_cap, int(snapshot.get('shelter_grant', grant))))
-            locations = [
-                location for location in (
-                    spot_placer.Location.from_pickleable(key)
-                    for key in snapshot.get('zero_cost_location_keys', []))
-                if location is not None
-            ]
+                if any(card not in identity.gpu_names
+                       for card in free_by_accelerator):
+                    raise ValueError('Protocol-v2 exact-card feed contains a '
+                                     'card outside its composite pool key.')
+            raw_grant = snapshot.get('grant', 0)
+            raw_shelter_grant = snapshot.get('shelter_grant', raw_grant)
+            if (isinstance(raw_grant, bool) or not isinstance(raw_grant, int) or
+                    raw_grant < 0 or isinstance(raw_shelter_grant, bool) or
+                    not isinstance(raw_shelter_grant, int) or
+                    raw_shelter_grant < 0):
+                raise ValueError('Protocol-v2 grant and shelter must be '
+                                 'non-negative integers.')
+            raw_grant_epoch = snapshot.get('grant_epoch')
+            if (raw_grant_epoch is not None and
+                (isinstance(raw_grant_epoch, bool) or
+                 not isinstance(raw_grant_epoch, int) or raw_grant_epoch < 1)):
+                raise ValueError('Protocol-v2 grant epoch must be a '
+                                 'positive integer when present.')
+            if raw_grant_epoch is None and (raw_grant > 0 or raw_free > 0):
+                raise ValueError('Protocol-v2 live launch authority requires '
+                                 'a positive grant epoch.')
+            grant = min(edge_cap, raw_grant)
+            shelter_grant = min(edge_cap, raw_shelter_grant)
+            locations = self._parse_reserved_fill_pool_locations(
+                identity, snapshot.get('zero_cost_location_keys'))
             physical_uid = snapshot.get('physical_cluster_uid')
-            if not isinstance(physical_uid, str) or not physical_uid:
+            if (not isinstance(physical_uid, str) or not physical_uid or
+                    physical_uid != identity.physical_cluster_uid):
                 raise ValueError('Protocol-v2 pool snapshot requires a '
-                                 'physical Kubernetes cluster UID.')
+                                 'physical Kubernetes cluster UID matching '
+                                 'its composite pool key.')
+            context = locations[0].region
+            if context in seen_contexts:
+                raise ValueError('Protocol-v2 pool snapshots may use each '
+                                 'Kubernetes context in only one edge.')
+            seen_contexts.add(context)
+            physical_cards = cards_by_physical_uid.setdefault(
+                physical_uid, set())
+            overlap = physical_cards.intersection(identity.gpu_names)
+            if overlap:
+                raise ValueError('Protocol-v2 pool snapshots overlap on one '
+                                 'physical cluster for cards '
+                                 f'{sorted(overlap)}.')
+            physical_cards.update(identity.gpu_names)
+            raw_timestamp = snapshot['timestamp']
+            if (isinstance(raw_timestamp, bool) or
+                    not isinstance(raw_timestamp, (int, float)) or
+                    not math.isfinite(raw_timestamp) or raw_timestamp < 0):
+                raise ValueError('Protocol-v2 pool snapshot timestamp must be '
+                                 'a finite non-negative number.')
+            if (raw_timestamp
+                    > time.time() + _RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS):
+                raise ValueError('Protocol-v2 pool snapshot timestamp is too '
+                                 'far in the future.')
             parsed[pool_key] = _PoolFillState(
                 protocol_version=protocol_version,
                 pool_key=pool_key,
@@ -851,11 +987,10 @@ class Autoscaler:
                 edge_cap=edge_cap,
                 free_slots_by_accelerator=free_by_accelerator,
                 zero_cost_locations=locations,
-                snapshot_time=float(snapshot['timestamp']),
+                snapshot_time=float(raw_timestamp),
                 shelter_grant=shelter_grant,
                 grant=grant,
-                grant_epoch=(None if snapshot.get('grant_epoch') is None else
-                             int(snapshot['grant_epoch'])),
+                grant_epoch=raw_grant_epoch,
             )
             # Damping is filled under the lock from the prior exact-generation
             # state; raw_free remains local so no half-updated map is visible.
@@ -950,17 +1085,28 @@ class Autoscaler:
         """Return clipped, non-launching shelter from an exact prior edge.
 
         The broker poller uses this only after a protocol-v2 round failed to
-        return an allocation.  Pool identity and service generation are both
-        fenced so neither a removed/re-added edge nor a same-name physical
-        cluster replacement can inherit stale shelter.
+        return an allocation. A generation advance invalidates every launch
+        grant and feed, but it must not cull healthy holdings in an unchanged
+        physical pool just because that generation's first provider poll
+        failed. Pool identity and physical UID fence the carry, and a future
+        prior generation is rejected.
         """
         with self._fill_pool_state_lock:
             prior = self._fill_pool_states.get(pool_key)
-            if (prior is None or prior.protocol_version != 2 or
-                    prior.service_generation != service_generation or
+            if (isinstance(service_generation, bool) or
+                    not isinstance(service_generation, int) or
+                    service_generation < 1 or
+                    not isinstance(physical_cluster_uid, str) or
+                    not physical_cluster_uid or isinstance(edge_cap, bool) or
+                    not isinstance(edge_cap, int) or edge_cap < 0 or
+                    prior is None or prior.protocol_version != 2 or
+                    isinstance(prior.service_generation, bool) or
+                    not isinstance(prior.service_generation, int) or
+                    prior.service_generation < 1 or
+                    prior.service_generation > service_generation or
                     prior.physical_cluster_uid != physical_cluster_uid):
                 return 0
-            return max(0, min(int(edge_cap), prior.shelter_grant))
+            return max(0, min(edge_cap, prior.shelter_grant))
 
     @staticmethod
     def _location_in_pool(location: spot_placer.Location,
@@ -2837,9 +2983,11 @@ class Autoscaler:
         self.latest_version_ever_ready = dynamic_states.pop(
             'latest_version_ever_ready', constants.INITIAL_VERSION)
         # Absent in dumps from builds predating the fill feature: keep
-        # the constructor defaults (empty snapshot).
+        # the constructor defaults (empty snapshot). A disabled destination
+        # is also a lifecycle boundary: do not restore authority that a later
+        # re-enable could mistake for its newly created claim.
         fill_state = dynamic_states.pop('reserved_capacity_fill_state', None)
-        if fill_state is not None:
+        if fill_state is not None and self.reserved_capacity_fill:
             broker_authority = bool(fill_state.get('broker_authority', True))
             self._fill_free_slots = (0 if broker_authority else max(
                 0, int(fill_state.get('fill_free_slots', 0))))
@@ -2855,16 +3003,56 @@ class Autoscaler:
             self._fill_snapshot_time = fill_state.get('fill_snapshot_time')
             if fill_state.get('version') == 2:
                 restored: dict[str, _PoolFillState] = {}
+                restored_contexts: set[str] = set()
+                restored_cards_by_uid: dict[str, set[str]] = {}
+                restored_generations: set[int] = set()
                 for pool_key, raw_pool in fill_state.get('pools', {}).items():
                     try:
-                        locations = [
-                            location for location in (
-                                spot_placer.Location.from_pickleable(key)
-                                for key in raw_pool.get(
-                                    'zero_cost_location_keys', []))
-                            if location is not None
-                        ]
-                        restored_edge_cap = max(0, int(raw_pool['edge_cap']))
+                        if (not isinstance(pool_key, str) or
+                                not isinstance(raw_pool, dict)):
+                            continue
+                        identity = reserved_capacity_broker.parse_pool_identity(
+                            pool_key)
+                        if identity.protocol_version != 2:
+                            continue
+                        canonical_pool_key = (
+                            reserved_capacity_broker.make_pool_key(
+                                '',
+                                identity.gpu_names,
+                                protocol_version=(
+                                    reserved_capacity_broker.PROTOCOL_V2),
+                                physical_cluster_uid=(
+                                    identity.physical_cluster_uid)))
+                        raw_protocol_version = raw_pool['protocol_version']
+                        raw_physical_uid = raw_pool['physical_cluster_uid']
+                        raw_generation = raw_pool['service_generation']
+                        raw_edge_cap = raw_pool['edge_cap']
+                        if (pool_key != canonical_pool_key or
+                                isinstance(raw_protocol_version, bool) or
+                                not isinstance(raw_protocol_version, int) or
+                                raw_protocol_version != 2 or
+                                not isinstance(raw_physical_uid, str) or
+                                not raw_physical_uid or raw_physical_uid
+                                != identity.physical_cluster_uid or
+                                isinstance(raw_generation, bool) or
+                                not isinstance(raw_generation, int) or
+                                raw_generation < 1 or
+                                isinstance(raw_edge_cap, bool) or
+                                not isinstance(raw_edge_cap, int) or
+                                raw_edge_cap < 0):
+                            continue
+                        locations = self._parse_reserved_fill_pool_locations(
+                            identity, raw_pool.get('zero_cost_location_keys'))
+                        restored_edge_cap = raw_edge_cap
+                        raw_snapshot_time = raw_pool.get('snapshot_time')
+                        if (isinstance(raw_snapshot_time, bool) or
+                                not isinstance(raw_snapshot_time,
+                                               (int, float)) or
+                                not math.isfinite(raw_snapshot_time) or
+                                raw_snapshot_time < 0 or
+                                raw_snapshot_time > time.time() +
+                                _RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS):
+                            continue
                         raw_shelter_grant = raw_pool.get('shelter_grant')
                         if (isinstance(raw_shelter_grant, bool) or
                                 not isinstance(raw_shelter_grant, int) or
@@ -2877,13 +3065,26 @@ class Autoscaler:
                         else:
                             restored_shelter_grant = min(
                                 restored_edge_cap, raw_shelter_grant)
+                        context = locations[0].region
+                        physical_cards = restored_cards_by_uid.setdefault(
+                            raw_physical_uid, set())
+                        if (context in restored_contexts or
+                                physical_cards.intersection(
+                                    identity.gpu_names)):
+                            # A restored complete-map conflict has no
+                            # deterministic authoritative subset. Drop the
+                            # whole map rather than making shelter depend on
+                            # serialized edge order.
+                            restored = {}
+                            break
+                        restored_contexts.add(context)
+                        physical_cards.update(identity.gpu_names)
+                        restored_generations.add(raw_generation)
                         restored[str(pool_key)] = _PoolFillState(
-                            protocol_version=int(raw_pool['protocol_version']),
-                            pool_key=str(pool_key),
-                            physical_cluster_uid=str(
-                                raw_pool['physical_cluster_uid']),
-                            service_generation=int(
-                                raw_pool['service_generation']),
+                            protocol_version=raw_protocol_version,
+                            pool_key=pool_key,
+                            physical_cluster_uid=raw_physical_uid,
+                            service_generation=raw_generation,
                             edge_cap=restored_edge_cap,
                             # Feed and epoch fail closed across the swap. The
                             # prior real grant remains a shelter-only ceiling;
@@ -2891,12 +3092,14 @@ class Autoscaler:
                             free_slots=0,
                             last_raw_free_slots=None,
                             zero_cost_locations=locations,
-                            snapshot_time=raw_pool.get('snapshot_time'),
+                            snapshot_time=float(raw_snapshot_time),
                             shelter_grant=restored_shelter_grant,
                             grant=0,
                             grant_epoch=None)
                     except (KeyError, TypeError, ValueError):
                         continue
+                if len(restored_generations) > 1:
+                    restored = {}
                 with self._fill_pool_state_lock:
                     self._fill_pool_states = restored
                     self._refresh_legacy_fill_projection_locked()
@@ -6674,20 +6877,72 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                                    not downscale_hold and
                                                    fresh_complete_attribution
                                                    and bool(explicit_target))
-        if fresh_complete_attribution and not downscale_hold:
-            reassignment_target = (explicit_target
-                                   if has_active_old_version else paid_target)
+        revalidation_desired_target = desired_target
+        if fresh_complete_attribution:
+            if has_active_old_version:
+                reassignment_target = ({}
+                                       if downscale_hold else explicit_target)
+            else:
+                # A downscale hold protects the adopted aggregate and its
+                # unbacked exact-card retry fence.  It must not prevent fresh,
+                # compatibility-owned demand from reusing a compatible
+                # latest-version backend that is already materialized.  The
+                # revalidator's backed-only pass makes this reassignment
+                # non-launching; cold cross-card movement remains disabled
+                # below for the duration of the hold.
+                reassignment_target = paid_target
+                if downscale_hold:
+                    # The public held map has already merged the fresh
+                    # no-supply placement with older exact-card slots. Keep
+                    # that fresh placement as the only eligible source for a
+                    # backed move; otherwise configured-card iteration could
+                    # replace an unrelated held unit that lacks compatibility
+                    # proof for the materialized destination.
+                    fresh_source_allocation = (
+                        self._calculate_concurrency_target_by_accelerator(
+                            replica_infos,
+                            target_ceiling=self._raw_target_num_replicas,
+                            min_replicas_override=(
+                                self._raw_target_num_replicas),
+                            use_existing_supply=False,
+                            pin_running_work=False,
+                            use_free_reserved=False))
+                    if (fresh_source_allocation.card_attribution_complete and
+                            sum(fresh_source_allocation.target_by_accelerator.
+                                values()) == self._raw_target_num_replicas):
+                        backed_reassignment_source = {
+                            card: min(count, demand_target.get(card, 0))
+                            for card, count in fresh_source_allocation.
+                            paid_target_by_accelerator.items()
+                            if count > 0 and demand_target.get(card, 0) > 0
+                        }
+                        bounded_target = (
+                            _bound_materialized_reassignment_target(
+                                adopted_target=demand_target,
+                                desired_target=desired_target,
+                                reassignment_source_by_accelerator=(
+                                    backed_reassignment_source),
+                                reassignment_destination_by_accelerator=(
+                                    paid_target),
+                                configured_cards=cards,
+                                final_target=final_target))
+                        if bounded_target or final_target == 0:
+                            revalidation_desired_target = bounded_target
+                            reassignment_target = bounded_target
+                        else:
+                            reassignment_target = {}
+                    else:
+                        reassignment_target = {}
         else:
             reassignment_target = {}
         target = _revalidate_actuation_target(
             adopted_target=demand_target,
-            desired_target=desired_target,
+            desired_target=revalidation_desired_target,
             nonretiring_supply=nonretiring_supply,
             configured_cards=cards,
             final_target=final_target,
             allow_adopted_reassignment=(not has_active_old_version and
-                                        fresh_complete_attribution and
-                                        not downscale_hold),
+                                        fresh_complete_attribution),
             allow_unbacked_adopted_reassignment=(fresh_complete_attribution and
                                                  not downscale_hold),
             allow_mixed_version_backed_reassignment=(
