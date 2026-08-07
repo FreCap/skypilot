@@ -124,10 +124,11 @@ resource "kubernetes_job_v1" "seed_config" {
   }
 }
 
-# Reconcile the RUNNING api-server after a config change. The seed writes config_yaml, but the
-# api-server loads workspaces/RBAC (casbin) into memory at boot and does NOT re-read on a raw DB
-# write — so a privacy/allowlist change silently has no effect until a restart. Roll the deployment
-# once per config generation, after the seed lands, so casbin re-reconciles from the new config.
+# Reconcile the running server roles after a config change. The seed writes config_yaml, but the
+# processes load workspaces/RBAC (casbin) into memory at boot and do NOT re-read on a raw DB write,
+# so a privacy/allowlist change silently has no effect until a restart. Compatibility mode rolls
+# only the all-role API Deployment. Guarded HA rolls the API, executor, and controller Deployments
+# once per config generation, after the seed lands, so every role re-reconciles from the new config.
 # Operators already have `aws eks get-token`/kubectl access to the host cluster (see main.tf); a
 # temp kubeconfig keeps this off the caller's default context.
 resource "terraform_data" "reconcile_api_server" {
@@ -137,6 +138,7 @@ resource "terraform_data" "reconcile_api_server" {
     interpreter = ["bash", "-c"]
     environment = merge(local.provider_exec_env, {
       SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION = tostring(var.suppress_api_server_reconcile_for_migration)
+      SKYPILOT_HIGH_AVAILABILITY_ENABLED                   = tostring(local.split_role_high_availability_enabled)
     })
     command = <<-EOT
       set -euo pipefail
@@ -151,8 +153,16 @@ resource "terraform_data" "reconcile_api_server" {
         proxy_args=(--proxy-url "$KUBE_PROXY_URL")
       fi
       aws eks update-kubeconfig --name ${var.host_cluster_name} --region ${var.aws_region} --kubeconfig "$KUBECONFIG_TMP" "$${proxy_args[@]}" >/dev/null
-      kubectl --kubeconfig "$KUBECONFIG_TMP" -n ${var.namespace} rollout restart deployment/${var.release_name}-api-server
-      kubectl --kubeconfig "$KUBECONFIG_TMP" -n ${var.namespace} rollout status deployment/${var.release_name}-api-server --timeout=${local.api_server_rollout_timeout_seconds}s
+      deployment_suffixes=(api-server)
+      if [[ "$${SKYPILOT_HIGH_AVAILABILITY_ENABLED:-false}" == "true" ]]; then
+        deployment_suffixes+=(executor controller)
+      fi
+      for deployment_suffix in "$${deployment_suffixes[@]}"; do
+        kubectl --kubeconfig "$KUBECONFIG_TMP" -n ${var.namespace} rollout restart "deployment/${var.release_name}-$deployment_suffix"
+      done
+      for deployment_suffix in "$${deployment_suffixes[@]}"; do
+        kubectl --kubeconfig "$KUBECONFIG_TMP" -n ${var.namespace} rollout status "deployment/${var.release_name}-$deployment_suffix" --timeout=${local.api_server_rollout_timeout_seconds}s
+      done
     EOT
   }
 

@@ -217,6 +217,10 @@ tests:
       - equal:
           path: spec.strategy.type
           value: Recreate
+      - notExists:
+          path: spec.minReadySeconds
+      - notExists:
+          path: spec.progressDeadlineSeconds
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -279,6 +283,18 @@ tests:
       - equal:
           path: spec.replicas
           value: 2
+      - equal:
+          path: spec.minReadySeconds
+          value: 10
+      - equal:
+          path: spec.progressDeadlineSeconds
+          value: 600
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 1
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 0
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -338,6 +354,77 @@ tests:
     asserts:
       - notExists:
           path: spec.template.spec.topologySpreadConstraints
+
+  - it: should reject unavailable API replicas during guarded HA rollouts
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxUnavailable: 1
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxUnavailable=0 or 0%"
+
+  - it: should accept zero-percent unavailable API replicas in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxUnavailable: 0%
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 0%
+
+  - it: should reject more than one API surge replica in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxSurge: 2
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
+
+  - it: should reject zero API surge replicas in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxSurge: 0
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
+
+  - it: should reject percentage API surge replicas in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxSurge: 25%
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
 
   - it: should reject a chart-managed database secret in HA mode
     set:

@@ -289,6 +289,10 @@ locals {
     local.extra_helm_top_level_keys,
     "requestStore",
   )
+  extra_helm_fullname_override_present = contains(
+    local.extra_helm_top_level_keys,
+    "fullnameOverride",
+  )
   extra_helm_api_service_present = contains(
     local.extra_helm_top_level_keys,
     "apiService",
@@ -301,6 +305,14 @@ locals {
     keys(try(local.extra_helm_values_decoded.apiService, null)),
     [],
   ))
+  # High availability is an escape-hatch chart value today. Keep the
+  # post-seed reconciler in compatibility mode unless the final Helm override
+  # explicitly enables split roles. Invalid shapes still fail the Helm release
+  # preconditions below; try() keeps those failures targeted.
+  split_role_high_availability_enabled = try(
+    local.extra_helm_values_decoded.apiService.highAvailability.enabled == true,
+    false,
+  )
   redefined_api_service_array_keys = setintersection(
     local.module_owned_api_service_array_keys,
     local.extra_helm_api_service_keys,
@@ -411,6 +423,10 @@ resource "helm_release" "skypilot" {
     precondition {
       condition     = !local.extra_helm_request_store_present
       error_message = "extra_helm_values must not redefine requestStore; use the typed request_store input so Terraform cannot silently override the selected persistence contract."
+    }
+    precondition {
+      condition     = !local.extra_helm_fullname_override_present
+      error_message = "extra_helm_values must not set fullnameOverride; use release_name so Terraform-managed identities and post-seed Deployment reconciliation target the same chart resources."
     }
     precondition {
       condition     = length(local.redefined_api_service_array_keys) == 0 && length(local.redefined_top_level_array_keys) == 0
