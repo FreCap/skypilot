@@ -1,5 +1,6 @@
 """Real-PostgreSQL tests for Serve system-recovery subdocuments."""
 # pylint: disable=protected-access,redefined-outer-name,unused-import
+# pylint: disable=unexpected-keyword-arg
 
 import contextlib
 import copy
@@ -27,7 +28,7 @@ _WORKSPACE = 'default'
 
 
 @pytest.fixture
-def recovery_database(postgres_engine, monkeypatch):
+def recovery_database(postgres_engine, monkeypatch):  # noqa: F811
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
@@ -417,6 +418,7 @@ def test_revision_terminal_quarantine_and_demotion_are_absorbing(
     assert serve_state.add_or_update_replica(_SERVICE_NAME, 9, _replica(9),
                                              **_fence())
     partial = _raw_replica_row(engine, 9)['replica_state']
+    partial['replica_info_version'] = 13
     partial.pop('service_job_id')
     with engine.begin() as connection:
         connection.execute(
@@ -722,6 +724,7 @@ def test_all_fields_absent_v13_rewrite_restores_json_pickle_parity(
     engine = recovery_database
     row = _raw_replica_row(engine, 7)
     rollback = row['replica_state']
+    rollback['replica_info_version'] = 13
     for field_name in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
         rollback.pop(field_name)
     with engine.begin() as connection:
@@ -744,6 +747,7 @@ def test_exact_rollback_transition_identity_can_fence_delete(
     engine = recovery_database
     row = _raw_replica_row(engine, 7)
     rollback = row['replica_state']
+    rollback['replica_info_version'] = 13
     for field_name in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
         rollback.pop(field_name)
     with engine.begin() as connection:
