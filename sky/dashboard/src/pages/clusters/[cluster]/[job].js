@@ -103,6 +103,7 @@ export function JobDetailPage() {
   useEffect(() => {
     if (activeRouteKeyRef.current !== routeKey) {
       activeRouteKeyRef.current = routeKey;
+      setIsRefreshing(false);
       setIsInitialLoad(true);
       setIsCopied(false);
       setLogsRefreshToken(0);
@@ -110,6 +111,7 @@ export function JobDetailPage() {
   }, [routeKey]);
 
   const ownsRouteState = activeRouteKeyRef.current === routeKey;
+  const currentIsRefreshing = ownsRouteState ? isRefreshing : false;
   const currentClusterData = useMemo(() => {
     if (!clusterData || !clusterRouteKey) {
       return null;
@@ -203,6 +205,8 @@ export function JobDetailPage() {
     !router.isReady ||
     !ownsRouteState ||
     (isInitialLoad && !hasCurrentRouteData);
+  const headerLoading =
+    !ownsRouteState || loading || clusterJobsLoading || isInitialLoad;
 
   const title =
     clusterRouteKey && jobRouteKey
@@ -220,8 +224,8 @@ export function JobDetailPage() {
           job={jobRouteKey}
           jobData={jobData}
           onRefresh={handleManualRefresh}
-          isRefreshing={isRefreshing}
-          loading={loading}
+          isRefreshing={currentIsRefreshing}
+          loading={headerLoading}
         />
         {isRouteLoading ? (
           <div className="flex items-center justify-center h-64">
