@@ -1,9 +1,9 @@
 # SkyServe explicit placement contract
 
-_Status: adversarial design review and code-level implementation review are GO;
-the transition implementation is complete locally, CI/release/production gates
-remain open, and the legacy-removal merge is blocked. Created and last updated:
-2026-08-07._
+_Status: transition and cleanup implementation reviews are GO for submission;
+the stacked steady-state cleanup remains blocked on the measured removal
+gates and is not approved to merge or deploy. CI, release, and production gates
+remain open. Created 2026-08-07; last updated 2026-08-07._
 
 ## Decision summary
 
@@ -24,11 +24,12 @@ slot, and counts logical GPU slots.  `dynamic_fallback` remains a physical
 compatibility policy for pools and existing services.  Both policies execute
 through the same engine; there is no second per-GPU allocator subclass.
 
-This transition does not silently change an existing version's replica unit.
-In particular, persisted `dynamic_fallback_per_gpu` versions created before
-logical semantics remain physical while retaining their historical whole-GPU
-catalog and per-GPU price ordering.  The compatibility reader is removable
-only after the durable-state and client-version gates in this design pass.
+The transition does not silently change an existing version's replica unit.
+Persisted `dynamic_fallback_per_gpu` versions created before logical semantics
+remain physical, with historical whole-GPU catalog and per-GPU price ordering,
+for the transition window only.  The stacked cleanup deletes that tuple and
+rejects its artifacts after the durable-state and client-version gates prove
+none remain.
 
 This design is the placement-policy subdesign of
 `docs/designs/skyserve-accelerator-compatibility.md`.  Its centralized catalog
@@ -100,19 +101,21 @@ are equivalent and select no placement engine:
 | `dynamic_fallback` | pool | dynamic fallback | physical backend | configured shapes | machine-hour | configured physical shape |
 | `dynamic_fallback_per_gpu` | new service | dynamic fallback | logical GPU slot | whole-GPU shapes | GPU-slot-hour | exactly one GPU/backend |
 
-One historical state is not constructible from new YAML but remains readable:
+One historical state is not constructible from new YAML.  The transition
+reader preserves it until the removal gates pass:
 
 | Persisted state | Workload | Engine | Replica unit | Catalog | Cost order | Reserved fill |
 |---|---|---|---|---|---|---|
 | per-GPU policy without the logical marker | service | dynamic fallback | physical backend | whole-GPU shapes | GPU-slot-hour | exactly one GPU/backend |
 
-All other tuples are rejected.  In particular, a pool cannot use
+The cleanup reader rejects this historical tuple as well as every other tuple
+outside the public table above.  In particular, a pool cannot use
 `dynamic_fallback_per_gpu`, a logical contract cannot name a pool, and the
 historical physical/per-GPU tuple is accepted only by compatibility decoding,
-not by fresh YAML or an override.  Historical fractional, non-exact, or
-otherwise odd resource shapes retain their old physical placement behavior;
-fresh logical validation is not retroactively applied during decode, retry, or
-copy.
+not by fresh YAML or an override, during the transition window.  Historical
+fractional, non-exact, or otherwise odd resource shapes retain their old
+physical behavior only in that window; cleanup deployment is forbidden until
+the inventory proves no such recoverable state remains.
 
 Policy names remain case-insensitive at the YAML boundary, matching the
 existing service schema, but every newly constructed spec canonicalizes and
@@ -161,18 +164,20 @@ Its precedence rules are strict:
 2. If `_placement_contract_version == 1`, all other six fields and the
    rollback mirror are required.  Validate their exact tuple, require the
    workload kind to match the containing service/pool object, and require the
-   mirror to agree with the replica unit.  The persisted `_spot_placer` must
-   map to that exact allowed tuple, including the sole historical physical
-   per-GPU tuple; a known public name cannot disagree with retained contract
-   fields.
+   mirror to agree with the replica unit.  The transition reader also accepts
+   the historical physical/per-GPU tuple; the cleanup reader accepts only the
+   five public tuples and rejects that removed tuple.  A known public name
+   cannot disagree with retained contract fields.
 3. If `_placement_contract_version == 2`, all other six fields are required
-   and the rollback mirror must be absent.  Validate the same exact fresh
-   tuples and policy-name/workload match, but reject the transition-only
-   historical physical/per-GPU tuple: the cleanup writer and its
-   `persisted_fields(v2)` boundary cannot encode that tuple, and the removal
-   inventory must prove it is absent before v2 writes begin.  The transition
-   reader accepts valid v2 state so the cleanup release is rollback-compatible,
-   but the transition writer emits only v1.
+   and the rollback mirror must be absent.  Validate the five public tuples and
+   policy-name/workload match.  The cleanup exposes a zero-argument,
+   v2-only `persisted_fields()` writer and `SkyServiceSpec.__getstate__()`
+   projects every encodable v1 artifact to v2 without mutating the source.
+   New service and version database writes use this serialization boundary;
+   exact retries of an already committed row remain acknowledgement-only and
+   byte preserving.  The transition reader accepts valid v2 state so the
+   cleanup release is rollback-compatible, but the transition writer emits
+   only v1.
 4. A partial field set, boolean masquerading as a version, unknown version,
    unknown value, invalid tuple, workload mismatch, forbidden/missing mirror,
    or v1 mirror disagreement is malformed current state and fails loudly.  It
@@ -240,14 +245,13 @@ validate and reconstruct from their primitive fields under the precedence
 rules above.  Impossible combinations fail at this boundary.  They never fall
 through to a nearby policy.
 
-The contract is immutable for a committed `(service_name, version)`.  A copy
-that overrides neither `spot_placer` nor `pool` carries the exact contract
-forward.  An explicit policy or workload-kind override resolves a fresh
-contract and goes through ordinary validation.  Copying a historical
-physical/per-GPU spec into pool form is rejected; it cannot preserve an
-inconsistent tuple.  The public constructor cannot accept a resolved contract;
-only a token-gated internal copy path may preserve one, so programmatic callers
-cannot forge the decode-only historical tuple.
+The contract is immutable for a committed `(service_name, version)`.  In the
+transition, a copy that overrides neither `spot_placer` nor `pool` carries the
+exact contract forward.  In cleanup, every encodable v1 copy writes v2 and a
+historical tuple is rejected during decode.  An explicit policy or
+workload-kind override resolves a fresh contract and goes through ordinary
+validation.  The public constructor cannot accept a resolved contract; only a
+token-gated internal copy path may preserve a supported tuple.
 
 Every consumer uses the typed access point: `SpotPlacer.validate_task()` and
 `build_catalog()` receive it before an engine exists; placer construction and
@@ -331,7 +335,7 @@ and prior warm replicas and claims have drained.
 
 ## Implementation and PR stack
 
-### Transition PR
+### Transition PR [#1318](https://github.com/boltz-bio/skypilot/pull/1318)
 
 1. Add the dependency-neutral contract resolver and seven primitive persisted
    fields.
@@ -348,23 +352,23 @@ and prior warm replicas and claims have drained.
 The transition is behavior preserving for every row in the contract tables.
 It may merge and deploy while legacy state exists.
 
-### Blocked cleanup PR
+### Blocked cleanup PR [#1319](https://github.com/boltz-bio/skypilot/pull/1319)
 
-Author a stacked cleanup change at the same time.  It removes the
-all-versioned-fields-absent decoder and dead compatibility machinery only after
-the inventory proves that no fieldless physical *or logical* artifact remains;
-pre-transition logical pickles are immutable and block this removal just as
-physical/per-GPU pickles do.  It writes contract v2 without a rollback mirror,
-while continuing to read retained v1 artifacts; existing immutable v1 pickle
-bytes are never rewritten to remove their field.  Because the transition
-reader already accepts v2, rolling back one release remains safe.  It
-deliberately retains the public `dynamic_fallback` physical preset required by
-pools.  Public policy removal is a separate breaking design/PR.  Keep this
-cleanup draft or otherwise blocked; do not merge it merely because no old
-replicas are currently READY.
+The stacked cleanup removes the all-versioned-fields-absent decoder, the
+historical physical/per-GPU tuple, and dead compatibility machinery only after
+inventory proves that no fieldless physical or logical artifact and no
+historical tuple remains.  Pre-transition pickles are immutable and block this
+removal.  It writes contract v2 without a rollback mirror while continuing to
+read the five supported v1 tuples; existing immutable v1 pickle bytes are never
+rewritten in place.  Because the transition reader already accepts v2, rolling
+back one release remains safe.  It deliberately retains the public
+`dynamic_fallback` physical preset required by pools.  Public policy removal is
+a separate breaking design/PR.  Keep this cleanup draft or otherwise blocked;
+do not merge it merely because no old replicas are currently READY.
 
-The transition PR links the cleanup PR.  The cleanup PR links this design and
-states its exact merge gate.
+Transition PR #1318 and draft cleanup PR #1319 form gh-stack #1320.  Both link
+this design; the cleanup PR states the exact merge gate below and remains
+blocked until its evidence is attached.
 
 ## Compatibility, rollout, and rollback
 
@@ -447,8 +451,10 @@ Automated coverage must prove:
   lowercase public spelling, while disabled canonical output omits the key;
 - every allowed and rejected tuple, including no-engine service/pool,
   per-GPU pool rejection, workload mismatch, and the sole historical tuple;
-- old pickles missing the logical marker remain physical, preserve whole-GPU
-  expansion/GPU-slot pricing, and survive copy and exact-YAML retry;
+- in the transition, old pickles missing the logical marker remain physical,
+  preserve whole-GPU expansion/GPU-slot pricing, and survive copy and
+  exact-YAML retry; after the cleanup gates pass, the same fieldless and
+  historical artifacts fail explicitly instead of selecting nearby semantics;
 - transition pickles contain v1, all six dimension fields, and the rollback
   marker; cleanup fixtures contain v2 and no marker; partial fields, unknown
   versions/values, invalid tuples, public-policy mismatch, and
@@ -473,9 +479,9 @@ Automated coverage must prove:
   and policy, its rollback reserialization round-trips through the transition
   reader unchanged, while a real fieldless legacy `_pool={}` remains a service;
 - v1-to-v2 and v2-to-v1 read/copy/reserialize rollback paths preserve exact
-  semantics for every v2-encodable v1 tuple; historical physical/per-GPU v1
-  serialization to v2 fails and blocks cleanup, and a class shim fixture (when
-  required) never recreates a second engine;
+  semantics for every v2-encodable v1 tuple; a frozen exact-transition
+  historical physical/per-GPU v1 artifact is rejected by cleanup, and a class
+  shim fixture (when required) never recreates a second engine;
 - the public constructor and an invalid internal-copy token cannot inject the
   decode-only historical physical/per-GPU tuple;
 - the monotonic service-level logical fence rejects mismatch under
@@ -497,7 +503,9 @@ zero-cost reserved-capacity tests remain fail closed.
 ### Verification evidence as of 2026-08-07
 
 - Adversarial review of this exact design and code-level implementation review
-  both returned GO.
+  both returned GO for the transition.  A separate final cleanup audit returned
+  GO for committing and submitting the blocked cleanup, and NO-GO for merging
+  or deploying it before every removal gate above is satisfied.
 - The exact unmodified v1.1.1132 source at
   `ab5ec55b89a8c576e20e6ea27cf240e88134bb64` read transition fixed-pool
   pickles, preserved pool size and policy through copy/protocol-4
@@ -506,13 +514,34 @@ zero-cost reserved-capacity tests remain fail closed.
   release's service meaning.  This bidirectional proof passed on Python
   3.11.13 and production-family Python 3.14.3.
 - Real v1.1.1132 and pre-marker v1.1.247 pickle fixtures pass restart, copy,
-  and reserialization coverage without a removed placer-class reference.
+  and reserialization coverage in the transition without a removed
+  placer-class reference.  Cleanup rejects both fieldless artifacts by
+  contract.
+- Frozen protocol-4 artifacts produced by the exact transition commit
+  `aee3da9e0910d597dc33f31ee964497ced58b78c` cover both a supported logical
+  per-GPU v1 contract and the removed historical physical/per-GPU v1 tuple.
+  Cleanup accepts and upgrades the former and rejects the latter.  The raw
+  SHA-256 digests are respectively
+  `a4c549ae75412dcff8917d29f892284745040b9a503b38f70d7cea1686acd05a`
+  and `3e912f262e1498d28891d27565f7c0720a429feb1b8131887adb40d13ce2ed28`.
+- Every one of the five supported v1 public tuples passes cleanup read, copy,
+  protocol-4 reserialization, YAML-equivalence, source-nonmutation, and
+  v2-without-mirror checks.  Exact cross-worktree rollback testing passed all
+  five tuples through cleanup v2 -> transition commit `aee3da9e0` read/copy to
+  v1 -> cleanup reread/rewrite to v2.
 - The affected Serve unit suite passes except for four AWS catalog tests whose
   only failure is the operator's expired SSO session; no login was initiated.
-  Focused Python 3.14.3 contract, factory, historical ranking, and reserved-fill
-  checks pass.
+  Cleanup contract, persistence, controller retry/recovery, service daemon,
+  replica-manager initialization/retry, dynamic placement, and
+  reserved-capacity suites otherwise pass.  Focused Python 3.14.3 contract,
+  factory, concurrency, and service-spec checks pass.
+- Cleanup adds real-PostgreSQL coverage for initial-service writes,
+  placeholder fills, direct version inserts, exact retry byte preservation,
+  and historical-artifact rejection.  It collects locally but is skipped
+  because this host has no Docker daemon; executing it in PostgreSQL CI remains
+  an open gate and no SQLite substitute was added.
 - YAPF/isort, mypy over 887 source files, pylint, and `git diff --check` pass on
-  the transition tree.
+  both the transition and cleanup trees.
 
 Real PostgreSQL CI, credentialed provider catalog coverage, release artifact
 verification, and zero-cost production smoke evidence remain open gates; the
@@ -538,7 +567,8 @@ evidence above does not satisfy any cleanup-removal observation window.
 
 ## Open gates
 
-- The stacked cleanup PR has not yet been authored.
+- Draft cleanup PR #1319 is authored in stack #1320; every removal gate above
+  remains unmet, so it is not approved to merge or deploy.
 - Transition CI, including the real PostgreSQL lane and credentialed catalog
   coverage, has not completed.
 - Production control-plane release artifacts and a reviewed deployment pin are
