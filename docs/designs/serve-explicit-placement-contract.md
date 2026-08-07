@@ -1,9 +1,10 @@
 # SkyServe explicit placement contract
 
-_Status: transition and cleanup implementation reviews are GO for submission;
-the stacked steady-state cleanup remains blocked on the measured removal
-gates and is not approved to merge or deploy. CI, release, and production gates
-remain open. Created 2026-08-07; last updated 2026-08-07._
+_Status: transition PR #1318 is merged and released as v1.1.1135.  Draft
+cleanup PR #1319 is 30/30 green but remains blocked on the measured removal
+gates and is not approved to merge or deploy.  Platform pin PR #8090 is
+CI-green and awaiting its required review; production deployment and cleanup
+removal gates remain open. Created 2026-08-07; last updated 2026-08-07._
 
 ## Decision summary
 
@@ -352,6 +353,10 @@ and prior warm replicas and claims have drained.
 The transition is behavior preserving for every row in the contract tables.
 It may merge and deploy while legacy state exists.
 
+PR #1318 merged as `95e0b41b15ad56598e06ef9cb08297815a65f662`
+and was released as v1.1.1135.  Its control-plane deployment remains a
+separate reviewed Platform change.
+
 ### Blocked cleanup PR [#1319](https://github.com/boltz-bio/skypilot/pull/1319)
 
 The stacked cleanup removes the all-versioned-fields-absent decoder, the
@@ -506,6 +511,20 @@ zero-cost reserved-capacity tests remain fail closed.
   both returned GO for the transition.  A separate final cleanup audit returned
   GO for committing and submitting the blocked cleanup, and NO-GO for merging
   or deploying it before every removal gate above is satisfied.
+- Transition PR #1318 passed 30/30 pre-merge checks and merged as
+  `95e0b41b15ad56598e06ef9cb08297815a65f662`.  The exact release workflows
+  published v1.1.1135 image digest
+  `sha256:cf76e4855167237c682ef43fc72554511adaa4aed374df40191a4ba0ea135706`
+  and chart digest
+  `sha256:3de28d2f3192b28e12d76430e369ea9cd1c0f14ebeb72edf2a3fec36e019609f`.
+  The initial merge push exposed a pre-existing shared-context Kubernetes
+  fence-test defect; test-only PR #1322 isolated those contexts and merged as
+  `fdfc2eb972ebab97add9226fa3cbf41b5792ad49`.  All nine exact-SHA workflows
+  then passed, including 13/13 Python and optimizer jobs.
+- Draft cleanup PR #1319 passes 30/30 checks at exact head
+  `90492de86202322a0391333648f6f327365d4b90`.  Its mandatory Unit Tests job
+  ran the repository's real-PostgreSQL suites and finished with 15,407 passed,
+  one xfailed test, and no failed test.
 - The exact unmodified v1.1.1132 source at
   `ab5ec55b89a8c576e20e6ea27cf240e88134bb64` read transition fixed-pool
   pickles, preserved pool size and policy through copy/protocol-4
@@ -538,14 +557,22 @@ zero-cost reserved-capacity tests remain fail closed.
 - Cleanup adds real-PostgreSQL coverage for initial-service writes,
   placeholder fills, direct version inserts, exact retry byte preservation,
   and historical-artifact rejection.  It collects locally but is skipped
-  because this host has no Docker daemon; executing it in PostgreSQL CI remains
-  an open gate and no SQLite substitute was added.
+  because this host has no Docker daemon; the mandatory real-PostgreSQL CI lane
+  passed and no SQLite substitute was added.
 - YAPF/isort, mypy over 887 source files, pylint, and `git diff --check` pass on
   both the transition and cleanup trees.
+- Platform pin PR #8090 selects v1.1.1135 and exact transition commit
+  `95e0b41b15ad56598e06ef9cb08297815a65f662`.  Its checks are terminal with
+  22 successful and 34 intentionally skipped checks, but it has zero reviews
+  and GitHub correctly blocks the merge pending required Platform approval.
+- The latest read-only production snapshot remains on service version 58 and
+  reports `READY` with 49/51 replicas while a new replica starts.  This proves
+  continuity of the existing deployment only; it is not transition-release
+  production validation.
 
-Real PostgreSQL CI, credentialed provider catalog coverage, release artifact
-verification, and zero-cost production smoke evidence remain open gates; the
-evidence above does not satisfy any cleanup-removal observation window.
+Credentialed provider catalog coverage and zero-cost production smoke evidence
+remain open gates; the evidence above does not satisfy any cleanup-removal
+observation window.
 
 ## Manual test plan
 
@@ -569,10 +596,14 @@ evidence above does not satisfy any cleanup-removal observation window.
 
 - Draft cleanup PR #1319 is authored in stack #1320; every removal gate above
   remains unmet, so it is not approved to merge or deploy.
-- Transition CI, including the real PostgreSQL lane and credentialed catalog
-  coverage, has not completed.
-- Production control-plane release artifacts and a reviewed deployment pin are
-  required before rollout.
+- Transition and cleanup GitHub CI, including the mandatory real-PostgreSQL
+  lane, completed successfully.  Credentialed AWS catalog coverage remains
+  open because the operator SSO session is expired; no login was initiated.
+- Production control-plane release artifacts are published.  Platform pin PR
+  #8090 is CI-green but requires Platform approval before merge and rollout.
+- Production apply remains human-owned and additionally requires the protected
+  deployment environment, approved identity/context, and exact pre-rollout
+  rollback identity to be verified.
 - The Boltz fleet's canonical service YAML currently keeps warm capacity; its
   separate scale-to-zero policy must be reviewed, deployed/applied, converged,
   and drained before any service update can claim scale-to-zero compliance.
