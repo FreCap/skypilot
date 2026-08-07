@@ -169,6 +169,53 @@ def test_get_handles_from_cluster_names_retries_transient_db_failure(
     assert isinstance(result['alive-1'], _MinimalHandle)
 
 
+def test_get_cluster_handle_status_from_name_returns_handle_and_status(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('alive-1', ready=True)
+
+    handle, status = global_user_state.get_cluster_handle_status_from_name(
+        'alive-1')
+
+    assert isinstance(handle, _MinimalHandle)
+    assert status == global_user_state.status_lib.ClusterStatus.UP
+
+
+def test_get_cluster_handle_status_from_name_missing_cluster_returns_nones(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    handle, status = global_user_state.get_cluster_handle_status_from_name(
+        'missing')
+
+    assert handle is None
+    assert status is None
+
+
+def test_get_cluster_handle_status_from_name_uses_one_select(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('alive-1', ready=True)
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        handle, status = global_user_state.get_cluster_handle_status_from_name(
+            'alive-1')
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert isinstance(handle, _MinimalHandle)
+    assert status == global_user_state.status_lib.ClusterStatus.UP
+    assert len(select_statements) == 1
+
+
 def test_get_clusters_from_names_chunks_large_input(tmp_path, monkeypatch):
     """Names beyond a single batch must still be resolved. Shrink the chunk
     size to 2 so we exercise the loop with only 5 clusters."""

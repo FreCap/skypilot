@@ -47,6 +47,7 @@ from sky.utils import context_utils
 from sky.utils import controller_utils
 from sky.utils import debug_dump_helpers
 from sky.utils import message_utils
+from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 
@@ -435,11 +436,9 @@ async def get_job_status(
         transient_error_reason: None if successful or fatal error; otherwise,
             the detailed reason for the transient error.
     """
-    # TODO(zhwu, cooperc): Make this get job status aware of cluster status, so
-    # that it can exit retry early if the cluster is down.
     # TODO(luca) make this async
-    handle = await asyncio.to_thread(
-        global_user_state.get_handle_from_cluster_name, cluster_name)
+    handle, cluster_status = await asyncio.to_thread(
+        global_user_state.get_cluster_handle_status_from_name, cluster_name)
 
     def _log_job_status(status: Optional['job_lib.JobStatus']) -> None:
         if status is None:
@@ -450,6 +449,17 @@ async def get_job_status(
 
     logger.info('=== Checking the job status... ===')
 
+    if handle is None:
+        # This can happen if the cluster was preempted and background status
+        # refresh already noticed and cleaned it up.
+        logger.info(f'Cluster {cluster_name} not found.')
+        return None, None
+    if cluster_status not in (status_lib.ClusterStatus.UP,
+                              status_lib.ClusterStatus.AUTOSTOPPING):
+        logger.info(f'Cluster {cluster_name} is not UP-like '
+                    f'(status: {cluster_status.value}); skipping remote job '
+                    'status check.')
+        return None, f'Cluster is not UP-like ({cluster_status.value})'
     if managed_job_runtime.is_registered():
         result = await asyncio.to_thread(managed_job_runtime.get_job_status,
                                          handle, cluster_name)
@@ -457,12 +467,6 @@ async def get_job_status(
             status, _ = result
             _log_job_status(status)
             return result
-
-    if handle is None:
-        # This can happen if the cluster was preempted and background status
-        # refresh already noticed and cleaned it up.
-        logger.info(f'Cluster {cluster_name} not found.')
-        return None, None
     assert isinstance(handle, backends.CloudVmRayResourceHandle), handle
     job_ids = None if job_id is None else [job_id]
     try:

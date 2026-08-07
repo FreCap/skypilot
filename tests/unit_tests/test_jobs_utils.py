@@ -19,6 +19,7 @@ from sky.jobs import state
 from sky.jobs import utils
 from sky.utils import controller_utils
 from sky.utils import message_utils
+from sky.utils import status_lib
 
 # String path for mock.patch — can't use the constant directly because
 # mock.patch needs the dotted path to the attribute being patched.
@@ -134,8 +135,8 @@ async def test_event_callback_pool_job_uses_one_context_helper():
 
 @pytest.mark.asyncio
 @mock.patch('sky.jobs.utils.logger')
-@mock.patch('sky.global_user_state.get_handle_from_cluster_name')
-async def test_get_job_status_timeout(mock_get_handle, mock_logger):
+@mock.patch('sky.global_user_state.get_cluster_handle_status_from_name')
+async def test_get_job_status_timeout(mock_get_cluster, mock_logger):
     """Test that get_job_status returns error reason on timeout.
 
     Note: get_job_status no longer retries - it returns (None, reason) on
@@ -143,7 +144,7 @@ async def test_get_job_status_timeout(mock_get_handle, mock_logger):
     """
     mock_handle = mock.MagicMock(
         spec=cloud_vm_ray_backend.CloudVmRayResourceHandle)
-    mock_get_handle.return_value = mock_handle
+    mock_get_cluster.return_value = (mock_handle, status_lib.ClusterStatus.UP)
 
     mock_backend = mock.MagicMock(spec=cloud_vm_ray_backend.CloudVmRayBackend)
 
@@ -182,13 +183,13 @@ async def test_get_job_status_timeout(mock_get_handle, mock_logger):
 
 @pytest.mark.asyncio
 @mock.patch('sky.jobs.utils.logger')
-@mock.patch('sky.global_user_state.get_handle_from_cluster_name')
+@mock.patch('sky.global_user_state.get_cluster_handle_status_from_name')
 async def test_get_job_status_returns_error_reason_on_failure(
-        mock_get_handle, mock_logger):
+        mock_get_cluster, mock_logger):
     """Test that get_job_status returns error reason on transient failures."""
     mock_handle = mock.MagicMock(
         spec=cloud_vm_ray_backend.CloudVmRayResourceHandle)
-    mock_get_handle.return_value = mock_handle
+    mock_get_cluster.return_value = (mock_handle, status_lib.ClusterStatus.UP)
 
     mock_backend = mock.MagicMock(spec=cloud_vm_ray_backend.CloudVmRayBackend)
 
@@ -208,6 +209,30 @@ async def test_get_job_status_returns_error_reason_on_failure(
 
     # Verify only one attempt was made (no retry in get_job_status)
     assert mock_logger.info.call_count == 1
+
+
+@pytest.mark.asyncio
+@mock.patch('sky.jobs.utils.logger')
+@mock.patch('sky.global_user_state.get_cluster_handle_status_from_name')
+async def test_get_job_status_skips_backend_when_cluster_not_up(
+        mock_get_cluster, mock_logger):
+    """A non-UP cluster row should short-circuit before the remote RPC."""
+    mock_handle = mock.MagicMock(
+        spec=cloud_vm_ray_backend.CloudVmRayResourceHandle)
+    mock_get_cluster.return_value = (mock_handle,
+                                     status_lib.ClusterStatus.STOPPED)
+    mock_backend = mock.MagicMock(spec=cloud_vm_ray_backend.CloudVmRayBackend)
+    mock_backend.get_job_status.side_effect = AssertionError(
+        'backend.get_job_status should not run for STOPPED clusters')
+
+    job_status, error_reason = await utils.get_job_status(
+        backend=mock_backend, cluster_name='test-cluster', job_id=1)
+
+    assert job_status is None
+    assert error_reason == 'Cluster is not UP-like (STOPPED)'
+    mock_get_cluster.assert_called_once_with('test-cluster')
+    mock_backend.get_job_status.assert_not_called()
+    assert mock_logger.info.call_count == 2
 
 
 @mock.patch('sky.utils.controller_utils.warn_jobs_consolidation_mode_intent')
@@ -249,8 +274,6 @@ def test_consolidation_mode_warning_without_restart(mock_config, mock_logger,
 
 def test_job_recovery_skips_autostopping():
     """Verify job recovery logic treats AUTOSTOPPING like UP (no recovery)."""
-    from sky.utils import status_lib
-
     # AUTOSTOPPING should be treated as UP-like (not preempted)
     # Recovery logic should skip AUTOSTOPPING (similar to UP)
     up_status = status_lib.ClusterStatus.UP
