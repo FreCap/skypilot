@@ -589,11 +589,23 @@ zero-cost reserved-capacity tests remain fail closed.
   Its elastic replica count changed from 59/89 immediately before the rollout
   to 73/78 after controller recovery; this count is observational and not a
   fixed-capacity assertion.
+- Controller recovery tied its new L4 launches to a version-58 logical target,
+  explicit per-accelerator cold-launch authority, measured demand, and the
+  bounded global paid-capacity admission window.  The resulting public-cloud
+  replicas reported Spot resources; no ordinary on-demand candidate was
+  observed.
+- A bounded sample of the last 5,000 controller-log lines contained 128
+  `event=skyserve_placement_contract_decode outcome=legacy_materialized`
+  events for the logical service contract and no rejected decode event.  This
+  is expected transition-reader behavior for the pre-transition version-58
+  artifact, but it directly proves that cleanup cannot remove the legacy
+  reader or begin its zero-event observation window.
 
 Credentialed provider catalog coverage and zero-cost production smoke evidence
 remain open gates.  This is only the first transition production release, and
-the 30-day observation clock has not started because the retained log sink and
-exact zero-event query required by the removal gate are not yet attached.
+the 30-day observation clock has not started because legacy materialization is
+nonzero and the retained log sink and exact zero-event query required by the
+removal gate are not yet attached.
 
 ## Manual test plan
 
@@ -630,5 +642,6 @@ exact zero-event query required by the removal gate are not yet attached.
 - The Boltz fleet's canonical service YAML currently keeps warm capacity; its
   separate scale-to-zero policy must be reviewed, deployed/applied, converged,
   and drained before any service update can claim scale-to-zero compliance.
-- Legacy durable-state inventory and the compatibility-window evidence needed
-  to unblock removal are not yet complete.
+- Service version 58 still materializes the legacy logical contract.  Its
+  separately approved migration and the legacy durable-state inventory across
+  every retained copy remain required before the zero-event window can start.
