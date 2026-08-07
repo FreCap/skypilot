@@ -1459,7 +1459,7 @@ def _load_spot_placer(
     workspace: str | None = None,
 ) -> spot_placer.SpotPlacer | None:
     """Load one version's durable catalog without provider resolution."""
-    if service_spec.spot_placer is None:
+    if not service_spec.placement_contract.enabled:
         return None
     catalog_data = serve_state.get_placement_catalog(service_name, version)
     if catalog_data is None:
@@ -1494,9 +1494,8 @@ def validate_service_update_preflight(
     default_planned_capacity = _uniform_whole_gpu_capacity(task.resources)
     if uses_logical_replicas:
         _exact_accelerator_shapes(task.resources)
-    placer_name = service_spec.spot_placer
     candidate_placer = None
-    if uses_logical_replicas or isinstance(placer_name, str):
+    if service_spec.placement_contract.enabled:
         candidate_placer = _load_spot_placer(service_name, version,
                                              service_spec, task, workspace)
     if uses_logical_replicas:
@@ -12152,9 +12151,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # set. Use the preflight placer when provided; otherwise load the
         # committed version's centralized catalog. Neither path rebuilds
         # provider candidates in the controller child.
-        new_placer_name = spec.spot_placer
-        if ((new_uses_logical_replicas or isinstance(new_placer_name, str)) and
-                new_spot_placer is None):
+        if (spec.placement_contract.enabled and new_spot_placer is None):
             new_spot_placer = _load_spot_placer(self._service_name, version,
                                                 spec, new_task, self._workspace)
         old_spot_placer = self._spot_placer

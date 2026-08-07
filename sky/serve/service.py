@@ -1504,7 +1504,7 @@ def _prepare_placement_catalog(
     recovery_version: int | None,
 ) -> dict[str, Any] | None:
     """Build a fresh catalog or load/backfill one legacy version."""
-    if service_spec.spot_placer is None:
+    if not service_spec.placement_contract.enabled:
         return None
     if is_recovery:
         if recovery_version is None:

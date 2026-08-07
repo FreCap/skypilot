@@ -18,6 +18,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.clouds import cloud as sky_cloud
 from sky.container_images import models as container_image_models
+from sky.serve import placement_policy
 from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import ux_utils
@@ -29,10 +30,12 @@ if typing.TYPE_CHECKING:
 
 logger = sky_logging.init_logger(__name__)
 
-SPOT_PLACERS = {}
-DEFAULT_SPOT_PLACER = None
-SPOT_HEDGE_PLACER = 'dynamic_fallback'
-CAPACITY_AWARE_SPOT_PLACER = 'dynamic_fallback_per_gpu'
+# Compatibility exports for callers that historically imported the public
+# names from this module.  Policy resolution itself lives in the dependency-
+# neutral placement_policy module.
+SPOT_HEDGE_PLACER = placement_policy.SPOT_HEDGE_PLACER
+CAPACITY_AWARE_SPOT_PLACER = placement_policy.CAPACITY_AWARE_SPOT_PLACER
+SUPPORTED_SPOT_PLACERS = placement_policy.SUPPORTED_SPOT_PLACERS
 
 # These backends build their accelerator catalogs by inspecting the user's
 # cluster. Per-GPU placement must not turn service-controller construction into
@@ -932,16 +935,15 @@ def _get_possible_location_from_task(
 class SpotPlacer:
     """Spot Placement specification."""
 
-    _expand_accelerator_counts = False
     _RETRY_STATE_VERSION = 1
     _BENCH_REASONS = frozenset({'capacity', 'quota', 'preempted'})
 
     def __new__(cls, *args: Any, **kwargs: Any) -> 'SpotPlacer':
         """Allocate the complete process-local compatibility interface.
 
-        Pickle restoration and lightweight test construction may skip
-        ``__init__``. Defaults belong at allocation time so runtime methods
-        use one explicit interface instead of probing for fields.
+        Lightweight test construction may skip ``__init__``. Defaults belong
+        at allocation time so runtime methods use one explicit interface
+        instead of probing for fields.
         """
         del args, kwargs
         instance = super().__new__(cls)
@@ -956,13 +958,19 @@ class SpotPlacer:
     def __init__(
         self,
         task: 'task_lib.Task',
+        placement_contract: placement_policy.PlacementContract,
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
         workspace: str | None = None,
     ) -> None:
+        if not placement_contract.enabled:
+            raise ValueError('A placement-disabled contract cannot construct '
+                             'a SpotPlacer.')
+        self._placement_contract = placement_contract
         if placement_catalog is None:
             catalog_value = PlacementCatalog.from_task(
                 task,
-                expand_accelerator_counts=self._expand_accelerator_counts,
+                expand_accelerator_counts=(
+                    placement_contract.expand_accelerator_counts),
                 workspace=workspace)
         elif isinstance(placement_catalog, PlacementCatalog):
             catalog_value = placement_catalog
@@ -1056,13 +1064,9 @@ class SpotPlacer:
             return False
         return True
 
-    def __init_subclass__(cls, name: str, default: bool = False):
-        SPOT_PLACERS[name] = cls
-        if default:
-            global DEFAULT_SPOT_PLACER
-            assert DEFAULT_SPOT_PLACER is None, (
-                'Only one policy can be default.')
-            DEFAULT_SPOT_PLACER = name
+    @property
+    def placement_contract(self) -> placement_policy.PlacementContract:
+        return self._placement_contract
 
     def select_next_location(
             self,
@@ -1332,10 +1336,17 @@ class SpotPlacer:
     def mark_retry_state_persisted(self) -> None:
         self._retry_state_dirty = False
 
+    @staticmethod
+    def _accelerator_slots(location: Location) -> float:
+        slots = sum((location.accelerators or {}).values())
+        return float(slots) if slots > 0 else 1.0
+
     def _min_cost_location(self, locations: list[Location]) -> Location:
         return min(
             locations,
-            key=lambda location: self.location2cost.get(location, float('inf')))
+            key=lambda location: self.placement_contract.normalize_hourly_cost(
+                self.location2cost.get(location, float('inf')),
+                self._accelerator_slots(location)))
 
     def _effective_status(self, location: Location) -> LocationStatus:
         """Status with TTL decay: an expired PREEMPTED mark counts ACTIVE.
@@ -1632,7 +1643,7 @@ class SpotPlacer:
     def validate_task(cls, spec: 'service_spec.SkyServiceSpec',
                       task: 'task_lib.Task') -> None:
         """Validate placer resource shape without provider enumeration."""
-        if spec.spot_placer is not None:
+        if spec.placement_contract.enabled:
             _validate_placement_resource_configs(task)
 
     @classmethod
@@ -1643,12 +1654,12 @@ class SpotPlacer:
         workspace: str | None = None,
     ) -> PlacementCatalog | None:
         """Build the one complete catalog for an immutable service version."""
-        if spec.spot_placer is None:
+        contract = spec.placement_contract
+        if not contract.enabled:
             return None
-        placer_cls = SPOT_PLACERS[spec.spot_placer]
         return PlacementCatalog.from_task(
             task,
-            expand_accelerator_counts=placer_cls._expand_accelerator_counts,  # pylint: disable=protected-access
+            expand_accelerator_counts=contract.expand_accelerator_counts,
             workspace=workspace)
 
     @classmethod
@@ -1659,24 +1670,33 @@ class SpotPlacer:
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
         workspace: str | None = None,
     ) -> Optional['SpotPlacer']:
-        if spec.spot_placer is None:
+        contract = spec.placement_contract
+        if not contract.enabled:
             return None
-        return SPOT_PLACERS[spec.spot_placer](
-            task, placement_catalog=placement_catalog, workspace=workspace)
+        if contract.engine != placement_policy.ENGINE_DYNAMIC_FALLBACK:
+            raise ValueError(f'Unsupported placement engine: '
+                             f'{contract.engine!r}.')
+        return DynamicFallbackSpotPlacer(task,
+                                         contract,
+                                         placement_catalog=placement_catalog,
+                                         workspace=workspace)
 
 
-class DynamicFallbackSpotPlacer(SpotPlacer,
-                                name=SPOT_HEDGE_PLACER,
-                                default=True):
+class DynamicFallbackSpotPlacer(SpotPlacer):
     """Dynamic Fallback Placer."""
 
     def __init__(
         self,
         task: 'task_lib.Task',
+        placement_contract: placement_policy.PlacementContract,
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
         workspace: str | None = None,
     ) -> None:
+        if placement_contract.engine != placement_policy.ENGINE_DYNAMIC_FALLBACK:
+            raise ValueError('DynamicFallbackSpotPlacer requires the dynamic '
+                             'fallback placement engine.')
         super().__init__(task,
+                         placement_contract,
                          placement_catalog=placement_catalog,
                          workspace=workspace)
         # INVARIANT: the bench TTL must exceed the worst-case launch
@@ -1764,27 +1784,3 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         logger.info(f'Active locations: {active_locations}\n'
                     f'Selected location: {res}\n')
         return res
-
-
-class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
-                                             name=CAPACITY_AWARE_SPOT_PLACER):
-    """Dynamic fallback that discovers and prices whole-GPU spot shapes.
-
-    Fill the cheapest active shape per GPU until a failed launch benches it,
-    then fall through to the next-cheapest active candidate.
-    """
-
-    _expand_accelerator_counts = True
-
-    @staticmethod
-    def _accelerator_slots(location: Location) -> float:
-        slots = sum((location.accelerators or {}).values())
-        return float(slots) if slots > 0 else 1.0
-
-    def _min_cost_location(self, locations: list[Location]) -> Location:
-        # TODO(fran): Rank heterogeneous accelerators by measured workload
-        # throughput per dollar once services can publish benchmark weights.
-        return min(
-            locations,
-            key=lambda location: self.location2cost.get(location, float(
-                'inf')) / self._accelerator_slots(location))

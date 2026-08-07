@@ -14,18 +14,22 @@ Focused on the helpers added for HA leader-aware routing:
 """
 # pylint: disable=import-outside-toplevel,missing-class-docstring
 # pylint: disable=protected-access,unreachable
+import contextlib
 import json
 import multiprocessing
 import socket
 import threading
 import time
+import types
 from unittest import mock
 import uuid
 
 import pytest
 
+from sky.serve import placement_policy
 from sky.serve import serve_state
 from sky.serve import service
+from sky.serve import service_spec as service_spec_lib
 
 
 def _bind_socket_async(host, port, delay):
@@ -762,16 +766,60 @@ run: echo hi
 """
 
 
+def _make_persisted_per_gpu_spec(
+        uses_logical_replicas: bool) -> service_spec_lib.SkyServiceSpec:
+    spec = service_spec_lib.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=1,
+        readiness_timeout_seconds=2,
+        endpoint_probe_interval_seconds=3,
+        lb_stream_timeout_seconds=4,
+        min_replicas=1,
+        max_replicas=8,
+        target_concurrency_per_replica=(1 if uses_logical_replicas else 2),
+        graceful_drain_async_occupancy=True,
+        spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+        lb_high_availability=False)
+    if uses_logical_replicas:
+        return spec
+    legacy_state = dict(spec.__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        legacy_state.pop(field)
+    legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    legacy_state['_graceful_drain_async_occupancy'] = None
+    restored = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+    restored.__setstate__(legacy_state)
+    assert restored.placement_contract.is_legacy_physical_per_gpu
+    return restored
+
+
+@contextlib.contextmanager
+def _mock_external_lb_recovery():
+    """Stub the platform boundary activated by a real non-pool spec."""
+    with mock.patch.object(service.serve_state,
+                           'get_lb_cutover_state',
+                           return_value=None), \
+         mock.patch.object(service.lb_k8s, 'require_external_lb_runtime'), \
+         mock.patch.object(service.lb_k8s,
+                           'lb_termination_grace_period_seconds',
+                           return_value=0), \
+         mock.patch.object(service.lb_k8s,
+                           'create_lb_deployment_and_service'), \
+         mock.patch.object(
+             service.serve_state,
+             'set_service_load_balancer_port_if_owner',
+             return_value=True):
+        yield
+
+
 @pytest.mark.parametrize('persisted_logical,yaml_content', [
     (False, _LEGACY_PER_GPU_YAML),
     (True, _CURRENT_PER_GPU_YAML),
 ])
 def test_recovery_spawns_controller_with_persisted_semantics(
         persisted_logical, yaml_content):
-    persisted = mock.MagicMock()
-    persisted.pool = True
-    persisted.uses_logical_replicas = persisted_logical
-    persisted.spot_placer = 'dynamic_fallback_per_gpu'
+    persisted = _make_persisted_per_gpu_spec(persisted_logical)
     record = {
         'hash': 'incarnation-a',
         'controller_job_id': 1,
@@ -780,7 +828,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
         'lifecycle_epoch': 8,
         'workspace': 'default',
         'resource_scope': 'incarnation-a',
-        'pool': True,
+        'pool': False,
         'status': serve_state.ServiceStatus.READY,
         'yaml_content': yaml_content,
     }
@@ -819,6 +867,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
              'build_catalog',
              side_effect=AssertionError(
                  'persisted recovery must not rebuild the catalog')), \
+         _mock_external_lb_recovery(), \
          mock.patch.object(service.serve_utils,
                            'generate_remote_service_dir_name',
                            return_value='/tmp/legacy-service'), \
@@ -912,10 +961,7 @@ def test_start_releases_port_lock_before_readiness_wait():
         events.append('spawn')
         return process
 
-    persisted = mock.MagicMock()
-    persisted.pool = True
-    persisted.uses_logical_replicas = True
-    persisted.spot_placer = 'dynamic_fallback_per_gpu'
+    persisted = _make_persisted_per_gpu_spec(uses_logical_replicas=True)
     record = {
         'hash': 'incarnation-a',
         'controller_job_id': 1,
@@ -923,7 +969,7 @@ def test_start_releases_port_lock_before_readiness_wait():
         'controller_ip': '10.0.0.2',
         'workspace': 'default',
         'resource_scope': 'incarnation-a',
-        'pool': True,
+        'pool': False,
         'status': serve_state.ServiceStatus.READY,
         'yaml_content': _CURRENT_PER_GPU_YAML,
     }
@@ -943,6 +989,7 @@ def test_start_releases_port_lock_before_readiness_wait():
          mock.patch.object(service.serve_state,
                            'get_placement_catalog',
                            return_value={'schema_version': 1, 'entries': []}), \
+         _mock_external_lb_recovery(), \
          mock.patch.object(service.serve_state,
                            'get_latest_version',
                            return_value=3), \
@@ -986,7 +1033,9 @@ def test_start_releases_port_lock_before_readiness_wait():
 
 def test_legacy_recovery_backfills_catalog_once():
     task = mock.Mock()
-    service_spec = mock.Mock(spot_placer='dynamic_fallback')
+    service_spec = types.SimpleNamespace(
+        placement_contract=placement_policy.resolve_fresh_contract(
+            placement_policy.SPOT_HEDGE_PLACER, pool=False))
     catalog = mock.Mock()
     catalog.to_dict.return_value = {
         'schema_version': 1,
@@ -1011,6 +1060,26 @@ def test_legacy_recovery_backfills_catalog_once():
     assert result == {'schema_version': 1, 'entries': []}
     build.assert_called_once_with(service_spec, task, workspace='default')
     persist.assert_called_once_with('svc', 3, result)
+
+
+def test_disabled_placement_contract_skips_catalog_state_and_build():
+    service_spec = types.SimpleNamespace(
+        placement_contract=placement_policy.resolve_fresh_contract(None,
+                                                                   pool=False))
+    with mock.patch.object(service.serve_state,
+                           'get_placement_catalog') as get_catalog, \
+         mock.patch.object(service.spot_placer.SpotPlacer,
+                           'build_catalog') as build:
+        result = service._prepare_placement_catalog('svc',
+                                                    service_spec,
+                                                    mock.Mock(),
+                                                    workspace='default',
+                                                    is_recovery=True,
+                                                    recovery_version=3)
+
+    assert result is None
+    get_catalog.assert_not_called()
+    build.assert_not_called()
 
 
 class TestCleanupAuditLog:
@@ -1504,6 +1573,9 @@ class TestFailedStartupCleansOnlyScopedStorage:
     def _task():
         spec = mock.MagicMock()
         spec.pool = True
+        spec.placement_contract = placement_policy.resolve_fresh_contract(
+            None, pool=True)
+        spec.uses_logical_replicas = False
         spec.autoscaling_policy_str.return_value = 'policy'
         spec.load_balancing_policy = 'round_robin'
         spec.tls_credential = None
@@ -1560,11 +1632,12 @@ class TestFailedStartupCleansOnlyScopedStorage:
 
     def test_multi_node_logical_service_is_rejected_before_registration(self):
         task = self._task()
-        task.service.uses_logical_replicas = True
+        task.service = _make_persisted_per_gpu_spec(uses_logical_replicas=True)
         task.num_nodes = 2
         patches = self._common_patches(task)
         with mock.patch.object(service.serve_state,
-                               'add_service') as add_service:
+                               'add_service') as add_service, \
+             _mock_external_lb_recovery():
             for patcher in patches:
                 patcher.start()
             try:

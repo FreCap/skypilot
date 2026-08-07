@@ -28,6 +28,7 @@ from unittest import mock
 
 from spot_placer_test_utils import make_location
 
+from sky.serve import placement_policy
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_allocation as allocation
 from sky.serve import reserved_capacity_broker
@@ -65,8 +66,11 @@ def _placer(*, benched=(), benched_at=None, locations=None):
     the whole placer: an unbenched second pool would satisfy every
     `select_next_zero_cost_location` and mask a single-pool assertion.
     """
-    placer = spot_placer.CapacityAwareDynamicFallbackSpotPlacer.__new__(
-        spot_placer.CapacityAwareDynamicFallbackSpotPlacer)
+    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
+        spot_placer.DynamicFallbackSpotPlacer)
+    placer._placement_contract = (  # pylint: disable=protected-access
+        placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
     if locations is None:
         locations = [*_EAST, _AWS_SPOT_L4]
     placer.location2status = {location: _ACTIVE for location in locations}

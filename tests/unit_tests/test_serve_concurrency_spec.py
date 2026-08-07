@@ -10,6 +10,7 @@ from typing import Any, Dict
 
 import pytest
 
+from sky.serve import placement_policy
 from sky.serve import service_spec as service_spec_lib
 from sky.serve import spot_placer
 
@@ -26,6 +27,11 @@ def _make_spec(**kwargs: Any) -> service_spec_lib.SkyServiceSpec:
     }
     base.update(kwargs)
     return service_spec_lib.SkyServiceSpec(**base)
+
+
+def _remove_versioned_placement_contract(state: Dict[str, Any]) -> None:
+    for field in placement_policy.CONTRACT_FIELDS:
+        state.pop(field, None)
 
 
 def test_concurrency_knob_enables_autoscaling():
@@ -356,6 +362,7 @@ def test_legacy_per_gpu_spec_stays_physical_until_explicit_update():
                          spot_placer=spot_placer.CAPACITY_AWARE_SPOT_PLACER,
                          graceful_drain_async_occupancy=True)
     legacy_state = dict(current.__dict__)
+    _remove_versioned_placement_contract(legacy_state)
     del legacy_state['_uses_logical_replicas']
     legacy = service_spec_lib.SkyServiceSpec.__new__(
         service_spec_lib.SkyServiceSpec)
@@ -372,12 +379,17 @@ def test_legacy_per_gpu_spec_stays_physical_until_explicit_update():
 
 
 def test_legacy_per_gpu_copy_does_not_apply_new_logical_validation():
-    legacy = _make_spec(min_replicas=1,
-                        max_replicas=17,
-                        target_concurrency_per_replica=2,
-                        spot_placer=spot_placer.SPOT_HEDGE_PLACER)
-    legacy.__dict__['_spot_placer'] = spot_placer.CAPACITY_AWARE_SPOT_PLACER
-    legacy.__dict__['_uses_logical_replicas'] = False
+    current = _make_spec(min_replicas=1,
+                         max_replicas=17,
+                         target_concurrency_per_replica=2,
+                         spot_placer=spot_placer.SPOT_HEDGE_PLACER)
+    legacy_state = dict(current.__dict__)
+    _remove_versioned_placement_contract(legacy_state)
+    legacy_state['_spot_placer'] = spot_placer.CAPACITY_AWARE_SPOT_PLACER
+    legacy_state['_uses_logical_replicas'] = False
+    legacy = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+    legacy.__setstate__(legacy_state)
 
     copied = legacy.copy(min_replicas=2)
 
@@ -396,6 +408,7 @@ def test_old_pickled_per_gpu_spec_copy_preserves_unbounded_downscale():
         graceful_drain_async_occupancy=True,
     )
     old_state = dict(current.__dict__)
+    _remove_versioned_placement_contract(old_state)
     for field in ('_uses_logical_replicas', '_target_utilization_percentage',
                   '_expected_request_duration_seconds',
                   '_max_scale_up_rate_percentage',

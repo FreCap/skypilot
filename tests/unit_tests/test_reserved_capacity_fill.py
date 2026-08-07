@@ -25,6 +25,7 @@ from sky import exceptions
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import placement_policy
 from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
@@ -3894,7 +3895,9 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
         with mock.patch.object(spot_placer,
                                '_get_possible_location_from_task',
                                return_value=[location]):
-            placer = spot_placer.SpotPlacer(task)
+            contract = placement_policy.resolve_fresh_contract(
+                placement_policy.SPOT_HEDGE_PLACER, pool=False)
+            placer = spot_placer.SpotPlacer(task, contract)
         placer.resources.copy = mock.Mock(
             side_effect=AssertionError('must not query cluster feasibility'))
 
@@ -3906,6 +3909,9 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
     def test_missing_spot_price_does_not_block_zero_cost_enumeration(self):
         placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
             spot_placer.DynamicFallbackSpotPlacer)
+        placer._placement_contract = (  # pylint: disable=protected-access
+            placement_policy.resolve_fresh_contract(
+                placement_policy.SPOT_HEDGE_PLACER, pool=False))
         free = _make_location('research-ctx', 'free')
         missing_price = _make_location('paid-region', 'missing-price')
         placer.location2status = {
@@ -4433,28 +4439,130 @@ class TestBrokerPollerCycle(unittest.TestCase):
         # scale-down shelter even while fill is inactive.
         self.assertIsNotNone(autoscaler._fill_snapshot_time)
 
-    def test_logical_multi_gpu_shape_withdraws_claim_and_feeds_zero(self):
-        autoscaler = _make_autoscaler(min_replicas=1)
-        logical_placer = (
-            spot_placer.CapacityAwareDynamicFallbackSpotPlacer.__new__(
-                spot_placer.CapacityAwareDynamicFallbackSpotPlacer))
+    def test_per_gpu_multi_gpu_shape_withdraws_v1_claim_and_feeds_zero(self):
+        for uses_logical_replicas in (True, False):
+            with self.subTest(uses_logical_replicas=uses_logical_replicas):
+                autoscaler = _make_autoscaler(min_replicas=1)
+                per_gpu_placer = (spot_placer.DynamicFallbackSpotPlacer.__new__(
+                    spot_placer.DynamicFallbackSpotPlacer))
+                per_gpu_placer._placement_contract = (  # pylint: disable=protected-access
+                    placement_policy.resolve_legacy_contract(
+                        placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+                        pool=False,
+                        uses_logical_replicas=uses_logical_replicas))
+                location_data = dict(_K8S_KEY, accelerators={'A100': 2})
+                zero_cost = [
+                    spot_placer.Location.from_pickleable(location_data)
+                ]
+                keys = [location.to_pickleable() for location in zero_cost]
+
+                with mock.patch.object(
+                        reserved_capacity.reserved_capacity_broker,
+                        'remove_claim') as remove_mock, \
+                     mock.patch.object(
+                         reserved_capacity.reserved_capacity_broker,
+                         'upsert_claim') as upsert_mock, \
+                     mock.patch.object(
+                         reserved_capacity.reserved_capacity_broker,
+                         'run_round_if_stale') as round_mock:
+                    reserved_capacity._broker_cycle(autoscaler, per_gpu_placer,
+                                                    'svc', zero_cost, keys)
+
+                remove_mock.assert_called_once_with('svc')
+                upsert_mock.assert_not_called()
+                round_mock.assert_not_called()
+                self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+
+    def test_per_gpu_multi_gpu_shape_withdraws_v2_claim_and_feeds_zero(self):
+        for uses_logical_replicas in (True, False):
+            with self.subTest(uses_logical_replicas=uses_logical_replicas):
+                autoscaler = _make_autoscaler(min_replicas=1)
+                per_gpu_placer = (spot_placer.DynamicFallbackSpotPlacer.__new__(
+                    spot_placer.DynamicFallbackSpotPlacer))
+                per_gpu_placer._placement_contract = (  # pylint: disable=protected-access
+                    placement_policy.resolve_legacy_contract(
+                        placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+                        pool=False,
+                        uses_logical_replicas=uses_logical_replicas))
+                location_data = dict(_K8S_KEY, accelerators={'A100': 2})
+                zero_cost = [
+                    spot_placer.Location.from_pickleable(location_data)
+                ]
+
+                with mock.patch.object(
+                        reserved_capacity.reserved_capacity_broker,
+                        'remove_claim') as remove_mock, \
+                     mock.patch.object(
+                         reserved_capacity.reserved_capacity_broker,
+                         'replace_claim_set') as replace_mock:
+                    reserved_capacity._broker_cycle_v2(autoscaler,
+                                                       per_gpu_placer, 'svc',
+                                                       zero_cost,
+                                                       'service-hash',
+                                                       (123, 'controller-ip'))
+
+                remove_mock.assert_called_once_with(
+                    'svc',
+                    expected_service_hash='service-hash',
+                    expected_controller_owner=(123, 'controller-ip'))
+                replace_mock.assert_not_called()
+                self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+
+    def test_configured_multi_gpu_shape_proceeds_through_both_brokers(self):
+        contract = placement_policy.resolve_fresh_contract(
+            placement_policy.SPOT_HEDGE_PLACER, pool=False)
+        configured_placer = mock.Mock(placement_contract=contract)
         location_data = dict(_K8S_KEY, accelerators={'A100': 2})
         zero_cost = [spot_placer.Location.from_pickleable(location_data)]
+        configured_placer.active_locations.return_value = zero_cost
+        configured_placer.zero_cost_locations.return_value = zero_cost
         keys = [location.to_pickleable() for location in zero_cost]
+        autoscaler_v1 = _make_autoscaler(min_replicas=1)
 
-        with mock.patch.object(reserved_capacity.reserved_capacity_broker,
-                               'remove_claim') as remove_mock, \
-             mock.patch.object(reserved_capacity.reserved_capacity_broker,
-                               'upsert_claim') as upsert_mock, \
-             mock.patch.object(reserved_capacity.reserved_capacity_broker,
-                               'run_round_if_stale') as round_mock:
-            reserved_capacity._broker_cycle(autoscaler, logical_placer, 'svc',
-                                            zero_cost, keys)
+        self.assertFalse(contract.requires_single_gpu_reserved_fill)
+        with mock.patch.object(
+                reserved_capacity.reserved_capacity_broker,
+                'remove_claim') as remove_v1, \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'upsert_claim') as upsert_v1, \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'run_round_if_stale', return_value=None):
+            reserved_capacity._broker_cycle(autoscaler_v1, configured_placer,
+                                            'svc', zero_cost, keys)
+        remove_v1.assert_not_called()
+        upsert_v1.assert_called_once()
 
-        remove_mock.assert_called_once_with('svc')
-        upsert_mock.assert_not_called()
-        round_mock.assert_not_called()
-        self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+        autoscaler_v2 = _make_autoscaler(min_replicas=1)
+        with mock.patch.object(
+                reserved_capacity,
+                'get_kubernetes_physical_cluster_uid', return_value='uid'), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_replica_infos', return_value=[]), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_reserved_fill_service_claim_set', return_value=None), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_round', return_value=None), \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'remove_claim') as remove_v2, \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'replace_claim_set', return_value=1) as replace_v2, \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'run_round_if_stale', return_value=None), \
+             mock.patch.object(
+                 reserved_capacity.provider_phase,
+                 'provider_phase',
+                 side_effect=lambda _mode: contextlib.nullcontext()):
+            reserved_capacity._broker_cycle_v2(autoscaler_v2, configured_placer,
+                                               'svc', zero_cost, 'service-hash',
+                                               (123, 'controller-ip'))
+        remove_v2.assert_not_called()
+        replace_v2.assert_called_once()
 
 
 class TestReplicaManagerInitIntact(unittest.TestCase):

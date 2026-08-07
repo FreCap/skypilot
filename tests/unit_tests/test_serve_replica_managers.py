@@ -35,6 +35,7 @@ from sky import exceptions
 from sky import skypilot_config
 from sky.provision import common as provision_common
 from sky.serve import paid_capacity
+from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import serve_utils
 from sky.serve import service_spec
@@ -46,6 +47,16 @@ from sky.utils import config_utils
 from sky.utils import context as sky_context
 from sky.utils import controller_utils
 from sky.utils import thread_utils
+
+_DISABLED_PLACEMENT_CONTRACT = placement_policy.resolve_fresh_contract(
+    None, pool=False)
+_LOGICAL_PLACEMENT_CONTRACT = placement_policy.resolve_fresh_contract(
+    placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+
+
+def _physical_service_spec_mock() -> mock.Mock:
+    return mock.Mock(spot_placer=None,
+                     placement_contract=_DISABLED_PLACEMENT_CONTRACT)
 
 
 def _canonical_paid_pool_key(region='us-east-1'):
@@ -3609,7 +3620,9 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         old_placer = mock.Mock(name='old_placer')
         new_placer = mock.Mock(name='new_placer')
         mgr._spot_placer = old_placer
-        spec = mock.Mock(spot_placer='dynamic_fallback_per_gpu')
+        spec = mock.Mock(
+            spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+            placement_contract=_LOGICAL_PLACEMENT_CONTRACT)
         new_task = mock.Mock(name='new_task', resources=[])
         new_yaml = ('resources: {accelerators: L4:1}\n'
                     'file_mounts: {}\n'
@@ -3680,7 +3693,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  'get_replica_infos',
                  return_value=replica_infos):
             mgr.update_version(3,
-                               mock.Mock(spot_placer=None),
+                               _physical_service_spec_mock(),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         get_new_yaml.assert_called_once_with('svc', 3)
@@ -3714,7 +3727,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                                'get_replica_infos',
                                return_value=[info]):
             mgr.update_version(2,
-                               mock.Mock(spot_placer=None),
+                               _physical_service_spec_mock(),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert info.version == 1
@@ -3755,7 +3768,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                     ValueError,
                     match='yaml content not found for svc version 2'):
                 mgr.update_version(3,
-                                   mock.Mock(spot_placer=None),
+                                   _physical_service_spec_mock(),
                                    update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert not persisted
@@ -3785,7 +3798,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                      'get_replica_infos',
                      return_value=replica_infos):
                 mgr.update_version(2,
-                                   mock.Mock(spot_placer=None),
+                                   _physical_service_spec_mock(),
                                    update_mode=serve_utils.UpdateMode.ROLLING)
 
             get_old_yamls.assert_not_called()
@@ -3832,7 +3845,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  'get_replica_infos',
                  return_value=[info]):
             mgr.update_version(2,
-                               mock.Mock(spot_placer=None),
+                               _physical_service_spec_mock(),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert persisted == [(1, 2)]
@@ -3868,7 +3881,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  return_value=[info]), \
              caplog.at_level(logging.INFO):
             mgr.update_version(2,
-                               mock.Mock(spot_placer=None),
+                               _physical_service_spec_mock(),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert persisted == [(1, 2)]
@@ -3905,7 +3918,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  return_value=[info]), \
              caplog.at_level(logging.INFO):
             mgr.update_version(2,
-                               mock.Mock(spot_placer=None),
+                               _physical_service_spec_mock(),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert not persisted
@@ -3949,7 +3962,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                  'get_replica_infos',
                  return_value=[info]):
             mgr.update_version(2,
-                               mock.Mock(spot_placer=None),
+                               _physical_service_spec_mock(),
                                update_mode=serve_utils.UpdateMode.ROLLING)
 
         assert not persisted
@@ -3967,7 +3980,8 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         new_task = types.SimpleNamespace(resources=[new_location], num_nodes=1)
         spec = types.SimpleNamespace(
             uses_logical_replicas=True,
-            spot_placer='dynamic_fallback_per_gpu',
+            spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+            placement_contract=_LOGICAL_PLACEMENT_CONTRACT,
         )
         yaml_content = ('resources: {}\n'
                         'file_mounts: {}\n'
@@ -4052,8 +4066,10 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         new_task = types.SimpleNamespace(resources=[location], num_nodes=1)
         new_placer = mock.Mock(name='new_placer')
         new_placer.active_locations.return_value = [location]
-        spec = types.SimpleNamespace(uses_logical_replicas=True,
-                                     spot_placer=None)
+        spec = types.SimpleNamespace(
+            uses_logical_replicas=True,
+            spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+            placement_contract=_LOGICAL_PLACEMENT_CONTRACT)
         yaml_content = ('resources: {}\n'
                         'file_mounts: {}\n'
                         'service: {readiness_probe: /}\n')
@@ -4078,7 +4094,8 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                                return_value=new_placer):
             mgr.update_version(2,
                                spec,
-                               update_mode=serve_utils.UpdateMode.ROLLING)
+                               update_mode=serve_utils.UpdateMode.ROLLING,
+                               new_spot_placer=new_placer)
 
         assert mgr.latest_version == 2
         assert mgr._logical_controller_epoch != old_epoch
@@ -4290,8 +4307,10 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         new_task = types.SimpleNamespace(resources=[location], num_nodes=1)
         new_placer = mock.Mock(name='new_placer')
         new_placer.active_locations.return_value = [location]
-        spec = types.SimpleNamespace(uses_logical_replicas=True,
-                                     spot_placer=None)
+        spec = types.SimpleNamespace(
+            uses_logical_replicas=True,
+            spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+            placement_contract=_LOGICAL_PLACEMENT_CONTRACT)
         yaml_content = ('resources: {}\n'
                         'file_mounts: {}\n'
                         'service: {readiness_probe: /}\n')
@@ -4316,7 +4335,8 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                                return_value=new_placer):
             mgr.update_version(2,
                                spec,
-                               update_mode=serve_utils.UpdateMode.ROLLING)
+                               update_mode=serve_utils.UpdateMode.ROLLING,
+                               new_spot_placer=new_placer)
 
         # The queued victim is outside the handoff: no epoch rotation, no
         # recovery entry, and the relabel leaves the old selection fence.

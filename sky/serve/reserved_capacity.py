@@ -1556,9 +1556,9 @@ def _broker_cycle(
     shapes = zero_cost_pool_shapes(zero_cost)
     contexts = {context for context, _ in shapes}
     per_replica_counts = set(shapes.values())
-    logical_slot_mismatch = (isinstance(
-        placer, spot_placer_lib.CapacityAwareDynamicFallbackSpotPlacer) and
-                             per_replica_counts != {1})
+    logical_slot_mismatch = (
+        placer.placement_contract.requires_single_gpu_reserved_fill and
+        per_replica_counts != {1})
     if (len(contexts) != 1 or len(per_replica_counts) != 1 or
             logical_slot_mismatch):
         logger.error(
@@ -1703,9 +1703,9 @@ def _broker_cycle_v2(
             expected_controller_owner=expected_controller_owner)
         autoscaler.collect_reserved_capacity_pools({})
         return
-    logical_slot_mismatch = (isinstance(
-        placer, spot_placer_lib.CapacityAwareDynamicFallbackSpotPlacer) and
-                             any(spec.gpus_per_replica != 1 for spec in specs))
+    logical_slot_mismatch = (
+        placer.placement_contract.requires_single_gpu_reserved_fill and
+        any(spec.gpus_per_replica != 1 for spec in specs))
     if not specs or logical_slot_mismatch:
         logger.error('Reserved-fill protocol v2 found no valid physical pool '
                      'set (logical services also require one-GPU shapes); '

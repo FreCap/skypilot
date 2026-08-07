@@ -3583,8 +3583,9 @@ class SkyServeController:
                                           status_code=400)
         placement_catalog = serve_state.get_placement_catalog(
             self._service_name, version)
-        if (placement_catalog is not None and
-                validation_service.spot_placer is not None):
+        if (authoritative_retry_service is None and
+                placement_catalog is not None and
+                validation_service.placement_contract.enabled):
             # A catalog reused from an earlier commit enumerates the locations
             # that existed when it was built. Adding a Kubernetes context to a
             # service afterwards therefore has no effect: the context never
@@ -3603,7 +3604,7 @@ class SkyServeController:
                     f'the inherited catalog is missing Kubernetes context(s) '
                     f'{sorted(missing)} that the task declares.')
                 placement_catalog = None
-        needs_catalog = (validation_service.spot_placer is not None and
+        needs_catalog = (validation_service.placement_contract.enabled and
                          placement_catalog is None)
         needs_logical_validation = (authoritative_retry_service is None and
                                     validation_service.uses_logical_replicas

@@ -28,6 +28,7 @@ from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import controller
 from sky.serve import drain_observability
+from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -863,11 +864,38 @@ def _make_update_controller() -> controller.SkyServeController:
 def _make_update_spec(
         replica_unit: str = 'physical_backend') -> types.SimpleNamespace:
     """Build the explicit service interface consumed by update tests."""
+    policy_name = (placement_policy.CAPACITY_AWARE_SPOT_PLACER
+                   if replica_unit == 'logical' else None)
     return types.SimpleNamespace(
         replica_unit=replica_unit,
         uses_logical_replicas=(replica_unit == 'logical'),
-        spot_placer=None,
+        spot_placer=policy_name,
+        placement_contract=placement_policy.resolve_fresh_contract(policy_name,
+                                                                   pool=False),
     )
+
+
+def _make_legacy_physical_per_gpu_spec() -> controller.serve.SkyServiceSpec:
+    """Build the real fieldless contract written before logical activation."""
+    current = controller.serve.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=1,
+        readiness_timeout_seconds=2,
+        endpoint_probe_interval_seconds=3,
+        lb_stream_timeout_seconds=4,
+        min_replicas=0,
+        max_replicas=8,
+        target_concurrency_per_replica=1,
+        graceful_drain_async_occupancy=True,
+        spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER)
+    legacy_state = dict(current.__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        legacy_state.pop(field)
+    legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    restored = controller.serve.SkyServiceSpec.__new__(
+        controller.serve.SkyServiceSpec)
+    restored.__setstate__(legacy_state)
+    return restored
 
 
 def _make_autoscaler_spec(**overrides) -> types.SimpleNamespace:
@@ -1900,6 +1928,10 @@ class TestServiceUpdateReconciler:
         with mock.patch.object(controller.task_lib.Task,
                                'from_yaml_str',
                                return_value=update_task), \
+             mock.patch.object(
+                 controller.replica_managers,
+                 'load_task_with_service_spec',
+                 return_value=update_task), \
              mock.patch.object(controller.serve_state,
                                'get_yaml_content',
                                return_value=None), \
@@ -1966,7 +1998,14 @@ class TestServiceUpdateReconciler:
             replica_unit='logical')
         ctrl._committed_version = 3  # pylint: disable=protected-access
         ctrl._applied_version = 3  # pylint: disable=protected-access
-        persisted = _make_update_spec()
+        persisted = _make_legacy_physical_per_gpu_spec()
+        placement_catalog = {
+            'schema_version': 1,
+            'entries': [{
+                'cloud': 'kubernetes',
+                'region': 'legacy-context',
+            }],
+        }
 
         with mock.patch.object(controller.serve_state,
                                'get_yaml_content',
@@ -1974,16 +2013,24 @@ class TestServiceUpdateReconciler:
              mock.patch.object(controller.serve_state,
                                'get_spec',
                                return_value=persisted), \
+             mock.patch.object(controller.serve_state,
+                               'get_placement_catalog',
+                               return_value=placement_catalog), \
+             mock.patch.object(controller.task_lib.Task,
+                               'from_yaml_str') as parse_task, \
              mock.patch.object(
                  controller.serve_state,
                  'add_or_update_version',
                  return_value=serve_state.VersionCommitResult.
-                 IDEMPOTENT_RETRY):
+                 IDEMPOTENT_RETRY) as commit:
             response = ctrl._commit_service_update(  # pylint: disable=protected-access
                 2, persisted, 'service: physical-v2',
                 serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
 
         assert response.status_code == 200
+        assert persisted.placement_contract.is_legacy_physical_per_gpu
+        parse_task.assert_not_called()
+        assert commit.call_args.kwargs['placement_catalog'] is placement_catalog
         assert ctrl._pending_update is None  # pylint: disable=protected-access
         assert ctrl._applied_version == 3  # pylint: disable=protected-access
         ctrl._replica_manager.notify_version_pending.assert_not_called()  # pylint: disable=protected-access
@@ -2002,9 +2049,14 @@ class TestServiceUpdateReconciler:
                                'get_spec',
                                return_value=persisted), \
              mock.patch.object(
-                 controller.task_lib.Task,
-                 'from_yaml_str',
-                 side_effect=AssertionError('current parser must not run')), \
+                 controller.serve_state,
+                 'get_placement_catalog',
+                 return_value={
+                     'schema_version': 1,
+                     'entries': [],
+                 }), \
+             mock.patch.object(controller.task_lib.Task,
+                               'from_yaml_str') as parse_task, \
              mock.patch.object(
                  controller.serve_state,
                  'add_or_update_version',
@@ -2015,6 +2067,7 @@ class TestServiceUpdateReconciler:
                 serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
 
         assert response.status_code == 200
+        parse_task.assert_not_called()
         ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
 
     @pytest.mark.parametrize('controller_state',
