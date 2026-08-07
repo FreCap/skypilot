@@ -23,6 +23,8 @@ from sqlalchemy.dialects import postgresql
 from sky import clouds
 from sky.serve import constants as serve_constants
 from sky.serve import paid_capacity
+from sky.serve import placement_contract_normalization
+from sky.serve import placement_policy
 from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -88,15 +90,45 @@ class _TestServiceSpec(service_spec_lib.SkyServiceSpec):
         return super().autoscaling_policy_str()
 
 
-def _service_spec(label: str = 'test-spec', **kwargs) -> _TestServiceSpec:
-    return _TestServiceSpec(label, **kwargs)
+def _service_spec(label: str = 'test-spec',
+                  **kwargs) -> service_spec_lib.SkyServiceSpec:
+    test_spec = _TestServiceSpec(label, **kwargs)
+    spec = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+    spec.__dict__ = dict(test_spec.__dict__)
+    return spec
+
+
+def _exact_service_spec(label: str = 'test-spec',
+                        **kwargs) -> service_spec_lib.SkyServiceSpec:
+    """Return the exact persisted class recognized by the raw inspector."""
+    return _service_spec(label, **kwargs)
+
+
+def _v2_service_spec(label: str = 'test-spec',
+                     **kwargs) -> service_spec_lib.SkyServiceSpec:
+    spec = _exact_service_spec(label, **kwargs)
+    contract = spec.placement_contract
+    spec.__dict__.update(contract.persisted_fields())
+    spec.__dict__.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+    return spec
+
+
+def _v1_service_spec(label: str = 'test-spec',
+                     **kwargs) -> service_spec_lib.SkyServiceSpec:
+    spec = _exact_service_spec(label, **kwargs)
+    contract = spec.placement_contract
+    spec.__dict__.update(contract._legacy_v1_persisted_fields())
+    spec.__dict__[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = (
+        contract.uses_logical_replicas)
+    return spec
 
 
 def _labeled_version_spec(result) -> tuple[int, str] | None:
     if result is None:
         return None
     version, spec = result
-    assert isinstance(spec, _TestServiceSpec)
+    assert type(spec) is service_spec_lib.SkyServiceSpec
     return version, spec.test_label
 
 
@@ -124,6 +156,70 @@ def _read_version_row(engine, name, version):
 def _config_snapshot(config: bytes,
                      snapshot_character: str = 'a') -> tuple[bytes, str, str]:
     return (config, hashlib.sha256(config).hexdigest(), snapshot_character * 64)
+
+
+def _insert_placement_normalization_run(engine,
+                                        run_id: uuid.UUID,
+                                        *,
+                                        row_count: int = 1,
+                                        classification_counts: dict[str, int] |
+                                        None = None,
+                                        schema_revision: str = '037') -> None:
+    digest = 'a' * 64
+    if classification_counts is None:
+        classification_counts = {'fieldless_supported': row_count}
+    with orm.Session(engine) as session:
+        session.execute(
+            serve_state.placement_normalization_runs_table.insert().values(
+                run_id=run_id,
+                mode='apply_supported',
+                normalizer_version='1:test',
+                schema_revision=schema_revision,
+                release_version='test',
+                started_at=1.0,
+                completed_at=2.0,
+                row_bound=row_count,
+                row_count=row_count,
+                classification_counts=classification_counts,
+                pre_inventory_sha256=digest,
+                post_inventory_sha256=digest,
+                freeze_evidence_sha256=digest))
+        session.commit()
+
+
+def _insert_placement_normalization_row(
+        engine,
+        run_id: uuid.UUID,
+        service_name: str,
+        version: int,
+        spec_bytes: bytes,
+        service_hash: str,
+        lifecycle_epoch: int | None,
+        *,
+        result_spec_sha256: str | None = None,
+        classification: str = 'fieldless_supported',
+        outcome: str = 'changed') -> None:
+    spec_digest = hashlib.sha256(spec_bytes).hexdigest()
+    row_digest = 'b' * 64
+    with orm.Session(engine) as session:
+        session.execute(
+            serve_state.placement_normalization_rows_table.insert().values(
+                run_id=run_id,
+                service_name=service_name,
+                version=version,
+                classification=classification,
+                outcome=outcome,
+                original_spec_sha256='c' * 64,
+                result_spec_sha256=(result_spec_sha256 or spec_digest),
+                original_row_sha256=row_digest,
+                result_row_sha256=row_digest,
+                original_column_sha256s={},
+                result_column_sha256s={},
+                contract_projection={'version': 1},
+                service_hash=service_hash,
+                service_lifecycle_epoch=lifecycle_epoch,
+                dependency_facts={}))
+        session.commit()
 
 
 _VERSIONED_HA_SCRIPT = (
@@ -179,6 +275,9 @@ def _add_minimal_service(name: str,
                          controller_config_snapshot_id=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
+    if spec is None:
+        spec = _service_spec(policy='policy',
+                             load_balancing_policy='round_robin')
     return serve_state.add_service(
         name=name,
         controller_job_id=1,
@@ -190,9 +289,6 @@ def _add_minimal_service(name: str,
         pool=pool,
         controller_pid=controller_pid,
         entrypoint='entry',
-        # A None spec is stored as pickled None (like `add_version` does), so
-        # the read path (`_get_service_from_row`) skips the spec-dependent
-        # fields instead of calling SkyServiceSpec methods on it.
         spec=spec,
         yaml_content=yaml_content,
         workspace=workspace,
@@ -1413,11 +1509,142 @@ def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
                                                      'value: original')
     assert retry_result is serve_state.VersionCommitResult.IDEMPOTENT_RETRY
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
-
     conflict_result = serve_state.add_or_update_version(
         'svc-immutable', 2, _service_spec('different'), 'value: different')
     assert conflict_result is serve_state.VersionCommitResult.CONTENT_CONFLICT
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
+
+
+def test_new_service_and_version_writes_require_raw_v2_state(_mock_serve_db):
+    with pytest.raises(ValueError, match='mirror-free v2'):
+        _add_minimal_service('svc-v1-registration',
+                             spec=_v1_service_spec('legacy'))
+    assert _read_row(_mock_serve_db, 'svc-v1-registration') is None
+    assert _read_version_row(_mock_serve_db, 'svc-v1-registration', 1) is None
+
+    assert _add_minimal_service('svc-v2-boundary',
+                                spec=_v2_service_spec('initial'))
+    initial_payload = _read_version_row(_mock_serve_db, 'svc-v2-boundary',
+                                        1)['spec']
+    assert placement_contract_normalization.analyze_spec_pickle(
+        initial_payload).classification is (
+            placement_contract_normalization.Classification.EXPLICIT_V2)
+
+    assert serve_state.add_version('svc-v2-boundary') == 2
+    placeholder_before = _read_version_row(_mock_serve_db, 'svc-v2-boundary', 2)
+    with pytest.raises(ValueError, match='mirror-free v2'):
+        serve_state.add_or_update_version('svc-v2-boundary', 2,
+                                          _v1_service_spec('legacy-fill'),
+                                          'yaml: legacy-fill')
+    assert _read_version_row(_mock_serve_db, 'svc-v2-boundary',
+                             2) == placeholder_before
+
+    with pytest.raises(ValueError, match='mirror-free v2'):
+        serve_state.add_or_update_version('svc-v2-boundary', 3,
+                                          _v1_service_spec('legacy-insert'),
+                                          'yaml: legacy-insert')
+    assert _read_version_row(_mock_serve_db, 'svc-v2-boundary', 3) is None
+
+    assert serve_state.add_or_update_version(
+        'svc-v2-boundary', 2, _v2_service_spec('current'),
+        'yaml: current') is serve_state.VersionCommitResult.COMMITTED
+    committed_payload = _read_version_row(_mock_serve_db, 'svc-v2-boundary',
+                                          2)['spec']
+    assert placement_contract_normalization.analyze_spec_pickle(
+        committed_payload).classification is (
+            placement_contract_normalization.Classification.EXPLICIT_V2)
+
+
+def test_identical_retry_preserves_existing_v1_bytes(_mock_serve_db):
+    service_name = 'svc-v1-retry'
+    yaml_content = 'yaml: legacy'
+    assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
+    assert serve_state.add_or_update_version(
+        service_name, 2, _v2_service_spec('committed'),
+        yaml_content) is serve_state.VersionCommitResult.COMMITTED
+
+    legacy_spec = _v1_service_spec('legacy-retry')
+    legacy_bytes = placement_contract_normalization._serialize_raw_state(
+        dict(legacy_spec.__dict__), 4)
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name == service_name,
+                serve_state.version_specs_table.c.version == 2).values(
+                    spec=legacy_bytes))
+        session.commit()
+    row_before = _read_version_row(_mock_serve_db, service_name, 2)
+
+    assert serve_state.add_or_update_version(
+        service_name, 2, legacy_spec,
+        yaml_content) is serve_state.VersionCommitResult.IDEMPOTENT_RETRY
+    row_after = _read_version_row(_mock_serve_db, service_name, 2)
+    assert row_after == row_before
+    assert row_after['spec'] == legacy_bytes
+
+
+def test_retired_version_cannot_be_refilled_and_remains_cleanup_inventory(
+        _mock_serve_db):
+    service_name = 'svc-retired'
+    retired_yaml = 'service:\n  pool: false\n'
+    assert _add_minimal_service(service_name, spec=_service_spec('v1'))
+    assert serve_state.add_or_update_version(
+        service_name, 2, _service_spec('v2'),
+        retired_yaml) is serve_state.VersionCommitResult.COMMITTED
+    assert serve_state.add_or_update_version(
+        service_name, 3, _service_spec('v3'),
+        'yaml: v3') is serve_state.VersionCommitResult.COMMITTED
+    run_id = uuid.uuid4()
+    _insert_placement_normalization_run(_mock_serve_db, run_id)
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name == service_name,
+                serve_state.version_specs_table.c.version == 2).values(
+                    spec=pickle.dumps(None, protocol=4),
+                    yaml_content=None,
+                    retired_yaml_content=retired_yaml,
+                    retired_at=10.0,
+                    retirement_reason='test retirement',
+                    retirement_run_id=run_id))
+        session.commit()
+
+    retired_before = _read_version_row(_mock_serve_db, service_name, 2)
+    result = serve_state.add_or_update_version(service_name, 2,
+                                               _service_spec('replacement'),
+                                               'yaml: replacement')
+
+    assert result is serve_state.VersionCommitResult.CONTENT_CONFLICT
+    assert _read_version_row(_mock_serve_db, service_name, 2) == retired_before
+    assert serve_state.get_yaml_contents(service_name, [2]) == {2: None}
+    assert serve_state.get_version_yaml_contents(service_name) == {
+        1: 'yaml: v1',
+        2: retired_yaml,
+        3: 'yaml: v3',
+    }
+
+
+def test_orphan_mode_uses_retired_yaml_without_reviving_live_yaml(
+        _mock_serve_db):
+    run_id = uuid.uuid4()
+    _insert_placement_normalization_run(_mock_serve_db, run_id)
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(serve_state.version_specs_table.insert().values(
+            service_name='orphan-retired-pool',
+            version=1,
+            spec=pickle.dumps(None, protocol=4),
+            yaml_content=None,
+            retired_yaml_content='service:\n  pool: true\n',
+            retired_at=10.0,
+            retirement_reason='test retirement',
+            retirement_run_id=run_id))
+        session.commit()
+
+    assert serve_state.get_orphaned_service_child_mode(
+        'orphan-retired-pool') is True
+    assert serve_state.get_yaml_contents('orphan-retired-pool', [1]) == {
+        1: None,
+    }
 
 
 def test_initial_version_controller_config_persists_and_verifies(
@@ -1890,7 +2117,7 @@ def test_get_service_from_name_uses_joined_spec_in_single_query(_mock_serve_db):
 
     assert counts['n'] == 1, counts
     assert record is not None
-    assert record['policy'] == 'qps=2'
+    assert record['policy'] == 'Fixed 1 replica'
     assert record['load_balancing_policy'] == 'least_load'
 
 
@@ -4067,6 +4294,546 @@ class TestRecoveryVersionSelection:
             expected_service_hash='incarnation-a',
             expected_controller_owner=owner,
             applied_at=400.0)
+
+    def test_placement_normalization_receipt_is_exact_and_owner_fenced(
+            self, _mock_serve_db):
+        service_name = 'svc-normalized'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(
+            service_name)
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db, run_id)
+        spec_bytes = _read_version_row(_mock_serve_db, service_name, 1)['spec']
+        _insert_placement_normalization_row(_mock_serve_db, run_id,
+                                            service_name, 1, spec_bytes,
+                                            'incarnation-a', lifecycle_epoch)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id))
+            session.commit()
+
+        request = serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=1,
+            current_version=1,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner)
+        assert request == serve_state.PlacementNormalizationRequest(
+            run_id=run_id,
+            recovery_version=1,
+            current_version=1,
+            lifecycle_epoch=lifecycle_epoch)
+        assert serve_state.acknowledge_placement_normalization_loaded(
+            service_name,
+            request,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            image_commit='commit-a',
+            child_controller_pid=456,
+            boot_id='a' * 32,
+            loaded_at=123.0)
+
+        service_row = _read_row(_mock_serve_db, service_name)
+        assert service_row['placement_normalization_requested_run_id'] == run_id
+        assert service_row['placement_normalization_loaded_run_id'] == run_id
+        assert (service_row['placement_normalization_loaded_image_commit'] ==
+                'commit-a')
+        assert (
+            service_row['placement_normalization_loaded_controller_pid'] == 456)
+        assert (service_row['placement_normalization_loaded_controller_ip'] ==
+                owner[1])
+        assert (service_row['placement_normalization_loaded_boot_id'] == 'a' *
+                32)
+        assert service_row['placement_normalization_loaded_at'] == 123.0
+
+        # The receipt is a one-time normalization proof, not a permanent
+        # requirement that future ordinary versions appear in the old run.
+        assert serve_state.add_or_update_version(
+            service_name, 2, _v2_service_spec('spec-2'),
+            'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
+        assert serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=2,
+            current_version=2,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner) is None
+
+    def test_placement_normalization_receipt_rejects_stale_lifecycle(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-stale'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(
+            service_name)
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db, run_id)
+        spec_bytes = _read_version_row(_mock_serve_db, service_name, 1)['spec']
+        _insert_placement_normalization_row(_mock_serve_db, run_id,
+                                            service_name, 1, spec_bytes,
+                                            'incarnation-a', lifecycle_epoch)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id))
+            session.commit()
+        request = serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=1,
+            current_version=1,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner)
+        assert request is not None
+
+        serve_state.claim_service_lifecycle_epoch(service_name)
+        assert not serve_state.acknowledge_placement_normalization_loaded(
+            service_name,
+            request,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            image_commit='commit-a',
+            child_controller_pid=456,
+            boot_id='a' * 32)
+        service_row = _read_row(_mock_serve_db, service_name)
+        assert service_row['placement_normalization_loaded_run_id'] is None
+
+    def test_placement_normalization_read_distinguishes_no_request_from_stale(
+            self, _mock_serve_db):
+        owner = (123, '10.0.0.1')
+        current_spec = _exact_service_spec('spec-1')
+        assert _add_minimal_service('svc-normalization-read',
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=current_spec)
+
+        v2_state = dict(current_spec.__dict__)
+        v1_state = dict(v2_state)
+        v1_state.update(
+            current_spec.placement_contract._legacy_v1_persisted_fields())
+        v1_state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+        fieldless_state = dict(v2_state)
+        for field in placement_policy.CONTRACT_FIELDS:
+            fieldless_state.pop(field)
+        historical_state = dict(
+            _exact_service_spec('historical',
+                                uses_logical_replicas=True).__dict__)
+        for field in placement_policy.CONTRACT_FIELDS:
+            historical_state.pop(field)
+        payloads = (
+            placement_contract_normalization._serialize_raw_state(
+                fieldless_state, 4),
+            placement_contract_normalization._serialize_raw_state(v1_state, 4),
+            placement_contract_normalization._serialize_raw_state(v2_state, 4),
+            placement_contract_normalization._serialize_raw_state(
+                historical_state, 4),
+        )
+        for payload in payloads:
+            with orm.Session(_mock_serve_db) as session:
+                session.execute(
+                    sqlalchemy.update(serve_state.version_specs_table).where(
+                        serve_state.version_specs_table.c.service_name ==
+                        'svc-normalization-read').values(spec=payload))
+                session.commit()
+            assert serve_state.get_placement_normalization_request(
+                'svc-normalization-read',
+                recovery_version=1,
+                current_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner) is None
+        with pytest.raises(RuntimeError, match='current-version fence'):
+            serve_state.get_placement_normalization_request(
+                'svc-normalization-read',
+                recovery_version=1,
+                current_version=2,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_completed_receipt_rejects_fieldless_raw_spec_despite_materializer(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-fieldless'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_exact_service_spec('spec-1'))
+        fieldless_spec = _exact_service_spec('fieldless')
+        fieldless_state = dict(fieldless_spec.__dict__)
+        for field in placement_policy.CONTRACT_FIELDS:
+            fieldless_state.pop(field)
+        fieldless_bytes = (
+            placement_contract_normalization._serialize_raw_state(
+                fieldless_state, 4))
+        materialized = pickle.loads(fieldless_bytes)
+        _, materialized_version = placement_policy.decode_contract_state(
+            materialized.__dict__)
+        assert materialized_version == (
+            placement_policy.PLACEMENT_CONTRACT_VERSION_V2)
+
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db, run_id)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    service_name,
+                    serve_state.version_specs_table.c.version == 1).values(
+                        spec=fieldless_bytes))
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id,
+                        placement_normalization_loaded_run_id=run_id,
+                        placement_normalization_loaded_image_commit='commit-a',
+                        placement_normalization_loaded_controller_pid=456,
+                        placement_normalization_loaded_controller_ip=owner[1],
+                        placement_normalization_loaded_boot_id='a' * 32,
+                        placement_normalization_loaded_at=123.0))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='mirror-free v2'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=1,
+                current_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_pending_receipt_rejects_mismatched_v2_ledger_result(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-ledger-mismatch'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db, run_id)
+        spec_bytes = _read_version_row(_mock_serve_db, service_name, 1)['spec']
+        _insert_placement_normalization_row(_mock_serve_db,
+                                            run_id,
+                                            service_name,
+                                            1,
+                                            spec_bytes,
+                                            'incarnation-a',
+                                            None,
+                                            result_spec_sha256='d' * 64)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='persisted spec does not match'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=1,
+                current_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_completed_receipt_rejects_substituted_inventoried_v2_spec(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-completed-mismatch'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(
+            service_name)
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db, run_id)
+        inventoried_spec = _read_version_row(_mock_serve_db, service_name,
+                                             1)['spec']
+        _insert_placement_normalization_row(_mock_serve_db, run_id,
+                                            service_name, 1, inventoried_spec,
+                                            'incarnation-a', lifecycle_epoch)
+        substituted_spec = pickle.dumps(_v2_service_spec('spec-2'), protocol=4)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    service_name,
+                    serve_state.version_specs_table.c.version == 1).values(
+                        spec=substituted_spec))
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id,
+                        placement_normalization_loaded_run_id=run_id,
+                        placement_normalization_loaded_image_commit='commit-a',
+                        placement_normalization_loaded_controller_pid=456,
+                        placement_normalization_loaded_controller_ip=owner[1],
+                        placement_normalization_loaded_boot_id='a' * 32,
+                        placement_normalization_loaded_at=123.0))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='persisted spec does not match'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=1,
+                current_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_completed_receipt_survives_later_lifecycle_epoch(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-later-lifecycle'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(
+            service_name)
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db, run_id)
+        spec_bytes = _read_version_row(_mock_serve_db, service_name, 1)['spec']
+        _insert_placement_normalization_row(_mock_serve_db, run_id,
+                                            service_name, 1, spec_bytes,
+                                            'incarnation-a', lifecycle_epoch)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id,
+                        placement_normalization_loaded_run_id=run_id,
+                        placement_normalization_loaded_image_commit='commit-a',
+                        placement_normalization_loaded_controller_pid=456,
+                        placement_normalization_loaded_controller_ip=owner[1],
+                        placement_normalization_loaded_boot_id='a' * 32,
+                        placement_normalization_loaded_at=123.0))
+            session.commit()
+
+        assert serve_state.claim_service_lifecycle_epoch(
+            service_name) == lifecycle_epoch + 1
+        assert serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=1,
+            current_version=1,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner) is None
+
+    def test_completed_receipt_allows_inventoried_placeholder_fill(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-placeholder-fill'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        assert serve_state.add_version(service_name) == 2
+        lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(
+            service_name)
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db,
+                                            run_id,
+                                            row_count=2,
+                                            classification_counts={
+                                                'fieldless_supported': 1,
+                                                'placeholder': 1,
+                                            })
+        first_spec = _read_version_row(_mock_serve_db, service_name, 1)['spec']
+        placeholder_spec = _read_version_row(_mock_serve_db, service_name,
+                                             2)['spec']
+        _insert_placement_normalization_row(_mock_serve_db, run_id,
+                                            service_name, 1, first_spec,
+                                            'incarnation-a', lifecycle_epoch)
+        _insert_placement_normalization_row(_mock_serve_db,
+                                            run_id,
+                                            service_name,
+                                            2,
+                                            placeholder_spec,
+                                            'incarnation-a',
+                                            lifecycle_epoch,
+                                            classification='placeholder',
+                                            outcome='unchanged')
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id,
+                        placement_normalization_loaded_run_id=run_id,
+                        placement_normalization_loaded_image_commit='commit-a',
+                        placement_normalization_loaded_controller_pid=456,
+                        placement_normalization_loaded_controller_ip=owner[1],
+                        placement_normalization_loaded_boot_id='a' * 32,
+                        placement_normalization_loaded_at=123.0))
+            session.commit()
+
+        assert serve_state.add_or_update_version(
+            service_name, 2, _v2_service_spec('spec-2'),
+            'yaml: v2') is serve_state.VersionCommitResult.COMMITTED
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == service_name,
+                        serve_state.placement_normalization_rows_table.c.version
+                        == 2).values(service_hash='incarnation-b'))
+            session.commit()
+        with pytest.raises(RuntimeError, match='service incarnation'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=2,
+                current_version=2,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == service_name,
+                        serve_state.placement_normalization_rows_table.c.version
+                        == 2).values(service_hash='incarnation-a'))
+            session.commit()
+        assert serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=2,
+            current_version=2,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner) is None
+
+    def test_completed_receipt_rejects_missing_requested_run(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-missing-run'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        missing_run_id = uuid.uuid4()
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=missing_run_id,
+                        placement_normalization_loaded_run_id=missing_run_id,
+                        placement_normalization_loaded_image_commit='commit-a',
+                        placement_normalization_loaded_controller_pid=456,
+                        placement_normalization_loaded_controller_ip=owner[1],
+                        placement_normalization_loaded_boot_id='a' * 32,
+                        placement_normalization_loaded_at=123.0))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='manifest is missing'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=1,
+                current_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_completed_receipt_rejects_corrupt_run_manifest(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-corrupt-run'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db,
+                                            run_id,
+                                            schema_revision='corrupt')
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id,
+                        placement_normalization_loaded_run_id=run_id,
+                        placement_normalization_loaded_image_commit='commit-a',
+                        placement_normalization_loaded_controller_pid=456,
+                        placement_normalization_loaded_controller_ip=owner[1],
+                        placement_normalization_loaded_boot_id='a' * 32,
+                        placement_normalization_loaded_at=123.0))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='invalid release identity'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=1,
+                current_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_completed_receipt_rejects_deleted_pre_run_ledger_row(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-deleted-ledger'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db, run_id)
+        spec_bytes = _read_version_row(_mock_serve_db, service_name, 1)['spec']
+        _insert_placement_normalization_row(_mock_serve_db, run_id,
+                                            service_name, 1, spec_bytes,
+                                            'incarnation-a', None)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    service_name,
+                    serve_state.version_specs_table.c.version == 1).values(
+                        created_at=1.5))
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id,
+                        placement_normalization_loaded_run_id=run_id,
+                        placement_normalization_loaded_image_commit='commit-a',
+                        placement_normalization_loaded_controller_pid=456,
+                        placement_normalization_loaded_controller_ip=owner[1],
+                        placement_normalization_loaded_boot_id='a' * 32,
+                        placement_normalization_loaded_at=123.0))
+            session.execute(
+                sqlalchemy.delete(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == service_name,
+                        serve_state.placement_normalization_rows_table.c.version
+                        == 1))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='predates.*no ledger'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=1,
+                current_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
 
     def test_quarantine_rejects_placeholder_and_is_idempotent(
             self, _mock_serve_db):

@@ -2393,6 +2393,38 @@ def get_cluster_status_fields(
 
 
 @metrics_lib.time_me
+def get_cluster_status_fields_by_prefix(
+    cluster_name_prefix: str,
+    *,
+    row_limit: int,
+) -> dict[str, tuple[str | None, int | None]]:
+    """Return a bounded, ordered plain-column cluster prefix inventory.
+
+    This applies the namespace predicate in the database, so callers proving
+    facts about one reserved prefix never load unrelated cluster rows.  The
+    extra selected row makes overflow fail closed without an unbounded query.
+    """
+    if (not isinstance(cluster_name_prefix, str) or not cluster_name_prefix or
+            type(row_limit) is not int or row_limit < 1):
+        raise ValueError('A nonempty cluster prefix and positive integer row '
+                         'limit are required.')
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.query(
+            cluster_table.c.name,
+            cluster_table.c.status,
+            cluster_table.c.status_updated_at,
+        ).filter(
+            cluster_table.c.name.startswith(
+                cluster_name_prefix, autoescape=True)).order_by(
+                    cluster_table.c.name).limit(row_limit + 1).all()
+    if len(rows) > row_limit:
+        raise ValueError('Cluster prefix inventory exceeds its explicit row '
+                         'limit.')
+    return {row.name: (row.status, row.status_updated_at) for row in rows}
+
+
+@metrics_lib.time_me
 def get_managed_cluster_status_fields(
     workload_type: str,) -> dict[str, tuple[str | None, int | None]]:
     """Returns plain status fields for one managed workload type.

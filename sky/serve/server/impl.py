@@ -30,6 +30,7 @@ from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.serve import constants as serve_constants
 from sky.serve import lb_k8s
+from sky.serve import maintenance
 from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -449,6 +450,10 @@ def up(
     submitted_yaml_content: str | None = None,
 ) -> tuple[str, str]:
     """Spins up a service or pool under the cross-pod name lifecycle lock."""
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe creation is disabled while the server controller hold '
+            'is active.')
     if service_name is None:
         service_name = serve_utils.generate_service_name(pool)
     lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
@@ -898,6 +903,10 @@ def update(
     submitted_yaml_content: str | None = None,
 ) -> None:
     """Updates an existing service or pool."""
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe updates are disabled while the server controller hold '
+            'is active.')
     # The lifecycle lock is cross-pod on PostgreSQL and lives outside the
     # service directory. Keep the legacy local lock outermost to match named
     # down's local-lock -> controller-purge lifecycle-lock order; reversing the
@@ -917,6 +926,10 @@ def update(
 def elect_version(service_name: str, version: int, expected_service_hash: str,
                   expected_elected_version: int | None) -> None:
     """Create a new rollout generation from an immutable stored version."""
+    if maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe version election is disabled while the server '
+            'controller hold is active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
         lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
         with lifecycle_lock:
@@ -955,6 +968,10 @@ def elect_version(service_name: str, version: int, expected_service_hash: str,
 def set_load_balancer_high_availability(service_name: str, enabled: bool,
                                         expected_service_hash: str) -> None:
     """Change only one service's external-LB topology under lifecycle lock."""
+    if maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe load balancer topology changes are disabled while the '
+            'server controller hold is active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
         lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
         with lifecycle_lock:
@@ -1500,6 +1517,10 @@ def apply(
     pool: bool = False,
 ) -> None:
     """Applies the config to the service or pool."""
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe apply is disabled while the server controller hold is '
+            'active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
         lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
         with lifecycle_lock:
@@ -1583,6 +1604,10 @@ def down(
     pool: bool = False,
 ) -> None:
     """Tears down a service or pool."""
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe termination and purge are disabled while the server '
+            'controller hold is active.')
     noun = 'pool' if pool else 'service'
     if service_names is None:
         service_names = []

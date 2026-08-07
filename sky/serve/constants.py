@@ -2,6 +2,12 @@
 
 CONTROLLER_TEMPLATE = 'sky-serve-controller.yaml.j2'
 
+# Server-owned operational fence used while persisted Serve state is rewritten.
+# The ``SKYPILOT_SERVER_`` prefix prevents a client request from overriding the
+# value in an executor process (see server/requests/payloads.py).  Pools use the
+# managed-jobs controller and are intentionally outside this hold.
+SERVE_CONTROLLER_HOLD_ENV_VAR = 'SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD'
+
 SKYSERVE_METADATA_DIR = '~/.sky/serve'
 
 # The filelock for reserving service ports when starting a service. Two

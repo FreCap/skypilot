@@ -624,6 +624,13 @@ imageCanaryWorker:
 
 # SkyServe (model serving) configuration.
 serve:
+  # Operator-only control-plane fence for persisted-state maintenance. When
+  # true, the API pod rejects non-pool Serve mutations and does not start,
+  # recover, or respawn service controllers. Existing external load balancers
+  # keep their last routing view. Keep false outside a documented maintenance
+  # window; pools are intentionally unaffected.
+  # @schema type: [boolean]
+  controllerHold: false
   # Portable external load balancer support for controller-owned SkyServe LBs.
   # When enabled, each service's LB runs in its own Deployment and syncs through
   # a route implemented on every API pod. The shared api-server Service is the

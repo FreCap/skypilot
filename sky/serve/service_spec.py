@@ -46,6 +46,55 @@ def _canonical_pool_driver(
     }
 
 
+def materialize_legacy_placement_contract_state(
+    state: dict[str, Any],
+) -> tuple[placement_policy.PlacementContract, int | None]:
+    """Decode compatibility state and materialize its in-memory contract.
+
+    This is the single raw-state boundary shared by normal unpickling and the
+    operator-only PostgreSQL normalizer.  It deliberately changes only the
+    placement-policy primitives; unrelated compatibility defaults remain the
+    responsibility of ``SkyServiceSpec.__setstate__``.
+    """
+    resolved_contract, contract_version = (
+        placement_policy.decode_contract_state(state))
+    if contract_version == placement_policy.PLACEMENT_CONTRACT_VERSION_V2:
+        return resolved_contract, contract_version
+
+    if contract_version is None:
+        state.setdefault(placement_policy.POLICY_NAME_FIELD, None)
+        state.setdefault(placement_policy.POOL_FIELD, False)
+        legacy_pool = state[placement_policy.POOL_FIELD]
+        if (resolved_contract.workload_kind ==
+                placement_policy.WORKLOAD_KIND_POOL):
+            state[placement_policy.POOL_FIELD] = _canonical_pool_driver(
+                legacy_pool, state.get('_min_replicas', 0),
+                state.get('_max_replicas'))
+        elif isinstance(legacy_pool, dict) and not legacy_pool:
+            # Preserve the preceding reader's explicit meaning for an empty
+            # legacy mapping: it was a service, not a pool.
+            state[placement_policy.POOL_FIELD] = False
+
+    if resolved_contract.is_legacy_physical_per_gpu:
+        # Keep only the transition-only tuple transition-shaped so the
+        # operator can identify and retire it without changing its semantics.
+        if contract_version is None:
+            # pylint: disable=protected-access
+            transition_fields = (
+                resolved_contract._legacy_v1_persisted_fields())
+            # pylint: enable=protected-access
+            state.update(transition_fields)
+            state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+        return resolved_contract, contract_version
+
+    # Compatibility decoding changes only this in-memory object.  The
+    # authoritative row remains byte-for-byte untouched until the explicit
+    # PostgreSQL normalizer records and CASes its v2 replacement.
+    state.update(resolved_contract.persisted_fields())
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+    return resolved_contract, contract_version
+
+
 class SkyServiceSpec:
     """SkyServe service specification."""
 
@@ -349,25 +398,33 @@ class SkyServiceSpec:
             # Internal copies of a committed version carry the complete
             # contract.  Validate it against both public drivers instead of
             # reconstructing through a different policy name.
-            placement_state = _preserved_placement_contract.persisted_fields(
-                placement_policy.PLACEMENT_CONTRACT_VERSION_TRANSITION)
+            preserves_legacy_placement_contract = (
+                _preserved_placement_contract.is_legacy_physical_per_gpu)
+            if preserves_legacy_placement_contract:
+                # This compatibility-only object must remain usable in memory
+                # until the operator retires its authoritative row.  Keep its
+                # v1 shape so __getstate__ and every central writer reject it.
+                # pylint: disable=protected-access
+                placement_state = (
+                    _preserved_placement_contract._legacy_v1_persisted_fields())
+                # pylint: enable=protected-access
+                placement_state[
+                    placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+            else:
+                placement_state = (
+                    _preserved_placement_contract.persisted_fields())
             placement_state.update({
                 placement_policy.POLICY_NAME_FIELD: spot_placer,
                 placement_policy.POOL_FIELD: pool,
-                placement_policy.ROLLBACK_REPLICA_UNIT_FIELD:
-                    _preserved_placement_contract.uses_logical_replicas,
             })
             resolved_placement_contract, _ = (
                 placement_policy.decode_contract_state(placement_state))
-            preserves_legacy_placement_contract = (
-                resolved_placement_contract.is_legacy_physical_per_gpu)
         uses_logical_replicas = (
             resolved_placement_contract.uses_logical_replicas)
 
         def _validate_percentage(name: str, value: int | None) -> None:
-            if preserves_legacy_placement_contract:
-                return
-            if (value is not None and
+            if (not preserves_legacy_placement_contract and
+                    value is not None and
                 (not isinstance(value, int) or isinstance(value, bool) or
                  value < 1 or value > 100)):
                 with ux_utils.print_exception_no_traceback():
@@ -766,14 +823,20 @@ class SkyServiceSpec:
         self._adaptive_scale_up: dict[str, Any] | None = adaptive_scale_up
         self._max_scale_down_rate_percentage: int | None = (
             max_scale_down_rate_percentage)
-        # Persist primitive placement dimensions, never the runtime dataclass,
-        # so the preceding server can ignore the new fields during rollback.
-        # Contract v1 dual-writes its historical logical marker; runtime policy
-        # reads placement_contract instead of the mirror.
-        self.__dict__.update(
-            resolved_placement_contract.persisted_fields(
-                placement_policy.PLACEMENT_CONTRACT_VERSION_TRANSITION))
-        self._uses_logical_replicas: bool = uses_logical_replicas
+        # Persist primitive placement dimensions, never the runtime dataclass.
+        # The historical tuple remains compatibility-only in memory: its v1
+        # shape makes __getstate__ and the central writers fail closed.  Every
+        # supported fresh/copy path is the sole mirror-free v2 representation.
+        if preserves_legacy_placement_contract:
+            # pylint: disable=protected-access
+            placement_fields = (
+                resolved_placement_contract._legacy_v1_persisted_fields())
+            # pylint: enable=protected-access
+            placement_fields[
+                placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+        else:
+            placement_fields = resolved_placement_contract.persisted_fields()
+        self.__dict__.update(placement_fields)
         # Opt-in: allow scaling up onto free reserved (zero-cost) capacity.
         # Absent/False means no behavior change. Bool form or object form
         # ({floor_replicas, weight}); object form implies enabled.
@@ -821,7 +884,7 @@ class SkyServiceSpec:
         """Set state from pickled state, for backward compatibility."""
         try:
             resolved_contract, contract_version = (
-                placement_policy.decode_contract_state(state))
+                materialize_legacy_placement_contract_state(state))
         except (TypeError, ValueError):
             present_fields = sum(
                 field in state for field in placement_policy.CONTRACT_FIELDS)
@@ -833,31 +896,18 @@ class SkyServiceSpec:
                 f'mirror_present='
                 f'{placement_policy.ROLLBACK_REPLICA_UNIT_FIELD in state}')
             raise
-        if contract_version is None:
-            logger.warning(f'event={_PLACEMENT_DECODE_EVENT} '
-                           'outcome=legacy_materialized '
-                           f'replica_unit={resolved_contract.replica_unit} '
-                           f'workload_kind={resolved_contract.workload_kind}')
-            # Materialize legacy state in memory.  The authoritative persisted
-            # version bytes remain untouched; a deliberate new copy is a v1
-            # transition write with the rollback marker.
-            state.setdefault(placement_policy.POLICY_NAME_FIELD, None)
-            state.setdefault(placement_policy.POOL_FIELD, False)
-            legacy_pool = state[placement_policy.POOL_FIELD]
-            if resolved_contract.workload_kind == (
-                    placement_policy.WORKLOAD_KIND_POOL):
-                state[placement_policy.POOL_FIELD] = _canonical_pool_driver(
-                    legacy_pool, state.get('_min_replicas', 0),
-                    state.get('_max_replicas'))
-            elif isinstance(legacy_pool, dict) and not legacy_pool:
-                # Preserve the preceding reader's explicit meaning for an
-                # empty legacy mapping: it was a service, not a pool.
-                state[placement_policy.POOL_FIELD] = False
-            state.update(
-                resolved_contract.persisted_fields(
-                    placement_policy.PLACEMENT_CONTRACT_VERSION_TRANSITION))
-            state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = (
-                resolved_contract.uses_logical_replicas)
+        if contract_version in (None,
+                                placement_policy.PLACEMENT_CONTRACT_VERSION_V1):
+            source = 'fieldless' if contract_version is None else 'v1'
+            logger.warning(
+                f'event={_PLACEMENT_DECODE_EVENT} '
+                'outcome=legacy_materialized '
+                f'source={source} '
+                f'historical='
+                f'{str(resolved_contract.is_legacy_physical_per_gpu).lower()} '
+                f'replica_unit={resolved_contract.replica_unit} '
+                f'workload_kind={resolved_contract.workload_kind}')
+            # The authoritative persisted version bytes remain untouched.
         # These fields were added after earlier releases had already persisted
         # SkyServiceSpec objects in the serve DB.
         state.setdefault('_endpoint_probe_interval_seconds',
@@ -910,6 +960,16 @@ class SkyServiceSpec:
         state.setdefault('_graceful_drain_seconds', None)
         state.setdefault('_graceful_drain_async_occupancy', None)
         self.__dict__.update(state)
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize only the sole current, mirror-free v2 representation."""
+        state = dict(self.__dict__)
+        _, contract_version = placement_policy.decode_contract_state(state)
+        if (contract_version != placement_policy.PLACEMENT_CONTRACT_VERSION_V2
+                or placement_policy.ROLLBACK_REPLICA_UNIT_FIELD in state):
+            raise ValueError('SkyServiceSpec serialization requires an '
+                             'explicit mirror-free v2 placement contract.')
+        return state
 
     @staticmethod
     def from_yaml_config(config: dict[str, Any]) -> 'SkyServiceSpec':

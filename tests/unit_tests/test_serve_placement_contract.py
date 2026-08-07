@@ -8,12 +8,21 @@ import pickle
 import types
 from typing import Any
 from unittest import mock
+import uuid
 import zlib
 
 import pytest
 from spot_placer_test_utils import make_location
+import sqlalchemy
+from sqlalchemy import orm
+import test_serve_resource_actions as resource_action_fixtures
+from test_serve_resource_actions_pg import empty_postgres
+from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky.container_images import demand_state
+from sky.serve import placement_contract_normalization
 from sky.serve import placement_policy
+from sky.serve import serve_state
 from sky.serve import service_spec
 from sky.serve import spot_placer
 
@@ -87,6 +96,72 @@ def _restore(state: dict[str, Any]) -> service_spec.SkyServiceSpec:
     restored = service_spec.SkyServiceSpec.__new__(service_spec.SkyServiceSpec)
     restored.__setstate__(state)
     return restored
+
+
+def _raw_spec_pickle(state: dict[str, Any], protocol: int = 4) -> bytes:
+    return placement_contract_normalization._serialize_raw_state(
+        state, protocol)
+
+
+def _explicit_v2_payload(spot_placer_name: str | None = None,
+                         protocol: int = 4) -> bytes:
+    spec = _spec(spot_placer_name)
+    state = dict(spec.__dict__)
+    state.update(spec.placement_contract.persisted_fields())
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+    return _raw_spec_pickle(state, protocol=protocol)
+
+
+def _normalizer_work(payload: bytes,
+                     version: int,
+                     yaml_content: str | None = 'service: {}'):
+    row = {
+        'service_name': 'svc',
+        'version': version,
+        'spec': payload,
+        'yaml_content': yaml_content,
+        'submitted_yaml_content': None,
+        'created_at': 1.0,
+        'created_by': 'test',
+        'quarantined_at': None,
+        'quarantine_reason': None,
+        'retired_yaml_content': None,
+        'retired_at': None,
+        'retirement_reason': None,
+        'retirement_run_id': None,
+        'placement_catalog': None,
+        'controller_config': None,
+        'controller_config_digest': None,
+        'controller_config_snapshot_id': None,
+        'controller_applied_at': None,
+    }
+    analysis, classification = (
+        placement_contract_normalization._classify_version_row(row))
+    return placement_contract_normalization._RowWork(
+        row,
+        dict(row),
+        analysis,
+        classification,
+        dependency_facts={
+            'service_present': True,
+            'service_current_version': 3,
+            'service_hash': 'current-hash',
+            'service_lifecycle_epoch': 7,
+            'service_resource_scope': 'current-scope',
+            'service_status': 'READY',
+            'service_active': False,
+            'replica_count': 0,
+            'unknown_version_replica_count': 0,
+            'cleanup_intent_count': 0,
+            'quarantined': False,
+            'controller_applied': False,
+            'retired': False,
+        })
+
+
+def _api_pod_identity() -> (placement_contract_normalization._ApiPodIdentity):
+    return placement_contract_normalization._canonical_api_pod_identity(
+        'pod-a', uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))
 
 
 @pytest.mark.parametrize(('policy_name', 'pool', 'expected'), [
@@ -324,11 +399,11 @@ def test_public_constructor_cannot_inject_historical_contract(invalid_token):
             _placement_contract_copy_token=invalid_token)
 
 
-def test_transition_spec_persists_only_primitive_v1_contract_fields():
+def test_current_spec_persists_only_primitive_v2_contract_fields():
     spec = _spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER)
 
-    assert spec.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 1
-    assert spec.__dict__[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] is True
+    assert spec.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 2
+    assert placement_policy.ROLLBACK_REPLICA_UNIT_FIELD not in spec.__dict__
     assert all(not isinstance(value, placement_policy.PlacementContract)
                for value in spec.__dict__.values())
     assert spec.placement_contract.uses_logical_replicas
@@ -339,7 +414,7 @@ def test_transition_spec_persists_only_primitive_v1_contract_fields():
 
 @pytest.mark.parametrize('version', [True, False, 1.0, '1', 0, 3])
 def test_contract_writer_rejects_non_exact_versions(version):
-    with pytest.raises(ValueError, match='Unsupported placement contract'):
+    with pytest.raises(TypeError):
         _spec().placement_contract.persisted_fields(version)
 
 
@@ -359,9 +434,9 @@ def test_preceding_release_per_gpu_pickle_survives_without_removed_class():
     expected = placement_policy.resolve_fresh_contract(
         placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
     assert restored.placement_contract == expected
-    assert restored.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 1
-    assert restored.__dict__[
-        placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] is True
+    assert restored.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 2
+    assert (placement_policy.ROLLBACK_REPLICA_UNIT_FIELD
+            not in restored.__dict__)
     copied = restored.copy()
     assert copied.placement_contract == expected
     assert pickle.loads(pickle.dumps(copied,
@@ -387,19 +462,1444 @@ def test_real_pre_marker_pickle_preserves_physical_per_gpu_contract():
     assert contract.reserved_fill_mode == (
         placement_policy.RESERVED_FILL_MODE_SINGLE_GPU_BACKEND)
     copied = restored.copy()
-    assert copied.placement_contract == contract
-    assert copied.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 1
-    assert copied.__dict__[
-        placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] is False
-    assert pickle.loads(pickle.dumps(copied,
-                                     protocol=4)).placement_contract == contract
+    assert copied.placement_contract == restored.placement_contract
+    with pytest.raises(ValueError, match='mirror-free v2'):
+        pickle.dumps(copied, protocol=4)
+    with pytest.raises(ValueError, match='serialization requires'):
+        pickle.dumps(restored, protocol=4)
+
+
+def test_raw_normalizer_accepts_exact_release_fixtures():
+    logical = placement_contract_normalization.analyze_spec_pickle(
+        zlib.decompress(base64.b64decode(_V1_1_1132_PER_GPU_SPEC_ZLIB_B64)))
+    assert logical.classification is (
+        placement_contract_normalization.Classification.FIELDLESS_SUPPORTED)
+    assert logical.changed
+    assert logical.source_protocol == 4
+    assert logical.contract_projection is not None
+    assert logical.contract_projection['replica_unit'] == 'logical'
+    assert logical.contract_projection['version'] == 2
+    assert logical.result_bytes is not None
+    normalized = pickle.loads(logical.result_bytes)
+    assert normalized.placement_contract.uses_logical_replicas
+    assert normalized.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 2
+    assert (placement_policy.ROLLBACK_REPLICA_UNIT_FIELD
+            not in normalized.__dict__)
+
+    historical = placement_contract_normalization.analyze_spec_pickle(
+        zlib.decompress(
+            base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64)))
+    assert historical.classification is (
+        placement_contract_normalization.Classification.
+        HISTORICAL_PHYSICAL_PER_GPU)
+    assert not historical.changed
+    assert historical.result_bytes is not None
+    assert historical.source_sha256 == historical.result_sha256
+
+
+@pytest.mark.parametrize(('policy_name', 'pool', 'logical_marker'), [
+    (None, False, False),
+    (None, {
+        'workers': 1
+    }, False),
+    (placement_policy.SPOT_HEDGE_PLACER, False, False),
+    (placement_policy.SPOT_HEDGE_PLACER, {
+        'workers': 1
+    }, False),
+    (placement_policy.CAPACITY_AWARE_SPOT_PLACER, False, True),
+])
+def test_raw_normalizer_materializes_all_supported_fieldless_contracts(
+        policy_name, pool, logical_marker):
+    state = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        state.pop(field)
+    state[placement_policy.POLICY_NAME_FIELD] = policy_name
+    state[placement_policy.POOL_FIELD] = pool
+    state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = logical_marker
+    state['_normalizer_unrelated_sentinel'] = ({'ordered': [1, 2]},)
+    payload = _raw_spec_pickle(state, protocol=5)
+
+    analysis = placement_contract_normalization.analyze_spec_pickle(payload)
+
+    assert analysis.classification is (
+        placement_contract_normalization.Classification.FIELDLESS_SUPPORTED)
+    assert analysis.source_protocol == 5
+    assert analysis.changed
+    assert analysis.result_bytes is not None
+    normalized_state = pickle.loads(analysis.result_bytes).__dict__
+    assert normalized_state['_normalizer_unrelated_sentinel'] == ({
+        'ordered': [1, 2]
+    },)
+    assert normalized_state[placement_policy.CONTRACT_VERSION_FIELD] == 2
+    assert (placement_policy.ROLLBACK_REPLICA_UNIT_FIELD
+            not in normalized_state)
+
+
+@pytest.mark.parametrize('protocol', [4, 5])
+def test_raw_normalizer_preserves_none_placeholder(protocol):
+    payload = pickle.dumps(None, protocol=protocol)
+
+    analysis = placement_contract_normalization.analyze_spec_pickle(payload)
+
+    assert analysis.classification is (
+        placement_contract_normalization.Classification.PLACEHOLDER)
+    assert not analysis.changed
+    assert analysis.result_bytes == payload
+
+
+@pytest.mark.parametrize('version', [1, 2])
+def test_raw_normalizer_converges_explicit_contract_to_v2(version):
+    state = dict(_spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER).__dict__)
+    state[placement_policy.CONTRACT_VERSION_FIELD] = version
+    if version == 1:
+        state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = True
+    else:
+        state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+    payload = _raw_spec_pickle(state)
+
+    analysis = placement_contract_normalization.analyze_spec_pickle(payload)
+
+    expected = (placement_contract_normalization.Classification.EXPLICIT_V1
+                if version == 1 else
+                placement_contract_normalization.Classification.EXPLICIT_V2)
+    assert analysis.classification is expected
+    assert analysis.changed is (version == 1)
+    assert analysis.result_bytes is not None
+    normalized = pickle.loads(analysis.result_bytes)
+    assert normalized.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 2
+    assert (placement_policy.ROLLBACK_REPLICA_UNIT_FIELD
+            not in normalized.__dict__)
+    if version == 2:
+        assert analysis.result_bytes == payload
+
+
+@pytest.mark.parametrize('payload', [
+    pickle.dumps('not-a-spec', protocol=4),
+    pickle.dumps(None, protocol=3),
+    pickle.dumps(None, protocol=0),
+    b'not-a-pickle',
+])
+def test_raw_normalizer_reports_non_spec_and_protocol_blockers(payload):
+    analysis = placement_contract_normalization.analyze_spec_pickle(payload)
+
+    assert analysis.blocked
+    assert analysis.blocker_reason
+    assert analysis.result_bytes is None
+
+
+def test_raw_normalizer_reports_partial_and_nested_spec_blockers():
+    partial = dict(_spec().__dict__)
+    partial.pop(placement_policy.CONTRACT_COST_UNIT_FIELD)
+    partial_analysis = placement_contract_normalization.analyze_spec_pickle(
+        _raw_spec_pickle(partial))
+    assert partial_analysis.blocked
+    assert 'Partial placement contract' in partial_analysis.blocker_reason
+
+    outer = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        outer.pop(field)
+    outer['_nested_spec'] = _spec()
+    nested_analysis = placement_contract_normalization.analyze_spec_pickle(
+        _raw_spec_pickle(outer))
+    assert nested_analysis.blocked
+    assert 'exactly one top-level' in nested_analysis.blocker_reason
+
+
+def test_raw_normalizer_row_classifies_null_spec_instead_of_crashing():
+    analysis, classification = (
+        placement_contract_normalization._classify_version_row({
+            'spec': None,
+            'yaml_content': None,
+            'retired_at': None,
+            'retired_yaml_content': None,
+            'retirement_reason': None,
+            'retirement_run_id': None,
+        }))
+
+    assert classification is (
+        placement_contract_normalization.Classification.BLOCKER)
+    assert analysis.blocked
+    assert analysis.blocker_reason == 'Persisted spec payload is not bytes.'
+
+
+def test_raw_normalizer_requires_exact_protocol_4_retirement_shape():
+    run_id = uuid.uuid4()
+    row = {
+        'spec': pickle.dumps(None, protocol=5),
+        'yaml_content': None,
+        'retired_yaml_content': 'service: {}',
+        'retired_at': 1.0,
+        'retirement_reason':
+            (placement_contract_normalization._RETIREMENT_REASON),
+        'retirement_run_id': run_id,
+    }
+
+    analysis, classification = (
+        placement_contract_normalization._classify_version_row(row))
+
+    assert analysis.blocked
+    assert classification is (
+        placement_contract_normalization.Classification.BLOCKER)
+
+    row['spec'] = pickle.dumps(None, protocol=4)
+    analysis, classification = (
+        placement_contract_normalization._classify_version_row(row))
+    assert not analysis.blocked
+    assert classification is (
+        placement_contract_normalization.Classification.RETIRED)
+
+
+def test_retirement_uses_cross_incarnation_target_demand(monkeypatch):
+    observed = []
+
+    def old_hash_target_evidence(service_name, version):
+        observed.append((service_name, version))
+        return demand_state.LiveServiceVersionDemandEvidence(count=1,
+                                                             digest='a' * 64)
+
+    monkeypatch.setattr(
+        demand_state,
+        'get_live_service_version_demand_evidence_any_incarnation',
+        old_hash_target_evidence)
+
+    evidence = placement_contract_normalization._image_demand_evidence('svc', 1)
+    no_requests = placement_contract_normalization._ExternalEvidence(
+        count=0, digest='0' * 64)
+
+    assert observed == [('svc', 1)]
+    assert evidence.count == 1
+    # No current service hash is accepted by this boundary, so an old-hash,
+    # target-scoped owner cannot be hidden by a same-name recreation.
+    assert evidence.digest == 'a' * 64
+    historical_payload = zlib.decompress(
+        base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
+    candidate = _normalizer_work(historical_payload, 1)
+    successor = _normalizer_work(_explicit_v2_payload(), 2)
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='live container-image demand'):
+        placement_contract_normalization._prepare_retirement_rows(
+            [candidate, successor], {
+                'svc': {
+                    'current_version': 2,
+                    'active_versions': '[2]',
+                    'hash': 'current-hash',
+                    'lifecycle_epoch': 7,
+                    'resource_scope': 'current-scope',
+                    'workspace': 'workspace',
+                    'status': 'READY',
+                    'pool': 0,
+                    'resource_action_mode': 'legacy',
+                    'resource_action_mode_changed_at': None,
+                }
+            }, uuid.uuid4(), 10.0, {('svc', 1): evidence},
+            {('svc', 1): no_requests}, no_requests, no_requests,
+            _api_pod_identity(), no_requests)
+
+
+def test_controller_process_evidence_matches_only_exact_service_argv(
+        monkeypatch):
+    target = placement_contract_normalization._ProcessTarget(
+        'svc', 'incarnation', 7)
+
+    class FakeProcess:
+
+        def __init__(self, pid, cmdline):
+            self.pid = pid
+            self._cmdline = cmdline
+
+        def status(self):
+            return 'running'
+
+        def cmdline(self):
+            return self._cmdline
+
+        def create_time(self):
+            return 100.0 + self.pid
+
+        def ppid(self):
+            return 10
+
+    processes = [
+        FakeProcess(1, [
+            'python', '-m', 'sky.serve.service', '--service-name', 'svc',
+            '--workspace', 'workspace', '--service-incarnation', 'incarnation'
+        ]),
+        FakeProcess(2, [
+            'sky.serve.controller --service-name svc '
+            '--service-incarnation incarnation', ''
+        ]),
+        # A malformed unrelated compatibility process is outside this exact
+        # target and must not make retirement of svc impossible.
+        FakeProcess(
+            3,
+            ['python', '-m', 'sky.serve.service', '--service-name', 'other']),
+        FakeProcess(4, ['sky.serve.service', '--service-name', 'svc-prefix']),
+    ]
+    monkeypatch.setattr(placement_contract_normalization.psutil, 'process_iter',
+                        lambda: iter(processes))
+
+    evidence = (
+        placement_contract_normalization._serve_controller_process_evidence(
+            frozenset({target}), 'pod-a'))
+
+    assert evidence.count == 2
+    assert len(evidence.digest) == 64
+    assert evidence.digest != (
+        placement_contract_normalization._serve_controller_process_evidence(
+            frozenset({target}), 'pod-b').digest)
+
+
+@pytest.mark.parametrize(
+    'cmdline', [[
+        'python', '-m', 'sky.serve.service', '--service-name=svc',
+        '--service-incarnation', 'incarnation'
+    ],
+                [
+                    'python', '-m', 'sky.serve.service', '--service-name',
+                    'svc', '--service-incarnation', 'wrong'
+                ],
+                [
+                    'sky.serve.controller --service-name svc '
+                    '--service-incarnation incarnation', 'trailing'
+                ]])
+def test_controller_process_evidence_rejects_malformed_target(
+        monkeypatch, cmdline):
+    target = placement_contract_normalization._ProcessTarget(
+        'svc', 'incarnation', 7)
+
+    class FakeProcess:
+        pid = 1
+
+        def status(self):
+            return 'running'
+
+        def cmdline(self):
+            return cmdline
+
+        def create_time(self):
+            return 1.0
+
+        def ppid(self):
+            return 0
+
+    monkeypatch.setattr(placement_contract_normalization.psutil, 'process_iter',
+                        lambda: iter([FakeProcess()]))
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker):
+        placement_contract_normalization._serve_controller_process_evidence(
+            frozenset({target}), 'pod-a')
+
+
+def test_controller_process_evidence_access_and_overflow_block(monkeypatch):
+    target = placement_contract_normalization._ProcessTarget(
+        'svc', 'incarnation', 7)
+
+    class AccessDeniedProcess:
+        pid = 1
+
+        def status(self):
+            raise placement_contract_normalization.psutil.AccessDenied(pid=1)
+
+    monkeypatch.setattr(placement_contract_normalization.psutil, 'process_iter',
+                        lambda: iter([AccessDeniedProcess()]))
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='cannot read every'):
+        placement_contract_normalization._serve_controller_process_evidence(
+            frozenset({target}), 'pod-a')
+
+    monkeypatch.setattr(placement_contract_normalization,
+                        '_MAX_PROCESS_EVIDENCE_ROWS', 1)
+
+    class ZombieProcess:
+
+        def status(self):
+            return placement_contract_normalization.psutil.STATUS_ZOMBIE
+
+    monkeypatch.setattr(
+        placement_contract_normalization.psutil, 'process_iter',
+        lambda: iter([ZombieProcess(), ZombieProcess()]))
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='explicit row bound'):
+        placement_contract_normalization._serve_controller_process_evidence(
+            frozenset({target}), 'pod-a')
+
+
+def test_process_evidence_rejects_nonzero_malformed_and_drift():
+    zero = placement_contract_normalization._ExternalEvidence(0, '0' * 64)
+    nonzero = placement_contract_normalization._ExternalEvidence(1, '0' * 64)
+    drifted = placement_contract_normalization._ExternalEvidence(0, '1' * 64)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='not quiescent'):
+        placement_contract_normalization._require_stable_zero_evidence(
+            zero, nonzero, 'processes')
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='changed during apply'):
+        placement_contract_normalization._require_stable_zero_evidence(
+            zero, drifted, 'processes')
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='malformed evidence'):
+        placement_contract_normalization._validate_external_evidence(
+            placement_contract_normalization._ExternalEvidence(0, 'BAD'),
+            'processes')
+
+
+def _resource_action_row(raw_spec, *, domain='serve', resource_type='replica'):
+    actions = resource_action_fixtures.actions
+    typed = actions.ServeReplicaActionSpecV1.from_value(raw_spec)
+    invocation = typed.invocation
+    identity = invocation.resource_identity
+    return {
+        'action_id': typed.action_id,
+        'domain': domain,
+        'resource_type': resource_type,
+        'resource_identity': identity.action_identity(invocation.action_kind
+                                                     ).resource_identity,
+        'desired_generation': identity.desired_generation,
+        'action_type': invocation.action_kind.value,
+        'immutable_spec': typed.canonical_value(),
+        'immutable_spec_sha256': typed.sha256,
+    }
+
+
+def test_resource_action_evidence_matches_exact_launch_source_any_incarnation():
+    target = placement_contract_normalization._ResourceActionTarget(
+        'svc', 3, 'different-current-hash')
+    launch_row = _resource_action_row(resource_action_fixtures._launch_spec())
+    down_row = _resource_action_row(resource_action_fixtures._down_spec())
+
+    launch_evidence = (
+        placement_contract_normalization._resource_action_evidence_from_rows(
+            [('api_resource_actions', launch_row),
+             ('api_resource_actions', down_row)], frozenset({target})))
+
+    assert launch_evidence[('svc', 3)].count == 1
+    assert len(launch_evidence[('svc', 3)].digest) == 64
+    unrelated = placement_contract_normalization._ResourceActionTarget(
+        'svc', 2, 'different-current-hash')
+    assert placement_contract_normalization._resource_action_evidence_from_rows(
+        [('api_resource_actions', down_row)],
+        frozenset({unrelated}))[('svc', 2)].count == 0
+
+
+def test_resource_action_evidence_rejects_malformed_possible_serve_root():
+    target = placement_contract_normalization._ResourceActionTarget(
+        'svc', 3, 'current-hash')
+    corrupted_outer = _resource_action_row(
+        resource_action_fixtures._launch_spec(), domain='other')
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='differs from its typed spec'):
+        placement_contract_normalization._resource_action_evidence_from_rows(
+            [('api_resource_actions', corrupted_outer)], frozenset({target}))
+
+    malformed = dict(corrupted_outer,
+                     domain='serve',
+                     immutable_spec={'invalid': True},
+                     immutable_spec_sha256='0' * 64)
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='unparseable possible Serve'):
+        placement_contract_normalization._resource_action_evidence_from_rows(
+            [('api_resource_actions', malformed)], frozenset({target}))
+
+
+def test_resource_action_evidence_validates_and_ignores_nonserve_root():
+    target = placement_contract_normalization._ResourceActionTarget(
+        'svc', 3, 'current-hash')
+    immutable_spec = {'version': 1, 'foreign': 'contract'}
+    foreign = {
+        'action_id': uuid.uuid4(),
+        'domain': 'foreign',
+        'resource_type': 'worker',
+        'resource_identity': 'worker-a',
+        'desired_generation': 1,
+        'action_type': 'launch',
+        'immutable_spec': immutable_spec,
+        'immutable_spec_sha256':
+            (resource_action_fixtures.kernel_actions.canonical_sha256(
+                immutable_spec)),
+    }
+
+    evidence = (
+        placement_contract_normalization._resource_action_evidence_from_rows(
+            [('api_resource_actions', foreign)], frozenset({target})))
+    empty = (
+        placement_contract_normalization._resource_action_evidence_from_rows(
+            [], frozenset({target})))
+
+    assert evidence[('svc', 3)].count == 0
+    assert evidence[('svc', 3)].digest != empty[('svc', 3)].digest
+
+
+def test_sole_recreate_api_pod_requires_current_registry_identity(monkeypatch):
+    instance_id = uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'all')
+    monkeypatch.setenv('SKYPILOT_POD_UID', 'pod-a')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_INSTANCE_ID', str(instance_id))
+    monkeypatch.delenv('SKYPILOT_ROLLING_UPDATE_ENABLED', raising=False)
+    row = {
+        'instance_id': instance_id,
+        'role': 'all',
+        'pod_uid': 'pod-a',
+        'ready': True,
+        'draining_at': None,
+    }
+    monkeypatch.setattr(placement_contract_normalization,
+                        '_fresh_api_instances', lambda _engine: [row])
+
+    identity = placement_contract_normalization._require_sole_recreate_api_pod(
+        mock.Mock())
+
+    assert identity.pod_uid == 'pod-a'
+    assert identity.instance_id == instance_id
+    assert len(identity.digest) == 64
+
+    # A second fresh registry member blocks even if it is already draining;
+    # it may still host a controller process in another pod.
+    second = dict(row,
+                  instance_id=uuid.uuid4(),
+                  pod_uid='pod-b',
+                  ready=False,
+                  draining_at=1.0)
+    monkeypatch.setattr(placement_contract_normalization,
+                        '_fresh_api_instances', lambda _engine: [row, second])
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='exactly one fresh registered'):
+        placement_contract_normalization._require_sole_recreate_api_pod(
+            mock.Mock())
+
+
+def test_sole_recreate_api_pod_rejects_wrong_instance_and_rolling(monkeypatch):
+    instance_id = uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'all')
+    monkeypatch.setenv('SKYPILOT_POD_UID', 'pod-a')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_INSTANCE_ID', str(instance_id))
+    monkeypatch.setattr(
+        placement_contract_normalization, '_fresh_api_instances',
+        lambda _engine: [{
+            'instance_id': uuid.uuid4(),
+            'role': 'all',
+            'pod_uid': 'pod-a',
+            'ready': True,
+            'draining_at': None,
+        }])
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='does not match'):
+        placement_contract_normalization._require_sole_recreate_api_pod(
+            mock.Mock())
+
+    monkeypatch.setenv('SKYPILOT_ROLLING_UPDATE_ENABLED', 'true')
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='Recreate'):
+        placement_contract_normalization._require_sole_recreate_api_pod(
+            mock.Mock())
+
+
+def test_legacy_controller_evidence_covers_every_server_identity(monkeypatch):
+    first_inventory = {
+        'ordinary-cluster': ('UP', 1),
+        'sky-serve-controller-old-server': ('DOWN', 2),
+        'sky-serve-controller-current-server': ('UP', 3),
+    }
+    monkeypatch.setattr(placement_contract_normalization.global_user_state,
+                        'get_cluster_status_fields_by_prefix',
+                        lambda _prefix, *, row_limit: first_inventory)
+
+    first = (placement_contract_normalization.
+             _legacy_serve_controller_cluster_evidence())
+
+    assert first.count == 2
+    monkeypatch.setattr(
+        placement_contract_normalization.global_user_state,
+        'get_cluster_status_fields_by_prefix',
+        lambda _prefix, *, row_limit: dict(
+            reversed(tuple(first_inventory.items()))))
+    second = (placement_contract_normalization.
+              _legacy_serve_controller_cluster_evidence())
+    assert second == first
+
+
+def test_multirow_retirement_proves_a_surviving_successor():
+    historical_payload = zlib.decompress(
+        base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
+    historical_one = _normalizer_work(historical_payload, 1)
+    historical_two = _normalizer_work(historical_payload, 2)
+    successor = _normalizer_work(_explicit_v2_payload(), 3)
+    rows = [historical_one, historical_two, successor]
+    service_rows = {
+        'svc': {
+            'current_version': 3,
+            'active_versions': '[3]',
+            'hash': 'current-hash',
+            'lifecycle_epoch': 7,
+            'resource_scope': 'current-scope',
+            'workspace': 'workspace',
+            'status': 'READY',
+            'pool': 0,
+            'resource_action_mode': 'legacy',
+            'resource_action_mode_changed_at': None,
+        }
+    }
+    no_demand = placement_contract_normalization._ExternalEvidence(count=0,
+                                                                   digest='0' *
+                                                                   64)
+
+    affected = placement_contract_normalization._prepare_retirement_rows(
+        rows, service_rows, uuid.uuid4(), 10.0, {
+            ('svc', 1): no_demand,
+            ('svc', 2): no_demand,
+        }, {
+            ('svc', 1): no_demand,
+            ('svc', 2): no_demand,
+        }, no_demand, no_demand, _api_pod_identity(), no_demand)
+
+    assert affected == {'svc'}
+    assert historical_one.dependency_facts[
+        'strictly_newer_committed_version'] == 3
+    assert historical_two.dependency_facts[
+        'strictly_newer_committed_version'] == 3
+    assert historical_one.dependency_facts['recovery_version'] == 3
+    assert historical_two.dependency_facts['recovery_version'] == 3
+    assert historical_one.dependency_facts['process_quiescence_count'] == 0
+    assert historical_one.dependency_facts[
+        'process_quiescence_sha256'] == '0' * 64
+    assert historical_one.dependency_facts[
+        'serve_consolidation_mode_proved'] is True
+    assert historical_one.dependency_facts['parent_non_pool_proved'] is True
+    assert historical_one.dependency_facts[
+        'resource_action_mode_legacy_inert'] is True
+    ledger_entry = {
+        'version': 1,
+        'dependency_facts': historical_one.dependency_facts,
+    }
+    assert (placement_contract_normalization.
+            _retirement_ledger_facts_are_complete(ledger_entry))
+    for field, contradictory_value in (
+        ('service_pool', 1),
+        ('service_resource_action_mode', 'shadow'),
+        ('service_resource_action_mode_changed_at', 1.0),
+    ):
+        tampered_facts = dict(historical_one.dependency_facts)
+        tampered_facts[field] = contradictory_value
+        assert not (placement_contract_normalization.
+                    _retirement_ledger_facts_are_complete({
+                        'version': 1,
+                        'dependency_facts': tampered_facts,
+                    }))
+    assert historical_one.result['yaml_content'] is None
+    assert historical_two.result['yaml_content'] is None
+    assert successor.result['yaml_content'] == 'service: {}'
+
+
+@pytest.mark.parametrize(('column', 'value', 'fact', 'fact_value', 'match'), [
+    ('placement_catalog', {}, None, None, 'placement catalog activation'),
+    (None, None, 'cleanup_intent_count', 1, 'storage cleanup intent'),
+    (None, None, 'replica_count', 1, 'owns replica rows'),
+    (None, None, 'unknown_version_replica_count', 1,
+     'NULL or orphan-version replica rows'),
+    ('controller_config', b'{}', None, None,
+     'incomplete staged controller configuration'),
+])
+def test_retirement_rejects_catalog_cleanup_and_bridge_dependencies(
+        column, value, fact, fact_value, match):
+    historical_payload = zlib.decompress(
+        base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
+    candidate = _normalizer_work(historical_payload, 1)
+    successor = _normalizer_work(_explicit_v2_payload(), 2)
+    if column is not None:
+        candidate.original[column] = value
+        candidate.result[column] = value
+    if fact is not None:
+        candidate.dependency_facts[fact] = fact_value
+    no_evidence = placement_contract_normalization._ExternalEvidence(
+        count=0, digest='0' * 64)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match=match):
+        placement_contract_normalization._prepare_retirement_rows(
+            [candidate, successor], {
+                'svc': {
+                    'current_version': 2,
+                    'active_versions': '[2]',
+                    'hash': 'current-hash',
+                    'lifecycle_epoch': 7,
+                    'resource_scope': 'current-scope',
+                    'workspace': 'workspace',
+                    'status': 'READY',
+                    'pool': 0,
+                    'resource_action_mode': 'legacy',
+                    'resource_action_mode_changed_at': None,
+                }
+            }, uuid.uuid4(), 10.0, {('svc', 1): no_evidence},
+            {('svc', 1): no_evidence}, no_evidence, no_evidence,
+            _api_pod_identity(), no_evidence)
+
+
+def test_retirement_rejects_same_service_placeholder_reservation():
+    historical_payload = zlib.decompress(
+        base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
+    candidate = _normalizer_work(historical_payload, 1)
+    successor = _normalizer_work(_explicit_v2_payload(), 2)
+    placeholder = _normalizer_work(pickle.dumps(None, protocol=4),
+                                   3,
+                                   yaml_content=None)
+    no_evidence = placement_contract_normalization._ExternalEvidence(
+        count=0, digest='0' * 64)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='placeholder or reservation'):
+        placement_contract_normalization._prepare_retirement_rows(
+            [candidate, successor, placeholder], {
+                'svc': {
+                    'current_version': 2,
+                    'active_versions': '[2]',
+                    'hash': 'current-hash',
+                    'lifecycle_epoch': 7,
+                    'resource_scope': 'current-scope',
+                    'workspace': 'workspace',
+                    'status': 'READY',
+                    'pool': 0,
+                    'resource_action_mode': 'legacy',
+                    'resource_action_mode_changed_at': None,
+                }
+            }, uuid.uuid4(), 10.0, {('svc', 1): no_evidence},
+            {('svc', 1): no_evidence}, no_evidence, no_evidence,
+            _api_pod_identity(), no_evidence)
+
+
+@pytest.mark.parametrize(('parent_delta', 'match'), [
+    ({
+        'pool': 1
+    }, 'exact non-pool parent'),
+    ({
+        'resource_action_mode': 'shadow',
+        'resource_action_mode_changed_at': 1.0,
+    }, 'inert legacy default'),
+    ({
+        'resource_action_mode': 'authoritative',
+        'resource_action_mode_changed_at': 1.0,
+    }, 'inert legacy default'),
+])
+def test_retirement_rejects_pool_or_active_resource_action_parent(
+        parent_delta, match):
+    historical_payload = zlib.decompress(
+        base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
+    candidate = _normalizer_work(historical_payload, 1)
+    successor = _normalizer_work(_explicit_v2_payload(), 2)
+    service = {
+        'current_version': 2,
+        'active_versions': '[2]',
+        'hash': 'current-hash',
+        'lifecycle_epoch': 7,
+        'resource_scope': 'current-scope',
+        'workspace': 'workspace',
+        'status': 'READY',
+        'pool': 0,
+        'resource_action_mode': 'legacy',
+        'resource_action_mode_changed_at': None,
+    }
+    service.update(parent_delta)
+    no_evidence = placement_contract_normalization._ExternalEvidence(
+        count=0, digest='0' * 64)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match=match):
+        placement_contract_normalization._prepare_retirement_rows(
+            [candidate, successor], {'svc': service}, uuid.uuid4(), 10.0,
+            {('svc', 1): no_evidence}, {('svc', 1): no_evidence}, no_evidence,
+            no_evidence, _api_pod_identity(), no_evidence)
+
+
+def test_terminal_service_normalizes_without_unloadable_receipt():
+    state = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        state.pop(field)
+    row = _normalizer_work(_raw_spec_pickle(state), 1)
+
+    affected = placement_contract_normalization._prepare_supported_rows(
+        [row], {'svc': {
+            'status': 'SHUTTING_DOWN',
+        }})
+
+    assert row.outcome == 'changed'
+    assert affected == set()
+
+
+def test_supported_apply_converts_fieldless_and_explicit_v1_to_v2():
+    fieldless_state = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        fieldless_state.pop(field)
+    fieldless = _normalizer_work(_raw_spec_pickle(fieldless_state), 1)
+    v1_spec = _spec()
+    explicit_v1_state = dict(v1_spec.__dict__)
+    explicit_v1_state.update(
+        v1_spec.placement_contract._legacy_v1_persisted_fields())
+    explicit_v1_state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+    explicit_v1 = _normalizer_work(_raw_spec_pickle(explicit_v1_state), 2)
+
+    affected = placement_contract_normalization._prepare_supported_rows(
+        [fieldless, explicit_v1], {
+            'svc': {
+                'status': 'READY',
+                'current_version': 2,
+                'pool': 0,
+                'logical_replica_semantics': 0,
+            }
+        })
+
+    assert affected == {'svc'}
+    for row in (fieldless, explicit_v1):
+        assert row.outcome == 'changed'
+        state = pickle.loads(row.result['spec']).__dict__
+        assert state[placement_policy.CONTRACT_VERSION_FIELD] == 2
+        assert placement_policy.ROLLBACK_REPLICA_UNIT_FIELD not in state
+        assert row.dependency_facts['receipt_current_version'] == 2
+        assert row.dependency_facts['receipt_recovery_version'] == 2
+        assert row.dependency_facts['receipt_loadable_result_proved'] is True
+        assert row.dependency_facts['receipt_parent_contract_proved'] is True
+
+
+def test_supported_receipt_rejects_parent_logical_fence_mismatch():
+    fieldless_state = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        fieldless_state.pop(field)
+    fieldless = _normalizer_work(_raw_spec_pickle(fieldless_state), 1)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='durable logical-replica fence'):
+        placement_contract_normalization._prepare_supported_rows(
+            [fieldless], {
+                'svc': {
+                    'status': 'READY',
+                    'current_version': 1,
+                    'pool': 0,
+                    'logical_replica_semantics': 1,
+                }
+            })
+
+
+def test_supported_receipt_rejects_recovery_logical_fence_mismatch():
+    fieldless_state = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        fieldless_state.pop(field)
+    fieldless = _normalizer_work(_raw_spec_pickle(fieldless_state), 1)
+    recovery = _normalizer_work(_explicit_v2_payload(), 2)
+    recovery.original['controller_applied_at'] = 1.0
+    recovery.result['controller_applied_at'] = 1.0
+    current = _normalizer_work(
+        _explicit_v2_payload(placement_policy.CAPACITY_AWARE_SPOT_PLACER), 3)
+    current.original['quarantined_at'] = 2.0
+    current.result['quarantined_at'] = 2.0
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='quarantine-aware recovery target disagrees'):
+        placement_contract_normalization._prepare_supported_rows(
+            [fieldless, recovery, current], {
+                'svc': {
+                    'status': 'READY',
+                    'current_version': 3,
+                    'pool': 0,
+                    'logical_replica_semantics': 1,
+                }
+            })
+
+
+@pytest.mark.parametrize('unloadable_current', ['placeholder', 'historical'])
+def test_supported_apply_rejects_unloadable_current_receipt_target(
+        unloadable_current):
+    fieldless_state = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        fieldless_state.pop(field)
+    fieldless = _normalizer_work(_raw_spec_pickle(fieldless_state), 1)
+    if unloadable_current == 'placeholder':
+        current = _normalizer_work(pickle.dumps(None, protocol=4),
+                                   2,
+                                   yaml_content=None)
+    else:
+        current = _normalizer_work(
+            zlib.decompress(
+                base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64)), 2)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='current_version is not a surviving committed'):
+        placement_contract_normalization._prepare_supported_rows(
+            [fieldless, current],
+            {'svc': {
+                'status': 'READY',
+                'current_version': 2,
+            }})
+
+
+def test_supported_apply_rejects_historical_recovery_receipt_target():
+    fieldless_state = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        fieldless_state.pop(field)
+    fieldless = _normalizer_work(_raw_spec_pickle(fieldless_state), 1)
+    historical = _normalizer_work(
+        zlib.decompress(
+            base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64)), 2)
+    historical.original['controller_applied_at'] = 1.0
+    historical.result['controller_applied_at'] = 1.0
+    current = _normalizer_work(_explicit_v2_payload(), 3)
+    quarantined = _normalizer_work(_explicit_v2_payload(), 4)
+    quarantined.original['quarantined_at'] = 2.0
+    quarantined.result['quarantined_at'] = 2.0
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='quarantine-aware recovery version'):
+        placement_contract_normalization._prepare_supported_rows(
+            [fieldless, historical, current, quarantined],
+            {'svc': {
+                'status': 'READY',
+                'current_version': 3,
+            }})
+
+
+def test_normalization_ledger_records_current_parent_identity():
+    row = _normalizer_work(_explicit_v2_payload(), 1)
+    session = mock.Mock()
+    run_id = uuid.uuid4()
+
+    placement_contract_normalization._insert_ledger(
+        session, [row],
+        run_id=run_id,
+        mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+        row_bound=1,
+        started_at=1.0,
+        completed_at=2.0,
+        freeze_evidence_sha256='f' * 64,
+        pre_digest='a' * 64,
+        post_digest='b' * 64)
+
+    ledger_values = session.execute.call_args_list[1].args[1]
+    assert ledger_values[0]['service_hash'] == 'current-hash'
+    assert ledger_values[0]['service_lifecycle_epoch'] == 7
+
+
+def test_apply_rejects_prior_ledger_drift():
+    mismatch = ({
+        'service_name': 'svc',
+        'version': 1,
+        'last_completed_at': 1.0,
+    },)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='Prior normalization ledger does not match'):
+        placement_contract_normalization._require_prior_ledger_consistency(
+            mismatch)
+
+    placement_contract_normalization._require_prior_ledger_consistency(({
+        'service_name': 'svc',
+        'version': 2,
+        'reason': 'untracked_current_row',
+    },))
+    placement_contract_normalization._require_prior_ledger_consistency(({
+        'service_name': 'svc',
+        'version': 3,
+        'reason': 'tracked_row_absent_from_current_inventory',
+    },))
+
+
+def test_postgres_inventory_blocks_live_parent_workload_kind_mismatch(
+        empty_postgres):
+    engine = empty_postgres
+    serve_state.Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(serve_state.services_table.insert().values(
+            name='svc',
+            workspace='workspace',
+            status='READY',
+            current_version=1,
+            active_versions='[1]',
+            pool=1,
+            hash='service-hash',
+            lifecycle_epoch=1,
+            resource_scope='service-hash'))
+        connection.execute(serve_state.version_specs_table.insert().values(
+            service_name='svc',
+            version=1,
+            spec=_explicit_v2_payload(),
+            yaml_content='service: {}',
+            created_at=1.0,
+            created_by='test'))
+
+    result = placement_contract_normalization.run_operator(engine=engine,
+                                                           mode=None,
+                                                           row_bound=10)
+
+    assert result.classification_counts == {'blocker': 1}
+    assert result.blockers[0]['reason'].startswith(
+        'Persisted contract workload kind disagrees with its live parent')
+
+
+def test_postgres_operator_apply_rerun_new_row_and_cas_rollback(
+        empty_postgres, monkeypatch):
+    engine = empty_postgres
+    serve_state.Base.metadata.create_all(engine)
+    fieldless_state = dict(_spec().__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        fieldless_state.pop(field)
+    fieldless_payload = _raw_spec_pickle(fieldless_state)
+    no_evidence = placement_contract_normalization._ExternalEvidence(
+        count=0, digest='0' * 64)
+
+    with engine.begin() as connection:
+        connection.execute(serve_state.services_table.insert().values(
+            name='svc',
+            workspace='workspace',
+            status='READY',
+            current_version=1,
+            active_versions='[1]',
+            hash='service-hash',
+            lifecycle_epoch=1,
+            resource_scope='service-hash'))
+        connection.execute(serve_state.version_specs_table.insert().values(
+            service_name='svc',
+            version=1,
+            spec=fieldless_payload,
+            yaml_content='service: {}',
+            created_at=1.0,
+            created_by='test'))
+
+    run = placement_contract_normalization.run_operator(
+        engine=engine,
+        mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+        row_bound=10,
+        freeze_evidence_sha256='f' * 64,
+        request_evidence_getter=lambda _engine: no_evidence,
+        api_pod_checker=lambda _engine: _api_pod_identity())
+    assert run.changed_rows == 1
+    assert run.prior_ledger_mismatches == ()
+    with engine.connect() as connection:
+        normalized_payload = connection.execute(
+            sqlalchemy.select(serve_state.version_specs_table.c.spec).where(
+                serve_state.version_specs_table.c.service_name == 'svc',
+                serve_state.version_specs_table.c.version == 1)).scalar_one()
+    normalized_state = pickle.loads(normalized_payload).__dict__
+    assert normalized_state[placement_policy.CONTRACT_VERSION_FIELD] == 2
+    assert placement_policy.ROLLBACK_REPLICA_UNIT_FIELD not in normalized_state
+
+    # A mutable, non-spec operational column may legitimately change after a
+    # manifest.  Prior consistency fences only the exact result spec for the
+    # same service incarnation; the next run records a fresh row snapshot.
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.update().where(
+            serve_state.version_specs_table.c.service_name == 'svc',
+            serve_state.version_specs_table.c.version == 1).values(
+                placement_catalog={'candidate': 'updated'}))
+    rerun = placement_contract_normalization.run_operator(
+        engine=engine,
+        mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+        row_bound=10,
+        freeze_evidence_sha256='e' * 64,
+        request_evidence_getter=lambda _engine: no_evidence,
+        api_pod_checker=lambda _engine: _api_pod_identity())
+    assert rerun.changed_rows == 0
+    assert rerun.prior_ledger_mismatches == ()
+
+    # A fieldless row committed after the prior inventory is not grandfathered
+    # by that manifest: the next run classifies and normalizes it.  Force its
+    # CAS to miss once and prove the ledger plus all writes roll back together.
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert().values(
+            service_name='svc',
+            version=2,
+            spec=fieldless_payload,
+            yaml_content='service: {}',
+            created_at=2.0,
+            created_by='test'))
+        connection.execute(serve_state.services_table.update().where(
+            serve_state.services_table.c.name == 'svc').values(
+                current_version=2, active_versions='[2]'))
+    untracked_dry_run = placement_contract_normalization.run_operator(
+        engine=engine, mode=None, row_bound=10)
+    assert [
+        mismatch['reason']
+        for mismatch in untracked_dry_run.prior_ledger_mismatches
+    ] == ['untracked_current_row']
+    original_cas = placement_contract_normalization._cas_version_result
+
+    def force_changed_row_cas_miss(session, row):
+        if row.outcome == 'changed':
+            session.execute(serve_state.version_specs_table.update().where(
+                serve_state.version_specs_table.c.service_name ==
+                row.identity[0], serve_state.version_specs_table.c.version ==
+                row.identity[1]).values(spec=_explicit_v2_payload()))
+        original_cas(session, row)
+
+    monkeypatch.setattr(placement_contract_normalization, '_cas_version_result',
+                        force_changed_row_cas_miss)
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='Version CAS failed'):
+        placement_contract_normalization.run_operator(
+            engine=engine,
+            mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+            row_bound=10,
+            freeze_evidence_sha256='d' * 64,
+            request_evidence_getter=lambda _engine: no_evidence,
+            api_pod_checker=lambda _engine: _api_pod_identity())
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state.placement_normalization_runs_table)).scalar_one(
+                ) == 2
+        assert connection.execute(
+            sqlalchemy.select(serve_state.version_specs_table.c.spec).where(
+                serve_state.version_specs_table.c.service_name == 'svc',
+                serve_state.version_specs_table.c.version ==
+                2)).scalar_one() == fieldless_payload
+
+    monkeypatch.setattr(placement_contract_normalization, '_cas_version_result',
+                        original_cas)
+    new_row_run = placement_contract_normalization.run_operator(
+        engine=engine,
+        mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+        row_bound=10,
+        freeze_evidence_sha256='c' * 64,
+        request_evidence_getter=lambda _engine: no_evidence,
+        api_pod_checker=lambda _engine: _api_pod_identity())
+    assert new_row_run.changed_rows == 1
+    assert new_row_run.run_id is not None
+    assert [
+        mismatch['reason'] for mismatch in new_row_run.prior_ledger_mismatches
+    ] == ['untracked_current_row']
+    with engine.connect() as connection:
+        ledger_row = connection.execute(
+            sqlalchemy.select(
+                serve_state.placement_normalization_rows_table.c.classification,
+                serve_state.placement_normalization_rows_table.c.outcome,
+            ).where(
+                serve_state.placement_normalization_rows_table.c.run_id ==
+                uuid.UUID(new_row_run.run_id),
+                serve_state.placement_normalization_rows_table.c.version ==
+                2)).one()
+    assert tuple(ledger_row) == ('fieldless_supported', 'changed')
+
+    # New explicit-v2 and uncommitted placeholder rows need no rewrite, but
+    # they are still captured by the next complete fleet manifest.
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert(), [{
+            'service_name': 'svc',
+            'version': 3,
+            'spec': pickle.dumps(None, protocol=4),
+            'yaml_content': None,
+            'created_at': 3.0,
+            'created_by': 'test',
+        }, {
+            'service_name': 'svc',
+            'version': 4,
+            'spec': _explicit_v2_payload(),
+            'yaml_content': 'service: {}',
+            'created_at': 4.0,
+            'created_by': 'test',
+        }])
+    manifest_dry_run = placement_contract_normalization.run_operator(
+        engine=engine, mode=None, row_bound=10)
+    assert [
+        mismatch['reason']
+        for mismatch in manifest_dry_run.prior_ledger_mismatches
+    ] == ['untracked_current_row', 'untracked_current_row']
+    manifest_run = placement_contract_normalization.run_operator(
+        engine=engine,
+        mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+        row_bound=10,
+        freeze_evidence_sha256='b' * 64,
+        request_evidence_getter=lambda _engine: no_evidence,
+        api_pod_checker=lambda _engine: _api_pod_identity())
+    assert manifest_run.changed_rows == 0
+    assert manifest_run.run_id is not None
+    assert [
+        mismatch['reason'] for mismatch in manifest_run.prior_ledger_mismatches
+    ] == ['untracked_current_row', 'untracked_current_row']
+    with engine.connect() as connection:
+        new_entries = connection.execute(
+            sqlalchemy.select(
+                serve_state.placement_normalization_rows_table.c.version,
+                serve_state.placement_normalization_rows_table.c.classification,
+                serve_state.placement_normalization_rows_table.c.outcome,
+            ).where(
+                serve_state.placement_normalization_rows_table.c.run_id ==
+                uuid.UUID(manifest_run.run_id),
+                serve_state.placement_normalization_rows_table.c.version.in_([
+                    3, 4
+                ])).order_by(serve_state.placement_normalization_rows_table.c.
+                             version)).all()
+    assert [tuple(entry) for entry in new_entries] == [
+        (3, 'placeholder', 'unchanged'),
+        (4, 'explicit_v2', 'unchanged'),
+    ]
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.delete().where(
+            serve_state.version_specs_table.c.service_name == 'svc',
+            serve_state.version_specs_table.c.version == 4))
+    removed_row_dry_run = placement_contract_normalization.run_operator(
+        engine=engine, mode=None, row_bound=10)
+    assert [
+        mismatch['reason']
+        for mismatch in removed_row_dry_run.prior_ledger_mismatches
+    ] == ['tracked_row_absent_from_current_inventory']
+    removed_row_manifest = placement_contract_normalization.run_operator(
+        engine=engine,
+        mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+        row_bound=10,
+        freeze_evidence_sha256='a' * 64,
+        request_evidence_getter=lambda _engine: no_evidence,
+        api_pod_checker=lambda _engine: _api_pod_identity())
+    assert [
+        mismatch['reason']
+        for mismatch in removed_row_manifest.prior_ledger_mismatches
+    ] == ['tracked_row_absent_from_current_inventory']
+    assert placement_contract_normalization.run_operator(
+        engine=engine, mode=None, row_bound=10).prior_ledger_mismatches == ()
+
+
+def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
+        empty_postgres):
+    engine = empty_postgres
+    serve_state.Base.metadata.create_all(engine)
+    historical_payload = zlib.decompress(
+        base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
+    successor_payload = _explicit_v2_payload()
+    with engine.begin() as connection:
+        connection.execute(serve_state.services_table.insert().values(
+            name='svc',
+            workspace='workspace',
+            status='READY',
+            current_version=2,
+            active_versions='[2]',
+            hash='service-hash',
+            lifecycle_epoch=7,
+            resource_scope='service-hash'))
+        connection.execute(serve_state.version_specs_table.insert(), [{
+            'service_name': 'svc',
+            'version': 1,
+            'spec': historical_payload,
+            'yaml_content': 'service: {}',
+            'created_at': 1.0,
+            'created_by': 'test',
+        }, {
+            'service_name': 'svc',
+            'version': 2,
+            'spec': successor_payload,
+            'yaml_content': 'service: {}',
+            'created_at': 2.0,
+            'created_by': 'test',
+        }])
+
+    no_evidence = placement_contract_normalization._ExternalEvidence(
+        count=0, digest='0' * 64)
+
+    for replica_id, replica_version in ((1, None), (2, 999)):
+        with engine.begin() as connection:
+            connection.execute(serve_state.replicas_table.insert().values(
+                service_name='svc',
+                replica_id=replica_id,
+                version=replica_version))
+        with orm.Session(engine) as session:
+            inventory, _ = placement_contract_normalization._scan_inventory(
+                session, row_bound=10)
+        historical = next(
+            row for row in inventory if row.identity == ('svc', 1))
+        assert historical.dependency_facts['unknown_version_replica_count'] == 1
+        with engine.begin() as connection:
+            connection.execute(serve_state.replicas_table.delete().where(
+                serve_state.replicas_table.c.service_name == 'svc',
+                serve_state.replicas_table.c.replica_id == replica_id))
+
+    def no_resource_actions(_engine, targets):
+        return {
+            (target.service_name, target.version): no_evidence
+            for target in targets
+        }
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='consolidation mode'):
+        placement_contract_normalization.run_operator(
+            engine=engine,
+            mode=(placement_contract_normalization.ApplyMode.
+                  RETIRE_TERMINAL_HISTORICAL),
+            row_bound=10,
+            freeze_evidence_sha256='f' * 64,
+            consolidation_mode_checker=lambda: False)
+
+    common_retirement_kwargs = {
+        'engine': engine,
+        'mode': (placement_contract_normalization.ApplyMode.
+                 RETIRE_TERMINAL_HISTORICAL),
+        'row_bound': 10,
+        'freeze_evidence_sha256': 'f' * 64,
+        'image_evidence_getter': lambda _name, _version: no_evidence,
+        'request_evidence_getter': lambda _engine: no_evidence,
+        'process_evidence_getter': lambda _targets, _pod_uid: no_evidence,
+        'resource_action_evidence_getter': no_resource_actions,
+        'api_pod_checker': lambda _engine: _api_pod_identity(),
+        'controller_hold_checker': lambda: True,
+        'consolidation_mode_checker': lambda: True,
+    }
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='cluster evidence is not quiescent'):
+        placement_contract_normalization.run_operator(
+            **common_retirement_kwargs,
+            legacy_controller_evidence_getter=lambda:
+            (placement_contract_normalization._ExternalEvidence(
+                count=1, digest='1' * 64)))
+
+    changing_legacy_evidence = iter((
+        no_evidence,
+        placement_contract_normalization._ExternalEvidence(count=0,
+                                                           digest='1' * 64),
+    ))
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='cluster evidence changed during apply'):
+        placement_contract_normalization.run_operator(
+            **common_retirement_kwargs,
+            legacy_controller_evidence_getter=lambda: next(
+                changing_legacy_evidence))
+
+    timestamps = iter((10.0, 11.0, 12.0))
+    result = placement_contract_normalization.run_operator(
+        **common_retirement_kwargs,
+        legacy_controller_evidence_getter=lambda: no_evidence,
+        now=lambda: next(timestamps))
+
+    assert result.changed_rows == 0
+    assert result.retired_rows == 1
+    assert result.run_id is not None
+    run_id = uuid.UUID(result.run_id)
+    with engine.connect() as connection:
+        versions = connection.execute(
+            sqlalchemy.select(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name == 'svc').
+            order_by(
+                serve_state.version_specs_table.c.version)).mappings().all()
+        service = connection.execute(
+            sqlalchemy.select(serve_state.services_table).where(
+                serve_state.services_table.c.name == 'svc')).mappings().one()
+        ledger = connection.execute(
+            sqlalchemy.select(
+                serve_state.placement_normalization_rows_table.c.version,
+                serve_state.placement_normalization_rows_table.c.classification,
+                serve_state.placement_normalization_rows_table.c.outcome,
+            ).where(serve_state.placement_normalization_rows_table.c.run_id ==
+                    run_id).order_by(
+                        serve_state.placement_normalization_rows_table.c.version
+                    )).all()
+
+    assert [row['version'] for row in versions] == [1, 2]
+    retired, successor = versions
+    assert bytes(retired['spec']) == pickle.dumps(None, protocol=4)
+    assert retired['yaml_content'] is None
+    assert retired['retired_yaml_content'] == 'service: {}'
+    assert retired['retired_at'] == 11.0
+    assert retired['retirement_run_id'] == run_id
+    assert bytes(successor['spec']) == successor_payload
+    assert successor['yaml_content'] == 'service: {}'
+    assert service['current_version'] == 2
+    assert service['placement_normalization_requested_run_id'] == run_id
+    assert service['placement_normalization_loaded_run_id'] is None
+    assert [tuple(row) for row in ledger] == [
+        (1, 'historical_physical_per_gpu', 'retired'),
+        (2, 'explicit_v2', 'unchanged'),
+    ]
+    dry_run = placement_contract_normalization.run_operator(engine=engine,
+                                                            mode=None,
+                                                            row_bound=10)
+    assert dry_run.classification_counts == {
+        'retired': 1,
+        'explicit_v2': 1,
+    }
+    assert dry_run.changed_rows == 0
+    assert dry_run.blockers == ()
+
+
+def test_ledger_manifest_verifies_complete_pre_and_post_inventory():
+    row = _normalizer_work(_explicit_v2_payload(), 1)
+    original_columns = placement_contract_normalization._column_sha256s(
+        row.original)
+    result_columns = placement_contract_normalization._column_sha256s(
+        row.result)
+    original_row_digest = placement_contract_normalization._row_sha256(
+        row.original)
+    result_row_digest = placement_contract_normalization._row_sha256(row.result)
+    run_id = uuid.uuid4()
+    entry = {
+        'run_id': run_id,
+        'service_name': 'svc',
+        'version': 1,
+        'classification': row.classification.value,
+        'outcome': 'unchanged',
+        'original_spec_sha256': row.analysis.source_sha256,
+        'result_spec_sha256': row.analysis.source_sha256,
+        'original_row_sha256': original_row_digest,
+        'result_row_sha256': result_row_digest,
+        'original_column_sha256s': original_columns,
+        'result_column_sha256s': result_columns,
+        'service_hash': 'current-hash',
+        'service_lifecycle_epoch': 7,
+        'dependency_facts': row.dependency_facts,
+    }
+    run = {
+        'run_id': run_id,
+        'mode': 'apply_supported',
+        'normalizer_version': '1:test-commit',
+        'schema_revision': '037',
+        'release_version': 'test-release',
+        'started_at': 1.0,
+        'completed_at': 2.0,
+        'row_count': 1,
+        'row_bound': 1,
+        'classification_counts': {
+            row.classification.value: 1,
+        },
+        'pre_inventory_sha256': placement_contract_normalization._sha256(
+            f'[["svc",1,"{original_row_digest}"]]'.encode()),
+        'post_inventory_sha256': placement_contract_normalization._sha256(
+            f'[["svc",1,"{result_row_digest}"]]'.encode()),
+        'freeze_evidence_sha256': 'e' * 64,
+    }
+
+    assert placement_contract_normalization._ledger_manifest_mismatches(
+        run, [entry]) == []
+
+    entry['outcome'] = 'changed'
+    tamper_reasons = {
+        issue['reason'] for issue in placement_contract_normalization.
+        _ledger_manifest_mismatches(run, [entry])
+    }
+    assert 'invalid_classification_outcome' in tamper_reasons
+    assert 'spec_digest_outcome_mismatch' in tamper_reasons
+    entry['outcome'] = 'unchanged'
+
+    entry['result_row_sha256'] = 'f' * 64
+    reasons = {
+        issue['reason'] for issue in placement_contract_normalization.
+        _ledger_manifest_mismatches(run, [entry])
+    }
+    assert 'invalid_result_column_inventory' in reasons
+    assert 'post_inventory_digest_mismatch' in reasons
+
+
+def test_postimage_verification_rereads_every_version_column(monkeypatch):
+    expected = _normalizer_work(_explicit_v2_payload(), 1)
+    observed = _normalizer_work(expected.original['spec'], 1)
+    digest = placement_contract_normalization._fleet_sha256([expected],
+                                                            result=True)
+    monkeypatch.setattr(placement_contract_normalization, '_scan_inventory',
+                        lambda _session, _bound: ([observed], {}))
+
+    placement_contract_normalization._verify_version_postimages(
+        mock.Mock(), [expected], 1, digest)
+
+    observed.original['created_by'] = 'unexpected-trigger-write'
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='postimages do not match'):
+        placement_contract_normalization._verify_version_postimages(
+            mock.Mock(), [expected], 1, digest)
 
 
 def test_fieldless_per_gpu_spec_materializes_historical_physical_contract():
     state = dict(_spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER).__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
         state.pop(field)
-    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
 
     restored = _restore(state)
 
@@ -410,28 +1910,29 @@ def test_fieldless_per_gpu_spec_materializes_historical_physical_contract():
         placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] is False
     copied = restored.copy()
     assert copied.placement_contract == restored.placement_contract
-    assert copied.spot_placer == placement_policy.CAPACITY_AWARE_SPOT_PLACER
+    with pytest.raises(ValueError, match='mirror-free v2'):
+        pickle.dumps(copied, protocol=4)
 
 
 def test_historical_copy_preserves_pre_validation_scaling_values():
     state = dict(_spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER).__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
         state.pop(field)
-    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
     state['_target_utilization_percentage'] = 0
     legacy = _restore(state)
 
     copied = legacy.copy()
-
-    assert copied.placement_contract.is_legacy_physical_per_gpu
     assert copied.target_utilization_percentage == 0
+    with pytest.raises(ValueError, match='mirror-free v2'):
+        pickle.dumps(copied, protocol=4)
 
 
 def test_pre_placement_spec_materializes_explicit_disabled_service_contract():
     state = dict(_spec().__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
         state.pop(field)
-    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
     state.pop(placement_policy.POLICY_NAME_FIELD)
     state.pop(placement_policy.POOL_FIELD)
 
@@ -460,6 +1961,9 @@ def test_pre_placement_spec_materializes_explicit_disabled_service_contract():
 ])
 def test_v1_contract_corruption_fails_loudly(corrupt):
     state = dict(_spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER).__dict__)
+    state[placement_policy.CONTRACT_VERSION_FIELD] = (
+        placement_policy.PLACEMENT_CONTRACT_VERSION_V1)
+    state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = True
     if corrupt == 'partial':
         state.pop(placement_policy.CONTRACT_COST_UNIT_FIELD)
     elif corrupt == 'boolean_version':
@@ -549,6 +2053,21 @@ def test_decode_boundary_emits_bounded_structured_events(caplog):
         assert not restored.placement_contract.enabled
     assert caplog.text.count('event=skyserve_placement_contract_decode') == 1
     assert 'outcome=legacy_materialized' in caplog.text
+    assert 'source=fieldless' in caplog.text
+
+    caplog.clear()
+    explicit_v1_state = dict(_spec().__dict__)
+    explicit_v1_state[placement_policy.CONTRACT_VERSION_FIELD] = (
+        placement_policy.PLACEMENT_CONTRACT_VERSION_V1)
+    explicit_v1_state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+    with caplog.at_level(logging.WARNING, logger='sky.serve.service_spec'):
+        restored_v1 = _restore(explicit_v1_state)
+    assert restored_v1.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 2
+    assert (placement_policy.ROLLBACK_REPLICA_UNIT_FIELD
+            not in restored_v1.__dict__)
+    assert caplog.text.count('event=skyserve_placement_contract_decode') == 1
+    assert 'outcome=legacy_materialized' in caplog.text
+    assert 'source=v1' in caplog.text
 
     caplog.clear()
     rejected_state = dict(_spec().__dict__)
@@ -561,29 +2080,26 @@ def test_decode_boundary_emits_bounded_structured_events(caplog):
     assert 'contract_fields_present=6' in caplog.text
 
 
-def test_transition_reader_accepts_v2_and_copy_downgrades_to_v1():
+def test_transition_reader_accepts_v2_and_copy_stays_v2():
     original = _spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER)
     state = dict(original.__dict__)
-    state.update(
-        original.placement_contract.persisted_fields(
-            placement_policy.PLACEMENT_CONTRACT_VERSION_CLEANUP))
-    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    state.update(original.placement_contract.persisted_fields())
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
 
     restored = _restore(state)
 
     assert restored.placement_contract == original.placement_contract
     assert placement_policy.ROLLBACK_REPLICA_UNIT_FIELD not in restored.__dict__
     copied = restored.copy()
-    assert copied.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 1
-    assert copied.__dict__[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] is True
+    assert copied.__dict__[placement_policy.CONTRACT_VERSION_FIELD] == 2
+    assert (placement_policy.ROLLBACK_REPLICA_UNIT_FIELD not in copied.__dict__)
 
 
 def test_v2_rejects_rollback_mirror():
     original = _spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER)
     state = dict(original.__dict__)
-    state.update(
-        original.placement_contract.persisted_fields(
-            placement_policy.PLACEMENT_CONTRACT_VERSION_CLEANUP))
+    state.update(original.placement_contract.persisted_fields())
+    state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = True
 
     with pytest.raises(ValueError, match='v2 must not contain'):
         _restore(state)
@@ -596,19 +2112,18 @@ def test_v2_writer_rejects_transition_only_historical_contract():
         uses_logical_replicas=False)
 
     with pytest.raises(ValueError, match='v2 cannot encode'):
-        legacy.persisted_fields(
-            placement_policy.PLACEMENT_CONTRACT_VERSION_CLEANUP)
+        legacy.persisted_fields()
 
 
 def test_v2_reader_rejects_transition_only_historical_contract():
     state = dict(_spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER).__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
         state.pop(field)
-    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
     historical = _restore(state)
     v2_state = dict(historical.__dict__)
     v2_state[placement_policy.CONTRACT_VERSION_FIELD] = (
-        placement_policy.PLACEMENT_CONTRACT_VERSION_CLEANUP)
+        placement_policy.PLACEMENT_CONTRACT_VERSION_V2)
     v2_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
 
     with pytest.raises(ValueError, match='v2 cannot encode'):
@@ -619,7 +2134,7 @@ def test_contract_driver_override_resolves_fresh_semantics():
     state = dict(_spec(placement_policy.CAPACITY_AWARE_SPOT_PLACER).__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
         state.pop(field)
-    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
     legacy = _restore(state)
     assert legacy.placement_contract.is_legacy_physical_per_gpu
 

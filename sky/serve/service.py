@@ -36,6 +36,7 @@ from sky.data import data_utils
 from sky.serve import constants
 from sky.serve import controller
 from sky.serve import lb_k8s
+from sky.serve import maintenance
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
@@ -1106,6 +1107,22 @@ def _respawn_controller(
     The external LB continues serving its last routing view while the proxy
     reports 503 during the controller gap.
     """
+    if maintenance.is_controller_hold_active():
+        try:
+            identity = serve_state.get_service_mode_and_hash(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            # The hold applies unless the durable row positively identifies a
+            # pool.  A DB error is not permission to resume a Serve child.
+            logger.warning(
+                f'Could not prove {service_name!r} is a pool while the server '
+                f'deployment hold is active: '
+                f'{common_utils.format_exception(e)}')
+            return None
+        if identity is None or not identity[0]:
+            logger.warning(f'Refusing to respawn the controller child for '
+                           f'{service_name!r} while the server deployment hold '
+                           'is active.')
+            return None
     if not _reap_dead_controller_for_respawn(service_name, dead_controller):
         return None
 
@@ -1551,6 +1568,28 @@ def _start(service_name: str,
            created_by: str | None = None,
            submitted_task_yaml: str | None = None):
     """Start the service controller and reconcile its external LB."""
+    # This check precedes every DB mutation and, critically, the destructive
+    # cleanup ``finally`` below. Both fresh and persisted recovery scripts use
+    # this entrypoint. Pools remain available, but an unprovable mode is held.
+    if maintenance.is_controller_hold_active():
+        identity = serve_state.get_service_mode_and_hash(service_name)
+        is_pool = identity is not None and identity[0]
+        if identity is None:
+            try:
+                with open(os.path.expanduser(tmp_task_yaml),
+                          encoding='utf-8') as task_file:
+                    raw_task = yaml_utils.safe_load(task_file.read())
+                is_pool = (isinstance(raw_task, dict) and
+                           raw_task.get('pool') is not None)
+            except Exception as e:
+                raise RuntimeError(
+                    f'Refusing to start controller {service_name!r}: its mode '
+                    'cannot be proven while the server deployment hold is '
+                    'active.') from e
+        if not is_pool:
+            raise RuntimeError(
+                'Refusing to start a SkyServe controller while the server '
+                'deployment hold is active.')
     raw_recovery_owner_fence = os.environ.pop(
         constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR, None)
     recovery_owner_fence = (

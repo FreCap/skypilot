@@ -178,6 +178,25 @@ tests:
             secret:
               secretName: db-ca
 
+  - it: should expose the explicit SkyServe controller maintenance hold
+    set:
+      serve.controllerHold: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD
+            value: "true"
+
+  - it: should reject overriding the chart-owned controller hold env
+    set:
+      apiService.extraEnvs:
+        - name: SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD
+          value: "true"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD" is duplicated or reserved by the chart'
+
   - it: should prefix gcp credentials init container image with the global registry override
     set:
       global.imageRegistry: registry.example.com/custom
@@ -1770,11 +1789,11 @@ tests:
             name: SOME_OTHER_ENV
             value: "x"
       # The four HA role and identity variables extend the prior baseline.
-      # The chart-owned quiescence guard extends the baseline by one.
-      # A duplicate POD_IP would push the count to 20.
+      # The chart-owned quiescence guard and Serve hold extend the baseline.
+      # A duplicate POD_IP would push the count to 21.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 19
+          count: 20
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -1785,11 +1804,11 @@ tests:
               fieldPath: status.podIP
     asserts:
       # The four HA role and identity variables extend the prior baseline.
-      # The chart-owned quiescence guard extends the baseline by one.
-      # A duplicate POD_IP would push the count to 19.
+      # The chart-owned quiescence guard and Serve hold extend the baseline.
+      # A duplicate POD_IP would push the count to 20.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 18
+          count: 19
 
   - it: should allow custom GCP workload identity env when native credentials are disabled
     set:

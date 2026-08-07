@@ -97,7 +97,7 @@ _REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
 _QUIESCENCE_BACKEND_GUARD_ENV_VAR = (
     'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS')
 _IMAGE_ID_DIGEST_PATTERN = re.compile(r'(?:@|//)(sha256:[0-9a-fA-F]{64})$')
-_PROTOCOL_V2_SCHEMA_REVISIONS = frozenset({'035', '036'})
+_PROTOCOL_V2_SCHEMA_REVISIONS = frozenset({'035', '036', '037'})
 _PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION = '008'
 _MAX_SERVICE_ACCOUNT_TOKEN_BYTES = 64 * 1024
 # Keep this equal to the API request server-instance lease's stale horizon.
@@ -1445,7 +1445,7 @@ def activate_protocol_v2() -> bool:
             observed_revision = schema_revision or 'uninitialized'
             raise ProtocolV2ActivationError(
                 'Reserved-fill protocol v2 requires exact Serve schema '
-                'revision 035 or 036; observed '
+                'revision 035, 036, or 037; observed '
                 f'{observed_revision}.')
         api_request_schema_revision = (
             migration_utils.get_current_alembic_revision(
@@ -1497,7 +1497,7 @@ def demote_protocol_v1() -> bool:
             observed_revision = schema_revision or 'uninitialized'
             raise ProtocolV1DemotionError(
                 'Reserved-fill protocol v1 demotion requires exact Serve '
-                'schema revision 035 or 036; observed '
+                'schema revision 035, 036, or 037; observed '
                 f'{observed_revision}.')
         api_request_schema_revision = (
             migration_utils.get_current_alembic_revision(

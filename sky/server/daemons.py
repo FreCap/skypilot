@@ -301,7 +301,19 @@ def _serve_status_refresh_event(pool: bool):
     """Refresh the sky serve status for controller consolidation mode."""
     # pylint: disable=import-outside-toplevel
     from sky.serve import constants as serve_constants
+    from sky.serve import maintenance
     from sky.serve import serve_utils
+
+    if not pool and maintenance.is_controller_hold_active():
+        # Keep the durable daemon registered, but do no recovery, status
+        # mutation, or orphan-LB cleanup while operators rewrite persisted
+        # contracts.  Returning without sleeping would busy-loop in
+        # InternalRequestDaemon.run_event().
+        from sky.skylet import events
+        logger.warning('SkyServe controller recovery and status refresh are '
+                       'held by the server deployment.')
+        time.sleep(events.EVENT_CHECKING_INTERVAL_SECONDS)
+        return
 
     # Acquire an advisory lock so that only one pod runs the recovery /
     # controller-startup path at a time. Re-verified every iteration: a

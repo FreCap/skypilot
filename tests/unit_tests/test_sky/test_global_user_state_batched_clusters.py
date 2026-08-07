@@ -7,6 +7,7 @@ as a double N+1 inside ReplicaInfo.to_info_dict.
 # pylint: disable=protected-access
 from unittest import mock
 
+import pytest
 import sqlalchemy
 from sqlalchemy import event
 
@@ -292,6 +293,37 @@ def test_get_cluster_status_fields_all_unmanaged_uses_one_select(
 
     assert set(result) == {'user-a', 'user-b'}
     assert len(select_statements) == 1
+
+
+def test_get_cluster_status_fields_by_prefix_is_filtered_and_bounded(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('sky-serve-controller-old')
+    _add_cluster('ordinary-cluster')
+    _add_cluster('sky-serve-controller-current')
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        result = global_user_state.get_cluster_status_fields_by_prefix(
+            'sky-serve-controller-', row_limit=2)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert list(result) == [
+        'sky-serve-controller-current',
+        'sky-serve-controller-old',
+    ]
+    assert len(select_statements) == 1
+    with pytest.raises(ValueError, match='exceeds'):
+        global_user_state.get_cluster_status_fields_by_prefix(
+            'sky-serve-controller-', row_limit=1)
 
 
 def test_get_managed_cluster_status_fields_filters_workload_type(

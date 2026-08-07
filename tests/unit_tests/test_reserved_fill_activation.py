@@ -438,7 +438,7 @@ def test_exact_token_client_shares_frozen_credential_between_apis(monkeypatch):
     raw_client.close.assert_called_once_with()
 
 
-@pytest.mark.parametrize('serve_revision', ['035', '036'])
+@pytest.mark.parametrize('serve_revision', ['035', '036', '037'])
 def test_activation_derives_stable_rollout_proof_under_global_lock(
         monkeypatch, serve_revision):
     broker.clear_caches()
@@ -1145,7 +1145,7 @@ def test_activation_rejects_schema_outside_compatible_set(monkeypatch):
                         setter)
 
     with pytest.raises(broker.ProtocolV2ActivationError,
-                       match='Serve schema revision 035 or 036'):
+                       match='Serve schema revision 035, 036, or 037'):
         broker.activate_protocol_v2()
     token_reader.assert_not_called()
     setter.assert_not_called()

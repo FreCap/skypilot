@@ -26,6 +26,7 @@ import uuid
 
 import pytest
 
+from sky.serve import constants
 from sky.serve import placement_policy
 from sky.serve import serve_state
 from sky.serve import service
@@ -67,6 +68,51 @@ def _listen_on_transferred_socket(controller_socket, ready):
     connection, _ = controller_socket.accept()
     connection.close()
     controller_socket.close()
+
+
+def test_controller_hold_rejects_service_before_boot_mutation(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: (False, 'incarnation-a'))
+    keys = mock.Mock()
+    monkeypatch.setattr(service.auth_utils, 'get_or_generate_keys', keys)
+
+    with pytest.raises(RuntimeError, match='Refusing to start a SkyServe'):
+        service._start('svc', '/unused/task.yaml', 1, 'sky serve up')
+
+    keys.assert_not_called()
+
+
+def test_controller_hold_preserves_recovering_pool(monkeypatch):
+
+    class PoolBootReached(RuntimeError):
+        pass
+
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: (True, 'incarnation-a'))
+    monkeypatch.setattr(service.auth_utils, 'get_or_generate_keys',
+                        mock.Mock(side_effect=PoolBootReached('pool boot')))
+
+    with pytest.raises(PoolBootReached, match='pool boot'):
+        service._start('pool-a', '/unused/task.yaml', 1, 'pool apply')
+
+
+def test_controller_hold_preserves_fresh_pool_from_yaml(monkeypatch, tmp_path):
+
+    class PoolBootReached(RuntimeError):
+        pass
+
+    task_yaml = tmp_path / 'pool.yaml'
+    task_yaml.write_text('pool:\n  workers: 1\n', encoding='utf-8')
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: None)
+    monkeypatch.setattr(service.auth_utils, 'get_or_generate_keys',
+                        mock.Mock(side_effect=PoolBootReached('pool boot')))
+
+    with pytest.raises(PoolBootReached, match='pool boot'):
+        service._start('pool-a', str(task_yaml), 1, 'pool apply')
 
 
 class TestWaitForControllerReady:
@@ -785,7 +831,7 @@ def _make_persisted_per_gpu_spec(
     legacy_state = dict(spec.__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
         legacy_state.pop(field)
-    legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD)
+    legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
     legacy_state['_graceful_drain_async_occupancy'] = None
     restored = service_spec_lib.SkyServiceSpec.__new__(
         service_spec_lib.SkyServiceSpec)

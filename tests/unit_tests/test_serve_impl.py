@@ -18,6 +18,7 @@ from sky.data import storage as storage_lib
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve.server import core
 from sky.serve.server import impl
 from sky.utils import config_utils
 
@@ -1332,6 +1333,101 @@ class TestSanitizeHaRecoveryConfigBytes:
         with pytest.raises(ValueError, match='1MiB'):
             serve_utils.sanitize_ha_recovery_config_bytes(b'x' *
                                                           (1024 * 1024 + 1))
+
+
+class TestServeControllerHold:
+
+    def test_up_is_blocked_before_name_lock(self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        with mock.patch.object(
+                impl.serve_utils,
+                'get_service_lifecycle_lock') as get_lifecycle_lock, \
+             pytest.raises(RuntimeError, match='creation is disabled'):
+            impl.up(mock.Mock(), service_name='svc', pool=False)
+
+        get_lifecycle_lock.assert_not_called()
+
+    def test_update_is_blocked_before_file_lock(self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        with mock.patch.object(impl.filelock, 'FileLock') as file_lock, \
+             pytest.raises(RuntimeError, match='updates are disabled'):
+            impl.update(mock.Mock(), service_name='svc', pool=False)
+
+        file_lock.assert_not_called()
+
+    def test_apply_is_blocked_before_file_lock(self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        with mock.patch.object(impl.filelock, 'FileLock') as file_lock, \
+             pytest.raises(RuntimeError, match='apply is disabled'):
+            impl.apply(mock.Mock(), None, 'svc', pool=False)
+
+        file_lock.assert_not_called()
+
+    def test_down_is_blocked_before_controller_lookup(self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        with mock.patch.object(
+                impl.backend_utils,
+                'is_controller_accessible') as controller_lookup, \
+             pytest.raises(RuntimeError, match='termination and purge'):
+            impl.down(['svc'], pool=False)
+
+        controller_lookup.assert_not_called()
+
+    def test_lb_topology_change_is_blocked_before_file_lock(self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        with mock.patch.object(impl.filelock, 'FileLock') as file_lock, \
+             pytest.raises(RuntimeError, match='topology changes are disabled'):
+            impl.set_load_balancer_high_availability('svc', True, 'hash-a')
+
+        file_lock.assert_not_called()
+
+    def test_version_election_is_blocked_before_file_lock(self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        with mock.patch.object(impl.filelock, 'FileLock') as file_lock, \
+             pytest.raises(RuntimeError, match='version election is disabled'):
+            impl.elect_version('svc', 2, 'hash-a', 1)
+
+        file_lock.assert_not_called()
+
+    def test_pool_up_is_not_blocked(self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        lifecycle_lock = mock.MagicMock()
+        with mock.patch.object(impl.serve_utils,
+                               'get_service_lifecycle_lock',
+                               return_value=lifecycle_lock), \
+             mock.patch.object(impl,
+                               '_up_impl',
+                               return_value=('pool-a', 'endpoint')) as up_impl:
+            result = impl.up(mock.Mock(), service_name='pool-a', pool=True)
+
+        assert result == ('pool-a', 'endpoint')
+        up_impl.assert_called_once()
+
+    def test_service_replica_termination_is_blocked_before_lookup(
+            self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        with mock.patch.object(core.serve_state,
+                               'get_service_mode_and_hash',
+                               return_value=(False, 'hash-a')), \
+             mock.patch.object(
+                 core.backend_utils,
+                 'is_controller_accessible') as controller_lookup, \
+             pytest.raises(RuntimeError, match='replica termination'):
+            core.terminate_replica('svc', 1, purge=False)
+
+        controller_lookup.assert_not_called()
+
+    def test_pool_replica_termination_is_not_blocked(self, monkeypatch):
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+        sentinel = RuntimeError('pool lookup reached')
+        with mock.patch.object(core.serve_state,
+                               'get_service_mode_and_hash',
+                               return_value=(True, 'hash-a')), \
+             mock.patch.object(core.backend_utils,
+                               'is_controller_accessible',
+                               side_effect=sentinel):
+            with pytest.raises(RuntimeError, match='pool lookup reached'):
+                core.terminate_replica('pool-a', 1, purge=False)
 
 
 class TestLifecycleLocking:

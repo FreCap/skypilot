@@ -4952,6 +4952,70 @@ def _warming_demand(
         now=now)
 
 
+def test_live_service_version_demand_evidence_covers_every_incarnation(
+        image_database, monkeypatch: pytest.MonkeyPatch,
+        profile: models.ManagedRegistryProfile) -> None:
+    active, publication_record, _, regional = _ready_regional(
+        image_database, monkeypatch, profile)
+    _warming_demand(active,
+                    publication_record,
+                    regional,
+                    profile,
+                    owner='svc:incarnation:old-hash:v2',
+                    controller_epoch='service:old-hash:v2',
+                    controller_sequence=2,
+                    request_id='old-unscoped')
+    _warming_demand(active,
+                    publication_record,
+                    regional,
+                    profile,
+                    owner='svc:incarnation:new-hash:v2:target:target-scope',
+                    controller_epoch='service:new-hash:v2',
+                    controller_sequence=2,
+                    request_id='new-target',
+                    now=51)
+    _warming_demand(active,
+                    publication_record,
+                    regional,
+                    profile,
+                    owner='svc:incarnation:new-hash:v20',
+                    controller_epoch='service:new-hash:v20',
+                    controller_sequence=20,
+                    request_id='different-version',
+                    now=52)
+    _warming_demand(active,
+                    publication_record,
+                    regional,
+                    profile,
+                    owner='svc-shadow:incarnation:new-hash:v2',
+                    controller_epoch='service:new-hash:v2-shadow',
+                    controller_sequence=2,
+                    request_id='different-service',
+                    now=53)
+
+    all_incarnations = (
+        demand_state.get_live_service_version_demand_evidence_any_incarnation(
+            'svc', 2))
+    exact_current = demand_state.get_live_service_version_demand_evidence(
+        'svc', 2, 'new-hash')
+
+    assert all_incarnations.count == 2
+    assert exact_current.count == 1
+    assert all_incarnations.digest != exact_current.digest
+
+    monkeypatch.setattr(demand_state,
+                        '_MAX_SERVICE_VERSION_DEMAND_EVIDENCE_ROWS', 1)
+    with pytest.raises(RuntimeError, match='explicit row bound'):
+        demand_state.get_live_service_version_demand_evidence_any_incarnation(
+            'svc', 2)
+
+    monkeypatch.setattr(demand_state,
+                        '_MAX_SERVICE_VERSION_DEMAND_EVIDENCE_ROWS', 0)
+    with pytest.raises(RuntimeError, match='explicit row bound'):
+        demand_state.get_live_service_version_demand_evidence(
+            'svc', 2, 'new-hash')
+
+
 def _refresh_runtime_attestation(
     active: topology_state.ProfileRevisionRecord,
     profile: models.ManagedRegistryProfile,
