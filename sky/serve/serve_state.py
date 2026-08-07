@@ -5921,6 +5921,18 @@ def _placement_normalization_receipt_query(
     )
 
 
+def _lock_placement_normalization_receipt_query(
+        query: sqlalchemy.Select,
+        engine: sqlalchemy.engine.Engine) -> sqlalchemy.Select:
+    """Lock only the non-nullable service row in a receipt snapshot."""
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        # The snapshot outer-joins the optional requested-run manifest.
+        # PostgreSQL rejects an unqualified FOR UPDATE because that would also
+        # lock the nullable side of the outer join.
+        return query.with_for_update(of=services_table)
+    return query
+
+
 def _validate_placement_normalization_run_manifest(
         row: Mapping[str, Any], requested_run_id: uuid.UUID) -> float:
     """Validate the bounded metadata for a requested completed run."""
@@ -6262,8 +6274,7 @@ def acknowledge_placement_normalization_loaded(
             require_ledger=True).where(
                 services_table.c.placement_normalization_requested_run_id ==
                 request.run_id)
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-            query = query.with_for_update()
+        query = _lock_placement_normalization_receipt_query(query, engine)
         row = session.execute(query).mappings().one_or_none()
         if row is None or row['lifecycle_epoch'] != request.lifecycle_epoch:
             session.rollback()

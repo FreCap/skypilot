@@ -222,6 +222,25 @@ def _insert_placement_normalization_row(
         session.commit()
 
 
+def test_placement_normalization_receipt_locks_only_service_row() -> None:
+    """The optional run manifest must stay outside PostgreSQL's row lock."""
+    query = serve_state._placement_normalization_receipt_query(
+        'svc',
+        recovery_version=1,
+        current_version=1,
+        expected_service_hash='incarnation-a',
+        expected_controller_owner=(123, '10.0.0.1'),
+        require_ledger=True)
+    engine = sqlalchemy.create_mock_engine('postgresql+psycopg2://',
+                                           lambda *args, **kwargs: None)
+
+    locked = serve_state._lock_placement_normalization_receipt_query(
+        query, engine)
+    sql = str(locked.compile(dialect=postgresql.dialect()))
+
+    assert 'FOR UPDATE OF services' in sql
+
+
 _VERSIONED_HA_SCRIPT = (
     f'{serve_constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER}\n'
     'export SKYPILOT_CONFIG=/tmp/config.yaml.v2\n'
