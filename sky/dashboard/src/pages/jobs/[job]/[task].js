@@ -38,12 +38,16 @@ import { trackJobAction } from '@/lib/analytics';
 function TaskDetails() {
   const router = useRouter();
   const { job: jobId, task: taskIndex } = router.query;
+  const jobRouteKey = Array.isArray(jobId) ? jobId[0] : jobId;
+  const taskRouteKey = Array.isArray(taskIndex) ? taskIndex[0] : taskIndex;
+  const routeKey = `${jobRouteKey ?? ''}:${taskRouteKey ?? ''}`;
   const { jobData, loading, refreshJobData } = useSingleManagedJob(jobId);
   const poolsData = useManagedJobPools(jobData?.jobs, jobId);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
   const [refreshLogsFlag, setRefreshLogsFlag] = useState(0);
   const [isLogsExpanded, setIsLogsExpanded] = useState(true);
+  const activeRouteKeyRef = React.useRef(routeKey);
   const isMobile = useMobile();
 
   // GPU metrics state
@@ -77,6 +81,15 @@ function TaskDetails() {
     setRefreshLogsFlag((prev) => prev + 1);
   };
 
+  useEffect(() => {
+    if (activeRouteKeyRef.current !== routeKey) {
+      activeRouteKeyRef.current = routeKey;
+      setIsRefreshing(false);
+      setIsLoadingLogs(false);
+      setIsLogsExpanded(true);
+    }
+  }, [routeKey]);
+
   if (!router.isReady) {
     return <div>Loading...</div>;
   }
@@ -90,6 +103,10 @@ function TaskDetails() {
   const taskData = allTasks[taskIndexNum] || null;
   const jobName = allTasks.length > 0 ? allTasks[0].name : '';
   const isRouteLoading = loading && taskData === null;
+  const ownsRouteState = activeRouteKeyRef.current === routeKey;
+  const currentIsRefreshing = ownsRouteState ? isRefreshing : false;
+  const currentIsLoadingLogs = ownsRouteState ? isLoadingLogs : false;
+  const currentIsLogsExpanded = ownsRouteState ? isLogsExpanded : true;
 
   const title = taskData
     ? `Task ${taskIndex}: ${taskData.task || 'Unnamed'} | Job ${jobId} | SkyPilot Dashboard`
@@ -123,7 +140,7 @@ function TaskDetails() {
           </div>
 
           <div className="text-sm flex items-center">
-            {(loading || isRefreshing || isLoadingLogs) && (
+            {(loading || currentIsRefreshing || currentIsLoadingLogs) && (
               <div className="flex items-center mr-4">
                 <CircularProgress size={15} className="mt-0" />
                 <span className="ml-2 text-gray-500">Loading...</span>
@@ -132,7 +149,7 @@ function TaskDetails() {
             <Tooltip content="Refresh" className="text-muted-foreground">
               <button
                 onClick={handleManualRefresh}
-                disabled={loading || isRefreshing}
+                disabled={loading || currentIsRefreshing}
                 className="text-sky-blue hover:text-sky-blue-bright font-medium inline-flex items-center h-8"
               >
                 <RotateCwIcon className="w-4 h-4 mr-1.5" />
@@ -183,11 +200,11 @@ function TaskDetails() {
             <div id="logs-section" className="mt-6">
               <Card>
                 <button
-                  onClick={() => setIsLogsExpanded(!isLogsExpanded)}
+                  onClick={() => setIsLogsExpanded(!currentIsLogsExpanded)}
                   className="flex items-center justify-between w-full px-4 py-4 text-left focus:outline-none"
                 >
                   <div className="flex items-center">
-                    {isLogsExpanded ? (
+                    {currentIsLogsExpanded ? (
                       <ChevronDownIcon className="w-5 h-5 mr-2 text-gray-500" />
                     ) : (
                       <ChevronRightIcon className="w-5 h-5 mr-2 text-gray-500" />
@@ -197,7 +214,7 @@ function TaskDetails() {
                       (Task {taskIndex} logs)
                     </span>
                   </div>
-                  {isLogsExpanded && (
+                  {currentIsLogsExpanded && (
                     <div className="flex items-center space-x-3">
                       <Tooltip
                         content="Download task logs"
@@ -239,14 +256,15 @@ function TaskDetails() {
                     </div>
                   )}
                 </button>
-                {isLogsExpanded && (
+                {currentIsLogsExpanded && (
                   <div className="p-4">
                     <TaskLogsContent
+                      key={routeKey}
                       taskData={taskData}
                       taskIndex={taskIndexNum}
                       refreshFlag={refreshLogsFlag}
                       setIsLoadingLogs={setIsLoadingLogs}
-                      isLoadingLogs={isLoadingLogs}
+                      isLoadingLogs={currentIsLoadingLogs}
                     />
                   </div>
                 )}
