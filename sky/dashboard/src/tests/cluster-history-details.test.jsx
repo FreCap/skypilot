@@ -30,6 +30,34 @@ describe('useHistoricalClusterLookup stale-response fencing', () => {
     jest.clearAllMocks();
   });
 
+  it('keeps history unsettled until the current route lookup finishes', async () => {
+    const pendingLookup = deferred();
+
+    dashboardCache.get.mockImplementationOnce(() => pendingLookup.promise);
+
+    const { result } = renderHook(() =>
+      useHistoricalClusterLookup({
+        cluster: 'cluster-a',
+        clusterData: null,
+        clusterDetailsLoading: false,
+      })
+    );
+
+    await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
+    expect(result.current.historyLoading).toBe(true);
+    expect(result.current.historySettled).toBe(false);
+
+    await act(async () => {
+      pendingLookup.resolve([]);
+      await Promise.resolve();
+    });
+
+    expect(result.current.historyData).toBeNull();
+    expect(result.current.isHistoricalCluster).toBe(false);
+    expect(result.current.historyLoading).toBe(false);
+    expect(result.current.historySettled).toBe(true);
+  });
+
   it('drops stale history results from a previous route target', async () => {
     const firstLookup = deferred();
     const secondLookup = deferred();
@@ -72,6 +100,7 @@ describe('useHistoricalClusterLookup stale-response fencing', () => {
     expect(result.current.historyData.cluster).toBe('cluster-b');
     expect(result.current.isHistoricalCluster).toBe(true);
     expect(result.current.historyLoading).toBe(false);
+    expect(result.current.historySettled).toBe(true);
 
     await act(async () => {
       firstLookup.resolve([
@@ -83,6 +112,7 @@ describe('useHistoricalClusterLookup stale-response fencing', () => {
     expect(result.current.historyData.cluster).toBe('cluster-b');
     expect(result.current.isHistoricalCluster).toBe(true);
     expect(result.current.historyLoading).toBe(false);
+    expect(result.current.historySettled).toBe(true);
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
   });
 
@@ -109,6 +139,7 @@ describe('useHistoricalClusterLookup stale-response fencing', () => {
 
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(1));
     expect(result.current.historyLoading).toBe(true);
+    expect(result.current.historySettled).toBe(false);
 
     rerender({
       cluster: 'cluster-a',
@@ -119,6 +150,7 @@ describe('useHistoricalClusterLookup stale-response fencing', () => {
     expect(result.current.historyData).toBeNull();
     expect(result.current.isHistoricalCluster).toBe(false);
     expect(result.current.historyLoading).toBe(false);
+    expect(result.current.historySettled).toBe(true);
 
     await act(async () => {
       pendingLookup.resolve([
@@ -130,6 +162,7 @@ describe('useHistoricalClusterLookup stale-response fencing', () => {
     expect(result.current.historyData).toBeNull();
     expect(result.current.isHistoricalCluster).toBe(false);
     expect(result.current.historyLoading).toBe(false);
+    expect(result.current.historySettled).toBe(true);
     expect(dashboardCache.get).toHaveBeenCalledTimes(1);
   });
 });
