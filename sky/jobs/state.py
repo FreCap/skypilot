@@ -1445,7 +1445,8 @@ def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
     pick the first non-terminal task if one exists, otherwise the last
     terminal task. Only jobs with durable modern ``job_info`` fields are
     cancellable through the consolidated signal path, so legacy rows are
-    excluded here.
+    excluded here. Reuse ``_latest_task_status_query`` so cancellation shares
+    the same duplicate-row resolution as every other latest-task reader.
     """
     unique_job_ids = list(dict.fromkeys(job_ids))
     if not unique_job_ids:
@@ -1456,28 +1457,23 @@ def _fetch_job_cancellation_state_rows(job_ids: list[int]) -> list[Any]:
     terminal_status_values = [
         status.value for status in ManagedJobStatus.terminal_statuses()
     ]
-    for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
-        chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
-        latest_task_ids = _latest_task_ids_subquery(chunk,
-                                                    terminal_status_values)
-        query = sqlalchemy.select(
-            latest_task_ids.c.spot_job_id,
-            latest_task_ids.c.task_id,
-            spot_table.c.status,
-            job_info_table.c.workspace,
-        ).select_from(
-            latest_task_ids.join(
-                spot_table,
-                sqlalchemy.and_(
-                    spot_table.c.spot_job_id == latest_task_ids.c.spot_job_id,
-                    spot_table.c.task_id == latest_task_ids.c.task_id)).join(
-                        job_info_table, latest_task_ids.c.spot_job_id ==
-                        job_info_table.c.spot_job_id)).where(
-                            job_info_table.c.workspace.is_not(None),
-                            job_info_table.c.schedule_state.is_not(
-                                None)).order_by(
-                                    latest_task_ids.c.spot_job_id.asc())
-        with orm.Session(engine) as session:
+    with orm.Session(engine) as session:
+        for start in range(0, len(unique_job_ids), _STATUS_CHECK_JOB_ID_CHUNK):
+            chunk = unique_job_ids[start:start + _STATUS_CHECK_JOB_ID_CHUNK]
+            latest_task = _latest_task_status_query(
+                chunk, terminal_status_values).subquery()
+            query = sqlalchemy.select(
+                latest_task.c.spot_job_id,
+                latest_task.c.task_id,
+                latest_task.c.status,
+                job_info_table.c.workspace,
+            ).select_from(
+                latest_task.join(
+                    job_info_table, latest_task.c.spot_job_id ==
+                    job_info_table.c.spot_job_id)).where(
+                        job_info_table.c.workspace.is_not(None),
+                        job_info_table.c.schedule_state.is_not(None),
+                    ).order_by(latest_task.c.spot_job_id.asc())
             rows.extend(session.execute(query).fetchall())
     return rows
 
