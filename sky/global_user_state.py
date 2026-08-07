@@ -1673,6 +1673,27 @@ def get_handle_from_cluster_name(
 
 @db_retries.retry
 @metrics_lib.time_me
+def get_cluster_handle_status_from_name(
+    cluster_name: str,
+    existing_cluster_hash: str | None = None
+) -> tuple[Optional['backends.ResourceHandle'], status_lib.ClusterStatus |
+           None]:
+    """Returns one cluster row's handle and status from a single query."""
+    engine = _db_manager.get_engine()
+    assert cluster_name is not None, 'cluster_name cannot be None'
+    with orm.Session(engine) as session:
+        query = session.query(cluster_table.c.handle, cluster_table.c.status)
+        query = query.filter_by(name=cluster_name)
+        if existing_cluster_hash is not None:
+            query = query.filter_by(cluster_hash=existing_cluster_hash)
+        row = query.first()
+    if row is None:
+        return None, None
+    return pickle.loads(row.handle), status_lib.ClusterStatus[row.status]
+
+
+@db_retries.retry
+@metrics_lib.time_me
 def get_handles_from_cluster_names(
         cluster_names: set[str]
 ) -> dict[str, Optional['backends.ResourceHandle']]:
