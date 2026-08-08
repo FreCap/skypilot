@@ -507,7 +507,10 @@ is NULL.  Its source run must have PostgreSQL `xmin` equal to
 `pg_current_xact_id()::xid`, and the singleton records the corresponding
 `xid8`.  Ledger writes are deliberately top-level transactions: a run or row
 inserted inside a savepoint has a subtransaction `xmin` and fails closed rather
-than weakening the binding.
+than weakening the binding.  Admission also requires the singleton's recorded
+transaction ID to differ from the current one, so a second distinct run in the
+same top-level transaction is rejected instead of ambiguously replacing the
+first.
 Concurrent read-committed statements re-evaluate the updated row after a wait,
 while an older repeatable-read/serializable snapshot receives PostgreSQL's
 concurrent-update serialization failure.
@@ -1589,6 +1592,7 @@ Automated coverage must prove:
   terminal candidates plus ordinary nonterminal inventory rows inserted by the
   same admitted run and reject a competing activation; insert a run or terminal
   row under a SAVEPOINT and require the subtransaction `xmin` to fail closed;
+  attempt two distinct runs in one top-level transaction and reject the second;
   race downgrade and terminal admission in both lock orders, including a writer
   whose external preflight predates a downgrade but whose session-lock attempt
   follows its commit, and require exactly one authority to proceed; require the
