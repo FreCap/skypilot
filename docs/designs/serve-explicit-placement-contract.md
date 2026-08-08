@@ -472,6 +472,27 @@ The terminal fence is checked against the latest fully validated manifest once
 before any external getter and again after acquiring the unchanged advisory and
 table locks; two concurrent first-retirement attempts cannot both pass it.
 
+The PostgreSQL ledger is an append-only authority, not a self-authenticating
+JSON document.  The protocol-4 migration installs database triggers that
+reject every `UPDATE` or `DELETE` of a normalization run or row.  After an
+immutable protocol-4 terminal `historical_physical_per_gpu/retired` row exists,
+the database also rejects insertion of any later normalization run, including
+one attempted by an older protocol-1/2/3 image.  The terminal transaction
+inserts its run before its rows, so its own first generation remains atomic;
+the insertion fence becomes active for subsequent transactions only after the
+terminal row commits.  Later cleanup must explicitly remove these triggers as
+part of its reviewed schema retirement, never weaken them in place.
+
+This database boundary is necessary because a maliciously coherent rewrite of
+the run protocol, every row classification and dependency fact, all counts,
+and all fleet digests cannot be distinguished from an originally written older
+manifest by a pure function.  The shared validator still rejects every partial
+or internally contradictory v3/v4 relabel.  PostgreSQL immutability rejects the
+whole-manifest rewrite itself, and the post-terminal run-insert trigger keeps
+old writers from replacing the latest terminal generation.  Receipt and
+operator validation therefore rely on both layers explicitly instead of
+pretending that recomputable digests authenticate their own source.
+
 The cleanup-contract and receipt additions introduced normalizer protocol 2.
 The NULL-timestamp proof below introduced protocol 3.  The explicit stale
 placeholder proof introduces protocol 4.  Ledger verification
@@ -500,8 +521,10 @@ only rows whose outcome is `retired`; every v1-v3 manifest rejects the v4
 classification and both v4-only nested fact objects.  This dispatcher is
 shared by complete-ledger verification, controller receipt-manifest
 validation, and the global predecessor-receipt scan; an unknown protocol, a
-malformed suffix, a relabeled v3/v4 proof, or any protocol/fact mismatch is a
-blocker.  Tests include a secret-free exact manifest/row snapshot of production
+malformed suffix, a partial relabeled v3/v4 proof, or any protocol/fact mismatch
+is a blocker.  A coherent whole-manifest downgrade is rejected by the
+append-only PostgreSQL boundary above.  Tests include a secret-free exact
+manifest/row snapshot of production
 run `3bacd32f-888e-4a1f-af87-8f17dd82f168`, not only a synthetic v1 ledger.
 The dependency-light `placement_normalization_manifest` module owns this pure
 persisted-manifest contract and imports no operator or database state module.
@@ -1119,6 +1142,14 @@ fixture before production apply.  Because that release can write v1 and lacks
 the controller hold, it must never be deployed after apply; the normalization
 release is the minimum server rollback floor.
 
+The protocol-4 follow-up adds a PostgreSQL-only schema revision for the
+append-only run/row triggers and the post-terminal run-insert fence described
+above.  It changes no placement pickle during startup.  Reader-first rollout
+must prove the trigger definitions are installed before the held operator
+transaction; after the terminal row commits, rollback to any image that does
+not understand protocol 4 is forbidden independently of the application-level
+writer fence.
+
 Production baseline inventory found 155 valid fieldless public contracts,
 seven pickled-`None` placeholders, and one fieldless transition-only
 physical/per-GPU contract.  The historical row is eligible only if the
@@ -1448,8 +1479,12 @@ Automated coverage must prove:
   zero-count digest drift, and evidence-target-map drift for candidates and
   stale placeholders; delete, substitute, or swap each protocol-4 count,
   successor, per-row evidence digest, row/column hash, candidate inventory
-  digest, nested key, and `stale_placeholder` classification; relabel v3 as v4
-  and v4 as v3; require full-manifest rejection and total database rollback;
+  digest, nested key, and `stale_placeholder` classification; partially
+  relabel v3 as v4 and v4 as v3 and require full-manifest rejection; attempt a
+  coherent whole-manifest v4-to-v3 rewrite in real PostgreSQL and require the
+  first ledger mutation to fail at the append-only trigger; after a successful
+  terminal transaction, attempt a protocol-3 run insert and require the
+  post-terminal database fence to reject it;
 - either candidate or intent ownership, duplicate/missing/colliding matches,
   malformed false-ish cleanup fields, noncanonical scope metadata, inventory
   overflow/drift, or ledger-fact tampering blocks retirement;
