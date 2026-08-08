@@ -430,11 +430,12 @@ PR #1350 merged at 04:35:28 UTC, but its exact-capacity-approval gate remained
 open and it did not yet contain the zero-capacity exception or the reproducible
 60-minute comparison below. A third concurrent action started production
 revision 369 at 04:36:18 UTC. The zero-capacity record was authored only at
-04:38:37 UTC and committed at 04:42:19 UTC. This is a third process-contract
-departure: the later empirical zero-capacity proof and monitoring contract do
-not retroactively satisfy design-first ordering. Kubernetes had already
-accepted the rollout when detected, so no competing rollback or replay was
-issued; every post-deployment gate remains binding.
+04:38:37 UTC in an unmerged local follow-up; later commit and rebase timestamps
+are not rollout gates. This is a third process-contract departure: the later
+empirical zero-capacity proof and monitoring contract do not retroactively
+satisfy design-first ordering. Kubernetes had already accepted the rollout
+when detected, so no competing rollback or replay was issued; every
+post-deployment gate remains binding.
 
 The final chart has no
 `resourceActions.authorityWorker` schema or enabled-value guard, and its
@@ -513,15 +514,24 @@ controller numerator or denominator. Enumerate it separately; a proxy-side 503
 without a controller-side 503 in the same sync cycle is unexplained and blocks
 closure, while a correlated line is classified once and disclosed.
 
+This exact method reproduces the revision-366 baseline as 21 gaps in 3,900
+seconds with 2,190 role completions, all HTTP 200, and five sync 503s in 182
+attempts. The validated final-artifact +10 window had six gaps in 600 seconds,
+328 role completions all HTTP 200, and zero sync 503s in 24 attempts. The
+interim rate is above the threshold, but the contractual decision is the exact
+60-minute numerator and denominator.
+
 At +60, query `/_lb/capacity` on both exact `boltz-l4-fleet` Pods. On each slot,
 `ha_observability.role.total_seconds.p99_recent` must be at most 10.32 seconds,
 controller `total_seconds.p99_recent` at most 9.75 seconds, lock-wait maximum at
 most 8.74 seconds, lock-hold p99 at most 9.64 seconds, pod-authority maximum at
 most 9.39 seconds, and Service-routing-read maximum at most 8.75 seconds. These
 are 125% of the worst recorded revision-368 values of respectively 8.25, 7.80,
-6.99, 7.71, 7.51, and 7.00 seconds. The process-local bounded windows include
-startup and are therefore a conservative supplement to the exact access-log
-window. The eight-second gap is also the configured client deadline.
+6.99, 7.71, 7.51, and 7.00 seconds. Each `p99_recent` is the last at most 256
+observations at the snapshot; each `max` spans the current process lifetime and
+therefore includes startup. These process-local measures supplement rather
+than replace the exact access-log window. The eight-second gap is also the
+configured client deadline.
 
 Enumerate every application WARN/WARNING, ERROR, CRITICAL, traceback, FATAL,
 and PANIC line and every Kubernetes Warning event in the exact window. The only
@@ -609,20 +619,22 @@ post-+30 interval was not a zero-severity quiet window.
 
 Independent pre-change evidence closes attribution to this cleanup. The
 persisted controller access log on production revision 366 had 21 role-response
-gaps of at least eight seconds from 02:25--03:30 UTC, compared with 18 from
-03:40--04:25 on revision 368. The same windows had respectively five
-controller-sync 503s in 182 attempts and two controller-side 503s in 158
+gaps of at least eight seconds from 02:25--03:30 UTC, compared with 19 from
+03:40--04:25 on revision 368. The corresponding windows had respectively five
+controller-sync 503s in 182 attempts and two controller-side 503s in 155
 attempts, plus the one post-change proxy-side 503 above. The exact diff from
 revision 366 commit `5eb15b544e6fdb5bf43853b5e753d6e24cf4515e` to compatibility
 merge `66de423064d01b7e0fbeaf552804bd55236d00f6` is a broad authority
 cleanup spanning 122 files; attribution does not depend on characterizing that
 whole diff as small. The executable heartbeat-path comparison leaves
-`load_balancer.py`, `lb_k8s.py`, `controller_proxy.py`, and
-`lb_ha.py`, and `lb_ha_observability.py` unchanged. Within the two changed files
-that overlap the Serve controller package, it deletes retired-authority
-constants from `constants.py` and a startup-only token-isolation check from
-`controller.py`; it does not change the role, proxy, Kubernetes-authority,
-routing, or sync paths. Bounded runtime observations
+`load_balancer.py`, `lb_k8s.py`, `controller_proxy.py`, `lb_ha.py`, and
+`lb_ha_observability.py` unchanged. The diff changes 33 other
+`sky/serve` files, but inspection of those deltas shows deletion or
+disconnection of retired `resource_action*` modules, arguments, state helpers,
+and preflight token functions. In the adjacent `constants.py` and
+`controller.py`, it deletes retired-authority constants and a startup-only
+token-isolation check; it does not change the functions serving role, proxy,
+Kubernetes-authority, routing, or sync traffic. Bounded runtime observations
 locate the latency in pre-existing serialized Kubernetes reads: pod-authority
 and Service-routing reads reached 6.25--7.51 seconds and role-lock wait reached
 6.99 seconds against an eight-second client budget. Issue #1349 owns that
