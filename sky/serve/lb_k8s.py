@@ -24,6 +24,8 @@ starting a real service calls :func:`require_external_lb_runtime` and fails
 closed instead of falling back to an in-pod LB.
 """
 from collections.abc import Callable
+import concurrent.futures
+import contextvars
 import copy
 import hashlib
 import ipaddress
@@ -2757,9 +2759,11 @@ def get_lb_role_snapshot(
     """Read one fail-closed Pod and Service authority snapshot for a role.
 
     The common heartbeat path shares one owner-row read, one Pod list, one
-    Service read, and one exact ownership validation.  Ownership validation
-    deliberately retains both Deployment UID reads so replacement between
-    identity resolution and validation still fails closed.
+    Service read, and one exact ownership validation.  The independent Pod,
+    Service, and first Deployment reads are fully joined before any decision;
+    ownership validation deliberately retains the second Deployment UID read
+    so replacement between identity resolution and validation still fails
+    closed.
     """
     if not _lb_mode_active():
         return None
@@ -2807,17 +2811,35 @@ def get_lb_role_snapshot(
         core_api = kubernetes.core_api(context)
         label_selector = (f'{SERVE_LB_LABEL_KEY}={service_name},'
                           f'{SERVICE_HASH_LABEL_KEY}={service_hash}')
-        pods = timed('snapshot_pod_list',
-                     core_api.list_namespaced_pod,
-                     namespace,
-                     label_selector=label_selector)
+        name = lb_service_name(service_name, resource_scope)
+        # These reads are independent but all are required for one authority
+        # snapshot.  Joining them removes their sum from the serialized role
+        # path without adding a cache or extending the snapshot's freshness
+        # window.  Resolve futures in the historical fail-closed order so a
+        # concurrent multi-failure retains deterministic outcome mapping.
+        parent_context = contextvars.copy_context()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            pods_future = executor.submit(parent_context.copy().run,
+                                          timed,
+                                          'snapshot_pod_list',
+                                          core_api.list_namespaced_pod,
+                                          namespace,
+                                          label_selector=label_selector)
+            service_future = executor.submit(parent_context.copy().run, timed,
+                                             'snapshot_service_read',
+                                             core_api.read_namespaced_service,
+                                             name, namespace)
+            owner_reference_future = executor.submit(
+                parent_context.copy().run, timed,
+                'snapshot_owner_identity_read', _api_deployment_owner_reference,
+                context, namespace)
+            pods = pods_future.result()
+            try:
+                service = service_future.result()
+                owner_reference = owner_reference_future.result()
+            except Exception as e:  # pylint: disable=broad-except
+                raise LbRoleSnapshotRoutingError(str(e)) from e
         try:
-            name = lb_service_name(service_name, resource_scope)
-            service = timed('snapshot_service_read',
-                            core_api.read_namespaced_service, name, namespace)
-            owner_reference = timed('snapshot_owner_identity_read',
-                                    _api_deployment_owner_reference, context,
-                                    namespace)
             resource_version = timed('snapshot_ownership_validation',
                                      _require_existing_lb_object_ownership,
                                      context, namespace, name, service,
