@@ -367,10 +367,11 @@ recovery rows must also agree with the parent's monotonic
 `logical_replica_semantics` fence.  This prevents a representation rewrite from
 requesting a controller reload that the durable parent fence would reject.
 
-Either apply mode is refused above an explicit dry-run row bound.  At
-`SERIALIZABLE` isolation it sets bounded PostgreSQL lock/statement timeouts,
-then acquires one transaction-scoped, process-global placement-normalizer
-advisory lock followed by
+Either apply mode is refused above an explicit dry-run row bound.  Before
+opening its `SERIALIZABLE` snapshot it attempts one nonblocking session-scoped,
+process-global placement-normalizer advisory lock and fails busy rather than
+waiting behind a migration or another writer.  It then sets bounded PostgreSQL
+lock/statement timeouts and takes
 `SHARE ROW EXCLUSIVE` table locks in this fixed order: `services`,
 `version_specs`, `replicas`, and `ephemeral_storage_cleanup_intents`.  This
 blocks all ordinary row writers while leaving status reads available.  The
@@ -554,8 +555,9 @@ without waiting, then take fixed-order `ACCESS EXCLUSIVE` locks on the
 singleton, run ledger, and row ledger, reverify the exact catalog and singleton,
 and recheck terminal state before removing revision 040.  If a writer owns the
 advisory authority, downgrade fails busy; if downgrade owns it first, a writer
-cannot enter before the catalog removal commits.  A committed terminal UUID
-always makes downgrade fail closed.
+fails its nonblocking session-lock attempt instead of waiting to enter after the
+catalog removal commits.  A committed terminal UUID always makes downgrade
+fail closed.
 
 This database boundary is necessary because a maliciously coherent rewrite of
 the run protocol, every row classification and dependency fact, all counts,
