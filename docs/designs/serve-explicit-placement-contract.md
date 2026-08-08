@@ -459,6 +459,11 @@ validation, and the global predecessor-receipt scan; an unknown protocol, a
 malformed suffix, a relabeled v3/v4 proof, or any protocol/fact mismatch is a
 blocker.  Tests include a secret-free exact manifest/row snapshot of production
 run `3bacd32f-888e-4a1f-af87-8f17dd82f168`, not only a synthetic v1 ledger.
+The protocol-1 through protocol-3 validators retain the historical
+`same_service_placeholder_dependency_absent=true` fact exactly.  Protocol 4
+must neither emit nor accept that fact: its complete stale-placeholder
+inventory replaces the blanket absence contract, so persisting both would be
+contradictory rather than additional evidence.
 The persisted `schema_revision="037"` is the immutable placement-normalization
 ledger schema identifier for protocols 1-4, not the central database migration
 number.  Protocol 4 nevertheless requires the current full column-hash maps to
