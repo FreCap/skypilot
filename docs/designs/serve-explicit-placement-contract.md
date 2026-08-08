@@ -487,6 +487,32 @@ Later cleanup must explicitly remove these triggers as part of its reviewed
 schema retirement, never weaken them in place or reuse the generic downgrade
 as a post-terminal escape hatch.
 
+An advisory-lock wait inside a trigger is not this fence: a repeatable-read or
+serializable transaction may keep a snapshot taken before the wait and miss the
+newly committed terminal row.  Revision 040 therefore owns one internal
+singleton write-fence row containing a monotonic generation, the latest
+admitted run UUID, and an optional terminal run UUID.  Every run `BEFORE
+INSERT` takes the unchanged cross-protocol advisory identity without waiting;
+failure to acquire it aborts instead of continuing on the statement snapshot.
+It then atomically updates that singleton only while the terminal UUID is NULL.
+Concurrent read-committed statements re-evaluate the updated row after a wait,
+while an older repeatable-read/serializable snapshot receives PostgreSQL's
+concurrent-update serialization failure.  A terminal ledger-row `BEFORE
+INSERT` verifies that its protocol-4 run is the singleton's latest admitted
+run and sets the terminal UUID in the same transaction.  Rollback therefore
+rolls back both admission and terminal activation; no nontransactional marker
+may poison the fence.
+
+The singleton is migration-private state, not an application interface.  Its
+own `ENABLE ALWAYS` trigger rejects direct `INSERT`, `DELETE`, `TRUNCATE`, and
+top-level `UPDATE`; only the nested updates issued by the exact run-admission
+and terminal-activation trigger functions are accepted.  Revision 040 verifies
+the complete trigger/function envelope: exact relation, function, event,
+row/statement level, always-enabled state, no `WHEN` predicate, arguments,
+transition tables, constraint metadata, duplicate name, overload, or function
+configuration.  A partial, disabled, predicate-gated, or same-name shadow
+catalog is a migration failure, not an adoptable state.
+
 This database boundary is necessary because a maliciously coherent rewrite of
 the run protocol, every row classification and dependency fact, all counts,
 and all fleet digests cannot be distinguished from an originally written older
@@ -1148,7 +1174,8 @@ release is the minimum server rollback floor.
 
 The protocol-4 follow-up adds PostgreSQL-only schema revision 040 for the
 append-only run/row triggers and the post-terminal run-insert fence described
-above.  It changes no placement pickle during startup.  Reader-first rollout
+above, including its single internal transactional gate row.  It changes no
+placement pickle during startup.  Reader-first rollout
 must prove the trigger definitions are installed before the held operator
 transaction; after the terminal row commits, rollback to any image that does
 not understand protocol 4 and downgrade of revision 040 are forbidden
@@ -1491,7 +1518,12 @@ Automated coverage must prove:
   successful terminal transaction, attempt a protocol-3 run insert and a
   revision-040 downgrade and require both post-terminal database fences to
   reject them; prove a pre-terminal downgrade removes exactly the revision-040
-  catalog;
+  catalog; race terminal insertion against read-committed, repeatable-read, and
+  serializable old-writer transactions whose snapshots precede or overlap the
+  terminal commit and require every physically later run either to fail at the
+  busy advisory gate, observe the terminal singleton, or abort with a
+  serialization failure; tamper with each function/trigger envelope field and
+  the singleton through top-level DML and require fail-closed rejection;
 - either candidate or intent ownership, duplicate/missing/colliding matches,
   malformed false-ish cleanup fields, noncanonical scope metadata, inventory
   overflow/drift, or ledger-fact tampering blocks retirement;
