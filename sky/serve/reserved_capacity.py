@@ -1664,6 +1664,21 @@ def _broker_cycle(
                 f'(round {allocation.round_id}, epoch {allocation.epoch}).')
 
 
+def _pool_round_sum_holdings(round_row: dict[str, Any] | None) -> int:
+    """Fill slots every claimant of this pool holds, per the last round.
+
+    Absent on rows written before the broker published it, and on a pool that
+    has not completed a round yet. Zero is the safe read: the caller only ever
+    takes it as a lower bound on the pool's size.
+    """
+    if round_row is None:
+        return 0
+    raw = round_row.get('sum_holdings')
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
+
+
 def _pool_capacity_hint(spec: FillPoolSpec,
                         holdings: int,
                         launchable: bool,
@@ -1679,7 +1694,28 @@ def _pool_capacity_hint(spec: FillPoolSpec,
         return holdings + 1
     observed = _fresh_round_observation(round_row, now)
     if observed is not None:
-        return holdings + observed[0]
+        # Size the hint to the WHOLE pool, not to this claimant's own corner
+        # of it. Slots held by peers are reclaimable: that is precisely what
+        # the weighted arbitration in compute_entitlements exists to do, and
+        # its `total` is already "observed free + Sum of fill holdings".
+        #
+        # Reporting `holdings + free` instead made a full pool self-locking.
+        # With free at zero every claimant's cap collapsed to exactly what it
+        # already held, so the allocator could not move a single slot and
+        # weights and floors both stopped applying. Measured in production:
+        # a weight-0.1 claimant sat on 63 of 65 A100s while a weight-100 peer
+        # with floor_replicas=10 was pinned at 2, unchanged across seven
+        # consecutive rounds, until the incumbent's Pods were deleted by hand.
+        #
+        # max() against the local count keeps this monotonic. sum_holdings is
+        # one round old and this claimant's own holdings may already have
+        # grown past it, so the hint can only widen, never narrow: no claimant
+        # loses ground to a stale total.
+        #
+        # This authorizes reclaim, it does not launch anything. Feeds stay
+        # bounded by observed free, and the service ceiling still binds --
+        # allocate_fill_pool_budgets never hands out more than global_budget.
+        return max(holdings, _pool_round_sum_holdings(round_row)) + observed[0]
     return max(holdings, previous_cap)
 
 
