@@ -552,6 +552,51 @@ recovered failures at most 15 seconds, no role/controller/phase observation in
 the eight-second bucket, and every safety, health, schema, state, event, and log
 gate passing.
 
+Production revision 372 deployed that exact #1362 merge artifact as release
+`1.1.1171`. All 17 API/load-balancer workloads converged to its immutable image
+with zero restarts, and every pair returned to one ACTIVE plus one STANDBY while
+remaining `STABLE`, synced, non-draining, and routing-converged. The strict
+latency gate still failed before a clean T0 could be established. During a
+passive 90-second interval, the two `boltz-l4-fleet` slots added 11
+`client_timeout` outcomes and the two `boltz-l4-fleet-test` slots added one
+each. One post-candidate recovery reached 15.93 seconds. Safety, exact image,
+readiness, and fixed three-node capacity did not regress, so revision 372 stays
+deployed while this independent latency correction proceeds.
+
+Revision 372's remaining amplification is between the two slot heartbeats.
+After #1362 they independently execute the same fail-closed Pod, Service, and
+final live Deployment-owner reads for the same immutable PostgreSQL fence and
+cutover state. Under provider pressure that doubles identical Kubernetes API
+traffic. Moving the final live Deployment UID read earlier is not acceptable:
+it would widen the replacement race by making the owner check cease to be the
+last Kubernetes snapshot observation.
+
+The next correction coalesces only an identical snapshot while it is actively
+running:
+
+- key the in-flight task by the complete immutable controller fence and frozen
+  cutover state, and share it only for validated STABLE requests with the exact
+  same key;
+- remove the task immediately when it completes, with an identity-checked
+  callback so an older task cannot clear a newer different-key task. There is
+  no TTL, completed-result reuse, cache, or stale authority window;
+- shield the shared task from individual request cancellation so one timed-out
+  slot cannot cancel work already awaited by its peer. Snapshot success,
+  bounded failure, and subphase timings are deterministic for every waiter;
+- keep the Service-then-live-Deployment ordering and final owner
+  linearization inside `get_lb_role_snapshot` unchanged; and
+- independently re-read and compare the exact fence and cutover state under
+  the role lock for every request before its own session-ledger update or role
+  decision. Different keys start independent tasks, and non-STABLE states keep
+  the existing locked path.
+
+Focused tests must prove that two concurrent exact-key STABLE heartbeats make
+one provider snapshot call but retain two independent fenced decisions, that a
+different fence or state is never shared, that cancelling one waiter does not
+poison its peer, that shared errors retain their deterministic fail-closed
+outcome, and that non-STABLE behavior is unchanged. The same immutable staging
+and fresh production readiness/+10/+30/+60 gates remain mandatory.
+
 ### Final-removal artifact evidence (2026-08-08)
 
 PR #1346's exact code head

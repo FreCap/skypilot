@@ -63,6 +63,16 @@ logger = sky_logging.init_logger(__name__)
 # Keep the historical controller-module patch surface for tests and plugins.
 serve_history = controller_history.serve_history
 
+_LbControllerFence = tuple[str, tuple[int | None, str | None], int]
+
+
+class _StableLbRoleSnapshotRead(NamedTuple):
+    """One shareable in-flight read, never a completed snapshot cache."""
+
+    snapshot: lb_k8s.LbRoleSnapshot | None
+    timings: dict[str, float]
+    error: Exception | None
+
 
 def _catalog_missing_task_contexts(
         yaml_content: str, placement_catalog: dict[str, Any]) -> set[str]:
@@ -414,6 +424,10 @@ class SkyServeController:
         # current loop.
         self._lb_sync_lock: asyncio.Lock | None = None
         self._lb_role_lock: asyncio.Lock | None = None
+        self._lb_role_snapshot_task: asyncio.Task[
+            _StableLbRoleSnapshotRead] | None = None
+        self._lb_role_snapshot_key: tuple[_LbControllerFence,
+                                          lb_ha.LbCutoverState] | None = None
         self._lb_demand_lock: asyncio.Lock | None = None
         durable_lb_state = (serve_state.get_lb_cutover_state(service_name)
                             if service_hash is not None else None)
@@ -2012,6 +2026,45 @@ class SkyServeController:
             'slots_converged': converged,
         }
 
+    async def _get_shared_stable_lb_role_snapshot(
+            self, loop: asyncio.AbstractEventLoop, fence: _LbControllerFence,
+            state: lb_ha.LbCutoverState) -> _StableLbRoleSnapshotRead:
+        """Join an identical snapshot only while its provider read is running."""
+        assert state.phase is lb_ha.LbCutoverPhase.STABLE
+        key = (fence, state)
+        task = self._lb_role_snapshot_task
+        if (task is None or task.done() or self._lb_role_snapshot_key != key):
+
+            async def read_snapshot() -> _StableLbRoleSnapshotRead:
+                timings: dict[str, float] = {}
+                try:
+                    snapshot = await loop.run_in_executor(
+                        None, lb_k8s.get_lb_role_snapshot, self._service_name,
+                        fence, state, timings)
+                    return _StableLbRoleSnapshotRead(snapshot, timings, None)
+                except Exception as e:  # pylint: disable=broad-except
+                    # Return failures as task data so an individually cancelled
+                    # waiter cannot leave an unobserved task exception behind.
+                    return _StableLbRoleSnapshotRead(None, timings, e)
+
+            task = asyncio.create_task(read_snapshot())
+            self._lb_role_snapshot_task = task
+            self._lb_role_snapshot_key = key
+
+            def clear_completed_snapshot(
+                    completed: asyncio.Task[_StableLbRoleSnapshotRead]) -> None:
+                # A different fence may have installed a newer task while this
+                # one ran.  Never let the old callback clear that newer read.
+                if self._lb_role_snapshot_task is completed:
+                    self._lb_role_snapshot_task = None
+                    self._lb_role_snapshot_key = None
+
+            task.add_done_callback(clear_completed_snapshot)
+
+        # Request cancellation must not poison the same exact read already
+        # awaited by the peer slot.
+        return await asyncio.shield(task)
+
     async def _handle_load_balancer_role(
             self, request_data: dict[str, Any]) -> fastapi.Response:
         """Ingest a fast HA report and advance the recoverable cutover saga."""
@@ -2119,21 +2172,27 @@ class SkyServeController:
                 prefetched_state.active_slot is not None and
                 prefetched_state.lifecycle_epoch == prefetched_fence[2] and
                 prefetched_state.phase is lb_ha.LbCutoverPhase.STABLE):
-            prefetched_timings: dict[str, float] = {}
+            snapshot_wait_started_at = time.monotonic()
             try:
-                prefetched_snapshot = await trace.run_in_executor(
-                    loop, 'kubernetes_role_snapshot',
-                    lb_k8s.get_lb_role_snapshot, self._service_name,
-                    prefetched_fence, prefetched_state, prefetched_timings)
-            except lb_k8s.LbRoleSnapshotStateMismatchError:
-                trace.add_phases(prefetched_timings)
+                snapshot_read = (await self._get_shared_stable_lb_role_snapshot(
+                    loop, prefetched_fence, prefetched_state))
+            finally:
+                trace.add_phases({
+                    'kubernetes_role_snapshot': time.monotonic() -
+                                                snapshot_wait_started_at
+                })
+            trace.add_phases(snapshot_read.timings)
+            if isinstance(snapshot_read.error,
+                          lb_k8s.LbRoleSnapshotStateMismatchError):
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
-            except lb_k8s.LbRoleSnapshotRoutingError:
-                trace.add_phases(prefetched_timings)
+            if isinstance(snapshot_read.error,
+                          lb_k8s.LbRoleSnapshotRoutingError):
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
-            trace.add_phases(prefetched_timings)
+            if snapshot_read.error is not None:
+                raise snapshot_read.error
+            prefetched_snapshot = snapshot_read.snapshot
             if prefetched_snapshot is None:
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
