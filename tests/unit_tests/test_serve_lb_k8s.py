@@ -1861,14 +1861,13 @@ def test_role_snapshot_reuses_owner_pods_and_service(monkeypatch):
     owner_read.assert_called_once_with('svc', include_lb_state=True)
     core.list_namespaced_pod.assert_called_once()
     core.read_namespaced_service.assert_called_once()
-    # Resolve the expected owner identity, then prove the same Deployment UID
-    # is still live.  No second Pod, Service, or owner-row read is needed.
-    assert apps.read_namespaced_deployment.call_count == 2
+    # The Service supplies the expected owner identity.  One subsequent live
+    # Deployment read proves that exact UID without an earlier duplicate GET.
+    assert apps.read_namespaced_deployment.call_count == 1
     assert set(timings) == {
         'snapshot_postgresql_owner_read',
         'snapshot_pod_list',
         'snapshot_service_read',
-        'snapshot_owner_identity_read',
         'snapshot_ownership_validation',
         'snapshot_parse_routing',
         'snapshot_parse_pods',
@@ -2069,6 +2068,26 @@ def test_role_snapshot_fails_closed_when_owner_deployment_is_replaced(
 
     with pytest.raises(lb_k8s.LbRoleSnapshotRoutingError):
         lb_k8s.get_lb_role_snapshot('svc', fence, state)
+
+
+@pytest.mark.parametrize('owner_references', [
+    [],
+    [_owner_reference(owner_name='other-api')],
+    [_owner_reference(owner_uid='')],
+    [_owner_reference(), _owner_reference()],
+])
+def test_role_snapshot_live_owner_validation_rejects_malformed_identity(
+        monkeypatch, owner_references):
+    existing = _owned_object(service_hash='incarnation')
+    existing.metadata.owner_references = owner_references
+    live_owner_read = mock.Mock(return_value='api-deployment-uid')
+    monkeypatch.setattr(lb_k8s, '_live_deployment_owner_uid', live_owner_read)
+
+    with pytest.raises(RuntimeError):
+        lb_k8s._require_existing_lb_object_live_ownership(
+            'context', 'namespace', 'service', existing, 'incarnation')
+
+    live_owner_read.assert_not_called()
 
 
 @pytest.mark.parametrize(

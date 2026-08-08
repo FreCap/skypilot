@@ -256,7 +256,6 @@ class LbHaRuntimeStats:
                     'snapshot_postgresql_owner_read',
                     'snapshot_pod_list',
                     'snapshot_service_read',
-                    'snapshot_owner_identity_read',
                     'snapshot_ownership_validation',
                     'snapshot_parse_routing',
                     'snapshot_parse_pods',
