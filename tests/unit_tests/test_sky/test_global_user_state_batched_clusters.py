@@ -386,6 +386,43 @@ def test_get_clusters_from_names_matches_single_helper(tmp_path, monkeypatch):
             assert batched[key] == single[key], f'mismatch on {key}'
 
 
+def test_get_clusters_from_names_batches_user_info_once_per_cluster_snapshot(
+        tmp_path, monkeypatch):
+    """include_user_info should add one batched user snapshot, not one query
+    per cluster row."""
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
+    global_user_state.add_or_update_user(models.User(id='user-a', name='Alice'))
+    global_user_state.add_or_update_user(models.User(id='user-b', name='Bob'))
+    for name, user_hash in [('c-0', 'user-a'), ('c-1', 'user-a'),
+                            ('c-2', 'user-b'), ('c-3', 'user-a'),
+                            ('c-4', 'user-b')]:
+        _add_cluster(name, ready=True)
+        _set_cluster_user_hash(name, user_hash)
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        result = global_user_state.get_clusters_from_names(
+            [f'c-{i}' for i in range(5)], include_user_info=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert [result[f'c-{i}']['user_name'] for i in range(5)
+           ] == ['Alice', 'Alice', 'Bob', 'Alice', 'Bob']
+    assert [result[f'c-{i}']['user_hash'] for i in range(5)
+           ] == ['user-a', 'user-a', 'user-b', 'user-a', 'user-b']
+    assert len(select_statements) == 4
+    assert sum(
+        'FROM users' in statement for statement in select_statements) == 1
+
+
 def test_get_clusters_current_user_filter_includes_legacy_null_user_hash(
         tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
