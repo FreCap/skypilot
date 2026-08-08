@@ -75,7 +75,21 @@ _RESOURCE_ACTION_EVIDENCE_SCHEMA = 'skyserve-resource-action-roots-v1'
 _API_POD_EVIDENCE_SCHEMA = 'skyserve-sole-api-pod-v1'
 _LEGACY_CONTROLLER_EVIDENCE_SCHEMA = (
     'skyserve-legacy-controller-cluster-absence-v2')
-_CLEANUP_PROOF_SCHEMA = 'skyserve-ephemeral-storage-retirement-v2'
+_CLEANUP_PROOF_SCHEMA_V2 = 'skyserve-ephemeral-storage-retirement-v2'
+_CLEANUP_PROOF_SCHEMA = 'skyserve-ephemeral-storage-retirement-v3'
+_CLEANUP_CREATED_AT_MODE_FINITE = 'finite'
+_CLEANUP_CREATED_AT_MODE_LEGACY_PREFIX_NULL = 'legacy_prefix_null'
+_CLEANUP_PROTOCOL_V3_ONLY_FIELDS = frozenset({
+    'cleanup_version_timestamp_service_count',
+    'cleanup_version_timestamp_inventory_count',
+    'cleanup_version_timestamp_matched_intent_count',
+    'cleanup_legacy_null_version_timestamp_count',
+    'cleanup_timestamp_boundary_count',
+    'cleanup_version_timestamp_inventory_sha256',
+    'cleanup_candidate_version_created_at_mode',
+    'cleanup_candidate_legacy_timestamp_boundary_version',
+    'cleanup_timestamp_proof_sha256',
+})
 _PREDECESSOR_RECEIPT_SCHEMA = 'skyserve-predecessor-receipt-inventory-v1'
 _POD_UID_ENV_VAR = 'SKYPILOT_POD_UID'
 _ROLLING_UPDATE_ENV_VAR = 'SKYPILOT_ROLLING_UPDATE_ENABLED'
@@ -440,6 +454,25 @@ class _RowWork:
 
 
 @dataclasses.dataclass
+class _CleanupVersionTimestampProof:
+    """One live version's explicit intent timestamp comparison contract."""
+
+    mode: str
+    created_at: float | None
+    boundary_version: int | None
+    boundary_created_at: float | None
+
+    @property
+    def intent_created_at_upper_bound(self) -> float:
+        if self.mode == _CLEANUP_CREATED_AT_MODE_FINITE:
+            assert self.created_at is not None
+            return self.created_at
+        assert self.mode == _CLEANUP_CREATED_AT_MODE_LEGACY_PREFIX_NULL
+        assert self.boundary_created_at is not None
+        return self.boundary_created_at
+
+
+@dataclasses.dataclass
 class _CleanupIntentWork:
     """One exact cleanup-intent preimage and its planned postimage."""
 
@@ -447,6 +480,7 @@ class _CleanupIntentWork:
     result: dict[str, Any]
     matched_version: tuple[str, int]
     projection_sha256: str
+    matched_version_timestamp: _CleanupVersionTimestampProof
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -577,12 +611,21 @@ def _canonical_json_sha256(value: Any) -> str:
                    default=_json_default).encode())
 
 
+def _cleanup_intent_inventory_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
+    inventory = [
+        (row['service_name'], row['resource_scope'], row['storage_generation'],
+         _row_sha256(row))
+        for row in sorted(rows,
+                          key=lambda item: (item['service_name'], item[
+                              'resource_scope'], item['storage_generation']))
+    ]
+    return _canonical_json_sha256(inventory)
+
+
 def _cleanup_intent_fleet_sha256(rows: Sequence[_CleanupIntentWork], *,
                                  result: bool) -> str:
-    inventory = [(work.identity[0], work.identity[1], work.identity[2],
-                  _row_sha256(work.result if result else work.original))
-                 for work in sorted(rows, key=lambda item: item.identity)]
-    return _canonical_json_sha256(inventory)
+    projected_rows = [work.result if result else work.original for work in rows]
+    return _cleanup_intent_inventory_sha256(projected_rows)
 
 
 def _fleet_sha256(rows: list[_RowWork], *, result: bool) -> str:
@@ -1573,6 +1616,135 @@ def _finite_nonnegative(value: Any) -> bool:
             math.isfinite(float(value)) and value >= 0)
 
 
+def _build_cleanup_version_timestamp_proofs(
+    rows: Sequence[_RowWork],
+    candidate_services: frozenset[str],
+    row_bound: int,
+) -> tuple[dict[tuple[str, int], _CleanupVersionTimestampProof], int]:
+    """Prove each candidate service's complete live timestamp topology."""
+    live_rows_by_service: dict[str,
+                               list[_RowWork]] = (collections.defaultdict(list))
+    seen_identities: set[tuple[str, int]] = set()
+    for row in rows:
+        raw_service_name = row.original.get('service_name')
+        if raw_service_name not in candidate_services:
+            continue
+        if (type(row.original.get('yaml_content')) is not str or
+                row.original.get('retired_at') is not None):
+            continue
+        raw_version = row.original.get('version')
+        if (type(raw_service_name) is not str or not raw_service_name or
+                type(raw_version) is not int or raw_version < 1):
+            raise NormalizationBlocker(
+                'Live version has an invalid timestamp-proof identity.')
+        identity = (raw_service_name, raw_version)
+        if identity in seen_identities:
+            raise NormalizationBlocker(
+                'Timestamp-proof inventory has a duplicate live version.')
+        seen_identities.add(identity)
+        live_rows_by_service[raw_service_name].append(row)
+
+    if set(live_rows_by_service) != set(candidate_services):
+        raise NormalizationBlocker(
+            'Timestamp proof has no live version for a candidate service.')
+    if len(seen_identities) > row_bound:
+        raise NormalizationBlocker(
+            'Timestamp-proof inventory exceeds its explicit row bound.')
+
+    proofs: dict[tuple[str, int], _CleanupVersionTimestampProof] = {}
+    boundary_count = 0
+    for service_name in sorted(candidate_services):
+        service_rows = sorted(live_rows_by_service[service_name],
+                              key=lambda item: item.identity[1])
+        first_finite_index: int | None = None
+        normalized_created_at: list[float | None] = []
+        for index, row in enumerate(service_rows):
+            created_at = row.original.get('created_at')
+            if created_at is None:
+                if first_finite_index is not None:
+                    raise NormalizationBlocker(
+                        'Live version has a NULL creation timestamp after '
+                        'the finite timestamp boundary.')
+                normalized_created_at.append(None)
+                continue
+            if not _finite_nonnegative(created_at):
+                raise NormalizationBlocker(
+                    'Live version has an invalid creation timestamp.')
+            if first_finite_index is None:
+                first_finite_index = index
+            normalized_created_at.append(float(created_at))
+
+        null_prefix_count = next(
+            (index for index, value in enumerate(normalized_created_at)
+             if value is not None), len(normalized_created_at))
+        boundary_version: int | None = None
+        boundary_created_at: float | None = None
+        if null_prefix_count:
+            if first_finite_index is None:
+                raise NormalizationBlocker(
+                    'Legacy NULL timestamp prefix has no finite boundary.')
+            boundary_row = service_rows[first_finite_index]
+            boundary_version = boundary_row.identity[1]
+            boundary_created_at = normalized_created_at[first_finite_index]
+            assert boundary_created_at is not None
+            boundary_count += 1
+
+        for index, row in enumerate(service_rows):
+            created_at = normalized_created_at[index]
+            if index < null_prefix_count:
+                mode = _CLEANUP_CREATED_AT_MODE_LEGACY_PREFIX_NULL
+                assert boundary_version is not None
+                assert boundary_created_at is not None
+                if row.identity[1] >= boundary_version:
+                    raise NormalizationBlocker(
+                        'Legacy NULL timestamp is not a strict version '
+                        'prefix.')
+                proof = _CleanupVersionTimestampProof(
+                    mode=mode,
+                    created_at=None,
+                    boundary_version=boundary_version,
+                    boundary_created_at=boundary_created_at)
+            else:
+                assert created_at is not None
+                proof = _CleanupVersionTimestampProof(
+                    mode=_CLEANUP_CREATED_AT_MODE_FINITE,
+                    created_at=created_at,
+                    boundary_version=None,
+                    boundary_created_at=None)
+            proofs[row.identity] = proof
+    return proofs, boundary_count
+
+
+def _cleanup_timestamp_proof_binding_sha256(
+    facts: Mapping[str, Any],
+    candidate_identity: tuple[str, int],
+) -> str:
+    """Bind one candidate to the complete timestamp inventory proof."""
+    service_name, version = candidate_identity
+    return _canonical_json_sha256({
+        'cleanup_contract_schema': facts.get('cleanup_contract_schema'),
+        'cleanup_version_timestamp_service_count':
+            facts.get('cleanup_version_timestamp_service_count'),
+        'cleanup_version_timestamp_inventory_count':
+            facts.get('cleanup_version_timestamp_inventory_count'),
+        'cleanup_version_timestamp_matched_intent_count':
+            facts.get('cleanup_version_timestamp_matched_intent_count'),
+        'cleanup_legacy_null_version_timestamp_count':
+            facts.get('cleanup_legacy_null_version_timestamp_count'),
+        'cleanup_timestamp_boundary_count':
+            facts.get('cleanup_timestamp_boundary_count'),
+        'cleanup_version_timestamp_inventory_sha256':
+            facts.get('cleanup_version_timestamp_inventory_sha256'),
+        'cleanup_candidate_service_name_sha256': _sha256(service_name.encode()),
+        'cleanup_candidate_version': version,
+        'cleanup_candidate_version_created_at_mode':
+            facts.get('cleanup_candidate_version_created_at_mode'),
+        'cleanup_candidate_legacy_timestamp_boundary_version':
+            facts.get('cleanup_candidate_legacy_timestamp_boundary_version'),
+        'cleanup_intent_key_sha256': facts.get('cleanup_intent_key_sha256'),
+    })
+
+
 def _zero_target_projection(yaml_content: str, source: str) -> tuple[Any, str]:
     try:
         projection = (ephemeral_storage_contract.
@@ -1600,6 +1772,9 @@ def _build_cleanup_intent_plan(
         if row.classification is Classification.HISTORICAL_PHYSICAL_PER_GPU
     ]
     candidate_services = frozenset(row.identity[0] for row in candidates)
+    timestamp_proofs, timestamp_boundary_count = (
+        _build_cleanup_version_timestamp_proofs(rows, candidate_services,
+                                                row_bound))
     expected_columns = {
         column.name for column in
         serve_state.ephemeral_storage_cleanup_intents_table.columns
@@ -1640,6 +1815,7 @@ def _build_cleanup_intent_plan(
     intent_by_candidate_yaml: dict[tuple[str, str],
                                    list[_CleanupIntentWork]] = (
                                        collections.defaultdict(list))
+    intent_by_version: dict[tuple[str, int], _CleanupIntentWork] = {}
     seen_intent_identities: set[tuple[str, str, str]] = set()
     seen_generations: set[tuple[str, str]] = set()
     seen_versions: set[tuple[str, int]] = set()
@@ -1726,13 +1902,17 @@ def _build_cleanup_intent_plan(
             raise NormalizationBlocker(
                 'Cleanup generation does not identify its unique matched '
                 'version.')
-        matched_created_at = matched.original.get('created_at')
-        if not _finite_nonnegative(matched_created_at):
+        matched_timestamp = timestamp_proofs.get(matched.identity)
+        if matched_timestamp is None:
             raise NormalizationBlocker(
-                'Matched version has an invalid creation timestamp.')
+                'Matched version has no complete timestamp proof.')
         assert isinstance(created_at, (int, float))
-        assert isinstance(matched_created_at, (int, float))
-        if float(created_at) > float(matched_created_at):
+        if float(created_at) > matched_timestamp.intent_created_at_upper_bound:
+            if (matched_timestamp.mode ==
+                    _CLEANUP_CREATED_AT_MODE_LEGACY_PREFIX_NULL):
+                raise NormalizationBlocker(
+                    'Cleanup intent was created after the legacy timestamp '
+                    'boundary.')
             raise NormalizationBlocker(
                 'Cleanup intent was created after its matched version.')
         matched_projection, matched_projection_sha256 = (
@@ -1749,9 +1929,10 @@ def _build_cleanup_intent_plan(
         result = dict(original)
         result['provisional'] = 0
         work = _CleanupIntentWork(original, result, matched.identity,
-                                  projection_sha256)
+                                  projection_sha256, matched_timestamp)
         work_rows.append(work)
         intent_by_candidate_yaml[(service_name, yaml_content)].append(work)
+        intent_by_version[matched.identity] = work
         key_sha256 = _canonical_json_sha256(list(identity))
         yaml_sha256 = _sha256(yaml_content.encode())
         match_inventory.append({
@@ -1762,7 +1943,34 @@ def _build_cleanup_intent_plan(
             'zero_target_projection_sha256': projection_sha256,
         })
 
-    candidate_facts: dict[tuple[str, int], Mapping[str, Any]] = {}
+    timestamp_inventory: list[list[Any]] = []
+    legacy_null_timestamp_count = 0
+    for version_identity in sorted(timestamp_proofs):
+        proof = timestamp_proofs[version_identity]
+        match = intent_by_version.get(version_identity)
+        matched_intent_key_sha256 = None
+        matched_intent_created_at = None
+        if match is not None:
+            matched_intent_key_sha256 = _canonical_json_sha256(
+                list(match.identity))
+            raw_intent_created_at = match.original['created_at']
+            assert isinstance(raw_intent_created_at, (int, float))
+            matched_intent_created_at = float(raw_intent_created_at)
+        if proof.mode == _CLEANUP_CREATED_AT_MODE_LEGACY_PREFIX_NULL:
+            legacy_null_timestamp_count += 1
+        timestamp_inventory.append([
+            _sha256(version_identity[0].encode()),
+            version_identity[1],
+            'committed',
+            proof.mode,
+            proof.created_at,
+            proof.boundary_version,
+            proof.boundary_created_at,
+            matched_intent_key_sha256,
+            matched_intent_created_at,
+        ])
+
+    candidate_facts: dict[tuple[str, int], dict[str, Any]] = {}
     for candidate in candidates:
         yaml_content = candidate.original.get('yaml_content')
         if not isinstance(yaml_content, str):
@@ -1786,6 +1994,7 @@ def _build_cleanup_intent_plan(
         intent_yaml = match.original['yaml_content']
         candidate_yaml_sha256 = _sha256(yaml_content.encode())
         intent_yaml_sha256 = _sha256(intent_yaml.encode())
+        matched_timestamp = match.matched_version_timestamp
         candidate_facts[candidate.identity] = {
             'cleanup_candidate_match_count': 1,
             'cleanup_intent_key_sha256': _canonical_json_sha256(
@@ -1797,6 +2006,9 @@ def _build_cleanup_intent_plan(
                 match.projection_sha256,
             'cleanup_candidate_deletion_target_count': 0,
             'cleanup_intent_deletion_target_count': 0,
+            'cleanup_candidate_version_created_at_mode': matched_timestamp.mode,
+            'cleanup_candidate_legacy_timestamp_boundary_version':
+                matched_timestamp.boundary_version,
             'retired_yaml_preserved': candidate_yaml_sha256 ==
                                       intent_yaml_sha256,
             'current_cleanup_reader_inventory_preserved': True,
@@ -1824,7 +2036,20 @@ def _build_cleanup_intent_plan(
             sorted(match_inventory,
                    key=lambda item: (item['matched_service_name_sha256'], item[
                        'matched_version'], item['intent_key_sha256']))),
+        'cleanup_version_timestamp_service_count': len(candidate_services),
+        'cleanup_version_timestamp_inventory_count': len(timestamp_inventory),
+        'cleanup_version_timestamp_matched_intent_count':
+            len(intent_by_version),
+        'cleanup_legacy_null_version_timestamp_count': legacy_null_timestamp_count,
+        'cleanup_timestamp_boundary_count': timestamp_boundary_count,
+        'cleanup_version_timestamp_inventory_sha256':
+            _canonical_json_sha256(timestamp_inventory),
     }
+    for candidate_identity, facts in candidate_facts.items():
+        combined_facts = {**global_facts, **facts}
+        facts['cleanup_timestamp_proof_sha256'] = (
+            _cleanup_timestamp_proof_binding_sha256(combined_facts,
+                                                    candidate_identity))
     return _CleanupIntentPlan(ordered_work, candidate_facts, global_facts)
 
 
@@ -2534,9 +2759,7 @@ def _verify_cleanup_intent_postimages(session: orm.Session,
     if observed_by_identity != expected_by_identity:
         raise NormalizationBlocker(
             'Locked cleanup-intent postimages do not match the frozen plan.')
-    observed_work = tuple(
-        _CleanupIntentWork(row, row, ('', 0), '') for row in observed_rows)
-    if (_cleanup_intent_fleet_sha256(observed_work, result=False)
+    if (_cleanup_intent_inventory_sha256(observed_rows)
             != plan.global_facts['cleanup_intent_post_inventory_sha256']):
         raise NormalizationBlocker(
             'Locked cleanup-intent postimage digest does not match the '
@@ -2694,8 +2917,9 @@ def _retirement_ledger_v1_facts_are_complete(entry: Mapping[str, Any]) -> bool:
             is facts.get('config_protocol_active'))
 
 
-def _retirement_ledger_v2_facts_are_complete(entry: Mapping[str, Any]) -> bool:
-    """Validate typed cleanup and predecessor-receipt retirement evidence."""
+def _retirement_ledger_typed_cleanup_facts_are_complete(
+        entry: Mapping[str, Any]) -> bool:
+    """Validate facts shared by typed cleanup retirement protocols."""
     facts = entry.get('dependency_facts')
     version = entry.get('version')
     if not isinstance(facts, dict) or type(version) is not int:
@@ -2780,7 +3004,6 @@ def _retirement_ledger_v2_facts_are_complete(entry: Mapping[str, Any]) -> bool:
         all(facts.get(field) is True for field in true_proofs) and
         all(facts.get(field) is False for field in false_facts) and
         all(_is_sha256(facts.get(field)) for field in digest_facts) and
-        facts.get('cleanup_contract_schema') == _CLEANUP_PROOF_SCHEMA and
         facts.get('predecessor_receipt_schema') == _PREDECESSOR_RECEIPT_SCHEMA
         and type(cleanup_count) is int and type(inventory_count) is int and
         inventory_count >= 1 and 1 <= cleanup_count <= inventory_count and
@@ -2819,12 +3042,88 @@ def _retirement_ledger_v2_facts_are_complete(entry: Mapping[str, Any]) -> bool:
         is facts.get('config_protocol_active'))
 
 
+def _retirement_ledger_v2_facts_are_complete(entry: Mapping[str, Any]) -> bool:
+    """Validate the frozen all-finite protocol-2 retirement evidence."""
+    facts = entry.get('dependency_facts')
+    original_column_sha256s = entry.get('original_column_sha256s')
+    return (isinstance(facts, dict) and
+            isinstance(original_column_sha256s, dict) and
+            _is_sha256(original_column_sha256s.get('created_at')) and
+            original_column_sha256s['created_at'] != _value_sha256(None) and
+            facts.get('cleanup_contract_schema') == _CLEANUP_PROOF_SCHEMA_V2 and
+            not any(field in facts
+                    for field in _CLEANUP_PROTOCOL_V3_ONLY_FIELDS) and
+            _retirement_ledger_typed_cleanup_facts_are_complete(entry))
+
+
+def _retirement_ledger_v3_facts_are_complete(entry: Mapping[str, Any]) -> bool:
+    """Validate timestamp-bound protocol-3 retirement evidence."""
+    facts = entry.get('dependency_facts')
+    service_name = entry.get('service_name')
+    version = entry.get('version')
+    original_column_sha256s = entry.get('original_column_sha256s')
+    if (not isinstance(facts, dict) or type(service_name) is not str or
+            not service_name or type(version) is not int or version < 1 or
+            not isinstance(original_column_sha256s, dict) or
+            not _is_sha256(original_column_sha256s.get('created_at')) or
+            facts.get('cleanup_contract_schema') != _CLEANUP_PROOF_SCHEMA or
+            not _retirement_ledger_typed_cleanup_facts_are_complete(entry)):
+        return False
+
+    service_count = facts.get('cleanup_version_timestamp_service_count')
+    inventory_count = facts.get('cleanup_version_timestamp_inventory_count')
+    matched_count = facts.get('cleanup_version_timestamp_matched_intent_count')
+    legacy_null_count = facts.get('cleanup_legacy_null_version_timestamp_count')
+    boundary_count = facts.get('cleanup_timestamp_boundary_count')
+    mode = facts.get('cleanup_candidate_version_created_at_mode')
+    boundary_version = facts.get(
+        'cleanup_candidate_legacy_timestamp_boundary_version')
+    if (type(service_count) is not int or service_count < 1 or
+            type(inventory_count) is not int or
+            not service_count <= inventory_count <= _MAX_INVENTORY_ROWS or
+            type(matched_count) is not int or
+            matched_count != facts.get('cleanup_match_inventory_count') or
+            matched_count != facts.get('cleanup_intent_inventory_count') or
+            not 1 <= matched_count <= inventory_count or
+            type(legacy_null_count) is not int or
+            not 0 <= legacy_null_count < inventory_count or
+            type(boundary_count) is not int or
+            not 0 <= boundary_count <= service_count or
+            boundary_count > legacy_null_count or
+            boundary_count > inventory_count - legacy_null_count or
+        ((legacy_null_count == 0) != (boundary_count == 0)) or not _is_sha256(
+            facts.get('cleanup_version_timestamp_inventory_sha256')) or
+            not _is_sha256(facts.get('cleanup_timestamp_proof_sha256'))):
+        return False
+
+    if mode == _CLEANUP_CREATED_AT_MODE_FINITE:
+        if (boundary_version is not None or
+                original_column_sha256s['created_at'] == _value_sha256(None)):
+            return False
+    elif mode == _CLEANUP_CREATED_AT_MODE_LEGACY_PREFIX_NULL:
+        current_version = facts.get('service_current_version')
+        if (legacy_null_count < 1 or boundary_count < 1 or
+                original_column_sha256s['created_at'] != _value_sha256(None) or
+                type(boundary_version) is not int or
+                not version < boundary_version or
+                type(current_version) is not int or
+                boundary_version > current_version):
+            return False
+    else:
+        return False
+
+    return facts['cleanup_timestamp_proof_sha256'] == (
+        _cleanup_timestamp_proof_binding_sha256(facts, (service_name, version)))
+
+
 def _retirement_ledger_facts_are_complete(entry: Mapping[str, Any],
                                           protocol: int) -> bool:
     if protocol == placement_normalization_identity.PROTOCOL_V1:
         return _retirement_ledger_v1_facts_are_complete(entry)
     if protocol == placement_normalization_identity.PROTOCOL_V2:
         return _retirement_ledger_v2_facts_are_complete(entry)
+    if protocol == placement_normalization_identity.PROTOCOL_V3:
+        return _retirement_ledger_v3_facts_are_complete(entry)
     return False
 
 
@@ -2952,7 +3251,8 @@ def _ledger_manifest_mismatches(
             add('incomplete_retirement_dependency_facts', entry)
         if (outcome == 'retired' and normalizer_identity is not None and
                 normalizer_identity.protocol
-                == placement_normalization_identity.PROTOCOL_V2 and
+                in (placement_normalization_identity.PROTOCOL_V2,
+                    placement_normalization_identity.PROTOCOL_V3) and
                 isinstance(facts, dict) and
                 facts.get('operator_freeze_approved_commit_binding_sha256')
                 != run.get('freeze_evidence_sha256')):
