@@ -61,6 +61,7 @@ variable "partitions" {
     pod_identity_role_arn        = optional(string, "")
     pod_identity_service_account = optional(string, "skypilot-pool-sa")
 
+
     priority_class = optional(object({
       value = number
       name  = optional(string)
@@ -227,16 +228,37 @@ variable "cluster_api_ingress_cidrs" {
 
 variable "serve_probe_ingress" {
   description = <<-EOT
-    Optional one-port ingress rule on a caller-owned node security group for a
-    SkyServe control-plane prober. The default creates no rule. The source CIDR
+    Optional ingress rules on a caller-owned node security group for the
+    SkyServe control plane. The default creates no rule. The source CIDR
     cannot be 0.0.0.0/0 unless allow_public_cidr is explicitly true.
+
+    `port` is the replica serving port the prober and load balancer reach.
+
+    `additional_ports` covers the rest of the control plane's Pod-IP traffic.
+    Provisioning a Kubernetes replica SSHes to its Pod IP, so a spoke whose
+    security group grants only the serving port accepts the probe but can
+    never finish a launch: the Pod runs, the container reports ready, and the
+    replica stays PROVISIONING until it is culled. Measured on a spoke built
+    from this module alone -- TCP/8080 answered while TCP/22 was dropped, and
+    every replica stalled. The sibling spoke worked only because an unrelated
+    legacy rule ("SSH access from admin subnets") happened to cover the same
+    control-plane CIDR, so the dependency was never represented here.
+
+    `additional_port_descriptions` pins the AWS description of one additional
+    port, keyed by port number as a string. Its only purpose is adopting a
+    pre-existing rule: AWS treats (protocol, ports, CIDR) as the rule identity
+    and rejects a duplicate, so a spoke that already carries the grant must
+    import it rather than create it, and the import only plans clean if the
+    description matches byte for byte. Leave it unset for new rules.
   EOT
   type = object({
-    node_security_group_id = string
-    control_plane_cidr     = string
-    port                   = number
-    description            = optional(string, "SkyServe probe traffic from the control plane")
-    allow_public_cidr      = optional(bool, false)
+    node_security_group_id       = string
+    control_plane_cidr           = string
+    port                         = number
+    additional_ports             = optional(set(number), [])
+    additional_port_descriptions = optional(map(string), {})
+    description                  = optional(string, "SkyServe probe traffic from the control plane")
+    allow_public_cidr            = optional(bool, false)
   })
   default = null
 
@@ -258,6 +280,32 @@ variable "serve_probe_ingress" {
       var.serve_probe_ingress.port <= 65535
     )
     error_message = "serve_probe_ingress.port must be between 1 and 65535."
+  }
+
+  validation {
+    condition = var.serve_probe_ingress == null ? true : alltrue([
+      for p in var.serve_probe_ingress.additional_ports : p >= 1 && p <= 65535
+    ])
+    error_message = "serve_probe_ingress.additional_ports must be between 1 and 65535."
+  }
+
+  validation {
+    # A description for a port that is not granted is silently dead config,
+    # and the likeliest form of that typo is adopting the wrong port.
+    condition = var.serve_probe_ingress == null ? true : alltrue([
+      for k in keys(var.serve_probe_ingress.additional_port_descriptions) :
+      contains([for p in var.serve_probe_ingress.additional_ports : tostring(p)], k)
+    ])
+    error_message = "Every serve_probe_ingress.additional_port_descriptions key must be a granted additional port."
+  }
+
+  validation {
+    # A duplicate would make two rules claim the same port/CIDR pair on a
+    # caller-owned group; AWS rejects the second and the apply half-fails.
+    condition = var.serve_probe_ingress == null ? true : !contains(
+      var.serve_probe_ingress.additional_ports, var.serve_probe_ingress.port
+    )
+    error_message = "serve_probe_ingress.additional_ports must not repeat serve_probe_ingress.port."
   }
 
   validation {

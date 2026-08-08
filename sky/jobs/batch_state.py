@@ -267,13 +267,18 @@ def record_batch_worker_job_id(job_id: int, owner_token: str,
 
 
 @db_retries.retry
-def get_batch_worker_records(job_id: int) -> list[dict[str, Any]]:
-    """Return every durable worker launch generation for a Batch job."""
+def get_batch_worker_records(job_id: int,
+                             owner_token: str | None = None
+                            ) -> list[dict[str, Any]]:
+    """Return durable worker launch generations for a Batch job."""
     engine = _db_manager.get_engine()
+    predicates = [batch_worker_table.c.job_id == job_id]
+    if owner_token is not None:
+        predicates.append(batch_worker_table.c.coordinator_token == owner_token)
     with orm.Session(engine) as session:
         rows = session.execute(
             sqlalchemy.select(batch_worker_table).where(
-                batch_worker_table.c.job_id == job_id).order_by(
+                sqlalchemy.and_(*predicates)).order_by(
                     batch_worker_table.c.coordinator_token,
                     batch_worker_table.c.worker_cluster)).mappings().all()
         return [dict(row) for row in rows]

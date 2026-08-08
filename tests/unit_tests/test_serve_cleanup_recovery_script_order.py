@@ -49,6 +49,9 @@ def _patch_common(monkeypatch, events, replicas):
                         lambda lock: True)
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         lambda svc: list(replicas))
+    monkeypatch.setattr(
+        serve_state, 'get_replica_resource_action_identities', lambda svc,
+        replica_ids: {replica_id: None for replica_id in replica_ids})
     cluster_names = {replica.cluster_name for replica in replicas}
     monkeypatch.setattr(
         service.serve_utils, 'get_existing_replica_cluster_names',
@@ -70,9 +73,13 @@ def test_cleanup_preserves_recovery_script_through_replica_teardown(
     """The recovery script remains durable throughout replica teardown."""
     events = []
 
-    def _terminate(cluster_name, unused_log_file_name, continue_guard=None):
+    def _terminate(cluster_name,
+                   unused_log_file_name,
+                   continue_guard=None,
+                   expected_cluster_record_uuid=None):
         assert continue_guard is not None
         assert continue_guard()
+        assert expected_cluster_record_uuid is None
         events.append(f'teardown:{cluster_name}')
 
     monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)
@@ -94,8 +101,12 @@ def test_cleanup_uses_exact_scoped_cluster_identity_for_long_name(monkeypatch):
         service_name, 1, 'incarnation-a')
     assert not info.cluster_name.startswith(service_name)
 
-    def _terminate(cluster_name, unused_log_file_name, continue_guard=None):
+    def _terminate(cluster_name,
+                   unused_log_file_name,
+                   continue_guard=None,
+                   expected_cluster_record_uuid=None):
         assert continue_guard is not None and continue_guard()
+        assert expected_cluster_record_uuid is None
         events.append(f'teardown:{cluster_name}')
 
     monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)

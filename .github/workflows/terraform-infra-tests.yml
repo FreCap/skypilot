@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   terraform-infra-tests:
-    runs-on: namespace-profile-ci-2x4
+    runs-on: namespace-profile-skypilot-ci-2x4
     env:
       TF_IN_AUTOMATION: '1'
 
@@ -87,4 +87,5 @@ jobs:
             --with 'SQLAlchemy>=2,<3' \
             python -m unittest -v \
               test_seed_config.py \
-              test_reconcile_api_server.py
+              test_reconcile_api_server.py \
+              test_verify_rwx_authority_fence.py

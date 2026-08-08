@@ -375,6 +375,26 @@ By default, the API server is upgraded with the ``Recreate`` strategy, which int
 
     This does not apply if you are using a :ref:`remote jobs controller <jobs-controller-remote>`.
 
+For a claim provisioned outside the chart, set
+:ref:`storage.existingClaim <helm-values-storage-existingClaim>` and keep
+``storage.enabled=true``. The claim must exist in the release namespace and be
+populated and qualified before the upgrade. In guarded HA, also declare
+``storage.accessMode=ReadWriteMany`` and verify that the live claim is Bound and
+actually advertises RWX; Helm cannot inspect that capability while rendering.
+
+Migrating an existing chart-owned claim requires separate revisions. First add
+``helm.sh/resource-policy: keep`` through ``storage.annotations`` while
+``storage.existingClaim`` is still empty, and verify that revision changes only
+the old PVC metadata. Then stop every filesystem and SQLite writer, copy and
+verify the data on the new claim, complete the request-store cutover, and only
+then select the external claim. Do not combine the keep annotation and claim
+switch: the old PVC is no longer rendered once ``existingClaim`` is set.
+
+The PostgreSQL request-store marker is a one-way rollback boundary. After it is
+committed, recover by applying a new upgrade revision pinned to a compatible
+image that already uses PostgreSQL and the same RWX claim. Do not use native
+Helm rollback to a stored RWO/SQLite revision.
+
 The following table compares the two upgrade strategies:
 
 .. list-table:: Upgrade Strategy Comparison

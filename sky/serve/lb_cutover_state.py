@@ -1,5 +1,7 @@
 """Durable repository for external load balancer cutover state."""
 
+from collections.abc import Iterator
+from collections.abc import Mapping
 import contextlib
 import json
 import time
@@ -20,6 +22,31 @@ def _require_postgresql_lb_cutover(engine: sqlalchemy.engine.Engine) -> None:
     if (engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
         raise RuntimeError('External load balancer HA cutover state is '
                            'supported only on PostgreSQL.')
+
+
+def parse_lb_cutover_state_record(
+        record: Mapping[str, Any]) -> lb_ha.LbCutoverState:
+    """Validate cutover state already read with its controller owner row."""
+    enabled = bool(record['lb_ha_enabled'])
+    active_slot = lb_ha.parse_slot(record['lb_active_slot'])
+    pending_slot = lb_ha.parse_slot(record['lb_pending_slot'])
+    phase = lb_ha.parse_phase(record['lb_cutover_phase'])
+    generation = record['lb_cutover_generation']
+    if (phase is None or not isinstance(generation, int) or generation < 0 or
+        (enabled and (active_slot is None or generation < 1)) or
+        (not enabled and
+         (active_slot is not None or generation != 0 or pending_slot is not None
+          or phase is not lb_ha.LbCutoverPhase.STABLE)) or
+        (phase is lb_ha.LbCutoverPhase.PREPARING and pending_slot is None) or
+        (phase is lb_ha.LbCutoverPhase.DRAINING and pending_slot is None)):
+        raise RuntimeError('Malformed LB cutover state.')
+    return lb_ha.LbCutoverState(enabled=enabled,
+                                active_slot=active_slot,
+                                generation=generation,
+                                pending_slot=pending_slot,
+                                phase=phase,
+                                lifecycle_epoch=record['lifecycle_epoch'],
+                                drain_started_at=record['lb_drain_started_at'])
 
 
 def get_lb_cutover_state(service_name: str) -> lb_ha.LbCutoverState | None:
@@ -478,7 +505,7 @@ def lb_cutover_kubernetes_guard(
     expected_generation: int,
     expected_phase: lb_ha.LbCutoverPhase,
     expected_pending_slot: lb_ha.LbSlot | None,
-):
+) -> Iterator[bool]:
     """Hold the service row lock across one external Kubernetes mutation.
 
     Controller ownership updates write the same PostgreSQL row and therefore

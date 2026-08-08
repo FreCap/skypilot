@@ -1,5 +1,6 @@
 """Tests for AWS capacity classification and cache scoping."""
 # pylint: disable=protected-access
+import contextlib
 import importlib
 import inspect
 import os
@@ -22,6 +23,8 @@ from sky.provision import failover_error_policy
 from sky.provision.aws import instance as aws_instance
 from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils as gcp_instance_utils
+from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 
 _CAPACITY_POLICY_SIGNATURES = {
     '_iter_error_chain': '(error)',
@@ -751,11 +754,12 @@ def test_quota_consult_hit_and_failure(monkeypatch):
 def _call_retry_zones(provisioner,
                       to_provision,
                       *,
+                      num_nodes=1,
                       dryrun=False,
                       skip_if_config_hash_matches=None):
     return provisioner._retry_zones(
         to_provision=to_provision,
-        num_nodes=1,
+        num_nodes=num_nodes,
         requested_resources={to_provision},
         dryrun=dryrun,
         stream_logs=False,
@@ -774,6 +778,7 @@ def _early_retry_provisioner(tmp_path, monkeypatch):
     provisioner = object.__new__(backend.RetryingVmProvisioner)
     provisioner.log_dir = str(tmp_path)
     provisioner._blocked_resources = set()
+    provisioner._extra_launch_context = {}
     monkeypatch.setattr(backend.os, 'system', lambda _: 0)
     monkeypatch.setattr(backend.rich_utils, 'force_update_status',
                         lambda _: None)
@@ -848,7 +853,7 @@ def test_retry_zones_preserves_structured_provider_failure(
     provisioner._active_cluster_hash = None
     provisioner._is_managed = False
     provisioner._workload_type = 'service'
-    provisioner._extra_launch_context = None
+    provisioner._extra_launch_context = {}
     to_provision = _to_provision()
     provider_error = _aggregate_error('InsufficientInstanceCapacity')
     provider_error.requested_count = 1
@@ -1000,7 +1005,7 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
     provisioner._active_cluster_hash = None
     provisioner._is_managed = False
     provisioner._workload_type = 'service'
-    provisioner._extra_launch_context = None
+    provisioner._extra_launch_context = {}
     provisioner._is_launched_by_jobs_controller = False
     to_provision = resources_lib.Resources(cloud=clouds.DO(),
                                            region='nyc3',
@@ -1435,6 +1440,294 @@ def test_new_provisioner_bulk_failure_skips_post_bulk_callback_and_cleans_up(
     cleanup.assert_called_once()
 
 
+def test_serve_provider_guard_spans_builtin_bulk_provision(
+        tmp_path, monkeypatch):
+    events = []
+    (provisioner, to_provision, provision_record, bulk_provision, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [{
+             'instance_type': 'g-2vcpu-8gb',
+             'custom_resources': 'writer-value',
+             'region': 'nyc3',
+         }, {
+             'instance_type': 'g-2vcpu-8gb',
+             'custom_resources': 'post-bulk-value',
+             'region': 'nyc3',
+         }],
+     )
+    provisioner._extra_launch_context = {
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+    }
+    fence_holds = mock.Mock(return_value=True)
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_fence_holds', fence_holds)
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_authority_guard_is_valid',
+                        lambda _: True)
+    guard = object()
+
+    @contextlib.contextmanager
+    def shared_guard(service_name):
+        assert service_name == 'svc'
+        events.append('guard-enter')
+        try:
+            yield guard
+        finally:
+            events.append('guard-exit')
+
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_authority_guard', shared_guard)
+
+    result = _call_retry_zones(provisioner, to_provision)
+
+    assert result['provision_record'] is provision_record
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+        'guard-enter',
+        'bulk_provision',
+        'guard-exit',
+        'deploy_vars:post_bulk',
+    ]
+    assert fence_holds.call_count >= 2
+    bulk_provision.assert_called_once()
+    cleanup.assert_not_called()
+
+
+def test_serve_provider_guard_spans_whole_legacy_ray_up(tmp_path, monkeypatch):
+    events = []
+    (provisioner, to_provision, _, bulk_provision, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [{
+             'instance_type': 'g-2vcpu-8gb',
+             'custom_resources': 'writer-value',
+             'region': 'nyc3',
+         }],
+     )
+    provisioner._extra_launch_context = {
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+    }
+    monkeypatch.setattr(clouds.DO, 'PROVISIONER_VERSION',
+                        clouds.ProvisionerVersion.RAY_AUTOSCALER)
+    monkeypatch.setitem(backend._NODES_LAUNCHING_PROGRESS_TIMEOUT, clouds.DO,
+                        90)
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_fence_holds', lambda _: True)
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_authority_guard_is_valid',
+                        lambda _: True)
+    guard_held = False
+    guard = object()
+
+    @contextlib.contextmanager
+    def shared_guard(service_name):
+        nonlocal guard_held
+        assert service_name == 'svc'
+        assert not guard_held
+        guard_held = True
+        events.append('guard-enter')
+        try:
+            yield guard
+        finally:
+            events.append('guard-exit')
+            guard_held = False
+
+    def run_ray_up(*args, **kwargs):
+        del args, kwargs
+        assert guard_held
+        events.append('ray-up')
+        return 0, 'head ready', ''
+
+    def wait_until_ready(*args, **kwargs):
+        del args, kwargs
+        assert guard_held
+        events.append('ray-ready')
+        return True, None
+
+    def update_cluster_ips(*args, **kwargs):
+        del args, kwargs
+        assert not guard_held
+        events.append('update-ips')
+
+    def update_ssh_ports(*args, **kwargs):
+        del args, kwargs
+        assert not guard_held
+        events.append('update-ports')
+
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_authority_guard', shared_guard)
+    monkeypatch.setattr(backend,
+                        'write_ray_up_script_with_patched_launch_hash_fn',
+                        lambda *_args, **_kwargs: '/tmp/ray-up.py')
+    monkeypatch.setattr(backend.log_lib, 'run_with_log', run_ray_up)
+    monkeypatch.setattr(backend.backend_utils, 'wait_until_ray_cluster_ready',
+                        wait_until_ready)
+    monkeypatch.setattr(backend.CloudVmRayResourceHandle, 'update_cluster_ips',
+                        update_cluster_ips)
+    monkeypatch.setattr(backend.CloudVmRayResourceHandle, 'update_ssh_ports',
+                        update_ssh_ports)
+
+    result = _call_retry_zones(provisioner, to_provision, num_nodes=2)
+
+    assert result['handle'].launched_nodes == 2
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+        'guard-enter',
+        'ray-up',
+        'ray-ready',
+        'guard-exit',
+        'update-ips',
+        'update-ports',
+    ]
+    bulk_provision.assert_not_called()
+    cleanup.assert_not_called()
+
+
+@pytest.mark.parametrize(('validity_results', 'message', 'body_runs'), [
+    ([False], 'before the provider operation started', False),
+    ([True, False], 'while the provider operation was in progress', True),
+])
+def test_serve_provider_guard_validity_failures_are_terminal(
+        monkeypatch, validity_results, message, body_runs):
+    provisioner = object.__new__(backend.RetryingVmProvisioner)
+    provisioner._workload_type = 'service'
+    provisioner._extra_launch_context = {
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+    }
+    validate = mock.Mock()
+    monkeypatch.setattr(provisioner, '_validate_service_replica_launch_fence',
+                        validate)
+    guard = object()
+
+    @contextlib.contextmanager
+    def shared_guard(_service_name):
+        yield guard
+
+    validity = mock.Mock(side_effect=validity_results)
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_authority_guard', shared_guard)
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_authority_guard_is_valid',
+                        validity)
+    ran = False
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError, match=message):
+        with provisioner._service_replica_launch_provider_guard():
+            ran = True
+
+    assert ran is body_runs
+    assert validate.call_count == (1 if body_runs else 0)
+    assert validity.call_count == len(validity_results)
+
+
+def test_serve_provider_guard_preserves_provider_exception(monkeypatch):
+    provisioner = object.__new__(backend.RetryingVmProvisioner)
+    provisioner._workload_type = 'service'
+    provisioner._extra_launch_context = {
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+    }
+    monkeypatch.setattr(provisioner, '_validate_service_replica_launch_fence',
+                        mock.Mock())
+    guard = object()
+
+    @contextlib.contextmanager
+    def shared_guard(_service_name):
+        yield guard
+
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_authority_guard', shared_guard)
+    monkeypatch.setattr(backend.serve_state,
+                        'service_replica_launch_authority_guard_is_valid',
+                        lambda _: True)
+    provider_error = provision_common.ProvisionerError(
+        'provider capacity classification')
+
+    with pytest.raises(provision_common.ProvisionerError) as exc_info:
+        with provisioner._service_replica_launch_provider_guard():
+            raise provider_error
+
+    assert exc_info.value is provider_error
+
+
+@pytest.mark.parametrize('workload_type', ['service', 'pool'])
+def test_serve_generation_change_at_terminal_boundary_skips_provider(
+        tmp_path, monkeypatch, workload_type):
+    """An admitted request cannot outlive its controller generation."""
+    events = []
+    (provisioner, to_provision, _, bulk_provision, cleanup,
+     _) = _configure_new_provisioner_callback_attempt(
+         tmp_path,
+         monkeypatch,
+         events,
+         [{
+             'instance_type': 'g-2vcpu-8gb',
+             'custom_resources': 'writer-value',
+             'region': 'nyc3',
+         }],
+     )
+    provisioner._extra_launch_context = {
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 1,
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+    }
+    provisioner._workload_type = workload_type
+    authorized_v1 = {
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'status': backend.serve_state.ServiceStatus.READY,
+        'launch_authorized_version': 1,
+        'launch_version_required': True,
+    }
+    elected_v2 = dict(authorized_v1, launch_authorized_version=2)
+    get_authorization = mock.Mock(
+        side_effect=[authorized_v1, authorized_v1, elected_v2])
+    monkeypatch.setattr(backend.serve_state,
+                        'get_service_replica_launch_authorization',
+                        get_authorization)
+
+    with pytest.raises(exceptions.RequestCancelled,
+                       match='durable service generation changed'):
+        _call_retry_zones(provisioner, to_provision)
+
+    assert events == [
+        'config_writer',
+        'resources_deploy_vars',
+        'deploy_vars:writer',
+    ]
+    assert get_authorization.call_count == 3
+    bulk_provision.assert_not_called()
+    # The terminal fence is not a capacity failure and must not trigger a
+    # provider cleanup/failover that could mutate a successor generation.
+    cleanup.assert_not_called()
+
+
+def test_serve_provider_fence_db_failure_is_terminal(tmp_path, monkeypatch):
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._workload_type = 'service'
+    provisioner._extra_launch_context = {
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+    }
+    monkeypatch.setattr(
+        backend.serve_state, 'service_replica_launch_fence_holds',
+        mock.Mock(side_effect=RuntimeError('database unavailable')))
+
+    with pytest.raises(exceptions.RequestCancelled,
+                       match='Unable to prove durable'):
+        provisioner._validate_service_replica_launch_fence()
+
+
 def test_new_provisioner_post_bulk_callback_failure_is_after_mutation_and_cleans_up(
         tmp_path, monkeypatch):
     events = []
@@ -1527,6 +1820,101 @@ def test_provision_with_retries_preserves_nested_terminal_failure(
     assert exc_info.value.failover_history == [per_location_error]
     assert backend.classify_resources_unavailable_error(
         clouds.AWS(), exc_info.value) == 'capacity'
+
+
+@pytest.mark.parametrize(
+    ('retry_context', 'retry_count'),
+    [
+        ('retargeted-context', 1),
+        ('phx-context', 2),
+    ],
+)
+def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
+        tmp_path, monkeypatch, retry_context, retry_count):
+
+    def launchable_resources(context, count):
+
+        class _LaunchableResources:
+            """Minimal optimizer-selected resource candidate."""
+
+            cloud = clouds.Kubernetes()
+            region = context
+            accelerators = {'H200': count}
+
+            def assert_launchable(self):
+                return self
+
+        return _LaunchableResources()
+
+    initial_resources = launchable_resources('phx-context', 1)
+    retry_resources = launchable_resources(retry_context, retry_count)
+    pool_key = reserved_capacity_broker.make_pool_key(
+        'phx-context',
+        'H200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='physical-uid')
+    launch_context = reserved_capacity.make_protocol_v2_launch_fence(
+        pool_key=pool_key,
+        service_generation=7,
+        physical_cluster_uid='physical-uid',
+        kubernetes_context='phx-context',
+        accelerator='H200',
+        accelerator_count=1)
+    task = mock.Mock()
+    task.is_controller_task.return_value = False
+    task.num_nodes = 1
+    task.resources = {initial_resources}
+    task.best_resources = initial_resources
+    task.volume_mounts = None
+    dag = mock.Mock()
+    dag.tasks = [task]
+    provisioner = backend.RetryingVmProvisioner(
+        log_dir=str(tmp_path),
+        dag=dag,
+        optimize_target=mock.Mock(),
+        requested_features=set(),
+        local_wheel_path=tmp_path / 'wheel',
+        wheel_hash='',
+        extra_launch_context=launch_context,
+    )
+    config = backend.RetryingVmProvisioner.ToProvisionConfig(
+        cluster_name='svc-replica',
+        resources=initial_resources,
+        num_nodes=1,
+        prev_cluster_status=None,
+        prev_handle=None,
+        prev_cluster_ever_up=False,
+        prev_config_hash=None,
+    )
+    provider_attempt = mock.Mock(
+        side_effect=exceptions.ResourcesUnavailableError(
+            'first exact attempt unavailable'))
+    monkeypatch.setattr(provisioner, '_retry_zones', provider_attempt)
+    monkeypatch.setattr(clouds.Kubernetes, 'get_identity_from_context_name',
+                        lambda *_: ['user'])
+    monkeypatch.setattr(clouds.Kubernetes, 'check_features_are_supported',
+                        lambda *_: None)
+
+    def optimize(*args, **kwargs):
+        del args, kwargs
+        task.best_resources = retry_resources
+        return dag
+
+    monkeypatch.setattr(backend.optimizer.Optimizer, 'optimize', optimize)
+    monkeypatch.setattr(backend.rich_utils, 'force_update_status',
+                        lambda *_: None)
+
+    with pytest.raises(exceptions.RequestCancelled,
+                       match='retry candidate changed'):
+        provisioner.provision_with_retries(task,
+                                           config,
+                                           dryrun=False,
+                                           stream_logs=False,
+                                           skip_unnecessary_provisioning=False)
+
+    # The exact candidate reached the provider once. The optimizer's drifted
+    # candidate was rejected at the next iteration's terminal fence.
+    provider_attempt.assert_called_once()
 
 
 def test_quota_notification_has_generic_actionable_context(monkeypatch):

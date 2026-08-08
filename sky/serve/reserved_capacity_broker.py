@@ -23,29 +23,45 @@ Design invariants (see the 2026-07-08 design doc):
   from ACTING on a superseded allocation (per-pool, so one pool's grant
   churn never fences another's launches); the global lease epoch exists
   only for the publish CAS.
-- Exactly one live claim => the fast path: grant None (no ceiling), feed =
-  raw observed free -- byte-identical #108 behavior, pinned by the existing
-  test suite.
+- Under protocol v1, exactly one live claim uses the fast path: grant None
+  (no ceiling), feed = raw observed free -- byte-identical #108 behavior,
+  pinned by the existing test suite. Protocol v2 always publishes an integer
+  grant capped by the partitioned edge cap.
 
 This module is the stable broker facade and owns the stateful round driver;
 deterministic allocation policy lives in reserved_capacity_allocation. All SQL
 lives in serve_state (the shared serve DB every controller in the api-server
 pod already uses).
 """
+import base64
+import binascii
 from collections.abc import Callable
+from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
+import hashlib
 import json
 import math
 import os
+import re
+import stat
+import threading
 import time
-from typing import Any
+import typing
+from typing import Any, TypeGuard
 
 from sky import sky_logging
+from sky.adaptors import kubernetes
 from sky.serve import constants
 from sky.serve import reserved_capacity_allocation
 from sky.serve import serve_state
+from sky.server.requests import postgres as request_postgres
 from sky.utils import common_utils
 from sky.utils import locks
+from sky.utils.db import migration_utils
+
+if typing.TYPE_CHECKING:
+    from sky.serve import replica_managers
 
 logger = sky_logging.init_logger(__name__)
 
@@ -55,6 +71,168 @@ logger = sky_logging.init_logger(__name__)
 # driving (with N pollers on the same interval, roughly one round is driven
 # per interval; the rest read).
 _ROUND_FRESH_FRACTION = 0.9
+
+# Durable broker protocol versions.  Protocol v1 is the historical
+# context-keyed, one-claim-per-service path.  Protocol v2 is activated only
+# through the durable state gate and uses physical-cluster pool keys plus
+# generation-fenced composite claims.
+PROTOCOL_V1 = 1
+PROTOCOL_V2 = 2
+_SUPPORTED_PROTOCOLS = frozenset((PROTOCOL_V1, PROTOCOL_V2))
+# Additive metadata inside the existing per-service exact-card JSON.  `$`
+# cannot begin a valid SkyServe service name, so old readers safely ignore it
+# while continuing to find their own service entry.
+_OBSERVED_FREE_BY_ACCELERATOR_KEY = '$skypilot-observed-free-v1'
+
+# This is the fixed container name emitted by the SkyPilot Helm chart.  The
+# activation gate deliberately does not accept an operator-selected container:
+# otherwise a stable sidecar could be presented as proof while the API server
+# itself is still rolling out.
+_API_SERVER_CONTAINER_NAME = 'skypilot-api'
+_CONTROLLER_CONTAINER_NAME = 'skypilot-controller'
+_EXECUTOR_CONTAINER_NAME = 'skypilot-executor'
+_SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
+_RELEASE_NAME_ENV_VAR = 'SKYPILOT_RELEASE_NAME'
+_REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
+_QUIESCENCE_BACKEND_GUARD_ENV_VAR = (
+    'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS')
+_IMAGE_ID_DIGEST_PATTERN = re.compile(r'(?:@|//)(sha256:[0-9a-fA-F]{64})$')
+_PROTOCOL_V2_SCHEMA_REVISIONS = frozenset({'035', '036', '037'})
+_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION = '008'
+_MAX_SERVICE_ACCOUNT_TOKEN_BYTES = 64 * 1024
+# Keep this equal to the API request server-instance lease's stale horizon.
+# Recently draining/unready rows remain relevant: their controller children may
+# still be alive until the full lease ages out.
+_WRITER_INSTANCE_STALE_AFTER_SECONDS = 20
+_HELM_INSTANCE_LABEL = 'app.kubernetes.io/instance'
+_MIGRATION_COMPONENT_LABEL = 'app.kubernetes.io/component'
+_MIGRATION_COMPONENT = 'database-migration'
+
+
+class ProtocolV2ActivationError(RuntimeError):
+    """A Kubernetes rollout cannot safely authorize broker protocol v2."""
+
+
+class ProtocolV1DemotionError(RuntimeError):
+    """The live rollout or durable claims cannot safely return to v1."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _TokenBoundPodIdentity:
+    """Pod identity authenticated by the mounted service-account token."""
+
+    namespace: str
+    name: str
+    uid: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _DeploymentOwnerIdentity:
+    """Deployment owner reached from a token-bound Pod owner chain."""
+
+    name: str
+    uid: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _WriterDeploymentTarget:
+    """One mechanically discovered writer Deployment."""
+
+    role: str
+    name: str
+    container_name: str
+    server_role: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _WriterDeploymentSnapshot:
+    """One fully validated API, controller, or executor rollout."""
+
+    role: str
+    deployment_name: str
+    deployment_generation: str
+    deployment_resource_version: str
+    deployment_uid: str
+    container_name: str
+    image_digest: str
+    # Name, UID, and resourceVersion make both membership and each member's
+    # observed state part of the stable double-read fence.
+    pod_cohort: tuple[tuple[str, str, str], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _WriterProcessInstance:
+    """One recent database lease held by a request-serving process."""
+
+    role: str
+    instance_id: str
+    pod_name: str
+    pod_uid: str
+    version: str
+    ready: bool
+    draining: bool
+    request_storage_backend: str
+    request_queue_backend: str
+    execution_quiescence_capable: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _WriterRolloutSnapshot:
+    """One stable view of every release process that can write fill state."""
+
+    release_name: str
+    deployments: tuple[_WriterDeploymentSnapshot, ...]
+    writer_instances: tuple[_WriterProcessInstance, ...]
+
+    @property
+    def image_digest(self) -> str:
+        digests = {deployment.image_digest for deployment in self.deployments}
+        if len(digests) != 1:
+            raise ProtocolV2ActivationError(
+                'The API/controller/executor writer fleet has mixed immutable '
+                'image digests.')
+        return digests.pop()
+
+    @property
+    def deployment_generation(self) -> str:
+        inventory = [(deployment.role, deployment.deployment_name,
+                      deployment.deployment_generation)
+                     for deployment in self.deployments]
+        return json.dumps(inventory, separators=(',', ':'), ensure_ascii=True)
+
+    @property
+    def deployment_uid(self) -> str:
+        inventory = [(deployment.role, deployment.deployment_name,
+                      deployment.deployment_uid)
+                     for deployment in self.deployments]
+        return json.dumps(inventory, separators=(',', ':'), ensure_ascii=True)
+
+    @property
+    def pod_inventory(self) -> tuple[tuple[str, str, str, str, str, str], ...]:
+        inventory: list[tuple[str, str, str, str, str, str]] = []
+        for deployment in self.deployments:
+            inventory.extend(
+                (deployment.role, deployment.deployment_name,
+                 deployment.container_name, pod_name, pod_uid, resource_version)
+                for pod_name, pod_uid, resource_version in
+                deployment.pod_cohort)
+        return tuple(sorted(inventory))
+
+    @property
+    def pod_inventory_count(self) -> int:
+        return len(self.pod_inventory)
+
+    @property
+    def pod_inventory_sha256(self) -> str:
+        proof = {
+            'pods': self.pod_inventory,
+            'writer_instances': [
+                dataclasses.astuple(instance)
+                for instance in self.writer_instances
+            ],
+        }
+        serialized = json.dumps(proof, separators=(',', ':'), ensure_ascii=True)
+        return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
 
 def claim_ttl_seconds() -> float:
@@ -70,39 +248,123 @@ def claim_ttl_seconds() -> float:
     return float(constants.RESERVED_FILL_CLAIM_TTL_SECONDS)
 
 
-def make_pool_key(context: str,
-                  gpu_names: str | list[str] | tuple[str, ...]) -> str:
-    """Canonical pool identity: (Kubernetes context, accelerator set).
-
-    JSON list, not a joined string: context names are user-controlled and a
-    separator collision must not merge two pools. Single-accelerator keys keep
-    their original encoding so existing broker rows remain valid.
-    """
+def _canonical_gpu_names(
+    gpu_names: str | list[str] | tuple[str, ...],) -> tuple[str, ...]:
+    names: tuple[str, ...]
     if isinstance(gpu_names, str):
-        names: tuple[str, ...] = (gpu_names.lower(),)
+        names = (gpu_names.lower(),)
     else:
         names = tuple(sorted({name.lower() for name in gpu_names}))
     if not names:
         raise ValueError('A reserved-capacity pool needs an accelerator.')
-    encoded_names: str | list[str] = names[0] if len(names) == 1 else list(
-        names)
-    return json.dumps([context, encoded_names])
+    return names
+
+
+def _encoded_gpu_names(names: tuple[str, ...]) -> str | list[str]:
+    return names[0] if len(names) == 1 else list(names)
+
+
+def make_pool_key(
+    context: str,
+    gpu_names: str | list[str] | tuple[str, ...],
+    *,
+    protocol_version: int = PROTOCOL_V1,
+    physical_cluster_uid: str | None = None,
+) -> str:
+    """Canonical pool identity for one broker protocol.
+
+    Protocol v1 remains byte-for-byte ``[context, accelerators]``. Protocol v2
+    deliberately drops the access-context alias from physical identity and
+    encodes ``["v2", cluster_uid, accelerators]``.  The context remains on the
+    v2 claim for querying and launch actuation.
+    """
+    if protocol_version not in _SUPPORTED_PROTOCOLS:
+        raise ValueError(f'Unsupported reserved-fill protocol version: '
+                         f'{protocol_version!r}.')
+    names = _canonical_gpu_names(gpu_names)
+    encoded_names = _encoded_gpu_names(names)
+    if protocol_version == PROTOCOL_V1:
+        return json.dumps([context, encoded_names])
+    if not isinstance(physical_cluster_uid, str) or not physical_cluster_uid:
+        raise ValueError('Protocol-v2 pool keys require a physical cluster '
+                         'UID.')
+    return json.dumps(['v2', physical_cluster_uid, encoded_names])
+
+
+@dataclasses.dataclass(frozen=True)
+class PoolIdentity:
+    protocol_version: int
+    access_context: str | None
+    physical_cluster_uid: str | None
+    gpu_names: tuple[str, ...]
+
+
+def parse_pool_identity(pool_key: str) -> PoolIdentity:
+    """Parse either pool-key protocol without guessing malformed keys."""
+    decoded = json.loads(pool_key)
+    if not isinstance(decoded, list):
+        raise ValueError(f'Invalid reserved-fill pool key: {pool_key!r}.')
+    if len(decoded) == 2:
+        context, encoded_names = decoded
+        if not isinstance(context, str) or not context:
+            raise ValueError(f'Invalid reserved-fill pool key: {pool_key!r}.')
+        protocol_version = PROTOCOL_V1
+        physical_cluster_uid = None
+        access_context: str | None = context
+    elif len(decoded) == 3 and decoded[0] == 'v2':
+        _, physical_cluster_uid, encoded_names = decoded
+        if (not isinstance(physical_cluster_uid, str) or
+                not physical_cluster_uid):
+            raise ValueError(f'Invalid reserved-fill pool key: {pool_key!r}.')
+        protocol_version = PROTOCOL_V2
+        access_context = None
+    else:
+        raise ValueError(f'Invalid reserved-fill pool key: {pool_key!r}.')
+    if isinstance(encoded_names, str):
+        raw_names = (encoded_names,)
+    elif isinstance(encoded_names, list) and all(
+            isinstance(name, str) for name in encoded_names):
+        raw_names = tuple(encoded_names)
+    else:
+        raise ValueError(f'Invalid reserved-fill pool key: {pool_key!r}.')
+    names = _canonical_gpu_names(raw_names)
+    return PoolIdentity(protocol_version=protocol_version,
+                        access_context=access_context,
+                        physical_cluster_uid=physical_cluster_uid,
+                        gpu_names=names)
 
 
 def parse_pool_key(pool_key: str) -> tuple[str, tuple[str, ...]]:
-    context, encoded_names = json.loads(pool_key)
-    if isinstance(encoded_names, str):
-        names: tuple[str, ...] = (encoded_names.lower(),)
-    else:
-        names = tuple(sorted({str(name).lower() for name in encoded_names}))
-    return context, names
+    """Parse a protocol-v1 pool key.
+
+    Kept for existing callers that require an access context. Protocol-v2
+    callers must use :func:`parse_pool_identity` and the claim's separate
+    access-context field.
+    """
+    identity = parse_pool_identity(pool_key)
+    if identity.protocol_version != PROTOCOL_V1:
+        raise ValueError('Protocol-v2 pool keys do not contain an access '
+                         'context.')
+    assert identity.access_context is not None
+    return identity.access_context, identity.gpu_names
 
 
 def _pool_keys_overlap(left: str, right: str) -> bool:
-    left_context, left_names = parse_pool_key(left)
-    right_context, right_names = parse_pool_key(right)
-    return (left_context == right_context and
-            bool(set(left_names).intersection(right_names)))
+    left_identity = parse_pool_identity(left)
+    right_identity = parse_pool_identity(right)
+    if left_identity.protocol_version != right_identity.protocol_version:
+        # Protocols never share a round. The durable activation gate prevents
+        # them from acting concurrently; treating them as non-overlapping here
+        # keeps the v1 compatibility shadow inert under protocol v2.
+        return False
+    if left_identity.protocol_version == PROTOCOL_V1:
+        same_pool = (
+            left_identity.access_context == right_identity.access_context)
+    else:
+        same_pool = (left_identity.physical_cluster_uid ==
+                     right_identity.physical_cluster_uid)
+    return same_pool and bool(
+        set(left_identity.gpu_names).intersection(right_identity.gpu_names))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,15 +376,22 @@ class PoolObservation:
     gpu_names are the canonical accelerator names the realtime query
     reported for the pool's context; empty on a successful query means the
     claimed GPU resolves to no labeled nodes (phantom pool).
+
+    free_slots_by_accelerator is the optional exact-card decomposition of
+    free_slots, in deterministic task-resource order. ``None`` means the
+    provider/writer did not publish exact-card telemetry; an empty tuple is an
+    authoritative zero-card split.  Tuple storage keeps this frozen value
+    immutable and JSON-independent while it crosses the round driver.
     """
     free_slots: int | None
     gpu_names: tuple[str, ...] = ()
+    free_slots_by_accelerator: tuple[tuple[str, int], ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
 class Allocation:
     """One service's slice of the latest round."""
-    # None = single-claimant fast path: no ceiling (#108 identity).
+    # None = protocol-v1 single-claimant fast path: no ceiling (#108 identity).
     grant: int | None
     feed: int
     round_id: int
@@ -139,6 +408,24 @@ class Allocation:
     # is instantaneous in the raw entitlement, max(damped, raw) reopens the
     # gate in the same round the burst is observed.
     demand_gate_grant: int | None = None
+    # Allocation authority. Protocol v1 uses generation zero. Protocol v2
+    # decisions must carry every field through final replica persistence.
+    protocol_version: int = PROTOCOL_V1
+    service_generation: int = 0
+    physical_cluster_uid: str | None = None
+    edge_cap: int | None = None
+    pool_key: str | None = None
+    # Exact-card portion of this service's feed. None means the round had no
+    # exact-card telemetry; an empty mapping means exact telemetry authorized
+    # no shaped launch.  The aggregate feed is always clamped to this mapping
+    # when present.
+    feed_by_accelerator: dict[str, int] | None = None
+    # Raw provider observation from the successfully published round.  These
+    # fields are all absent for old, blackout, rejected, or corrupt rounds.
+    # They are placement evidence only; feed/grant remain launch authority.
+    observed_free: int | None = None
+    observed_free_by_accelerator: dict[str, int] | None = None
+    observed_at: float | None = None
 
 
 # Keep the historical broker import and pickle identities as a direct facade.
@@ -157,29 +444,1101 @@ for _allocation_symbol in (ClaimInput, _largest_remainder_round, scale_floors,
     _allocation_symbol.__module__ = __name__
 del _allocation_symbol
 
-# In-process cache of the last GRANT each service observed, refreshed by
-# its poller every poll interval. The demand-placement gate in the launch
-# path reads ONLY this cache (never the DB): the gate is advisory and a
-# poll-interval-stale read is safe (grants only gate NEW launches), while a
-# DB read per demand launch would be a hot-path regression. A None grant
-# (single-claimant fast path) and a missing/stale entry read the same --
-# both leave the gate inert.
-_GRANT_CACHE: dict[str, tuple[int | None, float]] = {}
+
+@dataclasses.dataclass(frozen=True)
+class CachedPoolGrant:
+    """Fresh v2 demand-gate authority for one physical pool edge."""
+    grant: int
+    access_context: str
+    accelerator_names: tuple[str, ...]
+    physical_cluster_uid: str
+    service_generation: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _GrantCacheEntry:
+    grant: int | None
+    cached_at: float
+    access_context: str | None = None
+    accelerator_names: tuple[str, ...] = ()
+    physical_cluster_uid: str | None = None
+    service_generation: int = 0
+
+
+# In-process cache of the last GRANT each service/pool edge observed, refreshed
+# by its poller every poll interval. Protocol v1 stores its historical
+# service-only entry under a None pool key; protocol v2 entries are composite.
+# The demand-placement gate reads ONLY this cache (never the DB).
+_GRANT_CACHE: dict[tuple[str, str | None], _GrantCacheEntry] = {}
+# Pollers refresh/reconcile this map while replica reconciliation reads it.
+# The entries are immutable, so readers can release the lock after taking one
+# complete snapshot. RLock is required because cache reconciliation calls the
+# service-clear helper while it may already own the cache lock.
+_GRANT_CACHE_LOCK = threading.RLock()
 
 
 def clear_caches() -> None:
     """Test hook: drop in-process state."""
-    _GRANT_CACHE.clear()
+    with _GRANT_CACHE_LOCK:
+        _GRANT_CACHE.clear()
 
 
-def get_cached_grant(service_name: str, max_age_seconds: float) -> int | None:
-    entry = _GRANT_CACHE.get(service_name)
+def _cache_key(service_name: str,
+               pool_key: str | None) -> tuple[str, str | None]:
+    return service_name, pool_key
+
+
+def _clear_service_cache(service_name: str,
+                         pool_key: str | None = None) -> None:
+    with _GRANT_CACHE_LOCK:
+        if pool_key is not None:
+            _GRANT_CACHE.pop(_cache_key(service_name, pool_key), None)
+            return
+        for key in list(_GRANT_CACHE):
+            if key[0] == service_name:
+                _GRANT_CACHE.pop(key, None)
+
+
+def _grant_cache_snapshot(
+) -> tuple[tuple[tuple[str, str | None], _GrantCacheEntry], ...]:
+    """Return one coherent immutable-entry snapshot for lock-free filtering."""
+    with _GRANT_CACHE_LOCK:
+        return tuple(_GRANT_CACHE.items())
+
+
+def get_cached_grant(service_name: str,
+                     max_age_seconds: float,
+                     *,
+                     pool_key: str | None = None) -> int | None:
+    """Read one fresh advisory grant.
+
+    Omitting ``pool_key`` preserves the protocol-v1 service-only API.
+    Protocol-v2 callers must name the exact pool; grants are not transferable
+    across contexts.
+    """
+    with _GRANT_CACHE_LOCK:
+        entry = _GRANT_CACHE.get(_cache_key(service_name, pool_key))
     if entry is None:
         return None
-    grant, cached_at = entry
-    if time.time() - cached_at > max_age_seconds:
+    if time.time() - entry.cached_at > max_age_seconds:
         return None
-    return grant
+    return entry.grant
+
+
+def get_cached_grants(service_name: str,
+                      max_age_seconds: float) -> dict[str, int]:
+    """Return every fresh protocol-v2 pool grant for one service."""
+    now = time.time()
+    return {
+        pool_key: entry.grant
+        for (cached_service, pool_key), entry in _grant_cache_snapshot()
+        if (cached_service == service_name and pool_key is not None and
+            entry.grant is not None and now -
+            entry.cached_at <= max_age_seconds)
+    }
+
+
+def get_cached_pool_grants(
+        service_name: str,
+        max_age_seconds: float) -> dict[str, CachedPoolGrant]:
+    """Return fresh v2 grants with the access metadata needed to place."""
+    now = time.time()
+    result: dict[str, CachedPoolGrant] = {}
+    for (cached_service, pool_key), entry in _grant_cache_snapshot():
+        if (cached_service != service_name or pool_key is None or
+                entry.grant is None or
+                now - entry.cached_at > max_age_seconds or
+                entry.access_context is None or
+                entry.physical_cluster_uid is None or
+                not entry.accelerator_names):
+            continue
+        result[pool_key] = CachedPoolGrant(
+            grant=entry.grant,
+            access_context=entry.access_context,
+            accelerator_names=entry.accelerator_names,
+            physical_cluster_uid=entry.physical_cluster_uid,
+            service_generation=entry.service_generation)
+    return result
+
+
+def get_protocol_version() -> int:
+    """Read the durable broker protocol, failing closed to protocol v1."""
+    row = serve_state.get_reserved_fill_protocol_state()
+    if row is None:
+        return PROTOCOL_V1
+    try:
+        version = int(row['protocol_version'])
+    except (KeyError, TypeError, ValueError):
+        logger.error('Reserved-fill protocol state is malformed; retaining '
+                     'protocol v1.')
+        return PROTOCOL_V1
+    if version not in _SUPPORTED_PROTOCOLS:
+        logger.error(f'Unsupported durable reserved-fill protocol {version}; '
+                     'retaining protocol v1.')
+        return PROTOCOL_V1
+    return version
+
+
+def _decode_token_bound_pod_identity(token: str) -> _TokenBoundPodIdentity:
+    """Decode pod-bound claims whose trust comes from using this exact token."""
+    if (not isinstance(token, str) or not token or token != token.strip() or
+            len(token.encode('utf-8')) > _MAX_SERVICE_ACCOUNT_TOKEN_BYTES):
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token is malformed.')
+    segments = token.split('.')
+    if len(segments) != 3 or any(not segment for segment in segments):
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token is not a JWT.')
+    payload_segment = segments[1]
+    padded_payload = payload_segment + '=' * (-len(payload_segment) % 4)
+    try:
+        payload_bytes = base64.b64decode(padded_payload.encode('ascii'),
+                                         altchars=b'-_',
+                                         validate=True)
+        if len(payload_bytes) > _MAX_SERVICE_ACCOUNT_TOKEN_BYTES:
+            raise ValueError('JWT payload is too large.')
+        payload = json.loads(payload_bytes.decode('utf-8'))
+    except (binascii.Error, UnicodeError, ValueError):
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token payload is malformed.') from None
+    if not isinstance(payload, Mapping):
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token payload is malformed.')
+    kubernetes_claims = payload.get('kubernetes.io')
+    if not isinstance(kubernetes_claims, Mapping):
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token is not pod-bound.')
+    pod_claim = kubernetes_claims.get('pod')
+    namespace = kubernetes_claims.get('namespace')
+    pod_name = pod_claim.get('name') if isinstance(pod_claim, Mapping) else None
+    pod_uid = pod_claim.get('uid') if isinstance(pod_claim, Mapping) else None
+    if any(not isinstance(value, str) or not value
+           for value in (namespace, pod_name, pod_uid)):
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token has no complete pod binding.')
+    assert isinstance(namespace, str)
+    assert isinstance(pod_name, str)
+    assert isinstance(pod_uid, str)
+    return _TokenBoundPodIdentity(namespace=namespace,
+                                  name=pod_name,
+                                  uid=pod_uid)
+
+
+def _read_token_bound_pod_identity() -> tuple[str, _TokenBoundPodIdentity]:
+    """Read one bounded mounted token and its required pod binding."""
+    try:
+        with open(kubernetes.IN_CLUSTER_TOKEN_PATH, 'rb') as token_file:
+            if not stat.S_ISREG(os.fstat(token_file.fileno()).st_mode):
+                raise ProtocolV2ActivationError(
+                    'The mounted service-account token is not a regular file.')
+            token_bytes = token_file.read(_MAX_SERVICE_ACCOUNT_TOKEN_BYTES + 1)
+    except OSError as error:
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token could not be read.') from error
+    if not token_bytes or len(token_bytes) > _MAX_SERVICE_ACCOUNT_TOKEN_BYTES:
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token has an invalid size.')
+    try:
+        token = token_bytes.decode('ascii')
+    except UnicodeError:
+        raise ProtocolV2ActivationError(
+            'The mounted service-account token is malformed.') from None
+    return token, _decode_token_bound_pod_identity(token)
+
+
+def _required_object_string(value: Any, description: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ProtocolV2ActivationError(
+            f'The rollout {description} is missing.')
+    return value
+
+
+def _required_positive_int(value: Any, description: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ProtocolV2ActivationError(
+            f'The rollout {description} is not a positive integer.')
+    return value
+
+
+def _replica_count(value: Any, description: str, *, none_is_zero: bool) -> int:
+    if value is None and none_is_zero:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProtocolV2ActivationError(
+            f'The rollout {description} is not a replica count.')
+    return value
+
+
+def _deployment_exact_selector_labels(deployment: Any) -> dict[str, str]:
+    selector = getattr(getattr(deployment, 'spec', None), 'selector', None)
+    labels = getattr(selector, 'match_labels', None)
+    expressions = getattr(selector, 'match_expressions', None)
+    if expressions:
+        # The shipped chart uses exact matchLabels.  Refusing expressions keeps
+        # the proof cohort mechanically tied to a finite set of exact labels.
+        raise ProtocolV2ActivationError(
+            'A writer Deployment selector must use exact matchLabels only.')
+    if not isinstance(labels, Mapping) or not labels:
+        raise ProtocolV2ActivationError(
+            'A writer Deployment has no exact selector labels.')
+    normalized: dict[str, str] = {}
+    for key, value in labels.items():
+        if (not isinstance(key, str) or not key or not isinstance(value, str)):
+            raise ProtocolV2ActivationError(
+                'A writer Deployment has an invalid selector label.')
+        normalized[key] = value
+    return normalized
+
+
+def _is_object_sequence(value: Any) -> TypeGuard[Sequence[Any]]:
+    return (isinstance(value, Sequence) and
+            not isinstance(value, (str, bytes, bytearray)))
+
+
+def _named_container(containers: Any, container_name: str, description: str, *,
+                     required: bool) -> Any | None:
+    if not _is_object_sequence(containers):
+        if required:
+            raise ProtocolV2ActivationError(
+                f'The {description} has no container inventory.')
+        return None
+    matches = [
+        container for container in containers
+        if getattr(container, 'name', None) == container_name
+    ]
+    if len(matches) > 1:
+        raise ProtocolV2ActivationError(
+            f'The {description} has duplicate {container_name!r} containers.')
+    if not matches:
+        if required:
+            raise ProtocolV2ActivationError(
+                f'The {description} has no {container_name!r} container.')
+        return None
+    return matches[0]
+
+
+def _deployment_container(deployment: Any, container_name: str, *,
+                          required: bool) -> Any | None:
+    spec = getattr(deployment, 'spec', None)
+    template_spec = getattr(getattr(spec, 'template', None), 'spec', None)
+    return _named_container(getattr(template_spec, 'containers', None),
+                            container_name,
+                            'writer Deployment template',
+                            required=required)
+
+
+def _pod_container(pod: Any, container_name: str, *, required: bool) -> Any:
+    spec = getattr(pod, 'spec', None)
+    return _named_container(getattr(spec, 'containers', None),
+                            container_name,
+                            'writer Pod spec',
+                            required=required)
+
+
+def _literal_env_value(container: Any, name: str, description: str) -> str:
+    env = getattr(container, 'env', None)
+    if not _is_object_sequence(env):
+        raise ProtocolV2ActivationError(
+            f'The {description} has no literal {name} identity.')
+    matches = [entry for entry in env if getattr(entry, 'name', None) == name]
+    if len(matches) != 1:
+        raise ProtocolV2ActivationError(
+            f'The {description} does not have exactly one {name} identity.')
+    entry = matches[0]
+    value = getattr(entry, 'value', None)
+    if (getattr(entry, 'value_from', None) is not None or
+            not isinstance(value, str) or not value):
+        raise ProtocolV2ActivationError(
+            f'The {description} {name} identity is not a nonempty literal.')
+    return value
+
+
+def _labels_match(labels: Any, selector_labels: Mapping[str, str]) -> bool:
+    return (isinstance(labels, Mapping) and all(
+        labels.get(key) == value for key, value in selector_labels.items()))
+
+
+def _required_label(resource: Any, label: str, description: str) -> str:
+    labels = getattr(getattr(resource, 'metadata', None), 'labels', None)
+    value = labels.get(label) if isinstance(labels, Mapping) else None
+    if not isinstance(value, str) or not value:
+        raise ProtocolV2ActivationError(
+            f'The {description} has no {label!r} label.')
+    return value
+
+
+def _deployment_rollout_identity(
+        deployment: Any, target: _WriterDeploymentTarget, *, namespace: str,
+        release_name: str,
+        helm_instance: str) -> tuple[str, str, str, int, dict[str, str]]:
+    metadata = getattr(deployment, 'metadata', None)
+    if getattr(metadata, 'deletion_timestamp', None) is not None:
+        raise ProtocolV2ActivationError(
+            f'The {target.role} writer Deployment is terminating.')
+    observed_name = _required_object_string(getattr(metadata, 'name', None),
+                                            'Deployment name')
+    observed_namespace = _required_object_string(
+        getattr(metadata, 'namespace', None), 'Deployment namespace')
+    if observed_name != target.name or observed_namespace != namespace:
+        raise ProtocolV2ActivationError(
+            f'The {target.role} writer Deployment identity changed.')
+    generation = _required_positive_int(getattr(metadata, 'generation', None),
+                                        'Deployment generation')
+    resource_version = _required_object_string(
+        getattr(metadata, 'resource_version', None),
+        'Deployment resourceVersion')
+    deployment_uid = _required_object_string(getattr(metadata, 'uid', None),
+                                             'Deployment UID')
+    spec = getattr(deployment, 'spec', None)
+    desired = _required_positive_int(getattr(spec, 'replicas', None),
+                                     'desired replica count')
+    status = getattr(deployment, 'status', None)
+    observed_generation = _required_positive_int(
+        getattr(status, 'observed_generation', None),
+        'observed Deployment generation')
+    if observed_generation != generation:
+        raise ProtocolV2ActivationError(
+            f'The {target.role} writer Deployment controller has not observed '
+            'its generation.')
+    replica_counts = {
+        'replicas': _replica_count(getattr(status, 'replicas', None),
+                                   'current replica count',
+                                   none_is_zero=False),
+        'updated replicas': _replica_count(getattr(status, 'updated_replicas',
+                                                   None),
+                                           'updated replica count',
+                                           none_is_zero=False),
+        'ready replicas': _replica_count(getattr(status, 'ready_replicas',
+                                                 None),
+                                         'ready replica count',
+                                         none_is_zero=False),
+        'available replicas': _replica_count(getattr(status,
+                                                     'available_replicas',
+                                                     None),
+                                             'available replica count',
+                                             none_is_zero=False),
+    }
+    if any(count != desired for count in replica_counts.values()):
+        raise ProtocolV2ActivationError(
+            f'The {target.role} writer Deployment rollout is not fully '
+            'available: '
+            f'desired={desired}, {replica_counts}.')
+    unavailable = _replica_count(getattr(status, 'unavailable_replicas', None),
+                                 'unavailable replica count',
+                                 none_is_zero=True)
+    if unavailable != 0:
+        raise ProtocolV2ActivationError(
+            f'The {target.role} writer Deployment still has unavailable '
+            'replicas.')
+    container = _deployment_container(deployment,
+                                      target.container_name,
+                                      required=True)
+    if (_literal_env_value(container, _RELEASE_NAME_ENV_VAR,
+                           f'{target.role} writer Deployment')
+            != release_name or _literal_env_value(
+                container, _SERVER_ROLE_ENV_VAR,
+                f'{target.role} writer Deployment') != target.server_role):
+        raise ProtocolV2ActivationError(
+            f'The {target.role} writer Deployment runtime identity changed.')
+    if (_required_label(deployment, _HELM_INSTANCE_LABEL,
+                        f'{target.role} writer Deployment') != helm_instance or
+            _required_label(
+                getattr(getattr(deployment, 'spec', None), 'template',
+                        None), _HELM_INSTANCE_LABEL,
+                f'{target.role} writer Pod template') != helm_instance):
+        raise ProtocolV2ActivationError(
+            f'The {target.role} writer Deployment release scope changed.')
+    return (str(generation), resource_version, deployment_uid, desired,
+            _deployment_exact_selector_labels(deployment))
+
+
+def _pod_image_digest(pod: Any, container_name: str) -> str:
+    status = getattr(pod, 'status', None)
+    if getattr(status, 'phase', None) != 'Running':
+        raise ProtocolV2ActivationError('A writer Pod is not Running.')
+    conditions = getattr(status, 'conditions', None)
+    if not isinstance(conditions, Sequence) or not any(
+            getattr(condition, 'type', None) == 'Ready' and
+            getattr(condition, 'status', None) in (True, 'True')
+            for condition in conditions):
+        raise ProtocolV2ActivationError('A writer Pod is not Ready.')
+    container_statuses = getattr(status, 'container_statuses', None)
+    if not isinstance(container_statuses, Sequence):
+        raise ProtocolV2ActivationError(
+            'A writer Pod has no container status cohort.')
+    target_statuses = [
+        container_status for container_status in container_statuses
+        if getattr(container_status, 'name', None) == container_name
+    ]
+    if len(target_statuses) != 1:
+        raise ProtocolV2ActivationError(
+            f'A writer Pod does not have exactly one {container_name!r} '
+            'container status.')
+    target_status = target_statuses[0]
+    if getattr(target_status, 'ready', None) is not True:
+        raise ProtocolV2ActivationError(
+            'The target writer container is not Ready.')
+    image_id = getattr(target_status, 'image_id', None)
+    if not isinstance(image_id, str):
+        raise ProtocolV2ActivationError(
+            'The target writer container has no immutable imageID.')
+    match = _IMAGE_ID_DIGEST_PATTERN.search(image_id)
+    if match is None:
+        raise ProtocolV2ActivationError(
+            'The target writer container imageID has no sha256 digest.')
+    return match.group(1).lower()
+
+
+def _controller_owner(resource: Any, kind: str,
+                      description: str) -> tuple[str, str]:
+    owner_references = getattr(getattr(resource, 'metadata', None),
+                               'owner_references', None)
+    if not _is_object_sequence(owner_references):
+        raise ProtocolV2ActivationError(
+            f'The {description} has no controller owner reference.')
+    owners = [
+        owner for owner in owner_references
+        if getattr(owner, 'controller', None) is True and
+        getattr(owner, 'kind', None) == kind and
+        getattr(owner, 'api_version', None) == 'apps/v1'
+    ]
+    if len(owners) != 1:
+        raise ProtocolV2ActivationError(
+            f'The {description} is not controlled by exactly one {kind}.')
+    return (_required_object_string(getattr(owners[0], 'name', None),
+                                    f'{kind} owner name'),
+            _required_object_string(getattr(owners[0], 'uid', None),
+                                    f'{kind} owner UID'))
+
+
+def _read_token_bound_api_owner(
+        apps_api: Any, core_api: Any, identity: _TokenBoundPodIdentity
+) -> tuple[Any, _DeploymentOwnerIdentity]:
+    """Bind the authenticated Pod to its Deployment through immutable UIDs."""
+    bound_pod = core_api.read_namespaced_pod(
+        name=identity.name,
+        namespace=identity.namespace,
+        _request_timeout=kubernetes.API_TIMEOUT)
+    metadata = getattr(bound_pod, 'metadata', None)
+    observed_name = _required_object_string(getattr(metadata, 'name', None),
+                                            'bound pod name')
+    observed_namespace = _required_object_string(
+        getattr(metadata, 'namespace', None), 'bound pod namespace')
+    observed_uid = _required_object_string(getattr(metadata, 'uid', None),
+                                           'bound pod UID')
+    if (observed_name != identity.name or
+            observed_namespace != identity.namespace or
+            observed_uid != identity.uid):
+        raise ProtocolV2ActivationError(
+            'The authenticated pod binding does not match the live Pod.')
+    _required_label(bound_pod, _HELM_INSTANCE_LABEL, 'authenticated API Pod')
+    replica_set_name, replica_set_uid = _controller_owner(
+        bound_pod, 'ReplicaSet', 'authenticated API Pod')
+    replica_set = apps_api.read_namespaced_replica_set(
+        name=replica_set_name,
+        namespace=identity.namespace,
+        _request_timeout=kubernetes.API_TIMEOUT)
+    replica_set_metadata = getattr(replica_set, 'metadata', None)
+    if (_required_object_string(getattr(replica_set_metadata, 'name', None),
+                                'ReplicaSet name') != replica_set_name or
+            _required_object_string(
+                getattr(replica_set_metadata, 'namespace', None),
+                'ReplicaSet namespace') != identity.namespace or
+            _required_object_string(getattr(replica_set_metadata, 'uid', None),
+                                    'ReplicaSet UID') != replica_set_uid):
+        raise ProtocolV2ActivationError(
+            'The authenticated API Pod owner ReplicaSet identity changed.')
+    deployment_name, deployment_uid = _controller_owner(
+        replica_set, 'Deployment', 'authenticated API Pod ReplicaSet')
+    return bound_pod, _DeploymentOwnerIdentity(name=deployment_name,
+                                               uid=deployment_uid)
+
+
+def _deployment_inventory(deployment_list: Any,
+                          namespace: str) -> dict[str, Any]:
+    deployments = getattr(deployment_list, 'items', None)
+    if not _is_object_sequence(deployments):
+        raise ProtocolV2ActivationError(
+            'The writer Deployment inventory is malformed.')
+    inventory: dict[str, Any] = {}
+    for deployment in deployments:
+        metadata = getattr(deployment, 'metadata', None)
+        name = _required_object_string(getattr(metadata, 'name', None),
+                                       'Deployment inventory name')
+        observed_namespace = _required_object_string(
+            getattr(metadata, 'namespace', None),
+            'Deployment inventory namespace')
+        if observed_namespace != namespace or name in inventory:
+            raise ProtocolV2ActivationError(
+                'The writer Deployment inventory has an invalid identity.')
+        inventory[name] = deployment
+    return inventory
+
+
+def _discover_writer_targets(
+    deployments: dict[str,
+                      Any], bound_pod: Any, api_owner: _DeploymentOwnerIdentity
+) -> tuple[str, str, tuple[_WriterDeploymentTarget, ...]]:
+    """Derive the complete chart writer topology from authenticated ownership."""
+    api_deployment = deployments.get(api_owner.name)
+    if api_deployment is None:
+        raise ProtocolV2ActivationError(
+            'The authenticated API Deployment is absent from inventory.')
+    api_metadata = getattr(api_deployment, 'metadata', None)
+    if _required_object_string(getattr(api_metadata, 'uid', None),
+                               'API Deployment UID') != api_owner.uid:
+        raise ProtocolV2ActivationError(
+            'The authenticated API Deployment UID changed.')
+    api_container = _deployment_container(api_deployment,
+                                          _API_SERVER_CONTAINER_NAME,
+                                          required=True)
+    selector_labels = _deployment_exact_selector_labels(api_deployment)
+    if not _labels_match(
+            getattr(getattr(bound_pod, 'metadata', None), 'labels', None),
+            selector_labels):
+        raise ProtocolV2ActivationError(
+            'The authenticated API Deployment does not select its bound Pod.')
+    release_name = _literal_env_value(api_container, _RELEASE_NAME_ENV_VAR,
+                                      'authenticated API Deployment')
+    api_server_role = _literal_env_value(api_container, _SERVER_ROLE_ENV_VAR,
+                                         'authenticated API Deployment')
+    if api_server_role not in ('all', 'api'):
+        raise ProtocolV2ActivationError(
+            'The authenticated API Deployment has an invalid server role.')
+    if api_owner.name != f'{release_name}-api-server':
+        raise ProtocolV2ActivationError(
+            'The authenticated API Deployment name does not match its '
+            'chart-owned release identity.')
+    helm_instance = _required_label(bound_pod, _HELM_INSTANCE_LABEL,
+                                    'authenticated API Pod')
+
+    matching: dict[str, list[str]] = {
+        'api': [],
+        'controller': [],
+        'executor': [],
+    }
+    container_names = {
+        'api': _API_SERVER_CONTAINER_NAME,
+        'controller': _CONTROLLER_CONTAINER_NAME,
+        'executor': _EXECUTOR_CONTAINER_NAME,
+    }
+    expected_controller_name = f'{release_name}-controller'
+    expected_executor_name = f'{release_name}-executor'
+    for name, deployment in deployments.items():
+        for role, container_name in container_names.items():
+            container = _deployment_container(deployment,
+                                              container_name,
+                                              required=False)
+            if container is None:
+                continue
+            try:
+                observed_release = _literal_env_value(
+                    container, _RELEASE_NAME_ENV_VAR,
+                    f'{role} writer Deployment candidate')
+            except ProtocolV2ActivationError:
+                if name in (api_owner.name, expected_controller_name,
+                            expected_executor_name):
+                    raise
+                continue
+            if observed_release != release_name:
+                continue
+            observed_server_role = _literal_env_value(
+                container, _SERVER_ROLE_ENV_VAR,
+                f'{role} writer Deployment candidate')
+            if ((role == 'api' and observed_server_role not in ('all', 'api'))
+                    or (role == 'controller' and
+                        observed_server_role != 'controller') or
+                (role == 'executor' and observed_server_role != 'executor')):
+                raise ProtocolV2ActivationError(
+                    f'The {role} writer Deployment candidate has an invalid '
+                    'server role.')
+            request_backend = _literal_env_value(
+                container, _REQUEST_BACKEND_ENV_VAR,
+                f'{role} writer Deployment candidate')
+            if request_backend != 'postgres':
+                raise ProtocolV2ActivationError(
+                    f'The {role} writer Deployment candidate does not use '
+                    'the PostgreSQL API request backend.')
+            if _literal_env_value(
+                    container, _QUIESCENCE_BACKEND_GUARD_ENV_VAR,
+                    f'{role} writer Deployment candidate') != 'true':
+                raise ProtocolV2ActivationError(
+                    f'The {role} writer Deployment candidate does not '
+                    'enforce built-in execution-quiescence backends.')
+            observed_helm_instance = _required_label(
+                deployment, _HELM_INSTANCE_LABEL,
+                f'{role} writer Deployment candidate')
+            if observed_helm_instance != helm_instance:
+                raise ProtocolV2ActivationError(
+                    f'The {role} writer Deployment crosses Helm release '
+                    'scope.')
+            matching[role].append(name)
+
+    if matching['api'] != [api_owner.name]:
+        raise ProtocolV2ActivationError(
+            'The Helm release does not have exactly its authenticated API '
+            'writer Deployment.')
+    api_target = _WriterDeploymentTarget(
+        role='api',
+        name=api_owner.name,
+        container_name=_API_SERVER_CONTAINER_NAME,
+        server_role=api_server_role)
+    if api_server_role == 'all':
+        if (matching['controller'] or matching['executor'] or
+                expected_controller_name in deployments or
+                expected_executor_name in deployments):
+            raise ProtocolV2ActivationError(
+                'A compatibility API release has a separate controller or '
+                'executor Deployment.')
+        return release_name, helm_instance, (api_target,)
+    if matching['controller'] != [expected_controller_name]:
+        raise ProtocolV2ActivationError(
+            'The HA API release does not have exactly its controller writer '
+            'Deployment.')
+    if matching['executor'] != [expected_executor_name]:
+        raise ProtocolV2ActivationError(
+            'The HA API release does not have exactly its executor writer '
+            'Deployment.')
+    return release_name, helm_instance, (
+        api_target,
+        _WriterDeploymentTarget(role='controller',
+                                name=expected_controller_name,
+                                container_name=_CONTROLLER_CONTAINER_NAME,
+                                server_role='controller'),
+        _WriterDeploymentTarget(role='executor',
+                                name=expected_executor_name,
+                                container_name=_EXECUTOR_CONTAINER_NAME,
+                                server_role='executor'))
+
+
+def _pod_identity(pod: Any, namespace: str) -> tuple[str, str, str]:
+    metadata = getattr(pod, 'metadata', None)
+    observed_namespace = _required_object_string(
+        getattr(metadata, 'namespace', None), 'Pod namespace')
+    if observed_namespace != namespace:
+        raise ProtocolV2ActivationError(
+            'The Pod inventory crosses namespace scope.')
+    return (_required_object_string(getattr(metadata, 'name', None),
+                                    'Pod name'),
+            _required_object_string(getattr(metadata, 'uid', None), 'Pod UID'),
+            _required_object_string(getattr(metadata, 'resource_version', None),
+                                    'Pod resourceVersion'))
+
+
+def _is_terminal_pod(pod: Any) -> bool:
+    return getattr(getattr(pod, 'status', None), 'phase',
+                   None) in ('Succeeded', 'Failed')
+
+
+def _read_recent_writer_instances() -> tuple[_WriterProcessInstance, ...]:
+    """Read every recent all/api/controller/executor lease from PostgreSQL."""
+    try:
+        rows = serve_state.get_recent_reserved_fill_writer_instances(
+            _WRITER_INSTANCE_STALE_AFTER_SECONDS)
+    except RuntimeError as error:
+        raise ProtocolV2ActivationError(
+            'The live writer-process inventory could not be read.') from error
+    result: list[_WriterProcessInstance] = []
+    for row in rows:
+        role = row.role
+        pod_name = row.pod_name
+        pod_uid = row.pod_uid
+        version = row.version
+        request_storage_backend = row.request_storage_backend
+        request_queue_backend = row.request_queue_backend
+        execution_quiescence_capable = row.execution_quiescence_capable
+        if (role not in ('all', 'api', 'controller', 'executor') or
+                any(not isinstance(value, str) or not value
+                    for value in (pod_name, pod_uid, version,
+                                  request_storage_backend,
+                                  request_queue_backend)) or
+                not isinstance(execution_quiescence_capable, bool)):
+            raise ProtocolV2ActivationError(
+                'A recent writer-process lease has malformed Pod identity.')
+        assert isinstance(role, str)
+        assert isinstance(pod_name, str)
+        assert isinstance(pod_uid, str)
+        assert isinstance(version, str)
+        assert isinstance(request_storage_backend, str)
+        assert isinstance(request_queue_backend, str)
+        result.append(
+            _WriterProcessInstance(
+                role=role,
+                instance_id=row.instance_id,
+                pod_name=pod_name,
+                pod_uid=pod_uid,
+                version=version,
+                ready=row.ready,
+                draining=row.draining,
+                request_storage_backend=(request_storage_backend),
+                request_queue_backend=request_queue_backend,
+                execution_quiescence_capable=(execution_quiescence_capable)))
+    return tuple(
+        sorted(result,
+               key=lambda item: (item.role, item.pod_uid, item.instance_id)))
+
+
+def _validate_pod_runtime_identity(pod: Any, target: _WriterDeploymentTarget,
+                                   release_name: str,
+                                   helm_instance: str) -> None:
+    container = _pod_container(pod, target.container_name, required=True)
+    if (_literal_env_value(container, _RELEASE_NAME_ENV_VAR,
+                           f'{target.role} writer Pod') != release_name or
+            _literal_env_value(
+                container, _SERVER_ROLE_ENV_VAR,
+                f'{target.role} writer Pod') != target.server_role or
+            _required_label(pod, _HELM_INSTANCE_LABEL,
+                            f'{target.role} writer Pod') != helm_instance):
+        raise ProtocolV2ActivationError(
+            f'The {target.role} writer Pod runtime identity is malformed.')
+
+
+def _validate_live_writer_pod_inventory(
+        pods: Sequence[Any], deployments: Sequence[_WriterDeploymentSnapshot],
+        *, namespace: str, release_name: str, helm_instance: str) -> None:
+    attested: dict[str, tuple[str, str]] = {}
+    for deployment in deployments:
+        server_role = ('all' if deployment.role == 'api' and
+                       len(deployments) == 1 else deployment.role)
+        for pod_name, pod_uid, _ in deployment.pod_cohort:
+            if pod_uid in attested:
+                raise ProtocolV2ActivationError(
+                    'A writer Pod is selected by multiple Deployments.')
+            attested[pod_uid] = (server_role, pod_name)
+
+    observed: dict[str, tuple[str, str]] = {}
+    for pod in pods:
+        pod_name, pod_uid, _ = _pod_identity(pod, namespace)
+        labels = getattr(getattr(pod, 'metadata', None), 'labels', None)
+        if (isinstance(labels, Mapping) and
+                labels.get(_HELM_INSTANCE_LABEL) == helm_instance and
+                labels.get(_MIGRATION_COMPONENT_LABEL) == _MIGRATION_COMPONENT
+                and not _is_terminal_pod(pod)):
+            raise ProtocolV2ActivationError(
+                'A same-release database migration Pod is still active.')
+        if _is_terminal_pod(pod):
+            continue
+        matched: list[tuple[str, str]] = []
+        for role, container_name in (('api', _API_SERVER_CONTAINER_NAME),
+                                     ('controller', _CONTROLLER_CONTAINER_NAME),
+                                     ('executor', _EXECUTOR_CONTAINER_NAME)):
+            container = _pod_container(pod, container_name, required=False)
+            if container is None:
+                continue
+            pod_release = _literal_env_value(container, _RELEASE_NAME_ENV_VAR,
+                                             f'{role} writer Pod candidate')
+            if pod_release != release_name:
+                continue
+            if (not isinstance(labels, Mapping) or
+                    labels.get(_HELM_INSTANCE_LABEL) != helm_instance):
+                raise ProtocolV2ActivationError(
+                    'A release writer Pod crosses Helm release scope.')
+            server_role = _literal_env_value(container, _SERVER_ROLE_ENV_VAR,
+                                             f'{role} writer Pod candidate')
+            if ((role == 'api' and server_role not in ('all', 'api')) or
+                (role == 'controller' and server_role != 'controller') or
+                (role == 'executor' and server_role != 'executor')):
+                raise ProtocolV2ActivationError(
+                    'A Helm-scoped writer Pod has an invalid server role.')
+            request_backend = _literal_env_value(
+                container, _REQUEST_BACKEND_ENV_VAR,
+                f'{role} writer Pod candidate')
+            if request_backend != 'postgres':
+                raise ProtocolV2ActivationError(
+                    'A Helm-scoped writer Pod does not use the PostgreSQL API '
+                    'request backend.')
+            if _literal_env_value(container, _QUIESCENCE_BACKEND_GUARD_ENV_VAR,
+                                  f'{role} writer Pod candidate') != 'true':
+                raise ProtocolV2ActivationError(
+                    'A Helm-scoped writer Pod does not enforce built-in '
+                    'execution-quiescence backends.')
+            matched.append((server_role, role))
+        if not matched:
+            continue
+        if len(matched) != 1:
+            raise ProtocolV2ActivationError(
+                'A Pod has multiple writer-capable server containers.')
+        if pod_uid in observed:
+            raise ProtocolV2ActivationError(
+                'The live writer Pod inventory has duplicate UIDs.')
+        observed[pod_uid] = (matched[0][0], pod_name)
+    if observed != attested:
+        raise ProtocolV2ActivationError(
+            'The live writer Pod inventory is not exactly the attested '
+            'Deployment cohort.')
+
+
+def _validate_writer_process_instances(
+        instances: Sequence[_WriterProcessInstance],
+        deployments: Sequence[_WriterDeploymentSnapshot]) -> None:
+    expected: dict[str, tuple[str, str]] = {}
+    for deployment in deployments:
+        role = ('all' if deployment.role == 'api' and len(deployments) == 1 else
+                deployment.role)
+        for pod_name, pod_uid, _ in deployment.pod_cohort:
+            expected[pod_uid] = (role, pod_name)
+    observed: dict[str, tuple[str, str]] = {}
+    for instance in instances:
+        if (not instance.ready or instance.draining or
+                instance.instance_id != instance.pod_uid or
+                instance.pod_uid in observed):
+            raise ProtocolV2ActivationError(
+                'A recent writer-process lease is not one healthy '
+                'Pod-bound instance.')
+        if (instance.request_storage_backend
+                != request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE or
+                instance.request_queue_backend
+                != request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE or
+                not instance.execution_quiescence_capable):
+            raise ProtocolV2ActivationError(
+                'A recent writer-process lease does not attest the built-in '
+                'PostgreSQL request storage and queue with execution '
+                'quiescence support.')
+        observed[instance.pod_uid] = (instance.role, instance.pod_name)
+    if observed != expected:
+        raise ProtocolV2ActivationError(
+            'The shared database writer-process inventory is not exactly the '
+            'attested Kubernetes writer cohort.')
+
+
+def _read_writer_rollout_snapshot(
+        apps_api: Any, core_api: Any, *, namespace: str, bound_pod: Any,
+        api_owner: _DeploymentOwnerIdentity) -> _WriterRolloutSnapshot:
+    deployment_list = apps_api.list_namespaced_deployment(
+        namespace=namespace, _request_timeout=kubernetes.API_TIMEOUT)
+    deployment_inventory = _deployment_inventory(deployment_list, namespace)
+    release_name, helm_instance, targets = _discover_writer_targets(
+        deployment_inventory, bound_pod, api_owner)
+    deployment_rollouts = []
+    for target in targets:
+        deployment = deployment_inventory[target.name]
+        rollout_identity = _deployment_rollout_identity(
+            deployment,
+            target,
+            namespace=namespace,
+            release_name=release_name,
+            helm_instance=helm_instance)
+        deployment_rollouts.append((target, rollout_identity))
+    pod_list = core_api.list_namespaced_pod(
+        namespace=namespace, _request_timeout=kubernetes.API_TIMEOUT)
+    pods = getattr(pod_list, 'items', None)
+    if not _is_object_sequence(pods):
+        raise ProtocolV2ActivationError(
+            'The writer Pod inventory is malformed.')
+    snapshots: list[_WriterDeploymentSnapshot] = []
+    for target, rollout_identity in deployment_rollouts:
+        (generation, resource_version, deployment_uid, desired,
+         selector_labels) = rollout_identity
+        selected_pods = [
+            pod for pod in pods if _labels_match(
+                getattr(getattr(pod, 'metadata', None), 'labels', None),
+                selector_labels)
+        ]
+        if len(selected_pods) != desired:
+            raise ProtocolV2ActivationError(
+                f'The {target.role} writer Deployment selector does not '
+                'resolve to exactly its desired Pod cohort: '
+                f'desired={desired}, observed={len(selected_pods)}.')
+        digests: set[str] = set()
+        cohort: list[tuple[str, str, str]] = []
+        for pod in selected_pods:
+            metadata = getattr(pod, 'metadata', None)
+            if getattr(metadata, 'deletion_timestamp', None) is not None:
+                raise ProtocolV2ActivationError('A writer Pod is terminating.')
+            _validate_pod_runtime_identity(pod, target, release_name,
+                                           helm_instance)
+            cohort.append(_pod_identity(pod, namespace))
+            digests.add(_pod_image_digest(pod, target.container_name))
+        if len(digests) != 1:
+            raise ProtocolV2ActivationError(
+                f'The {target.role} writer Pod cohort has mixed immutable '
+                'image digests.')
+        snapshots.append(
+            _WriterDeploymentSnapshot(
+                role=target.role,
+                deployment_name=target.name,
+                deployment_generation=generation,
+                deployment_resource_version=resource_version,
+                deployment_uid=deployment_uid,
+                container_name=target.container_name,
+                image_digest=digests.pop(),
+                pod_cohort=tuple(sorted(cohort))))
+    _validate_live_writer_pod_inventory(pods,
+                                        snapshots,
+                                        namespace=namespace,
+                                        release_name=release_name,
+                                        helm_instance=helm_instance)
+    writer_instances = _read_recent_writer_instances()
+    _validate_writer_process_instances(writer_instances, snapshots)
+    snapshot = _WriterRolloutSnapshot(release_name=release_name,
+                                      deployments=tuple(snapshots),
+                                      writer_instances=writer_instances)
+    # Require a single image containing both this activation action and every
+    # process that can mutate broker state.  Independent image overrides are
+    # allowed only when they resolve to that same immutable digest.
+    if not snapshot.deployments:
+        raise ProtocolV2ActivationError(
+            'The writer Deployment inventory is empty.')
+    _ = snapshot.image_digest
+    return snapshot
+
+
+def _read_stable_writer_rollout() -> _WriterRolloutSnapshot:
+    """Return a double-read proof of all writer processes for this database.
+
+    The caller holds the global broker lock.  No identity is accepted from the
+    caller: the mounted pod-bound token anchors an owner-UID chain, and its
+    exact bytes authenticate the one bounded, no-refresh Kubernetes client.
+    """
+    token, identity = _read_token_bound_pod_identity()
+    try:
+        with kubernetes.in_cluster_core_and_apps_apis_for_token(token) as (
+                core_api, apps_api):
+            bound_pod, api_owner = _read_token_bound_api_owner(
+                apps_api, core_api, identity)
+            first = _read_writer_rollout_snapshot(apps_api,
+                                                  core_api,
+                                                  namespace=identity.namespace,
+                                                  bound_pod=bound_pod,
+                                                  api_owner=api_owner)
+            second = _read_writer_rollout_snapshot(apps_api,
+                                                   core_api,
+                                                   namespace=identity.namespace,
+                                                   bound_pod=bound_pod,
+                                                   api_owner=api_owner)
+            if second != first:
+                raise ProtocolV2ActivationError(
+                    'The API/controller/executor writer topology changed '
+                    'between rollout proof reads.')
+            token_pod = (identity.name, identity.uid)
+            for snapshot in (first, second):
+                api_deployments = [
+                    deployment for deployment in snapshot.deployments
+                    if deployment.role == 'api'
+                ]
+                if (len(api_deployments) != 1 or
+                        not any((pod_name, pod_uid) == token_pod for pod_name,
+                                pod_uid, _ in api_deployments[0].pod_cohort)):
+                    raise ProtocolV2ActivationError(
+                        'The token-bound pod UID is not in both verified API '
+                        'Pod cohorts.')
+            return second
+    finally:
+        del token
+
+
+def activate_protocol_v2() -> bool:
+    """Mechanically activate v2 from a stable complete writer rollout.
+
+    No rollout identity or proof is accepted from the operator.  The mounted
+    pod-bound service-account token supplies namespace, pod name, and pod UID;
+    its exact bytes authenticate every Kubernetes read.  Both observations and
+    the durable CAS occur under the global broker lock, excluding broker rounds
+    and fill persists throughout activation.
+    """
+    lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    with lock.acquire(blocking=True):
+        engine = serve_state.get_database_engine()
+        schema_revision = migration_utils.get_current_alembic_revision(
+            engine, migration_utils.SERVE_DB_NAME)
+        if schema_revision not in _PROTOCOL_V2_SCHEMA_REVISIONS:
+            observed_revision = schema_revision or 'uninitialized'
+            raise ProtocolV2ActivationError(
+                'Reserved-fill protocol v2 requires exact Serve schema '
+                'revision 035, 036, or 037; observed '
+                f'{observed_revision}.')
+        api_request_schema_revision = (
+            migration_utils.get_current_alembic_revision(
+                engine, migration_utils.API_REQUESTS_DB_NAME))
+        if (api_request_schema_revision
+                != _PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION):
+            observed_revision = api_request_schema_revision or 'uninitialized'
+            raise ProtocolV2ActivationError(
+                'Reserved-fill protocol v2 requires exact API-request schema '
+                f'revision {_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION}; '
+                f'observed {observed_revision}.')
+        protocol_state = serve_state.get_reserved_fill_protocol_state()
+        try:
+            current_protocol = int(protocol_state['protocol_version'])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProtocolV2ActivationError(
+                'The durable reserved-fill protocol state is malformed.'
+            ) from error
+        if current_protocol != PROTOCOL_V1:
+            if current_protocol == PROTOCOL_V2:
+                raise ProtocolV2ActivationError(
+                    'Reserved-fill protocol v2 is already active.')
+            raise ProtocolV2ActivationError(
+                f'Unsupported durable reserved-fill protocol '
+                f'{current_protocol}.')
+        rollout = _read_stable_writer_rollout()
+        changed = serve_state.set_reserved_fill_protocol_version(
+            PROTOCOL_V2,
+            expected_protocol_version=PROTOCOL_V1,
+            image_digest=rollout.image_digest,
+            deployment_generation=rollout.deployment_generation,
+            deployment_uid=rollout.deployment_uid,
+            pod_inventory_count=rollout.pod_inventory_count,
+            pod_inventory_sha256=rollout.pod_inventory_sha256,
+            changed_at=time.time())
+        if changed:
+            clear_caches()
+        return changed
+
+
+def demote_protocol_v1() -> bool:
+    """Mechanically attest the live writers, rebuild v1 state, and demote."""
+    lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    with lock.acquire(blocking=True):
+        engine = serve_state.get_database_engine()
+        schema_revision = migration_utils.get_current_alembic_revision(
+            engine, migration_utils.SERVE_DB_NAME)
+        if schema_revision not in _PROTOCOL_V2_SCHEMA_REVISIONS:
+            observed_revision = schema_revision or 'uninitialized'
+            raise ProtocolV1DemotionError(
+                'Reserved-fill protocol v1 demotion requires exact Serve '
+                'schema revision 035, 036, or 037; observed '
+                f'{observed_revision}.')
+        api_request_schema_revision = (
+            migration_utils.get_current_alembic_revision(
+                engine, migration_utils.API_REQUESTS_DB_NAME))
+        if (api_request_schema_revision
+                != _PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION):
+            observed_revision = api_request_schema_revision or 'uninitialized'
+            raise ProtocolV1DemotionError(
+                'Reserved-fill protocol v1 demotion requires exact '
+                'API-request schema revision '
+                f'{_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION}; observed '
+                f'{observed_revision}.')
+        protocol_state = serve_state.get_reserved_fill_protocol_state()
+        try:
+            current_protocol = int(protocol_state['protocol_version'])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProtocolV1DemotionError(
+                'The durable reserved-fill protocol state is malformed.'
+            ) from error
+        if current_protocol != PROTOCOL_V2:
+            if current_protocol == PROTOCOL_V1:
+                raise ProtocolV1DemotionError(
+                    'Reserved-fill protocol v1 is already active.')
+            raise ProtocolV1DemotionError(
+                f'Unsupported durable reserved-fill protocol '
+                f'{current_protocol}.')
+        # The proof is deliberately observed, not supplied by an operator.  It
+        # ensures no old/mixed writer can recreate a legacy-only row across the
+        # projection inventory and gate transaction below.
+        _read_stable_writer_rollout()
+        changed = serve_state.set_reserved_fill_protocol_version(
+            PROTOCOL_V1,
+            expected_protocol_version=PROTOCOL_V2,
+            changed_at=time.time())
+        if not changed:
+            raise ProtocolV1DemotionError(
+                'The atomic legacy projection rebuild was rejected; remove '
+                'multi-edge, malformed, or legacy-only reserved-fill claims '
+                'before retrying demotion.')
+        clear_caches()
+        return True
 
 
 # Sentinel returned by current_epoch while a pool's fence_pending marker
@@ -220,6 +1579,9 @@ def persist_fill_replica(
     *,
     pool_key: str,
     expected_epoch: int,
+    expected_protocol_version: int = PROTOCOL_V1,
+    expected_service_generation: int = 0,
+    expected_physical_cluster_uid: str | None = None,
     expected_service_hash: str | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
@@ -237,6 +1599,14 @@ def persist_fill_replica(
     AFTER its publish (a superseded decision is fenced by the bumped
     epoch / fence_pending inside add_replica_if_round_epoch).
 
+    PostgreSQL advisory locks can disappear server-side while this process
+    still believes it owns one.  Before using an ordinary ORM connection, the
+    persist advances the round lease epoch on the exact lock-owning session and
+    carries that token into the insert transaction.  A replacement round
+    advances the same epoch before its scan: either this transaction locks the
+    token first and commits before that scan, or the replacement advances first
+    and this persist fails closed.
+
     Non-blocking on purpose: a round in flight holds the lock across its
     whole cluster query, and blocking a scale-up batch that long is worse
     than skipping -- contention degrades into a fence-skip (False) and
@@ -247,12 +1617,33 @@ def persist_fill_replica(
     try:
         lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
         with lock.acquire(blocking=False):
+            lease_token = None
+            if isinstance(lock, locks.PostgresLock):
+                try:
+                    lease_token = lock.run_in_lock_session(
+                        serve_state.advance_reserved_fill_persist_token)
+                except Exception as error:  # pylint: disable=broad-except
+                    # The dedicated advisory-lock session may have died before
+                    # or during the token transaction.  This launch is not
+                    # authorized to fall back to an unrelated ORM connection.
+                    logger.error('Reserved-fill broker: persist fencing token '
+                                 f'advance failed; skipping fill launch: '
+                                 f'{error}')
+                    return False
+                if lease_token is None:
+                    logger.error('Reserved-fill broker: could not advance the '
+                                 'persist fencing token; skipping fill launch.')
+                    return False
             return serve_state.add_replica_if_round_epoch(
                 service_name,
                 replica_id,
                 replica_info,
                 pool_key=pool_key,
                 expected_epoch=expected_epoch,
+                expected_protocol_version=expected_protocol_version,
+                expected_service_generation=expected_service_generation,
+                expected_physical_cluster_uid=(expected_physical_cluster_uid),
+                expected_lease_token=lease_token,
                 expected_service_hash=expected_service_hash,
                 expected_controller_owner=expected_controller_owner)
     except locks.LockTimeout:
@@ -260,6 +1651,258 @@ def persist_fill_replica(
 
 
 # ============================== Round driver ================================
+
+
+def _claim_rows(protocol_version: int,
+                pool_key: str | None = None) -> list[dict[str, Any]]:
+    if protocol_version == PROTOCOL_V2:
+        return serve_state.get_authoritative_reserved_fill_claims(
+            pool_key=pool_key)
+    return serve_state.get_reserved_fill_claims(pool_key=pool_key)
+
+
+def _claim_generation(row: dict[str, Any], protocol_version: int) -> int:
+    if protocol_version == PROTOCOL_V1:
+        return 0
+    try:
+        generation = int(row['service_generation'])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError('Protocol-v2 claim is missing a valid service '
+                         f'generation: {row!r}.') from e
+    if generation < 1:
+        raise ValueError('Protocol-v2 service generations must be positive; '
+                         f'got {generation!r}.')
+    return generation
+
+
+def _claim_round_metadata(
+    pool_key: str,
+    rows: dict[str, dict[str, Any]],
+    protocol_version: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, int], tuple[str, ...], str |
+           None]:
+    """Validate and normalize the authority carried by one round."""
+    identity = parse_pool_identity(pool_key)
+    if identity.protocol_version != protocol_version:
+        raise ValueError('Pool-key protocol does not match the durable '
+                         f'protocol: pool={pool_key!r}, durable='
+                         f'{protocol_version}.')
+    normalized: dict[str, dict[str, Any]] = {}
+    generations: dict[str, int] = {}
+    access_contexts: set[str] = set()
+    for name, raw_row in rows.items():
+        row = dict(raw_row)
+        generations[name] = _claim_generation(row, protocol_version)
+        if protocol_version == PROTOCOL_V2:
+            row_uid = row.get('physical_cluster_uid')
+            if (not isinstance(row_uid, str) or not row_uid or
+                    row_uid != identity.physical_cluster_uid):
+                raise ValueError(
+                    'Protocol-v2 claim physical UID does not match its pool '
+                    f'key for {name!r}/{pool_key}.')
+            access_context = row.get('access_context')
+            if not isinstance(access_context, str) or not access_context:
+                raise ValueError('Protocol-v2 claim is missing its access '
+                                 f'context for {name!r}/{pool_key}.')
+            access_contexts.add(access_context)
+            try:
+                raw_cap = row.get('effective_cap')
+                if raw_cap is None:
+                    raise ValueError('missing')
+                row['effective_cap'] = max(0, int(raw_cap))
+            except (TypeError, ValueError):
+                # A v2 edge is always partitioned and therefore always has a
+                # finite cap. Corrupt/migration-shadow input cannot revive the
+                # v1 unbounded semantics; clamp that edge to zero.
+                logger.error('Protocol-v2 claim has no valid edge cap; '
+                             f'clamping {name!r}/{pool_key} to zero.')
+                row['effective_cap'] = 0
+        normalized[name] = row
+    return (normalized, generations, tuple(sorted(access_contexts)),
+            identity.physical_cluster_uid)
+
+
+def _remove_claim_for_protocol(
+    protocol_version: int,
+    service_name: str,
+    *,
+    pool_key: str | None,
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+) -> bool:
+    if protocol_version == PROTOCOL_V2:
+        if pool_key is None:
+            if expected_service_hash is None:
+                logger.error('Removing a protocol-v2 complete claim set '
+                             'requires an exact service owner hash.')
+                return False
+            return serve_state.remove_reserved_fill_claim_set(
+                service_name,
+                expected_service_hash=expected_service_hash,
+                expected_controller_owner=expected_controller_owner)
+        return serve_state.remove_authoritative_reserved_fill_claim(
+            service_name,
+            pool_key=pool_key,
+            expected_service_hash=expected_service_hash,
+            expected_controller_owner=expected_controller_owner)
+    return serve_state.remove_reserved_fill_claim(
+        service_name,
+        expected_service_hash=expected_service_hash,
+        expected_controller_owner=expected_controller_owner)
+
+
+def _remove_legacy_claims_for_pool(pool_key: str) -> None:
+    serve_state.remove_reserved_fill_claims_for_pool(pool_key)
+
+
+def _prune_claims(protocol_version: int, expired_before: float) -> list[Any]:
+    if protocol_version == PROTOCOL_V2:
+        pruned = serve_state.prune_authoritative_reserved_fill_claim_sets(
+            expired_before)
+        for service_name in pruned:
+            _clear_service_cache(str(service_name))
+        return pruned
+    return serve_state.prune_reserved_fill_claims(expired_before)
+
+
+def replace_claim_set(
+    service_name: str,
+    *,
+    semantic_hash: str,
+    global_headroom: int,
+    utilization_ceiling: int,
+    utilization_state: Any,
+    edges: Sequence[dict[str, Any]],
+    expected_service_hash: str | None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+) -> int | None:
+    """Atomically heartbeat one complete authoritative protocol-v2 set.
+
+    The owner fence is mandatory at this facade. A successful replacement
+    returns the authoritative service generation and invalidates every cached
+    edge absent from that set or produced by an earlier generation.
+    """
+    if expected_service_hash is None:
+        _clear_service_cache(service_name)
+        logger.error('Protocol-v2 claim-set replacement requires an exact '
+                     f'service owner hash for {service_name!r}.')
+        return None
+    if not semantic_hash:
+        raise ValueError('Protocol-v2 claim sets require a semantic hash.')
+    if (isinstance(global_headroom, bool) or
+            not isinstance(global_headroom, int) or global_headroom < 0 or
+            isinstance(utilization_ceiling, bool) or
+            not isinstance(utilization_ceiling, int) or
+            utilization_ceiling < 0):
+        raise ValueError('Protocol-v2 global budgets must be nonnegative.')
+    normalized_edges: list[dict[str, Any]] = []
+    pool_keys: set[str] = set()
+    access_contexts: set[str] = set()
+    identities: list[tuple[str, PoolIdentity]] = []
+    for raw_edge in edges:
+        edge = dict(raw_edge)
+        pool_key = edge.get('pool_key')
+        if not isinstance(pool_key, str) or not pool_key:
+            raise ValueError('Every protocol-v2 edge requires a pool key.')
+        identity = parse_pool_identity(pool_key)
+        if identity.protocol_version != PROTOCOL_V2:
+            raise ValueError('An authoritative protocol-v2 claim set cannot '
+                             f'contain a v1 pool key: {pool_key!r}.')
+        if pool_key in pool_keys:
+            raise ValueError('A protocol-v2 complete set cannot contain '
+                             f'duplicate pool edge {pool_key!r}.')
+        pool_keys.add(pool_key)
+        physical_uid = edge.get('physical_cluster_uid')
+        if physical_uid != identity.physical_cluster_uid:
+            raise ValueError('Protocol-v2 edge physical UID does not match '
+                             f'its pool key: {pool_key!r}.')
+        access_context = edge.get('access_context')
+        if not isinstance(access_context, str) or not access_context:
+            raise ValueError('Every protocol-v2 edge requires an access '
+                             f'context: {pool_key!r}.')
+        if access_context in access_contexts:
+            raise ValueError(
+                'A protocol-v2 complete set may contain at most '
+                f'one edge per access context: {access_context!r}.')
+        access_contexts.add(access_context)
+        for prior_key, prior_identity in identities:
+            if (prior_identity.physical_cluster_uid
+                    == identity.physical_cluster_uid and
+                    set(prior_identity.gpu_names).intersection(
+                        identity.gpu_names)):
+                raise ValueError('A protocol-v2 complete set contains '
+                                 'overlapping accelerator groups on one '
+                                 f'physical cluster: {prior_key!r} and '
+                                 f'{pool_key!r}.')
+        identities.append((pool_key, identity))
+        effective_cap = edge.get('effective_cap')
+        if (isinstance(effective_cap, bool) or
+                not isinstance(effective_cap, int)):
+            raise ValueError('Every protocol-v2 edge requires an integer '
+                             f'effective cap: {pool_key!r}.')
+        if effective_cap < 0:
+            raise ValueError('Protocol-v2 edge caps must be nonnegative: '
+                             f'{pool_key!r}.')
+        edge['effective_cap'] = effective_cap
+        normalized_edges.append(edge)
+
+    lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    with lock.acquire(blocking=True):
+        if get_protocol_version() != PROTOCOL_V2:
+            _clear_service_cache(service_name)
+            logger.error('Reserved-fill protocol v2 is not active; refusing '
+                         f'the complete claim set of {service_name!r}.')
+            return None
+        heartbeat_ts = time.time()
+        _prune_claims(PROTOCOL_V2, heartbeat_ts - claim_ttl_seconds())
+        for existing in _claim_rows(PROTOCOL_V2):
+            if existing['service_name'] == service_name:
+                continue
+            existing_pool = str(existing['pool_key'])
+            for pool_key in pool_keys:
+                if (existing_pool != pool_key and
+                        _pool_keys_overlap(existing_pool, pool_key)):
+                    logger.error(
+                        'Reserved-fill broker: rejecting the complete claim '
+                        f'set of {service_name!r}; pool {pool_key} overlaps '
+                        f'{existing_pool} claimed by '
+                        f'{existing["service_name"]!r}.')
+                    serve_state.remove_reserved_fill_claim_set(
+                        service_name,
+                        expected_service_hash=expected_service_hash,
+                        expected_controller_owner=expected_controller_owner)
+                    _clear_service_cache(service_name)
+                    return None
+        generation = serve_state.replace_reserved_fill_claim_set(
+            service_name,
+            semantic_hash=semantic_hash,
+            global_headroom=global_headroom,
+            utilization_ceiling=utilization_ceiling,
+            utilization_state=utilization_state,
+            edges=normalized_edges,
+            heartbeat_ts=heartbeat_ts,
+            expected_service_hash=expected_service_hash,
+            expected_controller_owner=expected_controller_owner)
+        if generation is None:
+            _clear_service_cache(service_name)
+            return None
+        generation = int(generation)
+        edge_by_pool = {
+            str(edge['pool_key']): edge for edge in normalized_edges
+        }
+        with _GRANT_CACHE_LOCK:
+            for cache_key, entry in list(_GRANT_CACHE.items()):
+                cached_service, cached_pool = cache_key
+                if cached_service != service_name:
+                    continue
+                current_edge = edge_by_pool.get(str(cached_pool))
+                if (current_edge is None or
+                        entry.service_generation != generation or
+                        entry.access_context != current_edge['access_context']
+                        or entry.physical_cluster_uid
+                        != current_edge['physical_cluster_uid']):
+                    _GRANT_CACHE.pop(cache_key, None)
+        return generation
 
 
 def upsert_claim(
@@ -279,6 +1922,11 @@ def upsert_claim(
     """Upsert one heartbeat without allowing overlapping pool groups."""
     lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
     with lock.acquire(blocking=True):
+        if get_protocol_version() != PROTOCOL_V1:
+            logger.error('Reserved-fill protocol v2 requires an atomic '
+                         'complete claim-set heartbeat; refusing the legacy '
+                         f'one-edge upsert for {service_name!r}.')
+            return False
         now = time.time()
         for row in serve_state.get_reserved_fill_claims():
             if row['service_name'] == service_name:
@@ -298,7 +1946,7 @@ def upsert_claim(
                     service_name,
                     expected_service_hash=expected_service_hash,
                     expected_controller_owner=expected_controller_owner)
-                _GRANT_CACHE.pop(service_name, None)
+                _clear_service_cache(service_name)
                 return False
         return serve_state.upsert_reserved_fill_claim(
             service_name,
@@ -327,16 +1975,25 @@ def upsert_claim(
 
 def remove_claim(
     service_name: str,
+    pool_key: str | None = None,
     expected_service_hash: str | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
-    removed = serve_state.remove_reserved_fill_claim(
-        service_name,
-        expected_service_hash=expected_service_hash,
-        expected_controller_owner=expected_controller_owner)
-    if removed or expected_service_hash is None:
-        _GRANT_CACHE.pop(service_name, None)
-    return removed
+    """Remove one v2 edge, or every claim of a service when pool is None."""
+    lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    with lock.acquire(blocking=True):
+        protocol_version = get_protocol_version()
+        removed = _remove_claim_for_protocol(
+            protocol_version,
+            service_name,
+            pool_key=pool_key,
+            expected_service_hash=expected_service_hash,
+            expected_controller_owner=expected_controller_owner)
+        if removed or expected_service_hash is None:
+            # A v2 edge removal advances the complete service-set generation,
+            # invalidating cached allocations for every sibling edge too.
+            _clear_service_cache(service_name)
+        return removed
 
 
 def utilization_gate_enabled() -> bool:
@@ -511,20 +2168,171 @@ def _claim_input(row: dict[str, Any]) -> ClaimInput:
                                      if effective_cap is not None else None))
 
 
+def _clamp_v2_grants(grants: dict[str, int], claims: dict[str, ClaimInput],
+                     protocol_version: int) -> dict[str, int]:
+    """Enforce partitioned edge caps even across damping/blackout carries."""
+    if protocol_version != PROTOCOL_V2:
+        return grants
+    return {
+        name: min(max(0, int(grants.get(name, 0))),
+                  max(0, int(claim.effective_cap or
+                             0))) for name, claim in claims.items()
+    }
+
+
+def _normalize_exact_card_observation(
+    observation: PoolObservation,
+    pool_key: str,
+) -> dict[str, int] | None:
+    """Validate the optional exact-card decomposition of one measurement.
+
+    The aggregate remains the broker's allocation unit, but a present split is
+    authoritative launch metadata.  A malformed split therefore invalidates
+    the measurement instead of silently degrading to an unshaped launch.
+    """
+    raw = observation.free_slots_by_accelerator
+    if raw is None:
+        return None
+    identity = parse_pool_identity(pool_key)
+    allowed_cards = set(identity.gpu_names)
+    normalized: dict[str, int] = {}
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError('exact-card observation entries must be pairs')
+        raw_card, raw_count = item
+        if not isinstance(raw_card, str) or not raw_card:
+            raise ValueError('exact-card observation has an invalid card name')
+        card = raw_card.casefold()
+        if card not in allowed_cards:
+            raise ValueError(
+                f'exact-card observation {card!r} is outside pool {pool_key!r}')
+        if card in normalized:
+            raise ValueError(
+                f'exact-card observation repeats accelerator {card!r}')
+        if (isinstance(raw_count, bool) or not isinstance(raw_count, int) or
+                raw_count < 0):
+            raise ValueError(
+                f'exact-card observation has invalid count {raw_count!r}')
+        normalized[card] = raw_count
+    measured = max(0, int(observation.free_slots or 0))
+    if sum(normalized.values()) != measured:
+        raise ValueError(
+            'exact-card observation does not sum to its aggregate '
+            f'free slots ({sum(normalized.values())} != {measured})')
+    return normalized
+
+
+def _allocate_feed_by_accelerator(
+    feeds: dict[str, int],
+    measured_by_accelerator: dict[str, int] | None,
+    observed_free: int,
+) -> dict[str, dict[str, int]] | None:
+    """Partition aggregate service feeds over the measured exact cards.
+
+    Aggregate debits can reduce ``observed_free`` below the raw measurement
+    without an exact-card identity (legacy rows are the important case).  Clip
+    the card budget to that conserved aggregate in measured-card order, then
+    assign each service's already-arbitrated feed in stable service order.
+    This may conservatively withhold a usable card, but can never invent one.
+    """
+    if measured_by_accelerator is None:
+        return None
+    remaining_total = max(0, int(observed_free))
+    remaining_by_card: dict[str, int] = {}
+    for card, measured in measured_by_accelerator.items():
+        available = min(max(0, int(measured)), remaining_total)
+        remaining_by_card[card] = available
+        remaining_total -= available
+
+    result: dict[str, dict[str, int]] = {}
+    for service_name in sorted(feeds):
+        remaining_feed = max(0, int(feeds[service_name]))
+        service_cards: dict[str, int] = {}
+        for card, card_remaining in remaining_by_card.items():
+            if remaining_feed <= 0:
+                break
+            assigned = min(remaining_feed, card_remaining)
+            if assigned <= 0:
+                continue
+            service_cards[card] = assigned
+            remaining_by_card[card] -= assigned
+            remaining_feed -= assigned
+        result[service_name] = service_cards
+    return result
+
+
+def _normalize_persisted_accelerator_counts(
+    raw_counts: Any,
+    pool_key: str,
+    *,
+    expected_total: int | None = None,
+) -> dict[str, int]:
+    """Validate one exact-card mapping read from a published round."""
+    if not isinstance(raw_counts, dict):
+        raise TypeError('exact-card entry must be an object')
+    allowed_cards = set(parse_pool_identity(pool_key).gpu_names)
+    normalized: dict[str, int] = {}
+    for raw_card, raw_count in raw_counts.items():
+        if (not isinstance(raw_card, str) or not raw_card or
+                isinstance(raw_count, bool) or not isinstance(raw_count, int) or
+                raw_count < 0):
+            raise ValueError('invalid exact-card entry')
+        card = raw_card.casefold()
+        if card not in allowed_cards:
+            raise ValueError(
+                f'exact-card entry {card!r} is outside pool {pool_key!r}')
+        if card in normalized:
+            raise ValueError('duplicate exact-card entry')
+        if raw_count > 0:
+            normalized[card] = raw_count
+    if expected_total is not None and sum(
+            normalized.values()) != expected_total:
+        raise ValueError('exact-card observation does not sum to its '
+                         f'aggregate ({sum(normalized.values())} != '
+                         f'{expected_total})')
+    return normalized
+
+
+def _service_feed_payload_for_epoch(raw_payload: str | None) -> str | None:
+    """Canonicalize shaped service authority without observation metadata."""
+    if raw_payload is None:
+        return None
+    try:
+        decoded = json.loads(raw_payload)
+    except (TypeError, json.JSONDecodeError):
+        # Preserve malformed payload identity so replacing it with valid state
+        # still advances the epoch.
+        return raw_payload
+    if not isinstance(decoded, dict):
+        return raw_payload
+    decoded.pop(_OBSERVED_FREE_BY_ACCELERATOR_KEY, None)
+    return json.dumps(decoded, sort_keys=True)
+
+
 def _reject_mixed_gpus_per_replica(
-        pool_key: str, rows: dict[str, dict[str,
-                                            Any]]) -> dict[str, dict[str, Any]]:
-    """Rejects claims disagreeing on gpus_per_replica (v1 uniform pools).
+    pool_key: str,
+    rows: dict[str, dict[str, Any]],
+    protocol_version: int = PROTOCOL_V1
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    """Isolates claims disagreeing on gpus_per_replica.
 
     Integer replica-slot bookkeeping is only sound when every claimant of a
     pool converts GPUs to slots the same way. Deterministic survivor rule:
-    the gpus_per_replica value shared by the most claimants wins, ties by
-    the smaller value; the losers' claims are DELETED (loud, visible) so
-    their pollers re-log every interval instead of silently free-riding.
+    the gpus_per_replica value shared by the most claimants wins, ties by the
+    smaller value.
+
+    Protocol v1 preserves its historical behavior and deletes losing claims.
+    A protocol-v2 edge is one member of an authoritative complete service
+    set, so deleting it here would advance the service-wide generation during
+    a pool round, fence healthy sibling pools, and let the next heartbeat add
+    it back forever.  V2 therefore retains the durable edge and generation,
+    but replaces its round-local policy with explicit zero authority.  The
+    returned loser set also prevents a losing poller's differently-scaled
+    query callback from driving the shared round.
     """
     sizes = sorted({int(row['gpus_per_replica'] or 1) for row in rows.values()})
     if len(sizes) <= 1:
-        return rows
+        return rows, set()
     counts = {
         size: sum(1
                   for row in rows.values()
@@ -537,37 +2345,184 @@ def _reject_mixed_gpus_per_replica(
     ]
     logger.error(
         f'Reserved-fill broker: pool {pool_key} has claims with mixed '
-        f'gpus_per_replica {sizes}; v1 requires a uniform pool. Rejecting '
-        f'claims of {losers} (keeping gpus_per_replica={winner}).')
+        f'gpus_per_replica {sizes}; the broker requires a uniform pool. '
+        f'Blackouting claims of {losers} '
+        f'(keeping gpus_per_replica={winner}).')
+    loser_set = set(losers)
     for name in losers:
-        serve_state.remove_reserved_fill_claim(name)
-        rows.pop(name)
-    return rows
+        if protocol_version == PROTOCOL_V1:
+            _remove_claim_for_protocol(protocol_version,
+                                       name,
+                                       pool_key=pool_key)
+            _clear_service_cache(name)
+            rows.pop(name)
+            continue
+        # This is a round-local view only; the normalized edge remains
+        # untouched in PostgreSQL.  A zero cap makes every grant/feed path
+        # fail closed while retaining the complete claim-generation map in
+        # the published round.
+        row = dict(rows[name])
+        row.update(floor_replicas=0,
+                   holdings_fill=0,
+                   effective_cap=0,
+                   launchable=0)
+        rows[name] = row
+        _clear_service_cache(name, pool_key=pool_key)
+    return rows, loser_set
 
 
-def _replica_row_on_pool(info: Any, context: str,
-                         gpu_names: tuple[str, ...]) -> bool:
+def _zero_v2_mixed_width_allocation(
+    service_name: str,
+    pool_key: str,
+    service_generation: int,
+    claim_row: dict[str, Any],
+    round_row: dict[str, Any] | None,
+    now: float,
+) -> Allocation:
+    """Return non-durable zero authority for a mismatched-width poller.
+
+    Only a poller whose width matches the deterministic pool width may query
+    and publish the shared slot count.  A loser still needs an explicit zero
+    result so its autoscaler withdraws both launch and shelter authority while
+    a winning peer drives the next durable round.
+    """
+    identity = parse_pool_identity(pool_key)
+    allocation = Allocation(
+        grant=0,
+        feed=0,
+        round_id=(0 if round_row is None else int(round_row['round_id'])),
+        epoch=(0 if round_row is None else int(round_row['epoch'])),
+        snapshot_time=now,
+        demand_gate_grant=0,
+        protocol_version=PROTOCOL_V2,
+        service_generation=service_generation,
+        physical_cluster_uid=identity.physical_cluster_uid,
+        edge_cap=0,
+        pool_key=pool_key,
+        feed_by_accelerator={},
+    )
+    _cache_allocation(service_name, allocation, claim_row)
+    return allocation
+
+
+def _replica_row_on_pool(
+    info: 'replica_managers.ReplicaInfo',
+    context: str | tuple[str, ...],
+    gpu_names: tuple[str, ...],
+    *,
+    pool_key: str | None = None,
+    physical_cluster_uid: str | None = None,
+    current_service_generation: int | None = None,
+    pool_gpus_per_replica: int | None = None,
+) -> bool:
     """Whether a replica row's persisted location sits on the pool.
 
-    Relaxed placement identity (mirrors the #108 fill matcher's spirit):
-    Kubernetes + same context; a shape-carrying row must name the pool's
-    GPU (case-insensitive), a legacy shape-less row matches on context
-    alone (its bound pod still occupies the pool).
+    Protocol-v2 launch provenance is one indivisible authority tuple: pool
+    key, immutable launch generation, physical cluster UID, and persisted
+    placement must all agree.  A partial or contradictory tuple fails closed;
+    it must not be re-attributed through a coincidentally matching context.
+
+    Only a row with all three origin fields absent is genuinely legacy and may
+    use the relaxed #108 placement identity: Kubernetes + same context; a
+    shape-carrying row must name the pool's GPU (case-insensitive), while a
+    legacy shape-less row matches on context alone (its bound pod still
+    occupies the pool).
     """
-    location = getattr(info, 'location', None)
-    if not location:
+    identity: PoolIdentity | None = None
+    if pool_key is not None:
+        try:
+            identity = parse_pool_identity(pool_key)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    if identity is None or identity.protocol_version == PROTOCOL_V1:
+        # Preserve protocol-v1 attribution exactly during the rollout window.
+        # Its historical rows may carry only the v1 pool key, and pre-upgrade
+        # shape-less rows remain physical occupants of this context.
+        persisted_pool_key = info.reserved_fill_pool_key
+        if isinstance(persisted_pool_key, str) and persisted_pool_key:
+            return persisted_pool_key == pool_key
+        persisted_uid = info.reserved_fill_physical_cluster_uid
+        if (isinstance(persisted_uid, str) and persisted_uid and
+                physical_cluster_uid is not None):
+            if persisted_uid != physical_cluster_uid:
+                return False
+            location = info.location
+            accelerators = (location or {}).get('accelerators') or {}
+            return (not accelerators or any(
+                isinstance(name, str) and name.lower() in gpu_names
+                for name in accelerators))
+        contexts = (context,) if isinstance(context, str) else context
+        location = info.location
+        if not location:
+            return False
+        if str(location.get('cloud', '')).lower() != 'kubernetes':
+            return False
+        if location.get('region') not in contexts:
+            return False
+        accelerators = location.get('accelerators') or {}
+        accelerator_matches = any(
+            isinstance(name, str) and name.lower() in gpu_names
+            for name in accelerators)
+        return not accelerators or accelerator_matches
+
+    contexts = (context,) if isinstance(context, str) else context
+    location = info.location
+    if not isinstance(location, Mapping) or not location:
         return False
     if str(location.get('cloud', '')).lower() != 'kubernetes':
         return False
-    if location.get('region') != context:
+    if location.get('region') not in contexts:
         return False
     accelerators = location.get('accelerators') or {}
-    if not accelerators:
-        return True
-    return any(name.lower() in gpu_names for name in accelerators)
+    if not isinstance(accelerators, Mapping):
+        return False
+    exact_accelerator_shape = False
+    if (len(accelerators) == 1 and isinstance(pool_gpus_per_replica, int) and
+            not isinstance(pool_gpus_per_replica, bool) and
+            pool_gpus_per_replica > 0):
+        accelerator_name, accelerator_count = next(iter(accelerators.items()))
+        exact_accelerator_shape = (
+            isinstance(accelerator_name, str) and
+            accelerator_name.lower() in identity.gpu_names and
+            not isinstance(accelerator_count, bool) and
+            isinstance(accelerator_count, (int, float)) and
+            accelerator_count >= 1 and float(accelerator_count).is_integer() and
+            int(accelerator_count) == pool_gpus_per_replica)
+
+    persisted_pool_key = info.reserved_fill_pool_key
+    persisted_generation = info.reserved_fill_service_generation
+    persisted_uid = info.reserved_fill_physical_cluster_uid
+    provenance = (persisted_pool_key, persisted_generation, persisted_uid)
+    if any(value is not None for value in provenance):
+        if (not isinstance(persisted_pool_key, str) or not persisted_pool_key or
+                persisted_pool_key != pool_key or
+                isinstance(persisted_generation, bool) or
+                not isinstance(persisted_generation, int) or
+                persisted_generation < 1 or
+                not isinstance(persisted_uid, str) or not persisted_uid or
+                physical_cluster_uid is None or
+                physical_cluster_uid != identity.physical_cluster_uid or
+                persisted_uid != physical_cluster_uid):
+            return False
+        if (current_service_generation is not None and
+            (isinstance(current_service_generation, bool) or
+             not isinstance(current_service_generation, int) or
+             current_service_generation < 1 or
+             persisted_generation > current_service_generation)):
+            return False
+        # Explicit provenance and placement form one authority tuple. Unlike a
+        # genuinely legacy row, a v2 row must prove its exact accelerator card
+        # and per-replica width too.
+        return exact_accelerator_shape
+
+    # Genuinely legacy rows retain the relaxed location fallback while the v1
+    # compatibility window is open.
+    return (not accelerators or any(
+        isinstance(name, str) and name.lower() in identity.gpu_names
+        for name in accelerators))
 
 
-def _row_was_launched(info: Any) -> bool:
+def _row_was_launched(info: 'replica_managers.ReplicaInfo') -> bool:
     """Whether the row's sky.launch completed (a cluster was provisioned).
 
     SHUTTING_DOWN is broader than "bound graceful drainer": a
@@ -580,14 +2535,20 @@ def _row_was_launched(info: Any) -> bool:
     DID partially bind reads as free-side undercount for its short
     cleanup window -- the conservative direction (never over-grant).
     """
-    status_property = getattr(info, 'status_property', None)
-    return (getattr(status_property, 'sky_launch_status',
-                    None) == common_utils.ProcessStatus.SUCCEEDED)
+    return (info.status_property.sky_launch_status ==
+            common_utils.ProcessStatus.SUCCEEDED)
 
 
 def _occupying_debit(
-        claim_names: list[str], pool_key: str,
-        snapshot_time: float) -> tuple[int, int, dict[str, int], int]:
+    claim_names: list[str],
+    pool_key: str,
+    snapshot_time: float,
+    *,
+    access_contexts: tuple[str, ...] | None = None,
+    physical_cluster_uid: str | None = None,
+    claim_generations: Mapping[str, int] | None = None,
+    pool_gpus_per_replica: int | None = None,
+) -> tuple[int, int, dict[str, int], int]:
     """Row-consistent scan of every service's replica rows on the pool.
 
     Mirrors the #108 occupied-slot subtraction at broker level. The scan
@@ -668,7 +2629,22 @@ def _occupying_debit(
       indefinitely, and counting them forever would over-count the pool
       once the pod eventually dies (accepted: rare and launch-gated).
     """
-    context, gpu_names = parse_pool_key(pool_key)
+    identity = parse_pool_identity(pool_key)
+    gpu_names = identity.gpu_names
+    contexts: tuple[str, ...]
+    if identity.protocol_version == PROTOCOL_V1:
+        assert identity.access_context is not None
+        contexts = (identity.access_context,)
+    else:
+        contexts = tuple(access_contexts or ())
+        if physical_cluster_uid is None:
+            physical_cluster_uid = identity.physical_cluster_uid
+        if not contexts:
+            # Every authoritative v2 edge carries an access context. Missing
+            # identity is corrupt state; matching nothing is fail-closed for
+            # ownership (the measured pool still excludes bound pods).
+            logger.error('Reserved-fill protocol-v2 debit has no access '
+                         f'context for pool {pool_key}.')
     feed_debit = 0
     entitlement_debit = 0
     live_fill: dict[str, int] = {}
@@ -723,16 +2699,30 @@ def _occupying_debit(
                 # the launch actually provisioned a pod -- see the
                 # unclaimed_fill docstring above for the demand-drain,
                 # FAILED_CLEANUP and unbound-launch reasoning).
-                if (getattr(info, 'status',
-                            None) == serve_state.ReplicaStatus.SHUTTING_DOWN and
-                        bool(getattr(info, 'reserved_fill', False)) and
-                        _replica_row_on_pool(info, context, gpu_names) and
+                if (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN and
+                        info.reserved_fill and _replica_row_on_pool(
+                            info,
+                            contexts,
+                            gpu_names,
+                            pool_key=pool_key,
+                            physical_cluster_uid=physical_cluster_uid,
+                            current_service_generation=(claim_generations or
+                                                        {}).get(name),
+                            pool_gpus_per_replica=pool_gpus_per_replica) and
                         _row_was_launched(info)):
                     unclaimed_fill += 1
                 continue
-            if not _replica_row_on_pool(info, context, gpu_names):
+            if not _replica_row_on_pool(
+                    info,
+                    contexts,
+                    gpu_names,
+                    pool_key=pool_key,
+                    physical_cluster_uid=physical_cluster_uid,
+                    current_service_generation=(claim_generations or
+                                                {}).get(name),
+                    pool_gpus_per_replica=pool_gpus_per_replica):
                 continue
-            is_fill = bool(getattr(info, 'reserved_fill', False))
+            is_fill = info.reserved_fill
             if not is_claimant and not is_fill:
                 # Non-claimants' demand rows stay invisible by design
                 # (demand capacity is not fill-arbitrable); only their
@@ -745,7 +2735,7 @@ def _occupying_debit(
                     # Former claimant's fill row: unclaimed occupancy,
                     # conserved like a drainer (see docstring).
                     unclaimed_fill += 1
-            created_at = getattr(info, 'created_at', None)
+            created_at = info.created_at
             post_snapshot = (created_at is not None and
                              created_at > snapshot_time)
             if (not info.is_ready) or post_snapshot:
@@ -769,8 +2759,97 @@ def _demand_gate_grant(damped: int | None, raw: Any) -> int | None:
     return max(damped, raw_int)
 
 
-def _allocation_from_round(service_name: str,
-                           round_row: dict[str, Any]) -> Allocation | None:
+def _round_protocol_version(round_row: dict[str, Any]) -> int:
+    raw = round_row.get('protocol_version')
+    if raw is None:
+        return PROTOCOL_V1
+    try:
+        version = int(raw)
+    except (TypeError, ValueError):
+        return -1
+    return version
+
+
+def _round_claim_generations(round_row: dict[str, Any]) -> dict[str, int]:
+    raw = round_row.get('claim_generations')
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(decoded, dict):
+            return {}
+        return {str(name): int(value) for name, value in decoded.items()}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _round_matches_claim(round_row: dict[str, Any], service_name: str,
+                         protocol_version: int,
+                         service_generation: int) -> bool:
+    if _round_protocol_version(round_row) != protocol_version:
+        return False
+    if protocol_version == PROTOCOL_V1:
+        return True
+    return (_round_claim_generations(round_row).get(service_name) ==
+            service_generation)
+
+
+def _round_matches_claim_set(round_row: dict[str, Any], protocol_version: int,
+                             claim_generations: dict[str, int]) -> bool:
+    if _round_protocol_version(round_row) != protocol_version:
+        return False
+    if protocol_version == PROTOCOL_V1:
+        return True
+    return _round_claim_generations(round_row) == claim_generations
+
+
+def _cache_allocation(service_name: str, allocation: Allocation,
+                      claim_row: dict[str, Any] | None) -> None:
+    """Cache an allocation without losing v2 access-context identity."""
+    if allocation.protocol_version == PROTOCOL_V1:
+        entry = _GrantCacheEntry(grant=allocation.demand_gate_grant,
+                                 cached_at=time.time())
+        with _GRANT_CACHE_LOCK:
+            _GRANT_CACHE[_cache_key(service_name, None)] = entry
+        return
+    if allocation.pool_key is None or claim_row is None:
+        return
+    try:
+        identity = parse_pool_identity(allocation.pool_key)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    access_context = claim_row.get('access_context')
+    physical_cluster_uid = (allocation.physical_cluster_uid or
+                            identity.physical_cluster_uid)
+    if (not isinstance(access_context, str) or not access_context or
+            not isinstance(physical_cluster_uid, str) or
+            not physical_cluster_uid):
+        # A v2 grant that cannot be mapped back to an access context must not
+        # influence demand placement. The allocation itself remains useful to
+        # its owning poller, whose query callback already carries the context.
+        return
+    entry = _GrantCacheEntry(grant=allocation.demand_gate_grant,
+                             cached_at=time.time(),
+                             access_context=access_context,
+                             accelerator_names=identity.gpu_names,
+                             physical_cluster_uid=physical_cluster_uid,
+                             service_generation=allocation.service_generation)
+    with _GRANT_CACHE_LOCK:
+        _GRANT_CACHE[_cache_key(service_name, allocation.pool_key)] = entry
+
+
+def _allocation_from_round(
+    service_name: str,
+    pool_key: str,
+    round_row: dict[str, Any],
+    *,
+    protocol_version: int,
+    service_generation: int,
+    claim_row: dict[str, Any] | None = None,
+) -> Allocation | None:
+    if not _round_matches_claim(round_row, service_name, protocol_version,
+                                service_generation):
+        return None
     grants = json.loads(round_row['grants'] or '{}')
     if service_name not in grants:
         # Claimed after this round was published: no allocation until the
@@ -778,40 +2857,188 @@ def _allocation_from_round(service_name: str,
         return None
     feeds = json.loads(round_row['feeds'] or '{}')
     raw_grants = json.loads(round_row['raw_grants'] or '{}')
-    allocation = Allocation(grant=grants[service_name],
-                            feed=int(feeds.get(service_name, 0)),
-                            round_id=int(round_row['round_id']),
-                            epoch=int(round_row['epoch']),
-                            snapshot_time=float(round_row['snapshot_time']),
-                            demand_gate_grant=_demand_gate_grant(
-                                grants[service_name],
-                                raw_grants.get(service_name)))
-    _GRANT_CACHE[service_name] = (allocation.demand_gate_grant, time.time())
+    raw_feed_by_accelerator = round_row.get('feed_by_accelerator')
+    feed_by_accelerator: dict[str, int] | None = None
+    observed_free: int | None = None
+    observed_free_by_accelerator: dict[str, int] | None = None
+    observed_at: float | None = None
+    all_feed_by_accelerator: dict[str, Any] | None = None
+    if raw_feed_by_accelerator is not None:
+        try:
+            decoded = json.loads(raw_feed_by_accelerator)
+            if not isinstance(decoded, dict):
+                raise TypeError('exact-card feed envelope must be an object')
+            all_feed_by_accelerator = decoded
+        except (TypeError, json.JSONDecodeError) as error:
+            # A present exact-card allocation is authoritative.  Corruption
+            # cannot degrade into an aggregate launch that may select another
+            # card from the same physical pool.
+            logger.error(
+                'Reserved-fill round has malformed exact-card feed for '
+                f'{service_name!r}/{pool_key}: {error}')
+            feed_by_accelerator = {}
+        if all_feed_by_accelerator is not None:
+            try:
+                feed_by_accelerator = _normalize_persisted_accelerator_counts(
+                    all_feed_by_accelerator[service_name], pool_key)
+            except (KeyError, TypeError, ValueError,
+                    json.JSONDecodeError) as error:
+                # Parse service launch authority independently from the raw
+                # observation metadata below.  Either side can fail closed
+                # without poisoning the other.
+                logger.error(
+                    'Reserved-fill round has malformed exact-card feed for '
+                    f'{service_name!r}/{pool_key}: {error}')
+                feed_by_accelerator = {}
+            raw_observation = all_feed_by_accelerator.get(
+                _OBSERVED_FREE_BY_ACCELERATOR_KEY)
+            if raw_observation is not None:
+                try:
+                    raw_observed_free = round_row.get('last_observed_free')
+                    if (isinstance(raw_observed_free, bool) or
+                            not isinstance(raw_observed_free, int) or
+                            raw_observed_free < 0):
+                        raise ValueError('invalid aggregate observation')
+                    raw_observed_at = round_row.get('last_observed_free_ts')
+                    if (isinstance(raw_observed_at, bool) or
+                            not isinstance(raw_observed_at, (int, float)) or
+                            not math.isfinite(raw_observed_at)):
+                        raise ValueError('invalid observation timestamp')
+                    snapshot_time = float(round_row['snapshot_time'])
+                    if float(raw_observed_at) != snapshot_time:
+                        raise ValueError('observation timestamp does not match '
+                                         'the round snapshot')
+                    observed_free_by_accelerator = (
+                        _normalize_persisted_accelerator_counts(
+                            raw_observation,
+                            pool_key,
+                            expected_total=raw_observed_free))
+                    observed_free = raw_observed_free
+                    observed_at = float(raw_observed_at)
+                except (KeyError, TypeError, ValueError,
+                        json.JSONDecodeError) as error:
+                    logger.error(
+                        'Reserved-fill round has malformed measured capacity '
+                        f'for {pool_key}: {error}')
+                    observed_free = None
+                    observed_free_by_accelerator = None
+                    observed_at = None
+    edge_cap = None
+    physical_cluster_uid = None
+    if claim_row is not None:
+        raw_cap = claim_row.get('effective_cap')
+        try:
+            edge_cap = None if raw_cap is None else max(0, int(raw_cap))
+        except (TypeError, ValueError):
+            edge_cap = None
+        physical_cluster_uid = claim_row.get('physical_cluster_uid')
+    grant = grants[service_name]
+    feed = max(0, int(feeds.get(service_name, 0)))
+    raw_for_gate = raw_grants.get(service_name)
+    if protocol_version == PROTOCOL_V2:
+        # Authoritative v2 claims always carry a finite partitioned cap. A
+        # missing cap is corrupt and fails closed to zero rather than reviving
+        # the v1 unbounded-None meaning.
+        if edge_cap is None:
+            logger.error('Protocol-v2 claim has no edge cap; clamping grant '
+                         f'to zero for {service_name!r}/{pool_key}.')
+            edge_cap = 0
+        grant = min(max(0, int(grant or 0)), edge_cap)
+        feed = min(feed, grant)
+        if feed_by_accelerator is not None:
+            feed = min(feed, sum(feed_by_accelerator.values()))
+        try:
+            raw_for_gate = min(max(0, int(raw_for_gate)), edge_cap)
+        except (TypeError, ValueError):
+            raw_for_gate = grant
+        if not isinstance(physical_cluster_uid,
+                          str) or not physical_cluster_uid:
+            try:
+                physical_cluster_uid = parse_pool_identity(
+                    pool_key).physical_cluster_uid
+            except (TypeError, ValueError, json.JSONDecodeError):
+                physical_cluster_uid = None
+    allocation = Allocation(
+        grant=grant,
+        feed=feed,
+        round_id=int(round_row['round_id']),
+        epoch=int(round_row['epoch']),
+        snapshot_time=float(round_row['snapshot_time']),
+        demand_gate_grant=_demand_gate_grant(grant, raw_for_gate),
+        protocol_version=protocol_version,
+        service_generation=service_generation,
+        physical_cluster_uid=physical_cluster_uid,
+        edge_cap=edge_cap,
+        pool_key=pool_key,
+        feed_by_accelerator=feed_by_accelerator,
+        observed_free=observed_free,
+        observed_free_by_accelerator=(observed_free_by_accelerator),
+        observed_at=observed_at)
+    _cache_allocation(service_name, allocation, claim_row)
     return allocation
 
 
-def get_my_allocation(service_name: str) -> Allocation | None:
+def get_my_allocation(service_name: str,
+                      pool_key: str | None = None) -> Allocation | None:
     """This service's slice of the latest published round, or None.
 
     None when the service has no live claim (expired/rejected) or the
     latest round predates its claim.
     """
-    claims = serve_state.get_reserved_fill_claims()
-    row = next((row for row in claims if row['service_name'] == service_name),
-               None)
+    protocol_version = get_protocol_version()
+    claims = _claim_rows(protocol_version, pool_key=pool_key)
+    matches = [
+        row for row in claims if row['service_name'] == service_name and
+        (pool_key is None or row['pool_key'] == pool_key)
+    ]
+    if protocol_version == PROTOCOL_V2 and pool_key is None and len(
+            matches) > 1:
+        logger.error('Protocol-v2 allocation lookup requires a pool key for '
+                     f'multi-pool service {service_name!r}.')
+        return None
+    row = matches[0] if len(matches) == 1 else None
     if row is None:
         return None
     if time.time() - float(row['heartbeat_ts'] or 0) > claim_ttl_seconds():
         return None
-    round_row = serve_state.get_reserved_fill_round(row['pool_key'])
+    resolved_pool_key = row['pool_key']
+    round_row = serve_state.get_reserved_fill_round(resolved_pool_key)
     if round_row is None:
         return None
-    return _allocation_from_round(service_name, round_row)
+    try:
+        generation = _claim_generation(row, protocol_version)
+        round_claims = [
+            claim for claim in claims if claim['pool_key'] == resolved_pool_key
+        ]
+        claim_generations = {
+            str(claim['service_name']): _claim_generation(
+                claim, protocol_version) for claim in round_claims
+        }
+    except ValueError as e:
+        logger.error(str(e))
+        return None
+    if not _round_matches_claim_set(round_row, protocol_version,
+                                    claim_generations):
+        return None
+    return _allocation_from_round(service_name,
+                                  resolved_pool_key,
+                                  round_row,
+                                  protocol_version=protocol_version,
+                                  service_generation=generation,
+                                  claim_row=row)
 
 
-def run_round_if_stale(service_name: str, pool_key: str,
-                       query_fn: Callable[[], PoolObservation | None],
-                       poll_interval_seconds: float) -> Allocation | None:
+def run_round_if_stale(
+    service_name: str,
+    pool_key: str,
+    query_fn: Callable[[], PoolObservation | None],
+    poll_interval_seconds: float,
+    *,
+    expected_protocol_version: int = PROTOCOL_V1,
+    expected_service_generation: int = 0,
+    lock_timeout_seconds: float = (
+        constants.RESERVED_FILL_BROKER_LOCK_TIMEOUT_SECONDS)
+) -> Allocation | None:
     """Reads the pool's round, driving a fresh one if it went stale.
 
     The caller (a service's capacity poller) must have upserted its claim
@@ -833,14 +3060,18 @@ def run_round_if_stale(service_name: str, pool_key: str,
     Returns None when the caller holds no live claim (expired, or rejected
     by a validation) or the round could not be driven; the caller then
     feeds its autoscaler zero free slots (existing holdings keep their
-    shelter via zero_cost_count, no new fill).
+    shelter via zero_cost_count, no new fill). Callers that already own a
+    bounded provider phase should pass a zero timeout: broker-lock contention
+    must retire that phase immediately instead of waiting behind another
+    controller's slow observation round.
     """
     try:
-        with locks.get_lock(
-                constants.RESERVED_FILL_BROKER_LOCK_ID,
-                timeout=constants.RESERVED_FILL_BROKER_LOCK_TIMEOUT_SECONDS):
+        with locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID,
+                            timeout=lock_timeout_seconds):
             return _run_round_locked(service_name, pool_key, query_fn,
-                                     poll_interval_seconds)
+                                     poll_interval_seconds,
+                                     expected_protocol_version,
+                                     expected_service_generation)
     except locks.LockTimeout:
         logger.warning(
             'Reserved-fill broker: timed out waiting for the round lock '
@@ -849,27 +3080,70 @@ def run_round_if_stale(service_name: str, pool_key: str,
         return None
 
 
-def _run_round_locked(service_name: str, pool_key: str,
-                      query_fn: Callable[[], PoolObservation | None],
-                      poll_interval_seconds: float) -> Allocation | None:
+def _run_round_locked(
+        service_name: str,
+        pool_key: str,
+        query_fn: Callable[[], PoolObservation | None],
+        poll_interval_seconds: float,
+        expected_protocol_version: int = PROTOCOL_V1,
+        expected_service_generation: int = 0) -> Allocation | None:
     now = time.time()
-    pruned = serve_state.prune_reserved_fill_claims(now - claim_ttl_seconds())
+    protocol_version = get_protocol_version()
+    if protocol_version != expected_protocol_version:
+        logger.info('Reserved-fill broker protocol changed before round '
+                    f'actuation for {service_name!r}/{pool_key}: expected '
+                    f'{expected_protocol_version}, current '
+                    f'{protocol_version}.')
+        return None
+    pruned = _prune_claims(protocol_version, now - claim_ttl_seconds())
     if pruned:
         logger.warning('Reserved-fill broker: pruned expired claim(s) of '
                        f'{pruned}.')
     claim_rows = {
         row['service_name']: row
-        for row in serve_state.get_reserved_fill_claims(pool_key=pool_key)
+        for row in _claim_rows(protocol_version, pool_key=pool_key)
     }
-    claim_rows = _reject_mixed_gpus_per_replica(pool_key, claim_rows)
+    claim_rows, mixed_width_losers = _reject_mixed_gpus_per_replica(
+        pool_key, claim_rows, protocol_version)
+    try:
+        (claim_rows, claim_generations, access_contexts,
+         physical_cluster_uid) = _claim_round_metadata(pool_key, claim_rows,
+                                                       protocol_version)
+    except (TypeError, ValueError, json.JSONDecodeError) as e:
+        logger.error(f'Reserved-fill broker: invalid round authority: {e}')
+        return None
     if service_name not in claim_rows:
         # Our own claim was pruned or rejected; the poller will re-upsert
         # (and re-trip any validation, loudly) next interval.
         return None
+    try:
+        service_generation = _claim_generation(claim_rows[service_name],
+                                               protocol_version)
+    except ValueError as e:
+        logger.error(str(e))
+        return None
+    if service_generation != expected_service_generation:
+        logger.info('Reserved-fill service generation changed before round '
+                    f'actuation for {service_name!r}/{pool_key}: expected '
+                    f'{expected_service_generation}, current '
+                    f'{service_generation}.')
+        return None
     round_row = serve_state.get_reserved_fill_round(pool_key)
+    if service_name in mixed_width_losers:
+        return _zero_v2_mixed_width_allocation(service_name, pool_key,
+                                               service_generation,
+                                               claim_rows[service_name],
+                                               round_row, now)
     if (round_row is not None and now - float(round_row['snapshot_time'])
-            < _ROUND_FRESH_FRACTION * poll_interval_seconds):
-        return _allocation_from_round(service_name, round_row)
+            < _ROUND_FRESH_FRACTION * poll_interval_seconds and
+            _round_matches_claim_set(round_row, protocol_version,
+                                     claim_generations)):
+        return _allocation_from_round(service_name,
+                                      pool_key,
+                                      round_row,
+                                      protocol_version=protocol_version,
+                                      service_generation=service_generation,
+                                      claim_row=claim_rows[service_name])
 
     # ---- Drive a new round: ownership token FIRST. ----
     # TOKEN-FIRST ordering invariant (the other half lives in
@@ -907,15 +3181,36 @@ def _run_round_locked(service_name: str, pool_key: str,
     # publish below.
     claim_rows = {
         row['service_name']: row
-        for row in serve_state.get_reserved_fill_claims(pool_key=pool_key)
+        for row in _claim_rows(protocol_version, pool_key=pool_key)
     }
-    claim_rows = _reject_mixed_gpus_per_replica(pool_key, claim_rows)
+    claim_rows, mixed_width_losers = _reject_mixed_gpus_per_replica(
+        pool_key, claim_rows, protocol_version)
+    try:
+        (claim_rows, claim_generations, access_contexts,
+         physical_cluster_uid) = _claim_round_metadata(pool_key, claim_rows,
+                                                       protocol_version)
+    except (TypeError, ValueError, json.JSONDecodeError) as e:
+        logger.error(f'Reserved-fill broker: invalid round authority: {e}')
+        return None
     if service_name not in claim_rows:
         # Our claim vanished between the pre-token check and here (only
         # possible when the round lock was bypassed); same reaction as
         # the pre-token miss.
         return None
+    try:
+        service_generation = _claim_generation(claim_rows[service_name],
+                                               protocol_version)
+    except ValueError as e:
+        logger.error(str(e))
+        return None
+    if service_generation != expected_service_generation:
+        return None
     round_row = serve_state.get_reserved_fill_round(pool_key)
+    if service_name in mixed_width_losers:
+        return _zero_v2_mixed_width_allocation(service_name, pool_key,
+                                               service_generation,
+                                               claim_rows[service_name],
+                                               round_row, now)
     # Snapshot time BEFORE the slow cluster query: a zero-cost row created
     # while the query runs already occupies a slot the query may still have
     # counted free, and the created_at > snapshot_time debit only catches it
@@ -928,6 +3223,20 @@ def _run_round_locked(service_name: str, pool_key: str,
         logger.warning('Reserved-fill broker: pool query failed for '
                        f'{pool_key}: {common_utils.format_exception(e)}')
     query_ok = observation is not None and observation.free_slots is not None
+    confirmed_phantom = False
+    measured_by_accelerator: dict[str, int] | None = None
+    if query_ok:
+        assert observation is not None
+        try:
+            measured_by_accelerator = _normalize_exact_card_observation(
+                observation, pool_key)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            # The card split is launch authority, not optional decoration once
+            # present. Treat an internally inconsistent split as a blackout so
+            # no aggregate feed can silently select the wrong card.
+            logger.error('Reserved-fill broker: invalid exact-card pool '
+                         f'observation for {pool_key}: {error}')
+            query_ok = False
     prev_phantom_streak = (int(round_row['phantom_streak'] or 0)
                            if round_row is not None else 0)
     # Carried unchanged through a measurement blackout: a failed query is
@@ -951,28 +3260,36 @@ def _run_round_locked(service_name: str, pool_key: str,
             phantom_streak = prev_phantom_streak + 1
             if (phantom_streak
                     >= constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS):
-                logger.error(
-                    f'Reserved-fill broker: pool {pool_key} is phantom (the '
-                    'realtime query reports no such accelerator in the '
-                    f'context, {phantom_streak} consecutive rounds). '
-                    'Rejecting all claims on it.')
-                serve_state.remove_reserved_fill_claims_for_pool(pool_key)
+                if protocol_version == PROTOCOL_V2:
+                    logger.error(
+                        f'Reserved-fill broker: pool {pool_key} is phantom '
+                        '(the realtime query reports no such accelerator in '
+                        f'the context, {phantom_streak} consecutive rounds). '
+                        'Blackouting this pool while retaining its complete '
+                        'service claim sets.')
+                    confirmed_phantom = True
+                else:
+                    logger.error(
+                        f'Reserved-fill broker: pool {pool_key} is phantom '
+                        '(the realtime query reports no such accelerator in '
+                        f'the context, {phantom_streak} consecutive rounds). '
+                        'Rejecting all claims on it.')
+                    _remove_legacy_claims_for_pool(pool_key)
                 # Fall through and PUBLISH an empty (blackout) round
                 # instead of returning here: without a published round
                 # the freshness gate never engages, so every claimant's
                 # poller re-drives the full cluster query each interval
-                # forever (N x duplication) with the pinned streak
-                # re-confirming each time. With the claim rows emptied
-                # the round below computes empty grants/feeds; readers
-                # then get no allocation (feed 0) WITHOUT driving a query
-                # for the rest of the interval. Grants going from
-                # something to nothing is an allocation change, so the
-                # transition bumps the fencing epoch once
-                # (re-confirmations republish identical empty grants and
-                # keep it stable); a later healthy observation still
-                # resets the streak, and the re-upserted claims resume
-                # normal rounds.
-                claim_rows = {}
+                # forever (N x duplication). Protocol v1 retains its legacy
+                # claim-rejection behavior. Protocol v2 must retain the
+                # complete normalized edge set: deleting this one edge would
+                # advance the whole service generation mid-poll and fence
+                # healthy sibling rounds. Instead the branch below publishes
+                # zero grants/feeds under the unchanged generation. A later
+                # healthy observation resets the streak and resumes normally.
+                if protocol_version == PROTOCOL_V1:
+                    claim_rows = {}
+                    claim_generations = {}
+                    access_contexts = ()
             else:
                 logger.warning(
                     f'Reserved-fill broker: pool {pool_key} looks phantom '
@@ -982,6 +3299,13 @@ def _run_round_locked(service_name: str, pool_key: str,
                     'blackout.')
             query_ok = False
 
+    winning_widths = {
+        int(row['gpus_per_replica'] or 1)
+        for name, row in claim_rows.items()
+        if name not in mixed_width_losers
+    }
+    pool_gpus_per_replica = (next(iter(winning_widths))
+                             if len(winning_widths) == 1 else None)
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
     activity = {name: _activity_input(row) for name, row in claim_rows.items()}
     names = sorted(claims)
@@ -1015,7 +3339,8 @@ def _run_round_locked(service_name: str, pool_key: str,
     sum_holdings = sum(claim.holdings_fill for claim in claims.values())
 
     grants: dict[str, int | None]
-    if len(claims) == 1:
+    observed_free = 0
+    if len(claims) == 1 and protocol_version == PROTOCOL_V1:
         # SINGLE-CLAIMANT FAST PATH: #108 identity. No ceiling, feed = raw
         # measured free (a failed query reads 0 free, exactly like the
         # pre-broker poller), no debit (the local overlay already debits its
@@ -1027,6 +3352,7 @@ def _run_round_locked(service_name: str, pool_key: str,
             assert (observation is not None and
                     observation.free_slots is not None)
             free = max(0, int(observation.free_slots))
+            observed_free = free
             last_free, last_free_ts = free, snapshot_time
         # The gate must survive the fast path. Left alone, a lone claimant
         # publishes a None grant, the autoscaler applies no ceiling at all,
@@ -1067,7 +3393,14 @@ def _run_round_locked(service_name: str, pool_key: str,
         # the live-holdings correction below must apply while blind, and
         # the conservation bookkeeping must not flip on a blackout.
         (feed_debit, entitlement_debit, live_fill,
-         unclaimed_fill) = _occupying_debit(names, pool_key, snapshot_time)
+         unclaimed_fill) = _occupying_debit(
+             names,
+             pool_key,
+             snapshot_time,
+             access_contexts=access_contexts,
+             physical_cluster_uid=physical_cluster_uid,
+             claim_generations=claim_generations,
+             pool_gpus_per_replica=pool_gpus_per_replica)
         # One row-consistent view: a claim's holdings_fill is only as
         # fresh as its owner's last heartbeat, while unclaimed_fill comes
         # from the live row scan above -- summing the two double-counts
@@ -1110,7 +3443,26 @@ def _run_round_locked(service_name: str, pool_key: str,
                              if round_row is not None else None)
         prev_shrink_baseline = (round_row['shrink_baseline']
                                 if round_row is not None else None)
-        if query_ok:
+        if confirmed_phantom:
+            # A confirmed v2 phantom is authoritative zero capacity for this
+            # physical pool, not a transient measurement blackout. Withdraw
+            # both launch and shelter authority, clear sticky feed state, and
+            # fence the transition while leaving the complete service claim
+            # generation untouched for healthy sibling pools.
+            assert protocol_version == PROTOCOL_V2
+            last_free, last_free_ts = 0, snapshot_time
+            raw_grants = {name: 0 for name in names}
+            damped = {name: 0 for name in names}
+            feeds = {name: 0 for name in names}
+            new_sticky = {}
+            utilization_state = {
+                name: dict(entry)
+                for name, entry in prev_utilization.items()
+                if name in claims
+            }
+            published_sum_holdings = conserved_holdings
+            new_shrink_baseline = None
+        elif query_ok:
             assert (observation is not None and
                     observation.free_slots is not None)
             measured = max(0, int(observation.free_slots))
@@ -1172,6 +3524,7 @@ def _run_round_locked(service_name: str, pool_key: str,
                 holdings_shrank = False
             damped = damp_grants(raw_grants, prev_published, prev_raw,
                                  holdings_shrank)
+            damped = _clamp_v2_grants(damped, claims, protocol_version)
             # raw_grants clamps each feed need to min(damped, raw): a
             # service inside a down-move's damping window must not be fed
             # above its raw entitlement -- the damped grant catches down
@@ -1208,6 +3561,7 @@ def _run_round_locked(service_name: str, pool_key: str,
             # claimant with no previous grant (joined during the blackout)
             # gets its holdings floor: nothing new, nothing stripped.
             raw_grants = {name: int(value) for name, value in prev_raw.items()}
+            raw_grants = _clamp_v2_grants(raw_grants, claims, protocol_version)
             damped = {}
             for name, claim in claims.items():
                 base = (prev_published.get(name)
@@ -1224,6 +3578,7 @@ def _run_round_locked(service_name: str, pool_key: str,
                     floor_holdings = min(floor_holdings, int(carried['cap']))
                 damped[name] = max(base if base is not None else 0,
                                    floor_holdings)
+            damped = _clamp_v2_grants(damped, claims, protocol_version)
             # Carry the release state through the blackout with its clocks
             # pushed forward, so a long outage cannot bank steps and then
             # apply several at once when measurement recovers.
@@ -1248,18 +3603,45 @@ def _run_round_locked(service_name: str, pool_key: str,
                                    prev_shrink_baseline is not None else None)
         grants = dict(damped)
 
+    feed_by_accelerator = (_allocate_feed_by_accelerator(
+        feeds, measured_by_accelerator, observed_free) if query_ok else None)
+    service_feed_by_accelerator = (json.dumps(feed_by_accelerator,
+                                              sort_keys=True)
+                                   if feed_by_accelerator is not None else None)
+    if feed_by_accelerator is not None:
+        assert measured_by_accelerator is not None
+        feed_by_accelerator[_OBSERVED_FREE_BY_ACCELERATOR_KEY] = dict(
+            measured_by_accelerator)
+    serialized_feed_by_accelerator = (json.dumps(feed_by_accelerator,
+                                                 sort_keys=True) if
+                                      feed_by_accelerator is not None else None)
+
     grants_changed = round_row is None or prev_grants_json != grants
     # Feeds are part of the allocation the fence protects: a feed-only
     # redistribution (grants damped in place while the launchable-now
     # split moved to a peer) or a positive-feed round giving way to a
     # blackout must fence launch batches queued under the previous round
     # -- their slots may now be fed to someone else, or unmeasurable.
-    # Multi-claimant rounds only: the single-claimant fast-path feed is
-    # the raw measured free (fluctuates every round, redistributes to
-    # nobody), and bumping on it would fence steady-state fill launches
-    # the pre-broker #108 path never fenced.
-    feeds_changed = (len(claims) != 1 and round_row is not None and
+    # V1 multi-claimant rounds only: the v1 single-claimant fast-path feed is
+    # raw measured free and redistributes to nobody. Protocol v2 deliberately
+    # has no unbounded single-claimant fast path, so feed movement remains
+    # fenced even when the partition currently contains one edge.
+    feeds_changed = ((protocol_version == PROTOCOL_V2 or len(claims) != 1) and
+                     round_row is not None and
                      json.loads(round_row['feeds'] or '{}') != feeds)
+    previous_feed_by_accelerator = (_service_feed_payload_for_epoch(
+        round_row.get('feed_by_accelerator'))
+                                    if round_row is not None else None)
+    exact_feed_changed = (protocol_version == PROTOCOL_V2 and
+                          round_row is not None and previous_feed_by_accelerator
+                          != service_feed_by_accelerator)
+    published_claim_generations = (claim_generations
+                                   if protocol_version == PROTOCOL_V2 else {})
+    metadata_changed = (
+        round_row is None or
+        _round_protocol_version(round_row) != protocol_version or
+        (protocol_version == PROTOCOL_V2 and
+         _round_claim_generations(round_row) != published_claim_generations))
     # The ROUND epoch is per-pool (the fencing token the launch path
     # compares against -- pool A's grant churn must not fence pool B's
     # launches). It bumps only when THIS pool's allocation (grants OR
@@ -1283,7 +3665,8 @@ def _run_round_locked(service_name: str, pool_key: str,
     # CAS-fail instead of clearing).
     fence_pending = (bool(round_row['fence_pending'])
                      if round_row is not None else False)
-    if grants_changed or feeds_changed or lease_expired or fence_pending:
+    if (grants_changed or feeds_changed or exact_feed_changed or
+            metadata_changed or lease_expired or fence_pending):
         new_epoch += 1
     round_id = int(round_row['round_id']) + 1 if round_row is not None else 1
     published = serve_state.publish_reserved_fill_round(
@@ -1293,6 +3676,7 @@ def _run_round_locked(service_name: str, pool_key: str,
         epoch=new_epoch,
         grants=json.dumps(grants, sort_keys=True),
         feeds=json.dumps(feeds, sort_keys=True),
+        feed_by_accelerator=serialized_feed_by_accelerator,
         raw_grants=json.dumps(raw_grants, sort_keys=True),
         feed_state=json.dumps(new_sticky, sort_keys=True),
         sum_holdings=published_sum_holdings,
@@ -1302,6 +3686,9 @@ def _run_round_locked(service_name: str, pool_key: str,
         shrink_baseline=new_shrink_baseline,
         lease_token=lease_token,
         lease_expires_at=now + lease_ttl_seconds,
+        protocol_version=protocol_version,
+        claim_generations=json.dumps(published_claim_generations,
+                                     sort_keys=True),
         utilization_state=(json.dumps(utilization_state, sort_keys=True)
                            if utilization_state else None))
     if not published:
@@ -1314,23 +3701,33 @@ def _run_round_locked(service_name: str, pool_key: str,
     logger.info(
         f'Reserved-fill broker: round {round_id} (epoch {new_epoch}) for '
         f'pool {pool_key}: grants={grants} feeds={feeds} '
+        f'feed_by_accelerator={feed_by_accelerator} '
         f'claimants={names}'
         f'{f" utilization={utilization_state}" if utilization_state else ""}.')
     if service_name not in grants:
-        # Confirmed-phantom blackout round: our claim was just rejected
-        # along with everyone else's, so there is no allocation to hand
-        # back (the caller feeds its autoscaler 0 free slots). Every
-        # normal round grants exactly its claimants.
+        # Protocol-v1 confirmed-phantom blackout round: our claim was just
+        # rejected along with everyone else's, so there is no allocation to
+        # hand back. Protocol v2 retains its claim and returns an explicit
+        # zero allocation under the unchanged service generation.
         return None
-    allocation = Allocation(grant=grants.get(service_name),
-                            feed=int(feeds.get(service_name, 0)),
-                            round_id=round_id,
-                            epoch=new_epoch,
-                            snapshot_time=snapshot_time,
-                            demand_gate_grant=_demand_gate_grant(
-                                grants.get(service_name),
-                                raw_grants.get(service_name)))
-    # The demand gate reads the permissive grant, the fill ceiling reads
-    # the damped one (see Allocation.demand_gate_grant).
-    _GRANT_CACHE[service_name] = (allocation.demand_gate_grant, time.time())
-    return allocation
+    # Build through the same generation-aware reader used by fresh-round
+    # lookups so the immediate writer path cannot omit authority metadata.
+    return _allocation_from_round(
+        service_name,
+        pool_key, {
+            'protocol_version': protocol_version,
+            'claim_generations': json.dumps(published_claim_generations,
+                                            sort_keys=True),
+            'grants': json.dumps(grants, sort_keys=True),
+            'feeds': json.dumps(feeds, sort_keys=True),
+            'feed_by_accelerator': serialized_feed_by_accelerator,
+            'raw_grants': json.dumps(raw_grants, sort_keys=True),
+            'round_id': round_id,
+            'epoch': new_epoch,
+            'snapshot_time': snapshot_time,
+            'last_observed_free': last_free,
+            'last_observed_free_ts': last_free_ts,
+        },
+        protocol_version=protocol_version,
+        service_generation=service_generation,
+        claim_row=claim_rows[service_name])

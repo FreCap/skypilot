@@ -12,7 +12,6 @@ import pytest
 from sky import core
 from sky.server import constants as server_constants
 from sky.server.requests import payloads
-from sky.server.requests import registry
 from sky.server.requests import requests
 from sky.server.requests.requests import RequestStatus
 from sky.server.requests.requests import ScheduleType
@@ -31,16 +30,18 @@ def isolated_database(tmp_path):
     temp_log_path = tmp_path / "logs"
     temp_log_path.mkdir()
 
+    # Close the prior aiosqlite worker before switching paths.  Dropping the
+    # module reference without closing it leaks a non-daemon thread and can
+    # hang a serial pytest process during interpreter shutdown.
+    asyncio.run(requests.close_db_async())
+
     # Patch the database path and log path constants
     with mock.patch('sky.server.constants.API_SERVER_REQUEST_DB_PATH',
                     str(temp_db_path)):
         with mock.patch('sky.server.constants.REQUEST_LOG_PATH_PREFIX',
                         str(temp_log_path)):
-            # Reset the global database variable to force re-initialization
-            requests._DB = None
             yield
-            # Clean up after the test
-            requests._DB = None
+            asyncio.run(requests.close_db_async())
 
 
 @pytest.mark.asyncio
@@ -131,38 +132,6 @@ def test_set_request_succeeded_nonexistent_request(isolated_database):
     # already-terminal one) and no row is created.
     requests.set_request_succeeded('nonexistent-request', {'result': 'ok'})
     assert requests.get_request('nonexistent-request') is None
-
-
-@pytest.mark.parametrize('result', [None, {}])
-@pytest.mark.asyncio
-async def test_sqlite_strict_return_encoder_failure_is_durably_failed(
-        isolated_database, result):
-    registration = registry.resolve_handler('serve_resource_action_launch')
-    request = requests.Request(
-        request_id='strict-result-failure',
-        name='sky.serve_resource_action_launch',
-        entrypoint=registration.func,
-        request_body=payloads.RequestBody(),
-        status=RequestStatus.RUNNING,
-        created_at=0.0,
-        user_id='test-user',
-    )
-    try:
-        await requests.create_if_not_exists_async(request)
-
-        requests.set_request_succeeded(request.request_id, result)
-
-        stored = await requests.get_request_async(request.request_id)
-        assert stored is not None
-        assert stored.status is RequestStatus.FAILED
-        assert stored.return_value is None
-        error = stored.get_error()
-        assert error is not None
-        assert error['type'] in ('TypeError', 'ValueError')
-        assert ('JSON object' in error['message'] or
-                'unknown or missing' in error['message'])
-    finally:
-        await requests.close_db_async()
 
 
 @pytest.mark.asyncio
@@ -1125,6 +1094,16 @@ async def test_get_request_tasks_async(isolated_database):
     assert len(pending_requests) == 1
     assert pending_requests[0].request_id == 'async-req-1'
 
+    # Exact request IDs do not use the legacy prefix semantics.
+    exact_requests = await requests.get_request_tasks_async(
+        requests.RequestTaskFilter(request_ids=['async-req-1', 'async-req-3'],
+                                   sort=True))
+    assert [request.request_id for request in exact_requests
+           ] == ['async-req-3', 'async-req-1']
+    no_prefix_matches = await requests.get_request_tasks_async(
+        requests.RequestTaskFilter(request_ids=['async-req'], sort=True))
+    assert no_prefix_matches == []
+
     # Test 3: Filter by user_id - async
     user1_requests = await requests.get_request_tasks_async(
         requests.RequestTaskFilter(user_id='async-user1', sort=True))
@@ -1314,25 +1293,42 @@ def test_requests_filter():
     assert sql == expected_sql
     assert params == []
 
+    # Test exact request-ID filter (uses parameterized query).
+    filter_request_ids = requests.RequestTaskFilter(
+        request_ids=['request-1', 'request-2'], sort=True)
+    sql, params = filter_request_ids.build_query()
+    expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
+                    'WHERE request_id IN (?,?) ORDER BY created_at DESC')
+    assert sql == expected_sql
+    assert params == ['request-1', 'request-2']
+
+    # An empty exact-ID list matches nothing without emitting invalid IN ().
+    empty_request_ids = requests.RequestTaskFilter(request_ids=[], sort=True)
+    sql, params = empty_request_ids.build_query()
+    expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
+                    'WHERE 1=0 ORDER BY created_at DESC')
+    assert sql == expected_sql
+    assert params == []
+
     # Test status filter
     filter_status = requests.RequestTaskFilter(
         status=[RequestStatus.PENDING, RequestStatus.RUNNING], sort=True)
     sql, params = filter_status.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE status IN (\'PENDING\',\'RUNNING\') '
+                    'WHERE status IN (?,?) '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == ['PENDING', 'RUNNING']
 
     # Test cluster_names filter
     filter_clusters = requests.RequestTaskFilter(
         cluster_names=['cluster1', 'cluster2'], sort=True)
     sql, params = filter_clusters.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE cluster_name IN (\'cluster1\',\'cluster2\') '
+                    'WHERE cluster_name IN (?,?) '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == ['cluster1', 'cluster2']
 
     # Test user_id filter (uses parameterized query)
     filter_user = requests.RequestTaskFilter(user_id='test-user-123', sort=True)
@@ -1347,20 +1343,20 @@ def test_requests_filter():
         exclude_request_names=['request1', 'request2'], sort=True)
     sql, params = filter_exclude.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE name NOT IN (\'request1\',\'request2\') '
+                    'WHERE name NOT IN (?,?) '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == ['request1', 'request2']
 
     # Test include_request_names filter
     filter_include = requests.RequestTaskFilter(
         include_request_names=['request3', 'request4'], sort=True)
     sql, params = filter_include.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE name IN (\'request3\',\'request4\') '
+                    'WHERE name IN (?,?) '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == ['request3', 'request4']
 
     # Test finished_before filter (uses parameterized query)
     timestamp = 1234567890.0
@@ -1382,13 +1378,16 @@ def test_requests_filter():
         sort=True)
     sql, params = filter_combined.build_query()
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE status IN (\'SUCCEEDED\',\'FAILED\') AND '
-                    'name NOT IN (\'internal-task\') AND '
-                    'cluster_name IN (\'prod-cluster\') AND '
+                    'WHERE status IN (?,?) AND '
+                    'name NOT IN (?) AND '
+                    'cluster_name IN (?) AND '
                     'user_id = ? AND finished_at < ? '
                     'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == ['admin-user', 9876543210.0]
+    assert params == [
+        'SUCCEEDED', 'FAILED', 'internal-task', 'prod-cluster', 'admin-user',
+        9876543210.0
+    ]
 
     # Test mutually exclusive filters raise ValueError
     with pytest.raises(ValueError, match='Only one of exclude_request_names'):
@@ -1396,17 +1395,22 @@ def test_requests_filter():
                                    include_request_names=['req2'],
                                    sort=True)
 
-    # Test special characters in names are properly escaped with repr()
-    filter_special_chars = requests.RequestTaskFilter(
-        cluster_names=['cluster\'with\'quotes', 'cluster\"with\"double'],
-        sort=True)
+    with pytest.raises(ValueError, match='Unsupported request status fields'):
+        requests.RequestTaskFilter(fields=['request_id FROM requests; --'])
+
+    # Special characters remain data and cannot alter the SQL expression.
+    filter_special_chars = requests.RequestTaskFilter(cluster_names=[
+        'cluster\'with\'quotes', 'cluster\"with\"double', "x') OR 1=1 --"
+    ],
+                                                      sort=True)
     sql, params = filter_special_chars.build_query()
-    # repr() should properly escape the quotes
     expected_sql = (f'SELECT {expected_columns} FROM {requests.REQUEST_TABLE} '
-                    'WHERE cluster_name IN (\"cluster\'with\'quotes\",'
-                    '\'cluster\"with\"double\') ORDER BY created_at DESC')
+                    'WHERE cluster_name IN (?,?,?) '
+                    'ORDER BY created_at DESC')
     assert sql == expected_sql
-    assert params == []
+    assert params == [
+        'cluster\'with\'quotes', 'cluster\"with\"double', "x') OR 1=1 --"
+    ]
 
 
 def test_encode_requests_empty_list():
@@ -1438,7 +1442,8 @@ def test_encode_requests_single_request():
     payload = result[0]
     assert payload.request_id == 'test-req-1'
     assert payload.name == 'test-request'
-    assert payload.entrypoint == 'dummy'
+    assert payload.entrypoint == ''
+    assert payload.request_body == 'null'
     assert payload.status == 'PENDING'
     assert payload.created_at == current_time
     assert payload.user_id == 'user-123'
@@ -1446,6 +1451,7 @@ def test_encode_requests_single_request():
     assert payload.pid is None
     assert payload.return_value == 'null'
     assert payload.error == 'null'
+    assert payload.status_msg is None
 
 
 def test_encode_requests_multiple_requests():
@@ -1586,8 +1592,8 @@ def test_encode_requests_readable_encode_parity():
     """encode_requests and readable_encode must produce identical payloads.
 
     Both feed the request table display (readable_encode delegates to
-    encode_requests); this locks in the shared field list, including
-    file_mounts_blob_id.
+    encode_requests); private request-body and file-mount capability fields
+    stay out of that projection.
     """
     from sky import models
 
@@ -1607,7 +1613,8 @@ def test_encode_requests_readable_encode_parity():
         batched_payload = requests.encode_requests([request])[0]
         per_row_payload = request.readable_encode()
 
-    assert batched_payload.file_mounts_blob_id == 'blob-123'
+    assert batched_payload.file_mounts_blob_id is None
+    assert batched_payload.request_body == 'null'
     assert per_row_payload.model_dump() == batched_payload.model_dump()
 
 
@@ -1801,6 +1808,40 @@ async def test_get_latest_request_id_async(isolated_database):
     request_id = await requests.get_latest_request_id_async()
     assert request_id == 'test-request-id-2'
 
+    other_request = requests.Request(request_id='other-user-latest',
+                                     name='test-request',
+                                     entrypoint=dummy,
+                                     request_body=payloads.RequestBody(),
+                                     status=RequestStatus.PENDING,
+                                     created_at=current_time + 2,
+                                     user_id='other-user')
+    await requests.create_if_not_exists_async(other_request)
+    assert await requests.get_latest_request_id_async() == 'other-user-latest'
+    assert (await requests.get_latest_request_id_async('test-user') ==
+            'test-request-id-2')
+
+
+@pytest.mark.asyncio
+async def test_sqlite_targeted_cancel_enforces_owner(isolated_database):
+    for request_id, user_id in (('cancel-own', 'alice'), ('cancel-foreign',
+                                                          'bob')):
+        await requests.create_if_not_exists_async(
+            requests.Request(request_id=request_id,
+                             name='test-request',
+                             entrypoint=dummy,
+                             request_body=payloads.RequestBody(),
+                             status=RequestStatus.PENDING,
+                             created_at=time.time(),
+                             user_id=user_id))
+
+    backend = requests.request_storage.get_request_backend()
+    assert backend.kill_requests(['cancel-own', 'cancel-foreign'],
+                                 user_id='alice') == ['cancel-own']
+    own = await requests.get_request_async('cancel-own')
+    foreign = await requests.get_request_async('cancel-foreign')
+    assert own is not None and own.status is RequestStatus.CANCELLED
+    assert foreign is not None and foreign.status is RequestStatus.PENDING
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('test_async', [True, False])
@@ -1862,6 +1903,17 @@ async def test_get_requests_with_prefix(isolated_database, test_async):
         result = requests.get_requests_with_prefix('batch-request')
     assert result is not None
     assert len(result) == 3
+
+    if test_async:
+        owned_result = await requests.get_requests_async_with_prefix(
+            'batch-request', fields=['request_id'], user_id='test-user-1')
+    else:
+        owned_result = requests.get_requests_with_prefix('batch-request',
+                                                         fields=['request_id'],
+                                                         user_id='test-user-1')
+    assert owned_result is not None
+    assert [request.request_id for request in owned_result
+           ] == ['batch-request-001']
 
     # Verify all returned requests match the prefix
     returned_ids = [req.request_id for req in result]

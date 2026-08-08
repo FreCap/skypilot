@@ -124,8 +124,8 @@ def test_status_kubernetes_empty_and_single_controller_fast_paths(controllers):
                 'job_name': pod_name,
                 'job_id': 1
             }]) as queue, mock.patch.object(
-                core.subprocess_utils.pool,
-                'ThreadPool',
+                core.subprocess_utils,
+                'ContextThreadPoolExecutor',
                 side_effect=AssertionError(
                     'thread pool should not be created')):
         _, _, jobs, _ = core.status_kubernetes()

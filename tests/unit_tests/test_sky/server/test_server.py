@@ -30,6 +30,10 @@ from sky.utils import common_utils
 from sky.utils import config_utils
 
 
+def _status_projection_entrypoint():
+    return None
+
+
 @mock.patch('uvicorn.run')
 @mock.patch('sky.server.requests.executor.start')
 @mock.patch('sky.utils.common_utils.get_cpu_count')
@@ -766,6 +770,183 @@ async def test_serve_launch_endpoint_attaches_owner_precondition():
     assert condition.service_hash == 'incarnation-a'
 
 
+def _protocol_v2_reserved_fill_launch_context() -> dict[str, object]:
+    from sky.serve import reserved_capacity
+    from sky.serve import reserved_capacity_broker
+
+    pool_key = reserved_capacity_broker.make_pool_key(
+        'phx-context',
+        'H200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='physical-uid')
+    context: dict[str, object] = {
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 3,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+    }
+    context.update(
+        reserved_capacity.make_protocol_v2_launch_fence(
+            pool_key=pool_key,
+            service_generation=7,
+            physical_cluster_uid='physical-uid',
+            kubernetes_context='phx-context',
+            accelerator='H200',
+            accelerator_count=1))
+    return context
+
+
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_accepts_complete_durable_fence():
+    from sky import execution
+    from sky.serve import reserved_capacity
+    from sky.server.requests import payloads
+    from sky.server.requests import preconditions
+    from sky.server.requests import requests as requests_lib
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='svc-replica',
+        is_launched_by_sky_serve_controller=True,
+        extra_launch_context=_protocol_v2_reserved_fill_launch_context())
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule:
+        await server.launch(launch_body, request)
+
+    condition = mock_schedule.await_args.kwargs['precondition']
+    assert isinstance(condition, preconditions.ServiceReplicaLaunchPrecondition)
+    queued_body = mock_schedule.await_args.kwargs['request_body']
+    assert (queued_body.extra_launch_context ==
+            _protocol_v2_reserved_fill_launch_context())
+    # Exercise the production durable JSON codec used to recover an enqueued
+    # launch after API-server restart, not merely the in-memory scheduler call.
+    durable_request = requests_lib.Request(
+        request_id='launch-request-id',
+        name='sky.launch',
+        entrypoint=execution.launch,
+        request_body=queued_body,
+        status=requests_lib.RequestStatus.PENDING,
+        created_at=123.0,
+        user_id='user-1',
+        schedule_type=requests_lib.ScheduleType.LONG)
+    restored = requests_lib.Request.from_durable_values(
+        durable_request.durable_values())
+    assert restored.request_body.extra_launch_context == (
+        _protocol_v2_reserved_fill_launch_context())
+    assert reserved_capacity.parse_protocol_v2_launch_fence(
+        restored.request_body.extra_launch_context) is not None
+
+
+@pytest.mark.parametrize('missing_key',
+                         server.serve_constants.RESERVED_FILL_LAUNCH_FENCE_KEYS)
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_rejects_each_missing_fence_field_before_queue(
+        missing_key):
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_context = _protocol_v2_reserved_fill_launch_context()
+    launch_context.pop(missing_key)
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=launch_context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='protocol-v2') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.parametrize(('field', 'invalid_value'), [
+    (server.serve_constants.RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY, '2'),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_POOL_KEY, 2),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY, '7'),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY, 7),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY, 7),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_ACCELERATOR_KEY, 7),
+    (server.serve_constants.RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY, 1.0),
+])
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_rejects_each_mistyped_fence_field_before_queue(
+        field, invalid_value):
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_context = _protocol_v2_reserved_fill_launch_context()
+    launch_context[field] = invalid_value
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=launch_context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='protocol-v2') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_rejects_contradictory_fence_before_queue():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    context = _protocol_v2_reserved_fill_launch_context()
+    context[server.serve_constants.
+            RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY] = 'replacement-uid'
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='protocol-v2') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reserved_fill_launch_rejects_non_serve_caller():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='user-cluster',
+        is_launched_by_sky_serve_controller=False,
+        extra_launch_context=_protocol_v2_reserved_fill_launch_context())
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='ordinary SkyServe') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
 def _unbound_system_recovery_launch_context() -> dict[str, object]:
     from sky.serve import system_oom_recovery
 
@@ -893,8 +1074,8 @@ async def test_partial_system_recovery_context_is_rejected_before_binding():
 
 
 @pytest.mark.asyncio
-async def test_exact_legacy_recovery_context_remains_retryable():
-    """The deprecated contract-1 tuple bypasses the v3 nonce protocol."""
+async def test_exact_legacy_recovery_context_is_rejected():
+    """Historical recovery fields cannot bypass closed v3 validation."""
     from sky.serve import constants as serve_constants
     from sky.server.requests import payloads
 
@@ -911,18 +1092,20 @@ async def test_exact_legacy_recovery_context_remains_retryable():
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
             serve_constants.SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY: 1,
             serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY: 'boltz-l4-v1',
-            serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY: 1,
+            'sky_serve_system_oom_recovery_profile_version': 1,
         })
 
     with mock.patch.object(
             server.serve_state,
             'bind_replica_system_recovery_launch_request') as mock_bind, \
          mock.patch('sky.server.server.executor.schedule_request_async',
-                    new_callable=mock.AsyncMock) as mock_schedule:
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='launch intent') as exc:
         await server.launch(launch_body, request)
 
+    assert exc.value.status_code == 409
     mock_bind.assert_not_called()
-    assert mock_schedule.await_args.kwargs['retryable'] is True
+    mock_schedule.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1571,7 +1754,8 @@ def test_api_get_endpoint_serializes_request_payload(monkeypatch):
         user_id='user-123',
     )
 
-    async def fake_expand(request_id):
+    async def fake_expand(request_id, owner_user_id=None):
+        del owner_user_id
         return request_id
 
     async def fake_status(request_id, include_msg=False):
@@ -1625,3 +1809,174 @@ def test_dashboard_config_endpoint_serializes_external_links(monkeypatch):
             'regex': 'https://grafana.example.com/.*'
         }]
     }
+
+
+@pytest.mark.asyncio
+async def test_status_query_rejects_caller_selected_internal_request_names():
+    from sky.server.requests import payloads
+
+    request = mock.Mock(spec=fastapi.Request)
+    request.state.auth_user = None
+    body = payloads.RequestStatusBody(
+        include_request_names=['sky.internal-daemon'])
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        await server.api_status_query(request, body)
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_status_query_internal_filters_require_controller(monkeypatch):
+    from sky.server.requests import payloads
+
+    request = mock.Mock(spec=fastapi.Request)
+    request.state.auth_user = mock.Mock(id='viewer')
+    request.state.controller_origin = None
+    monkeypatch.setattr(server.auth_loopback, 'is_loopback_request',
+                        lambda _request: False)
+    body = payloads.RequestStatusBody(cluster_names=['service-replica-1'],
+                                      include_request_names=['sky.launch'],
+                                      execution_quiescence_candidates_only=True)
+
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        await server.api_status_query(request, body)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_status_query_accepts_current_controller_and_owns_allowlist(
+        monkeypatch):
+    from sky.server.requests import payloads
+
+    request = mock.Mock(spec=fastapi.Request)
+    request.state.auth_user = None
+    request.state.controller_origin = ('controller-instance', 7)
+    monkeypatch.setattr(server.auth_loopback, 'is_loopback_request',
+                        lambda _request: False)
+    captured = []
+
+    async def get_request_tasks(req_filter):
+        captured.append(req_filter)
+        return []
+
+    monkeypatch.setattr(server.requests_lib, 'get_request_tasks_async',
+                        get_request_tasks)
+    monkeypatch.setattr(server.requests_lib, 'encode_requests',
+                        lambda requests: requests)
+    body = payloads.RequestStatusBody(cluster_names=['service-replica-1'],
+                                      include_request_names=['sky.launch'],
+                                      execution_quiescence_candidates_only=True,
+                                      fields=['request_id', 'name', 'status'])
+
+    assert await server.api_status_query(request, body) == []
+    assert len(captured) == 1
+    assert captured[0].include_request_names == ['sky.launch']
+
+
+@pytest.mark.asyncio
+async def test_api_status_uses_fixed_safe_default_projection(monkeypatch):
+    captured = []
+
+    async def get_request_tasks(req_filter):
+        captured.append(req_filter)
+        return []
+
+    monkeypatch.setattr(server.requests_lib, 'get_request_tasks_async',
+                        get_request_tasks)
+    monkeypatch.setattr(server.requests_lib, 'encode_requests',
+                        lambda request_tasks: request_tasks)
+
+    api_status_impl = server._api_status  # pylint: disable=protected-access
+    assert await api_status_impl(None, False, 5, None, None, None, None, False,
+                                 False) == []
+    assert len(captured) == 1
+    assert captured[0].fields == list(
+        server.requests_lib.REQUEST_STATUS_QUERY_FIELDS)
+    assert set(captured[0].fields).issubset(
+        server.requests_lib.REQUEST_STATUS_QUERY_FIELD_SET)
+    assert {
+        'entrypoint', 'request_body', 'return_value', 'error', 'status_msg',
+        'pid', 'file_mounts_blob_id'
+    }.isdisjoint(captured[0].fields)
+    assert set(
+        server.requests_lib.REQUEST_STATUS_POSTGRES_QUERY_FIELDS).isdisjoint(
+            captured[0].fields)
+
+
+@pytest.mark.asyncio
+async def test_api_status_default_projection_reads_sqlite(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'sqlite')
+    monkeypatch.setattr(server_constants, 'API_SERVER_REQUEST_DB_PATH',
+                        str(tmp_path / 'requests.db'))
+    monkeypatch.setattr(server_constants, 'REQUEST_LOG_PATH_PREFIX',
+                        str(tmp_path / 'logs'))
+    await server.requests_lib.close_db_async()
+    monkeypatch.setattr(server.requests_lib.request_storage, '_storage_backend',
+                        server.requests_lib.SqliteRequestBackend())
+    request = server.requests_lib.Request(
+        request_id='sqlite-status-request',
+        name='test-request',
+        entrypoint=_status_projection_entrypoint,
+        request_body=server.payloads.RequestBody(),
+        status=server.requests_lib.RequestStatus.PENDING,
+        created_at=123.0,
+        user_id='sqlite-user',
+    )
+    try:
+        assert await server.requests_lib.create_if_not_exists_async(request)
+        api_status_impl = server._api_status  # pylint: disable=protected-access
+        [projected] = await api_status_impl(None, False, 5, None, None, None,
+                                            None, False, False)
+    finally:
+        await server.requests_lib.close_db_async()
+
+    assert projected.request_id == request.request_id
+    assert projected.user_id == request.user_id
+    assert projected.request_body == 'null'
+    assert projected.entrypoint == ''
+
+
+@pytest.mark.parametrize('unsafe_field', [
+    'entrypoint',
+    'request_body',
+    'return_value',
+    'error',
+    'status_msg',
+    'pid',
+    'file_mounts_blob_id',
+])
+@pytest.mark.asyncio
+async def test_api_status_rejects_unsafe_fields(unsafe_field):
+    api_status_impl = server._api_status  # pylint: disable=protected-access
+    with pytest.raises(fastapi.HTTPException) as exc_info:
+        await api_status_impl(None, False, None, ['request_id', unsafe_field],
+                              None, None, None, False, False)
+
+    assert exc_info.value.status_code == 400
+    assert unsafe_field in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_api_status_passes_safe_fields_to_prefix_lookup(monkeypatch):
+    calls = []
+
+    async def get_requests_with_prefix(request_id,
+                                       *,
+                                       fields=None,
+                                       user_id=None):
+        calls.append((request_id, fields, user_id))
+        return []
+
+    monkeypatch.setattr(server.requests_lib, 'get_requests_async_with_prefix',
+                        get_requests_with_prefix)
+    monkeypatch.setattr(server.requests_lib, 'encode_requests',
+                        lambda request_tasks: request_tasks)
+
+    api_status_impl = server._api_status  # pylint: disable=protected-access
+    assert await api_status_impl(['request-prefix'], False, None,
+                                 ['status', 'request_id', 'status'], None, None,
+                                 None, False, False) == []
+    assert calls == [('request-prefix', ['status', 'request_id'], None)]

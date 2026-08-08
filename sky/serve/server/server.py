@@ -234,6 +234,48 @@ async def replica_page(
                                     detail='Invalid replica cursor.') from exc
 
 
+@router.get('/{service_name}/pricing')
+async def service_pricing(
+        service_name: str,
+        expected_service_hash: str = fastapi.Query(min_length=1),
+        replica_id: list[int] | None = fastapi.Query(default=None),
+) -> dict:
+    """Read bounded persisted pricing without controller or executor work."""
+    if replica_id is not None:
+        # Validate raw cardinality before deduplication and before the
+        # topology check so every deployment exposes the same wire contract.
+        if len(replica_id) > serve_dashboard.MAX_PRICING_REPLICA_IDS:
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='At most 100 replica IDs may be requested.')
+        if any(item < 1 or item > serve_dashboard.MAX_PRICING_REPLICA_ID
+               for item in replica_id):
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='Replica IDs must be positive PostgreSQL INTEGER '
+                'values.')
+    if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
+        return serve_dashboard.unavailable_service_pricing(
+            service_name, expected_service_hash, 'non_consolidated')
+    try:
+        return await asyncio.to_thread(
+            serve_dashboard.get_service_pricing,
+            service_name,
+            expected_service_hash,
+            replica_id,
+        )
+    except serve_dashboard.ServiceNotFoundError as exc:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.') from exc
+    except serve_dashboard.ServiceHashMismatchError as exc:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.') from exc
+    except ValueError as exc:
+        raise fastapi.HTTPException(status_code=422,
+                                    detail='Invalid pricing query.') from exc
+
+
 @router.post('/{service_name}/versions/elect')
 async def elect_version(
     request: fastapi.Request,

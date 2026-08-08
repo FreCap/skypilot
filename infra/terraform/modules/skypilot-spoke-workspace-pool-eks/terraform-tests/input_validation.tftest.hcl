@@ -261,6 +261,150 @@ run "accepts_explicit_public_probe_ingress" {
   }
 }
 
+run "additional_ports_default_to_creating_no_extra_rule" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+    }
+  }
+
+  assert {
+    condition     = length(aws_security_group_rule.serve_control_plane_additional) == 0
+    error_message = "Omitting additional_ports must not widen an existing spoke."
+  }
+}
+
+run "grants_the_ssh_port_a_kubernetes_launch_needs" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+      additional_ports       = [22]
+    }
+  }
+
+  # The serving port keeps index [0] so an existing rule is not re-keyed, and
+  # the SSH port arrives as a separate, independently addressed rule.
+  assert {
+    condition     = aws_security_group_rule.serve_probe_from_control_plane[0].from_port == 8080
+    error_message = "The serving-port rule must keep its address and port."
+  }
+
+  assert {
+    condition     = aws_security_group_rule.serve_control_plane_additional["22"].from_port == 22
+    error_message = "A Kubernetes replica launch SSHes to the Pod IP; 22 must be granted."
+  }
+
+  assert {
+    condition     = aws_security_group_rule.serve_control_plane_additional["22"].cidr_blocks == tolist(["10.30.0.0/16"])
+    error_message = "The extra rule must reuse the reviewed control-plane CIDR."
+  }
+}
+
+run "rejects_an_additional_port_repeating_the_serving_port" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+      additional_ports       = [22, 8080]
+    }
+  }
+
+  expect_failures = [var.serve_probe_ingress]
+}
+
+run "rejects_an_out_of_range_additional_port" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+      additional_ports       = [70000]
+    }
+  }
+
+  expect_failures = [var.serve_probe_ingress]
+}
+
+run "an_adopted_port_keeps_its_existing_aws_description" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+      additional_ports       = [22]
+      additional_port_descriptions = {
+        "22" = "SSH access from admin subnets (same VPC, different SG)"
+      }
+    }
+  }
+
+  # AWS identifies a rule by (protocol, ports, CIDR) and rejects a duplicate,
+  # so a spoke that already carries the grant must import it. The import only
+  # plans clean if the description matches the live rule byte for byte.
+  assert {
+    condition     = aws_security_group_rule.serve_control_plane_additional["22"].description == "SSH access from admin subnets (same VPC, different SG)"
+    error_message = "An adopted rule must keep the description AWS already holds."
+  }
+}
+
+run "an_unadopted_port_keeps_the_derived_description" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id = "sg-0123456789abcdef0"
+      control_plane_cidr     = "10.30.0.0/16"
+      port                   = 8080
+      additional_ports       = [22, 2222]
+      additional_port_descriptions = {
+        "22" = "adopted"
+      }
+      description = "base"
+    }
+  }
+
+  assert {
+    condition     = aws_security_group_rule.serve_control_plane_additional["22"].description == "adopted"
+    error_message = "An override must apply to exactly its own port."
+  }
+
+  assert {
+    condition     = aws_security_group_rule.serve_control_plane_additional["2222"].description == "base (port 2222)"
+    error_message = "A port without an override must keep the derived description."
+  }
+}
+
+run "rejects_a_description_for_a_port_that_is_not_granted" {
+  command = plan
+
+  variables {
+    serve_probe_ingress = {
+      node_security_group_id       = "sg-0123456789abcdef0"
+      control_plane_cidr           = "10.30.0.0/16"
+      port                         = 8080
+      additional_ports             = [22]
+      additional_port_descriptions = { "443" = "typo" }
+    }
+  }
+
+  expect_failures = [var.serve_probe_ingress]
+}
+
 run "rejects_a_controller_role_from_another_partition" {
   command = plan
 

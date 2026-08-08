@@ -423,6 +423,17 @@ def stream_logs_by_id(job_id: int,
     watchdog = threading.Thread(target=_orphan_watchdog, daemon=True)
     watchdog.start()
 
+    # Batch coordinator jobs never stream worker-task logs: the coordinator
+    # runs inline on the controller, so the controller log is the only durable
+    # log source regardless of any task filter.
+    if managed_job_state.is_batch_job(job_id):
+        return stream_logs(job_id,
+                           job_name=None,
+                           controller=True,
+                           follow=follow,
+                           tail=tail,
+                           tail_offset=tail_offset)
+
     msg = _JOB_WAITING_STATUS_MESSAGE.format(status_str='',
                                              provision_str='',
                                              job_id=job_id)
@@ -467,6 +478,11 @@ def stream_logs_by_id(job_id: int,
             return managed_job_state.get_latest_log_stream_snapshot(job_id)
         return managed_job_state.get_task_log_stream_snapshot(
             job_id, filtered_task_id)
+
+    def get_follow_status() -> managed_job_state.ManagedJobStatus | None:
+        if filtered_task_id is None:
+            return managed_job_state.get_status(job_id)
+        return get_stream_target_snapshot().status
 
     # Follow the jobs controller log during provisioning so the user sees the
     # same spinner messages that `sky launch` shows. The controller relays the
@@ -518,17 +534,6 @@ def stream_logs_by_id(job_id: int,
                 num_tasks=num_tasks,
                 tail=tail,
                 tail_offset=tail_offset)
-        # Batch coordinator jobs run inline on the controller — no
-        # separate cluster is provisioned. Stream controller logs instead
-        # of trying to find a worker cluster handle.
-        if managed_job_state.is_batch_job(job_id):
-            return stream_logs(job_id,
-                               job_name=None,
-                               controller=True,
-                               follow=follow,
-                               tail=tail,
-                               tail_offset=tail_offset)
-
         backend = backends.CloudVmRayBackend()
 
         while True:
@@ -705,8 +710,7 @@ def stream_logs_by_id(job_id: int,
                                 != managed_job_state.ManagedJobStatus.RUNNING)
 
                         while not is_managed_job_status_updated(
-                                managed_job_status :=
-                                managed_job_state.get_status(job_id)):
+                                managed_job_status := get_follow_status()):
                             _sleep_log_follow_wait(JOB_STATUS_CHECK_GAP_SECONDS)
                         assert managed_job_status is not None, (
                             job_id, managed_job_status)
@@ -750,7 +754,7 @@ def stream_logs_by_id(job_id: int,
                     f'Retrying in {JOB_STATUS_CHECK_GAP_SECONDS} seconds.')
             # Finish early if the managed job status is already in terminal
             # state.
-            managed_job_status = managed_job_state.get_status(job_id)
+            managed_job_status = get_follow_status()
             assert managed_job_status is not None, job_id
             if not _should_keep_logging(managed_job_status):
                 break
@@ -778,13 +782,13 @@ def stream_logs_by_id(job_id: int,
         # controller has not updated the managed job state yet. We wait for a
         # while, until the managed job state is updated.
         wait_seconds = 0
-        managed_job_status = managed_job_state.get_status(job_id)
+        managed_job_status = get_follow_status()
         assert managed_job_status is not None, job_id
         while (_should_keep_logging(managed_job_status) and follow and
                wait_seconds < _FINAL_JOB_STATUS_WAIT_TIMEOUT_SECONDS):
             _sleep_log_follow_wait(1)
             wait_seconds += 1
-            managed_job_status = managed_job_state.get_status(job_id)
+            managed_job_status = get_follow_status()
             assert managed_job_status is not None, job_id
 
     assert managed_job_status is not None, job_id

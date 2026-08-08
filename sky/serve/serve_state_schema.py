@@ -9,6 +9,7 @@ from sqlalchemy.ext import declarative
 
 from sky.serve import constants
 from sky.serve import lb_ha
+from sky.serve import resource_action_m4_state_schema
 from sky.utils import common_utils
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
@@ -63,6 +64,7 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('resource_action_mode_changed_at',
                       sqlalchemy.DateTime(timezone=True),
                       server_default=None),
+    *resource_action_m4_state_schema.service_candidate_columns(),
     # Monotonic name-fence token claimed by the lifecycle operation that most
     # recently owns this row.  Unlike ``hash`` (which changes only when the
     # service is recreated), this advances on every up/update/down/purge lock
@@ -80,6 +82,41 @@ services_table = sqlalchemy.Table(
     # Pod IP where the controller process is running.
     # Written by the sky.serve.service process at startup.
     sqlalchemy.Column('controller_ip', sqlalchemy.Text, server_default=None),
+    # A placement normalization updates persisted representation without
+    # changing service semantics.  The requested run fences controller reload;
+    # the remaining fields are the durable receipt written only after that
+    # controller has loaded and validated the normalized generation.
+    sqlalchemy.Column('placement_normalization_requested_run_id',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      sqlalchemy.ForeignKey(
+                          'placement_normalization_runs.run_id',
+                          name=('fk_services_placement_normalization_'
+                                'requested_run'),
+                          ondelete='RESTRICT'),
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_run_id',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      sqlalchemy.ForeignKey(
+                          'placement_normalization_runs.run_id',
+                          name=('fk_services_placement_normalization_'
+                                'loaded_run'),
+                          ondelete='RESTRICT'),
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_image_commit',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_controller_pid',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_controller_ip',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_boot_id',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('placement_normalization_loaded_at',
+                      sqlalchemy.Float,
+                      server_default=None),
     # Durable one-way activation fence. Logical per-GPU semantics may be
     # enabled by an update, but cannot safely be changed back to physical
     # backend counts in place. This parent-row bit makes that rule atomic with
@@ -158,6 +195,7 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column('down_shadow_coverage_id', sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('launch_shadow_sample_id', sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('down_shadow_sample_id', sqlalchemy.Uuid(as_uuid=True)),
+    *resource_action_m4_state_schema.replica_spec_identity_columns(),
 )
 sqlalchemy.Index('replicas_service_status_idx', replicas_table.c.service_name,
                  replicas_table.c.status)
@@ -179,11 +217,146 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('quarantined_at', sqlalchemy.Float, server_default=None),
     sqlalchemy.Column('quarantine_reason', sqlalchemy.Text,
                       server_default=None),
+    # Historical retirement preserves operator-readable YAML separately while
+    # removing the row from every live committed-version query.  The CHECK
+    # below prevents partially written retirement evidence.
+    sqlalchemy.Column('retired_yaml_content',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('retired_at', sqlalchemy.Float, server_default=None),
+    sqlalchemy.Column('retirement_reason', sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('retirement_run_id',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      sqlalchemy.ForeignKey(
+                          'placement_normalization_runs.run_id',
+                          name='fk_version_specs_retirement_run',
+                          ondelete='RESTRICT'),
+                      server_default=None),
     sqlalchemy.Column('placement_catalog',
                       sqlalchemy.JSON(none_as_null=True).with_variant(
                           postgresql.JSONB(none_as_null=True), 'postgresql'),
                       server_default=None),
+    # Sanitized, workspace-scoped controller configuration is versioned with
+    # the service spec.  Recovery must select the config belonging to the
+    # elected version rather than reading a singleton from the HA script.
+    sqlalchemy.Column('controller_config',
+                      sqlalchemy.LargeBinary,
+                      server_default=None),
+    sqlalchemy.Column('controller_config_digest',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('controller_config_snapshot_id',
+                      sqlalchemy.Text,
+                      server_default=None),
+    # The first successful controller transition records this once.  Unlike
+    # active_versions, this survives scale-to-zero and is therefore suitable
+    # for choosing a proven generation after a newer version is quarantined.
+    sqlalchemy.Column('controller_applied_at',
+                      sqlalchemy.Float,
+                      server_default=None),
+    *resource_action_m4_state_schema.version_spec_identity_columns(),
+    sqlalchemy.CheckConstraint(
+        '((retired_at IS NULL AND retired_yaml_content IS NULL AND '
+        'retirement_reason IS NULL AND retirement_run_id IS NULL) OR '
+        '(retired_at IS NOT NULL AND yaml_content IS NULL AND '
+        'retired_yaml_content IS NOT NULL AND retirement_reason IS NOT NULL '
+        'AND retirement_run_id IS NOT NULL))',
+        name='ck_version_specs_retirement_all_or_none'),
 )
+
+# One immutable manifest per successfully committed normalization phase.  Raw
+# specs and YAML are intentionally absent: the manifest and row inventory keep
+# only canonical digests and non-secret contract/dependency projections.
+placement_normalization_runs_table = sqlalchemy.Table(
+    'placement_normalization_runs',
+    Base.metadata,
+    sqlalchemy.Column('run_id', sqlalchemy.Uuid(as_uuid=True),
+                      primary_key=True),
+    sqlalchemy.Column('mode', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('normalizer_version', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('schema_revision', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('release_version', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('started_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('completed_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('row_bound', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('row_count', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('classification_counts',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      nullable=False),
+    sqlalchemy.Column('pre_inventory_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('post_inventory_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('freeze_evidence_sha256', sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.CheckConstraint(
+        "mode IN ('apply_supported', 'retire_terminal_historical')",
+        name='ck_placement_normalization_run_mode'),
+    sqlalchemy.CheckConstraint('completed_at >= started_at',
+                               name='ck_placement_normalization_run_times'),
+    sqlalchemy.CheckConstraint(
+        'row_bound >= 0 AND row_count >= 0 AND row_count <= row_bound',
+        name='ck_placement_normalization_run_row_bound'),
+    sqlalchemy.CheckConstraint(
+        'length(pre_inventory_sha256) = 64 AND '
+        'length(post_inventory_sha256) = 64 AND '
+        'length(freeze_evidence_sha256) = 64',
+        name='ck_placement_normalization_run_digests'),
+)
+
+placement_normalization_rows_table = sqlalchemy.Table(
+    'placement_normalization_rows',
+    Base.metadata,
+    sqlalchemy.Column('run_id',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      sqlalchemy.ForeignKey(
+                          'placement_normalization_runs.run_id',
+                          name='fk_placement_normalization_rows_run',
+                          ondelete='RESTRICT'),
+                      primary_key=True),
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('classification', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('outcome', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('original_spec_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('result_spec_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('original_row_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('result_row_sha256', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('original_column_sha256s',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      nullable=False),
+    sqlalchemy.Column('result_column_sha256s',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      nullable=False),
+    sqlalchemy.Column(
+        'contract_projection',
+        sqlalchemy.JSON(none_as_null=True).with_variant(
+            postgresql.JSONB(none_as_null=True), 'postgresql')),
+    sqlalchemy.Column('service_hash', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('service_lifecycle_epoch',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('dependency_facts',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      nullable=False),
+    sqlalchemy.CheckConstraint("outcome IN ('unchanged', 'changed', 'retired')",
+                               name='ck_placement_normalization_row_outcome'),
+    sqlalchemy.CheckConstraint(
+        'length(classification) > 0',
+        name='ck_placement_normalization_row_classification'),
+    sqlalchemy.CheckConstraint(
+        'length(original_spec_sha256) = 64 AND '
+        'length(result_spec_sha256) = 64 AND '
+        'length(original_row_sha256) = 64 AND '
+        'length(result_row_sha256) = 64',
+        name='ck_placement_normalization_row_digests'),
+)
+sqlalchemy.Index('placement_normalization_rows_version_idx',
+                 placement_normalization_rows_table.c.service_name,
+                 placement_normalization_rows_table.c.version)
 
 # Durable cleanup inventory is intentionally separate from ``version_specs``.
 # Version rows are immutable deployment history, while cleanup intents track
@@ -278,6 +451,173 @@ reserved_fill_claims_table = sqlalchemy.Table(
     sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float),
 )
 
+# Durable protocol switch for the reserved-fill broker.  Revision 035 starts
+# this singleton at v1; protocol v2 is activated only by an explicit operator
+# action after every broker process has been replaced.  Keeping the rollout
+# proof beside the switch makes the transition auditable and prevents a
+# multi-context service spec from implicitly changing the database protocol.
+reserved_fill_protocol_state_table = sqlalchemy.Table(
+    'reserved_fill_protocol_state',
+    Base.metadata,
+    sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column('protocol_version',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='1'),
+    # Global allocation fence for protocol-v2 claim-set incarnations.  It is
+    # deliberately owned by the never-deleted singleton instead of a service
+    # row, so disabling or recreating a same-name service cannot reuse a
+    # generation carried by an old round or queued launch decision.
+    sqlalchemy.Column('claim_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('image_digest', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('deployment_generation',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('deployment_uid', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('pod_inventory_count',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('pod_inventory_sha256',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('changed_at',
+                      sqlalchemy.Float,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.CheckConstraint('id = 1',
+                               name='ck_reserved_fill_protocol_singleton'),
+    sqlalchemy.CheckConstraint('protocol_version IN (1, 2)',
+                               name='ck_reserved_fill_protocol_version'),
+    sqlalchemy.CheckConstraint('claim_generation >= 0',
+                               name='ck_reserved_fill_claim_generation'),
+    sqlalchemy.CheckConstraint(
+        "((image_digest IS NULL AND deployment_generation IS NULL AND "
+        "deployment_uid IS NULL AND pod_inventory_count IS NULL AND "
+        "pod_inventory_sha256 IS NULL) OR "
+        "(image_digest IS NOT NULL AND deployment_generation IS NOT NULL "
+        "AND deployment_uid IS NOT NULL AND pod_inventory_count IS NOT NULL "
+        "AND pod_inventory_sha256 IS NOT NULL))",
+        name='ck_reserved_fill_protocol_proof_all_or_none'),
+    sqlalchemy.CheckConstraint(
+        'protocol_version <> 2 OR image_digest IS NOT NULL',
+        name='ck_reserved_fill_protocol_v2_has_proof'),
+    sqlalchemy.CheckConstraint(
+        "image_digest IS NULL OR (length(image_digest) = 71 AND "
+        "substr(image_digest, 1, 7) = 'sha256:')",
+        name='ck_reserved_fill_protocol_image_digest'),
+    sqlalchemy.CheckConstraint(
+        'deployment_generation IS NULL OR '
+        'length(deployment_generation) > 0',
+        name='ck_reserved_fill_protocol_deployment_generation'),
+    sqlalchemy.CheckConstraint(
+        'deployment_uid IS NULL OR length(deployment_uid) > 0',
+        name='ck_reserved_fill_protocol_deployment_uid'),
+    sqlalchemy.CheckConstraint(
+        'pod_inventory_count IS NULL OR pod_inventory_count > 0',
+        name='ck_reserved_fill_protocol_pod_inventory_count'),
+    sqlalchemy.CheckConstraint(
+        'pod_inventory_sha256 IS NULL OR '
+        'length(pod_inventory_sha256) = 64',
+        name='ck_reserved_fill_protocol_pod_inventory_sha256'),
+)
+
+# One authoritative marker per service.  The normalized edge rows below are
+# consumable only when all rows match this generation and edge_count.  A
+# generation-zero migration_shadow is deliberately inert: v1 reads the legacy
+# row, while v2 fails closed until the owning controller atomically adopts it.
+reserved_fill_service_claim_sets_table = sqlalchemy.Table(
+    'reserved_fill_service_claim_sets',
+    Base.metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('claim_set_state',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='migration_shadow'),
+    sqlalchemy.Column('generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('edge_count',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('semantic_hash', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('global_headroom',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('utilization_ceiling',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('utilization_state', sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('heartbeat_ts',
+                      sqlalchemy.Float,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.CheckConstraint(
+        "claim_set_state IN ('migration_shadow', 'authoritative_v2')",
+        name='ck_reserved_fill_claim_set_state'),
+    sqlalchemy.CheckConstraint('generation >= 0',
+                               name='ck_reserved_fill_claim_set_generation'),
+    sqlalchemy.CheckConstraint('edge_count >= 0',
+                               name='ck_reserved_fill_claim_set_edge_count'),
+    sqlalchemy.CheckConstraint(
+        'global_headroom IS NULL OR global_headroom >= 0',
+        name='ck_reserved_fill_claim_set_headroom'),
+    sqlalchemy.CheckConstraint(
+        'utilization_ceiling IS NULL OR utilization_ceiling >= 0',
+        name='ck_reserved_fill_claim_set_utilization'),
+)
+
+# Protocol-v2 normalized claim edges.  ``pool_key`` is the versioned physical
+# UID key used by v2 rounds; ``legacy_pool_key`` retains the context-based v1
+# identity used only by the stable rollback projection.  Activity columns are
+# retained for a lossless migration shadow but authoritative v2 writers keep
+# them NULL: the one utilization governor lives on the service-set row.
+reserved_fill_pool_claims_table = sqlalchemy.Table(
+    'reserved_fill_pool_claims',
+    Base.metadata,
+    sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('pool_key', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('legacy_pool_key', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pool_position', sqlalchemy.Integer, nullable=False),
+    sqlalchemy.Column('access_context', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('physical_cluster_uid',
+                      sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('accelerator_names', sqlalchemy.Text,
+                      server_default=None),
+    sqlalchemy.Column('service_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False),
+    sqlalchemy.Column('weight', sqlalchemy.Float),
+    sqlalchemy.Column('floor_replicas', sqlalchemy.Integer),
+    sqlalchemy.Column('gpus_per_replica', sqlalchemy.Integer),
+    sqlalchemy.Column('holdings_fill', sqlalchemy.Integer),
+    sqlalchemy.Column('effective_cap', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('launchable', sqlalchemy.Integer, server_default='1'),
+    sqlalchemy.Column('demonstrated_need',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('boot_hold', sqlalchemy.Integer, server_default=None),
+    sqlalchemy.Column('activity_ts', sqlalchemy.Float, server_default=None),
+    sqlalchemy.Column('heartbeat_ts', sqlalchemy.Float, nullable=False),
+    sqlalchemy.CheckConstraint('pool_position >= 0',
+                               name='ck_reserved_fill_pool_position'),
+    sqlalchemy.CheckConstraint('service_generation >= 0',
+                               name='ck_reserved_fill_pool_generation'),
+    sqlalchemy.CheckConstraint('effective_cap IS NULL OR effective_cap >= 0',
+                               name='ck_reserved_fill_pool_effective_cap'),
+)
+sqlalchemy.Index('reserved_fill_pool_claims_pool_idx',
+                 reserved_fill_pool_claims_table.c.pool_key)
+sqlalchemy.Index('reserved_fill_pool_claims_service_generation_idx',
+                 reserved_fill_pool_claims_table.c.service_name,
+                 reserved_fill_pool_claims_table.c.service_generation)
+
 # Latest published broker round per pool (overwritten in place each round).
 # Grants/feeds are the authoritative allocation record readers act on; the
 # remaining columns are the broker's cross-round memory (damping baselines,
@@ -295,11 +635,27 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     # against it (see reserved_capacity_broker.current_epoch) -- per-pool,
     # so one pool's grant churn never fences another pool's launches.
     sqlalchemy.Column('epoch', sqlalchemy.Integer),
+    # Protocol and per-service generations are part of the grant fence.  Old
+    # rows and old writers resolve to protocol v1 with an empty generation map.
+    sqlalchemy.Column('protocol_version',
+                      sqlalchemy.Integer,
+                      nullable=False,
+                      server_default='1'),
+    sqlalchemy.Column('claim_generations',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='{}'),
     # JSON {service: grant}; null grant = single-claimant fast path (no
     # ceiling, #108 identity).
     sqlalchemy.Column('grants', sqlalchemy.Text),
     # JSON {service: feed}; sum(feeds) <= observed free by construction.
     sqlalchemy.Column('feeds', sqlalchemy.Text),
+    # JSON {service: {accelerator: feed}} when the pool query returned an
+    # exact-card split.  NULL preserves compatibility with rounds written
+    # before exact-card publication (or providers that cannot report it).
+    # For a non-NULL value, each service's card counts sum to at most its
+    # aggregate feed and pool-wide card counts never exceed the measurement.
+    sqlalchemy.Column('feed_by_accelerator', sqlalchemy.Text),
     # JSON {service: raw undamped entitlement} of THIS round; next round's
     # damping baseline (a move must persist across two rounds to apply).
     sqlalchemy.Column('raw_grants', sqlalchemy.Text),
@@ -353,15 +709,17 @@ reserved_fill_rounds_table = sqlalchemy.Table(
     sqlalchemy.Column('fence_pending', sqlalchemy.Integer, server_default='0'),
 )
 
-# Singleton lease row (id=1). The epoch only moves forward; it is the round
+# Singleton lease row (id=1). The epoch only moves forward. It is the round
 # writer's OWNERSHIP TOKEN and the round's ENTRY POINT: CAS-advanced (and
 # committed) BEFORE the writer reads any claim/round state and before its
-# slow cluster query, and the publish only lands while the lease still
-# holds that exact token -- so everything a successful publish persisted
-# was read AFTER the token (see acquire_reserved_fill_lease_token). A
-# replacement writer (e.g. after the original's advisory-lock session died
-# mid-query) advances it again, so the stale writer's publish fails and
-# its observation is discarded.
+# slow cluster query, and the publish only lands while the lease still holds
+# that exact token. Fill persists also advance it on the exact advisory-lock
+# session and validate it in the replica insert transaction. A replacement
+# round advances the same epoch before scanning, so silent advisory-session
+# loss cannot place a stale persist inside the scan-to-publish window (see
+# advance_reserved_fill_persist_token and acquire_reserved_fill_lease_token).
+# A replacement writer after a lost round likewise advances it, so the stale
+# publish fails and its observation is discarded.
 # Fencing for actuation is the per-pool round epoch above.
 reserved_fill_lease_table = sqlalchemy.Table(
     'reserved_fill_lease',
@@ -463,7 +821,7 @@ def create_table(engine: sqlalchemy.engine.Engine):
     migration_utils.safe_alembic_upgrade(
         engine,
         migration_utils.SERVE_DB_NAME,
-        migration_utils.SERVE_VERSION,
+        migration_utils.serve_target_version(engine),
         mode=migration_utils.configured_migration_mode())
 
 

@@ -8,6 +8,7 @@ from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.provision import capacity_cache
+from sky.serve import maintenance
 from sky.serve import placement_history
 from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
@@ -139,6 +140,12 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> None:
         sky.exceptions.ClusterNotUpError: if the sky sere controller is not up.
         RuntimeError: if failed to terminate the replica.
     """
+    if maintenance.is_controller_hold_active():
+        identity = serve_state.get_service_mode_and_hash(service_name)
+        if identity is None or not identity[0]:
+            raise RuntimeError(
+                'SkyServe replica termination is disabled while the server '
+                'controller hold is active.')
     handle = backend_utils.is_controller_accessible(
         controller=controller_utils.Controllers.SKY_SERVE_CONTROLLER,
         stopped_message=

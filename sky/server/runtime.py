@@ -24,7 +24,7 @@ from sky import global_user_state
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
-from sky.serve import auth_tokens
+from sky.serve import serve_state
 from sky.server import clean_env as clean_env_module
 from sky.server import config as server_config
 from sky.server import constants as server_constants
@@ -35,13 +35,14 @@ from sky.server import metrics
 from sky.server import plugins
 from sky.server.blob import blob_storage as bs
 from sky.server.events import store as operational_event_store
-from sky.server.requests import authority_worker_retirement
+from sky.server.requests import cutover as request_cutover
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import registry as request_registry
 from sky.server.requests import request_names
 from sky.server.requests import requests as requests_lib
+from sky.server.requests import storage as request_storage
 from sky.skylet import constants
 from sky.usage import usage_lib
 from sky.users import permission
@@ -54,10 +55,12 @@ from sky.utils.db import db_utils
 logger = sky_logging.init_logger(__name__)
 
 _SERVER_USER_HASH_KEY = 'server_user_hash'
-_ROLE_CHOICES = ('all', 'api', 'executor', 'controller', 'authority-worker')
+_ROLE_CHOICES = ('all', 'api', 'executor', 'controller')
 _SINGLETON_PREFIX = 'skypilot:api-server-runtime:v1'
 _CONTROLLER_LEADERSHIP_POLL_SECONDS = 2
 _CONTROLLER_LEADERSHIP_PROBE_SECONDS = 2
+_METRICS_STARTUP_TIMEOUT_SECONDS = 30
+_METRICS_STARTUP_POLL_SECONDS = 0.01
 _CONTROLLER_CUTOVER_QUIESCENCE_ENV_VAR = (
     'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS')
 
@@ -91,6 +94,32 @@ def _uses_postgres_requests() -> bool:
             request_postgres.POSTGRES_REQUEST_BACKEND)
 
 
+def _guard_completed_request_store_cutover() -> None:
+    """Fail closed if a one-way cutover resolves back to stale storage."""
+    backend = request_storage.get_request_backend()
+    request_cutover.require_completed_cutover_backend(
+        postgres_configured=_uses_postgres_requests(),
+        postgres_backend=type(backend)
+        is request_postgres.PostgresRequestBackend,
+        sqlite_backend=type(backend) is requests_lib.SqliteRequestBackend)
+
+
+def _guard_active_reserved_fill_protocol(role: str) -> None:
+    """Require the prepared backend invariant after protocol-v2 activation."""
+    if role not in ('all', 'api', 'controller', 'executor'):
+        return
+    state = serve_state.get_reserved_fill_protocol_state()
+    if int(state['protocol_version']) != 2:
+        return
+    if not request_postgres.execution_quiescence_backend_guard_enabled():
+        raise RuntimeError(
+            'Reserved-fill protocol v2 is active, but execution-quiescence '
+            'backend enforcement is disabled. Demote protocol v2 before '
+            'disabling the guard.')
+    request_postgres.require_builtin_execution_quiescence_backends(
+        required=True)
+
+
 def _controller_cutover_quiescence_seconds() -> float:
     value = os.environ.get(_CONTROLLER_CUTOVER_QUIESCENCE_ENV_VAR, '70')
     try:
@@ -121,11 +150,13 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
     logger.info(f'Initializing SkyPilot {role} role')
     plugins.load_plugins(
         plugins.ExtensionContext(context=plugins.PluginContext.MAIN))
+    _guard_completed_request_store_cutover()
     usage_lib.maybe_show_privacy_policy()
 
     db_utils.set_max_connections(1)
     logger.info('Initializing database engines')
     database_migrations.initialize_central_databases()
+    _guard_active_reserved_fill_protocol(role)
     logger.info('Database engines initialized')
 
     requests_recovered = False
@@ -232,6 +263,9 @@ class _BackgroundLoop:
     def __init__(self) -> None:
         self.loop = uvloop.new_event_loop()
         self._tasks: list[asyncio.Task] = []
+        self._graceful_shutdown_hooks: list[Callable[[], Coroutine[Any, Any,
+                                                                   Any]]] = []
+        self._stopping = threading.Event()
         self._thread = threading.Thread(target=self._run,
                                         name='server-background-loop',
                                         daemon=True)
@@ -240,8 +274,19 @@ class _BackgroundLoop:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def create_task(self, coroutine: Coroutine[Any, Any, Any]) -> None:
-        self._tasks.append(self.loop.create_task(coroutine))
+    def create_task(self, coroutine: Coroutine[Any, Any,
+                                               Any]) -> asyncio.Task[Any]:
+        task = self.loop.create_task(coroutine)
+        self._tasks.append(task)
+        return task
+
+    @property
+    def is_stopping(self) -> bool:
+        return self._stopping.is_set()
+
+    def add_graceful_shutdown_hook(
+            self, hook: Callable[[], Coroutine[Any, Any, Any]]) -> None:
+        self._graceful_shutdown_hooks.append(hook)
 
     def start(self) -> None:
         self._thread.start()
@@ -254,9 +299,18 @@ class _BackgroundLoop:
         return future.result(timeout=timeout)
 
     def stop(self) -> None:
+        self._stopping.set()
         if not self._thread.is_alive():
             self.loop.close()
             return
+
+        for hook in self._graceful_shutdown_hooks:
+            future = asyncio.run_coroutine_threadsafe(hook(), self.loop)
+            try:
+                future.result(timeout=30)
+            except Exception as e:  # pylint: disable=broad-except
+                future.cancel()
+                logger.warning(f'Background shutdown hook was incomplete: {e}')
 
         async def cancel_tasks() -> None:
             for task in self._tasks:
@@ -283,29 +337,111 @@ def _singleton_task(
     return task_factory()
 
 
-def _start_background_loop(role: str, host: str,
-                           metrics_port: int) -> _BackgroundLoop:
+def _metrics_enabled() -> bool:
+    return (os.environ.get(constants.ENV_VAR_SERVER_METRICS_ENABLED,
+                           'false').lower() == 'true')
+
+
+async def _serve_metrics_server(metrics_server: Any) -> None:
+    """Keep uvicorn BaseExceptions contained in the background loop task."""
+    try:
+        await metrics_server.serve()
+    except asyncio.CancelledError:
+        raise
+    except BaseException as e:
+        # uvicorn raises SystemExit when its listener cannot bind. Let the
+        # foreground startup barrier surface that as an ordinary role startup
+        # failure instead of silently terminating only the background thread.
+        raise RuntimeError('The metrics server failed.') from e
+
+
+def _metrics_task_failure(task: asyncio.Task[Any]) -> BaseException:
+    if task.cancelled():
+        return RuntimeError(
+            'The metrics server task was cancelled unexpectedly.')
+    failure = task.exception()
+    if failure is not None:
+        return failure
+    return RuntimeError('The metrics server stopped unexpectedly.')
+
+
+def _start_metrics_background_loop(role: str, host: str,
+                                   metrics_port: int) -> _BackgroundLoop | None:
+    """Serve metrics owned by one API-server role pod."""
+    if role not in ('all', 'api', 'executor', 'controller'):
+        return None
+    if not _metrics_enabled():
+        return None
+    if (role in ('executor', 'controller') and
+            not os.environ.get('PROMETHEUS_MULTIPROC_DIR')):
+        raise RuntimeError(
+            f'The {role} metrics server requires '
+            'PROMETHEUS_MULTIPROC_DIR so child-process metrics are visible.')
+
     background = _BackgroundLoop()
-    if role in ('all', 'api') and os.environ.get(
-            constants.ENV_VAR_SERVER_METRICS_ENABLED):
+    # Initialize the optional managed-jobs shared-state collector only in its
+    # historical API/all owner. metrics.metrics() applies the same role gate
+    # to all built-in and plugin custom collectors. Process-local metrics,
+    # including controller children, still come from every role's pod-local
+    # multiprocess registry.
+    if role in ('all', 'api'):
         metrics.maybe_register_managed_jobs_collector()
-        metrics_server = metrics.build_metrics_server(host, metrics_port)
-        background.create_task(metrics_server.serve())
-        background.create_task(metrics.multiproc_reaper_daemon())
+    metrics_server = metrics.build_metrics_server(host, metrics_port)
+    serve_task = background.create_task(_serve_metrics_server(metrics_server))
+    background.create_task(metrics.multiproc_reaper_daemon())
 
-    if (role in ('all', 'api') and
-            auth_tokens.is_resource_action_authority_enabled()):
-        if not _uses_postgres_requests():
+    async def stop_metrics_server() -> None:
+        metrics_server.should_exit = True
+        await asyncio.gather(serve_task, return_exceptions=True)
+
+    background.add_graceful_shutdown_hook(stop_metrics_server)
+    startup_complete = threading.Event()
+    server_failed = threading.Event()
+    failure_holder: list[BaseException] = []
+
+    def metrics_server_done(task: asyncio.Task[Any]) -> None:
+        failure = _metrics_task_failure(task)
+        failure_holder.append(failure)
+        server_failed.set()
+        if not startup_complete.is_set() or background.is_stopping:
+            return
+        logger.error(
+            'Metrics server stopped after startup; terminating the role.',
+            exc_info=(type(failure), failure, failure.__traceback__))
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except OSError:
+            logger.exception('Failed to terminate the role after metrics '
+                             'server failure.')
+
+    serve_task.add_done_callback(metrics_server_done)
+    try:
+        background.start()
+        deadline = time.monotonic() + _METRICS_STARTUP_TIMEOUT_SECONDS
+        while not metrics_server.started:
+            if server_failed.wait(_METRICS_STARTUP_POLL_SECONDS):
+                failure = failure_holder[0]
+                raise RuntimeError(
+                    f'The {role} metrics server failed to become available '
+                    f'on {host}:{metrics_port}.') from failure
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f'Timed out waiting for the {role} metrics server on '
+                    f'{host}:{metrics_port}.')
+        startup_complete.set()
+        if server_failed.is_set():
+            failure = failure_holder[0]
             raise RuntimeError(
-                'Resource-action authority retirement requires the '
-                'PostgreSQL request backend.')
-        retirement_scope = (authority_worker_retirement.
-                            AuthorityWorkerRetirementScope.from_environment())
-        background.create_task(
-            _singleton_task(
-                retirement_scope.singleton_name,
-                authority_worker_retirement.retirement_verifier_daemon))
+                f'The {role} metrics server failed to remain available on '
+                f'{host}:{metrics_port}.') from failure
+    except Exception:
+        background.stop()
+        raise
+    return background
 
+
+def _start_background_loop(role: str) -> _BackgroundLoop:
+    background = _BackgroundLoop()
     if role in ('all', 'controller'):
         background.create_task(
             _singleton_task('requests-gc', requests_lib.requests_gc_daemon))
@@ -338,12 +474,8 @@ def _start_background_loop(role: str, host: str,
 class _RoleHealthServer:
     """Dependency-free role-supervisor liveness and readiness endpoint."""
 
-    def __init__(self,
-                 host: str,
-                 port: int,
-                 lease: request_postgres.ServerInstanceLease,
-                 *,
-                 bootstrap_ready: Callable[[], bool] | None = None) -> None:
+    def __init__(self, host: str, port: int,
+                 lease: request_postgres.ServerInstanceLease) -> None:
         # Imports are deferred so API-only and local compatibility processes do
         # not pay for another HTTP-server stack.
         # pylint: disable=import-outside-toplevel
@@ -357,10 +489,6 @@ class _RoleHealthServer:
             def do_GET(self) -> None:  # pylint: disable=invalid-name
                 if self.path == '/livez':
                     status = 200
-                elif self.path == '/bootstrapz' and bootstrap_ready is not None:
-                    status = 200 if (
-                        bootstrap_ready() and
-                        not request_postgres.role_is_draining()) else 503
                 elif self.path == '/readyz':
                     status = 200 if lease.is_locally_ready() else 503
                 else:
@@ -429,27 +557,6 @@ def _wait_for_executor_shutdown() -> None:
         signal.signal(signal.SIGINT, previous_int)
 
 
-def _wait_for_authority_shutdown(coordinator: Any) -> None:
-    """Wait for a signal while surfacing an immutable bootstrap failure."""
-    shutdown = threading.Event()
-
-    def request_shutdown(signum, frame) -> None:
-        del signum, frame
-        shutdown.set()
-
-    previous_term = signal.signal(signal.SIGTERM, request_shutdown)
-    previous_int = signal.signal(signal.SIGINT, request_shutdown)
-    try:
-        while not shutdown.wait(1):
-            failure = coordinator.failure
-            if failure is not None:
-                raise RuntimeError(
-                    'Authority-worker bootstrap failed closed.') from failure
-    finally:
-        signal.signal(signal.SIGTERM, previous_term)
-        signal.signal(signal.SIGINT, previous_int)
-
-
 def _request_worker_shutdown(workers: list[executor.RequestWorker],
                              *,
                              terminate_children: bool = False) -> None:
@@ -493,13 +600,6 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
     if state.instance_lease is None:
         raise RuntimeError(
             'The controller role requires PostgreSQL instance leases.')
-    if auth_tokens.is_resource_action_authority_enabled():
-        # Validate before the supervisor can publish standby or leader
-        # readiness. Per-service children and every preflight use repeat the
-        # check so projected Secret rotations remain fail-closed.
-        auth_tokens.validate_resource_action_preflight_auth_token_isolation(
-            required=True)
-
     lease = request_postgres.ControllerLeaderLease(
         state.instance_lease.instance_id)
     health_server = _RoleHealthServer(args.host, args.role_health_port,
@@ -608,8 +708,7 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
             execution_classes=frozenset(
                 {request_registry.ExecutionClass.CONTROLLER}),
             controller_generation=generation)
-        background = _start_background_loop('controller', args.host,
-                                            args.metrics_port)
+        background = _start_background_loop('controller')
         background.run(_initialize_controller_requests())
 
         # The existing managed-jobs consolidation lock and SkyServe lifecycle
@@ -721,121 +820,20 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
         raise RuntimeError('A legacy controller consumer reappeared.')
 
 
-def _load_authority_static_manifest() -> Any:
-    # Imported only by the dedicated preflight-only role.  Ordinary API and
-    # executor processes must not load its artifact verifier.
-    # pylint: disable=import-outside-toplevel
-    from sky.serve import resource_action_provider_preflight
-    return (resource_action_provider_preflight.
-            load_provider_authority_worker_static_evidence_v1())
-
-
-def _build_authority_bootstrap_coordinator(manifest: Any,
-                                           pod_identity: Any) -> Any:
-    # pylint: disable=import-outside-toplevel
-    from sky.server.requests import authority_worker_bootstrap
-    return authority_worker_bootstrap.build_default_coordinator(
-        manifest, pod_identity)
-
-
-def _run_authority_preflight_role(state: RuntimeState,
-                                  args: argparse.Namespace) -> None:
-    """Run P2a listeners/bootstrap without constructing a request executor."""
-    if state.instance_lease is None:
-        raise RuntimeError(
-            'The authority-worker role requires PostgreSQL instance leases.')
-    # pylint: disable=import-outside-toplevel
-    from sky.serve import resource_action_provider_preflight
-    from sky.server import authority_preflight
-    from sky.server.requests import authority_worker_bootstrap
-
-    pod_identity = (authority_worker_bootstrap.AuthorityWorkerPodIdentity.
-                    from_environment())
-    if state.instance_lease.instance_id != pod_identity.uid:
-        raise RuntimeError(
-            'Authority-worker instance lease differs from the Pod UID.')
-    coordinator_holder: list[Any | None] = [None]
-
-    def accepted_manifest() -> Any | None:
-        coordinator = coordinator_holder[0]
-        return None if coordinator is None else coordinator.accepted_manifest()
-
-    def clear_acceptance() -> None:
-        coordinator = coordinator_holder[0]
-        if coordinator is not None:
-            coordinator.clear_acceptance()
-
-    evaluator = (resource_action_provider_preflight.
-                 InitialProviderPreflightEvaluator(accepted_manifest))
-    preflight_server = authority_preflight.AuthorityPreflightServer(
-        args.host,
-        args.authority_preflight_port,
-        authority_preflight.authority_preflight_service_dns(),
-        evaluator,
-        on_transport_invalid=clear_acceptance)
-    listeners_ready = threading.Event()
-    static_evidence_ready = threading.Event()
-    health_server = _RoleHealthServer(
-        args.host,
-        args.role_health_port,
-        state.instance_lease,
-        bootstrap_ready=lambda:
-        (listeners_ready.is_set() and static_evidence_ready.is_set() and
-         preflight_server.is_transport_ready()))
-    health_started = False
-    preflight_started = False
-    coordinator = None
-    coordinator_started = False
-    try:
-        # Both constructors bind before either endpoint can report bootstrap
-        # readiness.  Registration starts only after both serving threads exist.
-        health_server.start()
-        health_started = True
-        preflight_server.start()
-        preflight_started = True
-        listeners_ready.set()
-        state.instance_lease.set_ready(
-            False, health_detail={'phase': 'preflight-only'})
-        manifest = _load_authority_static_manifest()
-        # Listener binding intentionally precedes static verification, but the
-        # bootstrap probe must not open until the complete manifest and its
-        # installed/external evidence have been verified.
-        static_evidence_ready.set()
-        coordinator = _build_authority_bootstrap_coordinator(
-            manifest, pod_identity)
-        coordinator_holder[0] = coordinator
-        coordinator.start()
-        coordinator_started = True
-        _wait_for_authority_shutdown(coordinator)
-    finally:
-        # Close admission/readiness before draining transport and evidence work.
-        listeners_ready.clear()
-        static_evidence_ready.clear()
-        clear_acceptance()
-        if preflight_started:
-            preflight_server.stop()
-        if coordinator_started and coordinator is not None:
-            coordinator.stop()
-        if health_started:
-            health_server.stop()
-
-
 def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
     """Start the selected role and unwind every owned resource on exit."""
+    metrics_background: _BackgroundLoop | None = None
     background: _BackgroundLoop | None = None
     queue_server = None
     workers: list[executor.RequestWorker] = []
     health_server = None
     try:
+        metrics_background = _start_metrics_background_loop(
+            state.role, args.host, args.metrics_port)
         if state.role == 'controller':
             _run_controller_role(state, args)
             return
-        if state.role == 'authority-worker':
-            _run_authority_preflight_role(state, args)
-            return
-
-        background = _start_background_loop(state.role, args.host,
-                                            args.metrics_port)
+        background = _start_background_loop(state.role)
         if state.role in ('all', 'executor'):
             clean_env_module.capture_clean_server_env()
             execution_classes = None
@@ -888,8 +886,14 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
             _stop_queue_server(queue_server)
             if background is not None:
                 background.stop()
-        for plugin in plugins.get_plugins():
-            plugin.shutdown()
+        # Stop collection before plugin teardown: API-owned custom collectors
+        # must not race a plugin while its backing state is closing.
+        try:
+            if metrics_background is not None:
+                metrics_background.stop()
+        finally:
+            for plugin in plugins.get_plugins():
+                plugin.shutdown()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -903,7 +907,6 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=os.environ.get(
                             request_postgres.SERVER_ROLE_ENV_VAR, 'all'))
     parser.add_argument('--role-health-port', default=46581, type=int)
-    parser.add_argument('--authority-preflight-port', default=46583, type=int)
     return parser
 
 
@@ -917,16 +920,11 @@ def main() -> None:
     os.environ[request_postgres.SERVER_ROLE_ENV_VAR] = args.role
     os.environ.setdefault(constants.ENV_VAR_IS_SKYPILOT_SERVER, 'true')
 
-    if args.role == 'authority-worker':
-        # The chart projects exactly the Pod name/namespace/UID.  Derive the
-        # durable server-instance identity here instead of adding a fourth
-        # downward-API environment binding.
-        # pylint: disable=import-outside-toplevel
-        from sky.server.requests import authority_worker_bootstrap
-        authority_worker_bootstrap.configure_server_instance_id_from_pod_uid()
-
     if args.port == args.metrics_port and args.role in ('all', 'api'):
         raise ValueError('port and metrics-port cannot be the same')
+    if (args.role in ('executor', 'controller') and _metrics_enabled() and
+            args.role_health_port == args.metrics_port):
+        raise ValueError('role-health-port and metrics-port cannot be the same')
     if args.role != 'all' and not _uses_postgres_requests():
         raise RuntimeError(
             f'The {args.role} role requires '
@@ -934,11 +932,6 @@ def main() -> None:
     if args.role in ('all',
                      'api') and not common_utils.is_port_available(args.port):
         raise RuntimeError(f'Port {args.port} is not available')
-    if (args.role == 'authority-worker' and
-            args.role_health_port == args.authority_preflight_port):
-        raise ValueError('role-health-port and authority-preflight-port cannot '
-                         'be the same')
-
     # Keep timestamped supervisor logs for every role, including executors
     # without Uvicorn.
     # pylint: disable=import-outside-toplevel

@@ -15,6 +15,30 @@ import sqlalchemy
 from sky.utils.db import db_utils
 
 
+def test_add_all_tables_follows_foreign_key_topology():
+    """A late-declared parent must exist before its child is created."""
+    metadata = sqlalchemy.MetaData()
+    child = sqlalchemy.Table(
+        'child', metadata,
+        sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True),
+        sqlalchemy.Column('parent_id', sqlalchemy.Integer,
+                          sqlalchemy.ForeignKey('parent.id')))
+    parent = sqlalchemy.Table(
+        'parent', metadata,
+        sqlalchemy.Column('id', sqlalchemy.Integer, primary_key=True))
+    creation_order = []
+    for table in (child, parent):
+        sqlalchemy.event.listen(
+            table, 'before_create', lambda target, _connection, **_kwargs:
+            creation_order.append(target.name))
+    engine = sqlalchemy.create_engine('sqlite:///:memory:')
+
+    db_utils.add_all_tables_to_db_sqlalchemy(metadata, engine)
+    db_utils.add_all_tables_to_db_sqlalchemy(metadata, engine)
+
+    assert creation_order == ['parent', 'child']
+
+
 class TestSkyRuntimeDirEnvVar:
     """Test that db_utils correctly uses SKY_RUNTIME_DIR for database paths."""
 
@@ -49,6 +73,16 @@ class TestSkyRuntimeDirEnvVar:
             db_path = call_args[0][0]
             expected_path = str(tmp_path / '.sky/test.db')
             assert expected_path in db_path
+
+
+@pytest.mark.asyncio
+async def test_database_manager_async_initialization_fails_without_engine(
+        monkeypatch):
+    manager = db_utils.DatabaseManager('test', lambda _: None)
+    monkeypatch.setattr(db_utils, 'get_engine', lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match='completed without an engine'):
+        await manager.get_async_engine()
 
 
 @pytest_asyncio.fixture
@@ -533,7 +567,6 @@ class TestGetEngine:
             'api',
             'executor',
             'controller',
-            'authority-worker',
             'managed-job-controller',
             'serve-controller',
             'unknown',
@@ -544,7 +577,6 @@ class TestGetEngine:
                 'api',
                 'executor',
                 'controller',
-                'authority-worker',
             }))
         assert db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES == (
             frozenset({
@@ -557,7 +589,7 @@ class TestGetEngine:
             {'sync', 'async'})
         assert (len(db_utils._POSTGRES_CONNECTION_METRIC_PROCESS_ROLES) *
                 len(db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES) *
-                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 64)
+                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 56)
 
     def test_postgres_connection_metric_process_role_is_write_once(
             self, monkeypatch):

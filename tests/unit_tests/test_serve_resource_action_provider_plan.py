@@ -5,9 +5,7 @@
 import builtins
 import copy
 import dataclasses
-import hashlib
 import operator
-from pathlib import Path
 
 import pytest
 
@@ -15,9 +13,6 @@ from sky.serve import resource_actions as actions
 
 _CLUSTER_UUID = '11111111-1111-4111-8111-111111111111'
 _REPLICA_UUID = '22222222-2222-4222-8222-222222222222'
-_RENDERER_ARTIFACT_ROOT = (Path(__file__).resolve().parents[2] / 'sky' /
-                           'serve' / 'resource_action_artifacts' /
-                           'kubernetes_renderer_v1')
 _PREREQUISITE_ROLE_KINDS = (
     ('authority_release_namespace', 'Namespace'),
     ('target_namespace', 'Namespace'),
@@ -483,12 +478,37 @@ def _renderer_requested_semantic(role: str, request_body: dict) -> dict:
 
 
 def _renderer_artifact_ref(role: str) -> dict:
-    path = _RENDERER_ARTIFACT_ROOT / f'{role}.json'
-    raw = path.read_bytes()
+    # These are immutable fixture commitments for persisted V1 capsules.  The
+    # retired renderer artifacts are intentionally absent from new packages,
+    # but historical capsule parsing must retain their exact preimages.
+    artifacts = {
+        'admitted_object_normalization':
+            (3033,
+             '3ab35d775ff1324587c1c10854d5de8572ce127a8541dc08d85349be06e8f850'
+            ),
+        'binding_schema':
+            (4520,
+             '2c64a3ed8ee6ac3108fbf13d509ef348c73937d60473b5f697b24ee077611aef'
+            ),
+        'config_access_inventory':
+            (23710,
+             '19901e8e0491a4e9f957f7ff2a1244fc1baff132c37015c9e8e726af2d538f13'
+            ),
+        'node_fragment':
+            (1632,
+             '2000b68c74ccb6710e43b03963cf31f40c35ec879743977a3e3ba6ff3baa43db'
+            ),
+        'outer_template':
+            (972,
+             '769039b9c25956833032fb670148797c3ba74cd5a12253faf1e99443a27444b8'
+            ),
+    }
+    byte_size, sha256 = artifacts[role]
     return {
-        'repo_path': str(path.relative_to(_RENDERER_ARTIFACT_ROOT.parents[3])),
-        'byte_size': len(raw),
-        'sha256': hashlib.sha256(raw).hexdigest(),
+        'repo_path': ('sky/serve/resource_action_artifacts/'
+                      f'kubernetes_renderer_v1/{role}.json'),
+        'byte_size': byte_size,
+        'sha256': sha256,
     }
 
 

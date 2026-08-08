@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: resource_action_authority_removed_values_test
+templates:
+  - templates/api-deployment.yaml
+tests:
+  - it: should reject a persisted disabled retired authority value
+    set:
+      resourceActions.authorityWorker.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker has been removed; delete the stored resourceActions value before upgrading
+
+  - it: should reject a persisted enabled retired authority value
+    set:
+      resourceActions.authorityWorker.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker has been removed; delete the stored resourceActions value before upgrading

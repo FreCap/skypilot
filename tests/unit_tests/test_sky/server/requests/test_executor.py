@@ -8,6 +8,7 @@ import functools
 import os
 import pathlib
 import queue as queue_lib
+import signal
 import threading
 import time
 from unittest import mock
@@ -209,6 +210,72 @@ def test_task_monitor_heartbeats_durable_claim(monkeypatch):
     assert claim.execution_generation == item.execution_generation
     assert claim.claim_token == item.claim_token
     assert executor.request_storage.active_execution_claim() is None
+
+
+def test_task_monitor_waits_for_normal_future_before_quiescence(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = None
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(worker, '_mark_executor_free', mock.Mock())
+    future_started = threading.Event()
+    future_release = threading.Event()
+
+    class BlockingFuture:
+
+        def result(self):
+            future_started.set()
+            assert future_release.wait(timeout=2)
+
+    item = executor.queue_base.QueueItem('blocked-future',
+                                         False,
+                                         False,
+                                         execution_generation=7,
+                                         claim_token='claim-token')
+    monitor = threading.Thread(target=worker.handle_task_result,
+                               args=(BlockingFuture(), item))
+    monitor.start()
+    assert future_started.wait(timeout=1)
+    backend.acknowledge_execution_quiescence.assert_not_called()
+
+    future_release.set()
+    monitor.join(timeout=2)
+    assert not monitor.is_alive()
+    backend.acknowledge_execution_quiescence.assert_called_once_with(
+        executor.request_storage.ExecutionClaim('blocked-future', 7,
+                                                'claim-token'))
+
+
+def test_task_monitor_does_not_quiesce_broken_process_pool(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = None
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(executor.api_requests, 'set_request_failed',
+                        mock.Mock())
+    monkeypatch.setattr(worker, '_mark_executor_free', mock.Mock())
+    future = concurrent.futures.Future()
+    future.set_exception(
+        concurrent.futures.process.BrokenProcessPool('pool failed'))
+    item = executor.queue_base.QueueItem('broken-future',
+                                         False,
+                                         False,
+                                         execution_generation=8,
+                                         claim_token='claim-token')
+
+    worker.handle_task_result(future, item)
+
+    backend.acknowledge_execution_quiescence.assert_not_called()
 
 
 @pytest.fixture()
@@ -1421,6 +1488,102 @@ async def test_request_worker_fails_nonretryable_broken_pool_request(
 
 
 @pytest.mark.asyncio
+async def test_durable_claim_is_not_requeued_after_broken_process_pool(
+        isolated_database, monkeypatch):
+    """A later generation must not mask an ambiguous claimed invocation."""
+    request_id = 'test-broken-pool-durable-claim'
+    request = requests_lib.Request(
+        request_id=request_id,
+        name='test-request',
+        entrypoint=_dummy_entrypoint_for_retry_test,
+        request_body=payloads.RequestBody(),
+        status=requests_lib.RequestStatus.RUNNING,
+        created_at=time.time(),
+        user_id='test-user',
+        retryable=True,
+    )
+    await requests_lib.create_if_not_exists_async(request)
+
+    request_queue = mock.Mock()
+    monkeypatch.setattr(executor, '_get_queue', lambda _: request_queue)
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    fut = concurrent.futures.Future()
+    fut.set_exception(
+        concurrent.futures.process.BrokenProcessPool('worker died'))
+    claimed = executor.queue_base.QueueItem(request_id,
+                                            False,
+                                            True,
+                                            execution_generation=7,
+                                            claim_token='exact-claim')
+
+    worker.handle_task_result(fut, claimed)
+
+    updated = requests_lib.get_request(request_id, fields=['status'])
+    assert updated is not None
+    assert updated.status == requests_lib.RequestStatus.FAILED
+    request_queue.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_durable_retry_parent_republishes_quiescence_before_waiting(
+        isolated_database, monkeypatch):
+    """A transient child receipt failure is repaired before retry handoff."""
+    request_id = 'test-durable-retry-quiescence-fallback'
+    request = requests_lib.Request(
+        request_id=request_id,
+        name='test-request',
+        entrypoint=_dummy_entrypoint_for_retry_test,
+        request_body=payloads.RequestBody(),
+        status=requests_lib.RequestStatus.RUNNING,
+        created_at=time.time(),
+        user_id='test-user',
+        retryable=True,
+    )
+    await requests_lib.create_if_not_exists_async(request)
+    request_queue = mock.Mock()
+    monkeypatch.setattr(executor, '_get_queue', lambda _: request_queue)
+    status_at_ack = []
+
+    def record_ack(_claim):
+        current = requests_lib.get_request(request_id, fields=['status'])
+        assert current is not None
+        status_at_ack.append(current.status)
+
+    acknowledge = mock.Mock(side_effect=record_ack)
+    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
+                        acknowledge)
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    fut = concurrent.futures.Future()
+    fut.set_exception(
+        exceptions.ExecutionRetryableError('retry after child receipt failed',
+                                           hint='retry safely',
+                                           retry_wait_seconds=0))
+    claimed = executor.queue_base.QueueItem(request_id,
+                                            False,
+                                            True,
+                                            execution_generation=7,
+                                            claim_token='exact-claim')
+
+    worker.handle_task_result(fut, claimed)
+
+    acknowledge.assert_called_once_with(
+        executor.request_storage.ExecutionClaim(request_id, 7, 'exact-claim'))
+    assert status_at_ack == [requests_lib.RequestStatus.RUNNING]
+    updated = requests_lib.get_request(request_id, fields=['status'])
+    assert updated is not None
+    assert updated.status == requests_lib.RequestStatus.WAITING
+    request_queue.put.assert_called_once_with(claimed)
+
+
+@pytest.mark.asyncio
 async def test_request_worker_does_not_requeue_cancelled_broken_pool_request(
         isolated_database, monkeypatch):
     """Cancellation must win over a concurrent broken-pool callback."""
@@ -2127,8 +2290,10 @@ def reset_sigterm_gate():
     import signal as _signal
     original_handler = _signal.getsignal(_signal.SIGTERM)
     executor._in_request_execution = False
+    executor._execution_cancellation_marker = None
     yield
     executor._in_request_execution = False
+    executor._execution_cancellation_marker = None
     _signal.signal(_signal.SIGTERM, original_handler)
 
 
@@ -2137,6 +2302,9 @@ def test_gated_sigterm_handler_raises_when_active(reset_sigterm_gate):
     executor._in_request_execution = True
     with pytest.raises(KeyboardInterrupt):
         executor._gated_sigterm_handler(_signal.SIGTERM, None)
+    assert executor._in_request_execution is False
+    # Duplicate cancellation delivery during cleanup is ignored.
+    executor._gated_sigterm_handler(_signal.SIGTERM, None)
 
 
 def test_gated_sigterm_handler_swallows_when_idle(reset_sigterm_gate):
@@ -2164,8 +2332,173 @@ async def test_wrapper_clears_in_request_execution_after_success(
     assert executor._in_request_execution is False
 
 
+@pytest.mark.asyncio
+async def test_wrapper_records_quiescence_after_effect_cleanup(
+        isolated_database, reset_sigterm_gate, monkeypatch):
+    req = requests_lib.Request(request_id='wrapper-quiescence',
+                               name='test',
+                               entrypoint=_gate_clears_after_success_entrypoint,
+                               request_body=payloads.RequestBody(),
+                               status=requests_lib.RequestStatus.PENDING,
+                               created_at=0.0,
+                               user_id='test-user')
+    assert await requests_lib.create_if_not_exists_async(req) is True
+    events = []
+    monkeypatch.setattr(executor.placement_history, 'flush_request_buffer',
+                        lambda: events.append('effect-cleanup'))
+
+    def acknowledge(claim):
+        events.append(('quiescence', claim))
+
+    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
+                        acknowledge)
+
+    executor._request_execution_wrapper('wrapper-quiescence',
+                                        ignore_return_value=False,
+                                        execution_generation=9,
+                                        claim_token='claim-token')
+
+    assert events == [
+        'effect-cleanup',
+        ('quiescence',
+         executor.request_storage.ExecutionClaim('wrapper-quiescence', 9,
+                                                 'claim-token')),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_wrapper_waits_for_cleanup_before_quiescence(
+        mock_fd_operations, reset_sigterm_gate, monkeypatch):
+    del mock_fd_operations
+    req = requests_lib.Request(request_id='cancel-cleanup-quiescence',
+                               name='test',
+                               entrypoint=_gated_sigterm_entrypoint,
+                               request_body=payloads.RequestBody(),
+                               status=requests_lib.RequestStatus.PENDING,
+                               created_at=0.0,
+                               user_id='test-user')
+    assert await requests_lib.create_if_not_exists_async(req) is True
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    acknowledged = threading.Event()
+
+    def blocking_cleanup():
+        cleanup_started.set()
+        assert cleanup_release.wait(timeout=2)
+
+    monkeypatch.setattr(executor.subprocess_utils, 'kill_children_processes',
+                        blocking_cleanup)
+    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
+                        lambda _claim: acknowledged.set())
+    wrapper = threading.Thread(target=executor._request_execution_wrapper,
+                               args=('cancel-cleanup-quiescence', False, 0, 11,
+                                     'claim-token'))
+    wrapper.start()
+    assert cleanup_started.wait(timeout=1)
+    assert not acknowledged.is_set()
+    # A second cancellation signal while child cleanup is in progress must not
+    # interrupt cleanup and let the wrapper publish a false receipt.
+    executor._gated_sigterm_handler(signal.SIGTERM, None)
+    assert not acknowledged.is_set()
+
+    cleanup_release.set()
+    wrapper.join(timeout=2)
+    assert not wrapper.is_alive()
+    assert acknowledged.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_wrapper_cleanup_failure_never_records_quiescence(
+        mock_fd_operations, reset_sigterm_gate, monkeypatch):
+    del mock_fd_operations
+    req = requests_lib.Request(request_id='cancel-cleanup-failed',
+                               name='test',
+                               entrypoint=_gated_sigterm_entrypoint,
+                               request_body=payloads.RequestBody(),
+                               status=requests_lib.RequestStatus.PENDING,
+                               created_at=0.0,
+                               user_id='test-user')
+    assert await requests_lib.create_if_not_exists_async(req) is True
+    monkeypatch.setattr(
+        executor.subprocess_utils, 'kill_children_processes',
+        mock.Mock(side_effect=RuntimeError('child cleanup failed')))
+    acknowledge = mock.Mock()
+    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
+                        acknowledge)
+
+    with pytest.raises(RuntimeError, match='child cleanup failed'):
+        executor._request_execution_wrapper('cancel-cleanup-failed', False, 0,
+                                            12, 'claim-token')
+
+    acknowledge.assert_not_called()
+    assert executor._in_request_execution is False
+
+
+@pytest.mark.asyncio
+async def test_marker_io_error_runs_cancellation_cleanup_before_receipt(
+        mock_fd_operations, reset_sigterm_gate, monkeypatch):
+    del mock_fd_operations
+    req = requests_lib.Request(request_id='cancel-marker-io-error',
+                               name='test',
+                               entrypoint=_gated_sigterm_entrypoint,
+                               request_body=payloads.RequestBody(),
+                               status=requests_lib.RequestStatus.PENDING,
+                               created_at=0.0,
+                               user_id='test-user')
+    assert await requests_lib.create_if_not_exists_async(req) is True
+    events = []
+    monkeypatch.setattr(
+        executor.request_storage, 'consume_execution_cancellation',
+        mock.Mock(side_effect=PermissionError('marker unreadable')))
+    monkeypatch.setattr(executor.subprocess_utils, 'kill_children_processes',
+                        lambda: events.append('child-cleanup'))
+    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
+                        lambda _claim: events.append('receipt'))
+
+    executor._request_execution_wrapper('cancel-marker-io-error', False, 0, 13,
+                                        'claim-token')
+
+    assert events == ['child-cleanup', 'receipt']
+
+
+@pytest.mark.asyncio
+async def test_marker_cleanup_error_does_not_suppress_quiescence_receipt(
+        isolated_database, reset_sigterm_gate, monkeypatch):
+    req = requests_lib.Request(request_id='marker-cleanup-error',
+                               name='test',
+                               entrypoint=_gate_clears_after_success_entrypoint,
+                               request_body=payloads.RequestBody(),
+                               status=requests_lib.RequestStatus.PENDING,
+                               created_at=0.0,
+                               user_id='test-user')
+    assert await requests_lib.create_if_not_exists_async(req) is True
+    marker = mock.Mock()
+    marker.unlink.side_effect = PermissionError('marker cannot be removed')
+    monkeypatch.setattr(executor.request_storage,
+                        'execution_cancellation_marker_path',
+                        lambda *_args, **_kwargs: marker)
+    acknowledge = mock.Mock()
+    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
+                        acknowledge)
+
+    executor._request_execution_wrapper('marker-cleanup-error', False, 0, 14,
+                                        'claim-token')
+
+    marker.unlink.assert_called_once_with()
+    acknowledge.assert_called_once_with(
+        executor.request_storage.ExecutionClaim('marker-cleanup-error', 14,
+                                                'claim-token'))
+
+
 def _gate_clears_after_success_entrypoint():
     return 'ok'
+
+
+def _gated_sigterm_entrypoint():
+    claim = executor.request_storage.active_execution_claim()
+    assert claim is not None
+    executor.request_storage.arm_execution_cancellation(os.getpid(), claim)
+    executor._gated_sigterm_handler(signal.SIGTERM, None)
 
 
 def _install_gated_handler_in_worker():
@@ -2176,12 +2509,98 @@ def _install_gated_handler_in_worker():
     _executor._in_request_execution = False
 
 
+def _install_observed_gated_handler_in_worker(observed_path):
+    import signal as _signal
+
+    from sky.server.requests import executor as _executor
+
+    def observed_handler(signum, frame):
+        pathlib.Path(observed_path).touch()
+        _executor._gated_sigterm_handler(signum, frame)
+
+    _signal.signal(_signal.SIGTERM, observed_handler)
+    _executor._in_request_execution = False
+
+
 def _worker_pid():
     return os.getpid()
 
 
 def _identity(x):
     return x
+
+
+def _run_token_gated_invocation(request_id, generation, token, ready_path,
+                                release_path):
+    from sky.server.requests import executor as _executor
+    from sky.server.requests import storage as _storage
+
+    claim = _storage.ExecutionClaim(request_id, generation, token)
+    _executor._execution_cancellation_marker = (
+        _storage.execution_cancellation_marker_path(os.getpid(), claim))
+    _executor._in_request_execution = True
+    pathlib.Path(ready_path).touch()
+    try:
+        deadline = time.time() + 10
+        while not pathlib.Path(release_path).exists():
+            if time.time() >= deadline:
+                raise TimeoutError('release marker was not created')
+            time.sleep(0.01)
+        return os.getpid()
+    finally:
+        _executor._in_request_execution = False
+        _executor._execution_cancellation_marker = None
+
+
+def test_delayed_signal_for_reused_pid_does_not_cancel_next_invocation(
+        tmp_path):
+    """A stale exact marker cannot authorize interruption of generation B."""
+    import signal as _signal
+
+    from sky.server.requests import storage as _storage
+
+    ready = tmp_path / 'ready'
+    release = tmp_path / 'release'
+    observed = tmp_path / 'signal-observed'
+    claim_a = _storage.ExecutionClaim('request-a', 1, 'claim-a')
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=1,
+            initializer=_install_observed_gated_handler_in_worker,
+            initargs=(str(observed),)) as pool:
+        pid = pool.submit(_worker_pid).result(timeout=10)
+        stale_marker = _storage.arm_execution_cancellation(pid, claim_a)
+        future_b = pool.submit(_run_token_gated_invocation, 'request-b', 2,
+                               'claim-b', str(ready), str(release))
+        deadline = time.time() + 10
+        while not ready.exists():
+            assert time.time() < deadline
+            time.sleep(0.01)
+
+        os.kill(pid, _signal.SIGTERM)
+        deadline = time.time() + 10
+        while not observed.exists():
+            assert time.time() < deadline
+            time.sleep(0.01)
+        assert not future_b.done()
+        release.touch()
+        assert future_b.result(timeout=10) == pid
+        _storage.clear_execution_cancellation(stale_marker)
+
+
+def _install_executor_process_title():
+    import setproctitle
+
+    setproctitle.setproctitle(f'SkyPilot:executor:test:{os.getpid()}')
+
+
+def test_pid_owner_check_accepts_real_thread_dispatcher_topology():
+    """Thread dispatchers create titled ProcessPool children of one server."""
+    from sky.server.requests import postgres as request_postgres
+
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=1, initializer=_install_executor_process_title) as pool:
+        pid = pool.submit(_worker_pid).result(timeout=10)
+        assert request_postgres._is_owned_executor_process(pid)
 
 
 def test_idle_worker_survives_sigterm_with_gated_handler():

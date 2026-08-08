@@ -5,11 +5,15 @@ Responsible for autoscaling and replica management.
 import asyncio
 from collections.abc import Callable
 import contextlib
+import contextvars
 import functools
+import hashlib
 import hmac
 import logging
 import math
 import os
+import re
+import signal
 import socket
 import threading
 import time
@@ -20,20 +24,27 @@ import uuid
 import colorama
 import fastapi
 from fastapi import responses
+import filelock
+import setproctitle
 import uvicorn
 
+from sky import __commit__ as sky_commit
+from sky import exceptions
 from sky import global_user_state
 from sky import serve
 from sky import sky_logging
+from sky import skypilot_config
 from sky import task as task_lib
-from sky.serve import auth_tokens
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
+from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
 from sky.serve import paid_capacity
+from sky.serve import placement_policy
+from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
@@ -43,6 +54,7 @@ from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.skylet import constants
 from sky.utils import common_utils
+from sky.utils import context as sky_context
 from sky.utils import context_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
@@ -51,6 +63,72 @@ from sky.utils.db import db_utils
 logger = sky_logging.init_logger(__name__)
 # Keep the historical controller-module patch surface for tests and plugins.
 serve_history = controller_history.serve_history
+
+_LbControllerFence = tuple[str, tuple[int | None, str | None], int]
+
+
+class _StableLbRoleSnapshotRead(NamedTuple):
+    """One shareable in-flight read, never a completed snapshot cache."""
+
+    snapshot: lb_k8s.LbRoleSnapshot | None
+    timings: dict[str, float]
+    error: Exception | None
+
+
+class _LbRoleDatabaseSnapshot(NamedTuple):
+    """One exact controller-owner and durable-cutover row observation."""
+
+    fence: tuple[str, tuple[int | None, str | None], int]
+    state: lb_ha.LbCutoverState
+    owner: dict[str, Any]
+
+
+def _catalog_missing_task_contexts(
+        yaml_content: str, placement_catalog: dict[str, Any]) -> set[str]:
+    """Kubernetes contexts the task declares that the catalog does not carry.
+
+    Compared on the context name alone. A catalog entry pins cloud, region and
+    a purchase model; the question here is only whether the enumeration ever
+    considered this context, so anything narrower would report a spurious
+    mismatch on an unrelated field.
+
+    Best effort by construction: a task or catalog this cannot parse yields an
+    empty set, which preserves the previous reuse behavior rather than failing
+    an update on a parsing difference.
+    """
+    try:
+        task = task_lib.Task.from_yaml_str(yaml_content)
+    except Exception:  # pylint: disable=broad-except
+        return set()
+
+    declared: set[str] = set()
+    for resources in (task.resources or []):
+        cloud = resources.cloud
+        if cloud is None or str(cloud).lower() != 'kubernetes':
+            continue
+        region = resources.region
+        if isinstance(region, str) and region:
+            declared.add(region)
+    if not declared:
+        return set()
+
+    present: set[str] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            cloud = node.get('cloud')
+            region = node.get('region')
+            if (isinstance(cloud, str) and cloud.lower() == 'kubernetes' and
+                    isinstance(region, str) and region):
+                present.add(region)
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                _walk(value)
+
+    _walk(placement_catalog)
+    return declared - present
 
 
 def _uses_current_request_classification_protocol(
@@ -68,6 +146,24 @@ class _PreparedLoadBalancerReport(NamedTuple):
     authority: tuple[bool, bool, bool]
     effective_request_data: dict[str, Any]
     ha_enabled: bool
+
+
+class _PreparedControllerConfig(NamedTuple):
+    """Validated, immutable inputs for one config-aware update generation."""
+
+    config: Any
+    service_name: str
+    live_path: str
+    staged_path: str
+    recovery_script: str
+    version: int
+    snapshot_id: str
+    source_digest: str
+    durable_bytes: bytes
+    durable_digest: str
+    source_is_staged: bool
+    source_is_live: bool
+    legacy_snapshot: tuple[bytes, str, str] | None
 
 
 def _make_auth_dependency(*,
@@ -242,6 +338,7 @@ class _PendingServiceUpdate(NamedTuple):
     service: Any
     update_mode: serve_utils.UpdateMode
     committed_at: float
+    prepared_config: _PreparedControllerConfig | None
 
 
 _UPDATE_RETRY_BACKOFF_SECONDS = 5
@@ -249,6 +346,10 @@ _UPDATE_RETRY_BACKOFF_SECONDS = 5
 
 class DeterministicServiceUpdateError(ValueError):
     """An immutable committed spec cannot be applied by this controller."""
+
+
+class ServiceUpdateRequiresRecoveryError(RuntimeError):
+    """A config/runtime transition began and cannot be retried in process."""
 
 
 class SkyServeController:
@@ -281,8 +382,7 @@ class SkyServeController:
                                   controller_ip is not None else None)
         if (service_hash is not None and
                 serve_state.service_uses_logical_replica_semantics(service_name)
-                and getattr(service_spec, 'uses_logical_replicas',
-                            False) is not True):
+                and service_spec.uses_logical_replicas is not True):
             raise RuntimeError(
                 'Refusing to recover a service whose durable logical-replica '
                 'activation fence disagrees with its latest specification.')
@@ -293,6 +393,7 @@ class SkyServeController:
         self._update_lock = threading.Lock()
         self._update_condition = threading.Condition()
         self._pending_update: _PendingServiceUpdate | None = None
+        self._applying_update: _PendingServiceUpdate | None = None
         # Recovery boots the latest applicable version. Preserve the highest
         # committed version separately so a quarantined candidate remains
         # visible without becoming runtime authority.
@@ -314,6 +415,15 @@ class SkyServeController:
         self._routing_state_lock = threading.RLock()
         self._update_apply_error: str | None = None
         self._update_apply_failures = 0
+        self._update_recovery_required = False
+        self._update_reconciler_stop = threading.Event()
+        # Serialize every autoscaler actuation epoch with a controller-config
+        # transition. If a transition fails after publishing any new runtime
+        # state, its catch path raises the irreversible stop fence before this
+        # lock is released; an old or partially updated decision can therefore
+        # never resume scaling while the parent prepares a fresh child.
+        self._actuation_epoch_lock = threading.RLock()
+        self._actuation_stop = threading.Event()
         # Serialize LB snapshots while resolving a cold replica cache in the
         # threadpool. Concurrent LB Pods can overlap during a rollout; without
         # this lock they would duplicate the fleet-wide endpoint work and race
@@ -323,12 +433,18 @@ class SkyServeController:
         # current loop.
         self._lb_sync_lock: asyncio.Lock | None = None
         self._lb_role_lock: asyncio.Lock | None = None
+        self._lb_role_snapshot_task: asyncio.Task[
+            _StableLbRoleSnapshotRead] | None = None
+        self._lb_role_snapshot_key: tuple[_LbControllerFence,
+                                          lb_ha.LbCutoverState,
+                                          tuple[tuple[str, Any],
+                                                ...]] | None = None
         self._lb_demand_lock: asyncio.Lock | None = None
         durable_lb_state = (serve_state.get_lb_cutover_state(service_name)
                             if service_hash is not None else None)
-        self._lb_ha_enabled = (
-            durable_lb_state.enabled if durable_lb_state is not None else
-            getattr(service_spec, 'lb_high_availability', False) is True)
+        self._lb_ha_enabled = (durable_lb_state.enabled
+                               if durable_lb_state is not None else
+                               service_spec.lb_high_availability is True)
         self._lb_session_ledger = (lb_ha.LbSessionLedger(
             serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
@@ -395,7 +511,7 @@ class SkyServeController:
         # poller_loop). The poller is the only component allowed to
         # issue the expensive cluster-wide realtime free-GPU query.
         self._reserved_capacity_fill_enabled: bool = bool(
-            getattr(service_spec, 'reserved_capacity_fill', False))
+            service_spec.reserved_capacity_fill)
         self._reserved_capacity_poller_started: bool = False
         # update_service handlers run in FastAPI's threadpool, so two
         # concurrent fill-enabling updates could both observe the
@@ -447,16 +563,14 @@ class SkyServeController:
         # replica snapshot. Status polling reads this without new DB/API work.
         self._replica_counts_snapshot: dict[str, int | str] | None = None
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
+        if not self._mark_controller_applied_version(version):
+            raise RuntimeError(
+                f'Could not durably mark recovered service version {version} '
+                'as controller-applied under the current ownership fence.')
+        self._acknowledge_pending_placement_normalization(service_spec, version)
 
     @contextlib.asynccontextmanager
     async def lifespan(self, _: fastapi.FastAPI):
-        if auth_tokens.is_resource_action_authority_enabled():
-            # Refuse to publish controller routes if the private authority
-            # credential overlaps any other ring mounted in this process.
-            # Reads remain fresh in the request client so later projected
-            # Secret rotations keep the same fail-closed boundary.
-            auth_tokens.validate_resource_action_preflight_auth_token_isolation(
-                required=True)
         uvicorn_access_logger = logging.getLogger('uvicorn.access')
         for handler in uvicorn_access_logger.handlers:
             handler.setFormatter(sky_logging.FORMATTER)
@@ -494,14 +608,13 @@ class SkyServeController:
         """Persist stabilization before authorizing economic scale-up."""
         if not autoscaler.cost_rebalance_state_dirty:
             return True
-        service_hash = getattr(self, '_service_hash', None)
+        service_hash = self._service_hash
         if service_hash is None:
             autoscaler.mark_cost_rebalance_state_persisted()
             return True
         try:
             persisted = serve_state.set_service_cost_rebalance_state(
-                self._service_name, service_hash,
-                getattr(self, '_controller_owner', None),
+                self._service_name, service_hash, self._controller_owner,
                 autoscaler.dump_cost_rebalance_state())
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
@@ -523,8 +636,10 @@ class SkyServeController:
         [boltz fork] Resolving a replica's url and gpu_type is expensive, so
         cluster records and provider configs for newly-READY replicas are each
         fetched in one batched lookup. The resulting endpoint/accelerator data
-        is cached for the replica's lifetime. A warm sync performs neither
-        lookup.
+        is cached for the replica's lifetime. Ordinary warm-cache rows perform
+        neither lookup. Protocol-v2 reserved-fill rows re-read their durable
+        handle and re-prove the physical Kubernetes identity on every sync;
+        rows sharing one physical pool reuse one UID fence/read for the round.
         A brand-new replica whose gpu_type cannot be resolved yet is reported
         as 'unknown' until it is.
 
@@ -532,19 +647,20 @@ class SkyServeController:
         capacity-hint computation, so the async sync handler issues no
         extra replica-list DB reads.
 
-        Returns the (url -> info) mapping and the number of READY, active
-        replicas seen -- which can exceed len(mapping) when a READY replica's
-        endpoint is transiently unresolvable this round. The load balancer uses
-        that count to tell an authoritative zero (no READY replicas) apart from
-        a spurious empty map (READY replicas exist but none resolved), so it
-        never blanks a healthy routing set on a transient blip.
+        Returns the (url -> info) mapping and the number of identity-verified
+        READY, active replicas seen -- which can exceed len(mapping) when a
+        verified replica's endpoint is transiently unresolvable this round.
+        The load balancer uses that count to tell an authoritative zero (no
+        verified READY replicas) apart from a spurious empty map (verified
+        replicas exist but none resolved), so a physical-cluster retarget
+        explicitly clears old routes instead of preserving them as transient.
         """
         runtime_snapshot = serve_state.get_service_runtime_snapshot(
             self._service_name, require_version=True)
         assert runtime_snapshot is not None, ('No service record found for '
                                               f'{self._service_name}')
-        service_hash = getattr(self, '_service_hash', None)
-        controller_owner = getattr(self, '_controller_owner', None)
+        service_hash = self._service_hash
+        controller_owner = self._controller_owner
         if (service_hash is not None and
             (runtime_snapshot.get('hash') != service_hash or
              (runtime_snapshot.get('controller_pid'),
@@ -562,44 +678,90 @@ class SkyServeController:
                 info.version in active_versions and
                 self._replica_manager.system_recovery_allows_routing(info))
         ]
-        uncached_cluster_names = [
-            info.cluster_name
-            for info in ready_infos
-            if (info.replica_id not in self._lb_replica_cache or
-                getattr(self, '_lb_replica_cache_record_ids', {}).get(
-                    info.replica_id) != info.replica_record_id)
+
+        def _is_recovery_capable(info: 'replica_managers.ReplicaInfo') -> bool:
+            return (info.system_recovery_disposition ==
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE)
+
+        def _retire_unverified_route(info: 'replica_managers.ReplicaInfo',
+                                     error: Exception) -> None:
+            if _is_recovery_capable(info):
+                self._replica_manager.retire_system_recovery_route(info)
+            logger.error(
+                'Withholding READY replica %s because its physical '
+                'Kubernetes identity could not be verified: %s',
+                info.replica_id, common_utils.format_exception(error))
+
+        def _cached_route(
+            info: 'replica_managers.ReplicaInfo'
+        ) -> tuple[str, str, int] | None:
+            cached = self._lb_replica_cache.get(info.replica_id)
+            if (self._lb_replica_cache_record_ids.get(info.replica_id)
+                    != info.replica_record_id):
+                return None
+            return cached
+
+        # Strictly classify every candidate before deciding that a warm cache
+        # can avoid its durable-handle lookup. A malformed row must never
+        # degrade to the ordinary/legacy path.
+        cleanup_fences: dict[int, reserved_capacity.ProtocolV2CleanupFence |
+                             None] = {}
+        identity_rejected_ids: set[int] = set()
+        for info in ready_infos:
+            try:
+                cleanup_fences[id(info)] = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+            except exceptions.KubernetesPhysicalClusterIdentityError as e:
+                identity_rejected_ids.add(id(info))
+                _retire_unverified_route(info, e)
+
+        cluster_lookup_infos = [
+            info for info in ready_infos
+            if id(info) not in identity_rejected_ids and (cleanup_fences[id(
+                info)] is not None or _cached_route(info) is None)
         ]
+        cluster_names = list(
+            dict.fromkeys(info.cluster_name for info in cluster_lookup_infos))
         cluster_records: dict[str, dict[str, Any] | None] = {}
-        if uncached_cluster_names:
+        if cluster_names:
             cluster_records = global_user_state.get_clusters_from_names(
-                uncached_cluster_names)
+                cluster_names)
 
         # get_endpoints normally reads and parses each cluster YAML to obtain
         # its provider config. That is another fleet-sized DB N+1. Reuse the
         # records above to collect the YAML paths, then fetch all YAMLs in one
         # query before resolving endpoints.
-        uncached_handles: dict[int, Any] = {}
-        for info in ready_infos:
-            if (info.replica_id in self._lb_replica_cache and
-                    getattr(self, '_lb_replica_cache_record_ids', {}).get(
-                        info.replica_id) == info.replica_record_id):
-                continue
+        handles: dict[int, Any] = {}
+        for info in cluster_lookup_infos:
             cluster_record = cluster_records.get(info.cluster_name)
             if cluster_record is None:
                 continue
-            handle = info.handle(cluster_record)
-            uncached_handles[info.replica_id] = handle
+            if cleanup_fences[id(info)] is None:
+                handle = info.handle(cluster_record)
+            else:
+                # A v2 row must validate the exact durable handle instead of
+                # letting a convenience accessor assert or fetch by name.
+                handle = (cluster_record.get('handle') if isinstance(
+                    cluster_record, dict) else None)
+            handles[id(info)] = handle
+        uncached_handles = {
+            info.replica_id: handles[id(info)]
+            for info in cluster_lookup_infos
+            if _cached_route(info) is None and id(info) in handles
+        }
         provider_configs = serve_utils.get_provider_configs_for_handles(
             uncached_handles)
 
-        for info in ready_infos:
-            is_capable = (
-                info.system_recovery_disposition ==
-                system_recovery_state.SystemRecoveryDisposition.CAPABLE)
-            cached = self._lb_replica_cache.get(info.replica_id)
-            if getattr(self, '_lb_replica_cache_record_ids',
-                       {}).get(info.replica_id) != info.replica_record_id:
-                cached = None
+        # First resolve/cache candidates under their physical-cluster fence.
+        # The emission pass below retains the caller's original row order so
+        # URL-collision handling remains deterministic even though pool fences
+        # are batched.
+        route_candidates: dict[int, tuple[str, str, int]] = {}
+
+        def _resolve_route_candidate(
+                info: 'replica_managers.ReplicaInfo') -> None:
+            is_capable = _is_recovery_capable(info)
+            cached = _cached_route(info)
             if cached is None:
                 cluster_record = cluster_records.get(info.cluster_name)
                 if cluster_record is None:
@@ -608,8 +770,8 @@ class SkyServeController:
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its cluster record is not available yet; '
                                    'skipping for this sync.')
-                    continue
-                handle = uncached_handles.get(info.replica_id)
+                    return
+                handle = handles.get(id(info))
                 url = info._resolve_url(  # pylint: disable=protected-access
                     cluster_record=cluster_record,
                     handle=handle,
@@ -626,7 +788,7 @@ class SkyServeController:
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its endpoint is not resolvable yet; '
                                    'skipping for this sync.')
-                    continue
+                    return
                 # gpu_type/gpu_count are used by instance-aware load
                 # balancing policies. They derive from the replica's
                 # launched accelerators, which are fixed for the replica's
@@ -642,6 +804,72 @@ class SkyServeController:
                         except (TypeError, ValueError):
                             gpu_count = 1
                 cached = (url, gpu_type, gpu_count)
+            route_candidates[id(info)] = cached
+
+        verified_ready_count = 0
+        v2_groups: dict[tuple[str, str], list[tuple[
+            replica_managers.ReplicaInfo,
+            contextlib.AbstractContextManager[None]]]] = {}
+        legacy_infos: list[replica_managers.ReplicaInfo] = []
+        for info in ready_infos:
+            if id(info) in identity_rejected_ids:
+                continue
+            cleanup_fence = cleanup_fences[id(info)]
+            if cleanup_fence is None:
+                legacy_infos.append(info)
+                continue
+            try:
+                # Construction performs the row/handle checks synchronously;
+                # entering one representative below performs the shared
+                # physical UID read for the whole pool.
+                provider_fence = reserved_capacity.protocol_v2_provider_fence(
+                    info, handle=handles.get(id(info)))
+            except exceptions.KubernetesPhysicalClusterIdentityError as e:
+                identity_rejected_ids.add(id(info))
+                _retire_unverified_route(info, e)
+                continue
+            key = (cleanup_fence.kubernetes_context,
+                   cleanup_fence.physical_cluster_uid)
+            v2_groups.setdefault(key, []).append((info, provider_fence))
+
+        if v2_groups:
+            # Resolve every physically fenced group before opening an ambient
+            # provider phase.  A timeout escapes before the local candidate
+            # maps below are published to any warm routing cache.
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED):
+                for grouped_infos in v2_groups.values():
+                    try:
+                        # Every row in this group has already validated its
+                        # own durable handle. Keeping the representative fence
+                        # open makes all endpoint reads use the same captured
+                        # physical target.
+                        with grouped_infos[0][1]:
+                            for info, _ in grouped_infos:
+                                _resolve_route_candidate(info)
+                    except exceptions.KubernetesPhysicalClusterIdentityError as e:
+                        # Treat the group as one coherent snapshot: a provider
+                        # fence failure invalidates candidates resolved earlier
+                        # in the same scope as well as any warm cached routes.
+                        for info, _ in grouped_infos:
+                            route_candidates.pop(id(info), None)
+                            identity_rejected_ids.add(id(info))
+                            _retire_unverified_route(info, e)
+                        continue
+                    verified_ready_count += len(grouped_infos)
+
+        if legacy_infos:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+                for info in legacy_infos:
+                    verified_ready_count += 1
+                    _resolve_route_candidate(info)
+
+        for info in ready_infos:
+            cached = route_candidates.get(id(info))
+            if cached is None:
+                continue
+            is_capable = _is_recovery_capable(info)
             url, gpu_type, gpu_count = cached
             try:
                 normalized_url = (
@@ -709,8 +937,8 @@ class SkyServeController:
                     serve_constants.SYSTEM_RECOVERY_ROUTE_TOKEN_KEY:
                         route_marker.route_token,
                 })
-            is_zero_cost = getattr(info, 'is_zero_cost', None)
-            if isinstance(is_zero_cost, bool):
+            is_zero_cost = info.is_zero_cost
+            if type(is_zero_cost) is bool:
                 # Placement-cost provenance is independent from the launch
                 # reason: an ordinary demand launch may land on free reserved
                 # capacity and should receive the same economic tie-break.
@@ -751,7 +979,7 @@ class SkyServeController:
             replica_id: cached
             for replica_id, cached in self._lb_translation_cache.items()
             if (replica_id in nonterminal_records and
-                getattr(self, '_lb_translation_cache_record_ids', {}).get(
+                self._lb_translation_cache_record_ids.get(
                     replica_id) == nonterminal_records[replica_id])
         }
         translation_cache_record_ids = {
@@ -766,7 +994,7 @@ class SkyServeController:
         # replicas that are no longer READY.
         self._lb_replica_cache = replica_cache
         self._lb_replica_cache_record_ids = replica_cache_record_ids
-        return replica_info, len(ready_infos)
+        return replica_info, verified_ready_count
 
     def _url_to_replica_id_map(self) -> dict[str, int]:
         """Invert the translation cache (url -> replica id)."""
@@ -824,7 +1052,7 @@ class SkyServeController:
         observed_slots: dict[int, int],
     ) -> dict[int, int]:
         """Return fresh physical-bridge widths bounded by launched GPUs."""
-        if getattr(self._autoscaler, 'replica_unit', None) != 'logical':
+        if self._autoscaler.replica_unit != 'logical':
             return {}
         candidates: dict[int, int] = {}
         for info in replica_infos:
@@ -833,13 +1061,9 @@ class SkyServeController:
             observed = observed_slots.get(info.replica_id)
             if observed is None or observed < 1:
                 continue
-            current = getattr(info, 'planned_capacity', 1)
-            if (isinstance(current, bool) or not isinstance(current, int) or
-                    current < 1):
-                current = 1
-            durable_bound = (current if bool(
-                getattr(info, 'logical_bridge_capacity_verified', False)) else
-                             1)
+            current = info.planned_capacity
+            durable_bound = (current
+                             if info.logical_bridge_capacity_verified else 1)
             cached = self._lb_translation_cache.get(info.replica_id)
             if cached is None:
                 observed_slots[info.replica_id] = min(observed, durable_bound)
@@ -852,8 +1076,7 @@ class SkyServeController:
             verified = min(observed, gpu_count)
             # Pass only state transitions to the manager. This keeps the LB
             # sync hot path free of a redundant DB read/write per heartbeat.
-            if (not bool(
-                    getattr(info, 'logical_bridge_capacity_verified', False)) or
+            if (not info.logical_bridge_capacity_verified or
                     verified > current):
                 candidates[info.replica_id] = verified
             # Reporter-controlled values must never reach the autoscaler above
@@ -998,14 +1221,11 @@ class SkyServeController:
             replica_infos, logical_versions, observed_slots)
         if not bridge_candidates:
             return
-        confirmer = getattr(self._replica_manager,
-                            'confirm_logical_bridge_capacities', None)
-        if not callable(confirmer):
-            return
         loop = asyncio.get_running_loop()
         try:
-            confirmed = await loop.run_in_executor(None, confirmer,
-                                                   bridge_candidates)
+            confirmed = await loop.run_in_executor(
+                None, self._replica_manager.confirm_logical_bridge_capacities,
+                bridge_candidates)
         except Exception as e:  # pylint: disable=broad-except
             logger.warning('Failed to persist verified logical bridge '
                            'capacity; retaining conservative width one: '
@@ -1091,7 +1311,7 @@ class SkyServeController:
         autoscaler/replica-manager phase.
         """
         (reporter_is_live, demand_authoritative, _) = authority
-        ha_enabled = getattr(self, '_lb_ha_enabled', False)
+        ha_enabled = self._lb_ha_enabled
         if not reporter_is_live:
             logger.warning('Ignoring non-authoritative load balancer demand '
                            'and drain report for service '
@@ -1107,31 +1327,30 @@ class SkyServeController:
                     self._restore_lb_demand_handoff(state.generation)
                     complete_report = self._lb_demand_report_is_complete(
                         request_data)
-                    handoff = getattr(self, '_lb_demand_handoff', None)
-                    if handoff is not None:
-                        if (complete_report and
-                                handoff.complete_report_at is None and
-                                handoff.generation == state.generation):
-                            fence = self._lb_cutover_fence()
-                            if fence is not None:
-                                service_hash, owner, lifecycle_epoch = fence
-                                complete_at = (
-                                    serve_state.mark_lb_demand_handoff_complete(
-                                        self._service_name, service_hash, owner,
-                                        lifecycle_epoch, state.generation))
-                                handoff.restore(handoff.generation,
-                                                handoff.snapshot, complete_at)
-                        handoff_generation = handoff.generation
-                        effective_request_data = handoff.apply(
-                            state.generation, request_data, complete_report)
-                        if (handoff_generation is not None and
-                                handoff.generation is None):
-                            fence = self._lb_cutover_fence()
-                            if fence is not None:
-                                service_hash, owner, lifecycle_epoch = fence
-                                serve_state.clear_lb_demand_handoff(
+                    handoff = self._lb_demand_handoff
+                    if (complete_report and
+                            handoff.complete_report_at is None and
+                            handoff.generation == state.generation):
+                        fence = self._lb_cutover_fence()
+                        if fence is not None:
+                            service_hash, owner, lifecycle_epoch = fence
+                            complete_at = (
+                                serve_state.mark_lb_demand_handoff_complete(
                                     self._service_name, service_hash, owner,
-                                    lifecycle_epoch, handoff_generation)
+                                    lifecycle_epoch, state.generation))
+                            handoff.restore(handoff.generation,
+                                            handoff.snapshot, complete_at)
+                    handoff_generation = handoff.generation
+                    effective_request_data = handoff.apply(
+                        state.generation, request_data, complete_report)
+                    if (handoff_generation is not None and
+                            handoff.generation is None):
+                        fence = self._lb_cutover_fence()
+                        if fence is not None:
+                            service_hash, owner, lifecycle_epoch = fence
+                            serve_state.clear_lb_demand_handoff(
+                                self._service_name, service_hash, owner,
+                                lifecycle_epoch, handoff_generation)
                 demand_snapshot = lb_ha.DemandSnapshot.from_request(
                     request_data)
                 self._lb_last_demand_snapshot = demand_snapshot
@@ -1186,8 +1405,7 @@ class SkyServeController:
             effective_request_data.get('occupancy_sampled_urls', []),
             effective_request_data.get('unknown_in_flight_urls', []),
             force_all_live_unknown=(not drain_authoritative and not ha_enabled))
-        self._reconcile_generation = getattr(self, '_reconcile_generation',
-                                             0) + 1
+        self._reconcile_generation += 1
         reconcile_generation = self._reconcile_generation
         # Validate the reporter epoch and ingest its exact-card gauges under
         # the same lock used to publish a new catalog/version. The report is
@@ -1244,8 +1462,8 @@ class SkyServeController:
                 'pressure_report_is_floored':
                     effective_request_data.get('pressure_report_is_floored'),
             })
-            if (translated_in_flight is not None and getattr(
-                    self._autoscaler, 'replica_unit', None) == 'logical'):
+            if (translated_in_flight is not None and
+                    self._autoscaler.replica_unit == 'logical'):
                 self._replica_manager.update_logical_reconcile_snapshot(
                     version=self._autoscaler.latest_version,
                     generation=reconcile_generation,
@@ -1319,9 +1537,20 @@ class SkyServeController:
             # Cold endpoint resolution is proportional to the READY fleet and
             # may take tens of seconds. Keep it off the FastAPI event loop so
             # controller liveness and ownership probes remain responsive.
-            lb_replica_info, num_ready = await loop.run_in_executor(
-                None, self._get_lb_replica_info, replica_infos,
-                async_occupancy_by_version)
+            try:
+                lb_replica_info, num_ready = await loop.run_in_executor(
+                    None, self._get_lb_replica_info, replica_infos,
+                    async_occupancy_by_version)
+            except exceptions.ProviderPhaseTimeoutError as error:
+                # No routing/cache state is published until
+                # _get_lb_replica_info completes both provider phases.  A
+                # timeout therefore fails the whole sync closed instead of
+                # returning a successful partial map.
+                logger.warning(
+                    'Load balancer route synchronization timed '
+                    'out waiting for provider authority: %s',
+                    common_utils.format_exception(error))
+                return fastapi.Response(status_code=503)
             if isinstance(lb_replica_info, dict):
                 self._lb_expected_occupancy_urls = {
                     url for url, info in lb_replica_info.items()
@@ -1361,7 +1590,7 @@ class SkyServeController:
             # Serialize only demand-handoff mutations; ordinary role
             # heartbeats do not take this lock and must remain responsive even
             # when PostgreSQL/Kubernetes fencing for a sync is slow.
-            demand_lock = getattr(self, '_lb_demand_lock', None)
+            demand_lock = self._lb_demand_lock
             if demand_lock is None:
                 demand_lock = asyncio.Lock()
                 self._lb_demand_lock = demand_lock
@@ -1444,7 +1673,7 @@ class SkyServeController:
                 # Legacy-selected and non-HA reporters can own drain state.
                 # Order their publication after any role transition that ran
                 # while the runtime tail waited on manager locks.
-                role_lock = getattr(self, '_lb_role_lock', None)
+                role_lock = self._lb_role_lock
                 if role_lock is None:
                     role_lock = asyncio.Lock()
                     self._lb_role_lock = role_lock
@@ -1510,9 +1739,34 @@ class SkyServeController:
             return None
         return (str(owner['hash']), actual_owner, int(owner['lifecycle_epoch']))
 
+    def _lb_role_database_snapshot(self) -> _LbRoleDatabaseSnapshot | None:
+        """Read the complete role owner/fence/cutover record once."""
+        owner = serve_state.get_service_controller_owner(self._service_name,
+                                                         include_lb_state=True)
+        if (owner is None or not owner.get('lb_ha_enabled') or
+                not owner.get('hash') or owner.get('lifecycle_epoch') is None):
+            return None
+        try:
+            live_owner_fingerprint = (
+                serve_utils.make_controller_owner_fingerprint(
+                    owner.get('hash'), owner.get('controller_pid'),
+                    owner.get('controller_ip'), owner.get('controller_port')))
+        except serve_utils.ControllerOwnerError:
+            return None
+        if live_owner_fingerprint != self._controller_owner_fingerprint:
+            return None
+        expected_owner = self._controller_owner
+        actual_owner = (owner.get('controller_pid'), owner.get('controller_ip'))
+        if expected_owner is None or actual_owner != expected_owner:
+            return None
+        fence = (str(owner['hash']), actual_owner,
+                 int(owner['lifecycle_epoch']))
+        state = lb_cutover_state.parse_lb_cutover_state_record(owner)
+        return _LbRoleDatabaseSnapshot(fence, state, owner)
+
     def _lb_promotion_report_is_current(self, request_data: dict[str,
                                                                  Any]) -> bool:
-        if not getattr(self, '_lb_occupancy_contract_known', False):
+        if not self._lb_occupancy_contract_known:
             return False
         routing_version = request_data.get('routing_version')
         if (not isinstance(routing_version, int) or
@@ -1600,8 +1854,8 @@ class SkyServeController:
         authority = self._lb_report_authority(request_data.get('lb_session_id'))
         if not authority[0]:
             return False
-        return self._apply_load_balancer_drain_report(
-            request_data, authority, getattr(self, '_lb_ha_enabled', False))
+        return self._apply_load_balancer_drain_report(request_data, authority,
+                                                      self._lb_ha_enabled)
 
     def _load_balancer_disclosure_is_authorized(self,
                                                 session_id: str | None) -> bool:
@@ -1757,9 +2011,8 @@ class SkyServeController:
             clean = report.complete and report.local_in_flight == 0
         drain_started_at = state.drain_started_at
         timed_out = (drain_started_at is not None and
-                     time.time() - drain_started_at >= getattr(
-                         self, '_lb_drain_timeout_seconds',
-                         serve_constants.LB_DRAIN_CLOSE_GRACE_SECONDS))
+                     time.time() - drain_started_at
+                     >= self._lb_drain_timeout_seconds)
         if timed_out and not clean:
             logger.warning('Finishing HA LB drain after the bounded Pod '
                            f'termination budget for {self._service_name!r}.')
@@ -1809,10 +2062,52 @@ class SkyServeController:
             'slots_converged': converged,
         }
 
+    async def _get_shared_stable_lb_role_snapshot(
+            self, loop: asyncio.AbstractEventLoop, fence: _LbControllerFence,
+            state: lb_ha.LbCutoverState,
+            owner: dict[str, Any]) -> _StableLbRoleSnapshotRead:
+        """Join an identical snapshot only while its provider read is running."""
+        assert state.phase is lb_ha.LbCutoverPhase.STABLE
+        owner_key = tuple(sorted(owner.items()))
+        key = (fence, state, owner_key)
+        task = self._lb_role_snapshot_task
+        if (task is None or task.done() or self._lb_role_snapshot_key != key):
+
+            async def read_snapshot() -> _StableLbRoleSnapshotRead:
+                timings: dict[str, float] = {}
+                try:
+                    snapshot = await loop.run_in_executor(
+                        None, lb_k8s.get_lb_role_snapshot, self._service_name,
+                        fence, state, owner, timings)
+                    return _StableLbRoleSnapshotRead(snapshot, timings, None)
+                except Exception as e:  # pylint: disable=broad-except
+                    # Return failures as task data so an individually cancelled
+                    # waiter cannot leave an unobserved task exception behind.
+                    return _StableLbRoleSnapshotRead(None, timings, e)
+
+            task = asyncio.create_task(read_snapshot())
+            self._lb_role_snapshot_task = task
+            self._lb_role_snapshot_key = key
+
+            def clear_completed_snapshot(
+                    completed: asyncio.Task[_StableLbRoleSnapshotRead]) -> None:
+                # A different fence may have installed a newer task while this
+                # one ran.  Never let the old callback clear that newer read.
+                if self._lb_role_snapshot_task is completed:
+                    self._lb_role_snapshot_task = None
+                    self._lb_role_snapshot_key = None
+
+            task.add_done_callback(clear_completed_snapshot)
+
+        # Request cancellation must not poison the same exact read already
+        # awaited by the peer slot.
+        return await asyncio.shield(task)
+
     async def _handle_load_balancer_role(
             self, request_data: dict[str, Any]) -> fastapi.Response:
         """Ingest a fast HA report and advance the recoverable cutover saga."""
         trace = lb_ha_obs.RoleRequestTrace()
+        verified_owner_fingerprint: str | None = None
 
         def role_response(
                 outcome: lb_ha_obs.LbRoleOutcome,
@@ -1822,8 +2117,14 @@ class SkyServeController:
             response_content = dict(content or {})
             response_content['outcome'] = outcome.value
             response_content['observability'] = trace.snapshot()
+            response_headers = {}
+            if verified_owner_fingerprint is not None:
+                response_headers[serve_constants.
+                                 LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER] = (
+                                     verified_owner_fingerprint)
             return responses.JSONResponse(content=response_content,
-                                          status_code=status_code)
+                                          status_code=status_code,
+                                          headers=response_headers)
 
         if not self._lb_ha_enabled:
             return role_response(
@@ -1838,15 +2139,11 @@ class SkyServeController:
         if not isinstance(session_id, str) or slot is None:
             return role_response(lb_ha_obs.LbRoleOutcome.INVALID_REPORT, 503)
         loop = asyncio.get_running_loop()
-        if not await trace.run_in_executor(loop, 'postgresql_owner_read',
-                                           self._owns_current_service):
-            return role_response(lb_ha_obs.LbRoleOutcome.CONTROLLER_NOT_OWNER,
-                                 503)
         role_lock = self._lb_role_lock
         if role_lock is None:
             role_lock = asyncio.Lock()
             self._lb_role_lock = role_lock
-        demand_lock = getattr(self, '_lb_demand_lock', None)
+        demand_lock = self._lb_demand_lock
         if demand_lock is None:
             demand_lock = asyncio.Lock()
             self._lb_demand_lock = demand_lock
@@ -1901,29 +2198,100 @@ class SkyServeController:
                 demand_transition_cancellation = None
                 raise cancellation  # pylint: disable=raising-bad-type
 
+        # A steady role snapshot is read-only, but an occasionally slow
+        # Kubernetes read used to hold the per-service transition lock and
+        # force the peer slot to queue behind it.  Prefetch only a fully
+        # validated STABLE snapshot.  The exact controller fence and frozen
+        # cutover state are re-read under the lock before this snapshot can
+        # influence the session ledger, role decision, or a planned cutover.
+        prefetched_database_snapshot = await trace.run_in_executor(
+            loop, 'postgresql_role_state_read', self._lb_role_database_snapshot)
+        prefetched_fence = (prefetched_database_snapshot.fence if
+                            prefetched_database_snapshot is not None else None)
+        prefetched_state: lb_ha.LbCutoverState | None = None
+        prefetched_snapshot: lb_k8s.LbRoleSnapshot | None = None
+        if prefetched_database_snapshot is not None:
+            prefetched_state = prefetched_database_snapshot.state
+        if (prefetched_state is not None and prefetched_state.enabled and
+                prefetched_state.active_slot is not None and
+                prefetched_fence is not None and
+                prefetched_state.lifecycle_epoch == prefetched_fence[2] and
+                prefetched_state.phase is lb_ha.LbCutoverPhase.STABLE):
+            snapshot_wait_started_at = time.monotonic()
+            try:
+                snapshot_read = (await self._get_shared_stable_lb_role_snapshot(
+                    loop, prefetched_fence, prefetched_state,
+                    prefetched_database_snapshot.owner))
+            finally:
+                trace.add_phases({
+                    'kubernetes_role_snapshot': time.monotonic() -
+                                                snapshot_wait_started_at
+                })
+            trace.add_phases(snapshot_read.timings)
+            if isinstance(snapshot_read.error,
+                          lb_k8s.LbRoleSnapshotStateMismatchError):
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+            if isinstance(snapshot_read.error,
+                          lb_k8s.LbRoleSnapshotRoutingError):
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
+            if snapshot_read.error is not None:
+                raise snapshot_read.error
+            prefetched_snapshot = snapshot_read.snapshot
+            if prefetched_snapshot is None:
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
+
         lock_wait_started_at = time.monotonic()
         async with role_lock:
             trace.lock_acquired(lock_wait_started_at)
-            authority = await trace.run_in_executor(loop,
-                                                    'kubernetes_pod_authority',
-                                                    lb_k8s.get_lb_pod_authority,
-                                                    self._service_name)
-            if authority is None or authority.slot_by_uid is None:
+            database_snapshot = await trace.run_in_executor(
+                loop, 'postgresql_role_state_read',
+                self._lb_role_database_snapshot)
+            if database_snapshot is None:
                 return role_response(
-                    lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
+                    lb_ha_obs.LbRoleOutcome.CONTROLLER_NOT_OWNER, 503)
+            verified_owner_fingerprint = self._controller_owner_fingerprint
+            fence = database_snapshot.fence
+            state = database_snapshot.state
+            if (state is None or not state.enabled or
+                    state.active_slot is None or
+                    state.lifecycle_epoch != fence[2]):
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+            if prefetched_snapshot is not None:
+                if (database_snapshot != prefetched_database_snapshot or
+                        state.phase is not lb_ha.LbCutoverPhase.STABLE):
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+                snapshot = prefetched_snapshot
+            else:
+                snapshot_timings: dict[str, float] = {}
+                try:
+                    snapshot = await trace.run_in_executor(
+                        loop, 'kubernetes_role_snapshot',
+                        lb_k8s.get_lb_role_snapshot, self._service_name, fence,
+                        state, database_snapshot.owner, snapshot_timings)
+                except lb_k8s.LbRoleSnapshotStateMismatchError:
+                    trace.add_phases(snapshot_timings)
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+                except lb_k8s.LbRoleSnapshotRoutingError:
+                    trace.add_phases(snapshot_timings)
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
+                trace.add_phases(snapshot_timings)
+                if snapshot is None:
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
+            authority = snapshot.authority
+            routing = snapshot.routing
             if (session_id not in authority.live_uids or
+                    authority.slot_by_uid is None or
                     authority.slot_by_uid.get(session_id) is not slot):
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.POD_NOT_AUTHORITATIVE, 503)
-            fence = await trace.run_in_executor(loop, 'postgresql_fence_read',
-                                                self._lb_cutover_fence)
-            state = await trace.run_in_executor(
-                loop, 'postgresql_cutover_state_read',
-                serve_state.get_lb_cutover_state, self._service_name)
-            if (fence is None or state is None or not state.enabled or
-                    state.active_slot is None):
-                return role_response(
-                    lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
             promotable = self._lb_promotion_report_is_current(request_data)
             role = state.role_for(slot)
             ledger = self._lb_session_ledger
@@ -1931,30 +2299,10 @@ class SkyServeController:
                     session_id, slot, role, state.generation, request_data):
                 return role_response(lb_ha_obs.LbRoleOutcome.REPORT_REJECTED,
                                      503)
-            try:
-                routing: (lb_k8s.LbServiceRouting |
-                          lb_k8s.LbServiceTransitionRouting)
-                if state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
-                                   lb_ha.LbCutoverPhase.ROLLING_BACK):
-                    routing = await trace.run_in_executor(
-                        loop, 'kubernetes_service_routing_read',
-                        lb_k8s.get_lb_service_transition_routing,
-                        self._service_name)
-                else:
-                    routing = await trace.run_in_executor(
-                        loop, 'kubernetes_service_routing_read',
-                        lb_k8s.get_lb_service_routing, self._service_name)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning('Cannot reconcile HA LB Service routing: '
-                               f'{common_utils.format_exception(e)}')
-                return role_response(
-                    lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
-
             service_hash, expected_owner, lifecycle_epoch = fence
-            transition_legacy_selected = bool(
-                state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
-                                lb_ha.LbCutoverPhase.ROLLING_BACK) and
-                getattr(routing, 'legacy_selected', False))
+            transition_legacy_selected = (isinstance(
+                routing, lb_k8s.LbServiceTransitionRouting) and
+                                          routing.legacy_selected)
             ready_by_slot = {
                 candidate_slot: {
                     uid
@@ -2336,8 +2684,8 @@ class SkyServeController:
 
     def _owns_current_service(self) -> bool:
         """Whether this controller parent still owns the exact DB row."""
-        service_hash = getattr(self, '_service_hash', None)
-        controller_owner = getattr(self, '_controller_owner', None)
+        service_hash = self._service_hash
+        controller_owner = self._controller_owner
         if service_hash is None:
             # Compatibility for direct/legacy controller construction.
             return True
@@ -2359,18 +2707,16 @@ class SkyServeController:
         replica_versions = sorted({info.version for info in replica_infos})
         version_specs = serve_state.get_specs(self._service_name,
                                               replica_versions)
-        async_occupancy_by_version: dict[int, bool | None] = {
-            replica_version: None if version_specs.get(replica_version)
-                             is None else getattr(
-                                 version_specs[replica_version],
-                                 'graceful_drain_async_occupancy',
-                                 None) for replica_version in replica_versions
-        }
-        logical_versions = {
-            replica_version for replica_version in replica_versions
-            if getattr(version_specs.get(replica_version),
-                       'uses_logical_replicas', False) is True
-        }
+        async_occupancy_by_version: dict[int, bool | None] = {}
+        logical_versions: set[int] = set()
+        for replica_version in replica_versions:
+            version_spec = version_specs.get(replica_version)
+            async_occupancy_by_version[replica_version] = (
+                None if version_spec is None else
+                version_spec.graceful_drain_async_occupancy)
+            if (version_spec is not None and
+                    version_spec.uses_logical_replicas is True):
+                logical_versions.add(replica_version)
         return replica_infos, async_occupancy_by_version, logical_versions
 
     def _get_capacity_hint(
@@ -2405,22 +2751,21 @@ class SkyServeController:
         latest_version = self._autoscaler.latest_version
         num_provisioning = 0
         num_latest_demand_nonterminal = 0
-        logical = getattr(self._autoscaler, 'replica_unit', None) == 'logical'
+        logical = self._autoscaler.replica_unit == 'logical'
         if logical_versions is None:
             logical_versions = {latest_version} if logical else set()
         for info in replica_infos:
             if info.version != latest_version or info.is_terminal:
                 continue
-            if (logical and getattr(getattr(info, 'status_property', None),
-                                    'is_scale_down', False) is True):
+            if logical and info.status_property.is_scale_down is True:
                 continue
-            width = int(getattr(info, 'planned_capacity', 1)) if logical else 1
+            width = info.planned_capacity if logical else 1
             # reserved_fill is launch-origin attribution. The dedicated
             # ready/provisioning fields still describe all usable capacity,
             # but opportunistic fill cannot raise this traffic-intent floor.
             # Legacy rows missing the additive flag remain demand-owned,
             # matching the autoscaler's restart baseline.
-            if not getattr(info, 'reserved_fill', False):
+            if not info.reserved_fill:
                 num_latest_demand_nonterminal += width
             if not info.is_ready:
                 num_provisioning += width
@@ -2441,11 +2786,9 @@ class SkyServeController:
             for key, value in replica_counts.items()
             if key != 'replica_unit'
         })
-        min_by_accelerator = getattr(self._autoscaler,
-                                     'min_replicas_by_accelerator', {})
-        demand_by_accelerator = getattr(self._autoscaler,
-                                        'target_num_replicas_by_accelerator',
-                                        {})
+        min_by_accelerator = self._autoscaler.min_replicas_by_accelerator
+        demand_by_accelerator = (
+            self._autoscaler.target_num_replicas_by_accelerator)
         if (isinstance(self._autoscaler, autoscalers.ConcurrencyAutoscaler) and
                 not self._autoscaler.has_recomputed_with_fresh_data()):
             demand_by_accelerator = {}
@@ -2458,18 +2801,14 @@ class SkyServeController:
         if (isinstance(self._autoscaler, autoscalers.ConcurrencyAutoscaler) and
                 self._autoscaler.has_recomputed_with_fresh_data()):
             hint['warm_retention_target_by_accelerator'] = dict(
-                getattr(self._autoscaler,
-                        'warm_retention_target_by_accelerator', {}))
+                self._autoscaler.warm_retention_target_by_accelerator)
             hint['cold_launch_authority_by_accelerator'] = dict(
-                getattr(self._autoscaler,
-                        'cold_launch_authority_by_accelerator', {}))
+                self._autoscaler.cold_launch_authority_by_accelerator)
         if logical:
             planned_capacity_by_url = {
-                cached[0]: int(getattr(info, 'planned_capacity', 1))
-                for info in replica_infos
-                if (info.version in logical_versions or bool(
-                    getattr(info, 'logical_bridge_capacity_verified', False))
-                   ) and not info.is_terminal
+                cached[0]: info.planned_capacity for info in replica_infos
+                if (info.version in logical_versions or info.
+                    logical_bridge_capacity_verified) and not info.is_terminal
                 for cached in [self._lb_translation_cache.get(info.replica_id)]
                 if cached is not None
             }
@@ -2482,8 +2821,8 @@ class SkyServeController:
         replica_infos: list['replica_managers.ReplicaInfo'],
     ) -> dict[str, Any]:
         """Return logical capacity and physical backend status aggregates."""
-        autoscaler = getattr(self, '_autoscaler', None)
-        logical = getattr(autoscaler, 'replica_unit', None) == 'logical'
+        autoscaler = self._autoscaler
+        logical = autoscaler.replica_unit == 'logical'
 
         ready = total = failed = 0
         physical_ready = physical_total = physical_failed = 0
@@ -2492,8 +2831,6 @@ class SkyServeController:
         total_by_accelerator: dict[str, int] = {}
         zero_cost_ready_by_accelerator: dict[str, int] = {}
         zero_cost_total_by_accelerator: dict[str, int] = {}
-        zero_cost_location_classifier = getattr(
-            autoscaler, 'is_replica_on_zero_cost_location', None)
         failed_statuses = serve_state.ReplicaStatus.failed_statuses()
         committed_unready_statuses = {
             serve_state.ReplicaStatus.PENDING,
@@ -2506,37 +2843,20 @@ class SkyServeController:
             # Pre-activation bridge rows deserialize with planned_capacity=1;
             # every logical version keeps its selected width. This lets a
             # rolling activation count both generations without spec queries.
-            planned_capacity = getattr(info, 'planned_capacity', 1)
-            width = (planned_capacity
-                     if logical and isinstance(planned_capacity, int) and
-                     not isinstance(planned_capacity, bool) and
-                     planned_capacity > 0 else 1)
+            width = info.planned_capacity if logical else 1
             cached = self._lb_translation_cache.get(info.replica_id)
             accelerator = cached[1] if cached is not None else 'unknown'
             if accelerator == 'unknown':
-                resources = getattr(getattr(info, 'handle', None),
-                                    'launched_resources', None)
-                accelerators = getattr(resources, 'accelerators', None)
-                if not accelerators:
-                    accelerators = (getattr(info, 'resources_override', None) or
-                                    {}).get('accelerators')
+                accelerators = (info.resources_override or
+                                {}).get('accelerators')
                 if isinstance(accelerators, dict) and accelerators:
                     accelerator = next(iter(accelerators))
             known_accelerator = accelerator != 'unknown'
-            is_zero_cost = bool(getattr(info, 'is_zero_cost', False))
-            if callable(zero_cost_location_classifier):
-                classified = zero_cost_location_classifier(info)
-                # Loose mocks used by callers may synthesize arbitrary
-                # attributes. Only the classifier's real boolean contract is
-                # accepted; persisted provenance remains a valid positive
-                # signal for builds/configurations without a location match.
-                if type(classified) is bool:
-                    is_zero_cost = is_zero_cost or classified
+            is_zero_cost = (info.is_zero_cost is True or
+                            autoscaler.is_replica_on_zero_cost_location(info))
             if status == serve_state.ReplicaStatus.READY:
-                capacity_getter = getattr(autoscaler,
-                                          'get_ready_replica_capacity', None)
-                observed_ready = (capacity_getter(info) if logical and
-                                  callable(capacity_getter) else width)
+                observed_ready = (autoscaler.get_ready_replica_capacity(info)
+                                  if logical else width)
                 ready += max(0, int(observed_ready))
                 physical_ready += 1
                 if known_accelerator:
@@ -2587,8 +2907,7 @@ class SkyServeController:
             zero_cost_total_by_accelerator, free_reserved)
         if fill_target:
             counts['fill_target_by_accelerator'] = fill_target
-        demand_target = getattr(autoscaler,
-                                'target_num_replicas_by_accelerator', {})
+        demand_target = autoscaler.target_num_replicas_by_accelerator
         if (isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler) and
                 not autoscaler.has_recomputed_with_fresh_data()):
             demand_target = {}
@@ -2597,23 +2916,21 @@ class SkyServeController:
         if (isinstance(autoscaler, autoscalers.ConcurrencyAutoscaler) and
                 autoscaler.has_recomputed_with_fresh_data()):
             counts['warm_retention_target_by_accelerator'] = dict(
-                getattr(autoscaler, 'warm_retention_target_by_accelerator', {}))
+                autoscaler.warm_retention_target_by_accelerator)
             counts['cold_launch_authority_by_accelerator'] = dict(
-                getattr(autoscaler, 'cold_launch_authority_by_accelerator', {}))
+                autoscaler.cold_launch_authority_by_accelerator)
         counts['replica_unit'] = ('logical_slot'
                                   if logical else 'physical_backend')
         return counts
 
     def _get_free_reserved_slots_by_accelerator(self) -> dict[str, int]:
         """Return fresh observed physical supply for cataloged free cards."""
-        placer = getattr(getattr(self, '_replica_manager', None), 'spot_placer',
-                         None)
+        placer = self._replica_manager.spot_placer
         # LB sync is latency-sensitive and consumes both immutable catalog
         # identities and observations refreshed by the background poller.
-        getter = getattr(placer, 'zero_cost_locations', None)
-        if not callable(getter):
+        if placer is None:
             return {}
-        locations = getter()  # pylint: disable=not-callable
+        locations = placer.zero_cost_locations()
         if not isinstance(locations, list) or not locations:
             return {}
         shapes = reserved_capacity.zero_cost_pool_shapes(locations)
@@ -2639,17 +2956,15 @@ class SkyServeController:
         free_reserved: dict[str, int],
     ) -> dict[str, int]:
         """Return a fully attributable aggregate fill overlay by exact card."""
-        if getattr(self._autoscaler, 'reserved_capacity_fill',
-                   False) is not True:
+        if self._autoscaler.reserved_capacity_fill is not True:
             return {}
-        raw_aggregate_target = getattr(self._autoscaler, '_fill_target', 0)
+        raw_aggregate_target = self._autoscaler.fill_target
         aggregate_target = (max(0, raw_aggregate_target)
                             if isinstance(raw_aggregate_target, int) and
                             not isinstance(raw_aggregate_target, bool) else 0)
         card_order: list[str] = []
         seen: set[str] = set()
-        demand_target = getattr(self._autoscaler,
-                                'target_num_replicas_by_accelerator', {})
+        demand_target = self._autoscaler.target_num_replicas_by_accelerator
         if not isinstance(demand_target, dict):
             demand_target = {}
         for mapping in (demand_target, zero_cost_total, free_reserved):
@@ -2680,8 +2995,7 @@ class SkyServeController:
 
     def _configured_accelerators(self, service_spec: Any) -> list[str]:
         """Return configured exact accelerator IDs in service resource order."""
-        yaml_content = getattr(getattr(self, '_replica_manager', None),
-                               'yaml_content', None)
+        yaml_content = self._replica_manager.yaml_content
         if not isinstance(yaml_content, str):
             # Direct controller unit tests replace ReplicaManager with a loose
             # mock. A real manager always owns the committed YAML string.
@@ -2704,7 +3018,7 @@ class SkyServeController:
                     continue
                 seen.add(normalized)
                 configured.append(accelerator)
-        floors = getattr(service_spec, 'min_replicas_by_accelerator', {})
+        floors = service_spec.min_replicas_by_accelerator
         configured_by_name = {name.casefold(): name for name in configured}
         unknown_floors = [
             name for name in floors if name.casefold() not in configured_by_name
@@ -2739,8 +3053,7 @@ class SkyServeController:
                 'SkyServe exact-card compatibility requires one positive GPU '
                 'count shape per accelerator; found ambiguous shapes '
                 f'{ambiguous}.')
-        placer = getattr(getattr(self, '_replica_manager', None), 'spot_placer',
-                         None)
+        placer = self._replica_manager.spot_placer
         if len(configured) > 1 and not isinstance(task.resources,
                                                   list) and placer is None:
             if floors:
@@ -2758,7 +3071,7 @@ class SkyServeController:
         # the instance-aware QPS key order and then exact lexical order.
         if not isinstance(task.resources, list):
             qps_order: dict[str, int] = {}
-            target_qps = getattr(service_spec, 'target_qps_per_replica', {})
+            target_qps = service_spec.target_qps_per_replica
             if isinstance(target_qps, dict):
                 for key in target_qps:
                     card = key.partition(':')[0].casefold()
@@ -2815,8 +3128,7 @@ class SkyServeController:
         configured = self._configured_accelerators(service_spec)
         if not configured:
             return {}
-        yaml_content = getattr(getattr(self, '_replica_manager', None),
-                               'yaml_content', None)
+        yaml_content = self._replica_manager.yaml_content
         if not isinstance(yaml_content, str):
             return {}
         task = replica_managers.load_task_with_service_spec(
@@ -2849,8 +3161,7 @@ class SkyServeController:
             self, candidate_autoscaler: autoscalers.Autoscaler,
             service_spec: Any) -> dict[str, int]:
         """Resolve the exact catalog for one autoscaler/spec transition."""
-        if (getattr(service_spec, 'load_balancing_policy',
-                    None) != 'instance_aware_least_load' or
+        if (service_spec.load_balancing_policy != 'instance_aware_least_load' or
                 not isinstance(candidate_autoscaler,
                                (autoscalers.InstanceAwareRequestRateAutoscaler,
                                 autoscalers.ConcurrencyAutoscaler))):
@@ -2862,11 +3173,10 @@ class SkyServeController:
             service_spec: Any,
             candidate_autoscaler: autoscalers.Autoscaler | None = None) -> bool:
         """Whether routing and autoscaling share the exact-card contract."""
-        compatible_autoscaler = (getattr(self, '_autoscaler', None)
-                                 if candidate_autoscaler is None else
-                                 candidate_autoscaler)
-        return (getattr(service_spec, 'load_balancing_policy',
-                        None) == 'instance_aware_least_load' and
+        compatible_autoscaler = (self._autoscaler if candidate_autoscaler
+                                 is None else candidate_autoscaler)
+        return (service_spec.load_balancing_policy
+                == 'instance_aware_least_load' and
                 isinstance(compatible_autoscaler,
                            (autoscalers.InstanceAwareRequestRateAutoscaler,
                             autoscalers.ConcurrencyAutoscaler)))
@@ -2895,8 +3205,8 @@ class SkyServeController:
             # Lets an instance-aware LB weight replicas per-GPU when the
             # service sizes on concurrency (no QPS dict to weight by) --
             # and clear stale QPS weights after an update switches modes.
-            'target_concurrency_per_replica': getattr(
-                service_spec, 'target_concurrency_per_replica', None),
+            'target_concurrency_per_replica':
+                service_spec.target_concurrency_per_replica,
             'stream_timeout_seconds': service_spec.lb_stream_timeout_seconds,
             'retriable_status_codes':
                 (list(retriable_status_codes)
@@ -2904,7 +3214,7 @@ class SkyServeController:
             'max_retries': service_spec.lb_max_retries,
             'retry_initial_backoff_seconds':
                 (service_spec.lb_retry_initial_backoff_seconds),
-            'request_queue': getattr(service_spec, 'lb_request_queue', None),
+            'request_queue': service_spec.lb_request_queue,
         }
         if configured_accelerators:
             routing_spec.update({
@@ -2929,7 +3239,7 @@ class SkyServeController:
         immutable in-memory snapshot removes that mismatch window and avoids
         steady-state DB reads on the hottest serve control-plane path.
         """
-        return getattr(self, '_routing_spec', None)
+        return self._routing_spec
 
     def _load_service_for_update(self, version: int, yaml_content: str) -> Any:
         """Parse a new update or reuse an exact legacy committed spec.
@@ -2948,6 +3258,324 @@ class SkyServeController:
                     'authoritative specification is missing.')
             return persisted
         return serve.SkyServiceSpec.from_yaml_str(yaml_content)
+
+    def _prepare_controller_config_update(
+            self, version: int, expected_digest: str,
+            snapshot_id: str) -> _PreparedControllerConfig:
+        """Validate a staged config and bind it to the HA recovery script."""
+        live_path = serve_utils.generate_versioned_config_yaml_file_name(
+            self._service_name, version, self._resource_scope)
+        staged_path = serve_utils.generate_staged_config_yaml_file_name(
+            self._service_name,
+            version,
+            self._resource_scope,
+            snapshot_id=snapshot_id)
+        recovery_script = serve_state.get_ha_recovery_script(self._service_name)
+        if recovery_script is None:
+            raise RuntimeError('Service HA recovery script is missing; '
+                               'refusing a non-durable config refresh.')
+        committed_yaml = serve_state.get_yaml_content(self._service_name,
+                                                      version)
+        committed_snapshot = (serve_state.get_version_controller_config(
+            self._service_name, version)
+                              if committed_yaml is not None else None)
+        try:
+            config_bytes = serve_utils.secure_staged_controller_config(
+                staged_path, expected_digest)
+        except FileNotFoundError:
+            config_bytes = None
+        if config_bytes is not None:
+            if committed_yaml is None:
+                serve_utils.write_config_snapshot_receipt(
+                    staged_path, version, snapshot_id, expected_digest)
+                durable_bytes = serve_utils.sanitize_ha_recovery_config_bytes(
+                    config_bytes)
+                durable_digest = hashlib.sha256(durable_bytes).hexdigest()
+                source_is_staged = True
+                source_is_live = False
+            else:
+                if committed_snapshot is None:
+                    raise RuntimeError('Committed controller config snapshot '
+                                       'is unavailable for retry.')
+                (durable_bytes, durable_digest,
+                 committed_snapshot_id) = committed_snapshot
+                if committed_snapshot_id != snapshot_id:
+                    raise RuntimeError(
+                        'Committed controller config snapshot ID does not '
+                        'match the API-server submission.')
+                # Never mint or overwrite a receipt after the immutable row is
+                # committed. A retry may upload different raw bytes using the
+                # same nonce and safe projection; those bytes must never gain
+                # authority over the committed version. Preserve raw fields
+                # only when the pre-commit receipt still proves exact identity.
+                receipt = serve_utils.get_config_snapshot_receipt(staged_path)
+                receipt_matches = (
+                    receipt is not None and receipt['version'] == version and
+                    receipt['snapshot_id'] == snapshot_id and
+                    receipt['source_digest'] == expected_digest and
+                    hashlib.sha256(config_bytes).hexdigest() == expected_digest)
+                if (receipt_matches and hashlib.sha256(
+                        serve_utils.sanitize_ha_recovery_config_bytes(
+                            config_bytes)).hexdigest() == durable_digest):
+                    source_is_staged = True
+                else:
+                    config_bytes = durable_bytes
+                    source_is_staged = False
+                source_is_live = False
+        else:
+            # os.replace consumes the staged file. A lost 200 response must be
+            # retryable after that point, but absence before the version commit
+            # is never valid and must not silently admit the old live config.
+            if committed_yaml is None:
+                raise RuntimeError('Staged controller config snapshot is '
+                                   'missing before version commit.')
+            if committed_snapshot is None:
+                raise RuntimeError('Committed controller config snapshot is '
+                                   'unavailable for retry.')
+            (durable_bytes, durable_digest,
+             committed_snapshot_id) = committed_snapshot
+            if committed_snapshot_id != snapshot_id:
+                raise RuntimeError(
+                    'Committed controller config snapshot ID does not match '
+                    'the API-server submission.')
+            live_receipt = serve_utils.get_config_snapshot_receipt(live_path)
+            if (live_receipt is not None and
+                    live_receipt['snapshot_id'] == snapshot_id and
+                    live_receipt['source_digest'] != expected_digest):
+                raise RuntimeError(
+                    'Committed raw controller config receipt does not match '
+                    'the retried API-server digest.')
+            live_bytes = serve_utils.read_verified_controller_config(
+                live_path, version, snapshot_id, expected_digest)
+            if (live_bytes is not None and hashlib.sha256(
+                    serve_utils.sanitize_ha_recovery_config_bytes(
+                        live_bytes)).hexdigest() == durable_digest):
+                # Preserve exact raw fields on a same-pod lost-response retry.
+                # Full child/pod recovery removes the receipt and deliberately
+                # falls back to the DB-bound safe projection below.
+                config_bytes = live_bytes
+                source_is_live = True
+            else:
+                # The random nonce identifies the already-committed request
+                # after a pod loss. Do not persist the source digest: stripped
+                # low-entropy secrets would otherwise gain an offline verifier.
+                config_bytes = durable_bytes
+                source_is_live = False
+            source_is_staged = False
+
+        recovery_script = (serve_utils.strip_legacy_ha_recovery_config_payload(
+            recovery_script, live_path))
+
+        expected_workspace = self._replica_manager.workspace
+        try:
+            config = serve_utils.parse_and_validate_version_controller_config(
+                config_bytes, expected_workspace,
+                'staged Serve controller config')
+        except Exception as e:  # pylint: disable=broad-except
+            raise RuntimeError('Staged controller config snapshot is invalid: '
+                               f'{common_utils.format_exception(e)}') from None
+        try:
+            serve_utils.parse_and_validate_version_controller_config(
+                durable_bytes, expected_workspace,
+                'durable Serve controller config')
+        except Exception as e:  # pylint: disable=broad-except
+            raise RuntimeError('Durable controller config snapshot is invalid: '
+                               f'{common_utils.format_exception(e)}') from None
+        legacy_snapshot = None
+        protocol_active = (serve_state.get_version_controller_config(
+            self._service_name, self._applied_version) is not None)
+        if (source_is_staged and committed_yaml is None and
+                not protocol_active):
+            current_config_path = os.environ.get(
+                skypilot_config.ENV_VAR_SKYPILOT_CONFIG,
+                serve_utils.generate_remote_config_yaml_file_name(
+                    self._service_name, self._resource_scope))
+            expanded_current_path = os.path.expanduser(current_config_path)
+            try:
+                with open(expanded_current_path, 'rb') as live_config_file:
+                    legacy_bytes = (
+                        serve_utils.sanitize_ha_recovery_config_bytes(
+                            live_config_file.read()))
+            except OSError:
+                recovery_version = serve_state.get_recovery_version_spec(
+                    self._service_name)
+                committed_legacy = (serve_state.get_version_controller_config(
+                    self._service_name, recovery_version[0])
+                                    if recovery_version is not None else None)
+                if committed_legacy is None:
+                    raise RuntimeError(
+                        'Current controller config is unavailable for '
+                        'legacy-version recovery backfill.') from None
+                legacy_bytes = committed_legacy[0]
+            try:
+                serve_utils.parse_and_validate_version_controller_config(
+                    legacy_bytes, expected_workspace,
+                    'legacy Serve controller config')
+            except Exception as e:  # pylint: disable=broad-except
+                raise RuntimeError(
+                    'Legacy controller config snapshot is invalid: '
+                    f'{common_utils.format_exception(e)}') from None
+            legacy_digest = hashlib.sha256(legacy_bytes).hexdigest()
+            # Historical versions all used the one frozen controller config.
+            # The safe digest is a stable, non-secret migration identity.
+            legacy_snapshot = (legacy_bytes, legacy_digest, legacy_digest)
+        return _PreparedControllerConfig(config, self._service_name, live_path,
+                                         staged_path, recovery_script, version,
+                                         snapshot_id, expected_digest,
+                                         durable_bytes, durable_digest,
+                                         source_is_staged, source_is_live,
+                                         legacy_snapshot)
+
+    @staticmethod
+    def _run_with_prepared_config(prepared: _PreparedControllerConfig,
+                                  callback: Callable[[], Any]) -> Any:
+        """Run admission under a request-local config without publishing it."""
+
+        def _run() -> Any:
+            sky_context.initialize()
+            with skypilot_config.replace_skypilot_config_in_memory(
+                    prepared.config):
+                return callback()
+
+        return contextvars.Context().run(_run)
+
+    @staticmethod
+    def _discard_prepared_controller_config(
+            prepared: _PreparedControllerConfig | None) -> None:
+        if prepared is not None and prepared.source_is_staged:
+            serve_utils.remove_staged_controller_config(prepared.staged_path)
+
+    @staticmethod
+    def _schedule_supervised_recovery() -> None:
+        """Terminate this child after its caller finishes durable writes."""
+
+        def _terminate_for_recovery() -> None:
+            time.sleep(0.1)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=_terminate_for_recovery, daemon=True).start()
+
+    def _get_actuation_epoch_lock(self) -> threading.RLock:
+        return self._actuation_epoch_lock
+
+    def _get_actuation_stop(self) -> threading.Event:
+        return self._actuation_stop
+
+    def _get_update_reconciler_stop(self) -> threading.Event:
+        return self._update_reconciler_stop
+
+    def _fence_actuation_for_update_recovery(self) -> None:
+        """Irreversibly stop this partial child from changing fleet state."""
+        self._update_recovery_required = True
+        self._get_actuation_stop().set()
+        self._update_reconciler_stop.set()
+        self._replica_manager.fence_launches_for_update_recovery()
+
+    def _mark_controller_applied_version(self, version: int) -> bool:
+        """Persist an exact recovery baseline under this controller owner."""
+        if self._service_hash is None:
+            return True
+        return serve_state.mark_version_controller_applied(
+            self._service_name,
+            version,
+            self._service_hash,
+            expected_controller_owner=self._controller_owner)
+
+    def _acknowledge_pending_placement_normalization(
+            self, service_spec: serve.SkyServiceSpec, version: int) -> None:
+        """Prove this child loaded one explicit, still-requested generation."""
+        try:
+            _, contract_version = placement_policy.decode_contract_state(
+                service_spec.__dict__)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                'Recovered service spec has an invalid placement contract.') \
+                from exc
+        if contract_version is None:
+            raise RuntimeError(
+                'Recovered service spec still has a fieldless legacy '
+                'placement contract.')
+        if self._service_hash is None:
+            return
+        if self._controller_owner is None:
+            raise RuntimeError('A durable service incarnation must carry an '
+                               'exact parent controller owner.')
+        request = serve_state.get_placement_normalization_request(
+            self._service_name,
+            recovery_version=version,
+            current_version=self._committed_version,
+            expected_service_hash=self._service_hash,
+            expected_controller_owner=self._controller_owner)
+        if request is None:
+            return
+        if not serve_state.acknowledge_placement_normalization_loaded(
+                self._service_name,
+                request,
+                expected_service_hash=self._service_hash,
+                expected_controller_owner=self._controller_owner,
+                image_commit=sky_commit,
+                child_controller_pid=os.getpid(),
+                boot_id=self._history_session_id):
+            raise RuntimeError(
+                'Could not acknowledge the requested placement normalization '
+                'generation under the current owner and version fences.')
+
+    @staticmethod
+    def _install_controller_config(prepared: _PreparedControllerConfig) -> None:
+        """Publish a config only after its version and recovery are durable."""
+        live_path = os.path.expanduser(prepared.live_path)
+
+        def _install_globally() -> None:
+            # An empty Context guarantees the already-validated config is
+            # atomically published to the process-global snapshot.
+            with filelock.FileLock(
+                    skypilot_config.get_skypilot_config_lock_path()):
+                installed_bytes: bytes | None
+                if prepared.source_is_staged:
+                    installed_bytes = (
+                        serve_utils.promote_staged_controller_config(
+                            prepared.live_path, prepared.staged_path,
+                            prepared.version, prepared.snapshot_id,
+                            prepared.source_digest))
+                elif prepared.source_is_live:
+                    installed_bytes = (
+                        serve_utils.read_verified_controller_config(
+                            prepared.live_path, prepared.version,
+                            prepared.snapshot_id, prepared.source_digest))
+                    if installed_bytes is None:
+                        raise RuntimeError('Committed raw controller config '
+                                           'changed before retry install.')
+                else:
+                    installed_bytes = (
+                        serve_utils.restore_version_controller_config(
+                            prepared.service_name,
+                            prepared.version,
+                            prepared.live_path,
+                            prepared.staged_path,
+                            expected_workspace=(prepared.config.get_nested(
+                                keys=('active_workspace',),
+                                default_value=None))))
+                    if installed_bytes is None:
+                        raise RuntimeError('Committed controller config is '
+                                           'unavailable for installation.')
+                expected_installed_digest = (
+                    prepared.source_digest if prepared.source_is_staged or
+                    prepared.source_is_live else prepared.durable_digest)
+                if (hashlib.sha256(installed_bytes).hexdigest()
+                        != expected_installed_digest):
+                    raise RuntimeError(
+                        'Controller config snapshot changed between admission '
+                        'and installation.')
+                skypilot_config.install_internal_config_snapshot(
+                    prepared.config, live_path)
+                expected_workspace = prepared.config.get_nested(
+                    keys=('active_workspace',), default_value=None)
+                if skypilot_config.get_active_workspace() != expected_workspace:
+                    raise RuntimeError(
+                        'Installed controller config changed the durable '
+                        'service workspace.')
+
+        contextvars.Context().run(_install_globally)
 
     def _transition_load_balancer_mode(
             self,
@@ -3078,14 +3706,16 @@ class SkyServeController:
             expected_lifecycle_epoch=expected_lifecycle_epoch)
 
     def _commit_service_update(
-            self,
-            version: int,
-            service: Any,
-            yaml_content: str,
-            update_mode: serve_utils.UpdateMode,
-            requested_service_hash: str | None,
-            lifecycle_epoch: int | None,
-            submitted_yaml_content: str | None = None) -> fastapi.Response:
+        self,
+        version: int,
+        service: Any,
+        yaml_content: str,
+        update_mode: serve_utils.UpdateMode,
+        requested_service_hash: str | None,
+        lifecycle_epoch: int | None,
+        submitted_yaml_content: str | None = None,
+        prepared_config: _PreparedControllerConfig | None = None
+    ) -> fastapi.Response:
         """Durably accept one immutable version and schedule its apply."""
         authoritative_retry_service = None
         persisted_yaml = serve_state.get_yaml_content(self._service_name,
@@ -3111,20 +3741,20 @@ class SkyServeController:
                 validation_service,
                 expected_service_hash=requested_service_hash,
                 expected_lifecycle_epoch=lifecycle_epoch)
-        current_autoscaler = getattr(self, '_autoscaler', None)
-        if (authoritative_retry_service is None and getattr(
-                current_autoscaler, 'replica_unit', None) == 'logical' and
-                getattr(validation_service, 'replica_unit',
-                        'physical_backend') != 'logical'):
+        current_autoscaler = self._autoscaler
+        if (authoritative_retry_service is None and
+                current_autoscaler.replica_unit == 'logical' and
+                validation_service.replica_unit != 'logical'):
+            self._discard_prepared_controller_config(prepared_config)
             return responses.JSONResponse(content={
                 'message': 'An existing dynamic_fallback_per_gpu service '
                            'cannot switch in place to physical-backend replica '
                            'semantics. Create a new service for that migration.'
             },
                                           status_code=400)
-        if (getattr(validation_service, 'replica_unit',
-                    'physical_backend') == 'logical' and
+        if (validation_service.replica_unit == 'logical' and
                 update_mode == serve_utils.UpdateMode.BLUE_GREEN):
+            self._discard_prepared_controller_config(prepared_config)
             return responses.JSONResponse(content={
                 'message': 'dynamic_fallback_per_gpu services currently '
                            'require rolling updates. Blue-green activation is '
@@ -3134,11 +3764,32 @@ class SkyServeController:
                                           status_code=400)
         placement_catalog = serve_state.get_placement_catalog(
             self._service_name, version)
-        needs_catalog = (getattr(validation_service, 'spot_placer', None)
-                         is not None and placement_catalog is None)
-        needs_logical_validation = (
-            authoritative_retry_service is None and
-            getattr(validation_service, 'uses_logical_replicas', False) is True)
+        if (authoritative_retry_service is None and
+                placement_catalog is not None and
+                validation_service.placement_contract.enabled):
+            # A catalog reused from an earlier commit enumerates the locations
+            # that existed when it was built. Adding a Kubernetes context to a
+            # service afterwards therefore has no effect: the context never
+            # enters the catalog, the placer never lists it as zero-cost, and
+            # the reserved-fill broker never claims a pool for it. That failure
+            # is silent -- the spec, the workspace and the cluster all look
+            # correct while the capacity is simply never used. Observed in
+            # production with a spec-declared context absent from six
+            # consecutive versions' catalogs. Rebuild rather than inherit an
+            # enumeration the spec has outgrown.
+            missing = _catalog_missing_task_contexts(yaml_content,
+                                                     placement_catalog)
+            if missing:
+                logger.info(
+                    f'Rebuilding the placement catalog for version {version}: '
+                    f'the inherited catalog is missing Kubernetes context(s) '
+                    f'{sorted(missing)} that the task declares.')
+                placement_catalog = None
+        needs_catalog = (validation_service.placement_contract.enabled and
+                         placement_catalog is None)
+        needs_logical_validation = (authoritative_retry_service is None and
+                                    validation_service.uses_logical_replicas
+                                    is True)
         if needs_catalog or needs_logical_validation:
             try:
                 if needs_catalog:
@@ -3152,18 +3803,57 @@ class SkyServeController:
                         'single-node services. Multi-node replica routing '
                         'does not yet define a safe logical capacity contract.')
                 if needs_catalog:
-                    built_catalog = spot_placer.SpotPlacer.build_catalog(
-                        validation_service,
-                        update_task,
-                        workspace=self._replica_manager.workspace)
+
+                    def _build_catalog() -> Any:
+                        return spot_placer.SpotPlacer.build_catalog(
+                            validation_service,
+                            update_task,
+                            workspace=self._replica_manager.workspace)
+
+                    if prepared_config is None:
+                        built_catalog = _build_catalog()
+                    else:
+                        built_catalog = self._run_with_prepared_config(
+                            prepared_config, _build_catalog)
                     assert built_catalog is not None
                     placement_catalog = built_catalog.to_dict()
+                    # A freshly built catalog that still omits a declared
+                    # context means the context is unreachable or not allowed
+                    # in this service's workspace, not that the catalog is
+                    # stale. Say so: the alternative is a service that runs
+                    # indefinitely without the capacity its spec asks for.
+                    still_missing = _catalog_missing_task_contexts(
+                        yaml_content, placement_catalog)
+                    if still_missing:
+                        logger.error(
+                            'Placement catalog for version '
+                            f'{version} omits Kubernetes context(s) '
+                            f'{sorted(still_missing)} declared by the task. '
+                            'Reserved fill will not claim a pool for them. '
+                            'Check that each context is reachable and allowed '
+                            'in workspace '
+                            f'{self._replica_manager.workspace!r}.')
             except (ValueError, RuntimeError) as e:
+                self._discard_prepared_controller_config(prepared_config)
                 return responses.JSONResponse(content={'message': str(e)},
                                               status_code=400)
-        catalog_kwargs = ({
+        catalog_kwargs: dict[str, Any] = ({
             'placement_catalog': placement_catalog
         } if placement_catalog is not None else {})
+        recovery_kwargs: dict[str, Any] = ({
+            # The script is service-global and points at the latest committed
+            # generation. A delayed retry of an older immutable version must
+            # compare only that version's snapshot, never rewrite or compare
+            # the newer service-global recovery pointer.
+            **({
+                'ha_recovery_script': prepared_config.recovery_script,
+                'legacy_controller_config_snapshot': (prepared_config.legacy_snapshot),
+                'legacy_controller_applied_version': (self._applied_version if prepared_config.legacy_snapshot is not None else None),
+            } if authoritative_retry_service is None else {}),
+            'controller_config': prepared_config.durable_bytes,
+            'controller_config_digest': prepared_config.durable_digest,
+            'controller_config_snapshot_id': prepared_config.snapshot_id,
+        } if prepared_config is not None else {})
         result = serve_state.add_or_update_version(
             self._service_name,
             version,
@@ -3174,7 +3864,11 @@ class SkyServeController:
                                    self._service_hash),
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=self._controller_owner,
-            **catalog_kwargs)
+            **catalog_kwargs,
+            **recovery_kwargs)
+        if result not in (serve_state.VersionCommitResult.COMMITTED,
+                          serve_state.VersionCommitResult.IDEMPOTENT_RETRY):
+            self._discard_prepared_controller_config(prepared_config)
         if result is serve_state.VersionCommitResult.REJECTED:
             return responses.JSONResponse(content={
                 'message': 'Service lifecycle ownership changed or entered '
@@ -3225,19 +3919,49 @@ class SkyServeController:
                 },
                                               status_code=409)
             service = persisted_service
+            # A committed retry is an acknowledgement only. Reinstalling or
+            # re-enqueueing it can roll the process policy back after a newer
+            # version has applied, or resurrect a quarantined generation.
+            self._discard_retry_stage_if_unused(version, prepared_config)
+            content = {'message': 'Success'}
+            if prepared_config is not None:
+                content['config_snapshot_id'] = prepared_config.snapshot_id
+            content.update(self._get_update_status())
+            return responses.JSONResponse(content=content, status_code=200)
 
         logger.info(f'Committed update to version {version}: {service}')
-        self._record_committed_update(version, service, update_mode)
+        self._record_committed_update(version, service, update_mode,
+                                      prepared_config)
         content = {'message': 'Success'}
+        if prepared_config is not None:
+            content['config_snapshot_id'] = prepared_config.snapshot_id
         content.update(self._get_update_status())
         return responses.JSONResponse(content=content, status_code=200)
 
-    def _record_committed_update(self, version: int, service: Any,
-                                 update_mode: serve_utils.UpdateMode) -> None:
+    def _discard_retry_stage_if_unused(
+            self, version: int,
+            prepared_config: _PreparedControllerConfig | None) -> None:
+        if prepared_config is None:
+            return
+        with self._update_condition:
+            stage_in_use = any(update is not None and update.version == version
+                               for update in (self._pending_update,
+                                              self._applying_update))
+        if not stage_in_use:
+            serve_utils.remove_staged_controller_config(
+                prepared_config.staged_path)
+
+    def _record_committed_update(
+            self,
+            version: int,
+            service: Any,
+            update_mode: serve_utils.UpdateMode,
+            prepared_config: _PreparedControllerConfig | None = None) -> None:
         """Wake the reconciler after the update's durable commit."""
         update = _PendingServiceUpdate(version, service, update_mode,
-                                       time.time())
+                                       time.time(), prepared_config)
         scheduled = False
+        discarded: _PendingServiceUpdate | None = None
         with self._update_condition:
             self._committed_version = max(self._committed_version, version)
             if version > self._applied_version:
@@ -3247,10 +3971,16 @@ class SkyServeController:
                     # This matches controller recovery, which also boots only
                     # the newest committed version.
                     self._pending_update = update
+                    if pending is not self._applying_update:
+                        discarded = pending
                     scheduled = True
                     self._update_apply_error = None
                     self._update_apply_failures = 0
             self._update_condition.notify()
+        if discarded is not None:
+            self._discard_prepared_controller_config(discarded.prepared_config)
+        if not scheduled:
+            self._discard_prepared_controller_config(prepared_config)
         if scheduled:
             # Publish this before the reconciler waits on the manager lock.
             # Large stale scale-up batches use the signal to yield to the newer
@@ -3295,6 +4025,7 @@ class SkyServeController:
             if self._pending_update is update:
                 self._pending_update = None
         self._replica_manager.clear_pending_version(update.version)
+        self._discard_prepared_controller_config(update.prepared_config)
 
     def _record_retryable_update_failure(self,
                                          update: _PendingServiceUpdate,
@@ -3326,6 +4057,8 @@ class SkyServeController:
 
     def _reconcile_pending_update_once(self, wait: bool = False) -> bool:
         """Apply one pending update; optionally wait through retry backoff."""
+        if self._update_recovery_required:
+            return True
         with self._update_condition:
             while (self._pending_update is None or
                    self._pending_update.version <= self._applied_version):
@@ -3333,7 +4066,22 @@ class SkyServeController:
                     return True
                 self._update_condition.wait()
             update = self._pending_update
+            self._applying_update = update
 
+        try:
+            return self._reconcile_selected_update(update, wait)
+        finally:
+            with self._update_condition:
+                if self._applying_update is update:
+                    self._applying_update = None
+                discard_prepared = self._pending_update is not update
+                self._update_condition.notify_all()
+            if discard_prepared:
+                self._discard_prepared_controller_config(update.prepared_config)
+
+    def _reconcile_selected_update(self, update: _PendingServiceUpdate,
+                                   wait: bool) -> bool:
+        """Apply one update already fenced as the active reconciliation."""
         try:
             if not self._update_still_authorized():
                 logger.info(
@@ -3342,7 +4090,8 @@ class SkyServeController:
                 self._drop_pending_update(update)
                 return True
             self._apply_service_update(update.version, update.service,
-                                       update.update_mode)
+                                       update.update_mode,
+                                       update.prepared_config)
         except DeterministicServiceUpdateError as e:
             exception_str = common_utils.format_exception(e)
             quarantined_at = time.time()
@@ -3369,8 +4118,8 @@ class SkyServeController:
             with self._update_condition:
                 if self._pending_update is update:
                     self._pending_update = None
-                self._update_apply_error = exception_str
-                self._update_apply_failures = 1
+                    self._update_apply_error = exception_str
+                    self._update_apply_failures = 1
                 self._quarantined_version = update.version
                 self._quarantined_at = quarantined_at
                 self._quarantine_reason = exception_str
@@ -3380,6 +4129,19 @@ class SkyServeController:
                 f'Quarantined committed service version {update.version}; '
                 f'continuing applied version {self._applied_version}: '
                 f'{exception_str}')
+            return True
+        except ServiceUpdateRequiresRecoveryError as e:
+            # Keep the pending-version launch fence asserted until the parent
+            # replaces this child. The raw stage may have been consumed and
+            # manager/autoscaler state may be partial, so an in-process retry
+            # is not an admissible recovery mechanism.
+            exception_str = common_utils.format_exception(e)
+            with self._update_condition:
+                self._update_apply_error = exception_str
+                self._update_apply_failures += 1
+            logger.error(f'Committed service version {update.version} '
+                         'requires supervised controller recovery: '
+                         f'{exception_str}')
             return True
         except Exception as e:  # pylint: disable=broad-except
             return self._record_retryable_update_failure(update, e, wait)
@@ -3396,8 +4158,37 @@ class SkyServeController:
 
     def _run_update_reconciler(self) -> None:
         """Continuously converge runtime state to the newest committed spec."""
-        while True:
+        stop_event = self._update_reconciler_stop
+        while (not self._update_recovery_required and not stop_event.is_set()):
             self._reconcile_pending_update_once(wait=True)
+
+    def _run_orphaned_config_stage_sweeper(self) -> None:
+        """Remove expired raw stages that no update handler can reconcile."""
+        stop_event = self._update_reconciler_stop
+        while not stop_event.is_set():
+            try:
+                # The update endpoint holds this same lock from raw-stage
+                # admission through its commit/cleanup finally block. GC can
+                # therefore never unlink a stage being consumed by this child.
+                with self._update_lock:
+                    removed_versions = (
+                        serve_utils.gc_orphaned_staged_controller_configs(
+                            self._service_name, self._resource_scope))
+                if removed_versions:
+                    logger.info(
+                        'Removed expired uncommitted controller config stages '
+                        f'for service {self._service_name!r}, versions '
+                        f'{removed_versions}.')
+            except Exception as e:  # pylint: disable=broad-except
+                # Database uncertainty must preserve the raw stage. Retry on
+                # the next bounded sweep instead of weakening commit safety.
+                logger.warning(
+                    'Could not reconcile orphaned controller config stages '
+                    f'for service {self._service_name!r}: '
+                    f'{common_utils.format_exception(e)}')
+            if stop_event.wait(serve_constants.
+                               ORPHANED_CONFIG_STAGE_SWEEP_INTERVAL_SECONDS):
+                return
 
     def _quarantine_unrecoverable_rollout(
         self,
@@ -3436,28 +4227,39 @@ class SkyServeController:
             self._quarantine_reason = failure.reason
             self._update_apply_error = failure.reason
             self._update_apply_failures = 1
+        self._fence_actuation_for_update_recovery()
         logger.error(
             f'Quarantined never-ready service version {failure.version}; '
             'terminating this controller child so recovery can elect the '
             f'proven active runtime: {failure.reason}')
         return True
 
-    def _apply_service_update(self, version: int, service: Any,
-                              update_mode: serve_utils.UpdateMode) -> None:
+    def _apply_service_update(
+            self,
+            version: int,
+            service: Any,
+            update_mode: serve_utils.UpdateMode,
+            prepared_config: _PreparedControllerConfig | None = None) -> None:
         """Apply a persisted update to the live controller state."""
         try:
-            if (getattr(self._autoscaler, 'replica_unit', None) == 'logical' and
-                    getattr(service, 'uses_logical_replicas',
-                            False) is not True):
-                raise ValueError(
-                    'Refusing to apply a physical-backend version after '
-                    'logical replica semantics were activated.')
-            candidate_spot_placer = (
-                replica_managers.validate_service_update_preflight(
+
+            def _preflight() -> Any:
+                if (self._autoscaler.replica_unit == 'logical' and
+                        service.uses_logical_replicas is not True):
+                    raise ValueError(
+                        'Refusing to apply a physical-backend version after '
+                        'logical replica semantics were activated.')
+                return replica_managers.validate_service_update_preflight(
                     self._service_name,
                     version,
                     service,
-                    workspace=self._replica_manager.workspace))
+                    workspace=self._replica_manager.workspace)
+
+            if prepared_config is None:
+                candidate_spot_placer = _preflight()
+            else:
+                candidate_spot_placer = self._run_with_prepared_config(
+                    prepared_config, _preflight)
         except (AssertionError, RuntimeError, TypeError, ValueError) as e:
             raise DeterministicServiceUpdateError(
                 f'Version {version} failed deterministic launch preflight: '
@@ -3469,71 +4271,117 @@ class SkyServeController:
         # signal lets that batch yield promptly so update_version can acquire
         # the lock and make the durable version live.
         self._replica_manager.notify_version_pending(version)
+        config_transition_started = False
+        runtime_transition_started = False
+
+        def _install_matching_config() -> None:
+            nonlocal config_transition_started
+            config_transition_started = True
+            assert prepared_config is not None
+            self._install_controller_config(prepared_config)
+
+        actuation_epoch_lock = self._get_actuation_epoch_lock()
+        actuation_epoch_lock.acquire()
         try:
-            self._replica_manager.update_version(
-                version,
-                service,
-                update_mode=update_mode,
-                new_spot_placer=(candidate_spot_placer))
-        finally:
-            self._replica_manager.clear_pending_version(version)
-        new_autoscaler = autoscalers.Autoscaler.from_spec(
-            self._service_name, service)
-        accelerator_shapes = self._accelerator_shapes_for_compatibility(
-            new_autoscaler, service)
-        replace_autoscaler = not isinstance(self._autoscaler,
-                                            type(new_autoscaler))
-        if replace_autoscaler:
-            logger.info('Autoscaler type changed to '
-                        f'{type(new_autoscaler)}, updating autoscaler.')
-        # Build against the candidate type before mutating the retained live
-        # autoscaler.  Publication below then contains no fallible catalog or
-        # task parsing between the runtime transition and its version fence.
-        new_routing_spec = self._build_routing_spec(service, new_autoscaler)
-        reserved_capacity_fill_enabled = bool(
-            getattr(service, 'reserved_capacity_fill', False))
-        with self._routing_state_lock:
-            if replace_autoscaler:
-                old_autoscaler = self._autoscaler
-                # Snapshot, restore, initialize, and publish while LB demand
-                # ingestion is excluded by this routing-epoch lock. The old
-                # autoscaler's own state lock makes its dump internally
-                # coherent; keeping the controller lock through publication
-                # also prevents a later authoritative report from landing on
-                # the old object and being lost from the replacement.
-                new_autoscaler.load_dynamic_states(
-                    old_autoscaler.dump_dynamic_states())
-                if isinstance(new_autoscaler,
-                              (autoscalers.InstanceAwareRequestRateAutoscaler,
-                               autoscalers.ConcurrencyAutoscaler)):
-                    new_autoscaler.update_version_and_accelerator_shapes(
-                        version, service, update_mode, accelerator_shapes)
-                else:
-                    new_autoscaler.update_version(version,
-                                                  service,
-                                                  update_mode=update_mode)
-                # Seed BEFORE publishing: the replacement cannot take a
-                # decision tick with an empty zero-cost location set.
-                self._seed_fill_zero_cost_locations(new_autoscaler)
-                self._autoscaler = new_autoscaler
+            runtime_transition_started = True
+            if prepared_config is None:
+                self._replica_manager.update_version(
+                    version,
+                    service,
+                    update_mode=update_mode,
+                    new_spot_placer=(candidate_spot_placer))
             else:
-                if isinstance(self._autoscaler,
-                              (autoscalers.InstanceAwareRequestRateAutoscaler,
-                               autoscalers.ConcurrencyAutoscaler)):
-                    self._autoscaler.update_version_and_accelerator_shapes(
-                        version, service, update_mode, accelerator_shapes)
+                self._replica_manager.update_version(
+                    version,
+                    service,
+                    update_mode=update_mode,
+                    new_spot_placer=(candidate_spot_placer),
+                    install_config=_install_matching_config)
+            new_autoscaler = autoscalers.Autoscaler.from_spec(
+                self._service_name, service)
+            accelerator_shapes = self._accelerator_shapes_for_compatibility(
+                new_autoscaler, service)
+            replace_autoscaler = not isinstance(self._autoscaler,
+                                                type(new_autoscaler))
+            if replace_autoscaler:
+                logger.info('Autoscaler type changed to '
+                            f'{type(new_autoscaler)}, updating autoscaler.')
+            # Build against the candidate type before mutating the retained live
+            # autoscaler.  Publication below then contains no fallible catalog or
+            # task parsing between the runtime transition and its version fence.
+            new_routing_spec = self._build_routing_spec(service, new_autoscaler)
+            reserved_capacity_fill_enabled = bool(
+                service.reserved_capacity_fill)
+            with self._routing_state_lock:
+                if replace_autoscaler:
+                    old_autoscaler = self._autoscaler
+                    # Snapshot, restore, initialize, and publish while LB demand
+                    # ingestion is excluded by this routing-epoch lock. The old
+                    # autoscaler's own state lock makes its dump internally
+                    # coherent; keeping the controller lock through publication
+                    # also prevents a later authoritative report from landing on
+                    # the old object and being lost from the replacement.
+                    new_autoscaler.load_dynamic_states(
+                        old_autoscaler.dump_dynamic_states())
+                    if isinstance(
+                            new_autoscaler,
+                        (autoscalers.InstanceAwareRequestRateAutoscaler,
+                         autoscalers.ConcurrencyAutoscaler)):
+                        new_autoscaler.update_version_and_accelerator_shapes(
+                            version, service, update_mode, accelerator_shapes)
+                    else:
+                        new_autoscaler.update_version(version,
+                                                      service,
+                                                      update_mode=update_mode)
+                    # Seed BEFORE publishing: the replacement cannot take a
+                    # decision tick with an empty zero-cost location set.
+                    self._seed_fill_zero_cost_locations(new_autoscaler)
+                    self._autoscaler = new_autoscaler
                 else:
-                    self._autoscaler.update_version(version,
-                                                    service,
-                                                    update_mode=update_mode)
-            self._reserved_capacity_fill_enabled = (
-                reserved_capacity_fill_enabled)
-            self._routing_spec = new_routing_spec
-            # This assignment is part of the same critical section as the
-            # exact-card catalog and routing spec.  The sync handler and demand
-            # ingestion take this lock, so no response/report can observe a
-            # mixed epoch.
-            self._applied_version = max(self._applied_version, version)
+                    if isinstance(
+                            self._autoscaler,
+                        (autoscalers.InstanceAwareRequestRateAutoscaler,
+                         autoscalers.ConcurrencyAutoscaler)):
+                        self._autoscaler.update_version_and_accelerator_shapes(
+                            version, service, update_mode, accelerator_shapes)
+                    else:
+                        self._autoscaler.update_version(version,
+                                                        service,
+                                                        update_mode=update_mode)
+                self._reserved_capacity_fill_enabled = (
+                    reserved_capacity_fill_enabled)
+                self._routing_spec = new_routing_spec
+                # This assignment is part of the same critical section as the
+                # exact-card catalog and routing spec.  The sync handler and demand
+                # ingestion take this lock, so no response/report can observe a
+                # mixed epoch.
+                self._applied_version = max(self._applied_version, version)
+            if not self._mark_controller_applied_version(version):
+                raise RuntimeError(
+                    f'Could not durably mark service version {version} as '
+                    'controller-applied under the current ownership fence.')
+        except Exception as e:  # pylint: disable=broad-except
+            if config_transition_started or runtime_transition_started:
+                # The immutable raw stage may already have been consumed and
+                # manager state may have advanced. In-process retry cannot
+                # prove a coherent rollback, so delegate to quarantine-aware
+                # supervised recovery before another launch is admitted.
+                # The parent keeps the same durable owner tuple while it
+                # respawns this child, so ownership checks alone cannot close
+                # this window.  Fence queued, in-flight, and future manager
+                # launches before arranging termination; correctness must not
+                # depend on how quickly SIGTERM is delivered.
+                self._fence_actuation_for_update_recovery()
+                self._schedule_supervised_recovery()
+                raise ServiceUpdateRequiresRecoveryError(
+                    f'Version {version} failed after its controller runtime '
+                    f'transition began: '
+                    f'{common_utils.format_exception(e)}') from e
+            raise
+        finally:
+            if not self._update_recovery_required:
+                self._replica_manager.clear_pending_version(version)
+            actuation_epoch_lock.release()
         if reserved_capacity_fill_enabled:
             # An update can enable fill on a live service: give
             # the (retained or replaced) autoscaler the location
@@ -3583,19 +4431,30 @@ class SkyServeController:
             self._reserved_capacity_poller_started = True
         thread_utils.start_supervised_thread(
             lambda: reserved_capacity.poller_loop(
-                lambda: self._autoscaler, lambda: self._replica_manager.
-                spot_placer, self._service_name, self._service_hash, self.
-                _controller_owner), 'reserved-capacity-poller')
+                lambda: self._autoscaler,
+                lambda: self._replica_manager.spot_placer,
+                self._service_name,
+                self._service_hash,
+                self._controller_owner,
+                stop_event=self._get_actuation_stop(),
+                actuation_epoch_lock=self._get_actuation_epoch_lock()),
+            'reserved-capacity-poller',
+            stop_event=self._get_actuation_stop())
 
     def _run_autoscaler(self):
         logger.info('Starting autoscaler.')
-        while True:
+        stop_event = self._get_actuation_stop()
+        while not stop_event.is_set():
             # Clear before reading durable replica and placement state. Typed
             # feedback that arrived before this point is consumed by this tick;
             # feedback that arrives during the tick leaves the signal set and
             # makes the interval wait below return immediately.
-            self._replica_manager.clear_scale_reconciliation_signal()
+            actuation_epoch_lock = self._get_actuation_epoch_lock()
+            actuation_epoch_lock.acquire()
             try:
+                if stop_event.is_set():
+                    return
+                self._replica_manager.clear_scale_reconciliation_signal()
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
                 self._replica_counts_snapshot = self._get_replica_counts(
@@ -3635,10 +4494,8 @@ class SkyServeController:
                     demand_target = (
                         decision_autoscaler.get_final_target_num_replicas())
                     fill_target = 0
-                    if (getattr(decision_autoscaler, 'reserved_capacity_fill',
-                                False) is True):
-                        fill_target = getattr(decision_autoscaler,
-                                              '_fill_target', 0)
+                    if decision_autoscaler.reserved_capacity_fill is True:
+                        fill_target = decision_autoscaler.fill_target
                     if (type(fill_target) is not int or  # pylint: disable=unidiomatic-typecheck
                             fill_target < 0):
                         fill_target = 0
@@ -3804,6 +4661,15 @@ class SkyServeController:
                                     'launch_priority_by_accelerator'] = dict(
                                         logical_target.
                                         launch_priority_by_accelerator)
+                            if (logical_target.
+                                    cold_launch_authority_by_accelerator
+                                    is not None):
+                                replacement_kwargs[
+                                    'cold_launch_authority_by_accelerator'] = (
+                                        dict(
+                                            logical_target.
+                                            cold_launch_authority_by_accelerator
+                                        ))
                             if logical_target.target_capacity_by_accelerator:
                                 replacement_kwargs[
                                     'target_capacity_by_accelerator'] = dict(
@@ -3862,6 +4728,10 @@ class SkyServeController:
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
+            finally:
+                actuation_epoch_lock.release()
+            if stop_event.is_set():
+                return
             self._replica_manager.wait_for_scale_reconciliation(
                 self._autoscaler.get_decision_interval())
 
@@ -3870,7 +4740,7 @@ class SkyServeController:
         # Every non-pool service uses the external LB topology. Refuse to boot
         # an externally reachable controller with either auth boundary absent;
         # pools have no LB and retain optional localhost/admin auth.
-        auth_required = not getattr(self, '_is_pool', True)
+        auth_required = not self._is_pool
         if auth_required:
             serve_utils.get_lb_sync_auth_tokens(required=True)
             serve_utils.get_controller_admin_auth_tokens(required=True)
@@ -3894,6 +4764,17 @@ class SkyServeController:
                                           status_code=200)
 
         @self._app.get(
+            serve_constants.CONTROLLER_UPDATE_CAPABILITIES_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        async def get_update_capabilities() -> fastapi.Response:
+            return responses.JSONResponse(content={
+                'config_snapshot_protocol_version':
+                    serve_constants.
+                    SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            },
+                                          status_code=200)
+
+        @self._app.get(
             serve_constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
             dependencies=[admin_auth_dependency, controller_owner_dependency])
         def get_placement_state() -> fastapi.Response:
@@ -3911,13 +4792,11 @@ class SkyServeController:
                 try:
                     budget = paid_capacity.build_launch_budget(
                         placer,
-                        workspace=getattr(self._replica_manager, '_workspace',
-                                          constants.SKYPILOT_DEFAULT_WORKSPACE),
+                        workspace=self._replica_manager.workspace,
                         existing_replica_infos=replica_infos,
-                        globally_managed=getattr(self, '_service_hash',
-                                                 None) is not None,
+                        globally_managed=self._service_hash is not None,
                         service_name=self._service_name,
-                        service_hash=getattr(self, '_service_hash', None))
+                        service_hash=self._service_hash)
                     paid_admission = (
                         paid_capacity.admission_snapshot_by_location(budget))
                 except Exception as e:  # pylint: disable=broad-except
@@ -4008,15 +4887,44 @@ class SkyServeController:
         @self._app.post(
             '/controller/update_service',
             dependencies=[admin_auth_dependency, controller_owner_dependency])
+        @self._app.post(
+            serve_constants.CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
         @_serialize_update
-        def update_service(request_data: dict[str, Any] = fastapi.Body(
-            ...)) -> fastapi.Response:
+        def update_service(
+            http_request: fastapi.Request,
+            request_data: dict[str, Any] = fastapi.Body(...)
+        ) -> fastapi.Response:
+            version = request_data.get('version', None)
+            snapshot_id = request_data.get('config_snapshot_id')
+            has_config_snapshot = request_data.get('has_config_snapshot', False)
+            is_config_endpoint = (http_request.url.path == serve_constants.
+                                  CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH)
             try:
-                version = request_data.get('version', None)
+                if is_config_endpoint != (has_config_snapshot is True):
+                    return responses.JSONResponse(content={
+                        'message': 'The atomic config-update endpoint and '
+                                   'snapshot body must be used together.'
+                    },
+                                                  status_code=400)
+                if (not is_config_endpoint and
+                        serve_utils.is_consolidation_mode(self._is_pool)):
+                    return responses.JSONResponse(content={
+                        'message': 'Legacy updates are disabled for a '
+                                   'controller running the atomic config '
+                                   'refresh protocol. Quiesce updates until '
+                                   'all API pods and controllers are rolled.'
+                    },
+                                                  status_code=409)
                 if version is None:
                     return responses.JSONResponse(
                         content={'message': 'Error: version is not specified.'},
                         status_code=400)
+                if type(version) is not int or version <= 0:  # pylint: disable=unidiomatic-typecheck
+                    return responses.JSONResponse(content={
+                        'message': 'Version must be a positive integer.'
+                    },
+                                                  status_code=400)
                 update_mode_str = request_data.get(
                     'mode', serve_utils.DEFAULT_UPDATE_MODE.value)
                 update_mode = serve_utils.UpdateMode(update_mode_str)
@@ -4033,7 +4941,6 @@ class SkyServeController:
                 submitted_yaml_content = _read_declared_submitted_yaml(
                     request_data, self._service_name, version,
                     self._resource_scope)
-                service = self._load_service_for_update(version, yaml_content)
                 requested_service_hash = request_data.get('service_hash')
                 lifecycle_epoch = request_data.get('lifecycle_epoch')
                 if (requested_service_hash is not None and
@@ -4043,11 +4950,34 @@ class SkyServeController:
                                    'the update was committed.'
                     },
                                                   status_code=409)
+                prepared_config = None
+                if has_config_snapshot:
+                    if (not isinstance(lifecycle_epoch, int) or
+                            isinstance(lifecycle_epoch, bool)):
+                        return responses.JSONResponse(content={
+                            'message': 'A config refresh requires a fenced '
+                                       'service lifecycle epoch.'
+                        },
+                                                      status_code=409)
+                    expected_digest = request_data.get('config_snapshot_digest')
+                    if (not isinstance(expected_digest, str) or re.fullmatch(
+                            r'[0-9a-f]{64}', expected_digest) is None or
+                            not isinstance(snapshot_id, str) or
+                            re.fullmatch(r'[0-9a-f]{64}', snapshot_id) is None):
+                        return responses.JSONResponse(content={
+                            'message': 'A valid config snapshot digest and '
+                                       'ID are required.'
+                        },
+                                                      status_code=400)
+                    prepared_config = self._prepare_controller_config_update(
+                        version, expected_digest, snapshot_id)
+                service = self._load_service_for_update(version, yaml_content)
                 return self._commit_service_update(version, service,
                                                    yaml_content, update_mode,
                                                    requested_service_hash,
                                                    lifecycle_epoch,
-                                                   submitted_yaml_content)
+                                                   submitted_yaml_content,
+                                                   prepared_config)
             except Exception as e:  # pylint: disable=broad-except
                 exception_str = common_utils.format_exception(e)
                 logger.error(f'Error in update_service: {exception_str}')
@@ -4057,6 +4987,61 @@ class SkyServeController:
                     'traceback': traceback.format_exc()
                 },
                                               status_code=500)
+            finally:
+                if (is_config_endpoint and isinstance(version, int) and
+                        not isinstance(version, bool) and
+                        isinstance(snapshot_id, str) and
+                        re.fullmatch(r'[0-9a-f]{64}', snapshot_id) is not None):
+                    try:
+                        committed = serve_state.get_yaml_content(
+                            self._service_name, version) is not None
+                    except Exception:  # pylint: disable=broad-except
+                        committed = True
+                    if not committed:
+                        staged_path = (
+                            serve_utils.generate_staged_config_yaml_file_name(
+                                self._service_name,
+                                version,
+                                self._resource_scope,
+                                snapshot_id=snapshot_id))
+                        serve_utils.remove_staged_controller_config(staged_path)
+
+        @self._app.post(
+            serve_constants.CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        @_serialize_update
+        def cleanup_staged_update_config(request_data: dict[
+            str, Any] = fastapi.Body(...)) -> fastapi.Response:
+            """Clean an ambiguous raw stage after all update handlers drain."""
+            version = request_data.get('version')
+            lifecycle_epoch = request_data.get('expected_lifecycle_epoch')
+            snapshot_id = request_data.get('config_snapshot_id')
+            if (not isinstance(version, int) or isinstance(version, bool) or
+                    not isinstance(lifecycle_epoch, int) or
+                    isinstance(lifecycle_epoch, bool) or
+                    not isinstance(snapshot_id, str) or
+                    re.fullmatch(r'[0-9a-f]{64}', snapshot_id) is None):
+                return responses.JSONResponse(content={
+                    'message': 'Version, lifecycle epoch, and config snapshot '
+                               'ID are required.'
+                },
+                                              status_code=400)
+            owner = serve_state.get_service_controller_owner(self._service_name)
+            current_owner = ((owner.get('controller_pid'),
+                              owner.get('controller_ip'))
+                             if owner is not None else None)
+            if (owner is None or owner.get('hash') != self._service_hash or
+                    owner.get('lifecycle_epoch') != lifecycle_epoch or
+                    current_owner != self._controller_owner):
+                return responses.JSONResponse(content={
+                    'message': 'Service lifecycle ownership changed before '
+                               'staged config cleanup.'
+                },
+                                              status_code=409)
+            removed = (serve_utils.remove_uncommitted_staged_controller_config(
+                self._service_name, version, self._resource_scope, snapshot_id))
+            return responses.JSONResponse(content={'removed': removed},
+                                          status_code=200)
 
         @self._app.post(
             '/controller/set_load_balancer_high_availability',
@@ -4151,13 +5136,27 @@ class SkyServeController:
         # A committed update is the API success boundary. Apply it on a
         # controller-owned worker so fleet-wide replica locks cannot make the
         # request time out or prevent a later update from committing.
-        thread_utils.start_supervised_thread(self._run_update_reconciler,
-                                             'service-update-reconciler')
+        thread_utils.start_supervised_thread(
+            self._run_update_reconciler,
+            'service-update-reconciler',
+            stop_event=self._get_update_reconciler_stop())
+
+        # Raw policy-admitted snapshots can contain credentials. A pod-local
+        # controller survives API-request crashes, so it owns periodic cleanup
+        # of expired NULL-yaml stages in addition to endpoint-local finally
+        # cleanup. The first sweep runs immediately on every child start.
+        thread_utils.start_supervised_thread(
+            self._run_orphaned_config_stage_sweeper,
+            'controller-config-stage-sweeper',
+            stop_event=self._get_update_reconciler_stop())
 
         # Supervised so a BaseException escaping the autoscaler loop (or the
         # loop returning) does not silently stop all scaling decisions while
         # the controller keeps serving HTTP -- it is restarted instead.
-        thread_utils.start_supervised_thread(self._run_autoscaler, 'autoscaler')
+        thread_utils.start_supervised_thread(
+            self._run_autoscaler,
+            'autoscaler',
+            stop_event=self._get_actuation_stop())
 
         if self._reserved_capacity_fill_enabled:
             self._start_reserved_capacity_poller_if_needed()
@@ -4211,6 +5210,9 @@ def run_controller(service_name: str,
                    controller_ip: str | None = None,
                    enforce_launch_fence: bool = False,
                    controller_socket: socket.socket | None = None):
+    setproctitle.setproctitle('sky.serve.controller '
+                              f'--service-name {service_name} '
+                              f'--service-incarnation {service_hash or ""}')
     db_utils.set_postgres_connection_metrics_process_role('serve-controller')
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.

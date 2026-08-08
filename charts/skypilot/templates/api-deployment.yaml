@@ -1,6 +1,16 @@
+{{- if hasKey .Values "resourceActions" -}}
+{{- fail "resourceActions.authorityWorker has been removed; delete the stored resourceActions value before upgrading" -}}
+{{- end -}}
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $haEnabled := get $haConfig "enabled" | default false -}}
+{{- $rollingUpdate := .Values.apiService.rollingUpdate | default (dict) -}}
+{{- $rollingUpdateMaxSurge := dig "maxSurge" 1 $rollingUpdate -}}
+{{- $rollingUpdateMaxUnavailable := dig "maxUnavailable" 0 $rollingUpdate -}}
+{{- if and (not .Values.storage.enabled) (not (empty (get .Values.storage "existingClaim"))) -}}
+{{- fail "storage.existingClaim requires storage.enabled=true" -}}
+{{- end -}}
 {{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
 {{- $apiTopologySpreadTopologyKey := get .Values.apiService "topologySpreadTopologyKey" -}}
 {{- if and $haEnabled (not (hasKey .Values.apiService "topologySpreadTopologyKey")) -}}
@@ -10,35 +20,9 @@
 {{- $executorReplicas := dig "replicas" 2 $executorService -}}
 {{- $controllerService := .Values.controllerService | default (dict) -}}
 {{- $controllerReplicas := dig "replicas" 2 $controllerService -}}
-{{- $resourceActions := .Values.resourceActions | default (dict) -}}
-{{- $authorityWorker := get $resourceActions "authorityWorker" | default (dict) -}}
-{{- $authorityWorkerEnabled := get $authorityWorker "enabled" | default false -}}
-{{- $authorityInstallationId := get $authorityWorker "installationId" | default "" -}}
-{{- $authorityCohortSuffixes := list -}}
-{{- $authorityRetirementTombstones := list -}}
-{{- if $authorityWorkerEnabled -}}
-{{- $authoritySuffixSet := dict -}}
-{{- range $cohort := get $authorityWorker "cohorts" | default (list) -}}
-{{- $suffix := get $cohort "id" | default "" -}}
-{{- if hasKey $authoritySuffixSet $suffix -}}
-{{- fail (printf "resourceActions.authorityWorker cohort id %q is duplicated" $suffix) -}}
-{{- end -}}
-{{- $_ := set $authoritySuffixSet $suffix true -}}
-{{- $authorityCohortSuffixes = append $authorityCohortSuffixes $suffix -}}
-{{- end -}}
-{{- $authorityCohortSuffixes = sortAlpha $authorityCohortSuffixes -}}
-{{- $authorityTombstoneSet := dict -}}
-{{- range $suffix := get $authorityWorker "retirementTombstones" | default (list) -}}
-{{- if or (hasKey $authoritySuffixSet $suffix) (hasKey $authorityTombstoneSet $suffix) -}}
-{{- fail (printf "resourceActions.authorityWorker retirement tombstone %q is duplicated or still active" $suffix) -}}
-{{- end -}}
-{{- $_ := set $authorityTombstoneSet $suffix true -}}
-{{- $authorityRetirementTombstones = append $authorityRetirementTombstones $suffix -}}
-{{- end -}}
-{{- $authorityRetirementTombstones = sortAlpha $authorityRetirementTombstones -}}
-{{- end -}}
 {{- $externalLB := .Values.serve.externalLoadBalancer | default (dict) -}}
 {{- $externalLBEnabled := get $externalLB "enabled" | default false -}}
+{{- $externalLBPriorityClassName := get $externalLB "priorityClassName" | default "" -}}
 {{- $externalLBResources := get $externalLB "resources" | default (dict) -}}
 {{- $externalLBAuth := get $externalLB "auth" | default (dict) -}}
 {{- $lbSyncAuth := get $externalLBAuth "lbSync" | default (dict) -}}
@@ -68,13 +52,8 @@
 {{- end -}}
 {{- /* Custom credential wiring is the compatibility path when a native chart
       credential block is disabled. Reserve provider-owned credential fields
-      only when the chart will actually emit them. The authority activation
-      marker has no compatibility meaning and remains chart-owned in every
-      mode. */ -}}
-{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
-{{- if $authorityWorkerEnabled -}}
-{{- $apiReservedEnvNames = concat $apiReservedEnvNames (list "SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON") -}}
-{{- end -}}
+      only when the chart will actually emit them. */ -}}
+{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedEnvNames = concat $apiReservedEnvNames (list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY") -}}
 {{- end -}}
@@ -195,6 +174,13 @@
 {{- if ne .Values.apiService.upgradeStrategy "RollingUpdate" -}}
 {{- fail "apiService.highAvailability.enabled=true requires apiService.upgradeStrategy=RollingUpdate" -}}
 {{- end -}}
+{{- $rollingUpdateMaxUnavailableString := toString $rollingUpdateMaxUnavailable -}}
+{{- if and (ne $rollingUpdateMaxUnavailableString "0") (ne $rollingUpdateMaxUnavailableString "0%") -}}
+{{- fail "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxUnavailable=0 or 0%" -}}
+{{- end -}}
+{{- if ne (toString $rollingUpdateMaxSurge) "1" -}}
+{{- fail "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1" -}}
+{{- end -}}
 {{- if not .Values.storage.enabled -}}
 {{- fail "apiService.highAvailability.enabled=true requires storage.enabled=true" -}}
 {{- end -}}
@@ -236,14 +222,23 @@
 {{- else if $haEnabled -}}
 {{- fail "apiService.highAvailability.enabled=true requires requestStore.backend=postgres" -}}
 {{- end -}}
+{{- if and (default false .Values.requestStore.enforceBuiltinExecutionQuiescenceBackends) (ne .Values.requestStore.backend "postgres") -}}
+{{- fail "requestStore.enforceBuiltinExecutionQuiescenceBackends=true requires requestStore.backend=postgres" -}}
+{{- end -}}
 {{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.apiService.extraEnvs) "reservedEnvNames" $apiReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes) "reservedVolumeNames" $apiReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts) "reservedMountPaths" $apiReservedMountPaths) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $fullName }}-api-server
   namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.apiService.replicas }}
+  {{- if $haEnabled }}
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  {{- end }}
   {{- if eq .Values.apiService.upgradeStrategy "RollingUpdate" }}
   {{- if and (not .Values.apiService.dbConnectionSecretName) (not .Values.apiService.dbConnectionString) }}
   {{- fail "External database must be configured via .apiService.dbConnectionSecretName or .apiService.dbConnectionString when using RollingUpdate strategy" }}
@@ -251,14 +246,13 @@ spec:
   {{- if and .Values.storage.enabled (ne .Values.storage.accessMode "ReadWriteMany") }}
   {{- fail "Local storage with ReadWriteOnce access mode is not supported when using RollingUpdate strategy. Either use Recreate upgrade strategy, set storage.enabled to false, or use ReadWriteMany access mode with a compatible storage class (e.g., NFS-backed storage like Google Filestore)." }}
   {{- end }}
-  {{- $rollingUpdate := .Values.apiService.rollingUpdate | default (dict) }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
       {{- /* dig (not `default`) so an explicit 0 is honored — Go templates treat
              0 as empty, which would silently fall back to the default. */}}
-      maxSurge: {{ dig "maxSurge" 1 $rollingUpdate }}
-      maxUnavailable: {{ dig "maxUnavailable" 0 $rollingUpdate }}
+      maxSurge: {{ $rollingUpdateMaxSurge }}
+      maxUnavailable: {{ $rollingUpdateMaxUnavailable }}
   {{- else }}
   strategy:
     type: Recreate
@@ -286,12 +280,13 @@ spec:
         {{- end }}
       labels:
         app: {{ $fullName }}-api
+        app.kubernetes.io/instance: {{ .Release.Name }}
         # This label indicates that the API server is ready to serve requests.
         skypilot.co/ready: "true"
     spec:
-      # External-LB and resource-action authority modes also need the SA token:
-      # their API-role reconcilers use in-cluster config for exact scoped reads.
-      automountServiceAccountToken: {{ or .Values.kubernetesCredentials.useApiServerCluster $externalLBEnabled $authorityWorkerEnabled }}
+      # External-LB mode also needs the SA token: the consolidated controller
+      # uses in-cluster config to reconcile each service's LB resources.
+      automountServiceAccountToken: {{ or .Values.kubernetesCredentials.useApiServerCluster $externalLBEnabled }}
       serviceAccountName: {{ include "skypilot.serviceAccountName" . }}
       {{- with .Values.podSecurityContext }}
       securityContext:
@@ -358,18 +353,10 @@ spec:
           value: {{ .Values.apiService.skypilotDev | quote }}
         - name: SKYPILOT_RELEASE_NAME
           value: {{ $fullName | quote }}
-        {{- if $authorityWorkerEnabled }}
-        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
-          value: "true"
-        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
-          value: {{ $authorityInstallationId | quote }}
-        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
-          value: {{ toRawJson $authorityCohortSuffixes | quote }}
-        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
-          value: {{ toRawJson $authorityRetirementTombstones | quote }}
-        {{- end }}
         - name: SKYPILOT_API_REQUEST_BACKEND
           value: {{ .Values.requestStore.backend | quote }}
+        - name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+          value: {{ default false .Values.requestStore.enforceBuiltinExecutionQuiescenceBackends | quote }}
         - name: SKYPILOT_API_SERVER_ROLE
           value: {{ ternary "api" "all" $haEnabled | quote }}
         - name: SKYPILOT_API_SERVER_INSTANCE_ID
@@ -490,6 +477,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD
+          value: {{ ternary "true" "false" .Values.serve.controllerHold | quote }}
         - name: SKYPILOT_SERVE_EXTERNAL_LB_ENABLED
           value: {{ ternary "true" "false" $externalLBEnabled | quote }}
         {{- if $externalLBEnabled }}
@@ -509,6 +498,8 @@ spec:
           value: {{ printf "http://%s-api-service.%s.svc" $fullName .Release.Namespace | quote }}
         - name: SKYPILOT_SERVE_LB_RESOURCES_JSON
           value: {{ toJson $externalLBResources | quote }}
+        - name: SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME
+          value: {{ $externalLBPriorityClassName | quote }}
         # Projected files are re-read by SkyServe, allowing overlap-token
         # rotation without restarting the API server or external LB pods.
         - name: SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE
@@ -844,10 +835,30 @@ spec:
         # Warn if logrotate is missing in the image and keep the sidecar running
         args:
         - |
+          # Track foreground work through wait so the shell can handle signals
+          # immediately instead of deferring them until a long sleep exits.
+          child_pid=""
+          shutdown() {
+            trap - TERM INT
+            if [ -n "${child_pid}" ]; then
+              kill "${child_pid}" 2>/dev/null || true
+            fi
+            exit 0
+          }
+          run_interruptibly() {
+            "$@" &
+            child_pid=$!
+            wait "${child_pid}"
+            child_status=$?
+            child_pid=""
+            return "${child_status}"
+          }
+          trap shutdown TERM INT
+
           if ! command -v logrotate >/dev/null 2>&1; then
             echo "warning: logrotate not found; skipping log retention" >&2
             while true; do
-              sleep 3600
+              run_interruptibly sleep 3600
             done
           fi
           set -x
@@ -869,8 +880,8 @@ spec:
           }
           EOF
           while true; do
-            logrotate -s /var/lib/logrotate/status /etc/logrotate.conf
-            sleep 60;
+            run_interruptibly logrotate -s /var/lib/logrotate/status /etc/logrotate.conf
+            run_interruptibly sleep 60
           done
         volumeMounts:
         {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
@@ -1167,7 +1178,7 @@ spec:
       {{- if .Values.storage.enabled }}
       - name: state-volume
         persistentVolumeClaim:
-          claimName: {{ $fullName }}-state
+          claimName: {{ $stateClaimName }}
       {{- if and (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
       # When using RollingUpdate with storage enabled, use a separate emptyDir
       # for ~/.sky to avoid running SQLite on NFS. Only specific subdirectories

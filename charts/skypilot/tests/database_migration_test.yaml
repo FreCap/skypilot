@@ -93,18 +93,11 @@ tests:
       - failedTemplate:
           errorMessage: 'databaseMigration.annotations["helm.sh/hook"] is managed by guarded PostgreSQL mode'
 
-  - it: should run the guarded preflight hook after HA is fully cleared
-    release:
-      name: stable-release
-      namespace: stable-namespace
+  - it: should keep the guarded PostgreSQL hook after HA is fully cleared
     set:
       apiService.dbConnectionSecretName: external-db
       apiService.highAvailability.enabled: false
       requestStore.backend: postgres
-      resourceActions.authorityWorker.enabled: false
-      resourceActions.authorityWorker.installationId: ""
-      resourceActions.authorityWorker.cohorts: []
-      resourceActions.authorityWorker.retirementTombstones: []
     asserts:
       - equal:
           path: metadata.annotations["helm.sh/hook"]
@@ -112,88 +105,10 @@ tests:
       - equal:
           path: metadata.annotations["helm.sh/hook-weight"]
           value: "-10"
-      - contains:
+      - notContains:
           path: spec.template.spec.containers[0].env
           content:
             name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON
-            value: '{"enabled":false,"helm_full_name":"stable-release","helm_release_name":"stable-release","installation_id":"","live_manifest_files":[],"namespace":"stable-namespace","tombstone_suffixes":[],"version":1}'
-
-  - it: should keep the Helm release anchor stable across a full-name override
-    release:
-      name: stable-release
-      namespace: stable-namespace
-    set:
-      fullnameOverride: proposed-full-name
-      apiService.dbConnectionSecretName: external-db
-      apiService.highAvailability.enabled: false
-      requestStore.backend: postgres
-      resourceActions.authorityWorker.enabled: false
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON
-            value: '{"enabled":false,"helm_full_name":"proposed-full-name","helm_release_name":"stable-release","installation_id":"","live_manifest_files":[],"namespace":"stable-namespace","tombstone_suffixes":[],"version":1}'
-
-  - it: should mount each enabled cohort manifest for exact pre-apply validation
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON
-            value: '{"enabled":true,"helm_full_name":"release-name","helm_release_name":"RELEASE-NAME","installation_id":"01234567-89ab-cdef-0123-456789abcdef","live_manifest_files":[{"cohort_suffix":"p2a-v1","path":"/etc/skypilot/resource-action-authority/release-preflight/p2a-v1/manifest.json"}],"namespace":"NAMESPACE","tombstone_suffixes":[],"version":1}'
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: authority-preflight-0
-            mountPath: /etc/skypilot/resource-action-authority/release-preflight/p2a-v1/manifest.json
-            subPath: manifest.json
-            readOnly: true
-      - contains:
-          path: spec.template.spec.volumes
-          content:
-            name: authority-preflight-0
-            configMap:
-              name: skypilot-ra-preflight-c3dfc52db6939125f1690179a09930e316d14a84
-              defaultMode: 292
-              items:
-                - key: manifest.json
-                  path: manifest.json
-
-  - it: should reserve enabled preflight manifest volume names
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    set:
-      databaseConnection.extraVolumes:
-        - name: authority-preflight-0
-          emptyDir: {}
-    asserts:
-      - failedTemplate:
-          errorMessage: volume name "authority-preflight-0" is duplicated or reserved by the chart
-
-  - it: should reserve enabled preflight manifest mount paths
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    set:
-      databaseConnection.extraVolumeMounts:
-        - name: compatibility-manifest
-          mountPath: /etc/skypilot/resource-action-authority/release-preflight/p2a-v1/manifest.json
-    asserts:
-      - failedTemplate:
-          errorMessage: volume mount path "/etc/skypilot/resource-action-authority/release-preflight/p2a-v1/manifest.json" is duplicated or reserved by the chart
-
-  - it: should reserve the guarded release proposal environment
-    set:
-      apiService.dbConnectionSecretName: external-db
-      requestStore.backend: postgres
-      databaseConnection.extraEnvs:
-        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON
-          value: '{}'
-    asserts:
-      - failedTemplate:
-          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON" is duplicated or reserved by the chart
 
   - it: should use the chart-managed connection secret
     set:

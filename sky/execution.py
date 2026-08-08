@@ -4,6 +4,7 @@ See `Stage` for a Task's life cycle.
 """
 import asyncio
 from collections.abc import Callable
+import contextlib
 import enum
 import logging
 import os
@@ -23,13 +24,17 @@ from sky import optimizer
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.container_images import consumers as container_image_consumers
 from sky.execution_autostop import _check_autostop_feasibility_early
 from sky.execution_autostop import (
     _compute_set_autostop_args_for_hooks_only_relaunch)
+from sky.execution_autostop import apply_launch_autostop
 from sky.execution_autostop import autostop_requested_features
 from sky.serve import constants as serve_constants
+from sky.serve import provider_phase
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.server.requests import request_names
@@ -102,18 +107,48 @@ def _validate_service_replica_launch_fence(
                  type(service_version) is int and service_version > 0) or
             not (controller_pid is None or isinstance(controller_pid, int)) or
             not (controller_ip is None or isinstance(controller_ip, str))):
-        raise exceptions.RequestCancelled(
+        raise exceptions.ServeReplicaLaunchFenceError(
             'SkyServe replica launch is missing its durable owner fence.')
-    owner = serve_state.get_service_controller_owner(service_name)
-    authorized = (
-        owner is not None and owner.get('hash') == service_hash and
-        (owner.get('controller_pid'), owner.get('controller_ip'))
-        == (controller_pid, controller_ip) and owner.get('status')
-        not in serve_state.ServiceStatus.replica_launch_blocking_statuses())
-    if not authorized:
-        raise exceptions.RequestCancelled(
+    if not serve_state.service_replica_launch_fence_holds(launch_context):
+        raise exceptions.ServeReplicaLaunchFenceError(
             f'Refusing replica launch for stale service owner '
             f'{service_name!r}/{service_hash!r}.')
+
+
+def _parse_reserved_fill_launch_fence(
+    launch_context: dict[str, Any],
+    *,
+    is_launched_by_sky_serve_controller: bool,
+) -> reserved_capacity.ProtocolV2LaunchFence | None:
+    """Fail closed on malformed or externally supplied fill authority."""
+    try:
+        fence = reserved_capacity.parse_protocol_v2_launch_fence(launch_context)
+    except ValueError as error:
+        raise exceptions.RequestCancelled(
+            'Reserved-fill launch is missing its durable protocol-v2 '
+            'fence.') from error
+    if fence is not None and not is_launched_by_sky_serve_controller:
+        raise exceptions.RequestCancelled(
+            'Reserved-fill launch authority is restricted to SkyServe.')
+    return fence
+
+
+def _validate_reserved_fill_final_resources(
+    task: 'sky.Task',
+    fence: reserved_capacity.ProtocolV2LaunchFence,
+) -> None:
+    """Revalidate a queued fill pin immediately before provider actuation."""
+    best_resources = task.best_resources
+    if best_resources is None:
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Reserved-fill launch has no finalized resources.')
+    try:
+        reserved_capacity.validate_protocol_v2_launch_resources(
+            fence, best_resources)
+    except ValueError as error:
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Reserved-fill launch no longer matches its fenced Kubernetes '
+            'context and accelerator shape.') from error
 
 
 def _maybe_clone_disk_from_cluster(clone_disk_from: str | None,
@@ -296,10 +331,15 @@ def _execute(
                 request_names.AdminPolicyRequestName.SERVE_LAUNCH_REPLICA)
     if _extra_launch_context is None:
         _extra_launch_context = {}
+    reserved_fill_launch_fence = _parse_reserved_fill_launch_fence(
+        _extra_launch_context,
+        is_launched_by_sky_serve_controller=_is_launched_by_sky_serve_controller
+    )
     has_launch_fence = any(key in _extra_launch_context
                            for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS)
     if (_is_launched_by_sky_serve_controller and
-        (has_launch_fence or serve_utils.is_external_load_balancer_mode())):
+        (has_launch_fence or reserved_fill_launch_fence is not None or
+         serve_utils.is_external_load_balancer_mode())):
         _validate_service_replica_launch_fence(_extra_launch_context)
     dag = dag_utils.convert_entrypoint_to_dag(entrypoint)
     for task in dag.tasks:
@@ -377,6 +417,63 @@ def _execute_dag(
     _extra_launch_context: dict[str, Any],
     job_logger: logging.Logger = logger,
 ) -> tuple[int | None, backends.ResourceHandle | None]:
+    """Plan first, then execute all provider stages under one exact fence."""
+    reserved_fill_launch_fence = _parse_reserved_fill_launch_fence(
+        _extra_launch_context,
+        is_launched_by_sky_serve_controller=_is_launched_by_sky_serve_controller
+    )
+    # The helper activates this stack only after optimization and final
+    # resource validation.  Constructing/entering the empty stack here keeps
+    # its lifetime around every later provider/runtime stage without making a
+    # Kubernetes identity read for a candidate that will be rejected locally.
+    with contextlib.ExitStack() as provider_fence_stack:
+        return _execute_dag_under_provider_fence(
+            dag,
+            dryrun=dryrun,
+            stream_logs=stream_logs,
+            handle=handle,
+            backend=backend,
+            retry_until_up=retry_until_up,
+            optimize_target=optimize_target,
+            stages=stages,
+            cluster_name=cluster_name,
+            detach_setup=detach_setup,
+            no_setup=no_setup,
+            clone_disk_from=clone_disk_from,
+            skip_unnecessary_provisioning=skip_unnecessary_provisioning,
+            _quiet_optimizer=_quiet_optimizer,
+            _is_launched_by_jobs_controller=_is_launched_by_jobs_controller,
+            _is_launched_by_sky_serve_controller=
+            _is_launched_by_sky_serve_controller,
+            _extra_launch_context=_extra_launch_context,
+            _reserved_fill_launch_fence=reserved_fill_launch_fence,
+            _provider_fence_stack=provider_fence_stack,
+            job_logger=job_logger)
+
+
+def _execute_dag_under_provider_fence(
+    dag: 'sky.Dag',
+    dryrun: bool,
+    stream_logs: bool,
+    handle: backends.ResourceHandle | None,
+    backend: backends.Backend | None,
+    retry_until_up: bool,
+    optimize_target: common.OptimizeTarget,
+    stages: list[Stage] | None,
+    cluster_name: str | None,
+    detach_setup: bool,
+    no_setup: bool,
+    clone_disk_from: str | None,
+    skip_unnecessary_provisioning: bool,
+    # pylint: disable=invalid-name
+    _quiet_optimizer: bool,
+    _is_launched_by_jobs_controller: bool,
+    _is_launched_by_sky_serve_controller: bool,
+    _extra_launch_context: dict[str, Any],
+    _reserved_fill_launch_fence: reserved_capacity.ProtocolV2LaunchFence | None,
+    _provider_fence_stack: contextlib.ExitStack,
+    job_logger: logging.Logger = logger,
+) -> tuple[int | None, backends.ResourceHandle | None]:
     """Execute a DAG.
 
     This is an internal helper function for _execute() and is expected to be
@@ -384,6 +481,7 @@ def _execute_dag(
     """
     assert len(dag) == 1, f'We support 1 task for now. {dag}'
     task = dag.tasks[0]
+    reserved_fill_launch_fence = _reserved_fill_launch_fence
 
     if any(r.job_recovery is not None for r in task.resources):
         job_logger.warning(
@@ -403,6 +501,10 @@ def _execute_dag(
         # unlike `gpus`.
 
     stages = stages if stages is not None else list(Stage)
+    if (reserved_fill_launch_fence is not None and
+            Stage.PROVISION not in stages):
+        raise exceptions.RequestCancelled(
+            'Reserved-fill launch requires the provisioning stage.')
 
     # Requested features that some clouds support and others don't.
     requested_features = set()
@@ -504,9 +606,11 @@ def _execute_dag(
     elif controller is not None:
         workload_type = 'controller'
     if workload_type == 'cluster':
-        previous_resources = getattr(handle, 'launched_resources', None)
-        previous_resolution = getattr(previous_resources,
-                                      'resolved_container_image', None)
+        previous_resolution = None
+        if isinstance(handle, backends.CloudVmRayResourceHandle):
+            previous_resources = handle.launched_resources
+            if previous_resources is not None:
+                previous_resolution = previous_resources.resolved_container_image
         _extra_launch_context = (
             container_image_consumers.reuse_persisted_cluster_epoch(
                 _extra_launch_context, previous_resolution))
@@ -564,8 +668,9 @@ def _execute_dag(
     # into the backend, we inject a small planner the backend can call under
     # the lock only when no reusable snapshot and no caller plan exist.
     planner: Callable[[sky.Task], resources_lib.Resources] | None = None
-    if isinstance(backend,
-                  backends.CloudVmRayBackend) and Stage.OPTIMIZE in stages:
+    if (reserved_fill_launch_fence is None and
+            isinstance(backend, backends.CloudVmRayBackend) and
+            Stage.OPTIMIZE in stages):
 
         def _planner(_t: 'sky.Task'):
             with container_image_consumers.use(image_consumer):
@@ -577,6 +682,33 @@ def _execute_dag(
             return new_task.best_resources.assert_launchable()
 
         planner = _planner
+
+    # A valid v2 request has a concrete best_resources below. Do not install
+    # the ordinary under-lock recovery planner for it: any future path that
+    # loses that concrete plan must fail closed, rather than re-optimize after
+    # the physical-identity read and rely on the later actuation-boundary
+    # check to reject a drifted result.
+
+    phase_mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+                  if reserved_fill_launch_fence is None else
+                  provider_phase.ProviderPhaseMode.V2_FENCED)
+    # API/executor processes can run ordinary and v2 requests concurrently.
+    # Admit the complete provider-bearing tail before constructing a physical
+    # capture so ambient requests can never overlap that immutable authority.
+    _provider_fence_stack.enter_context(
+        provider_phase.provider_phase(phase_mode))
+
+    if reserved_fill_launch_fence is not None:
+        # Optimization is allowed to rewrite best_resources. Reject any drift
+        # before physical_cluster_uid_fence() performs its first provider
+        # identity read, then keep the resulting immutable capture alive for
+        # registration, provisioning, setup, and job submission below.
+        _validate_reserved_fill_final_resources(task,
+                                                reserved_fill_launch_fence)
+        _provider_fence_stack.enter_context(
+            kubernetes_adaptor.physical_cluster_uid_fence(
+                reserved_fill_launch_fence.kubernetes_context,
+                reserved_fill_launch_fence.physical_cluster_uid))
 
     backend.register_info(
         dag=dag,
@@ -687,13 +819,20 @@ def _execute_dag(
             if idle_minutes_to_autostop is not None:
                 assert isinstance(backend, backends.CloudVmRayBackend)
                 assert isinstance(handle, backends.CloudVmRayResourceHandle)
-                backend.set_autostop(handle,
-                                     idle_minutes_to_autostop,
-                                     wait_for,
-                                     down,
-                                     hook=hook,
-                                     hook_timeout=hook_timeout,
-                                     hooks=hooks_payload)
+                apply_launch_autostop(
+                    backend,
+                    handle,
+                    idle_minutes_to_autostop,
+                    wait_for,
+                    down,
+                    hook=hook,
+                    hook_timeout=hook_timeout,
+                    hooks=hooks_payload,
+                    # A node that cannot execute the teardown only fails
+                    # the launch when the user is the one who asked for
+                    # it; SkyPilot's own leak backstops degrade instead.
+                    refusal_is_fatal=(not is_managed and controller is None),
+                    job_logger=job_logger)
             elif hooks_payload is not None:
                 # Hooks can fire on preemption/down independent of
                 # autostop — persist them even when autostop is disabled.

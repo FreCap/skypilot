@@ -1,5 +1,6 @@
 """Real-PostgreSQL tests for Serve system-recovery subdocuments."""
 # pylint: disable=protected-access,redefined-outer-name,unused-import
+# pylint: disable=unexpected-keyword-arg
 
 import contextlib
 import copy
@@ -27,7 +28,7 @@ _WORKSPACE = 'default'
 
 
 @pytest.fixture
-def recovery_database(postgres_engine, monkeypatch):
+def recovery_database(postgres_engine, monkeypatch):  # noqa: F811
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
@@ -144,6 +145,108 @@ def _assert_json_pickle_parity(engine, replica_id: int) -> None:
     json_info = replica_info.ReplicaInfo.from_storage_dict(row['replica_state'])
     pickle_info = pickle.loads(row['replica_info'])
     assert pickle_info.to_storage_dict() == json_info.to_storage_dict()
+
+
+def test_authorization_snapshot_pairs_quarantine_aware_version_and_incarnation(
+        recovery_database) -> None:
+    engine = recovery_database
+    other_service_name = 'other-svc'
+    other_service_hash = 'other-service-hash'
+    other_lifecycle_epoch = 1
+    stale_pointer_spec = {'identity': 'stale-current-pointer'}
+    newer_spec = {'identity': 'newest-applicable'}
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert(), [
+            {
+                'service_name': _SERVICE_NAME,
+                'version': 3,
+                'spec': pickle.dumps(stale_pointer_spec),
+                'yaml_content': 'run: stale-pointer\n',
+            },
+            {
+                'service_name': _SERVICE_NAME,
+                'version': 4,
+                'spec': pickle.dumps(newer_spec),
+                'yaml_content': 'run: newer\n',
+            },
+        ])
+        connection.execute(serve_state.services_table.update().where(
+            serve_state.services_table.c.name == _SERVICE_NAME).values(
+                current_version=3,
+                status=serve_state.ServiceStatus.NO_REPLICA.value))
+        connection.execute(serve_state.replicas_table.delete().where(
+            serve_state.replicas_table.c.service_name == _SERVICE_NAME))
+        connection.execute(
+            serve_state.service_lifecycle_fences_table.insert().values(
+                name=other_service_name, epoch=other_lifecycle_epoch))
+        connection.execute(serve_state.services_table.insert().values(
+            name=other_service_name,
+            workspace=_WORKSPACE,
+            hash=other_service_hash,
+            status=serve_state.ServiceStatus.READY.value,
+            controller_pid=_OWNER[0],
+            controller_ip=_OWNER[1],
+            lifecycle_epoch=other_lifecycle_epoch,
+            pool=0,
+            resource_action_mode='legacy'))
+    assert serve_state.add_or_update_replica(
+        other_service_name,
+        8,
+        _replica(8),
+        expected_service_hash=other_service_hash,
+        expected_lifecycle_epoch=other_lifecycle_epoch,
+        expected_controller_owner=_OWNER)
+
+    with _capture_sql(engine) as statements:
+        snapshot = serve_state.get_system_recovery_authorization_snapshot(
+            _SERVICE_NAME)
+
+    selects = [
+        statement for statement in statements
+        if statement.lstrip().startswith('select ')
+    ]
+    assert len(selects) == 1
+    assert statements == selects
+    assert snapshot == {
+        'service_name': _SERVICE_NAME,
+        'service_hash': _SERVICE_HASH,
+        'workspace': _WORKSPACE,
+        'version': 4,
+        'status': serve_state.ServiceStatus.NO_REPLICA,
+        'pool': False,
+        'resource_action_mode': 'legacy',
+        'spec': newer_spec,
+        'yaml_content': 'run: newer\n',
+        'quarantined_at': None,
+        'replica_count': 0,
+    }
+
+
+def test_authorization_snapshot_counts_same_service_stale_version_replica(
+        recovery_database) -> None:
+    engine = recovery_database
+    with engine.begin() as connection:
+        connection.execute(serve_state.version_specs_table.insert().values(
+            service_name=_SERVICE_NAME,
+            version=3,
+            spec=pickle.dumps({'identity': 'elected'}),
+            yaml_content='run: elected\n'))
+        connection.execute(serve_state.services_table.update().where(
+            serve_state.services_table.c.name == _SERVICE_NAME).values(
+                current_version=3,
+                status=serve_state.ServiceStatus.NO_REPLICA.value))
+        # Replica rows are incarnation-wide, not elected-version-scoped.  A
+        # stale version must still make zero-replica bootstrap ineligible.
+        connection.execute(serve_state.replicas_table.update().where(
+            serve_state.replicas_table.c.service_name == _SERVICE_NAME).values(
+                version=2))
+
+    snapshot = serve_state.get_system_recovery_authorization_snapshot(
+        _SERVICE_NAME)
+
+    assert snapshot is not None
+    assert snapshot['version'] == 3
+    assert snapshot['replica_count'] == 1
 
 
 @contextlib.contextmanager
@@ -315,6 +418,7 @@ def test_revision_terminal_quarantine_and_demotion_are_absorbing(
     assert serve_state.add_or_update_replica(_SERVICE_NAME, 9, _replica(9),
                                              **_fence())
     partial = _raw_replica_row(engine, 9)['replica_state']
+    partial['replica_info_version'] = 13
     partial.pop('service_job_id')
     with engine.begin() as connection:
         connection.execute(
@@ -573,25 +677,33 @@ def test_initial_replica_paths_are_insert_only_on_key_conflict(
             waiter_ttl_seconds=60.0,
             expected_controller_owner=_OWNER)
 
+    fill_pool_key = '["test-context","a100"]'
     with engine.begin() as connection:
         connection.execute(
             serve_state.reserved_fill_claims_table.insert().values(
                 service_name=_SERVICE_NAME,
-                pool_key='fill-pool',
+                pool_key=fill_pool_key,
                 weight=1,
                 floor_replicas=1,
                 gpus_per_replica=1,
                 holdings_fill=1,
                 heartbeat_ts=100.0))
+        connection.execute(
+            serve_state.reserved_fill_lease_table.insert().values(id=1,
+                                                                  epoch=1))
+    duplicate_fill_replica = _replica(7)
+    duplicate_fill_replica.reserved_fill = True
+    duplicate_fill_replica.reserved_fill_pool_key = fill_pool_key
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         serve_state.add_replica_if_round_epoch(
             _SERVICE_NAME,
             7,
-            _replica(7),
-            pool_key='fill-pool',
+            duplicate_fill_replica,
+            pool_key=fill_pool_key,
             expected_epoch=1,
             expected_service_hash=_SERVICE_HASH,
-            expected_controller_owner=_OWNER)
+            expected_controller_owner=_OWNER,
+            expected_lease_token=1)
 
     persisted = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
     assert persisted is not None
@@ -607,33 +719,12 @@ def test_initial_replica_paths_are_insert_only_on_key_conflict(
     assert paid_claim is None
 
 
-def test_all_fields_absent_v13_rewrite_restores_json_pickle_parity(
+def test_all_fields_absent_v13_is_quarantined_without_compatibility_rewrite(
         recovery_database) -> None:
     engine = recovery_database
     row = _raw_replica_row(engine, 7)
     rollback = row['replica_state']
-    for field_name in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        rollback.pop(field_name)
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.update(serve_state.replicas_table).where(
-                serve_state.replicas_table.c.service_name == _SERVICE_NAME,
-                serve_state.replicas_table.c.replica_id == 7).values(
-                    replica_state=rollback))
-
-    rewritten = serve_state.rewrite_rollback_replica_system_recovery_state(
-        _SERVICE_NAME, **_fence())
-    assert rewritten == 1
-    completed = _raw_replica_row(engine, 7)['replica_state']
-    assert set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).issubset(completed)
-    _assert_json_pickle_parity(engine, 7)
-
-
-def test_exact_rollback_transition_identity_can_fence_delete(
-        recovery_database) -> None:
-    engine = recovery_database
-    row = _raw_replica_row(engine, 7)
-    rollback = row['replica_state']
+    rollback['replica_info_version'] = 13
     for field_name in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
         rollback.pop(field_name)
     with engine.begin() as connection:
@@ -645,6 +736,35 @@ def test_exact_rollback_transition_identity_can_fence_delete(
 
     transitioned = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
     assert transitioned is not None
+    assert transitioned.system_recovery_quarantine == (
+        recovery_state.SystemRecoveryQuarantine(
+            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE))
+    assert not transitioned.is_ready
+    persisted = _raw_replica_row(engine, 7)
+    assert not set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).intersection(
+        persisted['replica_state'])
+
+
+def test_all_fields_absent_v13_quarantine_identity_can_fence_delete(
+        recovery_database) -> None:
+    engine = recovery_database
+    row = _raw_replica_row(engine, 7)
+    rollback = row['replica_state']
+    rollback['replica_info_version'] = 13
+    for field_name in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
+        rollback.pop(field_name)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.replicas_table).where(
+                serve_state.replicas_table.c.service_name == _SERVICE_NAME,
+                serve_state.replicas_table.c.replica_id == 7).values(
+                    replica_state=rollback))
+
+    transitioned = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
+    assert transitioned is not None
+    assert transitioned.system_recovery_quarantine == (
+        recovery_state.SystemRecoveryQuarantine(
+            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE))
     with _capture_sql(engine) as statements:
         assert serve_state.remove_replica(
             _SERVICE_NAME,

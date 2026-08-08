@@ -3,6 +3,92 @@ suite: server_deployment_test
 templates:
   - templates/api-deployment.yaml
 tests:
+  - it: should keep mounting the release-owned state claim by default
+    set:
+      storage.existingClaim: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: RELEASE-NAME-state
+
+  - it: should mount a pre-existing state claim
+    set:
+      storage.existingClaim: production-rwx-state
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: production-rwx-state
+
+  - it: should gate API startup on a separately mounted read-only authority claim
+    values:
+      - fixtures/rwx-authority-fence-values.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: verify-rwx-authority-fence
+      - equal:
+          path: spec.template.spec.initContainers[0].volumeMounts
+          value:
+            - name: skypilot-rwx-authority-fence
+              mountPath: /var/run/skypilot/rwx-authority
+              readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-rwx-authority-fence
+            persistentVolumeClaim:
+              claimName: skypilot-state-authority
+              readOnly: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          any: true
+          content:
+            name: skypilot-rwx-authority-fence
+
+  - it: should keep the authority fence in one-pod compatibility mode
+    values:
+      - fixtures/rwx-authority-fence-values.yaml
+    set:
+      apiService.highAvailability.enabled: false
+      apiService.replicas: 1
+      apiService.upgradeStrategy: Recreate
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: verify-rwx-authority-fence
+      - equal:
+          path: spec.template.spec.initContainers[0].volumeMounts
+          value:
+            - name: skypilot-rwx-authority-fence
+              mountPath: /var/run/skypilot/rwx-authority
+              readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-rwx-authority-fence
+            persistentVolumeClaim:
+              claimName: skypilot-state-authority
+              readOnly: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          any: true
+          content:
+            name: skypilot-rwx-authority-fence
+
+  - it: should reject an existing claim when persistence is disabled
+    set:
+      storage.enabled: false
+      storage.existingClaim: production-rwx-state
+    asserts:
+      - failedTemplate:
+          errorMessage: "storage.existingClaim requires storage.enabled=true"
+
   - it: should run as the externally managed API service account
     set:
       rbac.create: false
@@ -148,6 +234,25 @@ tests:
             secret:
               secretName: db-ca
 
+  - it: should expose the explicit SkyServe controller maintenance hold
+    set:
+      serve.controllerHold: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD
+            value: "true"
+
+  - it: should reject overriding the chart-owned controller hold env
+    set:
+      apiService.extraEnvs:
+        - name: SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD
+          value: "true"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD" is duplicated or reserved by the chart'
+
   - it: should prefix gcp credentials init container image with the global registry override
     set:
       global.imageRegistry: registry.example.com/custom
@@ -168,6 +273,10 @@ tests:
       - equal:
           path: spec.strategy.type
           value: Recreate
+      - notExists:
+          path: spec.minReadySeconds
+      - notExists:
+          path: spec.progressDeadlineSeconds
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -176,12 +285,30 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
             value: /root/.sky/api-request-cutover.json
+
+  - it: should default the quiescence guard false for legacy reused values
+    set:
+      # Helm --reuse-values can supply an old coalesced requestStore object
+      # that predates this field. Null exercises the same missing-value path.
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: null
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "false"
 
   - it: should enable the PostgreSQL request store for one compatibility pod
     set:
       requestStore.backend: postgres
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
       apiService.dbConnectionSecretName: external-db
     asserts:
       - contains:
@@ -189,6 +316,11 @@ tests:
           content:
             name: SKYPILOT_API_REQUEST_BACKEND
             value: postgres
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "true"
 
   - it: should render stateless API replicas for role-split HA
     set:
@@ -207,6 +339,18 @@ tests:
       - equal:
           path: spec.replicas
           value: 2
+      - equal:
+          path: spec.minReadySeconds
+          value: 10
+      - equal:
+          path: spec.progressDeadlineSeconds
+          value: 600
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 1
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 0
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -266,6 +410,77 @@ tests:
     asserts:
       - notExists:
           path: spec.template.spec.topologySpreadConstraints
+
+  - it: should reject unavailable API replicas during guarded HA rollouts
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxUnavailable: 1
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxUnavailable=0 or 0%"
+
+  - it: should accept zero-percent unavailable API replicas in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxUnavailable: 0%
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 0%
+
+  - it: should reject more than one API surge replica in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxSurge: 2
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
+
+  - it: should reject zero API surge replicas in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxSurge: 0
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
+
+  - it: should reject percentage API surge replicas in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.rollingUpdate.maxSurge: 25%
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - failedTemplate:
+          errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
 
   - it: should reject a chart-managed database secret in HA mode
     set:
@@ -370,6 +585,7 @@ tests:
       apiService.dbConnectionSecretName: external-db
       storage.enabled: true
       storage.accessMode: ReadWriteOnce
+      storage.existingClaim: production-rwx-state
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires storage.accessMode=ReadWriteMany"
@@ -417,6 +633,22 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: 'environment variable "SKYPILOT_API_REQUEST_BACKEND" is duplicated or reserved by the chart'
+
+  - it: should reject quiescence enforcement with the SQLite request store
+    set:
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.enforceBuiltinExecutionQuiescenceBackends=true requires requestStore.backend=postgres"
+
+  - it: should reject an environment override of the quiescence backend guard
+    set:
+      apiService.extraEnvs:
+        - name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+          value: "true"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" is duplicated or reserved by the chart'
 
   - it: should use RollingUpdate strategy when configured with external database via secret
     set:
@@ -711,11 +943,17 @@ tests:
           path: metadata.name
           value: custom-fullname-api-server
       - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+      - equal:
           path: spec.selector.matchLabels.app
           value: custom-fullname-api
       - equal:
           path: spec.template.metadata.labels.app
           value: custom-fullname-api
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -1308,6 +1546,15 @@ tests:
           content:
             name: slurm-config
 
+  - it: should pass the configured metrics port to the API runtime
+    set:
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9191
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "sky api start --deploy --metrics --metrics-port 9191 --foreground"
+
   # Test cases for apiService.serveServerLog configuration
   - it: should tee server logs to file by default
     asserts:
@@ -1402,6 +1649,33 @@ tests:
       - notMatchRegex:
           path: spec.template.spec.containers[1].args[0]
           pattern: '/root/\.sky/serve/\*/replica'
+
+  - it: should stop the logrotate sidecar child promptly on TERM or INT
+    set:
+      apiService.serveServerLog: true
+      apiService.logs.retention.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'shutdown\(\) \{[\s\S]*trap - TERM INT[\s\S]*kill "\$\{child_pid\}"[\s\S]*exit 0[\s\S]*\}'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'run_interruptibly\(\) \{[\s\S]*"\$@" &[\s\S]*child_pid=\$![\s\S]*wait "\$\{child_pid\}"[\s\S]*\}'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'trap shutdown TERM INT'
+
+  - it: should make both logrotate sidecar loops interruptible
+    set:
+      apiService.serveServerLog: true
+      apiService.logs.retention.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'if ! command -v logrotate[\s\S]*run_interruptibly sleep 3600[\s\S]*fi'
+      - matchRegex:
+          path: spec.template.spec.containers[1].args[0]
+          pattern: 'EOF\s+while true; do\s+run_interruptibly logrotate -s /var/lib/logrotate/status /etc/logrotate\.conf\s+run_interruptibly sleep 60\s+done'
 
   - it: should not include logrotate sidecar when serveServerLog is false
     set:
@@ -1658,10 +1932,11 @@ tests:
             name: SOME_OTHER_ENV
             value: "x"
       # The four HA role and identity variables extend the prior baseline.
-      # A duplicate POD_IP would push the count to 19.
+      # The chart-owned quiescence guard and Serve hold extend the baseline.
+      # A duplicate POD_IP would push the count to 21.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 18
+          count: 20
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -1672,10 +1947,11 @@ tests:
               fieldPath: status.podIP
     asserts:
       # The four HA role and identity variables extend the prior baseline.
-      # A duplicate POD_IP would push the count to 18.
+      # The chart-owned quiescence guard and Serve hold extend the baseline.
+      # A duplicate POD_IP would push the count to 20.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 17
+          count: 19
 
   - it: should allow custom GCP workload identity env when native credentials are disabled
     set:

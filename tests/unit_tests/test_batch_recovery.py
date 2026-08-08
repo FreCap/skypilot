@@ -1325,6 +1325,70 @@ def test_cancel_fans_out_worker_shutdowns(monkeypatch):
     assert not batch_coordinator._active_workers
 
 
+def test_cancel_contains_thread_start_failure(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    batch_coordinator._active_workers.update({
+        'worker-a': 17,
+        'worker-b': 18,
+        'worker-c': 19,
+    })
+    events = []
+
+    def _shutdown_worker(cluster_name, worker_job_id=None):
+        events.append(f'shutdown:{cluster_name}:{worker_job_id}')
+
+    class _FailingThread:
+        """Defers shutdown to join and simulates thread exhaustion."""
+
+        starts = 0
+
+        def __init__(self, target, args=(), kwargs=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            type(self).starts += 1
+            events.append(f'start:{self._args[1]}:{self._args[2]}')
+            if type(self).starts == 2:
+                raise RuntimeError('cannot start new thread')
+
+        def join(self):
+            events.append(f'join:{self._args[1]}:{self._args[2]}')
+            self._target(*self._args, **self._kwargs)
+
+    class _ContextStub:
+        """Runs the provided target inline for deterministic testing."""
+
+        def run(self, fn, *args):
+            fn(*args)
+
+    def _copy_context():
+        return _ContextStub()
+
+    monkeypatch.setattr(batch_coordinator, '_shutdown_worker', _shutdown_worker)
+    monkeypatch.setattr(coordinator.threading, 'Thread', _FailingThread)
+    monkeypatch.setattr(coordinator.contextvars, 'copy_context', _copy_context)
+
+    with mock.patch.object(coordinator.logger, 'warning') as log_warning:
+        batch_coordinator.cancel()
+
+    assert events == [
+        'start:worker-a:17',
+        'start:worker-b:18',
+        'start:worker-c:19',
+        'shutdown:worker-b:18',
+        'join:worker-a:17',
+        'shutdown:worker-a:17',
+        'join:worker-c:19',
+        'shutdown:worker-c:19',
+    ]
+    log_warning.assert_called_once_with(
+        'Failed to start shutdown thread for %s; shutting down '
+        'synchronously: %s', 'worker-b', mock.ANY)
+    assert not batch_coordinator._active_workers
+
+
 def test_cancel_contains_worker_shutdown_failure(monkeypatch):
     batch_coordinator = _make_coordinator()
     batch_coordinator._active_workers.update({
@@ -1815,6 +1879,146 @@ def test_stale_cleanup_reads_worker_records_once_per_pass(
 
     assert get_batch_worker_records.call_count == 1
     assert original_get_batch_worker_records(5) == []
+
+
+def test_stale_cleanup_scans_durable_worker_snapshot_at_most_twice(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    _create_batch_job(18, 'owner-a')
+    assert state.register_batch_worker_launch(18, 'owner-a', 'worker-a',
+                                              'batch-worker-18-owner-a')
+    assert state.register_batch_worker_launch(18, 'owner-a', 'worker-b',
+                                              'batch-worker-18-owner-a')
+    assert state.acquire_batch_coordinator(18, 'owner-b') == 'owner-a'
+    assert state.register_batch_worker_launch(18, 'owner-b', 'worker-a',
+                                              'batch-worker-18-owner-b')
+    assert state.acquire_batch_coordinator(18, 'owner-c') == 'owner-b'
+
+    batch_coordinator = _make_coordinator(job_id=18)
+    batch_coordinator._worker_token = 'owner-c'
+    batch_coordinator._stale_attempt_leases_drained = True
+
+    count = {'n': 0}
+
+    class _CountingRecords(list):
+
+        def __iter__(self):
+            for item in super().__iter__():
+                count['n'] += 1
+                yield item
+
+    original_get_batch_worker_records = state.get_batch_worker_records
+
+    def _get_batch_worker_records(job_id):
+        return _CountingRecords(original_get_batch_worker_records(job_id))
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(side_effect=_get_batch_worker_records))
+    monkeypatch.setattr(batch_coordinator,
+                        '_cancel_worker_record',
+                        lambda record, queue_jobs_by_cluster=None: None)
+
+    batch_coordinator._cleanup_stale_worker_services(strict=True)
+
+    assert count['n'] <= 6, count
+
+
+def test_get_batch_worker_records_filters_owner_token(batch_state_db):
+    del batch_state_db
+    _create_batch_job(16, 'owner-a')
+    assert state.register_batch_worker_launch(16, 'owner-a', 'worker-b',
+                                              'batch-worker-16-owner-a')
+    assert state.register_batch_worker_launch(16, 'owner-a', 'worker-a',
+                                              'batch-worker-16-owner-a')
+    assert state.acquire_batch_coordinator(16, 'owner-b') == 'owner-a'
+    assert state.register_batch_worker_launch(16, 'owner-b', 'worker-c',
+                                              'batch-worker-16-owner-b')
+
+    assert [
+        (record['coordinator_token'], record['worker_cluster'])
+        for record in state.get_batch_worker_records(16, owner_token='owner-a')
+    ] == [('owner-a', 'worker-a'), ('owner-a', 'worker-b')]
+    assert [(record['coordinator_token'], record['worker_cluster'])
+            for record in state.get_batch_worker_records(16)] == [
+                ('owner-a', 'worker-a'),
+                ('owner-a', 'worker-b'),
+                ('owner-b', 'worker-c'),
+            ]
+
+
+def test_cleanup_worker_services_for_token_reads_only_requested_token_records(
+        batch_state_db, monkeypatch):
+    del batch_state_db
+    _create_batch_job(17, 'owner-a')
+    assert state.register_batch_worker_launch(17, 'owner-a', 'worker-b',
+                                              'batch-worker-17-owner-a')
+    assert state.register_batch_worker_launch(17, 'owner-a', 'worker-a',
+                                              'batch-worker-17-owner-a')
+    assert state.acquire_batch_coordinator(17, 'owner-b') == 'owner-a'
+    assert state.register_batch_worker_launch(17, 'owner-b', 'worker-c',
+                                              'batch-worker-17-owner-b')
+
+    batch_coordinator = _make_coordinator(job_id=17)
+    original_get_batch_worker_records = state.get_batch_worker_records
+    read_calls = []
+    cleaned_records = []
+
+    def _get_batch_worker_records(job_id, owner_token=None):
+        read_calls.append((job_id, owner_token))
+        return original_get_batch_worker_records(job_id,
+                                                 owner_token=owner_token)
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(side_effect=_get_batch_worker_records))
+    monkeypatch.setattr(
+        batch_coordinator,
+        '_cancel_worker_record',
+        lambda record, queue_jobs_by_cluster=None: cleaned_records.append(
+            (record['coordinator_token'], record['worker_cluster'])))
+
+    batch_coordinator._cleanup_worker_services_for_token('owner-a')
+
+    assert read_calls == [(17, 'owner-a')]
+    assert cleaned_records == [('owner-a', 'worker-a'), ('owner-a', 'worker-b')]
+
+
+def test_cleanup_worker_services_for_token_skips_cancel_if_worker_record_disappeared(
+        monkeypatch):
+    batch_coordinator = _make_coordinator()
+    record = {
+        'coordinator_token': 'owner-a',
+        'worker_cluster': 'worker-a',
+        'worker_job_name': 'batch-worker-1-owner-a',
+        'worker_job_id': None,
+        'launch_request_id': None,
+    }
+    queued_jobs = [
+        types.SimpleNamespace(job_id=17, job_name=record['worker_job_name'])
+    ]
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(return_value=[record]))
+    monkeypatch.setattr(coordinator.sdk, 'queue',
+                        mock.Mock(return_value='queue-worker-a'))
+    get = mock.Mock(return_value=queued_jobs)
+    cancel = mock.Mock()
+    remove_record = mock.Mock()
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_job_id',
+                        mock.Mock(return_value=False))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove_record)
+
+    batch_coordinator._cleanup_worker_services_for_token('owner-a')
+
+    get.assert_called_once_with('queue-worker-a')
+    cancel.assert_not_called()
+    remove_record.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -2973,6 +3177,33 @@ async def test_superseded_cleanup_queries_each_owned_cluster_once(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_superseded_cleanup_reads_only_current_token_records(monkeypatch):
+    batch_coordinator = _make_coordinator()
+    records = [{
+        'coordinator_token': batch_coordinator._worker_token,
+        'worker_cluster': 'worker-a',
+        'worker_job_name': 'batch-worker-1-owner-a',
+        'worker_job_id': 17,
+        'launch_request_id': None,
+    }]
+    get_batch_worker_records = mock.Mock(return_value=records)
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records', get_batch_worker_records)
+    monkeypatch.setattr(coordinator.sdk, 'cancel',
+                        mock.Mock(return_value='cancel-17'))
+    monkeypatch.setattr(coordinator.sdk, 'get', mock.Mock(return_value=None))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record',
+                        mock.Mock(return_value=True))
+
+    await batch_coordinator.handle_superseded(timeout=1)
+
+    get_batch_worker_records.assert_called_once_with(
+        1, owner_token=batch_coordinator._worker_token)
+
+
+@pytest.mark.asyncio
 async def test_superseded_cleanup_reuses_queue_snapshot_on_same_cluster(
         monkeypatch):
     batch_coordinator = _make_coordinator()
@@ -3043,6 +3274,46 @@ async def test_superseded_cleanup_reuses_queue_snapshot_on_same_cluster(
             1, batch_coordinator._worker_token, 'worker-a', worker_job_id=18),
     ],
                                    any_order=True)
+
+
+@pytest.mark.asyncio
+async def test_superseded_cleanup_skips_cancel_if_worker_record_disappeared_before_persist(
+        monkeypatch):
+    batch_coordinator = _make_coordinator()
+    record = {
+        'coordinator_token': batch_coordinator._worker_token,
+        'worker_cluster': 'worker-a',
+        'worker_job_name': 'batch-worker-1-owner-a',
+        'worker_job_id': None,
+        'launch_request_id': None,
+    }
+    queued_jobs = [
+        types.SimpleNamespace(job_id=17, job_name=record['worker_job_name'])
+    ]
+    queue = mock.Mock(return_value='queue-worker-a')
+    get = mock.Mock(return_value=queued_jobs)
+    cancel = mock.Mock()
+    remove_record = mock.Mock()
+
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'get_batch_worker_records',
+                        mock.Mock(return_value=[record]))
+    monkeypatch.setattr(coordinator.sdk, 'queue', queue)
+    monkeypatch.setattr(coordinator.sdk, 'get', get)
+    monkeypatch.setattr(coordinator.sdk, 'cancel', cancel)
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'record_batch_worker_job_id',
+                        mock.Mock(return_value=False))
+    monkeypatch.setattr(coordinator.managed_job_state,
+                        'remove_batch_worker_record', remove_record)
+
+    await batch_coordinator.handle_superseded(timeout=1)
+
+    queue.assert_called_once_with('worker-a', skip_finished=True)
+    assert get.call_args_list
+    assert get.call_args_list[0] == mock.call('queue-worker-a')
+    cancel.assert_not_called()
+    remove_record.assert_not_called()
 
 
 @pytest.mark.asyncio

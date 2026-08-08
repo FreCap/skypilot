@@ -983,17 +983,21 @@ def _wait_for_pods_to_schedule(namespace, context, new_nodes, timeout: int,
             return
 
         # The Event source is authoritative. Karpenter may manage a cluster
-        # even when SkyPilot's optional autoscaler setting is absent.
-        pending_pod_uids = {
-            pod.metadata.uid
-            for pod in pods
-            if (pod.metadata.name in expected_pod_names and
-                pod.status.phase == 'Pending' and not _pod_is_scheduled(pod) and
-                isinstance(pod.metadata.uid, str))
-        }
-        _raise_for_karpenter_gpu_incompatibility(namespace, context,
-                                                 pending_pod_uids,
-                                                 create_pods_start)
+        # even when SkyPilot's optional autoscaler setting is absent. A
+        # negative timeout is the explicit exception: the caller asked to
+        # retain an admitted pod indefinitely, including on a fixed GPU pool
+        # that Karpenter itself cannot expand.
+        if timeout >= 0:
+            pending_pod_uids = {
+                pod.metadata.uid
+                for pod in pods
+                if (pod.metadata.name in expected_pod_names and pod.status.phase
+                    == 'Pending' and not _pod_is_scheduled(pod) and
+                    isinstance(pod.metadata.uid, str))
+            }
+            _raise_for_karpenter_gpu_incompatibility(namespace, context,
+                                                     pending_pod_uids,
+                                                     create_pods_start)
 
         # Check if cluster is autoscaling and update spinner message.
         # Minor optimization to not query k8s api after autoscaling

@@ -1,3 +1,5 @@
+"""Tests the control-plane config seed and Terraform wiring contracts."""
+
 import copy
 import os
 import pathlib
@@ -430,29 +432,49 @@ class ControlPlaneModuleSourceTest(unittest.TestCase):
             self.config_seed_hcl,
         )
 
-    def test_helper_image_is_part_of_seed_generation(self) -> None:
+    def test_helper_image_only_changes_seed_job_generation(self) -> None:
         self.assertIn(
             'seed_image = var.operations_helper_image != null ? '
             'var.operations_helper_image : (',
             self.config_seed_hcl,
         )
-        generation = re.search(
+        config_generation = re.search(
             r'config_hash = substr\(sha256\(jsonencode\(\{(?P<body>.*?)\}\)\)',
             self.config_seed_hcl,
             re.DOTALL,
         )
-        self.assertIsNotNone(generation)
-        assert generation is not None
+        self.assertIsNotNone(config_generation)
+        assert config_generation is not None
+        self.assertNotRegex(
+            config_generation.group('body'),
+            r'(?m)^\s*image\s*=',
+        )
+        seed_job_generation = re.search(
+            r'seed_job_hash = substr\(sha256\(jsonencode\(\{'
+            r'(?P<body>.*?)\}\)\)',
+            self.config_seed_hcl,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(seed_job_generation)
+        assert seed_job_generation is not None
         self.assertRegex(
-            generation.group('body'),
+            seed_job_generation.group('body'),
             r'(?m)^\s*image\s*=\s*local\.seed_image$',
         )
         self.assertIn(
-            'name      = "skypilot-seed-config-${local.config_hash}"',
+            'name      = "skypilot-seed-config-${local.seed_job_hash}"',
             self.config_seed_hcl,
         )
 
-    def test_api_restart_uses_helm_readiness_budget(self) -> None:
+    def test_config_reconcile_has_no_migration_suppression(self) -> None:
+        self.assertNotIn('suppress_api_server_reconcile_for_migration',
+                         self.variables_hcl)
+        self.assertNotIn(
+            'SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION',
+            self.config_seed_hcl,
+        )
+
+    def test_role_restarts_use_helm_readiness_budget(self) -> None:
         self.assertRegex(
             self.config_seed_hcl,
             r'(?m)^\s*api_server_rollout_timeout_seconds\s*=\s*600$',
@@ -466,6 +488,25 @@ class ControlPlaneModuleSourceTest(unittest.TestCase):
             r'(?m)^\s*timeout\s*=\s*'
             r'local\.api_server_rollout_timeout_seconds$',
         )
+
+    def test_config_reconcile_selects_split_roles_from_helm_ha(self) -> None:
+        self.assertIn(
+            'split_role_high_availability_enabled = try(',
+            self.module_hcl,
+        )
+        self.assertIn(
+            'local.extra_helm_values_decoded.apiService.highAvailability.'
+            'enabled == true',
+            self.module_hcl,
+        )
+        self.assertIn(
+            'SKYPILOT_HIGH_AVAILABILITY_ENABLED = '
+            'tostring(local.split_role_high_availability_enabled)',
+            self.config_seed_hcl,
+        )
+        self.assertIn('deployment_suffixes=(api-server)', self.config_seed_hcl)
+        self.assertIn('deployment_suffixes+=(executor controller)',
+                      self.config_seed_hcl)
 
 
 if __name__ == '__main__':

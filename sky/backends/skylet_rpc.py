@@ -123,6 +123,13 @@ def _handle_grpc_error(e: 'grpc.RpcError') -> None:
     if e.code() == grpc.StatusCode.INTERNAL:
         with ux_utils.print_exception_no_traceback():
             raise exceptions.SkyletInternalError(e.details())
+    elif e.code() == grpc.StatusCode.FAILED_PRECONDITION:
+        # The skylet rejected the request itself, not the transport: the
+        # node cannot honor what was asked (e.g. an autodown it has no
+        # permission to perform). Permanent, so surface it verbatim
+        # rather than burning retries on it.
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.NotSupportedError(e.details())
     elif e.code() == grpc.StatusCode.UNAVAILABLE:
         details = e.details() or ''
         if 'Connection refused' in details:

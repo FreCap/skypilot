@@ -386,6 +386,48 @@ def test_gang_schedule_retry_preserves_backoff_and_call_count():
     assert ray_up.call_count == 2
 
 
+def test_gang_schedule_revalidates_serve_fence_before_every_ray_up_retry():
+    handle = MagicMock(cluster_name='test-cluster', launched_nodes=2)
+    logging_info = {'region_name': 'us-east-1', 'zone_str': ''}
+    retryable_failure = (
+        1, 'Processing file mounts',
+        'Failed to setup head node. ConnectionResetError: [Errno 54] '
+        'Connection reset by peer')
+    provisioner = MagicMock()
+    provisioner._validate_service_replica_launch_fence.side_effect = [
+        None,
+        exceptions.RequestCancelled('generation changed'),
+    ]
+
+    with patch.object(
+            cloud_vm_ray_backend,
+            'write_ray_up_script_with_patched_launch_hash_fn',
+            return_value='/tmp/ray-up.py'), patch.object(
+                cloud_vm_ray_backend.log_lib,
+                'run_with_log',
+                return_value=retryable_failure) as ray_up, patch.object(
+                    cloud_vm_ray_backend.context_utils,
+                    'sleep_with_cancellation') as wait, patch.object(
+                        cloud_vm_ray_backend.common_utils,
+                        'Backoff') as backoff_cls:
+        backoff_cls.return_value.current_backoff.return_value = 17
+        with pytest.raises(exceptions.RequestCancelled,
+                           match='generation changed'):
+            RetryingVmProvisioner._gang_schedule_ray_up(  # pylint: disable=protected-access
+                provisioner,
+                cloud_vm_ray_backend.clouds.AWS(),
+                '/tmp/cluster.yaml',
+                handle,
+                '/tmp/provision.log',
+                stream_logs=False,
+                logging_info=logging_info,
+                use_spot=False)
+
+    assert provisioner._validate_service_replica_launch_fence.call_count == 2
+    ray_up.assert_called_once()
+    wait.assert_called_once_with(17)
+
+
 def test_wait_service_registration_rpc_covers_both_phase_budgets():
     """The RPC deadline must not preempt either server-side wait phase."""
     client = object.__new__(cloud_vm_ray_backend.SkyletClient)
@@ -1825,8 +1867,10 @@ class TestCloudVmRayBackendTeardownNoLock:
                 terminate=True,
                 expected_cluster_record_uuid=str(record_uuid))
 
-        snapshot_reader.assert_called_once_with(handle.cluster_name,
-                                                str(record_uuid))
+        assert snapshot_reader.call_args_list == [
+            call(handle.cluster_name, str(record_uuid)),
+            call(handle.cluster_name, str(record_uuid)),
+        ]
         provider_teardown.assert_called_once()
         cleanup.assert_called_once_with(
             handle,
@@ -1861,7 +1905,7 @@ class TestCloudVmRayBackendTeardownNoLock:
                                 'provisioner.teardown_cluster'
                             ) as provider_teardown:
             with pytest.raises(
-                    global_user_state.ClusterRecordIdentityConflictError,
+                    global_user_state.ClusterRecordHandleChangedError,
                     match='handle changed'):
                 backend.teardown_no_lock(
                     handle,
@@ -1869,6 +1913,125 @@ class TestCloudVmRayBackendTeardownNoLock:
                     expected_cluster_record_uuid=str(record_uuid))
 
         provider_teardown.assert_not_called()
+
+    def test_expected_hash_rejects_replacement_before_any_effect(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('legacy-conflict', '/tmp/exact.yaml', False)
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.global_user_state.'
+                'get_handle_from_cluster_name',
+                return_value=None), patch(
+                    'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                    'kill_cluster_requests') as kill_requests, patch(
+                        'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                        'refresh_cluster_status_handle') as refresh, patch(
+                            'sky.backends.cloud_vm_ray_backend.provisioner.'
+                            'teardown_cluster') as provider_teardown:
+            with pytest.raises(
+                    global_user_state.ClusterRecordIdentityConflictError,
+                    match='no longer has expected generation'):
+                backend.teardown_no_lock(handle,
+                                         terminate=True,
+                                         expected_cluster_hash='generation-a')
+
+        handle.close_skylet_ssh_tunnel.assert_not_called()
+        kill_requests.assert_not_called()
+        refresh.assert_not_called()
+        provider_teardown.assert_not_called()
+
+    def test_expected_uuid_rotation_while_waiting_for_locks_has_no_effect(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('action-rotated', '/tmp/exact.yaml', False)
+        record_uuid = '11111111-1111-4111-8111-111111111111'
+        status_lock = MagicMock()
+        resource_lock = MagicMock()
+        conflict = global_user_state.ClusterRecordIdentityConflictError(
+            'rotated action UUID')
+
+        with patch('sky.backends.cloud_vm_ray_backend.locks.get_lock',
+                   side_effect=[status_lock, resource_lock]), patch(
+                       'sky.backends.cloud_vm_ray_backend.global_user_state.'
+                       'get_cluster_record_identity_snapshot',
+                       side_effect=conflict
+                   ), patch(
+                       'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                       'kill_cluster_requests') as kill_requests, patch(
+                           'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                           'check_owner_identity') as owner_check, patch.object(
+                               backend, 'teardown_no_lock') as teardown_no_lock:
+            with pytest.raises(
+                    global_user_state.ClusterRecordIdentityConflictError,
+                    match='rotated action UUID'):
+                backend._teardown(  # pylint: disable=protected-access
+                    handle,
+                    terminate=True,
+                    expected_cluster_record_uuid=record_uuid)
+
+        kill_requests.assert_not_called()
+        owner_check.assert_not_called()
+        teardown_no_lock.assert_not_called()
+        status_lock.force_unlock.assert_not_called()
+
+    def test_guard_rejection_under_locks_has_no_effect(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('owner-rotated', '/tmp/exact.yaml', False)
+        status_lock = MagicMock()
+        resource_lock = MagicMock()
+        guard = MagicMock(return_value=False)
+
+        with patch('sky.backends.cloud_vm_ray_backend.locks.get_lock',
+                   side_effect=[status_lock, resource_lock]), patch(
+                       'sky.backends.cloud_vm_ray_backend.global_user_state.'
+                       'get_handle_from_cluster_name',
+                       return_value=handle
+                   ), patch(
+                       'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                       'kill_cluster_requests') as kill_requests, patch(
+                           'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                           'check_owner_identity') as owner_check, patch.object(
+                               backend, 'teardown_no_lock') as teardown_no_lock:
+            with pytest.raises(RuntimeError,
+                               match='continuation guard rejected'):
+                backend._teardown(  # pylint: disable=protected-access
+                    handle,
+                    terminate=True,
+                    expected_cluster_hash='generation-a',
+                    continue_guard=guard)
+
+        guard.assert_called_once_with()
+        kill_requests.assert_not_called()
+        owner_check.assert_not_called()
+        teardown_no_lock.assert_not_called()
+        status_lock.force_unlock.assert_not_called()
+
+    def test_hash_rotation_during_refresh_blocks_provider_teardown(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        handle = self._make_handle('refresh-rotated', '/tmp/exact.yaml', False)
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.global_user_state.'
+                'get_handle_from_cluster_name',
+                side_effect=[handle, None]), patch(
+                    'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                    'refresh_cluster_status_handle',
+                    return_value=(None, None)), patch(
+                        'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                        'kill_cluster_requests') as kill_requests, patch(
+                            'sky.backends.cloud_vm_ray_backend.provisioner.'
+                            'teardown_cluster') as provider_teardown, \
+             patch.object(backend,
+                          'post_teardown_cleanup') as post_cleanup:
+            with pytest.raises(
+                    global_user_state.ClusterRecordIdentityConflictError,
+                    match='no longer has expected generation'):
+                backend.teardown_no_lock(handle,
+                                         terminate=True,
+                                         expected_cluster_hash='generation-a')
+
+        kill_requests.assert_not_called()
+        provider_teardown.assert_not_called()
+        post_cleanup.assert_not_called()
 
 
 class TestCloudVmRayBackendLockedProvision:

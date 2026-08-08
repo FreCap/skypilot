@@ -750,6 +750,8 @@ describe('useClusterData request ownership', () => {
       refreshPromise = result.current.refresh();
     });
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusters, []);
 
     setDocumentVisibility('hidden');
     setDocumentVisibility('visible');
@@ -757,6 +759,7 @@ describe('useClusterData request ownership', () => {
       window.document.dispatchEvent(new Event('visibilitychange'));
     });
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       manualRefresh.resolve([{ cluster: 'manual' }]);
@@ -790,6 +793,8 @@ describe('useClusterData request ownership', () => {
     // The first explicit refresh deliberately supersedes the automatic mount
     // load. Its duplicate and all overdue interval ticks reuse that owner.
     expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusters, []);
 
     await act(async () => {
       initialRequest.resolve([{ cluster: 'cluster-a' }]);
@@ -936,6 +941,21 @@ describe('useClusterData request ownership', () => {
       refreshPromise = result.current.refresh();
     });
     await waitFor(() => expect(dashboardCache.get).toHaveBeenCalledTimes(2));
+    expect(dashboardCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(
+      window.__skyPaginationFetch,
+      [
+        expect.objectContaining({
+          page: 1,
+          limit: 10,
+          showHistory: false,
+          historyDays: 1,
+          sortBy: 'launched_at',
+          sortOrder: 'desc',
+          filters: [],
+        }),
+      ]
+    );
 
     await act(async () => {
       initialRequest.reject(new Error('superseded request failed'));

@@ -342,7 +342,6 @@ class JobSystemRecoveryPhase(enum.Enum):
 class JobSystemRecoveryDetailStatus(enum.Enum):
     """Validity/presence of one optional recovery detail record."""
 
-    UNSPECIFIED = 'UNSPECIFIED'
     ABSENT = 'ABSENT'
     PRESENT = 'PRESENT'
     MALFORMED = 'MALFORMED'
@@ -358,14 +357,10 @@ class JobSystemRecoveryDetailStatus(enum.Enum):
             jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_MALFORMED:
                 cls.MALFORMED,
         }
-        if value == jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED:
-            return cls.UNSPECIFIED
         return mapping.get(value, cls.MALFORMED)
 
     def to_protobuf(self) -> 'jobsv1_pb2.JobSystemRecoveryDetailStatus':
         mapping = {
-            self.UNSPECIFIED:
-                jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED,
             self.ABSENT: jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_ABSENT,
             self.PRESENT: jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_PRESENT,
             self.MALFORMED:
@@ -1257,19 +1252,23 @@ def load_statuses_with_system_recovery_payload(
     payload: str,
 ) -> tuple[dict[int | None, JobStatus | None], dict[int, JobSystemRecoveryInfo],
            dict[int, JobSystemRecoveryDetailStatus]]:
-    """Decode the new SSH envelope or a legacy status-only payload."""
+    """Decode the typed SSH envelope without hiding ordinary job status."""
     decoded = message_utils.decode_payload(payload)
     if not isinstance(decoded, dict) or 'job_statuses' not in decoded:
         statuses = _load_statuses_dict(decoded)
+        # A status-only runtime provides no explicit recovery observation.
+        # Preserve its ordinary status while failing recovery closed.
         return statuses, {}, {
-            job_id: JobSystemRecoveryDetailStatus.UNSPECIFIED
+            job_id: JobSystemRecoveryDetailStatus.MALFORMED
             for job_id in statuses
             if isinstance(job_id, int)
         }
 
     statuses = _load_statuses_dict(decoded['job_statuses'])
+    # Every requested job must have an explicit detail status. Missing map
+    # entries are malformed rather than positive absence.
     detail_statuses = {
-        job_id: JobSystemRecoveryDetailStatus.UNSPECIFIED
+        job_id: JobSystemRecoveryDetailStatus.MALFORMED
         for job_id in statuses
         if isinstance(job_id, int)
     }

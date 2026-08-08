@@ -57,6 +57,11 @@ class OAuth2ProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
         if not self.enabled:
             return await call_next(request)
 
+        if server_constants.is_unauthenticated_public_request(
+                request.method, request.url.path):
+            request.state.anonymous_user = True
+            return await call_next(request)
+
         # Forward /oauth2/* to oauth2-proxy, including /oauth2/start and
         # /oauth2/callback.
         if request.url.path.startswith('/oauth2'):

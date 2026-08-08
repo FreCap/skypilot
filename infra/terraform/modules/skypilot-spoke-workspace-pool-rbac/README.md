@@ -12,9 +12,13 @@ The module grants:
 
 - cluster-wide `get`/`list` access to nodes and pods;
 - cluster-wide `list` access to RuntimeClasses;
+- `get` access to only the `kube-system` Namespace object, whose UID lets
+  protocol-v2 reserved fill deduplicate context aliases and fence retargeting;
 - namespaced pod lifecycle, exec, and port-forward permissions;
-- namespaced service lifecycle and event-list permissions; and
-- optional read-only access to persistent volume claims.
+- namespaced service lifecycle and event-list permissions;
+- optional read-only access to persistent volume claims; and
+- a separate teardown-only role bound to the pool ServiceAccount, so a node can
+  delete itself when its idle timer fires.
 
 It does not create cloud IAM, an identity mapping, a cluster, storage, or
 SkyPilot configuration.
@@ -63,10 +67,42 @@ The cluster-wide pod read permission is needed by SkyPilot's real-time
 GPU-availability view. The namespaced role is the workload isolation boundary.
 This module does not enforce which namespace a SkyPilot workspace chooses; the
 control-plane configuration must pin workloads to the intended namespace.
+The physical-cluster identity grant cannot be expressed with a namespaced
+Role because Namespace objects are cluster-scoped. It grants only the named
+`kube-system` object's non-secret metadata: no namespace list/watch, mutation,
+or read of another Namespace is allowed.
 
 `subjects` accepts `User` and `Group` subjects. Service-account subjects are not
 accepted because Kubernetes role-binding service-account subjects also require
 an explicit namespace, which is not part of this module's public subject type.
+
+### Node self-teardown
+
+Everything bound to `subjects` is the *control plane's* identity. One SkyPilot
+operation does not run there: the idle-timer teardown behind
+`sky launch -i N --down` runs inside the node, as the pool ServiceAccount. With
+no binding for that ServiceAccount it fails with 403 every 60s forever, and
+because storing an autostop config needs no RBAC the API server still reports a
+healthy `AUTOSTOP Nm (down)` while the cluster runs indefinitely.
+
+The module therefore always creates a separate, teardown-shaped Role (pods
+`get`/`list`/`delete`, services `get`/`list`/`delete`/`deletecollection`, events
+`create`, deployments `list`) bound to the pool ServiceAccount. It is separate
+from the control-plane Role on purpose: that one carries pods `create`,
+`pods/exec` and `pods/portforward`, which would let a workload pod start pods and
+exec into its neighbours.
+
+This briefly shipped as an opt-in `allow_self_teardown` defaulting to `false`,
+because Kubernetes RBAC cannot scope a verb to "pods this cluster owns" — pod
+names are dynamic and verbs take no label selector — so in a namespace shared by
+several users one SkyPilot workload can delete another's SkyPilot pods. That
+reservation was misplaced. A pool namespace is not a tenant boundary and this
+module never claimed it was; the caller's `partitions` documentation says so
+outright, and the control-plane subjects already hold pods `create`/`exec`/
+`portforward` in the same namespace. A pool without the grant cannot honour
+`--down` at all, and nothing surfaces that until a cluster has been idling for
+hours. A knob whose only correct value is `true` is a footgun, so it was
+removed. Callers that set `allow_self_teardown` must drop the argument.
 
 ## Upgrade and rollback
 
@@ -109,7 +145,9 @@ No modules.
 | [kubernetes_cluster_role_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_v1) | resource |
 | [kubernetes_namespace_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/namespace_v1) | resource |
 | [kubernetes_role_binding_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_binding_v1) | resource |
+| [kubernetes_role_binding_v1.pool_sa_self_teardown](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_binding_v1) | resource |
 | [kubernetes_role_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_v1) | resource |
+| [kubernetes_role_v1.pool_sa_self_teardown](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_v1) | resource |
 | [kubernetes_service_account_v1.pool_sa](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/service_account_v1) | resource |
 
 ## Inputs
@@ -131,5 +169,6 @@ No modules.
 | <a name="output_cluster_role_name"></a> [cluster\_role\_name](#output\_cluster\_role\_name) | Name shared by the cluster role and its binding. |
 | <a name="output_namespace"></a> [namespace](#output\_namespace) | Namespace SkyPilot launches pool workloads into. |
 | <a name="output_role_name"></a> [role\_name](#output\_role\_name) | Name shared by the namespaced role and its binding. |
+| <a name="output_self_teardown_role_name"></a> [self\_teardown\_role\_name](#output\_self\_teardown\_role\_name) | Name shared by the pod ServiceAccount's self-teardown role and its binding<br/>-- the grant that lets a node honour `sky launch -i N --down`. |
 | <a name="output_service_account_name"></a> [service\_account\_name](#output\_service\_account\_name) | Name of the service account created for SkyPilot workloads. |
 <!-- END_TF_DOCS -->

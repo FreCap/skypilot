@@ -26,9 +26,15 @@ _SERVICE_HASH = 'service-hash-1'
 _OWNER_IDENTITY = ('aws-user-id', '123456789012')
 
 
-def _task() -> sky.Task:
+def _task(market_type: str = 'on_demand') -> sky.Task:
     task = sky.Task(run=_owned_spec().render(), envs={'MODEL': 'boltz'})
-    task.set_resources(sky.Resources(instance_type='g2-standard-4'))
+    task.set_resources(
+        sky.Resources(cloud=clouds.AWS(),
+                      instance_type='g6.xlarge',
+                      region='us-east-1',
+                      zone='us-east-1a',
+                      memory='16',
+                      use_spot=market_type == 'spot'))
     return task
 
 
@@ -38,6 +44,8 @@ def _owned_spec() -> runtime_recovery.OwnedContainerSpec:
 
 def _authorization(task: sky.Task) -> dict[str, object]:
     spec = _owned_spec()
+    resource, = task.resources
+    market_type = 'spot' if resource.use_spot else 'on_demand'
     return {
         'authorization_version': 3,
         'profile_id': 'boltz-l4-v3',
@@ -60,7 +68,7 @@ def _authorization(task: sky.Task) -> dict[str, object]:
                 'region': 'us-east-1',
                 'availability_zones': ['us-east-1a'],
             }],
-            'allowed_market_types': ['on_demand', 'spot'],
+            'allowed_market_types': [market_type],
             'allowed_instance_types': ['g6.xlarge'],
             'max_host_memory_gib': 16,
             'num_nodes': 1,
@@ -74,9 +82,11 @@ def _authorization(task: sky.Task) -> dict[str, object]:
     }
 
 
-def _context(*, include_contract: bool = True) -> dict[str, object]:
+def _context(*,
+             include_contract: bool = True,
+             market_type: str = 'on_demand') -> dict[str, object]:
     trusted = serve_recovery._authorization_v3_from_dict(  # pylint: disable=protected-access
-        _authorization(_task()))
+        _authorization(_task(market_type)))
     requested = serve_recovery.RequestedRecoveryAuthorizationV3.from_authorization(
         trusted)
     intent = requested.to_intent_fields()
@@ -174,7 +184,7 @@ def _evidence(**overrides) -> backend_recovery.FreshProvisionEvidence:
 
 def _recovery_info() -> job_lib.JobSystemRecoveryInfo:
     return job_lib.JobSystemRecoveryInfo(
-        capability=runtime_recovery.CAPABILITY_V1,
+        capability=runtime_recovery.CAPABILITY_V2,
         phase=job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED,
         original_attempt_id='attempt-original',
         replacement_attempt_id='attempt-replacement',
@@ -247,9 +257,9 @@ def _request_and_generation(monkeypatch):
 @pytest.mark.parametrize('market_type', ['on_demand', 'spot'])
 def test_exact_profile_and_handle_produce_typed_launch_plan(
         monkeypatch, market_type):
-    task = _task()
+    task = _task(market_type)
     _install_profile(monkeypatch, task)
-    backend = _backend()
+    backend = _backend(_context(market_type=market_type))
     alias = _bind(backend, _evidence(market_type=market_type))
 
     plan = _decide(backend, _handle(), task)
@@ -640,7 +650,7 @@ def test_structured_job_status_round_trips_over_grpc():
     assert detail_statuses == {7: job_lib.JobSystemRecoveryDetailStatus.PRESENT}
 
 
-def test_old_grpc_response_has_status_and_empty_recovery_detail():
+def test_old_grpc_response_preserves_status_and_is_malformed():
     backend = cloud_vm_ray_backend.CloudVmRayBackend()
     handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
     client = mock.MagicMock()
@@ -660,7 +670,7 @@ def test_old_grpc_response_has_status_and_empty_recovery_detail():
     assert statuses == {7: job_lib.JobStatus.RUNNING}
     assert not infos
     assert detail_statuses == {
-        7: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+        7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
     }
 
 
@@ -685,17 +695,21 @@ def test_new_grpc_response_reports_positive_absence():
                                                         stream_logs=False))
 
     assert statuses == {7: job_lib.JobStatus.RUNNING}
-    assert infos == {}
+    assert not infos
     assert detail_statuses == {7: job_lib.JobSystemRecoveryDetailStatus.ABSENT}
 
 
-def test_unknown_grpc_detail_status_is_malformed():
+@pytest.mark.parametrize('detail_status', [
+    jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED,
+    99,
+])
+def test_zero_or_unknown_grpc_detail_status_is_malformed(detail_status):
     backend = cloud_vm_ray_backend.CloudVmRayBackend()
     handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
     client = mock.MagicMock()
     client.get_job_status.return_value = jobsv1_pb2.GetJobStatusResponse(
         job_statuses={7: jobsv1_pb2.JOB_STATUS_RUNNING},
-        system_recovery_detail_statuses={7: 99})
+        system_recovery_detail_statuses={7: detail_status})
 
     with mock.patch.object(cloud_vm_ray_backend,
                            'SkyletClient',
@@ -708,7 +722,7 @@ def test_unknown_grpc_detail_status_is_malformed():
                                                         stream_logs=False))
 
     assert statuses == {7: job_lib.JobStatus.RUNNING}
-    assert infos == {}
+    assert not infos
     assert detail_statuses == {
         7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
     }
@@ -725,7 +739,7 @@ def test_malformed_grpc_detail_does_not_hide_ordinary_status():
         },
         system_recovery_infos={
             7: jobsv1_pb2.JobSystemRecoveryInfo(
-                capability=runtime_recovery.CAPABILITY_V1,
+                capability=runtime_recovery.CAPABILITY_V2,
                 phase=jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_UNSPECIFIED,
                 original_attempt_id='attempt-original',
                 node_boot_id='boot-id',
@@ -759,7 +773,7 @@ def test_structured_job_status_round_trips_over_ssh(legacy_payload):
         payload = message_utils.encode_payload({7: 'RUNNING'})
         expected_infos = {}
         expected_detail_statuses = {
-            7: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+            7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
         }
     else:
         payload = message_utils.encode_payload({
@@ -811,7 +825,7 @@ def test_structured_grpc_failure_falls_back_to_status_only_ssh():
     assert statuses == {7: job_lib.JobStatus.RUNNING}
     assert not infos
     assert detail_statuses == {
-        7: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+        7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
     }
 
 

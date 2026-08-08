@@ -20,7 +20,7 @@ import {
   InfrastructureSection,
   SkeletonBadge,
 } from '@/components/infra-section';
-import { canonicalizeGpuName } from '@/utils/gpuUtils';
+import { canonicalizeGpuName, summarizeGpusByType } from '@/utils/gpuUtils';
 import {
   getWorkspaceInfrastructure,
   getWorkspaceContexts,
@@ -729,23 +729,7 @@ export function GPUs() {
 
   // Compute allGPUs (aggregated totals) whenever perContextGPUs changes
   useEffect(() => {
-    const gpuSummary = {};
-    perContextGPUs.forEach((gpu) => {
-      const gpuName = canonicalizeGpuName(gpu.gpu_name);
-      if (gpuName in gpuSummary) {
-        gpuSummary[gpuName].gpu_total += gpu.gpu_total || 0;
-        gpuSummary[gpuName].gpu_free += gpu.gpu_free || 0;
-        gpuSummary[gpuName].gpu_not_ready += gpu.gpu_not_ready || 0;
-      } else {
-        gpuSummary[gpuName] = {
-          gpu_name: gpuName,
-          gpu_total: gpu.gpu_total || 0,
-          gpu_free: gpu.gpu_free || 0,
-          gpu_not_ready: gpu.gpu_not_ready || 0,
-        };
-      }
-    });
-    setAllGPUs(Object.values(gpuSummary));
+    setAllGPUs(summarizeGpusByType(perContextGPUs));
   }, [perContextGPUs]);
 
   // Effect for initial load.

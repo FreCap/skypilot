@@ -28,6 +28,7 @@ import { Card } from '@/components/ui/card';
 import { StatusBadge } from '@/components/elements/StatusBadge';
 import {
   getServiceHistory,
+  getServicePricing,
   getServiceReplicaSummaries,
   getServiceReplicas,
   getServices,
@@ -659,6 +660,7 @@ const PAST_REPLICA_SCOPE = 'past_attempts';
 
 function emptyReplicaPage() {
   return {
+    serviceHash: null,
     replicas: [],
     total: null,
     nextCursor: null,
@@ -806,6 +808,7 @@ export function useServiceReplicaData({
           setReplicaSummary(service);
           setReplicaSummaryUnavailable(false);
           setCurrentPage({
+            serviceHash: serviceHash || null,
             replicas: current,
             total: current.length,
             nextCursor: null,
@@ -816,6 +819,7 @@ export function useServiceReplicaData({
             refreshUnavailable: false,
           });
           setPastPage({
+            serviceHash: serviceHash || null,
             replicas: past,
             total: past.length,
             nextCursor: null,
@@ -1066,6 +1070,7 @@ export function useServiceReplicaData({
         });
         setPage((previous) => {
           const next = {
+            serviceHash: response.serviceHash,
             replicas: append
               ? dedupeReplicas(previous.replicas, response.replicas)
               : response.replicas,
@@ -1196,6 +1201,19 @@ export function useServiceReplicaData({
     serviceHash,
   ]);
 
+  const refreshCurrentPage = useCallback(() => {
+    const identity = identityRef.current;
+    const generation = generationRef.current;
+    if (!enabled || !identity || modeRef.current === 'legacy' || !serviceHash) {
+      return Promise.resolve();
+    }
+    return fetchReplicaPage({
+      identity,
+      generation,
+      scope: CURRENT_REPLICA_SCOPE,
+    });
+  }, [enabled, fetchReplicaPage, serviceHash]);
+
   const openPastAttempts = useCallback(() => {
     pastRequestedRef.current = true;
     if (
@@ -1269,9 +1287,514 @@ export function useServiceReplicaData({
     pastPage,
     legacyService,
     refreshReplicas,
+    refreshCurrentPage,
     openPastAttempts,
     loadMoreCurrent,
     loadMorePast,
+  };
+}
+
+function replicaPricingKey(replica) {
+  return JSON.stringify([
+    Number(replica.id),
+    replica.pricingFingerprint ?? null,
+  ]);
+}
+
+function pricingAggregateIsGood(aggregate) {
+  return aggregate?.available === true;
+}
+
+export function useServicePricing({
+  serviceName,
+  serviceHash,
+  metadataReady,
+  currentPage,
+  enabled = true,
+  onServiceHashMismatch,
+  onRefreshCurrentPage,
+}) {
+  const hasMetadata = metadataReady ?? Boolean(serviceHash);
+  const requestedIdentity =
+    serviceName && hasMetadata
+      ? `${serviceName}:${serviceHash ?? '<legacy>'}`
+      : null;
+  const [aggregate, setAggregate] = useState(null);
+  const [priceBasis, setPriceBasis] = useState(null);
+  const [aggregateLoading, setAggregateLoading] = useState(false);
+  const [aggregateRefreshing, setAggregateRefreshing] = useState(false);
+  const [aggregateUnavailable, setAggregateUnavailable] = useState(false);
+  const [aggregateRefreshUnavailable, setAggregateRefreshUnavailable] =
+    useState(false);
+  const [aggregateUnavailableReason, setAggregateUnavailableReason] =
+    useState(null);
+  const [rowPricing, setRowPricing] = useState({});
+  const [rowLoading, setRowLoading] = useState({});
+  const [rowUnavailable, setRowUnavailable] = useState({});
+  const [rowCapabilityUnavailable, setRowCapabilityUnavailable] =
+    useState(false);
+  const identityRef = useRef(null);
+  const generationRef = useRef(0);
+  const aggregateRequestRef = useRef(0);
+  const rowEpochRef = useRef(0);
+  const aggregateRef = useRef(null);
+  const rowPricingRef = useRef({});
+  const rowLoadingRef = useRef({});
+  const rowUnavailableRef = useRef({});
+  const rowCapabilityUnavailableRef = useRef(false);
+  const rowDeferredRef = useRef(new Set());
+  const currentPageRef = useRef(currentPage);
+
+  useEffect(() => {
+    currentPageRef.current = currentPage;
+  }, [currentPage]);
+
+  const replaceRowPricing = useCallback((next) => {
+    rowPricingRef.current = next;
+    setRowPricing(next);
+  }, []);
+  const replaceRowLoading = useCallback((next) => {
+    rowLoadingRef.current = next;
+    setRowLoading(next);
+  }, []);
+  const replaceRowUnavailable = useCallback((next) => {
+    rowUnavailableRef.current = next;
+    setRowUnavailable(next);
+  }, []);
+
+  const identityIsCurrent = useCallback(
+    (identity, generation) =>
+      identityRef.current === identity && generationRef.current === generation,
+    []
+  );
+
+  const reportHashMismatch = useCallback(
+    (identity, generation) => {
+      if (!identityIsCurrent(identity, generation)) return;
+      generationRef.current += 1;
+      rowEpochRef.current += 1;
+      setAggregateLoading(false);
+      setAggregateRefreshing(false);
+      setAggregateUnavailable(true);
+      replaceRowLoading({});
+      void onServiceHashMismatch?.();
+    },
+    [identityIsCurrent, onServiceHashMismatch, replaceRowLoading]
+  );
+
+  const fetchAggregate = useCallback(
+    async ({ identity, generation }) => {
+      if (
+        !identityIsCurrent(identity, generation) ||
+        !serviceHash ||
+        !enabled
+      ) {
+        return;
+      }
+      const requestVersion = aggregateRequestRef.current + 1;
+      aggregateRequestRef.current = requestVersion;
+      const hadLastGood = pricingAggregateIsGood(aggregateRef.current);
+      setAggregateLoading(!hadLastGood);
+      setAggregateRefreshing(hadLastGood);
+      setAggregateUnavailable(false);
+      setAggregateRefreshUnavailable(false);
+      setAggregateUnavailableReason(null);
+      try {
+        const response = await getServicePricing({
+          serviceName,
+          serviceHash,
+        });
+        if (
+          !identityIsCurrent(identity, generation) ||
+          aggregateRequestRef.current !== requestVersion
+        ) {
+          return;
+        }
+        if (!response.available) {
+          if (response.reason === 'not_found') {
+            reportHashMismatch(identity, generation);
+            return;
+          }
+          if (hadLastGood) {
+            setAggregateRefreshUnavailable(true);
+          } else {
+            setAggregateUnavailable(true);
+          }
+          setAggregateUnavailableReason(response.reason || 'unavailable');
+          return;
+        }
+        setPriceBasis(response.priceBasis);
+        if (!response.aggregate?.available) {
+          if (hadLastGood) {
+            setAggregateRefreshUnavailable(true);
+          } else {
+            aggregateRef.current = response.aggregate;
+            setAggregate(response.aggregate);
+            setAggregateUnavailable(true);
+          }
+          setAggregateUnavailableReason(
+            response.aggregate?.unavailableReason || 'unavailable'
+          );
+          return;
+        }
+        aggregateRef.current = response.aggregate;
+        setAggregate(response.aggregate);
+      } catch (error) {
+        if (
+          !identityIsCurrent(identity, generation) ||
+          aggregateRequestRef.current !== requestVersion
+        ) {
+          return;
+        }
+        if (error?.code === 'SERVICE_HASH_MISMATCH') {
+          reportHashMismatch(identity, generation);
+          return;
+        }
+        console.error('Failed to fetch service pricing aggregate:', error);
+        if (hadLastGood) {
+          setAggregateRefreshUnavailable(true);
+        } else {
+          setAggregateUnavailable(true);
+        }
+        setAggregateUnavailableReason('request_failed');
+      } finally {
+        if (
+          identityIsCurrent(identity, generation) &&
+          aggregateRequestRef.current === requestVersion
+        ) {
+          setAggregateLoading(false);
+          setAggregateRefreshing(false);
+        }
+      }
+    },
+    [enabled, identityIsCurrent, reportHashMismatch, serviceHash, serviceName]
+  );
+
+  const fetchRowChunk = useCallback(
+    async ({ identity, generation, epoch, replicas }) => {
+      if (
+        !identityIsCurrent(identity, generation) ||
+        rowEpochRef.current !== epoch ||
+        !serviceHash ||
+        !enabled ||
+        replicas.length === 0
+      ) {
+        return;
+      }
+      const expectedById = new Map(
+        replicas.map((replica) => [Number(replica.id), replica])
+      );
+      const keys = replicas.map(replicaPricingKey);
+      const nextLoading = { ...rowLoadingRef.current };
+      const nextUnavailable = { ...rowUnavailableRef.current };
+      keys.forEach((key) => {
+        nextLoading[key] = epoch;
+        delete nextUnavailable[key];
+      });
+      replaceRowLoading(nextLoading);
+      replaceRowUnavailable(nextUnavailable);
+      let refreshCurrentPage = false;
+      try {
+        const response = await getServicePricing({
+          serviceName,
+          serviceHash,
+          replicaIds: replicas.map((replica) => replica.id),
+        });
+        if (
+          !identityIsCurrent(identity, generation) ||
+          rowEpochRef.current !== epoch
+        ) {
+          return;
+        }
+        if (!response.available) {
+          if (response.reason === 'not_found') {
+            reportHashMismatch(identity, generation);
+            return;
+          }
+          rowCapabilityUnavailableRef.current = true;
+          setRowCapabilityUnavailable(true);
+          const unavailable = { ...rowUnavailableRef.current };
+          keys.forEach((key) => {
+            unavailable[key] = epoch;
+          });
+          replaceRowUnavailable(unavailable);
+          return;
+        }
+        setPriceBasis((previous) => previous || response.priceBasis);
+        const currentRows = new Map(
+          (currentPageRef.current?.serviceHash === serviceHash
+            ? currentPageRef.current.replicas
+            : []
+          ).map((replica) => [Number(replica.id), replica])
+        );
+        const nextPricing = { ...rowPricingRef.current };
+        const unavailable = { ...rowUnavailableRef.current };
+        response.replicas.forEach((pricedReplica) => {
+          const expected = expectedById.get(Number(pricedReplica.id));
+          const current = currentRows.get(Number(pricedReplica.id));
+          if (!expected || !current) return;
+          const expectedKey = replicaPricingKey(expected);
+          if (replicaPricingKey(current) !== expectedKey) return;
+          if (
+            pricedReplica.hourlyCostExclusionReason ===
+            'not_current_or_uncertain'
+          ) {
+            rowDeferredRef.current.add(expectedKey);
+            unavailable[expectedKey] = epoch;
+            refreshCurrentPage = true;
+            return;
+          }
+          if (
+            pricedReplica.pricingFingerprint !==
+            (expected.pricingFingerprint ?? null)
+          ) {
+            rowDeferredRef.current.add(expectedKey);
+            unavailable[expectedKey] = epoch;
+            refreshCurrentPage = true;
+            return;
+          }
+          nextPricing[expectedKey] = pricedReplica;
+          delete unavailable[expectedKey];
+        });
+        replaceRowPricing(nextPricing);
+        replaceRowUnavailable(unavailable);
+      } catch (error) {
+        if (
+          !identityIsCurrent(identity, generation) ||
+          rowEpochRef.current !== epoch
+        ) {
+          return;
+        }
+        if (error?.code === 'SERVICE_HASH_MISMATCH') {
+          reportHashMismatch(identity, generation);
+          return;
+        }
+        console.error('Failed to fetch service replica prices:', error);
+        const unavailable = { ...rowUnavailableRef.current };
+        keys.forEach((key) => {
+          unavailable[key] = epoch;
+        });
+        replaceRowUnavailable(unavailable);
+      } finally {
+        if (
+          identityIsCurrent(identity, generation) &&
+          rowEpochRef.current === epoch
+        ) {
+          const loading = { ...rowLoadingRef.current };
+          keys.forEach((key) => {
+            if (loading[key] === epoch) delete loading[key];
+          });
+          replaceRowLoading(loading);
+          if (refreshCurrentPage) void onRefreshCurrentPage?.();
+        }
+      }
+    },
+    [
+      enabled,
+      identityIsCurrent,
+      onRefreshCurrentPage,
+      replaceRowLoading,
+      replaceRowPricing,
+      replaceRowUnavailable,
+      reportHashMismatch,
+      serviceHash,
+      serviceName,
+    ]
+  );
+
+  const fetchMissingRows = useCallback(
+    ({ identity, generation, epoch }) => {
+      if (
+        !identityIsCurrent(identity, generation) ||
+        rowEpochRef.current !== epoch ||
+        rowCapabilityUnavailableRef.current ||
+        currentPageRef.current?.serviceHash !== serviceHash
+      ) {
+        return Promise.resolve([]);
+      }
+      const missing = (currentPageRef.current.replicas || []).filter(
+        (replica) => {
+          const key = replicaPricingKey(replica);
+          return (
+            !Object.prototype.hasOwnProperty.call(rowPricingRef.current, key) &&
+            !Object.prototype.hasOwnProperty.call(rowLoadingRef.current, key) &&
+            !Object.prototype.hasOwnProperty.call(
+              rowUnavailableRef.current,
+              key
+            ) &&
+            !rowDeferredRef.current.has(key)
+          );
+        }
+      );
+      const requests = [];
+      for (let index = 0; index < missing.length; index += 100) {
+        requests.push(
+          fetchRowChunk({
+            identity,
+            generation,
+            epoch,
+            replicas: missing.slice(index, index + 100),
+          })
+        );
+      }
+      return Promise.allSettled(requests);
+    },
+    [fetchRowChunk, identityIsCurrent, serviceHash]
+  );
+
+  useEffect(() => {
+    const identity = requestedIdentity;
+    const identityChanged = identityRef.current !== identity;
+    generationRef.current += 1;
+    rowEpochRef.current += 1;
+    const generation = generationRef.current;
+    const epoch = rowEpochRef.current;
+    identityRef.current = identity;
+    // Every effect restart invalidates the prior row epoch.  Drop its
+    // in-flight markers even when the service identity is unchanged (for
+    // example, when leaving and returning to Overview), since the stale
+    // request is intentionally unable to clear them in its finally block.
+    replaceRowLoading({});
+    if (identityChanged) {
+      aggregateRef.current = null;
+      rowPricingRef.current = {};
+      rowUnavailableRef.current = {};
+      rowCapabilityUnavailableRef.current = false;
+      rowDeferredRef.current = new Set();
+      setAggregate(null);
+      setPriceBasis(null);
+      setAggregateUnavailable(false);
+      setAggregateRefreshUnavailable(false);
+      setAggregateUnavailableReason(null);
+      replaceRowPricing({});
+      replaceRowUnavailable({});
+      setRowCapabilityUnavailable(false);
+    }
+    if (!enabled || !identity || !serviceHash) {
+      setAggregateLoading(false);
+      setAggregateRefreshing(false);
+      return undefined;
+    }
+    void fetchAggregate({ identity, generation });
+    void fetchMissingRows({ identity, generation, epoch });
+    return () => {
+      generationRef.current += 1;
+      rowEpochRef.current += 1;
+    };
+  }, [
+    enabled,
+    fetchAggregate,
+    fetchMissingRows,
+    hasMetadata,
+    replaceRowLoading,
+    replaceRowPricing,
+    replaceRowUnavailable,
+    requestedIdentity,
+    serviceHash,
+  ]);
+
+  useEffect(() => {
+    const identity = identityRef.current;
+    if (!enabled || !identity || !serviceHash) return;
+    void fetchMissingRows({
+      identity,
+      generation: generationRef.current,
+      epoch: rowEpochRef.current,
+    });
+  }, [currentPage, enabled, fetchMissingRows, serviceHash]);
+
+  const refreshPricing = useCallback(() => {
+    const identity = identityRef.current;
+    const generation = generationRef.current;
+    if (!enabled || !identity || !serviceHash) return Promise.resolve();
+    rowEpochRef.current += 1;
+    const epoch = rowEpochRef.current;
+    const positivePricing = Object.fromEntries(
+      Object.entries(rowPricingRef.current).filter(
+        ([, pricedReplica]) => pricedReplica.hourlyCost !== null
+      )
+    );
+    replaceRowPricing(positivePricing);
+    replaceRowLoading({});
+    replaceRowUnavailable({});
+    rowDeferredRef.current = new Set();
+    rowCapabilityUnavailableRef.current = false;
+    setRowCapabilityUnavailable(false);
+    return Promise.allSettled([
+      fetchAggregate({ identity, generation }),
+      fetchMissingRows({ identity, generation, epoch }),
+    ]);
+  }, [
+    enabled,
+    fetchAggregate,
+    fetchMissingRows,
+    replaceRowLoading,
+    replaceRowPricing,
+    replaceRowUnavailable,
+    serviceHash,
+  ]);
+
+  const refreshWhenVisible = useCallback(() => {
+    void refreshPricing();
+  }, [refreshPricing]);
+  useVisibleRefreshInterval(
+    Boolean(enabled && serviceName && serviceHash),
+    60 * 1000,
+    refreshWhenVisible
+  );
+
+  // Effects reset state after a prop change. Fence the render that observes a
+  // new same-name service hash before that reset effect has run, too.
+  const ownsPricingIdentity =
+    requestedIdentity !== null && identityRef.current === requestedIdentity;
+
+  const getReplicaPricing = useCallback(
+    (replica) => {
+      if (!ownsPricingIdentity) return { state: 'loading' };
+      const key = replicaPricingKey(replica);
+      const pricedReplica = rowPricing[key];
+      if (pricedReplica) {
+        return {
+          state: pricedReplica.hourlyCost === null ? 'excluded' : 'available',
+          ...pricedReplica,
+        };
+      }
+      if (Object.prototype.hasOwnProperty.call(rowLoading, key)) {
+        return { state: 'loading' };
+      }
+      if (
+        rowCapabilityUnavailable ||
+        Object.prototype.hasOwnProperty.call(rowUnavailable, key)
+      ) {
+        return { state: 'unavailable' };
+      }
+      return { state: 'loading' };
+    },
+    [
+      ownsPricingIdentity,
+      rowCapabilityUnavailable,
+      rowLoading,
+      rowPricing,
+      rowUnavailable,
+    ]
+  );
+
+  return {
+    aggregate: ownsPricingIdentity ? aggregate : null,
+    priceBasis: ownsPricingIdentity ? priceBasis : null,
+    aggregateLoading: ownsPricingIdentity
+      ? aggregateLoading
+      : Boolean(enabled && requestedIdentity && serviceHash),
+    aggregateRefreshing: ownsPricingIdentity ? aggregateRefreshing : false,
+    aggregateUnavailable: ownsPricingIdentity ? aggregateUnavailable : false,
+    aggregateRefreshUnavailable: ownsPricingIdentity
+      ? aggregateRefreshUnavailable
+      : false,
+    aggregateUnavailableReason: ownsPricingIdentity
+      ? aggregateUnavailableReason
+      : null,
+    getReplicaPricing,
+    refreshPricing,
   };
 }
 
@@ -1301,6 +1824,18 @@ function ServiceDetails() {
       Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
     enabled: activeTab === 'overview',
     onServiceHashMismatch: refreshData,
+  });
+  const pricingData = useServicePricing({
+    serviceName,
+    serviceHash:
+      serviceData?.name === serviceName ? serviceData.serviceHash : null,
+    metadataReady:
+      serviceData?.name === serviceName &&
+      Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
+    currentPage: replicaData.currentPage,
+    enabled: activeTab === 'overview' && !replicaData.legacyService,
+    onServiceHashMismatch: refreshData,
+    onRefreshCurrentPage: replicaData.refreshCurrentPage,
   });
   const { replicaHistory, historyLoading, loadHistoryHours, refreshHistory } =
     useServiceHistory({
@@ -1348,6 +1883,30 @@ function ServiceDetails() {
     const legacy = ownsIdentity(replicaData.legacyService)
       ? replicaData.legacyService
       : null;
+    const currentReplicas = legacy
+      ? replicaData.currentPage.replicas
+      : replicaData.currentPage.replicas.map((replica) => {
+          const pricing = pricingData.getReplicaPricing(replica);
+          return {
+            ...replica,
+            pricingState: pricing.state,
+            ...(pricing.state === 'available' || pricing.state === 'excluded'
+              ? {
+                  hourlyCost: pricing.hourlyCost,
+                  hourlyCostExclusionReason: pricing.hourlyCostExclusionReason,
+                  priceSource: pricing.priceSource,
+                }
+              : {}),
+          };
+        });
+    const persistedPricing =
+      !legacy && pricingAggregateIsGood(pricingData.aggregate)
+        ? {
+            ...pricingData.aggregate,
+            pricingCoverage: pricingData.aggregate.coverage,
+            priceBasis: pricingData.priceBasis,
+          }
+        : {};
     const directOnlyFields = persistedSummary
       ? {
           currentOrUncertainCount: persistedSummary.currentOrUncertainCount,
@@ -1360,22 +1919,35 @@ function ServiceDetails() {
       ...(persistedSummary || {}),
       ...(liveSummary || {}),
       ...directOnlyFields,
+      ...persistedPricing,
       ...(legacy || {}),
-      replicas: replicaData.currentPage.replicas,
+      replicas: currentReplicas,
       enrichmentUnavailable: replicaData.liveSummaryUnavailable,
       replicaSummaryUnavailable: replicaData.replicaSummaryUnavailable,
       pricingUnavailable:
         !legacy &&
-        !replicaData.currentPage.loading &&
-        (replicaData.currentPage.total !== null ||
-          replicaData.currentPage.unavailable),
+        pricingData.aggregateUnavailable &&
+        !pricingAggregateIsGood(pricingData.aggregate),
+      pricingRefreshUnavailable:
+        !legacy && pricingData.aggregateRefreshUnavailable,
+      pricingUnavailableReason:
+        !legacy && pricingData.aggregateUnavailableReason,
       serviceYamlUnavailable: !legacy && Boolean(anchoredHash),
     };
+    if (persistedPricing.estimatedHourlyCost != null) {
+      enriched.costPerThousandRequests =
+        enriched.requestRate > 0
+          ? (persistedPricing.estimatedHourlyCost * 1000) /
+            (enriched.requestRate * 3600)
+          : null;
+    } else if (!legacy && pricingData.aggregate) {
+      enriched.costPerThousandRequests = null;
+    }
     // A live controller summary settles metadata-dependent cells but cannot
     // erase an independently landed replica summary or page.
     if (liveSummary || legacy) enriched.metadataOnly = false;
     return enriched;
-  }, [ownsRouteState, replicaData, serviceData, serviceName]);
+  }, [ownsRouteState, pricingData, replicaData, serviceData, serviceName]);
   const isRouteLoading = !router.isReady || !ownsRouteState || isInitialLoad;
 
   const handleManualRefresh = async () => {
@@ -1384,6 +1956,7 @@ function ServiceDetails() {
       refreshData(),
       refreshHistory(),
       replicaData.refreshReplicas(),
+      pricingData.refreshPricing(),
     ]);
     setIsRefreshing(false);
   };
@@ -1494,7 +2067,7 @@ function ServiceDetails() {
               <ServiceDetailCard
                 serviceData={currentServiceData}
                 requestHistory={replicaHistory}
-                pricingLoading={replicaData.currentPage.loading}
+                pricingLoading={pricingData.aggregateLoading}
               />
               <AcceleratorCapacityCard serviceData={currentServiceData} />
               <ServeHistorySection
@@ -1679,6 +2252,28 @@ function formatUsd(value) {
   });
 }
 
+const PRICING_EXCLUSION_LABELS = {
+  missing_version_catalog: 'missing version catalog',
+  unsupported_version_catalog: 'unsupported version catalog',
+  invalid_version_catalog: 'invalid version catalog',
+  catalog_too_large: 'catalog too large',
+  missing_location: 'missing placement location',
+  invalid_location: 'invalid placement location',
+  location_not_in_version_catalog: 'location absent from version catalog',
+  ambiguous_legacy_location: 'ambiguous legacy location',
+  catalog_price_unavailable: 'catalog price unavailable',
+  purchase_option_mismatch: 'purchase option mismatch',
+  unknown_node_count: 'unknown node count',
+  pricing_identity_too_large: 'pricing identity too large',
+  not_current_or_uncertain: 'replica no longer current',
+  kubernetes: 'Kubernetes',
+};
+
+function pricingReasonLabel(reason) {
+  if (!reason) return 'unknown price';
+  return PRICING_EXCLUSION_LABELS[reason] || reason.replaceAll('_', ' ');
+}
+
 function formatRequestRate(value) {
   return `${Number(value).toLocaleString(undefined, {
     minimumFractionDigits: value < 1 ? 2 : 1,
@@ -1700,12 +2295,18 @@ export function ServiceDetailCard({
     </span>
   );
   const hourlyCostDetails = [];
+  const usesVersionCatalog = serviceData.priceBasis === 'version_catalog';
+  const nonSpotHourlyCost = usesVersionCatalog
+    ? serviceData.nonSpotHourlyCost
+    : serviceData.onDemandHourlyCost;
   if (serviceData.spotHourlyCost > 0) {
     hourlyCostDetails.push(`Spot ${formatUsd(serviceData.spotHourlyCost)}/hr`);
   }
-  if (serviceData.onDemandHourlyCost > 0) {
+  if (nonSpotHourlyCost > 0) {
     hourlyCostDetails.push(
-      `On-demand ${formatUsd(serviceData.onDemandHourlyCost)}/hr`
+      `${usesVersionCatalog ? 'Non-Spot' : 'On-demand'} ${formatUsd(
+        nonSpotHourlyCost
+      )}/hr`
     );
   }
   if (serviceData.hourlyCostExcludedReplicaCount > 0) {
@@ -1722,7 +2323,11 @@ export function ServiceDetailCard({
       }`
     );
   }
-  if (serviceData.estimatedHourlyCost != null) {
+  if (usesVersionCatalog) {
+    hourlyCostDetails.push(
+      "Each replica version's deployment catalog; reserved $0 from persisted placement provenance; compute estimate, not a provider bill"
+    );
+  } else if (serviceData.estimatedHourlyCost != null) {
     hourlyCostDetails.push(
       'Current catalog, compute only, not a provider bill'
     );
@@ -1731,7 +2336,7 @@ export function ServiceDetailCard({
   const excludedCostDetails = Object.entries(
     serviceData.hourlyCostExclusionReasons || {}
   ).map(([reason, count]) => {
-    const label = reason === 'kubernetes' ? 'Kubernetes' : reason;
+    const label = pricingReasonLabel(reason);
     return `${count} ${label} replica${count === 1 ? '' : 's'} excluded`;
   });
 
@@ -1884,15 +2489,24 @@ export function ServiceDetailCard({
               </div>
               <div className="text-base mt-1">
                 {serviceData.estimatedHourlyCost != null
-                  ? `${formatUsd(serviceData.estimatedHourlyCost)}/hr`
+                  ? `${formatUsd(serviceData.estimatedHourlyCost)}${
+                      serviceData.pricingCoverage === 'partial' ? '+' : ''
+                    }/hr`
                   : metadataDeferred
                     ? deferredValue
                     : pricingLoading
                       ? 'Loading replica prices...'
                       : serviceData.pricingUnavailable
-                        ? 'Unavailable in bounded replica view'
-                        : '-'}
+                        ? 'Pricing unavailable'
+                        : serviceData.pricingCoverage === 'none'
+                          ? 'Unknown'
+                          : '-'}
               </div>
+              {serviceData.pricingRefreshUnavailable && (
+                <div className="text-xs text-amber-700 mt-1">
+                  Pricing refresh failed. Showing the last available estimate.
+                </div>
+              )}
               {hourlyCostDetails.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">
                   {hourlyCostDetails.join(' · ')}
@@ -1930,7 +2544,7 @@ export function ServiceDetailCard({
                     : serviceData.hourlyCostExcludedReplicaCount > 0
                       ? 'Unknown'
                       : serviceData.pricingUnavailable
-                        ? 'Unavailable in bounded replica view'
+                        ? 'Pricing unavailable'
                         : '-'}
               </div>
               <div className="text-xs text-gray-500 mt-1">
@@ -1939,14 +2553,28 @@ export function ServiceDetailCard({
                     ? 'Request and pricing data are unavailable. Refresh to retry.'
                     : 'Loading request and pricing data.'
                   : serviceData.pricingUnavailable
-                    ? 'Pricing is not included in the bounded persisted replica projection.'
-                    : excludedCostDetails.length > 0
-                      ? serviceData.costPerThousandRequests != null
-                        ? `Known lower bound at the recent request rate · ${excludedCostDetails.join(' · ')}`
-                        : serviceData.pricedReplicaCount > 0
-                          ? `No recent request rate · ${excludedCostDetails.join(' · ')}`
-                          : `No pricing available · ${excludedCostDetails.join(' · ')}`
-                      : 'Current fleet cost at the recent request rate'}
+                    ? `Pricing could not be loaded${
+                        serviceData.pricingUnavailableReason
+                          ? ` (${pricingReasonLabel(
+                              serviceData.pricingUnavailableReason
+                            )})`
+                          : ''
+                      }. Refresh to retry.`
+                    : serviceData.pricingCoverage === 'empty'
+                      ? 'No cost-tracked replicas; current tracked compute cost is $0.'
+                      : serviceData.pricingCoverage === 'none'
+                        ? `No tracked replica price could be resolved${
+                            excludedCostDetails.length
+                              ? ` · ${excludedCostDetails.join(' · ')}`
+                              : ''
+                          }`
+                        : excludedCostDetails.length > 0
+                          ? serviceData.costPerThousandRequests != null
+                            ? `Known lower bound at the recent request rate · ${excludedCostDetails.join(' · ')}`
+                            : serviceData.pricedReplicaCount > 0
+                              ? `No recent request rate · ${excludedCostDetails.join(' · ')}`
+                              : `No pricing available · ${excludedCostDetails.join(' · ')}`
+                          : 'Current fleet cost at the recent request rate'}
               </div>
             </div>
             <div>
@@ -2286,7 +2914,7 @@ export function ReplicasCard({
     );
   };
 
-  const renderReplicaTable = (rows, emptyMessage) => (
+  const renderReplicaTable = (rows, emptyMessage, pastAttempt = false) => (
     <Card>
       <div className="overflow-x-auto rounded-lg">
         <Table className="min-w-full">
@@ -2335,11 +2963,42 @@ export function ReplicasCard({
                     )}
                   </TableCell>
                   <TableCell>
-                    {replica.hourlyCost != null
-                      ? formatUsd(replica.hourlyCost)
-                      : replica.directProjection
-                        ? 'Not loaded'
-                        : '-'}
+                    {pastAttempt && replica.directProjection ? (
+                      <span className="text-gray-400">Not available</span>
+                    ) : replica.hourlyCost != null ? (
+                      <NonCapitalizedTooltip
+                        content={
+                          replica.priceSource === 'zero_cost_provenance'
+                            ? 'Reserved zero-cost placement provenance'
+                            : replica.priceSource === 'version_catalog'
+                              ? "This replica version's deployment catalog"
+                              : 'Current catalog estimate'
+                        }
+                      >
+                        <span>
+                          {formatUsd(replica.hourlyCost)}
+                          {replica.priceSource === 'zero_cost_provenance'
+                            ? ' reserved'
+                            : ''}
+                        </span>
+                      </NonCapitalizedTooltip>
+                    ) : replica.pricingState === 'loading' ? (
+                      <span className="text-gray-400">Loading...</span>
+                    ) : replica.pricingState === 'excluded' ? (
+                      <NonCapitalizedTooltip
+                        content={pricingReasonLabel(
+                          replica.hourlyCostExclusionReason
+                        )}
+                      >
+                        <span>Excluded</span>
+                      </NonCapitalizedTooltip>
+                    ) : replica.pricingState === 'unavailable' ? (
+                      <span className="text-gray-400">Unavailable</span>
+                    ) : replica.directProjection ? (
+                      'Not loaded'
+                    ) : (
+                      '-'
+                    )}
                   </TableCell>
                   <TableCell>{replica.region || '-'}</TableCell>
                   <TableCell>
@@ -2468,7 +3127,8 @@ export function ReplicasCard({
               ? 'Past attempts are loading.'
               : pastUnavailable
                 ? 'Past attempts unavailable. Refresh to retry.'
-                : 'No past attempts.'
+                : 'No past attempts.',
+            true
           )}
           {!paginated &&
             historicalReplicas.length > boundedHistoricalReplicas.length && (

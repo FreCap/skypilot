@@ -314,12 +314,13 @@ async def test_endpoint_retries_use_independent_latency_samples():
 
 
 @pytest.mark.asyncio
-async def test_endpoint_api_get(monitor, mock_blocking_operations):
+async def test_endpoint_api_get(monitor, mock_request,
+                                mock_blocking_operations):
     """Test /api/get endpoint for blocking operations."""
     print("\n🔍 Testing: /api/get")
 
     async def test_func():
-        await server.api_get('test_req')
+        await server.api_get(mock_request, 'test_req')
 
     result = await run_endpoint_test(test_func, monitor)
     assert not result['blocking'], "/api/get should NOT block the event loop"

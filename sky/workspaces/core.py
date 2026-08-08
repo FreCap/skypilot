@@ -31,6 +31,7 @@ logger = sky_logging.init_logger(__name__)
 
 # Lock for workspace configuration updates to prevent race conditions
 _WORKSPACE_CONFIG_LOCK_TIMEOUT_SECONDS = 60
+_INHERITED_ALLOWED_CONTEXTS_UNSET = object()
 
 
 @dataclass
@@ -52,8 +53,9 @@ class WorkspaceConfigComparison:
         removed_users: Users removed from allowed_users
         added_users: Users added to allowed_users
         additive_allowed_contexts: True if the only non-user-access change is an
-            additive kubernetes.allowed_contexts change (old contexts remain a
-            subset of the new contexts)
+            additive kubernetes.allowed_contexts change (old effective
+            contexts remain allowed), including explicitly materializing an
+            unchanged inherited list
     """
     only_user_access_changes: bool
     private_changed: bool
@@ -129,8 +131,9 @@ def get_accessible_workspace_names_for_user(user_id: str,
 
 
 def _update_workspaces_config(
-        workspace_modifier_fn: Callable[[dict[str, Any]],
-                                        None]) -> dict[str, Any]:
+    workspace_modifier_fn: Callable[[dict[str, Any]], None],
+    expected_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Update the workspaces configuration in the config file.
 
     This function uses file locking to prevent race conditions when multiple
@@ -140,6 +143,8 @@ def _update_workspaces_config(
         workspace_modifier_fn: A function that takes the current workspaces
             dict and modifies it in-place. This ensures all read-modify-write
             operations happen atomically inside the lock.
+        expected_config: If provided, fail unless the config under the lock is
+            still equal to this previously validated snapshot.
 
     Returns:
         The updated workspaces configuration.
@@ -151,6 +156,11 @@ def _update_workspaces_config(
             # Read the current config inside the lock to ensure we have
             # the latest state
             current_config = skypilot_config.to_dict()
+            if (expected_config is not None and
+                    current_config != expected_config):
+                raise RuntimeError(
+                    'SkyPilot configuration changed while the workspace '
+                    'update was being validated. Please retry the update.')
             current_workspaces = current_config.get('workspaces', {}).copy()
 
             # Apply the modification inside the lock
@@ -199,14 +209,46 @@ def _extract_k8s_allowed_contexts(
     # The kubernetes block may be missing or explicitly null (e.g. a bare
     # `kubernetes:` in YAML), so guard against non-dict values.
     kubernetes_config = config.get('kubernetes')
-    if (not isinstance(kubernetes_config, dict) or
-            'allowed_contexts' not in kubernetes_config):
+    if not isinstance(kubernetes_config, dict):
         return config, None
+
+    # An empty Kubernetes block and an absent one have the same effective
+    # configuration. Normalize both so adding allowed_contexts to a workspace
+    # that previously inherited it does not look like an unrelated change.
+    if 'allowed_contexts' not in kubernetes_config:
+        if kubernetes_config:
+            return config, None
+        remaining = dict(config)
+        remaining.pop('kubernetes', None)
+        return remaining, None
+
     remaining = dict(config)
-    remaining['kubernetes'] = {
+    remaining_kubernetes = {
         k: v for k, v in kubernetes_config.items() if k != 'allowed_contexts'
     }
+    if remaining_kubernetes:
+        remaining['kubernetes'] = remaining_kubernetes
+    else:
+        remaining.pop('kubernetes', None)
     return remaining, kubernetes_config['allowed_contexts']
+
+
+def _get_local_k8s_allowed_contexts(config: dict[str, Any]) -> tuple[bool, Any]:
+    """Return whether allowed_contexts is local and its local value."""
+    kubernetes_config = config.get('kubernetes')
+    if (isinstance(kubernetes_config, dict) and
+            'allowed_contexts' in kubernetes_config):
+        return True, kubernetes_config['allowed_contexts']
+    return False, None
+
+
+def _get_effective_k8s_allowed_contexts(config: dict[str, Any],
+                                        inherited_allowed_contexts: Any) -> Any:
+    """Resolve a workspace's local allowed_contexts over its global value."""
+    has_local_contexts, local_contexts = _get_local_k8s_allowed_contexts(config)
+    if has_local_contexts:
+        return local_contexts
+    return inherited_allowed_contexts
 
 
 def _is_additive_contexts(current_allowed_contexts: Any,
@@ -236,6 +278,8 @@ def _compare_workspace_configs(
     current_config: dict[str, Any],
     new_config: dict[str, Any],
     resolver: user_resolver.UserResolver | None = None,
+    inherited_allowed_contexts: Any = None,
+    new_inherited_allowed_contexts: Any = _INHERITED_ALLOWED_CONTEXTS_UNSET,
 ) -> WorkspaceConfigComparison:
     """Compare current and new workspace configurations.
 
@@ -246,6 +290,13 @@ def _compare_workspace_configs(
             re-fetch ``get_all_users()`` / ``get_users_for_role(ADMIN)``
             per workspace. If not provided, a transient resolver is built
             internally.
+        inherited_allowed_contexts: The current global
+            ``kubernetes.allowed_contexts`` value. It is used as the current
+            effective value when the workspace has no local override. Removing
+            a local override is still treated as non-additive.
+        new_inherited_allowed_contexts: The proposed global value for a full
+            config update. Defaults to ``inherited_allowed_contexts`` for a
+            workspace-only update.
 
     Returns:
         WorkspaceConfigComparison object containing the comparison results.
@@ -289,8 +340,6 @@ def _compare_workspace_configs(
         if k not in ['private', 'allowed_users']
     }
 
-    only_user_access_changes = current_without_access == new_without_access
-
     # Extract kubernetes.allowed_contexts once, getting back both the remaining
     # config and the value. Same pattern as above: if the remaining configs are
     # equal, then allowed_contexts is the ONLY non-user-access change (fails
@@ -299,9 +348,40 @@ def _compare_workspace_configs(
         _extract_k8s_allowed_contexts(current_without_access))
     new_without_contexts, new_allowed_contexts = (
         _extract_k8s_allowed_contexts(new_without_access))
-    additive_allowed_contexts = (
-        current_without_contexts == new_without_contexts and
-        _is_additive_contexts(current_allowed_contexts, new_allowed_contexts))
+    current_has_local_contexts, _ = _get_local_k8s_allowed_contexts(
+        current_without_access)
+    new_has_local_contexts, _ = _get_local_k8s_allowed_contexts(
+        new_without_access)
+    if new_inherited_allowed_contexts is _INHERITED_ALLOWED_CONTEXTS_UNSET:
+        new_inherited_allowed_contexts = inherited_allowed_contexts
+    current_effective_contexts = _get_effective_k8s_allowed_contexts(
+        current_without_access, inherited_allowed_contexts)
+    new_effective_contexts = _get_effective_k8s_allowed_contexts(
+        new_without_access, new_inherited_allowed_contexts)
+    only_user_access_changes = (current_without_access == new_without_access and
+                                current_effective_contexts
+                                == new_effective_contexts)
+
+    # Removing a local override is intentionally never treated as additive,
+    # even if the inherited value happens to be broader today. Materializing
+    # an inherited list as the same explicit list is allowed; this is a safe,
+    # effective no-op needed when adding a second context locally.
+    additive_context_values = False
+    if new_has_local_contexts:
+        if current_has_local_contexts:
+            additive_context_values = _is_additive_contexts(
+                current_allowed_contexts, new_allowed_contexts)
+        elif isinstance(inherited_allowed_contexts, list):
+            additive_context_values = (
+                inherited_allowed_contexts == new_allowed_contexts or
+                _is_additive_contexts(inherited_allowed_contexts,
+                                      new_allowed_contexts))
+    elif not current_has_local_contexts:
+        additive_context_values = _is_additive_contexts(
+            current_effective_contexts, new_effective_contexts)
+    additive_allowed_contexts = (current_without_contexts
+                                 == new_without_contexts and
+                                 additive_context_values)
 
     return WorkspaceConfigComparison(
         only_user_access_changes=only_user_access_changes,
@@ -322,17 +402,22 @@ def _validate_workspace_config_changes_with_lock(
     new_config: dict[str, Any],
     resources: resource_checker.ResourceSnapshot | None = None,
     resolver: user_resolver.UserResolver | None = None,
+    inherited_allowed_contexts: Any = None,
+    new_inherited_allowed_contexts: Any = _INHERITED_ALLOWED_CONTEXTS_UNSET,
 ) -> None:
     lock_id = backend_utils.workspace_lock_id(workspace_name)
     lock_timeout = backend_utils.WORKSPACE_LOCK_TIMEOUT_SECONDS
     try:
         with locks.get_lock(lock_id, lock_timeout):
             # Validate the configuration changes based on active resources
-            _validate_workspace_config_changes(workspace_name,
-                                               current_config,
-                                               new_config,
-                                               resources=resources,
-                                               resolver=resolver)
+            _validate_workspace_config_changes(
+                workspace_name,
+                current_config,
+                new_config,
+                resources=resources,
+                resolver=resolver,
+                inherited_allowed_contexts=(inherited_allowed_contexts),
+                new_inherited_allowed_contexts=(new_inherited_allowed_contexts))
     except locks.LockTimeout as e:
         raise RuntimeError(
             f'Failed to validate workspace {workspace_name!r} due to '
@@ -347,6 +432,8 @@ def _validate_workspace_config_changes(
     new_config: dict[str, Any],
     resources: resource_checker.ResourceSnapshot | None = None,
     resolver: user_resolver.UserResolver | None = None,
+    inherited_allowed_contexts: Any = None,
+    new_inherited_allowed_contexts: Any = _INHERITED_ALLOWED_CONTEXTS_UNSET,
 ) -> None:
     """Validate workspace configuration changes based on active resources.
 
@@ -375,14 +462,22 @@ def _validate_workspace_config_changes(
             snapshot's index instead of fetching per call.
         resolver: Optional shared ``UserResolver`` (see
             ``_compare_workspace_configs``).
+        inherited_allowed_contexts: The current global
+            ``kubernetes.allowed_contexts`` value inherited by the current
+            workspace config when it has no local override.
+        new_inherited_allowed_contexts: The submitted global value inherited
+            by the proposed workspace config during a full config update.
 
     Raises:
         ValueError: If the configuration change is not allowed due to active
         resources.
     """
-    config_comparison = _compare_workspace_configs(current_config,
-                                                   new_config,
-                                                   resolver=resolver)
+    config_comparison = _compare_workspace_configs(
+        current_config,
+        new_config,
+        resolver=resolver,
+        inherited_allowed_contexts=(inherited_allowed_contexts),
+        new_inherited_allowed_contexts=(new_inherited_allowed_contexts))
 
     if (config_comparison.only_user_access_changes or
             config_comparison.additive_allowed_contexts):
@@ -510,13 +605,19 @@ def update_workspace(workspace_name: str, config: dict[str,
     """
     _validate_workspace_config(workspace_name, config)
 
-    # Get the current workspace configuration for comparison
-    current_workspaces = skypilot_config.get_nested(('workspaces',),
-                                                    default_value={})
+    # Use one immutable-time snapshot for both the workspace override and its
+    # inherited global value.
+    current_server_config = skypilot_config.to_dict()
+    current_workspaces = current_server_config.get('workspaces', {})
     current_config = current_workspaces.get(workspace_name, {})
+    _, inherited_allowed_contexts = _extract_k8s_allowed_contexts(
+        current_server_config)
 
-    _validate_workspace_config_changes_with_lock(workspace_name, current_config,
-                                                 config)
+    _validate_workspace_config_changes_with_lock(
+        workspace_name,
+        current_config,
+        config,
+        inherited_allowed_contexts=(inherited_allowed_contexts))
 
     def update_workspace_fn(workspaces: dict[str, Any]) -> None:
         """Function to update workspace inside the lock."""
@@ -526,7 +627,8 @@ def update_workspace(workspace_name: str, config: dict[str,
         permission_service.update_workspace_policy(workspace_name, users)
 
     # Use the internal helper function to save
-    result = _update_workspaces_config(update_workspace_fn)
+    result = _update_workspaces_config(update_workspace_fn,
+                                       expected_config=current_server_config)
 
     # Validate the workspace by running sky check for it
     try:
@@ -683,6 +785,9 @@ def update_config(config: dict[str, Any]) -> dict[str, Any]:
     # Check for workspace changes and validate them
     current_workspaces = current_config.get('workspaces', {})
     new_workspaces = config.get('workspaces', {})
+    _, inherited_allowed_contexts = _extract_k8s_allowed_contexts(
+        current_config)
+    _, new_inherited_allowed_contexts = _extract_k8s_allowed_contexts(config)
 
     # Collect all workspaces that need to be checked for active resources
     workspaces_to_check: list[tuple[str, str]] = []
@@ -692,9 +797,18 @@ def update_config(config: dict[str, Any]) -> dict[str, Any]:
         'delete': {}
     }
 
+    default_workspace = constants.SKYPILOT_DEFAULT_WORKSPACE
+
     # Check each workspace that is being modified
     for workspace_name, new_workspace_config in new_workspaces.items():
-        if workspace_name not in current_workspaces:
+        is_new_workspace = workspace_name not in current_workspaces
+        # ``default`` exists semantically even when it is omitted from the
+        # persisted mapping. Materializing it must therefore follow the update
+        # path so active resources are validated against its previous effective
+        # configuration and its existing access policy is replaced.
+        is_implicit_default = (is_new_workspace and
+                               workspace_name == default_workspace)
+        if is_new_workspace and not is_implicit_default:
             # Validate names for newly added workspaces only (not existing
             # ones, for backward compatibility with pre-validation names).
             common_utils.check_workspace_name_is_valid(workspace_name)
@@ -704,13 +818,39 @@ def update_config(config: dict[str, Any]) -> dict[str, Any]:
 
         current_workspace_config = current_workspaces.get(workspace_name, {})
 
-        # If workspace configuration is changing, validate and mark for checking
-        if current_workspace_config != new_workspace_config:
+        workspace_config_changed = (current_workspace_config
+                                    != new_workspace_config)
+        current_effective_contexts = _get_effective_k8s_allowed_contexts(
+            current_workspace_config, inherited_allowed_contexts)
+        new_effective_contexts = _get_effective_k8s_allowed_contexts(
+            new_workspace_config, new_inherited_allowed_contexts)
+
+        # A top-level allowed_contexts change also changes every inheriting
+        # workspace, even when its local configuration is byte-for-byte equal.
+        if (workspace_config_changed or
+                current_effective_contexts != new_effective_contexts):
             _validate_workspace_config(workspace_name, new_workspace_config)
             _validate_workspace_config_changes_with_lock(
-                workspace_name, current_workspace_config, new_workspace_config)
-            users = workspaces_utils.get_workspace_users(new_workspace_config)
-            workspaces_to_check_policy['update'][workspace_name] = users
+                workspace_name,
+                current_workspace_config,
+                new_workspace_config,
+                inherited_allowed_contexts=inherited_allowed_contexts,
+                new_inherited_allowed_contexts=(new_inherited_allowed_contexts))
+            if workspace_config_changed:
+                users = workspaces_utils.get_workspace_users(
+                    new_workspace_config)
+                workspaces_to_check_policy['update'][workspace_name] = users
+
+    # The default workspace exists implicitly even when it is not persisted in
+    # either workspaces mapping. It still inherits a changed top-level context
+    # default and may have active resources that need the same validation.
+    if (default_workspace not in current_workspaces and
+            default_workspace not in new_workspaces and
+            inherited_allowed_contexts != new_inherited_allowed_contexts):
+        _validate_workspace_config_changes_with_lock(
+            default_workspace, {}, {},
+            inherited_allowed_contexts=inherited_allowed_contexts,
+            new_inherited_allowed_contexts=new_inherited_allowed_contexts)
 
     # Check for workspace deletions
     for workspace_name in current_workspaces:
@@ -731,6 +871,17 @@ def update_config(config: dict[str, Any]) -> dict[str, Any]:
     try:
         with filelock.FileLock(lock_path,
                                _WORKSPACE_CONFIG_LOCK_TIMEOUT_SECONDS):
+            latest_config = skypilot_config.to_dict()
+            latest_workspaces = latest_config.get('workspaces', {})
+            _, latest_inherited_allowed_contexts = (
+                _extract_k8s_allowed_contexts(latest_config))
+            if (latest_workspaces != current_workspaces or
+                    latest_inherited_allowed_contexts
+                    != inherited_allowed_contexts):
+                raise RuntimeError(
+                    'SkyPilot workspace configuration changed while the full '
+                    'configuration update was being validated. Please retry '
+                    'the update.')
             # Convert to config_utils.Config and save
             config_obj = config_utils.Config.from_dict(config)
             skypilot_config.update_api_server_config_no_lock(config_obj)

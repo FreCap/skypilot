@@ -2,6 +2,12 @@
 
 CONTROLLER_TEMPLATE = 'sky-serve-controller.yaml.j2'
 
+# Server-owned operational fence used while persisted Serve state is rewritten.
+# The ``SKYPILOT_SERVER_`` prefix prevents a client request from overriding the
+# value in an executor process (see server/requests/payloads.py).  Pools use the
+# managed-jobs controller and are intentionally outside this hold.
+SERVE_CONTROLLER_HOLD_ENV_VAR = 'SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD'
+
 SKYSERVE_METADATA_DIR = '~/.sky/serve'
 
 # The filelock for reserving service ports when starting a service. Two
@@ -41,6 +47,34 @@ REPLICA_LAUNCH_FENCE_KEYS = (
     REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY,
 )
 
+# Protocol-v2 reserved-fill authority carried in the durable API launch row.
+# Unlike the underscore-prefixed resources_override fields below, these values
+# survive the controller-to-API queue boundary and are revalidated by the
+# executor immediately before provisioning.
+RESERVED_FILL_LAUNCH_FENCE_PREFIX = 'sky_serve_reserved_fill_'
+RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}protocol_version')
+RESERVED_FILL_LAUNCH_POOL_KEY = f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}pool_key'
+RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}service_generation')
+RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}physical_cluster_uid')
+RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}kubernetes_context')
+RESERVED_FILL_LAUNCH_ACCELERATOR_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}accelerator')
+RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}accelerator_count')
+RESERVED_FILL_LAUNCH_FENCE_KEYS = (
+    RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY,
+    RESERVED_FILL_LAUNCH_POOL_KEY,
+    RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY,
+    RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY,
+    RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY,
+    RESERVED_FILL_LAUNCH_ACCELERATOR_KEY,
+    RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY,
+)
+
 # Server-only allowlist for the first same-VM system-OOM recovery rollout.
 # The value is a versioned JSON document binding an exact service incarnation
 # to a safety-profile digest.  It is read only by the API server and is never
@@ -48,16 +82,12 @@ REPLICA_LAUNCH_FENCE_KEYS = (
 SYSTEM_OOM_RECOVERY_PROFILES_ENV_VAR = (
     'SKYPILOT_INTERNAL_SERVE_SYSTEM_OOM_RECOVERY_PROFILES')
 # Recovery-capable code generation requires one exact controller-owned
-# contract tuple.  Contract 1 remains a deprecated transition reader until the
-# stacked cleanup PR.  New candidates use contract 2 and a closed context that
-# is atomically bound to the API server's own ordinary request ID.
+# contract tuple. Candidates use contract 2 and a closed context that is
+# atomically bound to the API server's own ordinary request ID.
 SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY = (
     'sky_serve_system_oom_recovery_controller_contract_version')
-SYSTEM_OOM_RECOVERY_LEGACY_CONTROLLER_CONTRACT_VERSION = 1
 SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION = 2
 SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY = 'sky_serve_system_oom_recovery_profile_id'
-SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY = (
-    'sky_serve_system_oom_recovery_profile_version')
 SYSTEM_OOM_RECOVERY_AUTHORIZATION_VERSION_KEY = (
     'sky_serve_system_oom_recovery_authorization_version')
 SYSTEM_OOM_RECOVERY_AUTHORIZATION_SHA256_KEY = (
@@ -119,24 +149,6 @@ CONTROLLER_ADMIN_AUTH_TOKENS_FILE_ENV_VAR = (
     'SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE')
 LB_DATA_PLANE_AUTH_ENABLED_ENV_VAR = (
     'SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED')
-
-# Chart-owned marker for role-local authority behavior. Absence is the only
-# disabled representation; charts never emit a false value.
-RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR = (
-    'SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED')
-# Dedicated controller-to-authority-worker preflight trust domain.  This ring
-# has no legacy environment fallback and must never share a token with any
-# public API, LB sync, controller administration, or inference credential.
-RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR = (
-    'SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE')
-RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_PATH = (
-    '/etc/skypilot/resource-action-authority/auth/tokens')
-RESOURCE_ACTION_PREFLIGHT_TLS_DIRECTORY = (
-    '/etc/skypilot/resource-action-authority/tls')
-RESOURCE_ACTION_PREFLIGHT_PATH = (
-    '/internal/resource-actions/v1/kubernetes/preflight')
-RESOURCE_ACTION_PREFLIGHT_PORT = 46583
-RESOURCE_ACTION_PREFLIGHT_SERVICE_SUFFIX = 'authority-preflight'
 
 # A load balancer stamps the durable service incarnation it was created for.
 # The stable API-server proxy rejects stale same-name LBs before forwarding.
@@ -254,6 +266,7 @@ LB_POD_UID_ENV_VAR = 'SKYPILOT_SERVE_LB_POD_UID'
 LB_SLOT_ENV_VAR = 'SKYPILOT_SERVE_LB_SLOT'
 LB_IMAGE_DIGEST_ENV_VAR = 'SKYPILOT_SERVE_LB_IMAGE_DIGEST'
 LB_RESOURCES_ENV_VAR = 'SKYPILOT_SERVE_LB_RESOURCES_JSON'
+LB_PRIORITY_CLASS_NAME_ENV_VAR = 'SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME'
 
 # The load balancer's readiness route; exempt from inbound bearer auth so the
 # k8s readinessProbe (and any LB-level health check) can reach it. Kept here so
@@ -360,6 +373,12 @@ LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS = 256
 # controllers acknowledge the durable commit before taking that lock, but
 # clients keep this budget during mixed-version rollouts.
 UPDATE_SERVICE_TIMEOUT_SECONDS = 600
+# A raw controller-config stage may still belong to an API request that is
+# waiting for a controller response and then serializing an ambiguity cleanup.
+# The controller GC therefore waits for both full request budgets before it
+# considers a NULL-yaml stage orphaned.
+ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS = 2 * UPDATE_SERVICE_TIMEOUT_SECONDS
+ORPHANED_CONFIG_STAGE_SWEEP_INTERVAL_SECONDS = 60
 
 # Replica termination waits for the fleet-wide replica-manager lock before it
 # durably schedules teardown. Large-fleet recovery and probe rounds can hold
@@ -392,6 +411,8 @@ LB_CONTROLLER_HISTORY_SYNC_PATH = (
 LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH = (
     '/controller/system_recovery_route_lease')
 LB_ROLE_PROXY_OBSERVABILITY_HEADER = ('X-SkyServe-LB-Role-Proxy-Observability')
+LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER = (
+    'X-SkyServe-LB-Role-Controller-Owner-Verified')
 
 # A recovery-capable backend can bind the same route after Ray has killed its
 # first process.  The heavyweight 20-second controller sync deliberately keeps
@@ -437,6 +458,19 @@ LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 55
 # and can exceed the parent's tight health-check timeout during launch storms.
 CONTROLLER_HEALTH_ENDPOINT_PATH = '/controller/health'
 CONTROLLER_PLACEMENT_ENDPOINT_PATH = '/controller/placement'
+CONTROLLER_UPDATE_CAPABILITIES_ENDPOINT_PATH = (
+    '/controller/update_capabilities')
+CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH = (
+    '/controller/update_service_with_config')
+CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH = (
+    '/controller/cleanup_staged_update_config')
+SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION = 1
+VERSIONED_HA_CONFIG_RECOVERY_MARKER = (
+    '# SKY_SERVE_VERSIONED_CONFIG_RECOVERY_V1')
+# One invocation-local JSON fence inserted by the HA leader immediately before
+# it spawns `_start`. The child consumes and removes it from its environment so
+# descendants cannot accidentally reuse another recovery attempt's authority.
+HA_RECOVERY_OWNER_FENCE_ENV_VAR = 'SKYPILOT_SERVE_HA_RECOVERY_OWNER_FENCE'
 # A fleet-scale readiness sweep can briefly starve the controller event loop
 # even though the constant-time health handler is healthy.  Keep local connect
 # failure detection tight, but allow the lightweight response enough time to
@@ -634,6 +668,17 @@ RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY = '_reserved_fill_grant_epoch'
 # round epoch -- a global comparison would let pool A's grant churn fence
 # pool B's unrelated fill launches.
 RESERVED_FILL_POOL_KEY_OVERRIDE_KEY = '_reserved_fill_pool_key'
+# Internal protocol-v2 launch fences. These values are consumed by the
+# replica manager before Resources.copy(): they must never reach a provider
+# request.
+RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY = (
+    '_reserved_fill_protocol_version')
+RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY = (
+    '_reserved_fill_service_generation')
+RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY = (
+    '_reserved_fill_physical_cluster_uid')
+RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY = (
+    '_reserved_fill_allowed_locations')
 
 # Internal resources_override marker for a cost-rebalance launch.  The value is
 # the incumbent replica id.  ReplicaManager consumes it before sky.launch and

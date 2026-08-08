@@ -56,6 +56,8 @@ def test_request_body_env_vars_includes_expected_keys(monkeypatch):
     monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI, 'db-uri')
     monkeypatch.setenv(serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR, 'false')
     monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'controller')
+    monkeypatch.setenv('SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS',
+                       'true')
     monkeypatch.setenv('SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS', '70')
     monkeypatch.setenv('SKYPILOT_POD_UID', 'pod-uid')
     monkeypatch.setenv(constants.SKY_API_SERVER_URL_ENV_VAR,
@@ -71,6 +73,7 @@ def test_request_body_env_vars_includes_expected_keys(monkeypatch):
     assert constants.ENV_VAR_DB_CONNECTION_URI not in local_env
     assert serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR not in local_env
     assert 'SKYPILOT_API_SERVER_ROLE' not in local_env
+    assert 'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS' not in local_env
     assert 'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS' not in local_env
     assert 'SKYPILOT_POD_UID' not in local_env
     assert constants.SKY_API_SERVER_URL_ENV_VAR not in local_env
@@ -87,6 +90,7 @@ def test_request_body_env_vars_includes_expected_keys(monkeypatch):
     assert constants.CLIENT_USER_HASH_ENV_VAR not in remote_env
     assert serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR not in remote_env
     assert 'SKYPILOT_API_SERVER_ROLE' not in remote_env
+    assert 'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS' not in remote_env
     assert 'SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS' not in remote_env
     assert 'SKYPILOT_POD_UID' not in remote_env
     assert constants.SKY_API_SERVER_URL_ENV_VAR not in remote_env
@@ -114,6 +118,24 @@ def test_request_body_env_vars_client_user_hash_none_with_basic_auth(
 
     env_vars = payloads.request_body_env_vars()
     assert constants.CLIENT_USER_HASH_ENV_VAR not in env_vars
+
+
+def test_request_body_projection_placeholder_is_inert(monkeypatch):
+    ambient_env = mock.Mock(
+        side_effect=AssertionError('projection must not capture ambient env'))
+    monkeypatch.setattr(payloads, 'request_body_env_vars', ambient_env)
+
+    body = payloads.RequestBody.projection_placeholder()
+
+    ambient_env.assert_not_called()
+    assert body.env_vars == {}
+    assert body.entrypoint == ''
+    assert body.entrypoint_command == ''
+    assert body.using_remote_api_server is False
+    assert body.override_skypilot_config == {}
+    assert body.override_skypilot_config_path is None
+    assert body.file_mounts_blob_id is None
+    assert body.client_api_version is None
 
 
 def test_persisted_payload_strips_server_owned_kubernetes_autoscaler():

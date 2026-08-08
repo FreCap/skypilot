@@ -1,6 +1,7 @@
 """Spot Placer for SpotHedge."""
 
 import collections
+from collections.abc import Mapping
 import dataclasses
 import enum
 import math
@@ -17,6 +18,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.clouds import cloud as sky_cloud
 from sky.container_images import models as container_image_models
+from sky.serve import placement_policy
 from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import ux_utils
@@ -28,10 +30,12 @@ if typing.TYPE_CHECKING:
 
 logger = sky_logging.init_logger(__name__)
 
-SPOT_PLACERS = {}
-DEFAULT_SPOT_PLACER = None
-SPOT_HEDGE_PLACER = 'dynamic_fallback'
-CAPACITY_AWARE_SPOT_PLACER = 'dynamic_fallback_per_gpu'
+# Compatibility exports for callers that historically imported the public
+# names from this module.  Policy resolution itself lives in the dependency-
+# neutral placement_policy module.
+SPOT_HEDGE_PLACER = placement_policy.SPOT_HEDGE_PLACER
+CAPACITY_AWARE_SPOT_PLACER = placement_policy.CAPACITY_AWARE_SPOT_PLACER
+SUPPORTED_SPOT_PLACERS = placement_policy.SUPPORTED_SPOT_PLACERS
 
 # These backends build their accelerator catalogs by inspecting the user's
 # cluster. Per-GPU placement must not turn service-controller construction into
@@ -49,8 +53,17 @@ _LIVE_ACCELERATOR_CATALOG_CLOUDS = frozenset({'kubernetes', 'slurm', 'ssh'})
 # location with one probe launch per TTL window.
 _PREEMPTION_RETRY_SECONDS_DEFAULT = 600
 _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
+# How long a measured free-slot count stays authoritative for a zero-cost
+# location. The broker re-counts every poll interval, so this only has to
+# outlive a few missed rounds; past it the location falls back to the blind
+# probe path rather than launching on a reading nobody has refreshed.
+_MEASURED_CAPACITY_TTL_SECONDS_DEFAULT = 180
+_MEASURED_CAPACITY_TTL_ENV_VAR = 'SKYPILOT_MEASURED_CAPACITY_TTL_SECONDS'
 _PLACEMENT_SNAPSHOT_MAX_LOCATIONS = 500
 _PLACEMENT_CATALOG_SCHEMA_VERSION = 1
+# Public reader contract for bounded consumers such as the dashboard.  The
+# placement JSON remains versioned independently of the API wire version.
+PLACEMENT_CATALOG_SCHEMA_VERSION = _PLACEMENT_CATALOG_SCHEMA_VERSION
 _PLACEMENT_CATALOG_MAX_LOCATIONS = 100_000
 
 
@@ -95,6 +108,18 @@ def _preemption_retry_seconds() -> float:
                            f'{override!r}, using default '
                            f'{_PREEMPTION_RETRY_SECONDS_DEFAULT}s.')
     return _PREEMPTION_RETRY_SECONDS_DEFAULT
+
+
+def _measured_capacity_ttl_seconds() -> float:
+    override = os.environ.get(_MEASURED_CAPACITY_TTL_ENV_VAR)
+    if override is not None:
+        try:
+            return max(0.0, float(override))
+        except ValueError:
+            logger.warning(f'Invalid {_MEASURED_CAPACITY_TTL_ENV_VAR} value '
+                           f'{override!r}, using default '
+                           f'{_MEASURED_CAPACITY_TTL_SECONDS_DEFAULT}s.')
+    return _MEASURED_CAPACITY_TTL_SECONDS_DEFAULT
 
 
 @dataclasses.dataclass
@@ -340,6 +365,143 @@ def locations_match_placement(replica_location: Location,
     return True
 
 
+@dataclasses.dataclass(frozen=True)
+class CatalogLocationIndex:
+    """Precomputed pure indexes for exact and legacy catalog matching."""
+
+    exact: dict[Location, tuple[Location, ...]]
+    shape: dict[tuple[str, str, str | None, bool, str], tuple[Location, ...]]
+    coordinates: dict[tuple[str, str, str | None], tuple[Location, ...]]
+
+    @classmethod
+    def from_locations(
+            cls,
+            candidates: typing.Iterable[Location]) -> 'CatalogLocationIndex':
+        exact: dict[Location, list[Location]] = collections.defaultdict(list)
+        shape: dict[tuple[str, str, str | None, bool, str],
+                    list[Location]] = collections.defaultdict(list)
+        coordinates: dict[tuple[str, str, str | None],
+                          list[Location]] = collections.defaultdict(list)
+        # pylint: disable=protected-access
+        for candidate in candidates:
+            exact[candidate].append(candidate)
+            cloud_name = str(candidate.cloud)
+            shape[(cloud_name, candidate.region, candidate.zone,
+                   candidate.use_spot,
+                   candidate._accel_key(
+                       include_instance_type=False))].append(candidate)
+            coordinates[(cloud_name, candidate.region,
+                         candidate.zone)].append(candidate)
+        # pylint: enable=protected-access
+        return cls(
+            exact={
+                key: tuple(value) for key, value in exact.items()
+            },
+            shape={
+                key: tuple(value) for key, value in shape.items()
+            },
+            coordinates={
+                key: tuple(value) for key, value in coordinates.items()
+            },
+        )
+
+    def matches(self, location: Location) -> tuple[Location, ...]:
+        """Return exact or legacy-compatible candidates in priority order."""
+        exact = self.exact.get(location, ())
+        if exact:
+            return exact
+        cloud_name = str(location.cloud)
+        if location.instance_type is None:
+            # pylint: disable=protected-access
+            shape = self.shape.get(
+                (cloud_name, location.region, location.zone, location.use_spot,
+                 location._accel_key(include_instance_type=False)), ())
+            # pylint: enable=protected-access
+            if shape:
+                return shape
+        fully_shape_less = (location.accelerators is None and
+                            location.image_id is None and
+                            location.container_image is None and
+                            location.disk_tier is None and
+                            location.ephemeral_storage is None and
+                            location.instance_type is None)
+        if not fully_shape_less:
+            return ()
+        return self.coordinates.get(
+            (cloud_name, location.region, location.zone), ())
+
+
+def _catalog_location_matches(
+    location: Location,
+    candidates: typing.Iterable[Location] | CatalogLocationIndex,
+) -> list[Location]:
+    """Return exact or legacy-compatible catalog candidates in priority order.
+
+    Exact identity wins.  An instance-type-less row next tries the historical
+    shape identity, and a fully shape-less row finally falls back to exact
+    cloud/region/zone coordinates.  The caller decides whether multiple
+    legacy matches are admissible; dashboard pricing deliberately is strict,
+    while operational placement retains its temporary cheapest-match mode.
+    """
+    if isinstance(candidates, CatalogLocationIndex):
+        return list(candidates.matches(location))
+    if isinstance(candidates, Mapping) and location in candidates:
+        # Preserve SpotPlacer's common exact-key path as O(1). Returning the
+        # supplied identity matches its historical resolve_location behavior.
+        return [location]
+    # Operational placement resolves against mutable status maps. Preserve its
+    # one-pass lookup rather than allocating three full indexes per status
+    # transition; bounded dashboard reads explicitly pass a request-local
+    # prebuilt index above.
+    candidates = list(candidates)
+    exact = [candidate for candidate in candidates if candidate == location]
+    if exact:
+        return exact
+    if location.instance_type is None:
+        # pylint: disable=protected-access
+        shape_matches = [
+            candidate for candidate in candidates
+            if candidate.cloud.is_same_cloud(location.cloud) and candidate.
+            region == location.region and candidate.zone == location.zone and
+            candidate.use_spot == location.use_spot and candidate._accel_key(
+                include_instance_type=False) == location._accel_key(
+                    include_instance_type=False)
+        ]
+        # pylint: enable=protected-access
+        if shape_matches:
+            return shape_matches
+    fully_shape_less = (location.accelerators is None and
+                        location.image_id is None and
+                        location.container_image is None and
+                        location.disk_tier is None and
+                        location.ephemeral_storage is None and
+                        location.instance_type is None)
+    if not fully_shape_less:
+        return []
+    return [
+        candidate for candidate in candidates
+        if candidate.cloud.is_same_cloud(location.cloud) and
+        candidate.region == location.region and candidate.zone == location.zone
+    ]
+
+
+def match_catalog_location_strict(
+    location: Location,
+    candidates: typing.Iterable[Location] | CatalogLocationIndex
+) -> tuple[Location | None, bool]:
+    """Resolve only exact or unambiguous legacy placement identity.
+
+    Returns ``(location, False)`` for a unique match, ``(None, True)`` for an
+    ambiguous legacy match, and ``(None, False)`` when no catalog entry is
+    compatible.  This is pure: it performs no provider, task, or resource
+    lookup.
+    """
+    matches = _catalog_location_matches(location, candidates)
+    if len(matches) == 1:
+        return matches[0], False
+    return None, len(matches) > 1
+
+
 class LocationStatus(enum.Enum):
     """Location Spot Status."""
     ACTIVE = 'ACTIVE'
@@ -351,6 +513,10 @@ class PlacementCatalog:
     """Complete immutable placement candidates and their nominal costs."""
 
     entries: tuple[tuple[Location, float], ...]
+    # The entry cost is per node.  New catalogs persist the task's immutable
+    # node count; None is retained only for catalogs written before this
+    # additive field existed.
+    num_nodes: int | None = None
 
     @staticmethod
     def _serialize_location(location: Location) -> dict[str, Any]:
@@ -418,6 +584,32 @@ class PlacementCatalog:
         if workspace is not None:
             location_kwargs['workspace'] = workspace
         locations = _get_possible_location_from_task(task, **location_kwargs)
+        # A catalog is immutable for the life of a service version, and the
+        # Kubernetes contexts it enumerates decide which reserved pools that
+        # version can ever fill. When one is dropped -- because it is not
+        # reachable, or not allowed in the workspace this build ran under --
+        # nothing downstream can recover it, and the service simply never uses
+        # that capacity. Record what was enumerated and under which workspace,
+        # so the two can be compared against the task without reproducing the
+        # build.
+        declared_contexts = sorted({
+            str(resource.region)
+            for resource in (task.resources or [])
+            if (resource.cloud is not None and str(resource.cloud).lower() ==
+                'kubernetes' and isinstance(resource.region, str))
+        })
+        if declared_contexts:
+            enumerated_contexts = sorted({
+                str(location.region)
+                for location in locations
+                if str(location.cloud).lower() == 'kubernetes' and
+                location.region is not None
+            })
+            logger.info(
+                f'Placement catalog enumerated {len(locations)} location(s) '
+                f'under workspace {workspace!r}. Kubernetes contexts declared '
+                f'by the task: {declared_contexts}; enumerated: '
+                f'{enumerated_contexts}.')
         if len(locations) > _PLACEMENT_CATALOG_MAX_LOCATIONS:
             raise ValueError(
                 'Spot placement catalog contains too many locations: '
@@ -441,7 +633,12 @@ class PlacementCatalog:
                                    f'location {location}: {e}')
                     cost = float('inf')
             entries.append((location, cost))
-        return cls(tuple(entries))
+        num_nodes = task.num_nodes
+        if (isinstance(num_nodes, bool) or not isinstance(num_nodes, int) or
+                num_nodes < 1):
+            raise ValueError('Placement catalog num_nodes must be a positive '
+                             f'integer. Got: {num_nodes!r}')
+        return cls(tuple(entries), num_nodes=num_nodes)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> 'PlacementCatalog':
@@ -449,9 +646,17 @@ class PlacementCatalog:
         if not isinstance(data, dict):
             raise ValueError('Placement catalog must be a mapping.')
         schema_version = data.get('schema_version')
-        if schema_version != _PLACEMENT_CATALOG_SCHEMA_VERSION:
+        if (isinstance(schema_version, bool) or
+                not isinstance(schema_version, int) or
+                schema_version != _PLACEMENT_CATALOG_SCHEMA_VERSION):
             raise ValueError('Unsupported placement catalog schema version: '
                              f'{schema_version!r}.')
+        num_nodes = data.get('num_nodes')
+        if (num_nodes is not None and
+            (isinstance(num_nodes, bool) or not isinstance(num_nodes, int) or
+             num_nodes < 1)):
+            raise ValueError('Placement catalog num_nodes must be a positive '
+                             'integer or absent.')
         raw_entries = data.get('entries')
         if not isinstance(raw_entries, list):
             raise ValueError('Placement catalog entries must be a list.')
@@ -481,7 +686,12 @@ class PlacementCatalog:
                 raise ValueError('Placement catalog hourly cost must be a '
                                  'non-negative finite number or null.')
             else:
-                cost = float(raw_cost)
+                try:
+                    cost = float(raw_cost)
+                except OverflowError as exc:
+                    raise ValueError(
+                        'Placement catalog hourly cost must be a non-negative '
+                        'finite number or null.') from exc
                 if not math.isfinite(cost) or cost < 0:
                     raise ValueError('Placement catalog hourly cost must be a '
                                      'non-negative finite number or null.')
@@ -489,16 +699,19 @@ class PlacementCatalog:
         if entries != sorted(entries, key=lambda item: item[0].sort_key()):
             raise ValueError(
                 'Placement catalog entries must be deterministically sorted.')
-        return cls(tuple(entries))
+        return cls(tuple(entries), num_nodes=num_nodes)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             'schema_version': _PLACEMENT_CATALOG_SCHEMA_VERSION,
             'entries': [{
                 'location': self._serialize_location(location),
                 'hourly_cost': cost if math.isfinite(cost) else None,
             } for location, cost in self.entries],
         }
+        if self.num_nodes is not None:
+            result['num_nodes'] = self.num_nodes
+        return result
 
     def costs(self) -> dict[Location, float]:
         """Return a mutable runtime map with one value for every location."""
@@ -722,20 +935,42 @@ def _get_possible_location_from_task(
 class SpotPlacer:
     """Spot Placement specification."""
 
-    _expand_accelerator_counts = False
     _RETRY_STATE_VERSION = 1
     _BENCH_REASONS = frozenset({'capacity', 'quota', 'preempted'})
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> 'SpotPlacer':
+        """Allocate the complete process-local compatibility interface.
+
+        Lightweight test construction may skip ``__init__``. Defaults belong
+        at allocation time so runtime methods use one explicit interface
+        instead of probing for fields.
+        """
+        del args, kwargs
+        instance = super().__new__(cls)
+        instance._workspace = None
+        instance.location2preempted_at = {}
+        instance.location2preempted_reason = {}
+        instance.location2retry_reserved_at = {}
+        instance.location2observed_free = {}
+        instance._retry_state_dirty = False
+        return instance
 
     def __init__(
         self,
         task: 'task_lib.Task',
+        placement_contract: placement_policy.PlacementContract,
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
         workspace: str | None = None,
     ) -> None:
+        if not placement_contract.enabled:
+            raise ValueError('A placement-disabled contract cannot construct '
+                             'a SpotPlacer.')
+        self._placement_contract = placement_contract
         if placement_catalog is None:
             catalog_value = PlacementCatalog.from_task(
                 task,
-                expand_accelerator_counts=self._expand_accelerator_counts,
+                expand_accelerator_counts=(
+                    placement_contract.expand_accelerator_counts),
                 workspace=workspace)
         elif isinstance(placement_catalog, PlacementCatalog):
             catalog_value = placement_catalog
@@ -759,6 +994,10 @@ class SpotPlacer:
         # launch failures can release this reservation and leave the location
         # immediately eligible; typed failures replace the observation.
         self.location2retry_reserved_at: dict[Location, float] = {}
+        # Last measured free slots per zero-cost location, as (slots, when).
+        # Only pools the broker counts every round appear here; a paid spot
+        # region is never measured.
+        self.location2observed_free: dict[Location, tuple[int, float]] = {}
         self._retry_state_dirty = False
         # Complete by construction. Runtime paths must never resolve provider
         # feasibility or pricing because a location cost is missing.
@@ -776,22 +1015,58 @@ class SpotPlacer:
         self.resources = list(task.resources)[0]
         self.num_nodes = task.num_nodes
 
-    def _ensure_retry_state_fields(self) -> None:
-        """Initialize fields for lightweight or legacy reconstructed placers."""
-        if not hasattr(self, 'location2preempted_reason'):
-            self.location2preempted_reason = {}
-        if not hasattr(self, 'location2retry_reserved_at'):
-            self.location2retry_reserved_at = {}
-        if not hasattr(self, '_retry_state_dirty'):
-            self._retry_state_dirty = False
+    def observe_zero_cost_capacity(self, free_by_location: dict[Location, int],
+                                   observed_at: float) -> None:
+        """Record a broker round's measured free slots per zero-cost location.
 
-    def __init_subclass__(cls, name: str, default: bool = False):
-        SPOT_PLACERS[name] = cls
-        if default:
-            global DEFAULT_SPOT_PLACER
-            assert DEFAULT_SPOT_PLACER is None, (
-                'Only one policy can be default.')
-            DEFAULT_SPOT_PLACER = name
+        A reserved Kubernetes pool is counted every round, so its bench is not
+        carrying information the way a spot region's is: there is nothing left
+        to discover by spending a probe. Recording the count lets
+        `_effective_status` prefer the measurement over the probe clock.
+
+        Only zero-cost locations are accepted. A paid region is never measured,
+        so a caller naming one must not buy it a bench bypass.
+        """
+        if not math.isfinite(observed_at):
+            return
+        for location, free in free_by_location.items():
+            resolved = self.resolve_location(location,
+                                             allow_ambiguous_legacy_shape=True)
+            if resolved is None or self.location2cost.get(resolved) != 0:
+                continue
+            previous = self.location2observed_free.get(resolved)
+            # Rounds can complete out of order; a late arrival must not
+            # overwrite a fresher count.
+            if previous is not None and previous[1] >= observed_at:
+                continue
+            self.location2observed_free[resolved] = (max(0, int(free)),
+                                                     float(observed_at))
+            self._retry_state_dirty = True
+
+    def _measured_available(self, location: Location) -> bool:
+        """Whether a fresh count says this location can take a launch now.
+
+        The count must also be NEWER than the bench it would override.
+        Otherwise a pool that measures free but refuses launches (taints,
+        affinity, admission webhooks) would spin: every failure re-benches,
+        and a single stale reading would clear it again forever.
+        """
+        entry = self.location2observed_free.get(location)
+        if entry is None:
+            return False
+        free, observed_at = entry
+        if free <= 0:
+            return False
+        if time.time() - observed_at > _measured_capacity_ttl_seconds():
+            return False
+        benched_at = self.location2preempted_at.get(location)
+        if benched_at is not None and benched_at >= observed_at:
+            return False
+        return True
+
+    @property
+    def placement_contract(self) -> placement_policy.PlacementContract:
+        return self._placement_contract
 
     def select_next_location(
             self,
@@ -844,39 +1119,12 @@ class SpotPlacer:
         all shape fields retain the coordinates-only fallback under the same
         rule.
         """
-        if location in self.location2status:
-            return location
-        if location.instance_type is None:
-            # pylint: disable=protected-access
-            shape_matches = [
-                key for key in self.location2status
-                if key.cloud.is_same_cloud(location.cloud) and
-                key.region == location.region and key.zone == location.zone and
-                key.use_spot == location.use_spot and key._accel_key(
-                    include_instance_type=False) == location._accel_key(
-                        include_instance_type=False)
-            ]
-            # pylint: enable=protected-access
-            if len(shape_matches) == 1:
-                return shape_matches[0]
-            if allow_ambiguous_legacy_shape and shape_matches:
-                return self._min_cost_location(shape_matches)
-        fully_shape_less = (location.accelerators is None and
-                            location.image_id is None and
-                            location.container_image is None and
-                            location.disk_tier is None and
-                            location.ephemeral_storage is None and
-                            location.instance_type is None)
-        if not fully_shape_less:
-            return None
-        matches = [
-            key for key in self.location2status
-            if key.cloud.is_same_cloud(location.cloud) and
-            key.region == location.region and key.zone == location.zone
-        ]
-        if len(matches) == 1:
-            return matches[0]
-        if allow_ambiguous_legacy_shape and matches:
+        resolved, ambiguous = match_catalog_location_strict(
+            location, self.location2status)
+        if resolved is not None:
+            return resolved
+        if allow_ambiguous_legacy_shape and ambiguous:
+            matches = _catalog_location_matches(location, self.location2status)
             return self._min_cost_location(matches)
         return None
 
@@ -884,7 +1132,6 @@ class SpotPlacer:
                    location: Location,
                    *,
                    selected_at: float | None = None) -> None:
-        self._ensure_retry_state_fields()
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if resolved is None:
@@ -914,7 +1161,6 @@ class SpotPlacer:
                        *,
                        reason: str = 'capacity',
                        observed_at: float | None = None) -> None:
-        self._ensure_retry_state_fields()
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if resolved is None:
@@ -959,7 +1205,6 @@ class SpotPlacer:
                                 observed_at=observed_at)
 
     def clear_preemptive_locations(self) -> None:
-        self._ensure_retry_state_fields()
         changed = bool(self.location2preempted_at or
                        self.location2preempted_reason or
                        self.location2retry_reserved_at)
@@ -979,8 +1224,6 @@ class SpotPlacer:
         model, image, disk tier, or ephemeral storage; a capacity failure for
         the old shape must not bench that new shape.
         """
-        self._ensure_retry_state_fields()
-        old_placer._ensure_retry_state_fields()  # pylint: disable=protected-access
         for location in self.location2status:
             if (old_placer.location2status.get(location)
                     != LocationStatus.PREEMPTED):
@@ -996,11 +1239,16 @@ class SpotPlacer:
                 location)
             if retry_reserved_at is not None:
                 self.location2retry_reserved_at[location] = retry_reserved_at
+            # The free-slot count belongs to the pool, not to the service
+            # version being replaced; dropping it would re-bench a measured
+            # pool for a whole TTL on every service update.
+            observed = old_placer.location2observed_free.get(location)
+            if observed is not None:
+                self.location2observed_free[location] = observed
             self._retry_state_dirty = True
 
     def dump_retry_state(self) -> dict[str, Any]:
         """Return bounded JSON-safe placement retry state."""
-        self._ensure_retry_state_fields()
         benches = []
         for location in sorted(self.location2status,
                                key=lambda candidate: candidate.sort_key()):
@@ -1019,12 +1267,15 @@ class SpotPlacer:
             if (retry_reserved_at is not None and
                     math.isfinite(retry_reserved_at)):
                 bench['retry_reserved_at'] = retry_reserved_at
+            measured = self.location2observed_free.get(location)
+            if measured is not None and math.isfinite(measured[1]):
+                bench['measured_free'] = int(measured[0])
+                bench['measured_at'] = float(measured[1])
             benches.append(bench)
         return {'version': self._RETRY_STATE_VERSION, 'benches': benches}
 
     def load_retry_state(self, state: dict[str, Any] | None) -> None:
         """Restore exact durable benches without restarting their clocks."""
-        self._ensure_retry_state_fields()
         if not isinstance(state, dict) or state.get(
                 'version') != self._RETRY_STATE_VERSION:
             return
@@ -1067,19 +1318,35 @@ class SpotPlacer:
             if retry_reserved_at is not None:
                 self.location2retry_reserved_at[resolved] = min(
                     float(retry_reserved_at), now)
+            measured_free = raw.get('measured_free')
+            measured_at = raw.get('measured_at')
+            if (isinstance(measured_free, int) and
+                    not isinstance(measured_free, bool) and
+                    isinstance(measured_at, (int, float)) and
+                    not isinstance(measured_at, bool) and
+                    math.isfinite(measured_at)):
+                self.location2observed_free[resolved] = (max(
+                    0, measured_free), min(float(measured_at), now))
         self._retry_state_dirty = False
 
     @property
     def retry_state_dirty(self) -> bool:
-        return getattr(self, '_retry_state_dirty', False)
+        return self._retry_state_dirty
 
     def mark_retry_state_persisted(self) -> None:
         self._retry_state_dirty = False
 
+    @staticmethod
+    def _accelerator_slots(location: Location) -> float:
+        slots = sum((location.accelerators or {}).values())
+        return float(slots) if slots > 0 else 1.0
+
     def _min_cost_location(self, locations: list[Location]) -> Location:
         return min(
             locations,
-            key=lambda location: self.location2cost.get(location, float('inf')))
+            key=lambda location: self.placement_contract.normalize_hourly_cost(
+                self.location2cost.get(location, float('inf')),
+                self._accelerator_slots(location)))
 
     def _effective_status(self, location: Location) -> LocationStatus:
         """Status with TTL decay: an expired PREEMPTED mark counts ACTIVE.
@@ -1087,10 +1354,15 @@ class SpotPlacer:
         The stored status is left untouched — if the retry launch fails,
         set_preemptive refreshes the timestamp (benched for another TTL);
         if it succeeds, set_active clears the mark entirely.
+
+        A zero-cost location whose free slots were counted more recently than
+        its bench is ACTIVE on that count instead of on the probe clock: the
+        bench was standing in for an observation that has since arrived.
         """
-        self._ensure_retry_state_fields()
         status = self.location2status[location]
         if status == LocationStatus.PREEMPTED:
+            if self._measured_available(location):
+                return LocationStatus.ACTIVE
             retry_from = self.location2retry_reserved_at.get(
                 location, self.location2preempted_at.get(location))
             if (retry_from is not None and
@@ -1107,7 +1379,7 @@ class SpotPlacer:
         workspace cloud, capability, and context policy can change after a
         scale-to-zero service's placer was constructed.
         """
-        workspace = getattr(self, '_workspace', None)
+        workspace = self._workspace
         if workspace is None:
             return set(self.location2status)
         allowed_cloud_names = {
@@ -1153,7 +1425,7 @@ class SpotPlacer:
 
     def refresh_workspace_policy(self) -> None:
         """Reload centrally managed config before final launch admission."""
-        if getattr(self, '_workspace', None) is not None:
+        if self._workspace is not None:
             skypilot_config.safe_reload_config()
 
     def _location_with_status(self, status: LocationStatus) -> list[Location]:
@@ -1177,7 +1449,11 @@ class SpotPlacer:
         underlying provider observation. A successful launch clears both via
         set_active; a generic failure releases only the reservation.
         """
-        self._ensure_retry_state_fields()
+        if self._measured_available(location):
+            # Selection is riding a live count, not a probe. Charging it to the
+            # probe budget would re-bench the location after one launch and cap
+            # a measured pool's refill at one replica per TTL window.
+            return
         if self.location2status.get(location) == LocationStatus.PREEMPTED:
             self.location2retry_reserved_at[location] = time.time()
             self._retry_state_dirty = True
@@ -1191,7 +1467,6 @@ class SpotPlacer:
 
     def release_retry(self, location: Location) -> None:
         """Release an expired-bench probe after a non-availability failure."""
-        self._ensure_retry_state_fields()
         resolved = self.resolve_location(location,
                                          allow_ambiguous_legacy_shape=True)
         if (resolved is not None and
@@ -1222,7 +1497,6 @@ class SpotPlacer:
         paid_admission_by_location: dict[Location, dict[str, Any]] | None = None
     ) -> dict[str, Any]:
         """Serialize already-resident retry state without provider calls."""
-        self._ensure_retry_state_fields()
         if (not isinstance(limit, int) or isinstance(limit, bool) or
                 limit < 1 or limit > _PLACEMENT_SNAPSHOT_MAX_LOCATIONS):
             raise ValueError(f'limit must be an integer from 1 to '
@@ -1369,7 +1643,7 @@ class SpotPlacer:
     def validate_task(cls, spec: 'service_spec.SkyServiceSpec',
                       task: 'task_lib.Task') -> None:
         """Validate placer resource shape without provider enumeration."""
-        if spec.spot_placer is not None:
+        if spec.placement_contract.enabled:
             _validate_placement_resource_configs(task)
 
     @classmethod
@@ -1380,12 +1654,12 @@ class SpotPlacer:
         workspace: str | None = None,
     ) -> PlacementCatalog | None:
         """Build the one complete catalog for an immutable service version."""
-        if spec.spot_placer is None:
+        contract = spec.placement_contract
+        if not contract.enabled:
             return None
-        placer_cls = SPOT_PLACERS[spec.spot_placer]
         return PlacementCatalog.from_task(
             task,
-            expand_accelerator_counts=placer_cls._expand_accelerator_counts,  # pylint: disable=protected-access
+            expand_accelerator_counts=contract.expand_accelerator_counts,
             workspace=workspace)
 
     @classmethod
@@ -1396,24 +1670,33 @@ class SpotPlacer:
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
         workspace: str | None = None,
     ) -> Optional['SpotPlacer']:
-        if spec.spot_placer is None:
+        contract = spec.placement_contract
+        if not contract.enabled:
             return None
-        return SPOT_PLACERS[spec.spot_placer](
-            task, placement_catalog=placement_catalog, workspace=workspace)
+        if contract.engine != placement_policy.ENGINE_DYNAMIC_FALLBACK:
+            raise ValueError(f'Unsupported placement engine: '
+                             f'{contract.engine!r}.')
+        return DynamicFallbackSpotPlacer(task,
+                                         contract,
+                                         placement_catalog=placement_catalog,
+                                         workspace=workspace)
 
 
-class DynamicFallbackSpotPlacer(SpotPlacer,
-                                name=SPOT_HEDGE_PLACER,
-                                default=True):
+class DynamicFallbackSpotPlacer(SpotPlacer):
     """Dynamic Fallback Placer."""
 
     def __init__(
         self,
         task: 'task_lib.Task',
+        placement_contract: placement_policy.PlacementContract,
         placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
         workspace: str | None = None,
     ) -> None:
+        if placement_contract.engine != placement_policy.ENGINE_DYNAMIC_FALLBACK:
+            raise ValueError('DynamicFallbackSpotPlacer requires the dynamic '
+                             'fallback placement engine.')
         super().__init__(task,
+                         placement_contract,
                          placement_catalog=placement_catalog,
                          workspace=workspace)
         # INVARIANT: the bench TTL must exceed the worst-case launch
@@ -1501,27 +1784,3 @@ class DynamicFallbackSpotPlacer(SpotPlacer,
         logger.info(f'Active locations: {active_locations}\n'
                     f'Selected location: {res}\n')
         return res
-
-
-class CapacityAwareDynamicFallbackSpotPlacer(DynamicFallbackSpotPlacer,
-                                             name=CAPACITY_AWARE_SPOT_PLACER):
-    """Dynamic fallback that discovers and prices whole-GPU spot shapes.
-
-    Fill the cheapest active shape per GPU until a failed launch benches it,
-    then fall through to the next-cheapest active candidate.
-    """
-
-    _expand_accelerator_counts = True
-
-    @staticmethod
-    def _accelerator_slots(location: Location) -> float:
-        slots = sum((location.accelerators or {}).values())
-        return float(slots) if slots > 0 else 1.0
-
-    def _min_cost_location(self, locations: list[Location]) -> Location:
-        # TODO(fran): Rank heterogeneous accelerators by measured workload
-        # throughput per dollar once services can publish benchmark weights.
-        return min(
-            locations,
-            key=lambda location: self.location2cost.get(location, float(
-                'inf')) / self._accelerator_slots(location))

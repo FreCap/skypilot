@@ -7,6 +7,7 @@ logical targets divide demand by the per-GPU saturation knob and publish GPU
 slots. Neither mode shrinks while its demand signal is stale (a rebuilt
 controller must not mass-retire a live fleet before the first LB sync).
 """
+import dataclasses
 import math
 import threading
 # pylint: disable=protected-access
@@ -17,6 +18,7 @@ from unittest import mock
 
 from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -24,6 +26,45 @@ from sky.utils import common_utils
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
 _SCALE_DOWN = autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+
+
+@dataclasses.dataclass
+class _AutoscalerSpec:
+    """Complete mutable test implementation of SkyServiceSpec's interface."""
+
+    min_replicas: int = 0
+    min_replicas_by_accelerator: dict[str, int] = dataclasses.field(
+        default_factory=dict)
+    max_replicas: int | None = 20
+    num_overprovision: int | None = None
+    target_qps_per_replica: float | dict[str, float] | None = None
+    target_concurrency_per_replica: float | None = 1.0
+    replica_unit: str = 'physical_backend'
+    target_utilization_percentage: int = 100
+    expected_request_duration_seconds: float | None = None
+    initial_provision_lead_time_seconds: float | str | None = None
+    adaptive_demand_estimation: bool | None = None
+    max_scale_up_rate_percentage: int | None = None
+    scale_up_rate_min_replicas: int | None = None
+    scale_up_rate_period_seconds: int | None = None
+    adaptive_scale_up: dict | None = None
+    max_scale_down_rate_percentage: int = 100
+    lb_request_queue: dict | None = None
+    reserved_capacity_fill: bool = False
+    reserved_fill_floor_replicas: int = 0
+    reserved_fill_weight: float = 1.0
+    reserved_fill_utilization_gate: bool = False
+    cost_rebalance: bool = False
+    cost_rebalance_min_savings_fraction: float = 0.3
+    cost_rebalance_max_parallel_replacements: int = 1
+    cost_rebalance_stabilization_seconds: float = 300.0
+    upscale_delay_seconds: int | None = None
+    downscale_delay_seconds: int | None = None
+    pool: bool = False
+    use_ondemand_fallback: bool = False
+    dynamic_ondemand_fallback: bool | None = None
+    base_ondemand_fallback_replicas: int | None = None
+    queue_length_threshold: int | None = None
 
 
 def _spec(knob=1.0,
@@ -49,7 +90,7 @@ def _spec(knob=1.0,
     # thresholds of 1 tick, so most tests observe target changes on the
     # first post-snap recompute.
     interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
-    return types.SimpleNamespace(
+    return _AutoscalerSpec(
         min_replicas=min_replicas,
         min_replicas_by_accelerator=(min_replicas_by_accelerator or {}),
         max_replicas=max_replicas,
@@ -99,8 +140,13 @@ def _replica(replica_id,
                              if planned_capacity is None else planned_capacity)
     info.unknown_capacity_replacement = False
     info.reserved_fill = reserved_fill
+    info.created_at = None
+    info.is_zero_cost = False
+    info.cost_rebalance_for_replica_id = None
     info.status_property.sky_launch_status = (
         common_utils.ProcessStatus.SUCCEEDED)
+    info.status_property.sky_down_status = None
+    info.status_property.first_ready_time = None
     info.status_property.is_scale_down = False
     info.status_property.unrecoverable_failure.return_value = False
     info.resources_override = {'accelerators': {card: gpu_count}}
@@ -186,6 +232,20 @@ def _scale_ups(decisions):
     return [d for d in decisions if d.operator == _SCALE_UP]
 
 
+def _allocation(target,
+                *,
+                complete=True,
+                explicit_target=None,
+                paid_target=None):
+    explicit = target if explicit_target is None else explicit_target
+    return autoscalers._CompatibilityTargetResult(
+        target_by_accelerator=target,
+        explicit_target_by_accelerator=explicit,
+        paid_target_by_accelerator=(explicit
+                                    if paid_target is None else paid_target),
+        card_attribution_complete=complete)
+
+
 class TestFromSpecSelection(unittest.TestCase):
     """The concurrency knob selects ConcurrencyAutoscaler (pool first)."""
 
@@ -206,20 +266,12 @@ class TestFromSpecSelection(unittest.TestCase):
             autoscalers.Autoscaler.from_spec('svc', spec, version=1)
         mock_cls.assert_called_once()
 
-    def test_spec_without_knob_attribute_falls_through(self):
-        # from_spec must stay robust against spec objects predating the
-        # knob (e.g. unpickled from old DB rows): no attribute at all.
-        spec = types.SimpleNamespace(min_replicas=1,
-                                     max_replicas=2,
-                                     num_overprovision=None,
-                                     pool=False,
-                                     use_ondemand_fallback=False,
-                                     target_qps_per_replica=2.0,
-                                     upscale_delay_seconds=None,
-                                     downscale_delay_seconds=None)
-        autoscaler = autoscalers.Autoscaler.from_spec('svc', spec)
-        self.assertIsInstance(autoscaler, autoscalers.RequestRateAutoscaler)
-        self.assertNotIsInstance(autoscaler, autoscalers.ConcurrencyAutoscaler)
+    def test_incomplete_spec_interface_is_rejected(self):
+        # Persisted SkyServiceSpec objects are normalized by __setstate__.
+        # Other callers must implement the current interface explicitly.
+        spec = types.SimpleNamespace(pool=False)
+        with self.assertRaises(AttributeError):
+            autoscalers.Autoscaler.from_spec('svc', spec)
 
     def test_none_knob_falls_through(self):
         spec = _spec(knob=None)
@@ -228,6 +280,14 @@ class TestFromSpecSelection(unittest.TestCase):
         spec.target_qps_per_replica = 2.0
         autoscaler = autoscalers.Autoscaler.from_spec('svc', spec)
         self.assertIsInstance(autoscaler, autoscalers.RequestRateAutoscaler)
+
+    def test_base_interface_exposes_replica_unit(self):
+        spec = _spec(knob=None)
+        spec.target_qps_per_replica = 2.0
+
+        autoscaler = autoscalers.Autoscaler.from_spec('svc', spec)
+
+        self.assertEqual(autoscaler.replica_unit, 'physical_backend')
 
 
 class TestColdPaidCardOrdering(unittest.TestCase):
@@ -901,7 +961,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
     @staticmethod
     def _instance_aware_autoscaler():
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
-        spec = types.SimpleNamespace(
+        spec = _AutoscalerSpec(
             min_replicas=0,
             min_replicas_by_accelerator={},
             max_replicas=100,
@@ -910,6 +970,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 'L4': 1.0,
                 'A100': 1.0,
             },
+            target_concurrency_per_replica=None,
             upscale_delay_seconds=2 * interval,
             downscale_delay_seconds=2 * interval,
         )
@@ -1244,6 +1305,277 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(
             dict(_scale_ups(retry)[0].target.target_capacity_by_accelerator),
             {'L40S': 1})
+        self.assertEqual(
+            dict(
+                _scale_ups(retry)
+                [0].target.cold_launch_authority_by_accelerator), {'L40S': 1})
+
+    def test_downscale_hold_reuses_materialized_compatible_supply(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=10,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=900,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        autoscaler.target_num_replicas = 5
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 5}
+        autoscaler._logical_adopted_paid_target_by_accelerator = {'L4': 5}
+        autoscaler._snap_target_on_next_recompute = False
+
+        paid_l4 = [
+            _replica(replica_id, card='L4') for replica_id in range(1, 6)
+        ]
+        zero_cost_h200 = [
+            _replica(replica_id, card='H200', reserved_fill=True)
+            for replica_id in range(6, 8)
+        ]
+        for info in paid_l4:
+            info.is_zero_cost = False
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                1.0)
+        for info in zero_cost_h200:
+            info.is_zero_cost = True
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                0.0)
+        replicas = [*paid_l4, *zero_cost_h200]
+        _report(
+            autoscaler,
+            in_flight={info.replica_id: 0 for info in replicas},
+            observed_slots={info.replica_id: 1 for info in replicas},
+            queue_depth=2,
+            queued_profiles=[self._profile(50, ['L4', 'H200'], 2)],
+            compatibility_complete=True,
+        )
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            decisions = _decisions(autoscaler, replicas)
+
+        # Aggregate hysteresis still holds five slots, and the public demand
+        # map remains unchanged. The private actuator may nevertheless use
+        # the two already-running H200 slots for the two units of fresh,
+        # explicitly compatible demand; this authorizes no cold H200 launch.
+        self.assertEqual(autoscaler._raw_target_num_replicas, 2)
+        self.assertEqual(autoscaler.target_num_replicas, 5)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 5})
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator, {
+            'L4': 3,
+            'H200': 2,
+        })
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+        self.assertEqual(_scale_ups(decisions), [])
+        scale_down_targets = [
+            decision.target
+            for decision in decisions
+            if decision.operator == _SCALE_DOWN
+        ]
+        self.assertEqual(
+            sorted(target.replica_id for target in scale_down_targets), [4, 5])
+        self.assertTrue(
+            all(
+                dict(target.target_capacity_by_accelerator) == {
+                    'L4': 3,
+                    'H200': 2,
+                } for target in scale_down_targets))
+
+    def test_downscale_hold_backed_move_preserves_unrelated_exact_cards(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=10,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=900,
+        )
+        autoscaler.set_configured_accelerator_shapes({
+            'L40S': 1,
+            'L4': 1,
+            'H200': 1,
+        })
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {'L40S': 3}
+        autoscaler._logical_adopted_paid_target_by_accelerator = {'L40S': 3}
+        autoscaler._snap_target_on_next_recompute = False
+
+        held_l40s = [
+            _replica(replica_id, card='L40S') for replica_id in range(1, 4)
+        ]
+        fresh_l4 = _replica(4, card='L4')
+        zero_cost_h200 = _replica(5, card='H200', reserved_fill=True)
+        for info in [*held_l40s, fresh_l4]:
+            info.is_zero_cost = False
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                1.0)
+        zero_cost_h200.is_zero_cost = True
+        zero_cost_h200.handle.return_value.launched_resources.get_cost.return_value = (
+            0.0)
+        replicas = [*held_l40s, fresh_l4, zero_cost_h200]
+
+        def report(current_replicas, generation):
+            _report(
+                autoscaler,
+                in_flight={info.replica_id: 0 for info in current_replicas},
+                observed_slots={
+                    info.replica_id: 1 for info in current_replicas
+                },
+                queue_depth=1,
+                queued_profiles=[self._profile(50, ['L4', 'H200'], 1)],
+                compatibility_complete=True,
+                generation=generation,
+            )
+
+        report(replicas, 1)
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L40S': 2,
+            'L4': 1,
+        })
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator, {
+            'L40S': 2,
+            'H200': 1,
+        })
+        scale_down_ids = sorted(decision.target.replica_id
+                                for decision in decisions
+                                if decision.operator == _SCALE_DOWN)
+        self.assertEqual(scale_down_ids, [3, 4])
+
+        # If the materialized alternative and the redundant paid source both
+        # disappear, the fresh slot returns to its original L4 placement and
+        # only that one slot regains cold launch authority. The two unrelated
+        # held L40S slots remain untouched throughout.
+        remaining = held_l40s[:2]
+        report(remaining, 2)
+        with mock.patch.object(autoscalers.time, 'time', return_value=121.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=121.0):
+            retry = _decisions(autoscaler, remaining)
+
+        retry_target = _scale_ups(retry)[0].target
+        self.assertEqual(dict(retry_target.target_capacity_by_accelerator), {
+            'L40S': 2,
+            'L4': 1,
+        })
+        self.assertEqual(
+            dict(retry_target.cold_launch_authority_by_accelerator), {'L4': 1})
+
+    def test_generation_advance_failure_shelters_prior_h200_fill(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=40,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=300,
+            reserved_capacity_fill=True,
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        autoscaler.target_num_replicas = 17
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 17}
+        autoscaler._logical_adopted_paid_target_by_accelerator = {'L4': 17}
+        autoscaler._snap_target_on_next_recompute = False
+
+        phx_uid = 'phx-cluster-uid'
+        phx_location_key = {
+            'cloud': 'Kubernetes',
+            'region': 'phx-research-context',
+            'zone': None,
+            'accelerators': {
+                'H200': 1
+            },
+            'use_spot': False,
+            'image_id': None,
+            'disk_tier': None,
+        }
+        phx_location = spot_placer.Location.from_pickleable(phx_location_key)
+        phx_pool = reserved_capacity_broker.make_pool_key(
+            'phx-research-context',
+            'H200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid=phx_uid)
+        autoscaler.collect_reserved_capacity_pools({
+            phx_pool: {
+                'protocol_version': reserved_capacity_broker.PROTOCOL_V2,
+                'pool_key': phx_pool,
+                'physical_cluster_uid': phx_uid,
+                'service_generation': 2,
+                'edge_cap': 17,
+                'zero_cost_location_keys': [phx_location_key],
+                'free_slots': 0,
+                'free_slots_by_accelerator': None,
+                'grant': 0,
+                'shelter_grant': 17,
+                'grant_epoch': None,
+                'timestamp': 100.0,
+            }
+        })
+
+        paid_l4 = [
+            _replica(replica_id, card='L4') for replica_id in range(1, 18)
+        ]
+        prior_h200_fill = [
+            _replica(replica_id, card='H200', reserved_fill=True)
+            for replica_id in range(101, 118)
+        ]
+        for info in paid_l4:
+            info.is_zero_cost = False
+            info.get_spot_location.return_value = None
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                1.0)
+        for info in prior_h200_fill:
+            info.is_zero_cost = True
+            info.get_spot_location.return_value = phx_location
+            info.handle.return_value.launched_resources.get_cost.return_value = (
+                0.0)
+            info.reserved_fill_pool_key = phx_pool
+            info.reserved_fill_service_generation = 1
+            info.reserved_fill_physical_cluster_uid = phx_uid
+        replicas = [*paid_l4, *prior_h200_fill]
+        _report(
+            autoscaler,
+            in_flight={info.replica_id: 0 for info in replicas},
+            observed_slots={info.replica_id: 1 for info in replicas},
+            queue_depth=1,
+            queued_profiles=[self._profile(50, ['L4', 'H200'], 1)],
+            compatibility_complete=True,
+        )
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 1)
+        self.assertEqual(autoscaler.target_num_replicas, 17)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 17})
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator, {
+            'L4': 16,
+            'H200': 1,
+        })
+        self.assertEqual(autoscaler.fill_target, 17)
+        self.assertEqual(_scale_ups(decisions), [])
+        scale_down_ids = [
+            decision.target.replica_id
+            for decision in decisions
+            if decision.operator == _SCALE_DOWN
+        ]
+        self.assertEqual(scale_down_ids, [17])
+        self.assertTrue(
+            set(scale_down_ids).isdisjoint(
+                info.replica_id for info in prior_h200_fill))
 
     def test_smaller_fresh_demand_reassigns_only_nonheld_slots(self):
         autoscaler = _make_autoscaler(
@@ -1449,13 +1781,14 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             headerless_arrivals_300s=0,
         )
 
-        candidate, complete = (
-            autoscaler._calculate_concurrency_target_by_accelerator(
-                [], target_ceiling=20))
+        allocation = autoscaler._calculate_concurrency_target_by_accelerator(
+            [], target_ceiling=20)
         _decisions(autoscaler, [])
 
-        self.assertTrue(complete)
-        self.assertEqual(candidate, {'A100': 20})
+        self.assertTrue(allocation.card_attribution_complete)
+        self.assertEqual(allocation.target_by_accelerator, {'A100': 20})
+        self.assertEqual(allocation.explicit_target_by_accelerator,
+                         {'A100': 20})
         self.assertEqual(autoscaler._arrival_floor_target, 50)
         self.assertEqual(autoscaler.target_num_replicas, 50)
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
@@ -1668,8 +2001,11 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                          {'L4': 3})
         self.assertEqual(autoscaler.warm_retention_target_by_accelerator,
                          {'A100': 1})
-        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
-                         {'L4': 2})
+        # The aggregate overflow still preserves the capacity target and
+        # reuses the materialized A100, but an empty accepted-compatibility
+        # history cannot authorize a guessed paid L4 placement. The manager
+        # may continue probing zero-cost supply for the remaining two slots.
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
         self.assertEqual(len(decisions), 1)
         self.assertIsInstance(decisions[0].target,
                               autoscalers.LogicalScaleTarget)
@@ -1986,8 +2322,728 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 launch_budget=10,
                 target_capacity_by_accelerator=(('L4', 57),),
                 accelerator_shapes=(('L4', 1), ('A100', 1), ('A100-80GB', 1)),
-                launch_priority_by_accelerator=(('L4', 0),)))
+                launch_priority_by_accelerator=(('L4', 0),),
+                cold_launch_authority_by_accelerator=(('L4', 10),)))
         self.assertEqual(autoscaler.info()['fill_target'], 7)
+
+    def test_rollout_reprices_only_a100_capacity_gone_from_every_version(self):
+        autoscaler = _make_autoscaler(max_replicas=100, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 3,
+            'A100-80GB': 1,
+            'H200': 1,
+        })
+        autoscaler.target_num_replicas = 66
+        autoscaler.target_num_replicas_by_accelerator = {
+            'L4': 11,
+            'A100': 7,
+            'A100-80GB': 2,
+            'H200': 46,
+        }
+        autoscaler._raw_target_num_replicas = 66
+        autoscaler._compatibility_demand_complete = True
+        supply_aware_desired = {
+            'L4': 18,
+            'A100': 0,
+            'A100-80GB': 2,
+            'H200': 46,
+        }
+        actuation_target = {
+            card: count
+            for card, count in supply_aware_desired.items()
+            if count > 0
+        }
+
+        def _wide(replica_id, card, width, version=2):
+            return _replica(replica_id,
+                            gpu_count=width,
+                            card=card,
+                            version=version,
+                            planned_capacity=width)
+
+        latest = [
+            _wide(1, 'L4', 4),
+            _wide(2, 'A100-80GB', 2),
+            _wide(3, 'H200', 46),
+        ]
+        # Three of the seven adopted A100 slots still exist, on one
+        # old-version three-GPU backend.  The other four were reclaimed.
+        old_backing = _wide(10, 'A100', 3, version=1)
+        # Every retiring lifecycle spelling must be excluded from old-version
+        # provenance.  Counting even one of these rows would preserve more
+        # than the three A100 slots that still exist.
+        terminal = _wide(11, 'A100', 3, version=1)
+        terminal.status = serve_state.ReplicaStatus.FAILED
+        terminal.is_terminal = True
+        preempted = _wide(12, 'A100', 3, version=1)
+        preempted.status_property.preempted = True
+        scaling_down = _wide(13, 'A100', 3, version=1)
+        scaling_down.status_property.is_scale_down = True
+        replicas = [*latest, old_backing, terminal, preempted, scaling_down]
+
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=_allocation(
+                                   supply_aware_desired)), \
+                mock.patch.object(
+                    autoscaler, '_fresh_for_tick', return_value=True), \
+                mock.patch.object(
+                                   autoscalers,
+                                   '_revalidate_actuation_target',
+                                   wraps=autoscalers.
+                                   _revalidate_actuation_target) as revalidate:
+            decisions = autoscaler._generate_logical_scaling_decisions(
+                replicas, latest)
+
+        self.assertEqual(revalidate.call_args.kwargs['old_version_supply'], {
+            'L4': 0,
+            'A100': 3,
+            'A100-80GB': 0,
+            'H200': 0,
+        })
+        self.assertTrue(revalidate.call_args.
+                        kwargs['allow_mixed_version_backed_reassignment'])
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator,
+                         actuation_target)
+        self.assertEqual(sum(actuation_target.values()), 66)
+        self.assertEqual(len(_scale_ups(decisions)), 1)
+        target = _scale_ups(decisions)[0].target
+        self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
+        self.assertEqual(dict(target.target_capacity_by_accelerator),
+                         actuation_target)
+        # Old-version backing delays retirement, but fresh, complete
+        # compatibility attribution moves its replacement to L4. Buying only
+        # the eleven vanished slots would strand three old A100 slots forever;
+        # all fourteen L4 replacements must be authorized.
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'L4': 14})
+        self.assertEqual(dict(target.cold_launch_authority_by_accelerator),
+                         {'L4': 14})
+
+        # On the next tick the L4 wave is committed. The target stays on the
+        # fresh compatible card, no additional paid launch is authorized, and
+        # the now-redundant old A100 row is eligible to drain.
+        latest_after = [
+            _wide(20, 'L4', 18),
+            _wide(21, 'A100-80GB', 2),
+            _wide(22, 'H200', 46),
+        ]
+        second_tick_replicas = [*latest_after, old_backing]
+        autoscaler._in_flight_by_replica_id = {
+            info.replica_id: 0 for info in second_tick_replicas
+        }
+        autoscaler._observed_slots_by_replica_id = {
+            info.replica_id: info.planned_capacity
+            for info in second_tick_replicas
+        }
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=_allocation(
+                                   supply_aware_desired)), \
+                mock.patch.object(
+                    autoscaler, '_fresh_for_tick', return_value=True):
+            second_tick = autoscaler._generate_logical_scaling_decisions(
+                second_tick_replicas, latest_after)
+            retired = autoscaler._select_outdated_replicas_to_scale_down(
+                second_tick_replicas, [1, 2])
+
+        self.assertEqual(second_tick, [])
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+        self.assertEqual(retired, [old_backing.replica_id])
+
+    def test_rollout_paid_authority_obeys_partial_waves(self):
+        autoscaler = _make_autoscaler(max_replicas=100,
+                                      replica_unit='logical',
+                                      max_scale_up_rate_percentage=20,
+                                      scale_up_rate_min_replicas=10,
+                                      scale_up_rate_period_seconds=60)
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 3,
+            'A100-80GB': 1,
+            'H200': 1,
+        })
+        autoscaler.target_num_replicas = 66
+        autoscaler.target_num_replicas_by_accelerator = {
+            'L4': 11,
+            'A100': 7,
+            'A100-80GB': 2,
+            'H200': 46,
+        }
+        autoscaler._raw_target_num_replicas = 66
+        autoscaler._compatibility_demand_complete = True
+        desired = {
+            'L4': 18,
+            'A100': 0,
+            'A100-80GB': 2,
+            'H200': 46,
+        }
+
+        def _wide(replica_id, card, width, version=2):
+            return _replica(replica_id,
+                            gpu_count=width,
+                            card=card,
+                            version=version,
+                            planned_capacity=width)
+
+        old_a100 = _wide(10, 'A100', 3, version=1)
+        latest = [
+            _wide(1, 'L4', 4),
+            _wide(2, 'A100-80GB', 2),
+            _wide(3, 'H200', 46),
+        ]
+        replicas = [*latest, old_a100]
+        autoscaler._logical_actuation_wave_budget = 10
+        autoscaler._logical_actuation_wave_started = False
+        autoscaler._logical_actuation_wave_is_new = True
+
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=_allocation(desired)), \
+                mock.patch.object(autoscaler,
+                                  '_fresh_for_tick',
+                                  return_value=True):
+            first_actuation = autoscaler._actuation_target_by_accelerator(
+                replicas)
+            first_paid_target = dict(
+                autoscaler._logical_paid_launch_target_by_accelerator)
+            repeated_actuation = autoscaler._actuation_target_by_accelerator(
+                replicas)
+            repeated_paid_target = dict(
+                autoscaler._logical_paid_launch_target_by_accelerator)
+            first_wave = autoscaler._generate_logical_scaling_decisions(
+                replicas, latest)
+
+        self.assertEqual(repeated_actuation, first_actuation)
+        self.assertEqual(repeated_paid_target, first_paid_target)
+        first_target = _scale_ups(first_wave)[0].target
+        self.assertEqual(first_target.launch_budget, 10)
+        self.assertEqual(
+            dict(first_target.cold_launch_authority_by_accelerator), {'L4': 10})
+
+        # Ten replacements commit during the cooldown. The same exact target
+        # remains fenced, but the zero cooldown budget cannot reopen paid
+        # authority for the remaining four slots.
+        latest_after_ten = [
+            _wide(20, 'L4', 14),
+            _wide(21, 'A100-80GB', 2),
+            _wide(22, 'H200', 46),
+        ]
+        replicas_after_ten = [*latest_after_ten, old_a100]
+        autoscaler._logical_actuation_wave_budget = 0
+        autoscaler._logical_actuation_wave_started = False
+        autoscaler._logical_actuation_wave_is_new = False
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=_allocation(desired)), \
+                mock.patch.object(autoscaler,
+                                  '_fresh_for_tick',
+                                  return_value=True):
+            cooldown = autoscaler._generate_logical_scaling_decisions(
+                replicas_after_ten, latest_after_ten)
+
+        cooldown_target = _scale_ups(cooldown)[0].target
+        self.assertEqual(cooldown_target.launch_budget, 0)
+        self.assertEqual(cooldown_target.cold_launch_authority_by_accelerator,
+                         ())
+
+        autoscaler._logical_actuation_wave_budget = 4
+        autoscaler._logical_actuation_wave_started = False
+        autoscaler._logical_actuation_wave_is_new = True
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=_allocation(desired)), \
+                mock.patch.object(autoscaler,
+                                  '_fresh_for_tick',
+                                  return_value=True):
+            second_wave = autoscaler._generate_logical_scaling_decisions(
+                replicas_after_ten, latest_after_ten)
+
+        second_target = _scale_ups(second_wave)[0].target
+        self.assertEqual(second_target.launch_budget, 4)
+        self.assertEqual(
+            dict(second_target.cold_launch_authority_by_accelerator), {'L4': 4})
+
+    def test_old_single_card_rollout_keeps_paid_replacement_authority(self):
+        autoscaler = _make_autoscaler(max_replicas=10, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'L4': 3})
+        autoscaler.target_num_replicas = 3
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 3}
+        autoscaler._raw_target_num_replicas = 3
+        autoscaler._compatibility_demand_complete = True
+        old_l4 = _replica(1,
+                          gpu_count=3,
+                          card='L4',
+                          version=1,
+                          planned_capacity=3)
+
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=_allocation({
+                                   'L4': 3
+                               })), mock.patch.object(autoscaler,
+                                                      '_fresh_for_tick',
+                                                      return_value=True):
+            decisions = autoscaler._generate_logical_scaling_decisions([old_l4],
+                                                                       [])
+
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator,
+                         {'L4': 3})
+        # Old supply prevents an unsafe cross-card release; it does not stall
+        # an ordinary same-card rollout whose paid ownership is still L4.
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator,
+                         {'L4': 3})
+        target = _scale_ups(decisions)[0].target
+        self.assertEqual(dict(target.cold_launch_authority_by_accelerator),
+                         {'L4': 3})
+
+    def test_partial_same_card_rollout_retries_only_old_backing(self):
+        autoscaler = _make_autoscaler(max_replicas=3, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'A100': 1})
+        autoscaler.target_num_replicas = 2
+        autoscaler.target_num_replicas_by_accelerator = {'A100': 2}
+        autoscaler._raw_target_num_replicas = 2
+        autoscaler._compatibility_demand_complete = True
+        latest = _replica(1, card='A100', version=2, planned_capacity=1)
+        old = _replica(2, card='A100', version=1, planned_capacity=1)
+        allocation = _allocation({'A100': 2}, explicit_target={})
+
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=allocation), mock.patch.object(
+                                   autoscaler,
+                                   '_fresh_for_tick',
+                                   return_value=True):
+            decisions = autoscaler._generate_logical_scaling_decisions(
+                [latest, old], [latest])
+
+        # Paid ownership is an absolute latest-version ceiling. Subtracting
+        # the one latest slot leaves the one still-backed old slot to retry.
+        target = _scale_ups(decisions)[0].target
+        self.assertEqual(dict(target.target_capacity_by_accelerator),
+                         {'A100': 2})
+        self.assertEqual(dict(target.cold_launch_authority_by_accelerator),
+                         {'A100': 1})
+
+        latest_after = _replica(3,
+                                gpu_count=2,
+                                card='A100',
+                                version=2,
+                                planned_capacity=2)
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=allocation), mock.patch.object(
+                                   autoscaler,
+                                   '_fresh_for_tick',
+                                   return_value=True):
+            completed = autoscaler._generate_logical_scaling_decisions(
+                [latest_after, old], [latest_after])
+
+        self.assertEqual(completed, [])
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+
+    def test_latest_only_minimum_can_cold_start_without_explicit_profile(self):
+        autoscaler = _make_autoscaler(min_replicas=1,
+                                      max_replicas=2,
+                                      replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler, in_flight={}, compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [])
+
+        target = _scale_ups(decisions)[0].target
+        self.assertEqual(dict(target.target_capacity_by_accelerator), {'L4': 1})
+        self.assertEqual(dict(target.cold_launch_authority_by_accelerator),
+                         {'L4': 1})
+
+    def test_latest_only_default_queue_can_scale_from_zero(self):
+        autoscaler = _make_autoscaler(min_replicas=0,
+                                      max_replicas=2,
+                                      replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [])
+
+        target = _scale_ups(decisions)[0].target
+        self.assertEqual(dict(target.target_capacity_by_accelerator), {'L4': 1})
+        self.assertEqual(dict(target.cold_launch_authority_by_accelerator),
+                         {'L4': 1})
+
+    def test_stale_rollout_target_has_explicit_zero_paid_authority(self):
+        autoscaler = _make_autoscaler(max_replicas=2, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas = 1
+        autoscaler.target_num_replicas_by_accelerator = {'A100': 1}
+        autoscaler._raw_target_num_replicas = 1
+        autoscaler._compatibility_demand_complete = True
+        old_a100 = _replica(1, card='A100', version=1, planned_capacity=1)
+
+        with mock.patch.object(autoscaler,
+                               '_calculate_concurrency_target_by_accelerator',
+                               return_value=_allocation({
+                                   'L4': 1
+                               })), mock.patch.object(autoscaler,
+                                                      '_fresh_for_tick',
+                                                      return_value=False):
+            decisions = autoscaler._generate_logical_scaling_decisions(
+                [old_a100], [])
+
+        self.assertEqual(len(_scale_ups(decisions)), 1)
+        target = _scale_ups(decisions)[0].target
+        self.assertEqual(dict(target.target_capacity_by_accelerator),
+                         {'A100': 1})
+        self.assertEqual(target.cold_launch_authority_by_accelerator, ())
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+
+    def test_old_backing_moves_only_with_explicit_compatibility_proof(self):
+        cases = [
+            ('missing history', [], {}, 'A100'),
+            ('explicit flexible',
+             [self._arrival_profile(50, ['L4', 'A100'], 1)], {
+                 'L4': 1
+             }, 'L4'),
+            ('explicit exact', [self._arrival_profile(50, ['A100'], 1)], {
+                'A100': 1
+            }, 'A100'),
+        ]
+        for label, profiles, expected_explicit_target, expected_card in cases:
+            with self.subTest(label=label):
+                autoscaler = _make_autoscaler(max_replicas=2,
+                                              replica_unit='logical')
+                autoscaler.latest_version = 2
+                autoscaler.set_configured_accelerator_shapes({
+                    'L4': 1,
+                    'A100': 1,
+                })
+                autoscaler.target_num_replicas = 1
+                autoscaler.target_num_replicas_by_accelerator = {'A100': 1}
+                autoscaler._raw_target_num_replicas = 1
+                autoscaler._snap_target_on_next_recompute = False
+                old_a100 = _replica(1,
+                                    card='A100',
+                                    version=1,
+                                    planned_capacity=1)
+                _report(autoscaler,
+                        in_flight={1: 1},
+                        observed_slots={1: 1},
+                        compatibility_profiles=profiles,
+                        compatibility_complete=True)
+
+                allocation = (
+                    autoscaler._calculate_concurrency_target_by_accelerator(
+                        [old_a100],
+                        target_ceiling=1,
+                        min_replicas_override=1,
+                        use_existing_supply=True,
+                        pin_running_work=False,
+                        use_free_reserved=False))
+                decisions = autoscaler._generate_logical_scaling_decisions(
+                    [old_a100], [])
+
+                self.assertTrue(allocation.card_attribution_complete)
+                self.assertEqual(allocation.explicit_target_by_accelerator,
+                                 expected_explicit_target)
+                allocator_card = ('A100' if label == 'explicit exact' else 'L4')
+                self.assertEqual(allocation.target_by_accelerator,
+                                 {allocator_card: 1})
+                self.assertEqual(len(_scale_ups(decisions)), 1)
+                target = _scale_ups(decisions)[0].target
+                self.assertEqual(dict(target.target_capacity_by_accelerator),
+                                 {expected_card: 1})
+                self.assertEqual(
+                    dict(target.cold_launch_authority_by_accelerator),
+                    {expected_card: 1})
+
+    def test_vanished_latest_card_does_not_move_without_compatibility_proof(
+            self):
+        autoscaler = _make_autoscaler(max_replicas=2, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas = 1
+        autoscaler.target_num_replicas_by_accelerator = {'A100': 1}
+        autoscaler._raw_target_num_replicas = 1
+        preempted_a100 = _replica(1, card='A100', version=2, planned_capacity=1)
+        preempted_a100.status_property.preempted = True
+        _report(autoscaler,
+                in_flight={1: 0},
+                observed_slots={1: 0},
+                compatibility_profiles=[],
+                compatibility_complete=True)
+
+        allocation = autoscaler._calculate_concurrency_target_by_accelerator(
+            [preempted_a100],
+            target_ceiling=1,
+            min_replicas_override=1,
+            use_existing_supply=True,
+            pin_running_work=False,
+            use_free_reserved=False)
+        decisions = autoscaler._generate_logical_scaling_decisions(
+            [preempted_a100], [])
+
+        self.assertEqual(allocation.target_by_accelerator, {'L4': 1})
+        self.assertEqual(allocation.explicit_target_by_accelerator, {})
+        target = _scale_ups(decisions)[0].target
+        self.assertEqual(dict(target.target_capacity_by_accelerator),
+                         {'A100': 1})
+        self.assertEqual(target.cold_launch_authority_by_accelerator, ())
+
+    def test_timed_out_degraded_card_is_not_paid_placement_supply(self):
+        autoscaler = _make_autoscaler(max_replicas=2, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas = 1
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 1}
+        autoscaler._logical_adopted_explicit_target_by_accelerator = {'L4': 1}
+        autoscaler._raw_target_num_replicas = 1
+        autoscaler._snap_target_on_next_recompute = False
+        degraded = _replica(1, card='A100', version=2, planned_capacity=1)
+        degraded.is_zero_cost = False
+        _report(autoscaler,
+                in_flight={1: 0},
+                queue_depth=1,
+                observed_slots={1: 0},
+                queued_profiles=[self._profile(50, ['L4', 'A100'], 1)],
+                compatibility_complete=True)
+        autoscaler._degraded_capacity_since_by_replica_id[1] = (
+            time.time() -
+            constants.LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS - 1)
+
+        allocation = autoscaler._calculate_concurrency_target_by_accelerator(
+            [degraded],
+            target_ceiling=1,
+            min_replicas_override=1,
+            use_existing_supply=True,
+            pin_running_work=False,
+            use_free_reserved=False)
+        decisions = autoscaler._generate_logical_scaling_decisions([degraded],
+                                                                   [degraded])
+
+        self.assertEqual(autoscaler._committed_capacity(degraded), 0)
+        self.assertEqual(allocation.target_by_accelerator, {'L4': 1})
+        self.assertEqual(allocation.explicit_target_by_accelerator, {'L4': 1})
+        target = _scale_ups(decisions)[0].target
+        self.assertEqual(dict(target.target_capacity_by_accelerator), {'L4': 1})
+        self.assertEqual(dict(target.cold_launch_authority_by_accelerator),
+                         {'L4': 1})
+        self.assertEqual(target.replace_unknown_replica_ids, (1,))
+
+    def test_bounded_unknown_replacement_remains_committed_supply(self):
+        autoscaler = _make_autoscaler(max_replicas=2, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas = 1
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 1}
+        autoscaler._logical_adopted_explicit_target_by_accelerator = {'L4': 1}
+        autoscaler._raw_target_num_replicas = 1
+        autoscaler._snap_target_on_next_recompute = False
+        replacement = _replica(1, card='A100', version=2, planned_capacity=1)
+        replacement.is_zero_cost = False
+        replacement.unknown_capacity_replacement = True
+        _report(autoscaler,
+                in_flight={1: 0},
+                queue_depth=1,
+                observed_slots={1: 0},
+                queued_profiles=[self._profile(50, ['L4', 'A100'], 1)],
+                compatibility_complete=True)
+        autoscaler._degraded_capacity_since_by_replica_id[1] = (
+            time.time() -
+            constants.LOGICAL_UNKNOWN_CAPACITY_REPLACEMENT_SECONDS - 1)
+
+        allocation = autoscaler._calculate_concurrency_target_by_accelerator(
+            [replacement],
+            target_ceiling=1,
+            min_replicas_override=1,
+            use_existing_supply=True,
+            pin_running_work=False,
+            use_free_reserved=False)
+        decisions = autoscaler._generate_logical_scaling_decisions(
+            [replacement], [replacement])
+
+        self.assertEqual(autoscaler._committed_capacity(replacement), 1)
+        self.assertEqual(allocation.target_by_accelerator, {'A100': 1})
+        self.assertEqual(allocation.explicit_target_by_accelerator, {'A100': 1})
+        self.assertEqual(decisions, [])
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+
+    def test_unproven_overprovision_padding_is_zero_cost_only(self):
+        cases = [
+            ('missing history', [], [], {}, {
+                'L4': 1,
+                'A100': 1,
+            }, {
+                'A100': 1,
+            }),
+            ('explicit flexible',
+             [self._arrival_profile(50, ['L4', 'A100'],
+                                    1)], [self._profile(50, ['L4', 'A100'],
+                                                        1)], {
+                                                            'L4': 2
+                                                        }, {
+                                                            'L4': 2,
+                                                        }, {
+                                                            'L4': 2,
+                                                        }),
+        ]
+        for (label, accepted_profiles, queued_profiles, expected_explicit,
+             expected_target, expected_authority) in cases:
+            with self.subTest(label=label):
+                autoscaler = _make_autoscaler(max_replicas=3,
+                                              replica_unit='logical',
+                                              num_overprovision=1)
+                autoscaler.latest_version = 2
+                autoscaler.set_configured_accelerator_shapes({
+                    'L4': 1,
+                    'A100': 1,
+                })
+                autoscaler.target_num_replicas = 1
+                autoscaler.target_num_replicas_by_accelerator = {'A100': 1}
+                autoscaler._raw_target_num_replicas = 1
+                old_a100 = _replica(1,
+                                    card='A100',
+                                    version=1,
+                                    planned_capacity=1)
+                _report(autoscaler,
+                        in_flight={1: 1},
+                        queue_depth=len(queued_profiles),
+                        observed_slots={1: 1},
+                        compatibility_profiles=accepted_profiles,
+                        queued_profiles=queued_profiles,
+                        compatibility_complete=True)
+
+                allocation = (
+                    autoscaler._calculate_concurrency_target_by_accelerator(
+                        [old_a100],
+                        target_ceiling=2,
+                        min_replicas_override=2,
+                        use_existing_supply=True,
+                        pin_running_work=False,
+                        use_free_reserved=False))
+                decisions = autoscaler._generate_logical_scaling_decisions(
+                    [old_a100], [])
+
+                self.assertEqual(allocation.explicit_target_by_accelerator,
+                                 expected_explicit)
+                target = _scale_ups(decisions)[0].target
+                self.assertEqual(dict(target.target_capacity_by_accelerator),
+                                 expected_target)
+                self.assertEqual(
+                    dict(target.cold_launch_authority_by_accelerator),
+                    expected_authority)
+
+    def test_partial_explicit_ownership_does_not_rebuy_vanished_padding(self):
+        cases = [
+            ('one explicit unit', [], {
+                'L4': 1,
+            }, {
+                'L4': 1,
+                'A100': 2,
+            }, {
+                'L4': 1,
+                'A100': 1,
+            }),
+            ('all units explicit', [self._profile(50, ['L4', 'A100'], 2)], {
+                'L4': 3,
+            }, {
+                'L4': 3,
+            }, {
+                'L4': 3,
+            }),
+        ]
+        for (label, queued_profiles, expected_explicit, expected_target,
+             expected_authority) in cases:
+            with self.subTest(label=label):
+                autoscaler = _make_autoscaler(max_replicas=4,
+                                              replica_unit='logical')
+                autoscaler.latest_version = 2
+                autoscaler.set_configured_accelerator_shapes({
+                    'L4': 1,
+                    'A100': 1,
+                })
+                autoscaler.target_num_replicas = 3
+                autoscaler.target_num_replicas_by_accelerator = {'A100': 3}
+                autoscaler._raw_target_num_replicas = 3
+                old_a100 = _replica(1,
+                                    card='A100',
+                                    version=1,
+                                    planned_capacity=1)
+                _report(autoscaler,
+                        in_flight={1: 1},
+                        queue_depth=sum(
+                            profile['count'] for profile in queued_profiles),
+                        observed_slots={1: 1},
+                        compatibility_profiles=[
+                            self._arrival_profile(50, ['L4', 'A100'], 1)
+                        ],
+                        queued_profiles=queued_profiles,
+                        compatibility_complete=True)
+
+                allocation = (
+                    autoscaler._calculate_concurrency_target_by_accelerator(
+                        [old_a100],
+                        target_ceiling=3,
+                        min_replicas_override=3,
+                        use_existing_supply=True,
+                        pin_running_work=False,
+                        use_free_reserved=False))
+                decisions = autoscaler._generate_logical_scaling_decisions(
+                    [old_a100], [])
+
+                self.assertEqual(allocation.explicit_target_by_accelerator,
+                                 expected_explicit)
+                target = _scale_ups(decisions)[0].target
+                self.assertEqual(dict(target.target_capacity_by_accelerator),
+                                 expected_target)
+                self.assertEqual(
+                    dict(target.cold_launch_authority_by_accelerator),
+                    expected_authority)
+
+    def test_old_l4_only_work_never_moves_to_latest_a100_supply(self):
+        autoscaler = _make_autoscaler(max_replicas=80, replica_unit='logical')
+        autoscaler.latest_version = 2
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        autoscaler.target_num_replicas = 40
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 40}
+        autoscaler._raw_target_num_replicas = 40
+        autoscaler._snap_target_on_next_recompute = False
+        old_l4 = [
+            _replica(replica_id, card='L4', version=1, planned_capacity=1)
+            for replica_id in range(1, 41)
+        ]
+        latest_a100 = [
+            _replica(replica_id, card='A100', version=2, planned_capacity=1)
+            for replica_id in range(101, 141)
+        ]
+        replicas = [*old_l4, *latest_a100]
+        _report(
+            autoscaler,
+            in_flight={
+                **{
+                    info.replica_id: 1 for info in old_l4
+                },
+                **{
+                    info.replica_id: 0 for info in latest_a100
+                },
+            },
+            observed_slots={info.replica_id: 1 for info in replicas},
+            compatibility_profiles=[self._arrival_profile(50, ['L4'], 40)],
+            compatibility_complete=True,
+        )
+
+        target, complete = autoscaler._actuation_target_by_accelerator(replicas)
+
+        self.assertTrue(complete)
+        self.assertEqual(target, {'L4': 40})
+        self.assertNotIn('A100', target)
 
     def test_free_reserved_slot_cannot_back_paid_rollout_authority(self):
         autoscaler = _make_autoscaler(max_replicas=20, replica_unit='logical')
@@ -1998,6 +3054,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         })
         autoscaler.target_num_replicas = 10
         autoscaler.target_num_replicas_by_accelerator = {'L4': 10}
+        autoscaler._logical_adopted_explicit_target_by_accelerator = {'L4': 10}
         autoscaler._snap_target_on_next_recompute = False
         autoscaler.set_free_reserved_slots_by_accelerator({'A100': 5})
 
@@ -3533,7 +4590,7 @@ class TestLogicalScalingWaves(unittest.TestCase):
             adopted = kwargs.get('min_replicas_override')
             if adopted is not None and sum(result.values()) < adopted:
                 result['L4'] += adopted - sum(result.values())
-            return result, True
+            return _allocation(result)
 
         with mock.patch.object(
                 autoscaler,
@@ -3602,7 +4659,7 @@ class TestLogicalScalingWaves(unittest.TestCase):
             adopted = kwargs.get('min_replicas_override')
             if adopted is not None and sum(result.values()) < adopted:
                 result['L4'] = adopted - sum(result.values())
-            return result, True
+            return _allocation(result)
 
         with mock.patch.object(
                 autoscaler,
@@ -5248,7 +6305,13 @@ class TestRollingDrain(unittest.TestCase):
                     },
                     101: 0,
                 },
+                queue_depth=40,
                 observed_slots={101: 5},
+                queued_profiles=[{
+                    'priority': 50,
+                    'compatible_accelerators': ['L4'],
+                    'count': 40,
+                }],
                 compatibility_profiles=[{
                     'priority': 50,
                     'compatible_accelerators': ['L4'],
@@ -5428,6 +6491,14 @@ class TestUpdateVersion(unittest.TestCase):
                                   serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler.target_num_replicas, 5)
 
+    def test_update_refreshes_base_replica_unit(self):
+        autoscaler = _make_autoscaler(knob=1.0)
+
+        autoscaler.update_version(2, _spec(knob=1.0, replica_unit='logical'),
+                                  serve_utils.DEFAULT_UPDATE_MODE)
+
+        self.assertEqual(autoscaler.replica_unit, 'logical')
+
     def test_update_resets_logical_downscale_elapsed_window(self):
         autoscaler = _make_autoscaler(knob=1.0,
                                       replica_unit='logical',
@@ -5588,13 +6659,14 @@ class TestUpdateVersion(unittest.TestCase):
                 }],
                 rejected_profiles=[],
                 compatibility_complete=True)
-        qps_spec = types.SimpleNamespace(min_replicas=0,
-                                         min_replicas_by_accelerator={},
-                                         max_replicas=4,
-                                         num_overprovision=None,
-                                         target_qps_per_replica={'H100': 1.0},
-                                         upscale_delay_seconds=0,
-                                         downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={},
+                                   max_replicas=4,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={'H100': 1.0},
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)
@@ -5643,16 +6715,17 @@ class TestUpdateVersion(unittest.TestCase):
                 queued_profiles=[],
                 rejected_profiles=[],
                 compatibility_complete=True)
-        qps_spec = types.SimpleNamespace(min_replicas=0,
-                                         min_replicas_by_accelerator={},
-                                         max_replicas=4,
-                                         num_overprovision=None,
-                                         target_qps_per_replica={
-                                             'A100': 1.0,
-                                             'H100': 1.0,
-                                         },
-                                         upscale_delay_seconds=0,
-                                         downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={},
+                                   max_replicas=4,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={
+                                       'A100': 1.0,
+                                       'H100': 1.0,
+                                   },
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)
@@ -5704,16 +6777,17 @@ class TestUpdateVersion(unittest.TestCase):
                 in_flight={},
                 timestamps=[now] * 600,
                 compatibility_complete=False)
-        qps_spec = types.SimpleNamespace(min_replicas=0,
-                                         min_replicas_by_accelerator={},
-                                         max_replicas=20,
-                                         num_overprovision=None,
-                                         target_qps_per_replica={
-                                             'A100': 1.0,
-                                             'H100': 1.0,
-                                         },
-                                         upscale_delay_seconds=0,
-                                         downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={},
+                                   max_replicas=20,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={
+                                       'A100': 1.0,
+                                       'H100': 1.0,
+                                   },
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)
@@ -5756,16 +6830,17 @@ class TestUpdateVersion(unittest.TestCase):
                     'count': 60,
                 }],
                 compatibility_complete=True)
-        qps_spec = types.SimpleNamespace(min_replicas=0,
-                                         min_replicas_by_accelerator={},
-                                         max_replicas=20,
-                                         num_overprovision=None,
-                                         target_qps_per_replica={
-                                             'A100': 1.0,
-                                             'H100': 1.0,
-                                         },
-                                         upscale_delay_seconds=0,
-                                         downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={},
+                                   max_replicas=20,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={
+                                       'A100': 1.0,
+                                       'H100': 1.0,
+                                   },
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)
@@ -5795,14 +6870,14 @@ class TestUpdateVersion(unittest.TestCase):
                     'count': 120,
                 }],
                 compatibility_complete=True)
-        qps_spec = types.SimpleNamespace(
-            min_replicas=0,
-            min_replicas_by_accelerator={'H100': 1},
-            max_replicas=4,
-            num_overprovision=None,
-            target_qps_per_replica={'H100': 1.0},
-            upscale_delay_seconds=0,
-            downscale_delay_seconds=0)
+        qps_spec = _AutoscalerSpec(min_replicas=0,
+                                   min_replicas_by_accelerator={'H100': 1},
+                                   max_replicas=4,
+                                   num_overprovision=None,
+                                   target_qps_per_replica={'H100': 1.0},
+                                   target_concurrency_per_replica=None,
+                                   upscale_delay_seconds=0,
+                                   downscale_delay_seconds=0)
         replacement = autoscalers.InstanceAwareRequestRateAutoscaler('svc',
                                                                      qps_spec,
                                                                      version=2)

@@ -7,6 +7,7 @@ instead of sleeping a fixed 120s and then killing whatever is still
 running.
 """
 # pylint: disable=missing-class-docstring,protected-access
+import contextlib
 import threading
 from unittest import mock
 
@@ -17,6 +18,7 @@ from sky import exceptions
 from sky import skypilot_config
 from sky.serve import constants as serve_constants
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity
 from sky.serve import service_spec as service_spec_lib
 from sky.utils import schemas
 
@@ -33,6 +35,19 @@ class _FakeClock:
     def sleep(self, seconds):
         self.sleeps.append(seconds)
         self.now += seconds
+
+
+def _protocol_v2_cluster_record(workspace='mt_hybrid'):
+    handle = mock.Mock(
+        spec=replica_managers.cloud_vm_ray_backend.CloudVmRayResourceHandle)
+    handle.cluster_name = 'svc-1'
+    handle.launched_resources = mock.Mock(
+        cloud=replica_managers.clouds.Kubernetes(), region='phx-context')
+    return {
+        'workspace': workspace,
+        'handle': handle,
+        'cluster_hash': 'cluster-generation-a',
+    }
 
 
 @pytest.fixture(name='clock')
@@ -110,15 +125,20 @@ class TestWaitForDrain:
                     continue_guard=lambda: next(ownership))
 
         down.assert_called_once_with('svc-1',
-                                     _expected_cluster_record_uuid=None)
+                                     _expected_cluster_record_uuid=None,
+                                     _expected_cluster_record_handle=None)
 
     def test_terminate_pins_recorded_workspace_on_each_retry(self):
         context = mock.MagicMock()
         observed_workspaces = []
 
-        def _down(cluster_name, *, _expected_cluster_record_uuid=None):
+        def _down(cluster_name,
+                  *,
+                  _expected_cluster_record_uuid=None,
+                  _expected_cluster_record_handle=None):
             assert cluster_name == 'svc-1'
             assert _expected_cluster_record_uuid is None
+            assert _expected_cluster_record_handle is None
             observed_workspaces.append(skypilot_config.get_active_workspace())
             if len(observed_workspaces) == 1:
                 raise RuntimeError('transient down failure')
@@ -149,8 +169,12 @@ class TestWaitForDrain:
         context = mock.MagicMock()
         observed_workspaces = []
 
-        def _down(cluster_name, *, _expected_cluster_record_uuid=None):
+        def _down(cluster_name,
+                  *,
+                  _expected_cluster_record_uuid=None,
+                  _expected_cluster_record_handle=None):
             assert _expected_cluster_record_uuid is None
+            assert _expected_cluster_record_handle is None
             observed_workspaces.append(skypilot_config.get_active_workspace())
             raise exceptions.ClusterDoesNotExist(cluster_name)
 
@@ -172,6 +196,137 @@ class TestWaitForDrain:
                     'svc-1', '/tmp/replica.log', max_retry=1)
 
         assert observed_workspaces == ['default']
+
+    def test_protocol_v2_missing_record_is_cleanup_uncertainty(self):
+        context = mock.MagicMock()
+        down = mock.MagicMock()
+        cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value=None), \
+             mock.patch('sky.core.down', down), \
+             mock.patch.object(replica_managers.time, 'sleep'), \
+             pytest.raises(
+                 exceptions.KubernetesPhysicalClusterIdentityError,
+                 match='cluster record is absent'):
+            replica_managers.terminate_cluster.__wrapped__(
+                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+
+        down.assert_not_called()
+
+    def test_protocol_v2_capture_runs_inside_recorded_workspace(self):
+        context = mock.MagicMock()
+        observed_workspaces = []
+        cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+
+        @contextlib.contextmanager
+        def _fence(_context, _uid):
+            observed_workspaces.append(skypilot_config.get_active_workspace())
+            yield
+
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value=_protocol_v2_cluster_record()), \
+             mock.patch.object(
+                 replica_managers.kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 side_effect=_fence), \
+             mock.patch.object(replica_managers.usage_lib.messages.usage,
+                               'set_internal'), \
+             mock.patch('sky.core.down'), \
+             mock.patch.object(replica_managers.time, 'sleep'):
+            with skypilot_config.local_active_workspace_ctx('default'):
+                replica_managers.terminate_cluster.__wrapped__(
+                    'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+
+        assert observed_workspaces == ['mt_hybrid']
+
+    def test_protocol_v2_rejects_mismatched_durable_handle_before_capture(self):
+        context = mock.MagicMock()
+        cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+        record = _protocol_v2_cluster_record()
+        record['handle'].launched_resources.region = 'retargeted-context'
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value=record), \
+             mock.patch.object(
+                 replica_managers.kubernetes_adaptor,
+                 'physical_cluster_uid_fence') as provider_fence, \
+             mock.patch('sky.core.down') as down, \
+             mock.patch.object(replica_managers.time, 'sleep'), \
+             pytest.raises(
+                 exceptions.KubernetesPhysicalClusterIdentityError,
+                 match='handle does not match'):
+            replica_managers.terminate_cluster.__wrapped__(
+                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+
+        provider_fence.assert_not_called()
+        down.assert_not_called()
+
+    def test_protocol_v2_rejects_handle_without_launched_resources(self):
+        context = mock.MagicMock()
+        cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+        record = _protocol_v2_cluster_record()
+        record['handle'].launched_resources = None
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value=record), \
+             mock.patch.object(
+                 replica_managers.kubernetes_adaptor,
+                 'physical_cluster_uid_fence') as provider_fence, \
+             mock.patch('sky.core.down') as down, \
+             pytest.raises(
+                 exceptions.KubernetesPhysicalClusterIdentityError,
+                 match='handle does not match'):
+            replica_managers.terminate_cluster.__wrapped__(
+                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+
+        provider_fence.assert_not_called()
+        down.assert_not_called()
+
+    def test_protocol_v2_cluster_disappearing_is_not_success(self):
+        context = mock.MagicMock()
+        down = mock.MagicMock(
+            side_effect=exceptions.ClusterDoesNotExist('svc-1'))
+        cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+        with mock.patch.object(replica_managers.context,
+                               'get',
+                               return_value=context), \
+             mock.patch.object(replica_managers.global_user_state,
+                               'get_cluster_from_name',
+                               return_value=_protocol_v2_cluster_record()), \
+             mock.patch.object(
+                 replica_managers.kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers.usage_lib.messages.usage,
+                               'set_internal'), \
+             mock.patch('sky.core.down', down), \
+             mock.patch.object(replica_managers.time, 'sleep'), \
+             pytest.raises(
+                 exceptions.KubernetesPhysicalClusterIdentityError,
+                 match='disappeared during teardown'):
+            replica_managers.terminate_cluster.__wrapped__(
+                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+
+        down.assert_called_once()
 
     def test_terminate_plain_value_error_retries_then_raises(self):
         # ValueErrors other than ClusterDoesNotExist must NOT be treated
@@ -750,31 +905,10 @@ class TestRecoveryRedrive:
         kwargs = self._redrive(is_scale_down=True, persisted_cap=0)
         assert kwargs['in_flight_drain_cap_seconds'] == 0
 
-    def test_pre_field_row_falls_back_to_resolver(self):
-        # An unpickled row from before the field existed has no
-        # drain_cap_seconds attribute at all; getattr must default it.
-        kwargs = self._redrive(is_scale_down=True)
-        del kwargs  # Re-run with the attribute genuinely absent.
-        rm = _scale_down_manager(spec_drain=600)
-        rm._launch_thread_pool = {}
-        rm._down_thread_pool = {}
-        sp = mock.Mock()
-        sp.is_scale_down = True
-        sp.purged = False
-        sp.preempted = False
-        del sp.drain_cap_seconds
-        info = mock.Mock()
-        info.replica_id = 7
-        info.status_property = sp
-        info.status = (replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
-        with mock.patch.object(replica_managers.serve_state,
-                               'get_replica_infos',
-                               return_value=[info]), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replica_info_from_id',
-                               return_value=info):
-            rm._recover_replica_operations()
-        kwargs = rm._terminate_replica.call_args.kwargs
+    def test_materialized_pre_field_row_falls_back_to_resolver(self):
+        # ReplicaInfo's decode boundary materializes a missing legacy cap as
+        # None. Recovery consumes that explicit value and resolves the spec.
+        kwargs = self._redrive(is_scale_down=True, persisted_cap=None)
         assert kwargs['in_flight_drain_cap_seconds'] == 600
 
 
@@ -809,6 +943,10 @@ class TestTerminateReplicaDrainAssembly:
         rm._down_thread_pool = {}
         rm._replica_to_request_id = {}
         rm._replica_to_launch_cancelled = {}
+        if url_error is not None:
+            rm._resolve_probe_urls = mock.Mock(side_effect=url_error)
+        else:
+            rm._resolve_probe_urls = mock.Mock(return_value={7: url})
         if interrupted_launch:
             finished_launch = mock.Mock()
             finished_launch.is_alive.return_value = False
@@ -846,6 +984,10 @@ class TestTerminateReplicaDrainAssembly:
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_info_from_id',
                                return_value=info), \
+             mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_info_with_resource_action_identity',
+                return_value=(info, None)), \
              mock.patch.object(replica_managers.serve_state,
                                'add_or_update_replica',
                                side_effect=_snapshot_write), \
@@ -960,6 +1102,7 @@ class TestRecoveredStrictDrainDeadline:
         rm._wait_for_idle_trackers = {}
         rm._lb_in_flight_report = None
         rm._persist_replica = mock.Mock()
+        rm._resolve_probe_urls = mock.Mock(return_value={7: 'http://r7:8080'})
         info = mock.Mock(replica_id=7, cluster_name='svc-7')
         info.status_property = replica_managers.ReplicaStatusProperty(
             drain_cap_seconds=600, drain_started_at=started_at)
@@ -1060,7 +1203,8 @@ class TestRecoveredStrictDrainDeadline:
         assert info.status_property.drain_started_at == 1000.0
         assert order.mock_calls == [
             mock.call.persist(7, info),
-            mock.call.register(info)
+            mock.call.register(
+                info, replica_url=replica_managers._REPLICA_URL_NOT_PROVIDED)
         ]
 
 

@@ -1,6 +1,6 @@
 # SkyServe exact-accelerator compatibility, priority, and per-card capacity plan
 
-_Created: 2026-07-19. Updated: 2026-07-27._
+_Created: 2026-07-19. Updated: 2026-08-07._
 
 ## Decision summary
 
@@ -25,6 +25,9 @@ Scheduling and scaling follow these rules:
    per-card target is not authority to replace disappeared warm capacity on
    that same card: every cold launch must still be justified by the current
    compatibility profiles, floors, pinned work, and supply snapshot.
+   The logical reconciliation target and paid cold-launch authority are also
+   separate controller-to-manager fields. The former describes the capacity
+   mix to converge toward; only the latter permits a paid launch.
 6. A missing compatibility field means every exact accelerator configured for the active SkyServe service version is compatible.
 7. Global demand target, hard per-card serving-replica floors, and optional reserved-fill targets remain separate control-plane signals. With reserved fill enabled, every fresh broker-granted slot is launched independently of demand while total live and planned capacity remains below the hard `max_replicas` ceiling. The UI shows all three signals.
 8. `A100` and `A100-80GB` are distinct identifiers in validation, queue indexes, metrics, APIs, placement, tests, and UI. Matching may be case-insensitive, but it must never use family, prefix, regex, or memory-suffix normalization.
@@ -93,6 +96,10 @@ not evidence that the behavior is active in production.
 | `1.1.703` | PR #863, response-time history | Added full HTTP completion history without changing placement. | Included in deployed `1.1.704`; later superseded by prediction-time history. |
 | `1.1.704` | PR #864, bounded paid placement cohorts | Limited unresolved fresh paid launches to four per exact paid location by default, spilled later probes to the next-cheapest eligible location, and kept zero-cost fill outside the paid cohort. The detailed subdesign is `docs/designs/serve-paid-placement-cohort.md`. | Deployed 2026-07-22 as Helm revision 191. Initial post-deploy samples through 15:21 America/New_York found no active A100-class placement outside the fixed reserved research cluster; every pending A100-class launch was reserved, zero-cost Kubernetes fill, L4-compatible demand remained assigned only to L4, and A100-class cold-launch authority remained zero. An automated five-minute watch remains active through 03:00 America/New_York. |
 | `1.1.721` | PR #877, reserved rollout no-paid-spill | Prevents broker-reported but unmaterialized free A100-family slots from moving L4 demand into A100-family rollout actuation. Mixed-version rollouts preserve the adopted compatibility-owned card map; reserved fill remains independently zero-cost-only. | Included in deployed `1.1.726`. Production then exposed a separate catalog-ordering edge case when a zero-cost-only A100 preceded paid L4. |
+| Unreleased | PR #1303, generation-aware vanished-card release, plus tri-state provenance hardening | Splits an adopted card with live old-version backing from one whose capacity is absent from every generation. A complete provenance snapshot permits only the latter to move toward explicitly owned compatible placement before the mixed-version rollout guard; an unproven vanished unit receives no paid same-card authority. The follow-up makes unknown provenance preserve the adopted map instead of treating it as known empty. | PR #1303 merged 2026-08-06; the hardening is included in this follow-up. Neither change is deployed; both await the next control-plane release. |
+| Unreleased | PR #1304, mixed-version compatible replacement authority | On a fresh, complete, non-downscale logical tick with explicit cross-card compatibility proof, recomputes the supply-aware latest-version target even when adopted units are still backed by old-version rows. Old rows continue fencing nonpreemptive retirement, but do not select the paid replacement card. The manager consumes explicit paid authority using typed launch funding provenance. | Merged 2026-08-06 and covered by unit and cluster-free incident reproduction tests; production deployment remains pending. |
+| Unreleased | Owned Serve interface normalization | Materializes every supported legacy `ReplicaInfo`, `ReplicaStatusProperty`, and `SkyServiceSpec` default at its persistence boundary, and gives autoscalers, managers, controllers, and load balancers complete runtime state at construction. Policy, admission, recovery, and accounting code use those declared fields and methods directly. A malformed current-version object fails loudly instead of being silently reinterpreted through a local `getattr()` default. | Implemented in this follow-up; production deployment remains pending. |
+| `1.1.1135` transition; normalization release pending | Explicit placement contract | Resolves engine, replica unit, catalog expansion, price unit, reserved-fill mode, and workload kind once at the service-spec boundary, then runs physical and per-GPU policies through one dynamic engine. `dynamic_fallback_per_gpu` is the primary new GPU-concurrency policy; the public physical preset remains for pools. A separate operator-only PostgreSQL normalizer digest-CASes valid fieldless and explicit-v1 public rows to the sole mirror-free v2 encoding. It may retire the historical physical/per-GPU row in place only under a locked dependency-complete proof and only when a strictly newer committed successor preserves the version high-water mark. The canonical subdesign is `docs/designs/serve-explicit-placement-contract.md`. | Transition PR #1318 is deployed directly through Helm revision 351. The v2-only normalization release and production apply are pending. Cleanup PR #1319 remains draft and blocked on normalization, retained-artifact/version/observation gates, and must be rebased on the normalization release. No boltz-platform pin PR is used. The separate service-policy update remains blocked until its canonical scale-to-zero spec is corrected, applied, converged, and drained. |
 | Unreleased | Preserve exact cards during downscale-held retries | Keeps the held part of an adopted exact-card target on its prior cards while the request queue is briefly empty. Fresh remaining demand may still change its own card assignment, but the held portion cannot turn an L40S retry into an L4 cold launch. | Required after the 2026-07-27 `clin-structure-eval-6f51471-l40s-v8` acceptance run selected L4 while reporting an exact `{"L40S": 1}` target. |
 | Unreleased | Reserved-only card paid fallback | Excludes cards whose every successfully priced location is zero-cost from flexible cold-paid ordering. Paid-capable and unpriced cards keep the all-or-nothing service-order fallback, while exact demand can still target a reserved-only card. | Required before the next `opendde-10c200s-v4` rollout so default-all demand selects paid L4 instead of waiting on the reserved-only A100 location. |
 | Unreleased | Centralized placement catalog | Materializes every exact location and nominal cost once per immutable service version, persists the complete catalog in PostgreSQL, backfills legacy versions before controller-child spawn, and removes the old partial-cache accessors and fallback feasibility resolver. | Supersedes the bounded partial-cache fix for the July 23 `boltz-l4-fleet` and `boltz-l4-fleet-test` controller startup failures. The canonical subdesign is `docs/designs/serve-central-placement-catalog.md`. |
@@ -135,6 +142,42 @@ replica location, `reserved_fill`, and `is_zero_cost` provenance. Provider
 inventory is the final billing check. A nonzero A100 or A100-80GB provisioning
 count is expected while the reserved research cluster has granted empty slots;
 it is not evidence of a paid cloud launch.
+
+The manager must not use a subsequently appended `ReplicaInfo` row as the
+source of launch-budget accounting. Its placement/persistence seam returns an
+explicit typed launch result containing planned capacity and funding
+provenance. A `PAID` result debits paid cold-launch authority by that capacity;
+a `ZERO_COST` result does not. Persisted `ReplicaInfo.is_zero_cost` remains the
+durable operational provenance used for routing, history, and audits, not an
+implicit success-channel side effect. Policy code reads that typed field
+directly. Pre-v11 pickle migration and JSON decoding materialize the boolean at
+the record boundary; downstream admission, allocation, recovery, and ordering
+must not carry independent `getattr(..., False)` fallback paths.
+
+The same boundary owns every persisted replica field used by Serve policy.
+`ReplicaInfo.__setstate__()` and `ReplicaInfo.from_storage_dict()` materialize
+the complete current `ReplicaInfo` and nested `ReplicaStatusProperty`
+interfaces, including conservative defaults for pre-v8 logical width, pre-v9
+unknown-capacity replacement, pre-v10 bridge verification, additive fill and
+paid-capacity provenance, and retirement state. Missing
+`logical_retirement_committed` remains the one deliberate tri-state migration:
+it decodes as `None`, while a newly constructed record uses `False`. Outside
+those decoding/migration seams, consumers access declared fields directly.
+Tests and mocks must implement the real interface; they must not cause
+production code to grow attribute-existence fallbacks. A current-version object
+with a deleted required field is malformed and must raise rather than acquire a
+policy default.
+
+The same rule applies to non-record Serve objects. `SkyServiceSpec.__setstate__`
+owns persisted-spec compatibility; normal properties never probe whether their
+backing fields exist. Autoscaler, replica-manager, controller, spot-placement,
+and load-balancer constructors initialize their complete shared runtime
+interfaces, including neutral values for capabilities that only some concrete
+implementations populate. Shared code calls declared methods and reads declared
+fields directly instead of using reflection as a capability test. Reflection
+remains appropriate only at explicitly dynamic integration boundaries, such as
+Kubernetes client models, HTTP request/client/response metadata, SQLAlchemy
+column namespaces, and deliberate schema-field iteration.
 
 ### Production operating point
 
@@ -388,6 +431,13 @@ because it is outside the adopted traffic target. Already-running compatible
 GPU supply may still replace a held slot; only a new cold launch is forbidden
 from silently changing the held slot's card.
 
+This downscale hold is deliberately different from an ordinary mixed-version
+scale-up tick. While the hold is active, its adopted paid-owned portion remains
+the exact-card retry authority: a failed L40S launch is retried as L40S, not
+reinterpreted as L4. Synthesized padding in the same held reconciliation map
+does not thereby acquire paid authority. Mixed-version reassignment is enabled
+only when the tick is not holding a downscale.
+
 The live failure was observed on 2026-07-27 with service
 `clin-structure-eval-6f51471-l40s-v8`. One queued request produced aggregate
 target 1 and exact target `{"L40S": 1}`. After two L40S Spot locations failed
@@ -437,31 +487,76 @@ reported through warm retention and actuation, never by rewriting that demand
 map.
 
 Before emitting any exact-card scale-up or card-specific retirement, a fresh
-and complete control tick recomputes an actuation placement at the
+and complete control tick recomputes a supply-aware actuation placement at the
 already-adopted aggregate target from the current compatibility profiles, hard
-floors, non-retiring pinned work, and current supply. That second placement may
-be backed by a different compatible card. Only its positive shortage is cold
-launch authority. Any unbacked adopted unit whose fresh desired placement
-wants a different card may move toward that placement immediately. A backed
-unit may move only onto compatible capacity that already exists, such as a
-ready or free reserved A100 replacing a paid L4. Logical-card wave limits apply
-to positive cold shortages in this actuation map, not to the published demand
-map. While a constrained migration is wave-limited, the actuator retains old
-card capacity as a non-demand transition placeholder until each authorized
-replacement wave is ready. This fence is derived from current supply rather
-than the continued presence of a retiring replica row, so it survives row
-deletion and controller recovery. This revalidation does not increase the
-adopted aggregate target and does not accelerate retirement. It prevents
-disappeared warm capacity from becoming a cold same-card replacement order and
-lets existing compatible supply suppress redundant paid capacity.
+floors, non-retiring pinned work, and latest-version supply. That placement is
+the capacity mix reconciliation should converge toward. Only its positive
+shortage that also appears in the separately published paid authority is
+allowed to create paid capacity.
+
+The allocation result carries three independently computed per-card maps plus
+an attribution-completeness bit:
+
+- the full reconciliation map includes all demand and padding;
+- the explicit-compatibility map includes request compatibility evidence,
+  exact-card floors, and fixed exact-card work, and bounds mixed-version
+  cross-card movement;
+- the paid-ownership map includes demand that may buy capacity in an ordinary
+  latest-only service. In addition to explicit demand, this includes the
+  aggregate minimum and headerless queued/rejected demand, so cold
+  scale-from-zero remains possible. It excludes inferred in-flight overflow
+  and generic overprovision padding.
+
+All three maps are intersected with the same full allocation; ownership cannot
+be transferred to a card selected only because unrelated unproven work changed
+the allocator's marginal placement. The explicit and paid-owned maps are
+adopted alongside the demand target so exact retries survive a transiently
+empty histogram. A later target adoption replaces those carried maps.
+
+On a non-downscale mixed-version tick, only the explicit-compatibility subset
+may move an adopted unit, including one still backed by an old version.
+Aggregate queue/rejection gaps, running work whose accepted compatibility
+history has aged out, unattributed arrival work, and aggregate
+minimum/overprovision padding never enter that explicit subset. On a
+latest-only tick, the paid-ownership subset may also move to its freshly
+allocated card; this lets a headerless queue reprice vanished supply without
+letting inferred in-flight overflow guess a purchase.
+
+For explicitly owned units, an old row protects active work and prevents its
+own retirement until compatible latest-version READY coverage is available;
+it never dictates the paid replacement card. Thus an old A100 that had served
+explicit default-all work may remain nonpreemptively alive while the latest
+version launches the allocator-owned L4 replacement. Exact A100 demand or an
+A100 hard floor still selects A100. A backed adopted unit outside the explicit
+subset may authorize only its same-card rollout replacement. A vanished
+unproven unit and synthesized padding authorize no paid placement; they may
+retain a reconciliation/zero-cost probe without becoming an A100 or L4
+purchase. Same-card rollout ownership is an absolute latest-version ceiling:
+`min(reconciliation target, adopted demand, latest committed + live old
+backing)`. The decision layer subtracts latest committed capacity from that
+ceiling, so a partially completed `latest=1, old=1, target=2` rollout receives
+exactly one more launch rather than deadlocking at zero.
+
+During a mixed-version rollout, stale or otherwise incomplete telemetry keeps
+the conservative adopted reconciliation target and publishes an explicit empty
+paid-authority map. A stale single-version target may still be recomputed from
+retained valid gauges, but it likewise authorizes no paid mutation and cannot
+retire capacity. Existing zero-cost placement remains eligible under its own
+fence. Logical-card wave limits and busy/unknown-work protections apply in all
+cases.
 
 Rows already marked for scale-down or preempted are excluded from
 ready/provisioning supply in that cold-launch recomputation and from
-latest-version coverage used to authorize an old-version rollout drain. Work
-still draining on such a row remains in the aggregate outstanding-work safety
-total, but it does not pin replacement capacity to the retiring row's card.
-The replacement portion is allocated by the current request compatibility
-sets. Consequently:
+latest-version coverage used to authorize an old-version rollout drain.
+Logical supply uses the same committed-capacity function as duplicate-launch
+suppression: healthy READY width is bounded by observed slots, pending width is
+planned capacity, and a persistently zero/unknown READY row contributes zero
+after the bounded replacement timeout. A row explicitly marked as that
+bounded replacement remains committed so telemetry loss cannot recursively
+launch replacements. Work still draining on an excluded row remains in the
+aggregate outstanding-work safety total, but it does not pin replacement
+capacity to the retiring row's card. The replacement portion is allocated by
+the current request compatibility sets. Consequently:
 
 - losing an idle or retiring reserved A100 that had served default-all or
   `L4/A100` work shifts any unbacked replacement shortfall to L4 when L4 is the
@@ -471,13 +566,36 @@ sets. Consequently:
   A100-only queued demand can still authorize an A100 cold launch;
 - an already-ready compatible A100 remains eligible for routing and avoids an
   unnecessary L4 launch, including when it is reserved capacity;
-- stale or incomplete compatibility telemetry authorizes neither a guessed
-  card migration nor a cold launch.
+- stale or incomplete compatibility telemetry authorizes neither a paid card
+  migration nor a paid cold launch. In particular, a mixed-version rollout
+  preserves its adopted card map; a stale single-version tick may recompute a
+  reconciliation target from retained valid gauges but cannot spend or retire.
+- a timed-out degraded A100 cannot bias a flexible allocator toward A100 or
+  preserve A100 backing while shortage accounting treats it as zero; the
+  allocator, actuation revalidator, and decision layer share one committed
+  capacity value.
 
-This cold-launch map is also the logical replica-manager reconciliation fence
-for that scale-up decision. While it differs from the adopted retirement map,
-the autoscaler suppresses retirement. After normal hysteresis adopts the new
-card assignment, scale-down again uses the adopted map and the existing
+During a mixed-version rollout, generation provenance is tri-state. An
+explicit old-version supply map is a complete snapshot, and an omitted card in
+that map has known zero old-version supply. An empty explicit map therefore
+proves that every adopted card absent from latest-version supply is gone from
+the whole fleet. If old-version provenance is unavailable, it is represented
+as unknown rather than as an empty map; the actuator fails closed and preserves
+the adopted exact-card map. With complete provenance, adopted units backed by
+neither latest nor old non-retiring supply may move only as far as the
+per-card explicit ownership subset requires before conservative mixed-version
+handling. Any unproven remainder stays outside paid authority. When the rest of
+the tick is also fresh, complete, and not downscale-held, ordinary rollout
+reconciliation may likewise move units that remain old-version-backed toward
+that explicit subset. Preempted and scale-down rows never count as backing on
+either generation.
+
+The logical replica-manager reconciliation target and paid cold-launch
+authority are deliberately distinct. The target drives convergence and
+zero-cost placement eligibility; the paid-authority map is an incremental,
+per-card spending budget. While they differ from the adopted retirement map,
+the autoscaler suppresses unsafe retirement. After normal hysteresis adopts
+the new card assignment, scale-down again uses the adopted map and the existing
 idle/graceful-drain proofs.
 
 The fence is checked again immediately before each queued demand launch makes
@@ -490,6 +608,14 @@ zero-cost demand-owned PENDING rows and finally the oldest paid demand-owned
 PENDING rows that fit the remaining target. Rows launched for reserved fill
 remain governed by the independent broker-grant fence and are not charged to
 this demand budget.
+
+Placement returns a typed launch result with `funding` (`PAID` or
+`ZERO_COST`) and `planned_capacity`. Batch reconciliation debits authority only
+for `PAID` results, using the returned planned capacity. It never recovers that
+decision by inspecting a newly appended `ReplicaInfo`, and it never charges a
+zero-cost demand placement against paid authority. If a card has no paid
+authority left, the manager may still attempt an eligible zero-cost location;
+it must not fall through to paid placement.
 
 An ordinary unpinned launch has no per-replica resources override before that
 first mutation. When the complete configured catalog contains exactly one
@@ -590,6 +716,11 @@ service:
   demand wave it may be nonzero only on the cheapest compatible card selected
   by the allocator. Exact-card-constrained demand may authorize its required
   card.
+- Logical scale decisions carry the reconciliation target and paid authority
+  independently. An explicit empty authority means zero paid launches even if
+  the retained reconciliation target is nonzero. A missing authority field is
+  reserved only for backward compatibility with legacy aggregate decisions;
+  new exact-card decisions always publish the field explicitly.
 - Broker-reported free reserved slots are not materialized capacity and cannot
   back a supply-aware demand reassignment. They are consumed only by the
   reserved-fill overlay, whose launch carries the zero-cost-only fence. This
@@ -600,11 +731,19 @@ service:
   `warm_retention_target_by_accelerator` and blocks its replica from draining,
   but the serving card does not pin the private desired-card actuation map.
   Compatibility demand ownership selects the cold card. While old and latest
-  versions coexist, paid actuation preserves that adopted card map exactly;
-  after rollout, materialized latest-version supply may satisfy compatible
-  demand without changing ownership. This prevents a warm research A100 from
-  becoming paid A100 replacement authority while preserving exact-card and
-  non-preemptive rollout safety.
+  versions coexist, a fresh, complete, non-downscale tick may move only the
+  per-card explicitly owned subset toward the supply-aware compatible
+  latest-version placement, even when old-version rows still back the prior
+  card. Those rows fence nonpreemptive retirement but do not choose the paid
+  replacement card. With complete generation provenance, units absent from
+  every generation move only toward explicit ownership and receive no
+  same-card paid fallback; with unknown provenance, the full map is preserved
+  and paid authority is explicitly empty. A downscale hold keeps its adopted
+  paid-owned exact-card retry authority while unowned padding remains
+  zero-cost-only. After rollout, materialized latest-version supply may satisfy
+  compatible demand without changing ownership. This prevents both a warm and
+  a reclaimed research A100 from becoming paid A100 replacement authority for
+  L4-compatible work.
 - The aggregate demand target is `max(calculated demand, min_replicas, sum(per-card floors))`, capped by `max_replicas`. When demand exceeds the cap, requests remain queued; compatibility is never widened.
 - Scale-up decisions carry an exact accelerator resource override. Scale-down selects an exact card whose current serving replicas exceed that card's target and floor, observes the existing graceful/idleness delay, and never terminates active work.
 - Economic cost rebalancing may move a replica to a cheaper provider, region,
@@ -969,6 +1108,38 @@ A100-80GB serve or retain already-running work. That warm work appears only in
 required, cold authority contains only L4. A constrained A100-only wave must
 instead target and authorize A100.
 
+Mixed-version regression coverage must use the production-shaped multi-card
+case where old A100 rows back part of an adopted target but current compatible
+demand belongs on L4. A fresh, complete, explicitly-proven non-downscale tick
+must move the latest-version reconciliation target and paid authority to L4,
+then a second tick after that L4 capacity commits must allow the old A100 rows
+to retire without creating a paid A100 replacement. Companion cases must prove
+that 40 old L4-only units remain L4, an exact A100 floor or demand retains A100
+authority, a downscale-held exact-card retry stays on its adopted card, and
+stale or incomplete telemetry publishes explicit zero paid authority. With a
+fresh report but no accepted compatibility history for running old A100 work,
+the allocator must publish an empty explicit-ownership subset, preserve A100
+only for the backed same-card replacement, and never follow its synthesized
+default-all L4 placement. A partial explicit profile may authorize only its own
+L4 units plus the actually backed A100 replacement; vanished or aggregate
+padding must receive no paid authority. An explicit flexible profile covering
+the complete target is the positive companion that permits full L4 movement.
+
+Replica-manager tests must distinguish paid from zero-cost demand placement by
+the typed launch result. Paid planned capacity consumes the matching authority;
+zero-cost planned capacity does not. The same tests must prove that exhausting
+paid authority cannot fall through to a paid location and that no
+`ReplicaInfo` lookup participates in the debit.
+
+Allocator regressions must separately cover latest-only cold scale-from-zero
+for an aggregate minimum and for headerless/default-compatible queued demand;
+both receive paid authority on the selected cheapest card. Inferred in-flight
+overflow remains outside paid ownership. A timed-out degraded READY A100 with
+zero observed slots must contribute zero to both allocation and actuation,
+select L4 for a flexible explicit request, and emit exactly one bounded
+replacement ID. The companion row marked as the bounded unknown-capacity
+replacement remains committed and cannot recursively launch another wave.
+
 The all-compatible case must also be replayed from the production recovery
 shape: the aggregate target is held above fresh raw demand, the process-local
 per-card map starts empty, and committed L4, A100, and A100-80GB supply already
@@ -1191,6 +1362,14 @@ Production checks:
 - During a rolling update, mark latest-version physical and logical replicas
   preempted while their derived status is still READY. Confirm they do not
   authorize retirement of healthy old-version serving coverage.
+- During a mixed-version update, retain old A100 replicas serving
+  L4-compatible work and publish a fresh complete compatibility snapshot whose
+  supply-aware latest-version placement is L4. Confirm the latest version
+  launches only the authorized L4 replacement wave, old A100 work is not
+  preempted, a subsequent fresh tick retires idle old A100 only after compatible
+  latest READY coverage exists, and no paid A100 launch occurs. Repeat with a
+  stale or incomplete snapshot and confirm paid launch authority is explicitly
+  empty.
 - Replay representative traffic with measured per-request service times and
   per-card startup distributions. Low-priority requests must complete queue
   admission before their 600-second timeout, default-all/L4-compatible traffic

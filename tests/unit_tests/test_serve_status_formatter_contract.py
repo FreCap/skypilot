@@ -133,7 +133,8 @@ def test_empty_and_replica_truncation_contracts():
     assert re.search(rf'^svc\s+{last_included}\s', plain_rendered, re.MULTILINE)
     assert not re.search(rf'^svc\s+{first_excluded}\s', plain_rendered,
                          re.MULTILINE)
-    assert '... (use --all to show all replicas)' in rendered
+    # `sky serve status` has no --all; show_all comes from --verbose there.
+    assert '... (use -v to show all replicas)' in rendered
 
 
 def test_facade_function_metadata_and_pickle_contract():

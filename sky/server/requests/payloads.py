@@ -138,6 +138,7 @@ _SERVER_OWNED_ENV_VARS = frozenset({
     'SKYPILOT_API_DEPLOYMENT_NAME',
     'SKYPILOT_API_REQUEST_BACKEND',
     'SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH',
+    'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS',
     'SKYPILOT_API_SERVER_INSTANCE_ID',
     'SKYPILOT_API_SERVER_ROLE',
     'SKYPILOT_API_SERVER_STORAGE_ENABLED',
@@ -269,6 +270,18 @@ class RequestBody(BasePayload):
     # client-specific code. `None` means the request arrived without
     # the header — i.e. an old client.
     client_api_version: int | None = None
+
+    @classmethod
+    def projection_placeholder(cls) -> 'RequestBody':
+        """Build an inert body for a metadata-only database projection.
+
+        Normal construction intentionally captures client process context in
+        ``__init__``.  A projected row has no body, so invoking that path would
+        synthesize unrelated API-server state.  ``model_construct`` applies
+        the declared field defaults without running the ambient-context
+        constructor.
+        """
+        return cls.model_construct()
 
     def __init__(self, **data):
         data['env_vars'] = data.get('env_vars', request_body_env_vars())
@@ -1185,10 +1198,15 @@ class RequestCancelBody(RequestBody):
 class RequestStatusBody(pydantic.BaseModel):
     """The request body for the API request status endpoint."""
     request_ids: list[str] | None = None
+    # Treat request_ids as exact primary keys instead of legacy prefixes.
+    exact_request_ids: bool = False
     all_status: bool = False
     limit: int | None = None
     fields: list[str] | None = None
     cluster_name: str | None = None
+    cluster_names: list[str] | None = None
+    include_request_names: list[str] | None = None
+    execution_quiescence_candidates_only: bool = False
 
 
 class OperatorNotificationReadBody(pydantic.BaseModel):
@@ -1581,6 +1599,14 @@ class RequestPayload(BasePayload):
     should_retry: bool = False
     finished_at: float | None = None
     file_mounts_blob_id: str | None = None
+    # Servers at MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION or newer expose
+    # these together. Equality between the observed execution generation and
+    # quiesced generation proves that exact invocation has stopped running
+    # effect-bearing handler code.
+    execution_generation: int | None = None
+    execution_quiescence_required: bool | None = None
+    execution_quiesced_generation: int | None = None
+    execution_quiesced_at: float | None = None
 
 
 class SlurmGpuAvailabilityRequestBody(RequestBody):

@@ -227,6 +227,7 @@ if __name__ == '__main__':
             'sky_templates',
             'sky_templates.*',
         )),
+        py_modules=['skypilot_serve_system_oom_recovery_authorization'],
         author='SkyPilot Team',
         license='Apache 2.0',
         readme='README.md',

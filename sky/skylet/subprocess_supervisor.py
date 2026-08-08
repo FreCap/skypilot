@@ -168,21 +168,6 @@ def _wait_for_descendants_empty(command: subprocess.Popen[bytes] | None,
     return False
 
 
-def _force_remove_attempt_containers(
-        expected: system_oom_recovery.DockerIdentity) -> None:
-    # Baseline emptiness is what makes every current container attempt-owned.
-    # Never call this for an unarmed attempt.
-    if not system_oom_recovery.docker_identity_matches(expected):
-        return
-    try:
-        inventory = system_oom_recovery.docker_container_inventory()
-        if inventory:
-            system_oom_recovery._run_docker(  # pylint: disable=protected-access
-                ['rm', '-f', *inventory])
-    except system_oom_recovery.RecoveryError:
-        pass
-
-
 def _remove_owned_container(expected: system_oom_recovery.DockerIdentity,
                             container_id: str,
                             deadline: float,
@@ -230,57 +215,37 @@ def _remove_owned_container(expected: system_oom_recovery.DockerIdentity,
 
 
 def _cleanup(command: subprocess.Popen[bytes] | None,
-             docker_identity: system_oom_recovery.DockerIdentity | None,
-             armed: bool,
-             owned_container_id: str | None = None) -> dict[str, object]:
+             docker_identity: system_oom_recovery.DockerIdentity,
+             owned_container_id: str) -> dict[str, object]:
     """Terminate/reap the scope, returning facts for the cleanup marker."""
     command_pid = command.pid if command is not None else None
     started_at = time.time()
     graceful_deadline = time.monotonic() + GRACEFUL_TERMINATION_SECONDS
     enumeration_proven = _signal_descendants(signal.SIGTERM, command_pid)
-    owned_removed = True
-    if (armed and docker_identity is not None and
-            owned_container_id is not None):
-        # Docker daemon ownership outlives the attached CLI. Signal and remove
-        # the exact ID before waiting for the CLI descendant to disappear.
-        owned_removed = _remove_owned_container(docker_identity,
-                                                owned_container_id,
-                                                graceful_deadline)
+    # Docker daemon ownership outlives the attached CLI. Signal and remove the
+    # exact ID before waiting for the CLI descendant to disappear.
+    owned_removed = _remove_owned_container(docker_identity, owned_container_id,
+                                            graceful_deadline)
     descendants_empty = (enumeration_proven and _wait_for_descendants_empty(
         command, graceful_deadline))
-    docker_empty = False
-    if descendants_empty and armed and docker_identity is not None:
-        if owned_container_id is None:
-            docker_empty = system_oom_recovery.wait_for_stable_empty_docker(
-                docker_identity, graceful_deadline)
-        else:
-            docker_empty = (owned_removed and
-                            system_oom_recovery.wait_for_stable_empty_docker(
-                                docker_identity, graceful_deadline))
-    elif not armed:
-        # This value is diagnostic only.  An unarmed capability marker can
-        # never authorize replay regardless of the cleanup marker.
-        docker_empty = False
+    docker_empty = (descendants_empty and owned_removed and
+                    system_oom_recovery.wait_for_stable_empty_docker(
+                        docker_identity, graceful_deadline))
 
-    forced = not descendants_empty or (armed and not docker_empty)
+    forced = not descendants_empty or not docker_empty
     if forced:
         enumeration_proven = (_signal_descendants(signal.SIGKILL, command_pid)
                               and enumeration_proven)
-        if armed and docker_identity is not None:
-            if owned_container_id is None:
-                _force_remove_attempt_containers(docker_identity)
-            else:
-                _remove_owned_container(docker_identity,
-                                        owned_container_id,
-                                        time.monotonic() + FORCED_REAP_SECONDS,
-                                        force=True)
+        _remove_owned_container(docker_identity,
+                                owned_container_id,
+                                time.monotonic() + FORCED_REAP_SECONDS,
+                                force=True)
         forced_deadline = time.monotonic() + FORCED_REAP_SECONDS
         descendants_empty = (enumeration_proven and _wait_for_descendants_empty(
             command, forced_deadline))
-        if armed and docker_identity is not None:
-            docker_empty = (
-                system_oom_recovery.docker_identity_matches(docker_identity) and
-                not system_oom_recovery.docker_container_inventory())
+        docker_empty = (
+            system_oom_recovery.docker_identity_matches(docker_identity) and
+            not system_oom_recovery.docker_container_inventory())
 
     try:
         survivor_pids = sorted(process.pid for process in _descendants())
@@ -292,8 +257,8 @@ def _cleanup(command: subprocess.Popen[bytes] | None,
     return {
         'started_at': started_at,
         'completed_at': time.time(),
-        'graceful': (armed and not forced and enumeration_proven and
-                     descendants_empty and docker_empty),
+        'graceful': (not forced and enumeration_proven and descendants_empty and
+                     docker_empty),
         'forced': forced,
         'timed_out': forced,
         'descendants_empty': descendants_empty,
@@ -330,21 +295,17 @@ def _write_capability(context: dict[str, object],
                                             marker)
 
 
-def _write_cleanup(context: dict[str, object],
-                   supervisor: dict[str, object],
-                   docker_identity: system_oom_recovery.DockerIdentity | None,
-                   facts: dict[str, object],
-                   trigger: str,
-                   owned_container_id: str | None = None) -> None:
+def _write_cleanup(context: dict[str, object], supervisor: dict[str, object],
+                   docker_identity: system_oom_recovery.DockerIdentity,
+                   facts: dict[str, object], trigger: str,
+                   owned_container_id: str) -> None:
     marker = {
         'schema_version': context['schema_version'],
         'kind': 'cleanup',
         **system_oom_recovery._attempt_fields(  # pylint: disable=protected-access
             context),
         'supervisor': supervisor,
-        'docker_identity':
-            (docker_identity.to_dict() if docker_identity is not None else None
-            ),
+        'docker_identity': docker_identity.to_dict(),
         'trigger': trigger,
         'owned_container_id': owned_container_id,
         **facts,
@@ -425,9 +386,9 @@ def _wait_for_command(
 
 
 def supervise(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
-        inner_command: str | None, context: dict[str, object],
+        context: dict[str, object],
         recovery_plan: system_oom_recovery.RecoveryLaunchPlan) -> int:
-    """Run one direct-shell or owned-container workload under a subreaper."""
+    """Run one supervisor-owned container workload under a subreaper."""
     context = system_oom_recovery._validate_attempt_context(  # pylint: disable=protected-access
         context)
     if recovery_plan.profile_version != context['profile_version']:
@@ -450,8 +411,7 @@ def supervise(  # pylint: disable=too-many-locals,too-many-branches,too-many-sta
         parent_pid = _set_parent_death_signal(expected_parent_pid)
         _assert_parent_fence(context, parent_pid, termination_requested)
     except (OSError, system_oom_recovery.RecoveryError) as e:
-        # PDEATHSIG, parent, latch, and boot failures are fatal for both
-        # profiles. No workload/container Popen is reachable from here.
+        # No workload/container Popen is reachable after a fatal parent fence.
         print(f'SkyPilot recovery parent fence failed: {e}',
               file=sys.stderr,
               flush=True)
@@ -488,42 +448,13 @@ def supervise(  # pylint: disable=too-many-locals,too-many-branches,too-many-sta
     except (OSError, system_oom_recovery.RecoveryError) as e:
         failure_reason = str(e)
 
-    requires_armed_start = bool(context['require_armed_start'])
-    if not armed and requires_armed_start:
+    if not armed:
         _write_capability(context,
                           armed=False,
                           reason=failure_reason,
                           supervisor=supervisor,
                           docker_identity=docker_identity)
         return 1
-
-    if (recovery_plan.profile_version ==
-            system_oom_recovery.PROFILE_VERSION_DIRECT_SHELL):
-        # Deprecated transition: only the original v1 command may retain its
-        # ordinary no-retry behavior after a nonfatal capability failure.
-        assert inner_command is not None
-        _write_capability(context,
-                          armed=armed,
-                          reason=failure_reason,
-                          supervisor=supervisor,
-                          docker_identity=docker_identity)
-        try:
-            _assert_parent_fence(context, parent_pid, termination_requested,
-                                 docker_identity if armed else None,
-                                 () if armed else None)
-        except system_oom_recovery.RecoveryError as e:
-            print(f'SkyPilot recovery pre-Popen fence failed: {e}',
-                  file=sys.stderr,
-                  flush=True)
-            return 1
-        command = subprocess.Popen(  # pylint: disable=consider-using-with
-            inner_command,
-            shell=True,
-            start_new_session=True)
-        returncode, trigger = _wait_for_command(command, termination_requested)
-        facts = _cleanup(command, docker_identity, armed)
-        _write_cleanup(context, supervisor, docker_identity, facts, trigger)
-        return returncode
 
     assert recovery_plan.owned_container_spec is not None
     assert recovery_plan.execution_envelope is not None
@@ -561,7 +492,6 @@ def supervise(  # pylint: disable=too-many-locals,too-many-branches,too-many-sta
                                              recovery_plan.execution_envelope)
         facts = _cleanup(owned_command,
                          docker_identity,
-                         armed=True,
                          owned_container_id=container_id)
         _write_cleanup(context,
                        supervisor,
@@ -601,13 +531,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--context-json', required=True)
     parser.add_argument('--plan-path', required=True)
-    parser.add_argument('--command')
     arguments = parser.parse_args()
     try:
         context = json.loads(arguments.context_json)
         recovery_plan = system_oom_recovery.consume_private_recovery_plan(
             arguments.plan_path, context)
-        returncode = supervise(arguments.command, context, recovery_plan)
+        returncode = supervise(context, recovery_plan)
     except Exception as e:  # pylint: disable=broad-except
         print(f'SkyPilot recovery supervisor failed: {e}',
               file=sys.stderr,

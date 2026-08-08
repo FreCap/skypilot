@@ -18,6 +18,7 @@ only sqlite. This module:
 """
 # pylint: disable=cell-var-from-loop,missing-class-docstring
 # pylint: disable=protected-access,redefined-outer-name,unused-import
+import contextlib
 import datetime
 import importlib
 import os
@@ -47,11 +48,14 @@ from sky import global_user_state
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
+from sky.serve import placement_contract_normalization
 from sky.serve import placement_history
+from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_history
 from sky.serve import serve_state
+from sky.serve import service_spec
 from sky.serve import spot_placer
 from sky.utils import common_utils
 from sky.utils import locks
@@ -83,6 +87,34 @@ pytestmark = pytest.mark.skipif(
     reason='docker unavailable; skipping real-Postgres broker tests')
 if _DOCKER_UNAVAILABLE and _POSTGRES_REQUIRED:
     pytest.fail('Docker is required for Serve PostgreSQL tests.', pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_disposable_database_migrations(monkeypatch):
+    """Do not serialize migrations across independent throwaway databases."""
+
+    @contextlib.contextmanager
+    def _unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', _unlocked)
+
+
+def _service_spec(*, pool: bool = False) -> service_spec.SkyServiceSpec:
+    return service_spec.SkyServiceSpec.from_yaml_config({
+        'pool': {},
+        'workers': 1,
+    } if pool else {
+        'replicas': 1,
+    })
+
+
+def _v1_service_spec() -> service_spec.SkyServiceSpec:
+    spec = _service_spec()
+    contract = spec.placement_contract
+    spec.__dict__.update(contract._legacy_v1_persisted_fields())
+    spec.__dict__[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+    return spec
 
 
 @pytest.fixture(scope='session')
@@ -162,6 +194,69 @@ class TestFixtureWiring:
         re-run on sqlite and this module would test nothing new."""
         engine = serve_state._db_manager.get_engine()
         assert engine.dialect.name == 'postgresql'
+
+
+@pytest.mark.usefixtures('_broker_db')
+class TestPlacementContractWriteBoundaryPG:
+
+    def test_new_writes_reject_v1_and_store_only_raw_v2(self):
+        with pytest.raises(ValueError, match='mirror-free v2'):
+            serve_state.add_service(name='legacy-registration',
+                                    controller_job_id=1,
+                                    policy='policy',
+                                    requested_resources_str='1x[CPU:1+]',
+                                    load_balancing_policy='round_robin',
+                                    status=serve_state.ServiceStatus.READY,
+                                    tls_encrypted=False,
+                                    pool=False,
+                                    controller_pid=11,
+                                    entrypoint='entry',
+                                    spec=_v1_service_spec(),
+                                    yaml_content='service: {}')
+        engine = serve_state._db_manager.get_engine()
+        with sqlalchemy.orm.Session(engine) as session:
+            assert session.execute(
+                sqlalchemy.select(serve_state.services_table.c.name).where(
+                    serve_state.services_table.c.name ==
+                    'legacy-registration')).first() is None
+
+        assert serve_state.add_service(name='v2-boundary',
+                                       controller_job_id=1,
+                                       policy='policy',
+                                       requested_resources_str='1x[CPU:1+]',
+                                       load_balancing_policy='round_robin',
+                                       status=serve_state.ServiceStatus.READY,
+                                       tls_encrypted=False,
+                                       pool=False,
+                                       controller_pid=11,
+                                       entrypoint='entry',
+                                       spec=_service_spec(),
+                                       yaml_content='service: {}')
+        assert serve_state.add_version('v2-boundary') == 2
+        with pytest.raises(ValueError, match='mirror-free v2'):
+            serve_state.add_or_update_version('v2-boundary', 2,
+                                              _v1_service_spec(),
+                                              'service: {legacy: true}')
+        with sqlalchemy.orm.Session(engine) as session:
+            placeholder = session.execute(
+                sqlalchemy.select(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    'v2-boundary', serve_state.version_specs_table.c.version ==
+                    2)).mappings().one()
+        assert placeholder['yaml_content'] is None
+
+        assert serve_state.add_or_update_version(
+            'v2-boundary', 2, _service_spec(), 'service: {current: true}') is (
+                serve_state.VersionCommitResult.COMMITTED)
+        with sqlalchemy.orm.Session(engine) as session:
+            payload = session.execute(
+                sqlalchemy.select(serve_state.version_specs_table.c.spec).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    'v2-boundary', serve_state.version_specs_table.c.version ==
+                    2)).scalar_one()
+        assert placement_contract_normalization.analyze_spec_pickle(
+            payload).classification is (
+                placement_contract_normalization.Classification.EXPLICIT_V2)
 
 
 class TestSingleClaimantFastPathPG(sqlite_suite.TestSingleClaimantFastPath):
@@ -249,7 +344,7 @@ class TestPaidCapacityAuthorityPG:
                                        pool=False,
                                        controller_pid=pid,
                                        entrypoint='entry',
-                                       spec=None,
+                                       spec=_service_spec(),
                                        yaml_content='service: {}',
                                        controller_ip='10.0.0.1',
                                        service_hash=service_hash,
@@ -2742,7 +2837,7 @@ class TestServiceLivenessSnapshotPG:
                                        pool=False,
                                        controller_pid=11,
                                        entrypoint='entry',
-                                       spec=None,
+                                       spec=_service_spec(),
                                        yaml_content='service: {}',
                                        controller_ip='10.0.0.1',
                                        service_hash='hash-a',
@@ -2757,7 +2852,7 @@ class TestServiceLivenessSnapshotPG:
                                        pool=True,
                                        controller_pid=22,
                                        entrypoint='entry',
-                                       spec=None,
+                                       spec=_service_spec(pool=True),
                                        yaml_content='service: {}')
         with sqlalchemy.orm.Session(broker_engine) as session:
             session.execute(serve_state.services_table.insert().values(
@@ -2794,7 +2889,7 @@ class TestServiceWorkspaceBackfillPG:
                                        pool=False,
                                        controller_pid=11,
                                        entrypoint='entry',
-                                       spec=None,
+                                       spec=_service_spec(),
                                        yaml_content='service: {}',
                                        workspace=None,
                                        service_hash='incarnation-a')
@@ -2941,6 +3036,16 @@ class TestMigrationChainPG:
                 assert 'phantom_streak' in columns, columns
                 assert 'shrink_baseline' in columns, columns
                 assert 'fence_pending' in columns, columns
+                assert 'feed_by_accelerator' in columns, columns
+                protocol_columns = {
+                    column['name'] for column in inspector.get_columns(
+                        'reserved_fill_protocol_state')
+                }
+                assert {
+                    'deployment_uid',
+                    'pod_inventory_count',
+                    'pod_inventory_sha256',
+                }.issubset(protocol_columns)
                 request_columns = {
                     column['name']: column for column in inspector.get_columns(
                         'serve_request_activity_history')
@@ -3424,116 +3529,50 @@ class TestMigrationChainPG:
         """Both pre-merge revision 016 schemas converge on PostgreSQL."""
         url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
         engine = create_engine(url)
-        metadata = sqlalchemy.MetaData()
-        service_columns = [
-            sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True)
-        ]
-        if preview_workspace_016:
-            service_columns.append(
-                sqlalchemy.Column('workspace', sqlalchemy.Text))
-        else:
-            service_columns.extend([
-                sqlalchemy.Column('lb_ha_enabled',
-                                  sqlalchemy.Integer,
-                                  nullable=False,
-                                  server_default='0'),
-                sqlalchemy.Column('lb_active_slot', sqlalchemy.Text),
-                sqlalchemy.Column('lb_cutover_generation',
-                                  sqlalchemy.Integer,
-                                  nullable=False,
-                                  server_default='0'),
-                sqlalchemy.Column('lb_pending_slot', sqlalchemy.Text),
-                sqlalchemy.Column('lb_cutover_phase',
-                                  sqlalchemy.Text,
-                                  nullable=False,
-                                  server_default='STABLE'),
-                sqlalchemy.Column('lb_drain_started_at', sqlalchemy.Float),
-                sqlalchemy.Column('lb_demand_handoff_generation',
-                                  sqlalchemy.Integer),
-                sqlalchemy.Column('lb_demand_handoff_snapshot',
-                                  sqlalchemy.Text),
-                sqlalchemy.Column('lb_demand_handoff_complete_at',
-                                  sqlalchemy.Float),
-                sqlalchemy.Column('lb_last_demand_snapshot', sqlalchemy.Text),
-            ])
-        services = sqlalchemy.Table('services', metadata, *service_columns)
-        sqlalchemy.Table(
-            'version_specs', metadata,
-            sqlalchemy.Column('service_name', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
-            sqlalchemy.Column('created_at', sqlalchemy.Float),
-            sqlalchemy.Column('created_by', sqlalchemy.Text))
-        sqlalchemy.Table(
-            'replicas', metadata,
-            sqlalchemy.Column('service_name', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('replica_id',
-                              sqlalchemy.Integer,
-                              primary_key=True),
-            sqlalchemy.Column('version', sqlalchemy.Integer))
-        sqlalchemy.Table(
-            'serve_replica_status_history', metadata,
-            sqlalchemy.Column('service_name', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('service_hash', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
-            sqlalchemy.Column('bucket_start',
-                              sqlalchemy.DateTime(timezone=True),
-                              primary_key=True),
-            sqlalchemy.Column('observed_at',
-                              sqlalchemy.DateTime(timezone=True),
-                              nullable=False),
-            sqlalchemy.Column('ready_count', sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('provisioning_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('not_ready_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('errored_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('preempted_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('stopping_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('total_count', sqlalchemy.Integer,
-                              nullable=False))
-        sqlalchemy.Table(
-            'serve_request_activity_history', metadata,
-            sqlalchemy.Column('service_name', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('service_hash', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('reporter_session_id',
-                              sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('bucket_start',
-                              sqlalchemy.DateTime(timezone=True),
-                              primary_key=True),
-            sqlalchemy.Column('observed_at',
-                              sqlalchemy.DateTime(timezone=True),
-                              nullable=False),
-            sqlalchemy.Column('request_count',
-                              sqlalchemy.Integer,
-                              nullable=False))
-        metadata.create_all(engine)
         try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '015')
             with engine.begin() as connection:
-                connection.execute(services.insert().values(name='legacy-svc'))
+                collision_columns = ('workspace', 'lb_ha_enabled',
+                                     'lb_active_slot', 'lb_cutover_generation',
+                                     'lb_pending_slot', 'lb_cutover_phase',
+                                     'lb_drain_started_at',
+                                     'lb_demand_handoff_generation',
+                                     'lb_demand_handoff_snapshot',
+                                     'lb_demand_handoff_complete_at',
+                                     'lb_last_demand_snapshot')
+                for column in collision_columns:
+                    connection.exec_driver_sql(
+                        f'ALTER TABLE services DROP COLUMN IF EXISTS {column}')
+                if preview_workspace_016:
+                    connection.exec_driver_sql(
+                        'ALTER TABLE services ADD COLUMN workspace TEXT')
+                else:
+                    for definition in (
+                            'lb_ha_enabled INTEGER NOT NULL DEFAULT 0',
+                            'lb_active_slot TEXT',
+                            'lb_cutover_generation INTEGER NOT NULL DEFAULT 0',
+                            'lb_pending_slot TEXT',
+                            "lb_cutover_phase TEXT NOT NULL DEFAULT 'STABLE'",
+                            'lb_drain_started_at DOUBLE PRECISION',
+                            'lb_demand_handoff_generation INTEGER',
+                            'lb_demand_handoff_snapshot TEXT',
+                            'lb_demand_handoff_complete_at DOUBLE PRECISION',
+                            'lb_last_demand_snapshot TEXT'):
+                        connection.exec_driver_sql(
+                            f'ALTER TABLE services ADD COLUMN {definition}')
+                connection.execute(serve_state.services_table.insert().values(
+                    name='legacy-svc'))
                 connection.execute(
-                    sqlalchemy.text(
-                        'CREATE TABLE alembic_version_serve_state_db '
-                        '(version_num VARCHAR(32) NOT NULL)'))
+                    serve_state.version_specs_table.insert().values(
+                        service_name='legacy-svc',
+                        version=1,
+                        created_at=1.0,
+                        created_by='legacy-writer'))
                 connection.execute(
-                    sqlalchemy.text(
-                        "INSERT INTO alembic_version_serve_state_db "
-                        "VALUES ('016')"))
+                    sqlalchemy.text('UPDATE alembic_version_serve_state_db '
+                                    "SET version_num = '016'"))
 
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,
@@ -3561,6 +3600,7 @@ class TestMigrationChainPG:
                 column['name']
                 for column in inspector.get_columns('version_specs')
             }
+            assert 'yaml_content' in version_columns
             assert 'submitted_yaml_content' in version_columns
             replica_columns = {
                 column['name'] for column in inspector.get_columns('replicas')
@@ -3588,9 +3628,17 @@ class TestMigrationChainPG:
                         'SELECT workspace FROM services WHERE name = :name'), {
                             'name': 'legacy-svc'
                         }).scalar_one()
+                version_row = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT created_at, created_by, yaml_content FROM '
+                        'version_specs WHERE service_name = :name AND '
+                        'version = 1'), {
+                            'name': 'legacy-svc'
+                        }).one()
                 connection.execute(
                     sqlalchemy.select(serve_state.replicas_table).limit(1))
             assert workspace is None
+            assert tuple(version_row) == (1.0, 'legacy-writer', None)
         finally:
             engine.dispose()
 
@@ -5339,6 +5387,209 @@ class TestConcurrentRoundsPG:
             round_row = serve_state.get_reserved_fill_round(pool)
             assert round_row is not None
             assert int(round_row['round_id']) == 1
+
+
+def test_killed_persist_lock_session_is_fenced_by_replacement_round(
+        _pg_concurrency_db, monkeypatch):
+    """A v2 persist cannot land in a successor's scan/publish window."""
+    engine = _pg_concurrency_db
+    service_name = 'svc'
+    service_hash = 'svc-hash'
+    access_context = 'persist-fence'
+    physical_cluster_uid = 'persist-fence-cluster'
+    pool = broker.make_pool_key(access_context,
+                                'A100',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid=physical_cluster_uid)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state.services_table).values(
+                name=service_name,
+                hash=service_hash,
+                resource_scope=service_hash,
+                current_version=1,
+                pool=0))
+    assert serve_state.set_reserved_fill_protocol_version(
+        broker.PROTOCOL_V2,
+        expected_protocol_version=broker.PROTOCOL_V1,
+        image_digest=f'sha256:{"a" * 64}',
+        deployment_generation='1',
+        deployment_uid='persist-fence-deployment',
+        pod_inventory_count=1,
+        pod_inventory_sha256='b' * 64)
+    generation = broker.replace_claim_set(
+        service_name,
+        semantic_hash='persist-fence-v2',
+        global_headroom=1,
+        utilization_ceiling=1,
+        utilization_state=None,
+        edges=[{
+            'pool_key': pool,
+            'legacy_pool_key': broker.make_pool_key(access_context, 'A100'),
+            'pool_position': 0,
+            'access_context': access_context,
+            'physical_cluster_uid': physical_cluster_uid,
+            'accelerator_names': ['A100'],
+            'weight': 1.0,
+            'floor_replicas': 0,
+            'gpus_per_replica': 1,
+            'holdings_fill': 0,
+            'effective_cap': 1,
+            'launchable': True,
+        }],
+        expected_service_hash=service_hash)
+    assert generation is not None
+    allocation = broker.run_round_if_stale(
+        service_name,
+        pool,
+        lambda: broker.PoolObservation(free_slots=1,
+                                       gpu_names=('A100',),
+                                       free_slots_by_accelerator=(
+                                           ('a100', 1),)),
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=generation)
+    assert allocation is not None
+    # Force the successor through the drive path instead of the fresh-round
+    # read path once it takes over the killed advisory lock.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state.reserved_fill_rounds_table).where(
+                serve_state.reserved_fill_rounds_table.c.pool_key ==
+                pool).values(snapshot_time=0.0))
+
+    real_persist = serve_state.add_replica_if_round_epoch
+    persist_entered = threading.Event()
+    resume_persist = threading.Event()
+    stale_token = {}
+
+    def paused_persist(*args, **kwargs):
+        stale_token['value'] = kwargs['expected_lease_token']
+        persist_entered.set()
+        assert resume_persist.wait(timeout=60)
+        return real_persist(*args, **kwargs)
+
+    monkeypatch.setattr(serve_state, 'add_replica_if_round_epoch',
+                        paused_persist)
+    fill_replica = sqlite_suite._fill_replica(1, pool)
+    fill_replica.reserved_fill_service_generation = generation
+    fill_replica.reserved_fill_physical_cluster_uid = physical_cluster_uid
+    result = {}
+    errors = []
+
+    def run_persist():
+        try:
+            result['persisted'] = broker.persist_fill_replica(
+                service_name,
+                1,
+                fill_replica,
+                pool_key=pool,
+                expected_epoch=allocation.epoch,
+                expected_protocol_version=broker.PROTOCOL_V2,
+                expected_service_generation=generation,
+                expected_physical_cluster_uid=physical_cluster_uid,
+                expected_service_hash=service_hash)
+        except Exception as error:  # pylint: disable=broad-except
+            errors.append(error)
+
+    persist_thread = threading.Thread(target=run_persist)
+    persist_thread.start()
+    assert persist_entered.wait(timeout=60)
+    assert int(stale_token['value']) > 0
+
+    lock_key = locks.postgres_lock_key(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    with engine.begin() as observer:
+        holder_pid = observer.execute(
+            sqlalchemy.text(
+                "SELECT pid FROM pg_locks WHERE locktype = 'advisory' "
+                'AND granted AND '
+                '((classid::bigint << 32) | objid::bigint) = :lock_key'), {
+                    'lock_key': lock_key
+                }).scalar_one()
+        assert observer.execute(
+            sqlalchemy.text('SELECT pg_terminate_backend(:pid)'), {
+                'pid': holder_pid
+            }).scalar_one()
+
+    real_occupying_debit = broker._occupying_debit
+    successor_scanned = threading.Event()
+    resume_successor = threading.Event()
+
+    def paused_after_replica_scan(*args, **kwargs):
+        scanned = real_occupying_debit(*args, **kwargs)
+        successor_scanned.set()
+        assert resume_successor.wait(timeout=60)
+        return scanned
+
+    monkeypatch.setattr(broker, '_occupying_debit', paused_after_replica_scan)
+    successor_result = {}
+
+    def run_successor():
+        try:
+            successor_result['allocation'] = broker.run_round_if_stale(
+                service_name,
+                pool,
+                lambda: broker.PoolObservation(free_slots=1,
+                                               gpu_names=('A100',),
+                                               free_slots_by_accelerator=(
+                                                   ('a100', 1),)),
+                0.001,
+                expected_protocol_version=broker.PROTOCOL_V2,
+                expected_service_generation=generation)
+        except Exception as error:  # pylint: disable=broad-except
+            errors.append(error)
+
+    successor_thread = threading.Thread(target=run_successor)
+    successor_thread.start()
+    try:
+        assert successor_scanned.wait(timeout=60)
+        # The successor has advanced the durable token and completed the
+        # replica debit scan, but is deterministically blocked before publish.
+        # Resume the stale persist inside that exact vulnerability window.
+        with engine.connect() as connection:
+            successor_token = connection.execute(
+                sqlalchemy.select(
+                    serve_state.reserved_fill_lease_table.c.epoch).where(
+                        serve_state.reserved_fill_lease_table.c.id ==
+                        1)).scalar_one()
+        assert int(successor_token) > int(stale_token['value'])
+        assert successor_thread.is_alive()
+        resume_persist.set()
+        persist_thread.join(timeout=60)
+        assert not persist_thread.is_alive(), 'stale persist thread hung'
+        assert not errors, errors
+        assert result == {'persisted': False}
+        with engine.connect() as connection:
+            replica_count_before_publish = connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                                 ).select_from(
+                                     serve_state.replicas_table)).scalar_one()
+        assert replica_count_before_publish == 0
+    finally:
+        resume_persist.set()
+        resume_successor.set()
+    persist_thread.join(timeout=60)
+    successor_thread.join(timeout=60)
+    assert not persist_thread.is_alive(), 'stale persist thread hung'
+    assert not successor_thread.is_alive(), 'successor round thread hung'
+    assert not errors, errors
+    assert result == {'persisted': False}
+    successor = successor_result.get('allocation')
+    assert successor is not None
+    assert successor.protocol_version == broker.PROTOCOL_V2
+    assert successor.service_generation == generation
+    with engine.connect() as connection:
+        lease_token = connection.execute(
+            sqlalchemy.select(
+                serve_state.reserved_fill_lease_table.c.epoch).where(
+                    serve_state.reserved_fill_lease_table.c.id ==
+                    1)).scalar_one()
+        replica_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(
+                                 serve_state.replicas_table)).scalar_one()
+    assert int(lease_token) > int(stale_token['value'])
+    assert replica_count == 0
 
 
 def test_advisory_lock_does_not_consume_ordinary_pool(pg_server, monkeypatch):

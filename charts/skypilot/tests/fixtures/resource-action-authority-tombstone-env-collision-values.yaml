@@ -1,4 +1,0 @@
-global:
-  extraEnvs:
-    - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
-      value: '[]'

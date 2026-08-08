@@ -23,7 +23,9 @@ _EXPECTED_SIGNATURES = {
     'record_batch_worker_job_id':
         ("(job_id: int, owner_token: str, worker_cluster: str, "
          "worker_job_id: int) -> bool"),
-    'get_batch_worker_records': "(job_id: int) -> list[dict[str, typing.Any]]",
+    'get_batch_worker_records':
+        ("(job_id: int, owner_token: str | None = None) -> "
+         "list[dict[str, typing.Any]]"),
     'remove_batch_worker_record':
         ("(job_id: int, owner_token: str, worker_cluster: str, "
          "worker_job_id: int | None = None) -> bool"),

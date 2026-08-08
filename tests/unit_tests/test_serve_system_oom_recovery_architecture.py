@@ -28,6 +28,31 @@ _SCOPED_PRODUCTION_FILES = (
     'sky/serve/service.py',
 )
 
+_STEADY_STATE_PRODUCTION_FILES = _SCOPED_PRODUCTION_FILES + (
+    'sky/skylet/log_lib.py',
+    'sky/serve/constants.py',
+    'sky/serve/replica_info.py',
+    'sky/serve/serve_state.py',
+    'sky/server/server.py',
+)
+
+_REMOVED_TRANSITION_TOKENS = (
+    'PROFILE_VERSION_DIRECT_SHELL',
+    'CAPABILITY_V1',
+    'subreaper-v1+local-docker-empty-inventory-v1',
+    'TrustedRecoveryProfile',
+    'RequestedRecoveryProfile',
+    'resolve_requested_profile',
+    'SYSTEM_OOM_RECOVERY_LEGACY_CONTROLLER_CONTRACT_VERSION',
+    'SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY',
+    'authorization_v1_selected',
+    'authorization_v2_selected',
+    'runtime_capability_v1_observed',
+    'status_only_read',
+    'rewrite_rollback_replica_system_recovery_state',
+    'JobSystemRecoveryDetailStatus.UNSPECIFIED',
+)
+
 _FORBIDDEN_AUTHORITIES = (
     ('fixed listener port 4517',
      re.compile(r'(?<![a-z0-9])4517(?![a-z0-9])', re.I)),
@@ -86,3 +111,17 @@ def test_negative_architecture_matchers_cover_closed_authorities() -> None:
     # contract. Qualify event/queue authority with application/workload in the
     # matcher above so ordinary launch-thread synchronization remains legal.
     assert not _find_forbidden_authorities('launch_completion_queue.put(id)')
+
+
+def test_transition_compatibility_symbols_are_absent_from_production() -> None:
+    violations = []
+    for relative_path in _STEADY_STATE_PRODUCTION_FILES:
+        source = (_REPO_ROOT / relative_path).read_text(encoding='utf-8')
+        violations.extend(
+            f'{relative_path}: {token}' for token in _REMOVED_TRANSITION_TOKENS
+            if token in source)
+
+    assert not violations, (
+        'The steady-state implementation must not retain deprecated v1/v2 '
+        'authorization, direct-shell runtime, status-only telemetry, or v13 '
+        'rollback compatibility:\n' + '\n'.join(violations))

@@ -8,19 +8,27 @@ pruned when a replica leaves the ready set.
 """
 # pylint: disable=missing-class-docstring,protected-access
 import asyncio
+import contextlib
+import hashlib
 import json
 import os
+import pathlib
 import threading
+import time
 import types
 from typing import Dict, Optional
 from unittest import mock
 
+from fastapi import testclient as fastapi_testclient
 import pytest
 
+from sky import exceptions
+from sky import skypilot_config
 from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import controller
 from sky.serve import drain_observability
+from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -34,6 +42,8 @@ def _restore_consolidation_override():
     """Keep in-process controller markers scoped to each test."""
     marker = controller.constants.OVERRIDE_CONSOLIDATION_MODE
     original = os.environ.pop(marker, None)
+    original_process_title = controller.setproctitle.getproctitle()
+    restore_process_title = controller.setproctitle.setproctitle
     original_metrics_role = (
         controller.db_utils._postgres_connection_metrics_process_role_override)
     controller.db_utils._postgres_connection_metrics_process_role_override = None
@@ -41,52 +51,9 @@ def _restore_consolidation_override():
     os.environ.pop(marker, None)
     if original is not None:
         os.environ[marker] = original
+    restore_process_title(original_process_title)
     controller.db_utils._postgres_connection_metrics_process_role_override = (
         original_metrics_role)
-
-
-def test_lifespan_validates_resource_action_auth_isolation(monkeypatch):
-    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
-    monkeypatch.setenv(
-        controller.serve_constants.
-        RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR, '/purpose/tokens')
-    monkeypatch.setenv(
-        controller.serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
-        'true')
-    validate = mock.Mock()
-    monkeypatch.setattr(
-        controller.auth_tokens,
-        'validate_resource_action_preflight_auth_token_isolation', validate)
-
-    async def _run_lifespan():
-        async with ctrl.lifespan(None):
-            pass
-
-    asyncio.run(_run_lifespan())
-    validate.assert_called_once_with(required=True)
-
-
-def test_lifespan_ignores_custom_preflight_env_while_authority_disabled(
-        monkeypatch):
-    ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
-    monkeypatch.delenv(
-        controller.serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
-        raising=False)
-    monkeypatch.setenv(
-        controller.serve_constants.
-        RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR,
-        '/compatibility/tokens')
-    validate = mock.Mock()
-    monkeypatch.setattr(
-        controller.auth_tokens,
-        'validate_resource_action_preflight_auth_token_isolation', validate)
-
-    async def _run_lifespan():
-        async with ctrl.lifespan(None):
-            pass
-
-    asyncio.run(_run_lifespan())
-    validate.assert_not_called()
 
 
 def test_update_ignores_stale_submitted_yaml_without_request_declaration():
@@ -128,19 +95,36 @@ def test_run_controller_sets_connection_metric_role_before_initialization(
         monkeypatch):
     initialization_order = []
     monkeypatch.setattr(
+        controller.setproctitle, 'setproctitle',
+        lambda title: initialization_order.append(('process-title', title)))
+    monkeypatch.setattr(
         controller.db_utils, 'set_postgres_connection_metrics_process_role',
         lambda role: initialization_order.append(('metrics-role', role)))
     monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
                         lambda: initialization_order.append(('context', None)))
     controller_instance = mock.Mock()
-    monkeypatch.setattr(controller, 'SkyServeController',
-                        mock.Mock(return_value=controller_instance))
 
-    controller.run_controller('pool', mock.Mock(), 1, '127.0.0.1', 20001,
-                              'fingerprint')
+    def _construct_controller(*_args, **_kwargs):
+        initialization_order.append(('controller-construction', None))
+        return controller_instance
 
-    assert initialization_order[:2] == [('metrics-role', 'serve-controller'),
-                                        ('context', None)]
+    monkeypatch.setattr(controller, 'SkyServeController', _construct_controller)
+
+    controller.run_controller('pool',
+                              mock.Mock(),
+                              1,
+                              '127.0.0.1',
+                              20001,
+                              'fingerprint',
+                              service_hash='incarnation-a')
+
+    assert initialization_order == [
+        ('process-title', 'sky.serve.controller --service-name pool '
+         '--service-incarnation incarnation-a'),
+        ('metrics-role', 'serve-controller'),
+        ('context', None),
+        ('controller-construction', None),
+    ]
     controller_instance.run.assert_called_once_with()
 
 
@@ -257,6 +241,20 @@ class _FakeReplicaInfo:
         self.last_provider_config = None
         self.planned_capacity = 1
         self.logical_bridge_capacity_verified = False
+        self.resources_override = None
+        self.reserved_fill = False
+        self.unknown_capacity_replacement = False
+        self.created_at = None
+        self.cost_rebalance_for_replica_id = None
+        self.status_property = types.SimpleNamespace(
+            is_scale_down=False,
+            sky_down_status=None,
+            first_ready_time=None,
+            sky_launch_status=None,
+        )
+        # Most routing tests exercise the protocol's legacy/unknown omission
+        # shape. Tests for persisted provenance override this with a bool.
+        self.is_zero_cost = None
         self.system_recovery_disposition = (
             system_recovery_state.SystemRecoveryDisposition.ORDINARY)
 
@@ -295,22 +293,48 @@ def _make_controller() -> controller.SkyServeController:
     ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
     ctrl._service_name = 'svc'  # pylint: disable=protected-access
     ctrl._resource_scope = None  # pylint: disable=protected-access
+    ctrl._service_hash = None  # pylint: disable=protected-access
+    ctrl._controller_owner = None  # pylint: disable=protected-access
+    ctrl._history_session_id = 'test-session'  # pylint: disable=protected-access
     ctrl._lb_replica_cache = {}  # pylint: disable=protected-access
     ctrl._lb_replica_cache_record_ids = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache = {}  # pylint: disable=protected-access
     ctrl._lb_translation_cache_record_ids = {}  # pylint: disable=protected-access
     ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
+        yaml_content=None,
+        spot_placer=None,
         system_recovery_allows_routing=lambda _info: True,
         system_recovery_route_marker=lambda _info, _url: None,
         retire_system_recovery_route=lambda _info: None)
+    ctrl._autoscaler = None  # pylint: disable=protected-access
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
     ctrl._lb_role_lock = None  # pylint: disable=protected-access
     ctrl._lb_demand_lock = None  # pylint: disable=protected-access
+    ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
+    ctrl._lb_session_ledger = None  # pylint: disable=protected-access
+    ctrl._lb_expected_occupancy_urls = set()  # pylint: disable=protected-access
+    ctrl._lb_occupancy_contract_known = False  # pylint: disable=protected-access
+    ctrl._lb_last_demand_snapshot = None  # pylint: disable=protected-access
+    ctrl._lb_demand_handoff = controller.lb_ha.DemandHandoff(  # pylint: disable=protected-access
+        constants.LB_DEMAND_HANDOFF_SECONDS)
     ctrl._routing_spec = None  # pylint: disable=protected-access
     ctrl._applied_version = 1  # pylint: disable=protected-access
     ctrl._routing_state_lock = threading.RLock()  # pylint: disable=protected-access
+    ctrl._actuation_epoch_lock = threading.RLock()  # pylint: disable=protected-access
+    ctrl._actuation_stop = threading.Event()  # pylint: disable=protected-access
+    ctrl._update_reconciler_stop = threading.Event()  # pylint: disable=protected-access
+    ctrl._update_recovery_required = False  # pylint: disable=protected-access
+    ctrl._reconcile_generation = 0  # pylint: disable=protected-access
+    ctrl._is_pool = False  # pylint: disable=protected-access
     ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
     return ctrl
+
+
+def _explicit_placement_contract_spec():
+    spec = types.SimpleNamespace(_spot_placer=None, _pool=False)
+    contract = placement_policy.resolve_fresh_contract(None, False)
+    spec.__dict__.update(contract.persisted_fields())
+    return spec
 
 
 def test_cost_rebalance_state_persistence_is_owner_fenced():
@@ -350,6 +374,80 @@ def test_cost_rebalance_state_db_error_suppresses_only_economic_work():
     scaler.mark_cost_rebalance_state_persisted.assert_not_called()
 
 
+def test_controller_startup_acknowledges_pending_normalization(monkeypatch):
+    ctrl = _make_controller()
+    ctrl._service_hash = 'incarnation-a'
+    ctrl._controller_owner = (123, '10.0.0.1')
+    ctrl._committed_version = 3
+    ctrl._history_session_id = 'a' * 32
+    request = serve_state.PlacementNormalizationRequest(
+        run_id=controller.uuid.uuid4(),
+        recovery_version=2,
+        current_version=3,
+        lifecycle_epoch=7)
+    read_request = mock.Mock(return_value=request)
+    acknowledge = mock.Mock(return_value=True)
+    monkeypatch.setattr(controller.serve_state,
+                        'get_placement_normalization_request', read_request)
+    monkeypatch.setattr(controller.serve_state,
+                        'acknowledge_placement_normalization_loaded',
+                        acknowledge)
+    monkeypatch.setattr(controller, 'sky_commit', 'commit-a')
+    monkeypatch.setattr(controller.os, 'getpid', lambda: 456)
+
+    ctrl._acknowledge_pending_placement_normalization(
+        _explicit_placement_contract_spec(), 2)
+
+    read_request.assert_called_once_with('svc',
+                                         recovery_version=2,
+                                         current_version=3,
+                                         expected_service_hash='incarnation-a',
+                                         expected_controller_owner=(123,
+                                                                    '10.0.0.1'))
+    acknowledge.assert_called_once_with('svc',
+                                        request,
+                                        expected_service_hash='incarnation-a',
+                                        expected_controller_owner=(123,
+                                                                   '10.0.0.1'),
+                                        image_commit='commit-a',
+                                        child_controller_pid=456,
+                                        boot_id='a' * 32)
+
+
+def test_controller_startup_fails_when_normalization_receipt_cas_is_stale():
+    ctrl = _make_controller()
+    ctrl._service_hash = 'incarnation-a'
+    ctrl._controller_owner = (123, '10.0.0.1')
+    ctrl._committed_version = 1
+    request = serve_state.PlacementNormalizationRequest(
+        run_id=controller.uuid.uuid4(),
+        recovery_version=1,
+        current_version=1,
+        lifecycle_epoch=7)
+    with mock.patch.object(controller.serve_state,
+                           'get_placement_normalization_request',
+                           return_value=request), mock.patch.object(
+                               controller.serve_state,
+                               'acknowledge_placement_normalization_loaded',
+                               return_value=False), pytest.raises(
+                                   RuntimeError, match='Could not acknowledge'):
+        ctrl._acknowledge_pending_placement_normalization(
+            _explicit_placement_contract_spec(), 1)
+
+
+def test_controller_startup_rejects_fieldless_placement_contract():
+    ctrl = _make_controller()
+    fieldless = types.SimpleNamespace(_spot_placer=None,
+                                      _pool=False,
+                                      _uses_logical_replicas=False)
+    with mock.patch.object(
+            controller.serve_state,
+            'get_placement_normalization_request') as read_request, \
+            pytest.raises(RuntimeError, match='fieldless legacy'):
+        ctrl._acknowledge_pending_placement_normalization(fieldless, 1)
+    read_request.assert_not_called()
+
+
 def test_recovery_rejects_physical_spec_after_durable_logical_activation():
     physical = mock.MagicMock()
     physical.uses_logical_replicas = False
@@ -380,7 +478,10 @@ class _FakeSpec:
                  lb_retriable_status_codes=None,
                  lb_max_retries=None,
                  lb_retry_initial_backoff_seconds=None,
-                 target_concurrency_per_replica=None) -> None:
+                 target_concurrency_per_replica=None,
+                 lb_request_queue=None,
+                 reserved_capacity_fill=False,
+                 uses_logical_replicas=False) -> None:
         self.load_balancing_policy = load_balancing_policy
         self.target_qps_per_replica = target_qps_per_replica
         self.lb_stream_timeout_seconds = lb_stream_timeout_seconds
@@ -389,6 +490,9 @@ class _FakeSpec:
         self.lb_retry_initial_backoff_seconds = (
             lb_retry_initial_backoff_seconds)
         self.target_concurrency_per_replica = (target_concurrency_per_replica)
+        self.lb_request_queue = lb_request_queue
+        self.reserved_capacity_fill = reserved_capacity_fill
+        self.uses_logical_replicas = uses_logical_replicas
 
 
 class TestGetRoutingSpec:
@@ -410,7 +514,6 @@ class TestGetRoutingSpec:
             'target_qps_per_replica': {
                 'L4': 2.5
             },
-            # _FakeSpec has no concurrency knob; getattr resolves None.
             'target_concurrency_per_replica': None,
             'stream_timeout_seconds': 120,
             'retriable_status_codes': [503],
@@ -527,7 +630,8 @@ class TestGetRoutingSpec:
     def test_controller_feeds_exact_task_gpu_counts_to_autoscaler(self):
         ctrl = _make_controller()
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
-            yaml_content='service: {}')
+            yaml_content='service: {}',
+            spot_placer=None)
         ctrl._autoscaler = mock.Mock(  # pylint: disable=protected-access
             spec=controller.autoscalers.InstanceAwareRequestRateAutoscaler)
         task = types.SimpleNamespace(resources=[
@@ -710,6 +814,9 @@ class TestGetRoutingSpec:
         ctrl._routing_spec = ctrl._build_routing_spec(old_spec)  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._autoscaler = mock.MagicMock()  # pylint: disable=protected-access
+        ctrl._autoscaler.replica_unit = 'physical'  # pylint: disable=protected-access
+        ctrl._mark_controller_applied_version = mock.Mock(  # pylint: disable=protected-access
+            return_value=True)
         ctrl._seed_fill_zero_cost_locations = mock.Mock()  # pylint: disable=protected-access
         ctrl._start_reserved_capacity_poller_if_needed = mock.Mock()  # pylint: disable=protected-access
 
@@ -771,6 +878,8 @@ class TestGetRoutingSpec:
             update_mode=mock.sentinel.mode,
             new_spot_placer=candidate_placer)
         assert ctrl._applied_version == 2  # pylint: disable=protected-access
+        ctrl._mark_controller_applied_version.assert_called_once_with(  # pylint: disable=line-too-long,protected-access
+            2)
         assert ctrl._get_routing_spec() == {  # pylint: disable=protected-access
             'load_balancing_policy_name': 'instance_aware_least_load',
             'target_qps_per_replica': new_target_qps,
@@ -785,11 +894,16 @@ class TestGetRoutingSpec:
 
 def _make_update_controller() -> controller.SkyServeController:
     ctrl = _make_controller()
+    ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+        replica_unit='physical_backend')
     ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
     ctrl._controller_owner = (123, '10.0.0.1')  # pylint: disable=protected-access
     ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
     ctrl._update_condition = threading.Condition()  # pylint: disable=protected-access
     ctrl._pending_update = None  # pylint: disable=protected-access
+    ctrl._applying_update = None  # pylint: disable=protected-access
+    ctrl._update_recovery_required = False  # pylint: disable=protected-access
+    ctrl._update_reconciler_stop = threading.Event()  # pylint: disable=protected-access
     ctrl._committed_version = 1  # pylint: disable=protected-access
     ctrl._applied_version = 1  # pylint: disable=protected-access
     ctrl._update_apply_error = None  # pylint: disable=protected-access
@@ -799,10 +913,756 @@ def _make_update_controller() -> controller.SkyServeController:
     ctrl._quarantine_reason = None  # pylint: disable=protected-access
     ctrl._update_still_authorized = mock.Mock(  # pylint: disable=protected-access
         return_value=True)
+    ctrl._mark_controller_applied_version = mock.Mock(  # pylint: disable=protected-access
+        return_value=True)
     return ctrl
 
 
+def _make_update_spec(
+        replica_unit: str = 'physical_backend') -> types.SimpleNamespace:
+    """Build the explicit service interface consumed by update tests."""
+    policy_name = (placement_policy.CAPACITY_AWARE_SPOT_PLACER
+                   if replica_unit == 'logical' else None)
+    return types.SimpleNamespace(
+        replica_unit=replica_unit,
+        uses_logical_replicas=(replica_unit == 'logical'),
+        spot_placer=policy_name,
+        placement_contract=placement_policy.resolve_fresh_contract(policy_name,
+                                                                   pool=False),
+    )
+
+
+def _make_legacy_physical_per_gpu_spec() -> controller.serve.SkyServiceSpec:
+    """Build the real fieldless contract written before logical activation."""
+    current = controller.serve.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=1,
+        readiness_timeout_seconds=2,
+        endpoint_probe_interval_seconds=3,
+        lb_stream_timeout_seconds=4,
+        min_replicas=0,
+        max_replicas=8,
+        target_concurrency_per_replica=1,
+        graceful_drain_async_occupancy=True,
+        spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER)
+    legacy_state = dict(current.__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        legacy_state.pop(field)
+    legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+    restored = controller.serve.SkyServiceSpec.__new__(
+        controller.serve.SkyServiceSpec)
+    restored.__setstate__(legacy_state)
+    return restored
+
+
+def _make_autoscaler_spec(**overrides) -> types.SimpleNamespace:
+    """Build the explicit SkyServiceSpec interface used by autoscalers."""
+    values = {
+        'min_replicas': 0,
+        'min_replicas_by_accelerator': {},
+        'max_replicas': 20,
+        'num_overprovision': None,
+        'replica_unit': 'physical_backend',
+        'target_qps_per_replica': None,
+        'target_concurrency_per_replica': None,
+        'pool': False,
+        'use_ondemand_fallback': False,
+        'queue_length_threshold': None,
+        'upscale_delay_seconds': None,
+        'downscale_delay_seconds': None,
+        'reserved_capacity_fill': False,
+        'reserved_fill_floor_replicas': 0,
+        'reserved_fill_weight': 1.0,
+        'reserved_fill_utilization_gate': False,
+        'cost_rebalance': False,
+        'cost_rebalance_min_savings_fraction': 0.3,
+        'cost_rebalance_max_parallel_replacements': 1,
+        'cost_rebalance_stabilization_seconds': 300.0,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def _make_prepared_controller_config(
+    version: int,
+    *,
+    staged_path: str | None = None,
+    source_is_staged: bool = True
+) -> controller._PreparedControllerConfig:  # pylint: disable=protected-access
+    config = mock.Mock(name=f'config_v{version}')
+    config.get_nested.return_value = 'research'
+    return controller._PreparedControllerConfig(  # pylint: disable=protected-access
+        config=config,
+        service_name='svc',
+        live_path=f'/tmp/config.yaml.v{version}',
+        staged_path=(staged_path or f'/tmp/config.yaml.v{version}.staged'),
+        recovery_script=f'recovery-v{version}',
+        version=version,
+        snapshot_id=f'{version:x}' * 64,
+        source_digest=f'{version + 1:x}' * 64,
+        durable_bytes=f'durable-v{version}'.encode(),
+        durable_digest=f'{version + 2:x}' * 64,
+        source_is_staged=source_is_staged,
+        source_is_live=False,
+        legacy_snapshot=None)
+
+
+def test_orphaned_config_stage_sweeper_serializes_with_update_handler(
+        monkeypatch):
+    ctrl = _make_update_controller()
+    ctrl._update_lock = threading.Lock()  # pylint: disable=protected-access
+    observed_lock = []
+
+    def _gc(service_name, resource_scope):
+        assert service_name == 'svc'
+        assert resource_scope is None
+        observed_lock.append(ctrl._update_lock.locked())  # pylint: disable=protected-access
+        ctrl._update_reconciler_stop.set()  # pylint: disable=protected-access
+        return [2]
+
+    monkeypatch.setattr(controller.serve_utils,
+                        'gc_orphaned_staged_controller_configs', _gc)
+
+    ctrl._run_orphaned_config_stage_sweeper()  # pylint: disable=protected-access
+
+    assert observed_lock == [True]
+
+
+def _register_update_test_routes(
+        ctrl: controller.SkyServeController,
+        monkeypatch: pytest.MonkeyPatch) -> fastapi_testclient.TestClient:
+    """Register real FastAPI routes without starting controller threads."""
+
+    async def _allow_request():
+        return None
+
+    monkeypatch.setenv(controller.constants.OVERRIDE_CONSOLIDATION_MODE, 'true')
+    monkeypatch.setattr(controller, '_make_auth_dependency',
+                        lambda **unused_kwargs: _allow_request)
+    monkeypatch.setattr(controller, '_make_controller_owner_dependency',
+                        lambda unused_fingerprint: _allow_request)
+    monkeypatch.setattr(controller.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: {'test-token'})
+    monkeypatch.setattr(controller.serve_utils,
+                        'get_controller_admin_auth_tokens',
+                        lambda required=False: {'test-token'})
+    monkeypatch.setattr(controller.thread_utils, 'start_supervised_thread',
+                        lambda *unused_args, **unused_kwargs: None)
+    monkeypatch.setattr(controller.uvicorn, 'run',
+                        lambda *unused_args, **unused_kwargs: None)
+    monkeypatch.setattr(controller.os, '_exit', lambda unused_code: None)
+    ctrl._app = controller.fastapi.FastAPI()  # pylint: disable=protected-access
+    ctrl._is_pool = False  # pylint: disable=protected-access
+    ctrl._controller_owner_fingerprint = 'owner'  # pylint: disable=protected-access
+    ctrl._update_lock = threading.Lock()  # pylint: disable=protected-access
+    ctrl._host = '127.0.0.1'  # pylint: disable=protected-access
+    ctrl._port = 30000  # pylint: disable=protected-access
+    ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
+    ctrl.run()
+    return fastapi_testclient.TestClient(ctrl._app)  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize('path,body,expected_status', [
+    ('/controller/update_service', {
+        'version': 2,
+        'has_config_snapshot': True,
+    }, 400),
+    (constants.CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH, {
+        'version': 2,
+    }, 400),
+    ('/controller/update_service', {
+        'version': 2,
+    }, 409),
+])
+def test_atomic_config_route_matrix_rejects_mixed_protocol(
+        monkeypatch, path, body, expected_status):
+    ctrl = _make_update_controller()
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.post(path, json=body)
+    assert response.status_code == expected_status
+
+
+def test_atomic_config_route_reaches_prepare_and_commit(monkeypatch, tmp_path):
+    ctrl = _make_update_controller()
+    task_yaml = tmp_path / 'task.yaml'
+    task_yaml.write_text('service: {}\n')
+    monkeypatch.setattr(controller.serve_utils, 'generate_task_yaml_file_name',
+                        lambda *unused_args, **unused_kwargs: str(task_yaml))
+    prepared = mock.sentinel.prepared_config
+    service_spec = mock.sentinel.service_spec
+    ctrl._prepare_controller_config_update = mock.Mock(  # pylint: disable=protected-access
+        return_value=prepared)
+    ctrl._load_service_for_update = mock.Mock(  # pylint: disable=protected-access
+        return_value=service_spec)
+    ctrl._commit_service_update = mock.Mock(  # pylint: disable=protected-access
+        return_value=controller.responses.JSONResponse(
+            content={'message': 'Success'}, status_code=200))
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.post(constants.CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH,
+                           json={
+                               'version': 2,
+                               'mode': serve_utils.UpdateMode.ROLLING.value,
+                               'has_config_snapshot': True,
+                               'lifecycle_epoch': 7,
+                               'config_snapshot_digest': 'a' * 64,
+                               'config_snapshot_id': 'b' * 64,
+                           })
+    assert response.status_code == 200
+    ctrl._prepare_controller_config_update.assert_called_once_with(  # pylint: disable=protected-access
+        2, 'a' * 64, 'b' * 64)
+    ctrl._commit_service_update.assert_called_once()
+
+
 class TestServiceUpdateReconciler:
+
+    def test_config_snapshot_commit_enqueues_without_publishing(self):
+        ctrl = _make_update_controller()
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+        prepared = _make_prepared_controller_config(2)
+        order = []
+        ctrl._install_controller_config = mock.Mock(  # pylint: disable=protected-access
+            side_effect=lambda _prepared: order.append('install'))
+
+        def _commit(*_args, **kwargs):
+            assert kwargs['ha_recovery_script'] == 'recovery-v2'
+            order.append('commit')
+            return serve_state.VersionCommitResult.COMMITTED
+
+        with mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value=None), mock.patch.object(
+                                   controller.serve_state,
+                                   'add_or_update_version',
+                                   side_effect=_commit):
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2,
+                _make_update_spec(),
+                'service: changed',
+                serve_utils.UpdateMode.ROLLING,
+                'incarnation-a',
+                7,
+                prepared_config=prepared)
+        assert response.status_code == 200
+        assert order == ['commit']
+        ctrl._install_controller_config.assert_not_called()  # pylint: disable=protected-access
+        ctrl._record_committed_update.assert_called_once_with(  # pylint: disable=protected-access
+            2, mock.ANY, serve_utils.UpdateMode.ROLLING, prepared)
+
+    def test_staged_config_cannot_move_service_workspace(self, tmp_path):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        ctrl._replica_manager.workspace = 'research'  # pylint: disable=protected-access
+        staged = tmp_path / 'config.staged'
+        staged.write_text('active_workspace: other\n'
+                          'workspaces:\n'
+                          '  research: {}\n'
+                          '  other: {}\n')
+        live = tmp_path / 'config.yaml'
+        live.write_text('active_workspace: research\n'
+                        'workspaces: {research: {}}\n')
+        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        recovery_script = ('export SKYPILOT_CONFIG=/tmp/config.yaml\n'
+                           '/usr/bin/python \\\n'
+                           '  -u -m sky.serve.service \\\n'
+                           '  --service-name svc\n')
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_remote_config_yaml_file_name',
+                return_value=str(tmp_path / 'config.yaml')), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value=recovery_script), \
+             pytest.raises(RuntimeError, match='expected.*research'):
+            ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, digest, 'c' * 64)
+        assert staged.stat().st_mode & 0o777 == 0o600
+
+    def test_legacy_backfill_cannot_move_service_workspace(self, tmp_path):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        ctrl._replica_manager.workspace = 'research'  # pylint: disable=protected-access
+        staged = tmp_path / 'config.staged'
+        staged.write_text('active_workspace: research\n'
+                          'workspaces: {research: {}}\n')
+        live = tmp_path / 'config.yaml'
+        live.write_text('active_workspace: other\n'
+                        'workspaces:\n'
+                        '  research: {}\n'
+                        '  other: {}\n')
+        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        recovery_script = ('export SKYPILOT_CONFIG=/tmp/config.yaml\n'
+                           '/usr/bin/python \\\n'
+                           '  -u -m sky.serve.service \\\n'
+                           '  --service-name svc\n')
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_remote_config_yaml_file_name',
+                return_value=str(live)), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value=recovery_script), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'add_or_update_version') as commit_version, \
+             mock.patch.object(
+                 controller.serve_state,
+                 'set_ha_recovery_script') as update_recovery_script, \
+             pytest.raises(RuntimeError,
+                           match='Legacy controller config snapshot is invalid'):
+            ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, digest, 'c' * 64)
+
+        commit_version.assert_not_called()
+        update_recovery_script.assert_not_called()
+        assert ctrl._committed_version == 1  # pylint: disable=protected-access
+
+    def test_delayed_lower_version_skips_legacy_activation(self, tmp_path):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        ctrl._applied_version = 3  # pylint: disable=protected-access
+        ctrl._replica_manager.workspace = 'research'  # pylint: disable=protected-access
+        staged = tmp_path / 'config.v2.staged'
+        staged.write_text('active_workspace: research\n'
+                          'workspaces: {research: {}}\n')
+        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        durable = serve_utils.sanitize_ha_recovery_config_bytes(
+            staged.read_bytes())
+        existing_snapshot = (durable, hashlib.sha256(durable).hexdigest(),
+                             'd' * 64)
+        recovery_script = ('export SKYPILOT_CONFIG=/tmp/config.yaml.v3\n'
+                           '/usr/bin/python \\\n'
+                           '  -u -m sky.serve.service \\\n'
+                           '  --service-name svc\n')
+
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_versioned_config_yaml_file_name',
+                return_value=str(tmp_path / 'config.v2')), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value=recovery_script), \
+             mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value=None), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_version_controller_config',
+                 return_value=existing_snapshot):
+            prepared = ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, digest, 'c' * 64)
+
+        assert prepared.legacy_snapshot is None
+        service = _make_update_spec()
+        with mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value=None), \
+             mock.patch.object(controller.serve_state,
+                               'get_placement_catalog',
+                               return_value=None), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'add_or_update_version',
+                 return_value=serve_state.VersionCommitResult.STALE_VERSION
+             ) as commit_version:
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2,
+                service,
+                'service: {}',
+                serve_utils.UpdateMode.ROLLING,
+                'incarnation-a',
+                7,
+                prepared_config=prepared)
+
+        assert response.status_code == 409
+        assert (
+            commit_version.call_args.kwargs['legacy_controller_config_snapshot']
+            is None)
+        assert (
+            commit_version.call_args.kwargs['legacy_controller_applied_version']
+            is None)
+
+    def test_staged_config_digest_mismatch_precedes_commit_and_install(
+            self, tmp_path):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        staged = tmp_path / 'config.staged'
+        staged.write_text('active_workspace: research\n')
+        ctrl._install_controller_config = mock.Mock()  # pylint: disable=protected-access
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_remote_config_yaml_file_name',
+                return_value=str(tmp_path / 'config.yaml')), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value='legacy'), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'add_or_update_version') as commit, \
+             pytest.raises(RuntimeError, match='digest does not match'):
+            ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, '0' * 64, 'c' * 64)
+        commit.assert_not_called()
+        ctrl._install_controller_config.assert_not_called()  # pylint: disable=protected-access
+
+    def test_invalid_sanitized_projection_precedes_commit(self, tmp_path):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        ctrl._replica_manager.workspace = 'research'  # pylint: disable=protected-access
+        staged = tmp_path / 'config.staged'
+        staged.write_text('active_workspace: research\n'
+                          'workspaces: {research: {}}\n')
+        live = tmp_path / 'config.yaml'
+        live.write_text('active_workspace: research\n'
+                        'workspaces: {research: {}}\n')
+        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        recovery_script = ('export SKYPILOT_CONFIG=/tmp/config.yaml\n'
+                           '/usr/bin/python \\\n'
+                           '  -u -m sky.serve.service \\\n'
+                           '  --service-name svc\n')
+        invalid_projection = (b'active_workspace: research\n'
+                              b'workspaces: {}\n')
+
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_remote_config_yaml_file_name',
+                return_value=str(live)), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value=recovery_script), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'sanitize_ha_recovery_config_bytes',
+                 return_value=invalid_projection), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'add_or_update_version') as commit_version, \
+             pytest.raises(RuntimeError,
+                           match='Durable controller config snapshot is invalid'):
+            ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, digest, 'c' * 64)
+
+        commit_version.assert_not_called()
+        assert ctrl._committed_version == 1  # pylint: disable=protected-access
+
+    def test_committed_retry_requires_raw_receipt_digest_and_preserves_raw(
+            self, tmp_path):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        ctrl._replica_manager.workspace = 'research'  # pylint: disable=protected-access
+        live = tmp_path / 'config.yaml'
+        staged = tmp_path / 'config.staged'
+        secret = 'same-pod-raw-config-sentinel'
+        raw_bytes = (
+            'active_workspace: research\n'
+            'workspaces: {research: {}}\n'
+            'kubernetes: {allowed_contexts: [east, phx]}\n'
+            'docker:\n'
+            f'  run_options: ["--env=TOKEN={secret}"]\n').encode('utf-8')
+        live.write_bytes(raw_bytes)
+        source_digest = hashlib.sha256(raw_bytes).hexdigest()
+        wrong_digest = hashlib.sha256(b'a different API request').hexdigest()
+        snapshot_id = 'c' * 64
+        serve_utils.write_config_snapshot_receipt(str(live), 2, snapshot_id,
+                                                  source_digest)
+        durable_bytes = serve_utils.sanitize_ha_recovery_config_bytes(raw_bytes)
+        durable_digest = hashlib.sha256(durable_bytes).hexdigest()
+        recovery_script = ('export SKYPILOT_CONFIG=/tmp/config.yaml\n'
+                           '/usr/bin/python \\\n'
+                           '  -u -m sky.serve.service \\\n'
+                           '  --service-name svc\n')
+
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_versioned_config_yaml_file_name',
+                return_value=str(live)), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value=recovery_script), \
+             mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value='service: {}'), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_version_controller_config',
+                 return_value=(durable_bytes, durable_digest, snapshot_id)):
+            with pytest.raises(RuntimeError,
+                               match='raw controller config receipt'):
+                ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                    2, wrong_digest, snapshot_id)
+
+            prepared = ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, source_digest, snapshot_id)
+
+        assert prepared.source_is_staged is False
+        assert prepared.source_is_live is True
+        assert prepared.source_digest == source_digest
+        assert prepared.durable_bytes == durable_bytes
+        assert secret.encode('utf-8') not in prepared.durable_bytes
+        assert prepared.config.get_nested(('docker', 'run_options'),
+                                          None) == [f'--env=TOKEN={secret}']
+
+    @pytest.mark.parametrize('receipt_state', ['missing', 'mismatched'])
+    def test_committed_retry_without_exact_receipt_ignores_raw_and_never_mints(
+            self, tmp_path, receipt_state):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        ctrl._replica_manager.workspace = 'research'  # pylint: disable=protected-access
+        live = tmp_path / 'config.yaml.v2'
+        staged = tmp_path / 'config.yaml.v2.staged'
+        secret = 'unauthorized-retry-raw-secret'
+        raw_bytes = (
+            'active_workspace: research\n'
+            'workspaces: {research: {}}\n'
+            'kubernetes: {allowed_contexts: [east, phx]}\n'
+            'docker:\n'
+            f'  run_options: ["--env=TOKEN={secret}"]\n').encode('utf-8')
+        staged.write_bytes(raw_bytes)
+        source_digest = hashlib.sha256(raw_bytes).hexdigest()
+        snapshot_id = 'c' * 64
+        if receipt_state == 'mismatched':
+            serve_utils.write_config_snapshot_receipt(str(staged), 2, 'f' * 64,
+                                                      'e' * 64)
+        durable_bytes = serve_utils.sanitize_ha_recovery_config_bytes(raw_bytes)
+        durable_digest = hashlib.sha256(durable_bytes).hexdigest()
+        recovery_script = ('export SKYPILOT_CONFIG=/tmp/config.yaml.v2\n'
+                           '/usr/bin/python \\\n'
+                           '  -u -m sky.serve.service \\\n'
+                           '  --service-name svc\n')
+
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_versioned_config_yaml_file_name',
+                return_value=str(live)), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value=recovery_script), \
+             mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value='service: {}'), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_version_controller_config',
+                 return_value=(durable_bytes, durable_digest, snapshot_id)), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'write_config_snapshot_receipt') as write_receipt:
+            prepared = ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, source_digest, snapshot_id)
+
+        assert prepared.source_is_staged is False
+        assert prepared.source_is_live is False
+        assert prepared.durable_bytes == durable_bytes
+        assert secret.encode() not in prepared.durable_bytes
+        assert prepared.config.get_nested(('docker', 'run_options'),
+                                          None) is None
+        write_receipt.assert_not_called()
+        receipt = serve_utils.get_config_snapshot_receipt(str(staged))
+        if receipt_state == 'missing':
+            assert receipt is None
+        else:
+            assert receipt == {
+                'version': 2,
+                'snapshot_id': 'f' * 64,
+                'source_digest': 'e' * 64,
+            }
+
+    def test_staged_config_secrets_are_not_logged(self, tmp_path, caplog):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        ctrl._replica_manager.workspace = 'research'  # pylint: disable=protected-access
+        staged = tmp_path / 'config.staged'
+        secret = 'controller-log-secret-sentinel'
+        staged.write_text('active_workspace: research\n'
+                          'workspaces: {research: {}}\n'
+                          'docker:\n'
+                          f'  run_options: ["--env=TOKEN={secret}"]\n')
+        live = tmp_path / 'config.yaml'
+        live.write_text('active_workspace: research\n'
+                        'workspaces: {research: {}}\n')
+        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        legacy = ('/usr/bin/python \\\n'
+                  '  -u -m sky.serve.service \\\n'
+                  '  --service-name svc\n')
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_remote_config_yaml_file_name',
+                return_value=str(tmp_path / 'config.yaml')), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value=legacy), \
+             caplog.at_level('DEBUG'):
+            ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, digest, 'c' * 64)
+        assert secret not in caplog.text
+
+    def test_config_transition_failure_schedules_supervised_recovery(self):
+        ctrl = _make_update_controller()
+        prepared = _make_prepared_controller_config(2)
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='physical_backend')
+        ctrl._run_with_prepared_config = mock.Mock(  # pylint: disable=protected-access
+            side_effect=lambda _prepared, callback: callback())
+        ctrl._install_controller_config = mock.Mock(  # pylint: disable=protected-access
+            side_effect=OSError('install failed'))
+
+        def _transition(*_args, install_config, **_kwargs):
+            install_config()
+
+        ctrl._replica_manager.update_version.side_effect = _transition  # pylint: disable=protected-access
+        with mock.patch.object(
+                controller.replica_managers,
+                'validate_service_update_preflight',
+                return_value=mock.sentinel.placer), \
+             mock.patch.object(
+                 ctrl,
+                 '_schedule_supervised_recovery') as schedule_recovery, \
+             pytest.raises(controller.ServiceUpdateRequiresRecoveryError,
+                           match='install failed'):
+            ctrl._apply_service_update(  # pylint: disable=protected-access
+                2, types.SimpleNamespace(uses_logical_replicas=False),
+                serve_utils.UpdateMode.ROLLING, prepared)
+
+        ctrl._replica_manager.update_version.assert_called_once()  # pylint: disable=protected-access
+        assert callable(ctrl._replica_manager.update_version.call_args.kwargs[  # pylint: disable=protected-access
+            'install_config'])
+        ctrl._install_controller_config.assert_called_once_with(prepared)  # pylint: disable=protected-access
+        ctrl._replica_manager.fence_launches_for_update_recovery.assert_called_once_with()  # pylint: disable=line-too-long,protected-access
+        assert ctrl._update_reconciler_stop.is_set()  # pylint: disable=protected-access
+        assert ctrl._get_actuation_stop().is_set()  # pylint: disable=protected-access
+        schedule_recovery.assert_called_once_with()
+        ctrl._replica_manager.clear_pending_version.assert_not_called()  # pylint: disable=protected-access
+
+    def test_partial_runtime_transition_stops_all_autoscaler_actuation(self):
+        ctrl = _make_update_controller()
+        prepared = _make_prepared_controller_config(2)
+        ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
+            replica_unit='physical_backend')
+        ctrl._run_with_prepared_config = mock.Mock(  # pylint: disable=protected-access
+            side_effect=lambda _prepared, callback: callback())
+        ctrl._install_controller_config = mock.Mock()  # pylint: disable=protected-access
+
+        def _manager_transition(*_args, install_config, **_kwargs):
+            install_config()
+            ctrl._replica_manager.latest_version = 2  # pylint: disable=protected-access
+
+        ctrl._replica_manager.update_version.side_effect = _manager_transition  # pylint: disable=protected-access
+        with mock.patch.object(
+                controller.replica_managers,
+                'validate_service_update_preflight',
+                return_value=mock.sentinel.placer), \
+             mock.patch.object(
+                 controller.autoscalers.Autoscaler,
+                 'from_spec',
+                 side_effect=RuntimeError('autoscaler rebuild failed')), \
+             mock.patch.object(
+                 ctrl,
+                 '_schedule_supervised_recovery') as schedule_recovery, \
+             pytest.raises(controller.ServiceUpdateRequiresRecoveryError,
+                           match='autoscaler rebuild failed'):
+            ctrl._apply_service_update(  # pylint: disable=protected-access
+                2, types.SimpleNamespace(uses_logical_replicas=False),
+                serve_utils.UpdateMode.ROLLING, prepared)
+
+        assert ctrl._get_actuation_stop().is_set()  # pylint: disable=protected-access
+        schedule_recovery.assert_called_once_with()
+        ctrl._run_autoscaler()  # pylint: disable=protected-access
+        ctrl._replica_manager.clear_scale_reconciliation_signal.assert_not_called()  # pylint: disable=line-too-long,protected-access
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long,protected-access
+        ctrl._replica_manager.scale_up_batch.assert_not_called()  # pylint: disable=protected-access
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long,protected-access
+        ctrl._replica_manager.scale_down.assert_not_called()  # pylint: disable=protected-access
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long,protected-access
+
+    def test_install_atomically_replaces_config_and_removes_old_keys(
+            self, tmp_path, monkeypatch):
+        live = tmp_path / 'config.yaml'
+        staged = tmp_path / 'config.yaml.v2.staged'
+        old_bytes = (b'active_workspace: old\nworkspaces: {old: {}}\n'
+                     b'kubernetes: {allowed_contexts: [old]}\n')
+        new_bytes = (b'active_workspace: research\n'
+                     b'workspaces: {research: {}}\n'
+                     b'kubernetes: {allowed_contexts: [east, phx]}\n')
+        live.write_bytes(old_bytes)
+        staged.write_bytes(new_bytes)
+        snapshot_id = 'c' * 64
+        source_digest = hashlib.sha256(new_bytes).hexdigest()
+        serve_utils.write_config_snapshot_receipt(str(staged), 2, snapshot_id,
+                                                  source_digest)
+        durable_bytes = serve_utils.sanitize_ha_recovery_config_bytes(new_bytes)
+        durable_digest = hashlib.sha256(durable_bytes).hexdigest()
+        recovery_script = ('export SKYPILOT_CONFIG=/tmp/config.yaml\n'
+                           '/usr/bin/python \\\n'
+                           '  -u -m sky.serve.service \\\n'
+                           '  --service-name svc\n')
+        new_config = skypilot_config.parse_and_validate_config_bytes(
+            new_bytes, 'test config', log_config=False)
+        old_config = skypilot_config.parse_and_validate_config_bytes(
+            old_bytes, 'old test config', log_config=False)
+        monkeypatch.setattr(
+            skypilot_config,
+            '_global_config_context',  # pylint: disable=protected-access
+            skypilot_config.ConfigContext(config=old_config))
+        monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, str(live))
+        monkeypatch.setattr(
+            skypilot_config, 'reload_config',
+            mock.Mock(side_effect=AssertionError(
+                'reload must not expose an empty config')))
+        prepared = controller._PreparedControllerConfig(  # pylint: disable=protected-access
+            config=new_config,
+            service_name='svc',
+            live_path=str(live),
+            staged_path=str(staged),
+            recovery_script=recovery_script,
+            version=2,
+            snapshot_id=snapshot_id,
+            source_digest=source_digest,
+            durable_bytes=durable_bytes,
+            durable_digest=durable_digest,
+            source_is_staged=True,
+            source_is_live=False,
+            legacy_snapshot=None)
+
+        controller.SkyServeController._install_controller_config(  # pylint: disable=protected-access
+            prepared)
+
+        assert live.read_bytes() == new_bytes
+        assert skypilot_config.get_active_workspace() == 'research'
+        assert skypilot_config.get_nested(('kubernetes', 'allowed_contexts'),
+                                          None) == ['east', 'phx']
+        assert 'old' not in skypilot_config.to_dict().get('workspaces', {})
 
     @pytest.mark.parametrize('explicit', [True, False, None])
     def test_ha_update_round_trip_never_migrates_from_yaml(self, explicit):
@@ -1009,7 +1869,7 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='logical')
-        legacy_spec = types.SimpleNamespace(replica_unit='physical_backend')
+        legacy_spec = _make_update_spec()
 
         with mock.patch.object(controller.serve_state,
                                'add_or_update_version') as commit:
@@ -1026,7 +1886,7 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='logical')
-        logical_spec = types.SimpleNamespace(replica_unit='logical')
+        logical_spec = _make_update_spec('logical')
 
         with mock.patch.object(controller.serve_state,
                                'add_or_update_version') as commit:
@@ -1040,14 +1900,15 @@ class TestServiceUpdateReconciler:
 
     def test_content_conflict_returns_409_without_scheduling(self):
         ctrl = _make_update_controller()
+        spec = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
         with mock.patch.object(controller.serve_state,
                                'add_or_update_version',
                                return_value=serve_state.VersionCommitResult.
                                CONTENT_CONFLICT) as commit:
             response = ctrl._commit_service_update(  # pylint: disable=protected-access
-                2, mock.sentinel.spec, 'service: changed',
-                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+                2, spec, 'service: changed', serve_utils.UpdateMode.ROLLING,
+                'incarnation-a', 7)
 
         assert response.status_code == 409
         assert 'already committed with different content' in json.loads(
@@ -1055,7 +1916,7 @@ class TestServiceUpdateReconciler:
         ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
         commit.assert_called_once_with('svc',
                                        2,
-                                       mock.sentinel.spec,
+                                       spec,
                                        'service: changed',
                                        submitted_yaml_content=None,
                                        expected_service_hash='incarnation-a',
@@ -1065,14 +1926,15 @@ class TestServiceUpdateReconciler:
 
     def test_stale_version_returns_409_without_scheduling(self):
         ctrl = _make_update_controller()
+        spec = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
         with mock.patch.object(
                 controller.serve_state,
                 'add_or_update_version',
                 return_value=serve_state.VersionCommitResult.STALE_VERSION):
             response = ctrl._commit_service_update(  # pylint: disable=protected-access
-                2, mock.sentinel.spec, 'service: stale',
-                serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
+                2, spec, 'service: stale', serve_utils.UpdateMode.ROLLING,
+                'incarnation-a', 7)
 
         assert response.status_code == 409
         assert 'superseded' in json.loads(response.body)['message']
@@ -1085,8 +1947,7 @@ class TestServiceUpdateReconciler:
         # fence, not the currently published autoscaler, must reject v3.
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='physical_backend')
-        physical = types.SimpleNamespace(replica_unit='physical_backend',
-                                         uses_logical_replicas=False)
+        physical = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
         with mock.patch.object(controller.serve_state,
                                'add_or_update_version',
@@ -1118,13 +1979,16 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='physical_backend')
-        logical = types.SimpleNamespace(replica_unit='logical',
-                                        uses_logical_replicas=True)
+        logical = _make_update_spec('logical')
         update_task = types.SimpleNamespace(service=logical, num_nodes=2)
 
         with mock.patch.object(controller.task_lib.Task,
                                'from_yaml_str',
                                return_value=update_task), \
+             mock.patch.object(
+                 controller.replica_managers,
+                 'load_task_with_service_spec',
+                 return_value=update_task), \
              mock.patch.object(controller.serve_state,
                                'get_yaml_content',
                                return_value=None), \
@@ -1139,14 +2003,13 @@ class TestServiceUpdateReconciler:
             response.body)['message']
         commit.assert_not_called()
 
-    def test_legacy_per_gpu_retry_applies_authoritative_physical_spec(self):
+    def test_legacy_per_gpu_retry_acknowledges_authoritative_physical_spec(
+            self):
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='physical_backend')
-        caller = types.SimpleNamespace(replica_unit='logical',
-                                       uses_logical_replicas=True)
-        persisted = types.SimpleNamespace(replica_unit='physical_backend',
-                                          uses_logical_replicas=False)
+        caller = _make_update_spec('logical')
+        persisted = _make_update_spec()
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
 
         with mock.patch.object(controller.serve_state,
@@ -1166,13 +2029,11 @@ class TestServiceUpdateReconciler:
 
         assert response.status_code == 200
         get_spec.assert_called_once_with('svc', 1)
-        ctrl._record_committed_update.assert_called_once_with(  # pylint: disable=protected-access
-            1, persisted, serve_utils.UpdateMode.BLUE_GREEN)
+        ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
 
     def test_exact_legacy_yaml_is_loaded_before_current_parser(self):
         ctrl = _make_update_controller()
-        persisted = types.SimpleNamespace(replica_unit='physical_backend',
-                                          uses_logical_replicas=False)
+        persisted = _make_update_spec()
         with mock.patch.object(controller.serve_state,
                                'get_yaml_content',
                                return_value='old-invalid-yaml'), \
@@ -1194,8 +2055,14 @@ class TestServiceUpdateReconciler:
             replica_unit='logical')
         ctrl._committed_version = 3  # pylint: disable=protected-access
         ctrl._applied_version = 3  # pylint: disable=protected-access
-        persisted = types.SimpleNamespace(replica_unit='physical_backend',
-                                          uses_logical_replicas=False)
+        persisted = _make_legacy_physical_per_gpu_spec()
+        placement_catalog = {
+            'schema_version': 1,
+            'entries': [{
+                'cloud': 'kubernetes',
+                'region': 'legacy-context',
+            }],
+        }
 
         with mock.patch.object(controller.serve_state,
                                'get_yaml_content',
@@ -1203,16 +2070,24 @@ class TestServiceUpdateReconciler:
              mock.patch.object(controller.serve_state,
                                'get_spec',
                                return_value=persisted), \
+             mock.patch.object(controller.serve_state,
+                               'get_placement_catalog',
+                               return_value=placement_catalog), \
+             mock.patch.object(controller.task_lib.Task,
+                               'from_yaml_str') as parse_task, \
              mock.patch.object(
                  controller.serve_state,
                  'add_or_update_version',
                  return_value=serve_state.VersionCommitResult.
-                 IDEMPOTENT_RETRY):
+                 IDEMPOTENT_RETRY) as commit:
             response = ctrl._commit_service_update(  # pylint: disable=protected-access
                 2, persisted, 'service: physical-v2',
                 serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
 
         assert response.status_code == 200
+        assert persisted.placement_contract.is_legacy_physical_per_gpu
+        parse_task.assert_not_called()
+        assert commit.call_args.kwargs['placement_catalog'] is placement_catalog
         assert ctrl._pending_update is None  # pylint: disable=protected-access
         assert ctrl._applied_version == 3  # pylint: disable=protected-access
         ctrl._replica_manager.notify_version_pending.assert_not_called()  # pylint: disable=protected-access
@@ -1221,8 +2096,7 @@ class TestServiceUpdateReconciler:
         ctrl = _make_update_controller()
         ctrl._autoscaler = types.SimpleNamespace(  # pylint: disable=protected-access
             replica_unit='logical')
-        persisted = types.SimpleNamespace(replica_unit='logical',
-                                          uses_logical_replicas=True)
+        persisted = _make_update_spec('logical')
         ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
 
         with mock.patch.object(controller.serve_state,
@@ -1232,9 +2106,14 @@ class TestServiceUpdateReconciler:
                                'get_spec',
                                return_value=persisted), \
              mock.patch.object(
-                 controller.task_lib.Task,
-                 'from_yaml_str',
-                 side_effect=AssertionError('current parser must not run')), \
+                 controller.serve_state,
+                 'get_placement_catalog',
+                 return_value={
+                     'schema_version': 1,
+                     'entries': [],
+                 }), \
+             mock.patch.object(controller.task_lib.Task,
+                               'from_yaml_str') as parse_task, \
              mock.patch.object(
                  controller.serve_state,
                  'add_or_update_version',
@@ -1245,17 +2124,84 @@ class TestServiceUpdateReconciler:
                 serve_utils.UpdateMode.ROLLING, 'incarnation-a', 7)
 
         assert response.status_code == 200
-        ctrl._record_committed_update.assert_called_once_with(  # pylint: disable=protected-access
-            2, persisted, serve_utils.UpdateMode.ROLLING)
+        parse_task.assert_not_called()
+        ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
 
-    def test_second_commit_does_not_wait_for_first_apply(self):
+    @pytest.mark.parametrize('controller_state',
+                             ['newer_applied', 'newer_pending', 'quarantined'])
+    def test_delayed_config_retry_is_ack_only_in_every_runtime_state(
+            self, tmp_path, controller_state):
+        ctrl = _make_update_controller()
+        pending_before = None
+        if controller_state == 'newer_applied':
+            ctrl._committed_version = 3  # pylint: disable=protected-access
+            ctrl._applied_version = 3  # pylint: disable=protected-access
+        elif controller_state == 'newer_pending':
+            ctrl._committed_version = 3  # pylint: disable=protected-access
+            prepared_v3 = _make_prepared_controller_config(
+                3, source_is_staged=False)
+            pending_before = controller._PendingServiceUpdate(  # pylint: disable=protected-access
+                3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING,
+                time.time(), prepared_v3)
+            ctrl._pending_update = pending_before  # pylint: disable=protected-access
+        else:
+            ctrl._committed_version = 2  # pylint: disable=protected-access
+            ctrl._quarantined_version = 2  # pylint: disable=protected-access
+            ctrl._quarantine_reason = 'invalid v2'  # pylint: disable=protected-access
+
+        staged = tmp_path / 'config.yaml.v2.staged'
+        staged.write_bytes(b'raw retry')
+        serve_utils.write_config_snapshot_receipt(str(staged), 2, '2' * 64,
+                                                  '3' * 64)
+        prepared_v2 = _make_prepared_controller_config(2,
+                                                       staged_path=str(staged))
+        persisted = _make_update_spec()
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+        ctrl._install_controller_config = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.reset_mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value='service: immutable-v2'), \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               return_value=persisted), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'add_or_update_version',
+                 return_value=serve_state.VersionCommitResult.
+                 IDEMPOTENT_RETRY):
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2,
+                persisted,
+                'service: immutable-v2',
+                serve_utils.UpdateMode.ROLLING,
+                'incarnation-a',
+                7,
+                prepared_config=prepared_v2)
+
+        assert response.status_code == 200
+        ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
+        ctrl._install_controller_config.assert_not_called()  # pylint: disable=protected-access
+        ctrl._replica_manager.notify_version_pending.assert_not_called()  # pylint: disable=protected-access
+        assert ctrl._pending_update is pending_before  # pylint: disable=protected-access
+        assert not staged.exists()
+        assert not pathlib.Path(
+            serve_utils.generate_config_snapshot_receipt_file_name(
+                str(staged))).exists()
+
+    def test_blocked_v2_apply_and_v3_commit_keep_exact_prepared_configs(self):
         ctrl = _make_update_controller()
         first_apply_started = threading.Event()
         release_first_apply = threading.Event()
-        applied_versions = []
+        applied_updates = []
+        prepared_v2 = _make_prepared_controller_config(2,
+                                                       source_is_staged=False)
+        prepared_v3 = _make_prepared_controller_config(3,
+                                                       source_is_staged=False)
 
-        def _apply(version, *_args):
-            applied_versions.append(version)
+        def _apply(version, _service, _mode, prepared_config):
+            applied_updates.append((version, prepared_config))
             if version == 2:
                 first_apply_started.set()
                 assert release_first_apply.wait(timeout=5)
@@ -1263,41 +2209,62 @@ class TestServiceUpdateReconciler:
         ctrl._apply_service_update = mock.Mock(  # pylint: disable=protected-access
             side_effect=_apply)
         ctrl._record_committed_update(  # pylint: disable=protected-access
-            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING,
+            prepared_v2)
         worker = threading.Thread(target=ctrl._reconcile_pending_update_once)  # pylint: disable=protected-access
         worker.start()
         assert first_apply_started.wait(timeout=5)
+        assert ctrl._applying_update.prepared_config is prepared_v2  # pylint: disable=protected-access
 
         # Regression: the old handler held _update_lock through the blocked
         # apply, so this second durable commit could not be recorded.
         ctrl._record_committed_update(  # pylint: disable=protected-access
-            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING,
+            prepared_v3)
         status = ctrl._get_update_status()  # pylint: disable=protected-access
         assert status['committed_version'] == 3
         assert status['applied_version'] == 1
         assert status['update_apply_pending']
+        assert ctrl._pending_update.prepared_config is prepared_v3  # pylint: disable=protected-access
+        assert ctrl._applying_update.prepared_config is prepared_v2  # pylint: disable=protected-access
 
         release_first_apply.set()
         worker.join(timeout=5)
         assert not worker.is_alive()
         assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
-        assert applied_versions == [2, 3]
+        assert applied_updates == [(2, prepared_v2), (3, prepared_v3)]
         status = ctrl._get_update_status()  # pylint: disable=protected-access
         assert status['committed_version'] == 3
         assert status['applied_version'] == 3
         assert not status['update_apply_pending']
 
-    def test_commits_coalesce_before_apply(self):
+    def test_commits_coalesce_and_remove_unused_raw_stage(self, tmp_path):
         ctrl = _make_update_controller()
         ctrl._apply_service_update = mock.Mock()  # pylint: disable=protected-access
+        staged_v2 = tmp_path / 'config.yaml.v2.staged'
+        staged_v2.write_bytes(b'unused raw v2')
+        serve_utils.write_config_snapshot_receipt(str(staged_v2), 2, '2' * 64,
+                                                  '3' * 64)
+        prepared_v2 = _make_prepared_controller_config(
+            2, staged_path=str(staged_v2))
+        prepared_v3 = _make_prepared_controller_config(3,
+                                                       source_is_staged=False)
         ctrl._record_committed_update(  # pylint: disable=protected-access
-            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING)
+            2, mock.sentinel.spec_v2, serve_utils.UpdateMode.ROLLING,
+            prepared_v2)
         ctrl._record_committed_update(  # pylint: disable=protected-access
-            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING,
+            prepared_v3)
+
+        assert not staged_v2.exists()
+        assert not pathlib.Path(
+            serve_utils.generate_config_snapshot_receipt_file_name(
+                str(staged_v2))).exists()
 
         assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
         ctrl._apply_service_update.assert_called_once_with(  # pylint: disable=line-too-long,protected-access
-            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
+            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING,
+            prepared_v3)
         assert ctrl._get_update_status()['applied_version'] == 3  # pylint: disable=protected-access
 
     def test_duplicate_commit_does_not_replace_in_flight_update(self):
@@ -1310,7 +2277,8 @@ class TestServiceUpdateReconciler:
 
         assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
         ctrl._apply_service_update.assert_called_once_with(  # pylint: disable=line-too-long,protected-access
-            2, mock.sentinel.original_spec, serve_utils.UpdateMode.ROLLING)
+            2, mock.sentinel.original_spec, serve_utils.UpdateMode.ROLLING,
+            None)
         status = ctrl._get_update_status()  # pylint: disable=protected-access
         assert status['applied_version'] == 2
         assert not status['update_apply_pending']
@@ -1345,7 +2313,10 @@ class TestServiceUpdateReconciler:
 
         with mock.patch.object(controller.serve_state,
                                'quarantine_version',
-                               return_value=True) as quarantine:
+                               return_value=True) as quarantine, \
+             mock.patch.object(
+                 ctrl,
+                 '_schedule_supervised_recovery') as schedule_recovery:
             assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
 
         quarantine.assert_called_once()
@@ -1356,16 +2327,7 @@ class TestServiceUpdateReconciler:
         assert status['quarantined_version'] == 2
         assert 'invalid ingress port' in status['quarantine_reason']
         ctrl._replica_manager.clear_pending_version.assert_called_with(2)  # pylint: disable=line-too-long
-
-        ctrl._apply_service_update = mock.Mock()  # pylint: disable=protected-access
-        ctrl._record_committed_update(  # pylint: disable=protected-access
-            3, mock.sentinel.spec_v3, serve_utils.UpdateMode.ROLLING)
-        assert ctrl._reconcile_pending_update_once()  # pylint: disable=protected-access
-        status = ctrl._get_update_status()  # pylint: disable=protected-access
-        assert status['committed_version'] == 3
-        assert status['applied_version'] == 3
-        assert not status['update_apply_pending']
-        assert status['quarantined_version'] == 2
+        schedule_recovery.assert_not_called()
 
     def test_never_ready_runtime_failure_is_durably_quarantined(self):
         ctrl = _make_update_controller()
@@ -1534,8 +2496,12 @@ def _sync_full(ctrl: controller.SkyServeController,
          mock.patch.object(
              controller.global_user_state,
              'get_clusters_from_names',
-             side_effect=lambda names: {name: {'handle': mock.sentinel.handle}
-                                        for name in names}), \
+             side_effect=lambda names: {
+                 name: {
+                     'handle': _FakeHandle(None, f'{name}.yaml')
+                 }
+                 for name in names
+             }), \
          mock.patch.object(
              controller.global_user_state,
              'get_cluster_yaml_dict_multiple',
@@ -1643,7 +2609,7 @@ class TestGetLbReplicaInfo:
         info._url = unusable_url
         replica_info, num_ready = _sync_full(ctrl, [info])
 
-        assert replica_info == {}
+        assert not replica_info
         assert num_ready == 1
         retire.assert_called_once_with(info)
 
@@ -1656,7 +2622,7 @@ class TestGetLbReplicaInfo:
 
         replica_info, num_ready = _sync_full(ctrl, [info])
 
-        assert replica_info == {}
+        assert not replica_info
         assert num_ready == 1
 
     @pytest.mark.parametrize('capable_url,ordinary_url,canonical_url', [
@@ -1911,6 +2877,224 @@ class TestGetLbReplicaInfo:
         get_yamls.assert_called_once_with([shared_yaml])
         assert infos[0].last_provider_config == {'shared': True}
         assert infos[1].last_provider_config == {'shared': True}
+
+    def test_v2_cold_sync_batches_one_physical_fence_per_pool(self):
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(1,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://1.1.1.1:8080',
+                             accelerators={'H200': 8}),
+            _FakeReplicaInfo(2,
+                             serve_state.ReplicaStatus.READY,
+                             url='http://2.2.2.2:8080',
+                             accelerators={'H200': 8}),
+        ]
+        cleanup_fence = controller.reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='research-usw2-h200',
+            physical_cluster_uid='uid-a')
+        active_fence_depth = 0
+        fence_calls = []
+        fence_entries = 0
+
+        class _PhysicalFence:
+
+            def __enter__(self):
+                nonlocal active_fence_depth, fence_entries
+                assert active_fence_depth == 0
+                active_fence_depth += 1
+                fence_entries += 1
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                nonlocal active_fence_depth
+                active_fence_depth -= 1
+
+        def _provider_fence(info, *, handle=None):
+            # Each durable row proves its own handle before the physical pool
+            # fence is entered once for the group.
+            assert handle is not None
+            fence_calls.append(info.replica_id)
+            return _PhysicalFence()
+
+        for info in infos:
+
+            def _resolve_url(*,
+                             cluster_record=None,
+                             handle=None,
+                             provider_config=None,
+                             _info=info):
+                del cluster_record, handle, provider_config
+                assert active_fence_depth == 1
+                return _info._url
+
+            info._resolve_url = mock.Mock(  # type: ignore[method-assign]
+                side_effect=_resolve_url)
+
+        with mock.patch.object(controller.reserved_capacity,
+                               'parse_protocol_v2_cleanup_fence',
+                               return_value=cleanup_fence), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'protocol_v2_provider_fence',
+                                   side_effect=_provider_fence):
+            replica_info, num_ready = _sync_full(ctrl, infos)
+
+        assert set(replica_info) == {
+            'http://1.1.1.1:8080', 'http://2.2.2.2:8080'
+        }
+        assert num_ready == 2
+        assert fence_calls == [1, 2]
+        assert fence_entries == 1
+        assert active_fence_depth == 0
+
+    def test_mixed_sync_completes_v2_phase_before_ambient(self):
+        ctrl = _make_controller()
+        ordinary = _FakeReplicaInfo(1,
+                                    serve_state.ReplicaStatus.READY,
+                                    url='http://1.1.1.1:8080',
+                                    accelerators={'L4': 1})
+        fenced = _FakeReplicaInfo(2,
+                                  serve_state.ReplicaStatus.READY,
+                                  url='http://2.2.2.2:8080',
+                                  accelerators={'H200': 8})
+        cleanup_fence = controller.reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='research-usw2-h200',
+            physical_cluster_uid='uid-a')
+        active_mode = None
+        phase_entries = []
+
+        @contextlib.contextmanager
+        def _phase(mode):
+            nonlocal active_mode
+            assert active_mode is None
+            active_mode = mode
+            phase_entries.append(mode)
+            try:
+                yield mock.sentinel.admission
+            finally:
+                active_mode = None
+
+        @contextlib.contextmanager
+        def _physical_fence():
+            assert (active_mode ==
+                    controller.provider_phase.ProviderPhaseMode.V2_FENCED)
+            yield
+
+        def _parse(info):
+            return cleanup_fence if info is fenced else None
+
+        def _ordinary_resolve(**_kwargs):
+            assert (active_mode ==
+                    controller.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY)
+            return ordinary._url
+
+        ordinary._resolve_url = mock.Mock(  # type: ignore[method-assign]
+            side_effect=_ordinary_resolve)
+        with mock.patch.object(controller.reserved_capacity,
+                               'parse_protocol_v2_cleanup_fence',
+                               side_effect=_parse), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'protocol_v2_provider_fence',
+                                   return_value=_physical_fence()), \
+             mock.patch.object(controller.provider_phase,
+                               'provider_phase', side_effect=_phase):
+            replica_info, num_ready = _sync_full(ctrl, [ordinary, fenced])
+
+        assert phase_entries == [
+            controller.provider_phase.ProviderPhaseMode.V2_FENCED,
+            controller.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY,
+        ]
+        assert set(replica_info) == {
+            'http://1.1.1.1:8080', 'http://2.2.2.2:8080'
+        }
+        assert num_ready == 2
+
+    def test_phase_timeout_does_not_publish_partial_route_caches(self):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'H200': 8})
+        cleanup_fence = controller.reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='research-usw2-h200',
+            physical_cluster_uid='uid-a')
+        old_replica_cache = {9: ('http://old:8080', 'L4', 1)}
+        old_record_ids = {9: '00000000-0000-0000-0000-000000000009'}
+        ctrl._lb_replica_cache = dict(old_replica_cache)
+        ctrl._lb_replica_cache_record_ids = dict(old_record_ids)
+        ctrl._lb_translation_cache = dict(old_replica_cache)
+        ctrl._lb_translation_cache_record_ids = dict(old_record_ids)
+        timed_out = mock.MagicMock()
+        timed_out.__enter__.side_effect = exceptions.ProviderPhaseTimeoutError(
+            'busy')
+
+        with mock.patch.object(controller.reserved_capacity,
+                               'parse_protocol_v2_cleanup_fence',
+                               return_value=cleanup_fence), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'protocol_v2_provider_fence',
+                                   return_value=contextlib.nullcontext()), \
+             mock.patch.object(controller.provider_phase,
+                               'provider_phase', return_value=timed_out), \
+             pytest.raises(exceptions.ProviderPhaseTimeoutError):
+            _sync_full(ctrl, [info])
+
+        assert ctrl._lb_replica_cache == old_replica_cache
+        assert ctrl._lb_replica_cache_record_ids == old_record_ids
+        assert ctrl._lb_translation_cache == old_replica_cache
+        assert ctrl._lb_translation_cache_record_ids == old_record_ids
+
+    @pytest.mark.parametrize('warm_cache', [False, True])
+    def test_v2_retarget_clears_cold_or_warm_route_authoritatively(
+            self, warm_cache):
+        ctrl = _make_controller()
+        info = _FakeReplicaInfo(1,
+                                serve_state.ReplicaStatus.READY,
+                                url='http://1.1.1.1:8080',
+                                accelerators={'H200': 8})
+        cleanup_fence = controller.reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='research-usw2-h200',
+            physical_cluster_uid='uid-a')
+        observed_uid = 'uid-a' if warm_cache else 'uid-b'
+        provider_fence_calls = 0
+
+        class _PhysicalFence:
+
+            def __enter__(self):
+                if observed_uid != cleanup_fence.physical_cluster_uid:
+                    raise exceptions.KubernetesPhysicalClusterIdentityError(
+                        'context was retargeted')
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                return None
+
+        def _provider_fence(_info, *, handle=None):
+            nonlocal provider_fence_calls
+            assert handle is not None
+            provider_fence_calls += 1
+            return _PhysicalFence()
+
+        with mock.patch.object(controller.reserved_capacity,
+                               'parse_protocol_v2_cleanup_fence',
+                               return_value=cleanup_fence), mock.patch.object(
+                                   controller.reserved_capacity,
+                                   'protocol_v2_provider_fence',
+                                   side_effect=_provider_fence):
+            if warm_cache:
+                initial_info, initial_count = _sync_full(ctrl, [info])
+                assert list(initial_info) == ['http://1.1.1.1:8080']
+                assert initial_count == 1
+                assert info.replica_id in ctrl._lb_replica_cache
+                observed_uid = 'uid-b'
+
+            replica_info, num_ready = _sync_full(ctrl, [info])
+
+        # A physical retarget is authoritative absence, not a transient URL
+        # miss: returning zero makes the LB apply the empty set immediately.
+        assert not replica_info
+        assert num_ready == 0
+        assert info.replica_id not in ctrl._lb_replica_cache
+        assert provider_fence_calls == (2 if warm_cache else 1)
+        assert info.url_resolutions == (1 if warm_cache else 0)
 
     def test_uses_runtime_snapshot_not_joined_service_read(self):
         ctrl = _make_controller()
@@ -2242,7 +3426,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
         ctrl._autoscaler.latest_version = 2
         ctrl._autoscaler.reserved_capacity_fill = True
-        ctrl._autoscaler._fill_target = 3  # pylint: disable=protected-access
+        ctrl._autoscaler.fill_target = 3
         ctrl._autoscaler.generate_scaling_decisions.return_value = []
         ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
         ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
@@ -2273,7 +3457,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
         ctrl._autoscaler.latest_version = 2
         ctrl._autoscaler.reserved_capacity_fill = False
-        ctrl._autoscaler._fill_target = 3  # pylint: disable=protected-access
+        ctrl._autoscaler.fill_target = 3
         ctrl._autoscaler.generate_scaling_decisions.return_value = []
         ctrl._autoscaler.has_recomputed_with_fresh_data.return_value = True
         ctrl._autoscaler.get_final_target_num_replicas.return_value = 0
@@ -2353,6 +3537,11 @@ class TestAutoscalerRuntimeSnapshot:
         decision_autoscaler = mock.Mock(spec=autoscalers.ConcurrencyAutoscaler)
         decision_autoscaler.latest_version = 1
         decision_autoscaler.replica_unit = 'logical'
+        decision_autoscaler.reserved_capacity_fill = False
+        decision_autoscaler.target_num_replicas_by_accelerator = {}
+        decision_autoscaler.has_recomputed_with_fresh_data.return_value = False
+        decision_autoscaler.cost_rebalance_state_dirty = False
+        decision_autoscaler.unrecoverable_rollout_failure = None
         decision_autoscaler.logical_target_state = None
         decision_autoscaler.configured_accelerator_shapes = {
             'L4': 1,
@@ -2381,6 +3570,55 @@ class TestAutoscalerRuntimeSnapshot:
         )
         ctrl._replica_manager.wait_for_scale_reconciliation.assert_called_once_with(  # pylint: disable=line-too-long
             0)
+
+    def test_logical_scale_up_forwards_explicit_paid_authority(self):
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock()
+        decision_autoscaler.latest_version = 2
+        decision_autoscaler.get_decision_interval.return_value = 0
+        logical_target = autoscalers.LogicalScaleTarget(
+            version=2,
+            reconcile_generation=7,
+            target_capacity=66,
+            target_capacity_by_accelerator=(('L4', 18), ('A100-80GB', 2),
+                                            ('H200', 46)),
+            accelerator_shapes=(('L4', 1), ('A100-80GB', 1), ('H200', 1)),
+            cold_launch_authority_by_accelerator=(('L4', 14),))
+        decision_autoscaler.generate_scaling_decisions.return_value = [
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_UP, logical_target)
+        ]
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.wait_for_scale_reconciliation.side_effect = (  # pylint: disable=line-too-long
+            StopIteration)
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1, 2]}):
+            with pytest.raises(StopIteration):
+                ctrl._run_autoscaler()  # pylint: disable=protected-access
+
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_called_once_with(  # pylint: disable=line-too-long
+            66,
+            2,
+            7,
+            launch_priority=constants.LB_REQUEST_PRIORITY_MIN,
+            cold_launch_authority_by_accelerator={'L4': 14},
+            target_capacity_by_accelerator={
+                'L4': 18,
+                'A100-80GB': 2,
+                'H200': 46,
+            },
+            accelerator_shapes={
+                'L4': 1,
+                'A100-80GB': 1,
+                'H200': 1,
+            })
 
     def test_logical_scale_down_waves_are_batched_without_reordering(self):
         ctrl = _make_controller()
@@ -2444,17 +3682,10 @@ class TestAutoscalerRuntimeSnapshot:
 
     def test_instance_aware_physical_batches_keep_per_card_priority(self):
         ctrl = _make_controller()
-        spec = types.SimpleNamespace(
-            min_replicas=0,
-            max_replicas=20,
-            num_overprovision=None,
-            target_qps_per_replica={
-                'L4': 1.0,
-                'A100': 2.0,
-            },
-            upscale_delay_seconds=None,
-            downscale_delay_seconds=None,
-        )
+        spec = _make_autoscaler_spec(target_qps_per_replica={
+            'L4': 1.0,
+            'A100': 2.0,
+        },)
         decision_autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
             'svc', spec, version=1)
         l4_override = {'accelerators': {'L4': 1}}
@@ -2824,6 +4055,12 @@ class _StatefulDemandAutoscaler:
         self.latest_version = 1
         self.max_replicas = 100
         self.target_num_replicas = 1
+        self.min_replicas_by_accelerator = {}
+        self.target_num_replicas_by_accelerator = {}
+        self.warm_retention_target_by_accelerator = {}
+        self.cold_launch_authority_by_accelerator = {}
+        self.reserved_capacity_fill = False
+        self.fill_target = 0
         self.request_timestamps = [101]
         self.in_flight_by_replica_id = {1: 9}
         self.unknown_in_flight_replica_ids = {1}
@@ -2837,6 +4074,12 @@ class _StatefulDemandAutoscaler:
 
     def has_recomputed_with_fresh_data(self):
         return True
+
+    def is_replica_on_zero_cost_location(self, _info):
+        return False
+
+    def get_ready_replica_capacity(self, info):
+        return info.planned_capacity
 
     def info(self):
         return {
@@ -2866,6 +4109,8 @@ class _StatefulReplicaManager:
     """Small stateful drain-report sink used to detect any mutation."""
 
     def __init__(self) -> None:
+        self.spot_placer = None
+        self.yaml_content = None
         self.report = ({
             'http://trusted:8080': 4
         }, ['http://trusted:8080'], ['http://trusted:8080'],
@@ -3256,7 +4501,7 @@ class TestAuthoritativeLbReportIngestion:
         ctrl, _, _ = self._controller_and_report()
         autoscaler = mock.Mock()
         autoscaler.reserved_capacity_fill = True
-        autoscaler._fill_target = 3
+        autoscaler.fill_target = 3
         autoscaler.target_num_replicas_by_accelerator = {
             'A100': 0,
             'A100-80GB': 0,
@@ -3359,6 +4604,37 @@ class TestAuthoritativeLbReportIngestion:
         assert response.status_code == 200
         assert (json.loads(response.body)['request_history_accepted']
                 is history_accepted)
+
+    def test_provider_phase_timeout_aborts_lb_sync_before_publication(self):
+        ctrl, info, report = self._controller_and_report()
+        ctrl._service_hash = 'service-hash'  # pylint: disable=protected-access
+        persist_history = mock.Mock()
+
+        with mock.patch.object(
+                ctrl, '_owns_current_service', return_value=True), \
+             mock.patch.object(
+                 controller.lb_k8s,
+                 'get_lb_pod_authority',
+                 return_value=controller.lb_k8s.LbPodAuthority(
+                     {'lb-a'}, {'lb-a'})), \
+             mock.patch.object(
+                 ctrl,
+                 '_snapshot_replica_occupancy',
+                 return_value=([info], {
+                     1: True
+                 }, set())), \
+             mock.patch.object(
+                 ctrl,
+                 '_get_lb_replica_info',
+                 side_effect=exceptions.ProviderPhaseTimeoutError('busy')), \
+             mock.patch.object(ctrl,
+                               '_persist_request_histories', persist_history):
+            response = asyncio.run(
+                ctrl._handle_load_balancer_sync(  # pylint: disable=protected-access
+                    report))
+
+        assert response.status_code == 503
+        persist_history.assert_not_called()
 
     def test_v1_classification_failure_retains_both_history_snapshots(self):
         ctrl, info, report = self._controller_and_report()
@@ -3848,7 +5124,8 @@ class TestAuthoritativeLbReportIngestion:
                  'get_specs',
                  return_value={
                      1: types.SimpleNamespace(
-                         graceful_drain_async_occupancy=False),
+                         graceful_drain_async_occupancy=False,
+                         uses_logical_replicas=False),
                      3: types.SimpleNamespace(
                          graceful_drain_async_occupancy=True,
                          uses_logical_replicas=True),
@@ -3887,12 +5164,24 @@ class _FakeAutoscaler:
         self.latest_version = latest_version
         self.max_replicas = 20
         self.replica_unit = replica_unit
+        self.min_replicas_by_accelerator = {}
+        self.target_num_replicas_by_accelerator = {}
+        self.warm_retention_target_by_accelerator = {}
+        self.cold_launch_authority_by_accelerator = {}
+        self.reserved_capacity_fill = False
+        self.fill_target = 0
 
     def get_final_target_num_replicas(self) -> int:
         return self._target
 
     def has_recomputed_with_fresh_data(self) -> bool:
         return self._recomputed
+
+    def is_replica_on_zero_cost_location(self, _info) -> bool:
+        return False
+
+    def get_ready_replica_capacity(self, info) -> int:
+        return info.planned_capacity
 
 
 class TestGetCapacityHint:
@@ -4299,6 +5588,8 @@ class TestReservedCapacityPollerStart:
         ctrl._replica_manager = mock.Mock()
         ctrl._replica_manager.spot_placer = placer
         ctrl._autoscaler = mock.Mock()
+        ctrl._service_hash = None
+        ctrl._controller_owner = None
         ctrl._reserved_capacity_poller_started = False
         ctrl._reserved_capacity_poller_lock = threading.Lock()
         return ctrl
@@ -4310,10 +5601,16 @@ class TestReservedCapacityPollerStart:
         placer = mock.Mock()
         ctrl = self._controller_with(placer)
         with mock.patch.object(controller.thread_utils,
-                               'start_supervised_thread') as start_mock:
+                               'start_supervised_thread') as start_mock, \
+             mock.patch.object(controller.reserved_capacity,
+                               'poller_loop') as poller_loop:
             ctrl._start_reserved_capacity_poller_if_needed()
             ctrl._start_reserved_capacity_poller_if_needed()
-        assert start_mock.call_count == 1
+            assert start_mock.call_count == 1
+            start_mock.call_args.args[0]()
+            poller_loop.assert_called_once()
+            assert (poller_loop.call_args.kwargs['actuation_epoch_lock']
+                    is ctrl._get_actuation_epoch_lock())
 
     def test_without_placer_is_inert(self):
         ctrl = self._controller_with(placer=None)

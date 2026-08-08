@@ -699,6 +699,38 @@ def test_get_job_controller_processes_empty_input_uses_no_query(
     assert counts['n'] == 0, counts
 
 
+def test_get_job_controller_processes_chunks_deduped_batches(
+        _mock_managed_jobs_db_conn, monkeypatch):
+    engine = _mock_managed_jobs_db_conn
+    first_job = _insert_job_info(engine)
+    second_job = _insert_job_info(engine)
+    third_job = _insert_job_info(engine)
+    _set_controller_process(engine, first_job, 101, 1001.5)
+    _set_controller_process(engine, second_job, 202, 1002.5)
+    _set_controller_process(engine, third_job, -303, None)
+    monkeypatch.setattr(state, '_STATUS_CHECK_JOB_ID_CHUNK', 2)
+
+    with _count_sql_statements(engine) as counts:
+        records = state.get_job_controller_processes([
+            first_job,
+            second_job,
+            third_job,
+            999999,
+            first_job,
+            second_job,
+            third_job,
+        ])
+
+    assert records == {
+        first_job: state.ControllerPidRecord(pid=101, started_at=1001.5),
+        second_job: state.ControllerPidRecord(pid=202, started_at=1002.5),
+        third_job: state.ControllerPidRecord(pid=303, started_at=None),
+    }
+    # Four unique ids with a chunk size of two must stay bounded to two
+    # statement-sized reads; duplicates must not create extra chunk work.
+    assert counts['n'] == 2, counts
+
+
 def test_scheduler_set_waiting_empty_input_uses_no_query(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn
@@ -1128,6 +1160,75 @@ def test_get_job_cancellation_state_rows_use_latest_task_only(
         (active_job, 1, state.ManagedJobStatus.RUNNING.value, 'team-a'),
         (completed_job, 29, state.ManagedJobStatus.FAILED.value, 'team-b'),
     ]
+    assert counts['n'] == 1, counts
+
+
+def test_get_job_cancellation_state_rows_preserve_duplicate_nonterminal_latest_task(  # pylint: disable=line-too-long
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    _set_controller_process(engine, active_job, 101, 1001.5)
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert(), [{
+            'spot_job_id': active_job,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': state.ManagedJobStatus.RUNNING.value,
+        }, {
+            'spot_job_id': active_job,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': state.ManagedJobStatus.SUCCEEDED.value,
+        }])
+
+    with _count_sql_statements(engine) as counts:
+        rows = state._fetch_job_cancellation_state_rows(
+            [active_job, active_job])
+
+    assert rows == [(active_job, 0, state.ManagedJobStatus.RUNNING.value,
+                     'team-a')]
+    assert counts['n'] == 1, counts
+
+
+def test_get_job_cancellation_states_preserve_duplicate_nonterminal_latest_task(  # pylint: disable=line-too-long
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    active_job = state.set_job_info_without_job_id(
+        name='active',
+        workspace='team-a',
+        entrypoint='entry',
+        pool=None,
+        pool_hash=None,
+        user_hash='u',
+    )
+    _set_controller_process(engine, active_job, 101, 1001.5)
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert(), [{
+            'spot_job_id': active_job,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': state.ManagedJobStatus.RUNNING.value,
+        }, {
+            'spot_job_id': active_job,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': state.ManagedJobStatus.SUCCEEDED.value,
+        }])
+
+    with _count_sql_statements(engine) as counts:
+        snapshots = state.get_job_cancellation_states([active_job, active_job])
+
+    assert snapshots == {
+        active_job: state.JobCancellationState(state.ManagedJobStatus.RUNNING,
+                                               'team-a'),
+    }
     assert counts['n'] == 1, counts
 
 

@@ -1,8 +1,9 @@
 """Utility functions for subprocesses."""
 import collections
 from collections.abc import Callable
+import concurrent.futures
+import contextvars
 import multiprocessing
-from multiprocessing import pool
 import os
 import random
 import resource
@@ -220,6 +221,20 @@ def get_parallel_threads(cloud_str: str | None = None) -> int:
     return max(4, cpu_count - 1) * _get_thread_multiplier(cloud_str)
 
 
+class ContextThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Thread pool that snapshots the submitter's ContextVars per task.
+
+    ``contextvars`` do not propagate to worker threads automatically.  A fresh
+    copy is required for every submission because one ``Context`` cannot be
+    entered concurrently by multiple workers.
+    """
+
+    def submit(self, fn: Callable, /, *args: Any,
+               **kwargs: Any) -> concurrent.futures.Future:
+        submit_context = contextvars.copy_context()
+        return super().submit(submit_context.run, fn, *args, **kwargs)
+
+
 def run_in_parallel(func: Callable,
                     args: list[Any] | set[Any],
                     num_threads: int | None = None) -> list[Any]:
@@ -247,9 +262,10 @@ def run_in_parallel(func: Callable,
     processes = (num_threads
                  if num_threads is not None else get_parallel_threads())
 
-    with pool.ThreadPool(processes=processes) as p:
-        ordered_iterators = p.imap(func, args)
-        return list(ordered_iterators)
+    with ContextThreadPoolExecutor(max_workers=processes) as executor:
+        # Executor.map preserves input order and dispatches through submit(),
+        # so every item receives an independent copy of the caller's context.
+        return list(executor.map(func, args))
 
 
 def handle_returncode(returncode: int,

@@ -3,6 +3,7 @@ import bisect
 from collections.abc import Iterable
 from collections.abc import Sequence
 import copy
+import dataclasses
 import math
 import threading
 import time
@@ -16,6 +17,7 @@ from sky.serve import autoscaler_compatibility
 from sky.serve import autoscaler_decisions
 from sky.serve import constants
 from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -46,12 +48,15 @@ _replica_is_retiring_card_supply = (
     autoscaler_compatibility._replica_is_retiring_card_supply)  # pylint: disable=protected-access
 _merge_fresh_target_into_downscale_hold = (
     autoscaler_compatibility._merge_fresh_target_into_downscale_hold)  # pylint: disable=protected-access
+_bound_materialized_reassignment_target = (
+    autoscaler_compatibility._bound_materialized_reassignment_target)  # pylint: disable=protected-access
 _revalidate_actuation_target = (
     autoscaler_compatibility._revalidate_actuation_target)  # pylint: disable=protected-access
 for _compatibility_helper in (
         _allocate_compatibility_target,
         _replica_is_retiring_card_supply,
         _merge_fresh_target_into_downscale_hold,
+        _bound_materialized_reassignment_target,
         _revalidate_actuation_target,
 ):
     _compatibility_helper.__module__ = __name__
@@ -77,6 +82,65 @@ _COST_REBALANCE_STATE_MAX_ENTRIES = 256
 # sub-epsilon remainder here exactly as the compatibility allocator's
 # demand_epsilon already does.
 _SLOT_CONVERSION_EPSILON = 1e-9
+_RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS = (
+    constants.RESERVED_CAPACITY_POLL_INTERVAL_SECONDS *
+    constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
+
+
+@dataclasses.dataclass
+class _PoolFillState:
+    """One protocol-v2 reserved-fill pool's independently mutable gauges."""
+
+    protocol_version: int
+    pool_key: str
+    physical_cluster_uid: str
+    service_generation: int
+    edge_cap: int
+    free_slots: int = 0
+    last_raw_free_slots: int | None = None
+    # None means the broker round had no exact-card measurement. A present map
+    # is this service's already-arbitrated portion of the aggregate pool feed.
+    free_slots_by_accelerator: dict[str, int] | None = None
+    zero_cost_locations: list[spot_placer.Location] = dataclasses.field(
+        default_factory=list)
+    snapshot_time: float | None = None
+    # Scale-down protection is deliberately separate from live launch
+    # authority.  A transient broker-round failure may carry the last real
+    # grant from the same physical pool here while clearing grant/feed/epoch,
+    # so a service-generation transition cannot cull existing pool-local fill
+    # and no new launch can replay stale authority.
+    shelter_grant: int = 0
+    grant: int = 0
+    grant_epoch: int | None = None
+    fill_target: int = 0
+
+    def detached_copy(self) -> '_PoolFillState':
+        return dataclasses.replace(
+            self,
+            zero_cost_locations=list(self.zero_cost_locations),
+            free_slots_by_accelerator=(None if self.free_slots_by_accelerator
+                                       is None else dict(
+                                           self.free_slots_by_accelerator)))
+
+
+@dataclasses.dataclass(frozen=True)
+class _CompatibilityTargetResult:
+    """Explicit provenance for one exact-card compatibility allocation.
+
+    ``card_attribution_complete`` means every fixed replica row could be
+    mapped to a configured physical card. ``explicit_target_by_accelerator``
+    is the subset backed by explicit compatibility evidence, an exact-card
+    floor, or fixed exact-card work; it bounds cross-card rollout movement.
+    ``paid_target_by_accelerator`` is the independently allocated subset that
+    may acquire paid capacity. It also includes ordinary aggregate minimums
+    and headerless queued/rejected demand, but excludes inferred in-flight
+    overflow and generic overprovision padding.
+    """
+
+    target_by_accelerator: dict[str, int]
+    explicit_target_by_accelerator: dict[str, int]
+    paid_target_by_accelerator: dict[str, int]
+    card_attribution_complete: bool
 
 
 def _work_to_slots(work: float, capacity: float) -> int:
@@ -293,10 +357,13 @@ class Autoscaler:
         self._service_name: str = service_name
         self.min_replicas: int = spec.min_replicas
         self.min_replicas_by_accelerator: dict[str, int] = dict(
-            getattr(spec, 'min_replicas_by_accelerator', {}))
+            spec.min_replicas_by_accelerator)
         self.max_replicas: int = (spec.max_replicas if spec.max_replicas
                                   is not None else spec.min_replicas)
         self.num_overprovision: int | None = spec.num_overprovision
+        # All autoscaler implementations expose the service's replica unit so
+        # controller consumers can rely on one explicit base-class interface.
+        self.replica_unit: str = spec.replica_unit
         # Target number of replicas is initialized to min replicas
         self.target_num_replicas: int = max(
             spec.min_replicas, sum(self.min_replicas_by_accelerator.values()))
@@ -312,6 +379,23 @@ class Autoscaler:
         # target, this never treats satisfied warm retention as scale-up
         # demand.
         self.cold_launch_authority_by_accelerator: dict[str, int] = {}
+        # Optional demand surfaces have explicit neutral defaults in the base
+        # interface. Shape-aware and request-rate autoscalers replace these
+        # values with their live state; generic autoscalers do not need
+        # capability probes to participate in shared status/fill logic.
+        self.request_timestamps: list[float] | None = None
+        self.qps_window_size: int | None = None
+        self._queue_depth_by_priority: dict[int, int] | None = None
+        self.compatibility_profiles: list[dict[str, Any]] = []
+        self.queued_compatibility_profiles: list[dict[str, Any]] = []
+        self.rejected_compatibility_profiles: list[dict[str, Any]] = []
+        self._compatibility_demand_complete: bool = False
+        self.configured_accelerator_shapes: dict[str, int] = {}
+        self.free_reserved_slots_by_accelerator: dict[str, int] = {}
+        # Shape-aware autoscalers publish a per-tick handle snapshot before
+        # entering their state lock. The neutral value is part of the shared
+        # resolver interface and means no snapshot is active.
+        self._gpu_shape_handles_for_tick: dict[int, Any] | None = None
         # Seed from the constructed service version (not always
         # INITIAL_VERSION). On a controller restart/respawn the autoscaler is
         # rebuilt; if it reset to version 1 while live replicas are at version
@@ -334,23 +418,20 @@ class Autoscaler:
         self.update_mode = serve_utils.DEFAULT_UPDATE_MODE
         # [boltz fork] Reserved-capacity fill (opt-in): snapshot state fed
         # by the controller's poller thread via collect_reserved_capacity.
-        # Lives in the base class so fill composes with every autoscaler
-        # type without touching their demand math. getattr: robust against
-        # spec objects predating the flag (e.g. unpickled from old DB
-        # rows).
-        self.reserved_capacity_fill: bool = bool(
-            getattr(spec, 'reserved_capacity_fill', False))
+        # Lives in the base class so fill composes with every autoscaler type
+        # without touching their demand math. SkyServiceSpec.__setstate__
+        # materializes the field for specs unpickled from old DB rows.
+        self.reserved_capacity_fill: bool = bool(spec.reserved_capacity_fill)
         # Broker claim parameters, snapshotted from the spec so the poller
-        # can read them off the live autoscaler (update_version refreshes
-        # them). getattr: spec objects predating the knobs.
+        # can read them off the live autoscaler (update_version refreshes them).
         self.reserved_fill_floor_replicas: int = int(
-            getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
-        self.reserved_fill_weight: float = float(
-            getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
+            spec.reserved_fill_floor_replicas or 0)
+        self.reserved_fill_weight: float = float(spec.reserved_fill_weight or
+                                                 1.0)
         # Whether this service releases its whole fill entitlement while it
         # demonstrates no work (see reserved_capacity_broker).
         self.reserved_fill_utilization_gate: bool = bool(
-            getattr(spec, 'reserved_fill_utilization_gate', False))
+            spec.reserved_fill_utilization_gate)
         # Damped free-slot value the fill target acts on (see
         # collect_reserved_capacity for the two-poll increase damping).
         self._fill_free_slots: int = 0
@@ -371,15 +452,23 @@ class Autoscaler:
         self._fill_grant: int | None = None
         self._fill_grant_epoch: int | None = None
         self._fill_grant_pool_key: str | None = None
+        self._fill_protocol_version: int = 1
+        self._fill_service_generation: int = 0
+        self._fill_physical_cluster_uid: str | None = None
+        # Protocol-v2 state is a complete map published atomically by one
+        # service poll cycle. The legacy scalar fields above remain the exact
+        # protocol-v1 implementation and compatibility/status projection.
+        self._fill_pool_state_lock = threading.RLock()
+        self._fill_pool_states: dict[str, _PoolFillState] = {}
         # Opt-in economic replacement.  The placer reference is injected by
         # the controller each tick because ReplicaManager owns placement state.
-        self.cost_rebalance: bool = bool(getattr(spec, 'cost_rebalance', False))
+        self.cost_rebalance: bool = bool(spec.cost_rebalance)
         self.cost_rebalance_min_savings_fraction: float = float(
-            getattr(spec, 'cost_rebalance_min_savings_fraction', 0.3))
+            spec.cost_rebalance_min_savings_fraction)
         self.cost_rebalance_max_parallel_replacements: int = int(
-            getattr(spec, 'cost_rebalance_max_parallel_replacements', 1))
+            spec.cost_rebalance_max_parallel_replacements)
         self.cost_rebalance_stabilization_seconds: float = float(
-            getattr(spec, 'cost_rebalance_stabilization_seconds', 300.0))
+            spec.cost_rebalance_stabilization_seconds)
         self._cost_rebalance_spot_placer: spot_placer.SpotPlacer | None = None
         self._cost_rebalance_candidate_since: dict[tuple[int,
                                                          spot_placer.Location],
@@ -402,7 +491,7 @@ class Autoscaler:
         if not self._launch_priority_evidence_is_fresh():
             return constants.LB_REQUEST_PRIORITY_MIN
         priorities = [constants.LB_REQUEST_PRIORITY_MIN]
-        by_priority = getattr(self, '_queue_depth_by_priority', None)
+        by_priority = self._queue_depth_by_priority
         if isinstance(by_priority, dict):
             priorities.extend(
                 int(priority)
@@ -410,10 +499,9 @@ class Autoscaler:
                 if isinstance(priority, int) and
                 not isinstance(priority, bool) and isinstance(count, int) and
                 not isinstance(count, bool) and count > 0)
-        for field in ('queued_compatibility_profiles',
-                      'rejected_compatibility_profiles',
-                      'compatibility_profiles'):
-            profiles = getattr(self, field, ())
+        for profiles in (self.queued_compatibility_profiles,
+                         self.rejected_compatibility_profiles,
+                         self.compatibility_profiles):
             if not isinstance(profiles, list):
                 continue
             for profile in profiles:
@@ -450,10 +538,9 @@ class Autoscaler:
         if not self._launch_priority_evidence_is_fresh():
             return priorities
         saw_valid_profile = False
-        for field in ('queued_compatibility_profiles',
-                      'rejected_compatibility_profiles',
-                      'compatibility_profiles'):
-            profiles = getattr(self, field, ())
+        for profiles in (self.queued_compatibility_profiles,
+                         self.rejected_compatibility_profiles,
+                         self.compatibility_profiles):
             if not isinstance(profiles, list):
                 continue
             for profile in profiles:
@@ -493,6 +580,11 @@ class Autoscaler:
         """Return this tick's typed never-ready rollout failure, if any."""
         return self._unrecoverable_rollout_failure
 
+    @property
+    def fill_target(self) -> int:
+        """Return the latest aggregate reserved-capacity fill target."""
+        return self._fill_target
+
     def _calculate_target_num_replicas(self) -> int:
         """Calculate target number of replicas."""
         raise NotImplementedError
@@ -506,9 +598,10 @@ class Autoscaler:
         self.latest_version = version
         self.min_replicas = spec.min_replicas
         self.min_replicas_by_accelerator = dict(
-            getattr(spec, 'min_replicas_by_accelerator', {}))
+            spec.min_replicas_by_accelerator)
         self.max_replicas = (spec.max_replicas if spec.max_replicas is not None
                              else spec.min_replicas)
+        self.replica_unit = spec.replica_unit
         # Re-clip self.target_num_replicas with new min and max replicas.
         self.target_num_replicas = self._clip_target_num_replicas(
             self.target_num_replicas)
@@ -518,23 +611,46 @@ class Autoscaler:
         # seeds the zero-cost location set and starts the poller when an
         # update enables the flag -- no respawn needed, provided the spot
         # placer already exists.)
-        self.reserved_capacity_fill = bool(
-            getattr(spec, 'reserved_capacity_fill', False))
+        self.reserved_capacity_fill = bool(spec.reserved_capacity_fill)
         # Broker claim knobs follow the update too: the poller reads them
         # off the live autoscaler on its next heartbeat.
         self.reserved_fill_floor_replicas = int(
-            getattr(spec, 'reserved_fill_floor_replicas', 0) or 0)
-        self.reserved_fill_weight = float(
-            getattr(spec, 'reserved_fill_weight', 1.0) or 1.0)
+            spec.reserved_fill_floor_replicas or 0)
+        self.reserved_fill_weight = float(spec.reserved_fill_weight or 1.0)
         self.reserved_fill_utilization_gate = bool(
-            getattr(spec, 'reserved_fill_utilization_gate', False))
-        self.cost_rebalance = bool(getattr(spec, 'cost_rebalance', False))
+            spec.reserved_fill_utilization_gate)
+        with self._fill_pool_state_lock:
+            if not self.reserved_capacity_fill:
+                # Disabling fill deliberately withdraws every edge. Do not
+                # leave a process-local shelter that a later re-enable could
+                # relay across a failed first round for a newly created claim.
+                self._fill_pool_states = {}
+            else:
+                # A service update may add/remove/reorder pool edges and
+                # therefore advance the authoritative service generation.
+                # Preserve location identity for scale-down shelter, but
+                # invalidate all old feed until the poller publishes the new
+                # complete generation.
+                for pool_state in self._fill_pool_states.values():
+                    pool_state.free_slots = 0
+                    pool_state.last_raw_free_slots = None
+                    # Shelter-only until the next exact-generation heartbeat:
+                    # preserve only the last real broker entitlement. Zero
+                    # feed cannot authorize a launch under it, while widening
+                    # the grant to edge_cap would let an update shelter
+                    # holdings that a peer had already been granted.
+                    pool_state.shelter_grant = min(pool_state.shelter_grant,
+                                                   pool_state.edge_cap)
+                    pool_state.grant = 0
+                    pool_state.grant_epoch = None
+            self._refresh_legacy_fill_projection_locked()
+        self.cost_rebalance = bool(spec.cost_rebalance)
         self.cost_rebalance_min_savings_fraction = float(
-            getattr(spec, 'cost_rebalance_min_savings_fraction', 0.3))
+            spec.cost_rebalance_min_savings_fraction)
         self.cost_rebalance_max_parallel_replacements = int(
-            getattr(spec, 'cost_rebalance_max_parallel_replacements', 1))
+            spec.cost_rebalance_max_parallel_replacements)
         self.cost_rebalance_stabilization_seconds = float(
-            getattr(spec, 'cost_rebalance_stabilization_seconds', 300.0))
+            spec.cost_rebalance_stabilization_seconds)
         self._clear_cost_rebalance_candidates()
         self.warm_retention_target_by_accelerator = {}
         self.cold_launch_authority_by_accelerator = {}
@@ -617,13 +733,17 @@ class Autoscaler:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
 
-    def collect_reserved_capacity(self,
-                                  free_slots: int,
-                                  zero_cost_location_keys: list[dict[str, Any]],
-                                  timestamp: float,
-                                  grant: int | None = None,
-                                  grant_epoch: int | None = None,
-                                  grant_pool_key: str | None = None) -> None:
+    def collect_reserved_capacity(
+            self,
+            free_slots: int,
+            zero_cost_location_keys: list[dict[str, Any]],
+            timestamp: float,
+            grant: int | None = None,
+            grant_epoch: int | None = None,
+            grant_pool_key: str | None = None,
+            protocol_version: int = 1,
+            service_generation: int = 0,
+            physical_cluster_uid: str | None = None) -> None:
         """Ingest a free-capacity snapshot from the reserved-capacity poller.
 
         `zero_cost_location_keys` are Location.to_pickleable() dicts of
@@ -645,6 +765,12 @@ class Autoscaler:
         grant_pool_key the pool the epoch belongs to (epochs are per-pool
         round counters; the fence compares against that pool's round).
         """
+        if int(protocol_version) == 1:
+            # Explicit protocol demotion: scalar state becomes authoritative.
+            # A retained v2 map would otherwise make the overlay ignore every
+            # subsequent v1 heartbeat forever.
+            with self._fill_pool_state_lock:
+                self._fill_pool_states = {}
         free_slots = max(0, int(free_slots))
         prev_raw = self._fill_last_raw_free_slots
         self._fill_last_raw_free_slots = free_slots
@@ -661,6 +787,418 @@ class Autoscaler:
         self._fill_grant = grant
         self._fill_grant_epoch = grant_epoch
         self._fill_grant_pool_key = grant_pool_key
+        self._fill_protocol_version = int(protocol_version)
+        self._fill_service_generation = int(service_generation)
+        self._fill_physical_cluster_uid = physical_cluster_uid
+
+    @staticmethod
+    def _parse_reserved_fill_pool_locations(
+        identity: reserved_capacity_broker.PoolIdentity,
+        raw_location_keys: Any,
+    ) -> list[spot_placer.Location]:
+        """Parse an exact v2 pool location set or reject all authority."""
+        if not isinstance(raw_location_keys, list) or not raw_location_keys:
+            raise ValueError('Protocol-v2 pool snapshots require a nonempty '
+                             'location-key list.')
+        locations: list[spot_placer.Location] = []
+        cards: set[str] = set()
+        contexts: set[str] = set()
+        widths: set[int] = set()
+        for key in raw_location_keys:
+            try:
+                location = spot_placer.Location.from_pickleable(key)
+            except (AssertionError, KeyError, TypeError, ValueError) as error:
+                raise ValueError('Protocol-v2 pool snapshot contains a '
+                                 'malformed location key.') from error
+            if location is None or str(location.cloud).lower() != 'kubernetes':
+                raise ValueError('Protocol-v2 pool locations must resolve to '
+                                 'Kubernetes.')
+            if not isinstance(location.region, str) or not location.region:
+                raise ValueError('Protocol-v2 pool locations require a '
+                                 'nonempty Kubernetes context.')
+            accelerators = location.accelerators
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                raise ValueError('Protocol-v2 pool locations require one '
+                                 'exact accelerator shape.')
+            raw_card, raw_count = next(iter(accelerators.items()))
+            if (not isinstance(raw_card, str) or not raw_card or
+                    isinstance(raw_count, bool) or
+                    not isinstance(raw_count, (int, float)) or
+                    not math.isfinite(float(raw_count)) or
+                    not float(raw_count).is_integer() or raw_count <= 0):
+                raise ValueError('Protocol-v2 pool locations require a '
+                                 'positive whole accelerator count.')
+            card = raw_card.casefold()
+            if card not in identity.gpu_names:
+                raise ValueError('Protocol-v2 pool location accelerator does '
+                                 'not match its composite pool key.')
+            cards.add(card)
+            contexts.add(location.region)
+            widths.add(int(raw_count))
+            locations.append(location)
+        if (cards != set(identity.gpu_names) or len(contexts) != 1 or
+                len(widths) != 1):
+            raise ValueError('Protocol-v2 pool locations must exactly cover '
+                             'their composite cards in one context and at one '
+                             'GPU width.')
+        return locations
+
+    def collect_reserved_capacity_pools(
+        self,
+        pool_snapshots: dict[str, dict[str, Any]],
+    ) -> None:
+        """Atomically ingest one complete protocol-v2 pool snapshot map.
+
+        Every entry must describe the same authoritative service generation.
+        A pool without an exact-generation round is still present, but carries
+        ``free_slots=0`` and ``grant=0``. A generation change starts damping
+        from zero, so feed from the old cross-pool budget cannot survive the
+        atomic map swap.
+        """
+        parsed: dict[str, _PoolFillState] = {}
+        generations: set[int] = set()
+        seen_contexts: set[str] = set()
+        cards_by_physical_uid: dict[str, set[str]] = {}
+        for map_key, snapshot in pool_snapshots.items():
+            pool_key = str(snapshot.get('pool_key', map_key))
+            if pool_key != map_key:
+                raise ValueError('Reserved-fill pool snapshot key mismatch: '
+                                 f'{map_key!r} != {pool_key!r}.')
+            try:
+                identity = reserved_capacity_broker.parse_pool_identity(
+                    pool_key)
+            except (TypeError, ValueError) as error:
+                raise ValueError('Reserved-fill pool snapshot has a malformed '
+                                 f'pool key {pool_key!r}.') from error
+            if identity.protocol_version != 2:
+                raise ValueError('Multi-pool snapshots require a protocol-v2 '
+                                 f'pool key, got {pool_key!r}.')
+            canonical_pool_key = reserved_capacity_broker.make_pool_key(
+                '',
+                identity.gpu_names,
+                protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                physical_cluster_uid=identity.physical_cluster_uid)
+            if pool_key != canonical_pool_key:
+                raise ValueError('Protocol-v2 pool snapshot key must be '
+                                 f'canonical, got {pool_key!r}.')
+            protocol_version = snapshot.get('protocol_version', 0)
+            if (isinstance(protocol_version, bool) or
+                    not isinstance(protocol_version, int) or
+                    protocol_version != 2):
+                raise ValueError('Multi-pool snapshots require reserved-fill '
+                                 f'protocol 2, got {protocol_version!r}.')
+            generation = snapshot['service_generation']
+            if (isinstance(generation, bool) or
+                    not isinstance(generation, int) or generation < 1):
+                raise ValueError('Reserved-fill service generation must be '
+                                 'positive under protocol 2.')
+            generations.add(generation)
+            edge_cap = snapshot['edge_cap']
+            if (isinstance(edge_cap, bool) or not isinstance(edge_cap, int) or
+                    edge_cap < 0):
+                raise ValueError('Reserved-fill edge cap must be a '
+                                 'non-negative integer under protocol 2.')
+            raw_free = snapshot.get('free_slots', 0)
+            if (isinstance(raw_free, bool) or not isinstance(raw_free, int) or
+                    raw_free < 0):
+                raise ValueError('Protocol-v2 free-slot feed must be a '
+                                 'non-negative integer.')
+            raw_free_by_accelerator = snapshot.get('free_slots_by_accelerator')
+            free_by_accelerator: dict[str, int] | None = None
+            if raw_free_by_accelerator is not None:
+                if not isinstance(raw_free_by_accelerator, dict):
+                    raise ValueError('Protocol-v2 exact-card feed must be a '
+                                     'mapping when present.')
+                free_by_accelerator = {}
+                for raw_card, raw_count in raw_free_by_accelerator.items():
+                    if (not isinstance(raw_card, str) or not raw_card or
+                            isinstance(raw_count, bool) or
+                            not isinstance(raw_count, int) or raw_count < 0):
+                        raise ValueError('Protocol-v2 exact-card feed contains '
+                                         'an invalid card/count entry.')
+                    card = raw_card.casefold()
+                    if card in free_by_accelerator:
+                        raise ValueError('Protocol-v2 exact-card feed contains '
+                                         'duplicate card identities.')
+                    if raw_count > 0:
+                        free_by_accelerator[card] = raw_count
+                if sum(free_by_accelerator.values()) != raw_free:
+                    raise ValueError('Protocol-v2 exact-card feed must sum to '
+                                     'its aggregate free-slot feed.')
+                if any(card not in identity.gpu_names
+                       for card in free_by_accelerator):
+                    raise ValueError('Protocol-v2 exact-card feed contains a '
+                                     'card outside its composite pool key.')
+            raw_grant = snapshot.get('grant', 0)
+            raw_shelter_grant = snapshot.get('shelter_grant', raw_grant)
+            if (isinstance(raw_grant, bool) or not isinstance(raw_grant, int) or
+                    raw_grant < 0 or isinstance(raw_shelter_grant, bool) or
+                    not isinstance(raw_shelter_grant, int) or
+                    raw_shelter_grant < 0):
+                raise ValueError('Protocol-v2 grant and shelter must be '
+                                 'non-negative integers.')
+            raw_grant_epoch = snapshot.get('grant_epoch')
+            if (raw_grant_epoch is not None and
+                (isinstance(raw_grant_epoch, bool) or
+                 not isinstance(raw_grant_epoch, int) or raw_grant_epoch < 1)):
+                raise ValueError('Protocol-v2 grant epoch must be a '
+                                 'positive integer when present.')
+            if raw_grant_epoch is None and (raw_grant > 0 or raw_free > 0):
+                raise ValueError('Protocol-v2 live launch authority requires '
+                                 'a positive grant epoch.')
+            grant = min(edge_cap, raw_grant)
+            shelter_grant = min(edge_cap, raw_shelter_grant)
+            locations = self._parse_reserved_fill_pool_locations(
+                identity, snapshot.get('zero_cost_location_keys'))
+            physical_uid = snapshot.get('physical_cluster_uid')
+            if (not isinstance(physical_uid, str) or not physical_uid or
+                    physical_uid != identity.physical_cluster_uid):
+                raise ValueError('Protocol-v2 pool snapshot requires a '
+                                 'physical Kubernetes cluster UID matching '
+                                 'its composite pool key.')
+            context = locations[0].region
+            if context in seen_contexts:
+                raise ValueError('Protocol-v2 pool snapshots may use each '
+                                 'Kubernetes context in only one edge.')
+            seen_contexts.add(context)
+            physical_cards = cards_by_physical_uid.setdefault(
+                physical_uid, set())
+            overlap = physical_cards.intersection(identity.gpu_names)
+            if overlap:
+                raise ValueError('Protocol-v2 pool snapshots overlap on one '
+                                 'physical cluster for cards '
+                                 f'{sorted(overlap)}.')
+            physical_cards.update(identity.gpu_names)
+            raw_timestamp = snapshot['timestamp']
+            if (isinstance(raw_timestamp, bool) or
+                    not isinstance(raw_timestamp, (int, float)) or
+                    not math.isfinite(raw_timestamp) or raw_timestamp < 0):
+                raise ValueError('Protocol-v2 pool snapshot timestamp must be '
+                                 'a finite non-negative number.')
+            if (raw_timestamp
+                    > time.time() + _RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS):
+                raise ValueError('Protocol-v2 pool snapshot timestamp is too '
+                                 'far in the future.')
+            parsed[pool_key] = _PoolFillState(
+                protocol_version=protocol_version,
+                pool_key=pool_key,
+                physical_cluster_uid=physical_uid,
+                service_generation=generation,
+                edge_cap=edge_cap,
+                free_slots_by_accelerator=free_by_accelerator,
+                zero_cost_locations=locations,
+                snapshot_time=float(raw_timestamp),
+                shelter_grant=shelter_grant,
+                grant=grant,
+                grant_epoch=raw_grant_epoch,
+            )
+            # Damping is filled under the lock from the prior exact-generation
+            # state; raw_free remains local so no half-updated map is visible.
+            parsed[pool_key].last_raw_free_slots = raw_free
+
+        if len(generations) > 1:
+            raise ValueError('A complete reserved-fill pool map must carry '
+                             f'one service generation, got {generations}.')
+
+        with self._fill_pool_state_lock:
+            previous = self._fill_pool_states
+            for pool_key, state in parsed.items():
+                raw_free = state.last_raw_free_slots or 0
+                prior = previous.get(pool_key)
+                if (prior is None or
+                        prior.service_generation != state.service_generation or
+                        prior.physical_cluster_uid
+                        != state.physical_cluster_uid):
+                    # A newly authorized generation gets no feed on its first
+                    # sample. The next exact-generation sample confirms the
+                    # increase, mirroring protocol-v1 two-poll damping.
+                    state.free_slots = 0
+                    state.last_raw_free_slots = raw_free
+                else:
+                    state.free_slots = prior.free_slots
+                    previous_raw = prior.last_raw_free_slots
+                    state.last_raw_free_slots = raw_free
+                    if raw_free <= state.free_slots:
+                        state.free_slots = raw_free
+                    elif (previous_raw is not None and
+                          previous_raw > state.free_slots):
+                        state.free_slots = min(previous_raw, raw_free)
+                state.free_slots = min(state.free_slots, state.edge_cap)
+            self._fill_pool_states = parsed
+            self._refresh_legacy_fill_projection_locked()
+
+    def seed_zero_cost_pools(
+        self,
+        pool_location_keys: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Seed protocol-v2 location identity without authorizing feed."""
+        with self._fill_pool_state_lock:
+            if self._fill_pool_states:
+                return
+            # A seed intentionally lacks protocol/generation/UID authority.
+            # Keep it only in the aggregate legacy location projection for
+            # restart-time scale-down protection; it cannot launch.
+            self._fill_zero_cost_locations = [
+                location for keys in pool_location_keys.values()
+                for location in (
+                    spot_placer.Location.from_pickleable(key) for key in keys)
+                if location is not None
+            ]
+
+    def _refresh_legacy_fill_projection_locked(self) -> None:
+        """Refresh scalar compatibility/status fields from the v2 map."""
+        states = list(self._fill_pool_states.values())
+        self._fill_free_slots = sum(state.free_slots for state in states)
+        raw_values = [
+            state.last_raw_free_slots
+            for state in states
+            if state.last_raw_free_slots is not None
+        ]
+        self._fill_last_raw_free_slots = (sum(raw_values)
+                                          if raw_values else None)
+        self._fill_zero_cost_locations = [
+            location for state in states
+            for location in state.zero_cost_locations
+        ]
+        timestamps = [
+            state.snapshot_time
+            for state in states
+            if state.snapshot_time is not None
+        ]
+        # The oldest component controls aggregate freshness.
+        self._fill_snapshot_time = min(timestamps) if timestamps else None
+        self._fill_grant = sum(state.grant for state in states)
+        self._fill_grant_epoch = None
+        self._fill_grant_pool_key = None
+
+    def _pool_fill_states_snapshot(self) -> dict[str, _PoolFillState]:
+        with self._fill_pool_state_lock:
+            return {
+                key: state.detached_copy()
+                for key, state in self._fill_pool_states.items()
+            }
+
+    def get_reserved_capacity_pool_shelter_grant(self, pool_key: str, *,
+                                                 service_generation: int,
+                                                 physical_cluster_uid: str,
+                                                 edge_cap: int) -> int:
+        """Return clipped, non-launching shelter from an exact prior edge.
+
+        The broker poller uses this only after a protocol-v2 round failed to
+        return an allocation. A generation advance invalidates every launch
+        grant and feed, but it must not cull healthy holdings in an unchanged
+        physical pool just because that generation's first provider poll
+        failed. Pool identity and physical UID fence the carry, and a future
+        prior generation is rejected.
+        """
+        with self._fill_pool_state_lock:
+            prior = self._fill_pool_states.get(pool_key)
+            if (isinstance(service_generation, bool) or
+                    not isinstance(service_generation, int) or
+                    service_generation < 1 or
+                    not isinstance(physical_cluster_uid, str) or
+                    not physical_cluster_uid or isinstance(edge_cap, bool) or
+                    not isinstance(edge_cap, int) or edge_cap < 0 or
+                    prior is None or prior.protocol_version != 2 or
+                    isinstance(prior.service_generation, bool) or
+                    not isinstance(prior.service_generation, int) or
+                    prior.service_generation < 1 or
+                    prior.service_generation > service_generation or
+                    prior.physical_cluster_uid != physical_cluster_uid):
+                return 0
+            return max(0, min(edge_cap, prior.shelter_grant))
+
+    @staticmethod
+    def _location_in_pool(location: spot_placer.Location,
+                          state: _PoolFillState) -> bool:
+        return any(
+            spot_placer.locations_match_placement(location, candidate)
+            for candidate in state.zero_cost_locations)
+
+    def _fill_pool_key_for_replica(
+        self,
+        info: 'replica_managers.ReplicaInfo',
+        states: dict[str, _PoolFillState],
+    ) -> str | None:
+        # Read persisted fields without triggering unittest.mock.Mock's dynamic
+        # attribute synthesis: only actual row state is provenance authority.
+        try:
+            persisted = vars(info)
+        except TypeError:
+            persisted = {}
+        persisted_key = persisted.get('reserved_fill_pool_key')
+        persisted_generation = persisted.get('reserved_fill_service_generation')
+        persisted_uid = persisted.get('reserved_fill_physical_cluster_uid')
+        provenance = (persisted_key, persisted_generation, persisted_uid)
+        if any(value is not None for value in provenance):
+            # Once any v2 origin field exists, the trio is authoritative.  A
+            # partial, malformed, retargeted, or future-generation row must not
+            # be re-attributed by a coincidentally matching context/location.
+            if (not isinstance(persisted_key, str) or not persisted_key or
+                    isinstance(persisted_generation, bool) or
+                    not isinstance(persisted_generation, int) or
+                    persisted_generation < 1 or
+                    not isinstance(persisted_uid, str) or not persisted_uid):
+                return None
+            state = states.get(persisted_key)
+            if (state is None or persisted_uid != state.physical_cluster_uid or
+                    persisted_generation > state.service_generation):
+                return None
+            location = info.get_spot_location()
+            if (location is None or
+                    not self._location_in_pool(location, state)):
+                # Explicit origin and persisted placement are one authority
+                # tuple.  A retargeted/corrupt row must not consume shelter
+                # from either its claimed pool or a coincidentally matching
+                # replacement pool.
+                return None
+            # Older positive generations remain valid for existing holdings:
+            # the generation is the immutable launch fence and is expected to
+            # trail the service set after later cap/policy heartbeats.
+            return persisted_key
+
+        # Only genuinely legacy rows (and ordinary demand rows), for which all
+        # three origin fields are absent, may use exact location attribution.
+        location = info.get_spot_location()
+        if location is None:
+            return None
+        matches = [
+            pool_key for pool_key, state in states.items()
+            if self._location_in_pool(location, state)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _exact_launch_shapes_for_pool(
+        state: _PoolFillState,) -> dict[str, tuple[str, int]] | None:
+        """Return normalized card -> exact launch shape in location order."""
+        try:
+            identity = reserved_capacity_broker.parse_pool_identity(
+                state.pool_key)
+        except (TypeError, ValueError):
+            return None
+        if identity.protocol_version != 2:
+            return None
+        shapes: dict[str, tuple[str, int]] = {}
+        for location in state.zero_cost_locations:
+            accelerators = location.accelerators
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                return None
+            raw_card, raw_count = next(iter(accelerators.items()))
+            if (not isinstance(raw_card, str) or not raw_card or
+                    isinstance(raw_count, bool) or
+                    not isinstance(raw_count, (int, float)) or
+                    not float(raw_count).is_integer() or raw_count <= 0):
+                return None
+            card = raw_card.casefold()
+            if card not in identity.gpu_names:
+                return None
+            shape = (raw_card, int(raw_count))
+            prior = shapes.get(card)
+            if prior is not None and prior[1] != shape[1]:
+                return None
+            shapes.setdefault(card, shape)
+        return shapes or None
 
     def fill_demand_sample(
         self,
@@ -688,10 +1226,10 @@ class Autoscaler:
 
         The broker claim heartbeat reports this split: fill holdings are
         broker property (arbitrated by grants), demand-placed rows are
-        demand-protected and exempt from the ceiling. Rows pickled before
-        the reserved_fill flag existed read as demand (getattr default) --
-        the conservative direction: they keep their shelter and inflate
-        nobody's fill count.
+        demand-protected and exempt from the ceiling. ReplicaInfo's storage
+        decoder materializes rows predating reserved_fill as demand -- the
+        conservative direction: they keep their shelter and inflate nobody's
+        fill count.
         """
         fill = 0
         demand = 0
@@ -700,11 +1238,59 @@ class Autoscaler:
                 continue
             if not self._replica_on_zero_cost_location(info):
                 continue
-            if getattr(info, 'reserved_fill', False):
+            if info.reserved_fill:
                 fill += 1
             else:
                 demand += 1
         return fill, demand
+
+    def count_zero_cost_holdings_by_pool(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        pool_location_keys: dict[str, list[dict[str, Any]]] | None = None,
+        pool_authority: dict[str, tuple[str, int]] | None = None,
+    ) -> dict[str, tuple[int, int]]:
+        """Return the fill/demand holdings split for every v2 pool.
+
+        ``pool_authority`` supplies the durable UID/current generation during
+        controller restart, before an in-memory pool snapshot exists. It is
+        required to validate explicit v2 provenance; location-only fallback is
+        reserved for rows whose entire provenance trio predates protocol v2.
+        """
+        states = self._pool_fill_states_snapshot()
+        if pool_location_keys is not None:
+            for pool_key, keys in pool_location_keys.items():
+                if pool_key in states:
+                    continue
+                locations = [
+                    location
+                    for location in (spot_placer.Location.from_pickleable(key)
+                                     for key in keys)
+                    if location is not None
+                ]
+                authority = (pool_authority or {}).get(pool_key)
+                physical_uid, generation = (authority if authority is not None
+                                            else ('', 0))
+                states[pool_key] = _PoolFillState(
+                    protocol_version=2,
+                    pool_key=pool_key,
+                    physical_cluster_uid=(physical_uid),
+                    service_generation=generation,
+                    edge_cap=0,
+                    zero_cost_locations=locations)
+        counts = {pool_key: [0, 0] for pool_key in states}
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            replica_pool_key = self._fill_pool_key_for_replica(info, states)
+            if replica_pool_key is None:
+                continue
+            index = 0 if info.reserved_fill else 1
+            counts[replica_pool_key][index] += self._fill_capacity_units(info)
+        return {
+            pool_key: (values[0], values[1])
+            for pool_key, values in counts.items()
+        }
 
     def seed_zero_cost_locations(
             self, zero_cost_location_keys: list[dict[str, Any]]) -> None:
@@ -789,7 +1375,7 @@ class Autoscaler:
         if self._fill_snapshot_time is None:
             # No snapshot: spendable free slots are 0 regardless.
             return False
-        created_at = getattr(info, 'created_at', None)
+        created_at = info.created_at
         return created_at is not None and created_at > self._fill_snapshot_time
 
     def _replica_on_zero_cost_location(
@@ -819,6 +1405,16 @@ class Autoscaler:
         del info
         return 1
 
+    def _supports_exact_fill_shape_resolution(self) -> bool:
+        """Whether this autoscaler can resolve exact replica GPU shapes."""
+        return False
+
+    def _resolve_fill_gpu_shape(
+            self, info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
+        """Resolve one replica's exact GPU shape for fill accounting."""
+        del info
+        raise NotImplementedError
+
     def _exact_card_fill_shelter(
         self,
         zero_cost_infos: list['replica_managers.ReplicaInfo'],
@@ -832,12 +1428,12 @@ class Autoscaler:
         drain one reserved card and immediately refill another. Autoscalers
         without a complete exact-card view retain the legacy aggregate path.
         """
-        demand_target = getattr(self, 'target_num_replicas_by_accelerator', {})
-        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        demand_target = self.target_num_replicas_by_accelerator
+        configured_shapes = self.configured_accelerator_shapes
         if (not isinstance(demand_target, dict) or
                 not isinstance(configured_shapes, dict) or
                 not configured_shapes or
-                not getattr(self, '_compatibility_demand_complete', False)):
+                not self._compatibility_demand_complete):
             return None
 
         canonical_by_name = {
@@ -894,7 +1490,7 @@ class Autoscaler:
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
         decisions: list[AutoscalerDecision],
-    ) -> tuple[int, dict[str, int] | None]:
+    ) -> tuple[int, dict[str, int] | None, dict[str, int] | None]:
         """Count free exact-card slots already claimed by demand decisions.
 
         Reserved fill is overlaid after ordinary demand scaling. A shaped
@@ -902,18 +1498,18 @@ class Autoscaler:
         slots, so emitting the full fill delta as well would create two rows
         for one physical slot. Count only claims that match a currently free
         exact card. Unknown or aggregate decisions retain the legacy fill
-        behavior because they cannot be reconciled safely by card here.
+        behavior because they cannot be reconciled safely by card here.  The
+        third return value preserves the exact-card split so protocol v2 can
+        debit only compatible physical pools instead of assigning an H200
+        demand claim to (for example) an unrelated L4 pool.
         """
-        raw_free = getattr(self, 'free_reserved_slots_by_accelerator', None)
-        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
-        shape_resolver = getattr(self, '_get_gpu_shape_from_replica_info', None)
+        raw_free = self.free_reserved_slots_by_accelerator
+        configured_shapes = self.configured_accelerator_shapes
         if (not isinstance(raw_free, dict) or not raw_free or
                 not isinstance(configured_shapes, dict) or
-                not configured_shapes or not callable(shape_resolver)):
-            return 0, None
-        shape_resolver_fn = typing.cast(
-            typing.Callable[['replica_managers.ReplicaInfo'], tuple[str, int]],
-            shape_resolver)
+                not configured_shapes or
+                not self._supports_exact_fill_shape_resolution()):
+            return 0, None, None
         canonical_by_name = {
             str(card).casefold(): str(card) for card in configured_shapes
         }
@@ -931,14 +1527,14 @@ class Autoscaler:
             if (info.is_terminal or info.version != self.latest_version or
                     _replica_is_retiring_card_supply(info)):
                 continue
-            raw_card, _ = shape_resolver_fn(  # pylint: disable=not-callable
-                info)
+            raw_card, _ = self._resolve_fill_gpu_shape(info)
             card = canonical_by_name.get(str(raw_card).casefold())
             if card is not None:
                 current_capacity_by_card[card] += self._fill_capacity_units(
                     info)
 
         claimed = 0
+        claimed_by_card: dict[str, int] = {}
 
         def claim(card: str, count: int) -> None:
             nonlocal claimed
@@ -946,6 +1542,9 @@ class Autoscaler:
             consumed = min(available, max(0, count))
             remaining_free[card] = available - consumed
             claimed += consumed
+            if consumed > 0:
+                claimed_by_card[card] = (claimed_by_card.get(card, 0) +
+                                         consumed)
 
         for decision in decisions:
             if decision.operator != AutoscalerDecisionOperator.SCALE_UP:
@@ -981,7 +1580,411 @@ class Autoscaler:
                     0,
                     int(raw_target) - current_capacity_by_card.get(card, 0))
                 claim(card, math.ceil(shortfall / gpu_count))
-        return claimed, remaining_free
+        return claimed, remaining_free, claimed_by_card
+
+    def _fresh_pool_fill_free_slots(self, state: _PoolFillState) -> int:
+        if state.snapshot_time is None:
+            return 0
+        max_age = (reserved_capacity.poll_interval_seconds() *
+                   constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
+        if time.time() - state.snapshot_time > max_age:
+            return 0
+        return min(state.edge_cap, state.free_slots)
+
+    def _exact_card_pool_shelter(
+        self,
+        data: dict[str, dict[str, Any]],
+        targets: dict[str, int],
+        ordered_keys: list[str],
+    ) -> tuple[dict[str, dict[str, int]], dict[int, str]] | None:
+        """Partition exact-card demand coverage independently by pool."""
+        demand_target = self.target_num_replicas_by_accelerator
+        configured_shapes = self.configured_accelerator_shapes
+        if (not isinstance(demand_target, dict) or
+                not isinstance(configured_shapes, dict) or
+                not configured_shapes or
+                not self._compatibility_demand_complete):
+            return None
+        canonical_by_name = {
+            str(card).casefold(): str(card) for card in configured_shapes
+        }
+        demand_by_card: dict[str, int] = {}
+        for raw_card, raw_target in demand_target.items():
+            card = canonical_by_name.get(str(raw_card).casefold())
+            if card is None:
+                return None
+            demand_by_card[card] = max(0, int(raw_target))
+        if sum(demand_by_card.values()) != self.get_final_target_num_replicas():
+            return None
+
+        replica_cards: dict[int, str] = {}
+        targets_by_pool_card: dict[str, dict[str, int]] = {}
+        for pool_key in ordered_keys:
+            current_by_card: dict[str, int] = {}
+            for info in data[pool_key]['infos']:
+                location = info.get_spot_location()
+                accelerators = (location.accelerators
+                                if location is not None else None)
+                if not accelerators or len(accelerators) != 1:
+                    return None
+                raw_card = next(iter(accelerators))
+                card = canonical_by_name.get(str(raw_card).casefold())
+                if card is None:
+                    return None
+                replica_cards[info.replica_id] = card
+                current_by_card[card] = (current_by_card.get(card, 0) +
+                                         self._fill_capacity_units(info))
+            remaining = targets[pool_key]
+            pool_targets: dict[str, int] = {}
+            for configured_card in configured_shapes:
+                card = canonical_by_name[str(configured_card).casefold()]
+                assigned = min(remaining, current_by_card.get(card, 0))
+                if assigned > 0:
+                    pool_targets[card] = assigned
+                    remaining -= assigned
+                if remaining <= 0:
+                    break
+            targets_by_pool_card[pool_key] = pool_targets
+
+        shelter: dict[str, dict[str, int]] = {
+            pool_key: {} for pool_key in ordered_keys
+        }
+        for configured_card in configured_shapes:
+            card = canonical_by_name[str(configured_card).casefold()]
+            remaining_demand = demand_by_card.get(card, 0)
+            for pool_key in ordered_keys:
+                target = targets_by_pool_card[pool_key].get(card, 0)
+                covered = min(target, remaining_demand)
+                remaining_demand -= covered
+                quota = target - covered
+                if quota > 0:
+                    shelter[pool_key][card] = quota
+        return shelter, replica_cards
+
+    def _apply_reserved_capacity_fill_v2(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        decisions: list[AutoscalerDecision],
+        states: dict[str, _PoolFillState],
+    ) -> list[AutoscalerDecision]:
+        """Apply independently fenced pool feeds under one service ceiling."""
+        if not states:
+            return decisions
+        ordered_keys = list(states)
+        generations = {state.service_generation for state in states.values()}
+        if len(generations) != 1:
+            # A complete poll publication may never mix budgets. Fail closed
+            # if corrupted in-memory state reaches a decision tick.
+            logger.error('Reserved-fill protocol-v2 state mixes service '
+                         f'generations {generations}; feeding zero.')
+            return decisions
+
+        data: dict[str, dict[str, Any]] = {
+            key: {
+                'count': 0,
+                'latest': 0,
+                'occupying': 0,
+                'demand': 0,
+                'demand_latest': 0,
+                'infos': [],
+            } for key in ordered_keys
+        }
+        num_nonterminal = 0
+        num_latest_nonterminal = 0
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            units = self._fill_capacity_units(info)
+            num_nonterminal += units
+            is_latest = info.version == self.latest_version
+            if is_latest:
+                num_latest_nonterminal += units
+            pool_key = self._fill_pool_key_for_replica(info, states)
+            if pool_key is None:
+                continue
+            entry = data[pool_key]
+            entry['infos'].append(info)
+            entry['count'] += units
+            if is_latest:
+                entry['latest'] += units
+            state = states[pool_key]
+            created_at = info.created_at
+            if (not info.is_ready or
+                (state.snapshot_time is not None and created_at is not None and
+                 created_at > state.snapshot_time)):
+                entry['occupying'] += units
+            if not info.reserved_fill:
+                entry['demand'] += units
+                if is_latest:
+                    entry['demand_latest'] += units
+
+        spendable: dict[str, int] = {
+            key: max(
+                0,
+                self._fresh_pool_fill_free_slots(states[key]) -
+                int(data[key]['occupying'])) for key in ordered_keys
+        }
+        # Ordinary decisions are emitted before this overlay and may consume
+        # a just-observed reserved slot. Debit each exact-card claim only from
+        # pools that can serve that card. If several contexts expose the same
+        # card, the ordinary decision does not yet carry its eventual context;
+        # debit the claim from every compatible pool. This intentionally
+        # withholds some fill while placement is ambiguous, but guarantees that
+        # whichever context demand selects cannot receive both the demand launch
+        # and fill for the same physical slot.
+        (_, remaining_global_free_by_card, demand_reserved_claims_by_card) = (
+            self._reserved_slots_claimed_by_demand(replica_infos, decisions))
+        pool_cards: dict[str, frozenset[str]] = {}
+        pool_shapes: dict[str, dict[str, tuple[str, int]] | None] = {}
+        pool_exact_slots: dict[str, dict[str, int] | None] = {}
+        for key in ordered_keys:
+            try:
+                identity = reserved_capacity_broker.parse_pool_identity(key)
+            except (TypeError, ValueError):
+                logger.error('Reserved-fill protocol-v2 state has a malformed '
+                             f'pool key {key!r}; feeding it zero.')
+                spendable[key] = 0
+                pool_shapes[key] = None
+                pool_exact_slots[key] = {}
+                continue
+            if identity.protocol_version != 2:
+                logger.error('Reserved-fill protocol-v2 state has a non-v2 '
+                             f'pool key {key!r}; feeding it zero.')
+                spendable[key] = 0
+                pool_shapes[key] = None
+                pool_exact_slots[key] = {}
+                continue
+            pool_cards[key] = frozenset(identity.gpu_names)
+            shapes = self._exact_launch_shapes_for_pool(states[key])
+            pool_shapes[key] = shapes
+            exact_slots = states[key].free_slots_by_accelerator
+            if exact_slots is None:
+                pool_exact_slots[key] = None
+            elif (shapes is None or
+                  any(card not in shapes for card in exact_slots)):
+                # A present per-card feed is authoritative. If it cannot be
+                # translated back to an exact task shape, never degrade it to
+                # an aggregate launch.
+                logger.error('Reserved-fill protocol-v2 exact-card feed does '
+                             f'not match pool locations for {key!r}; '
+                             'withholding its launches.')
+                pool_exact_slots[key] = {}
+                spendable[key] = 0
+            else:
+                pool_exact_slots[key] = dict(exact_slots)
+        if demand_reserved_claims_by_card:
+            for card, claimed_slots in demand_reserved_claims_by_card.items():
+                canonical_card = str(card).casefold()
+                for key in ordered_keys:
+                    if canonical_card not in pool_cards.get(key, frozenset()):
+                        continue
+                    spendable[key] = max(0, spendable[key] - claimed_slots)
+                    exact_slots = pool_exact_slots[key]
+                    if exact_slots is not None:
+                        exact_slots[canonical_card] = max(
+                            0,
+                            exact_slots.get(canonical_card, 0) - claimed_slots)
+
+        targets: dict[str, int] = {}
+        launch_targets: dict[str, int] = {}
+        for key in ordered_keys:
+            state = states[key]
+            entry = data[key]
+            ceiling = state.shelter_grant + int(entry['demand'])
+            launch_ceiling = state.grant + int(entry['demand_latest'])
+            targets[key] = min(
+                int(entry['count']) + spendable[key], ceiling,
+                self.max_replicas)
+            launch_targets[key] = min(
+                int(entry['latest']) + spendable[key], launch_ceiling,
+                self.max_replicas)
+            state.fill_target = targets[key]
+
+        remaining_target_budget = self.max_replicas
+        for key in ordered_keys:
+            targets[key] = min(targets[key], remaining_target_budget)
+            remaining_target_budget -= targets[key]
+
+        total_target = sum(targets.values())
+        self._fill_target = total_target
+        with self._fill_pool_state_lock:
+            for key, target in targets.items():
+                live = self._fill_pool_states.get(key)
+                if (live is not None and live.service_generation
+                        == states[key].service_generation):
+                    live.fill_target = target
+        result = list(decisions)
+
+        # Partition the exact v1 shelter equation over pools. When complete
+        # exact-card demand telemetry exists, run the same coverage equation
+        # independently per card before the stable pool pass.
+        exact_shelter = self._exact_card_pool_shelter(data, targets,
+                                                      ordered_keys)
+        shelter_quota: dict[str, int] = {}
+        if exact_shelter is None:
+            remaining_demand = min(self.get_final_target_num_replicas(),
+                                   sum(targets.values()))
+            for key in ordered_keys:
+                covered = min(targets[key], remaining_demand)
+                remaining_demand -= covered
+                shelter_quota[key] = max(0, targets[key] - covered)
+
+        id_to_info = {info.replica_id: info for info in replica_infos}
+        victims_by_pool: dict[str, list[int]] = {key: [] for key in ordered_keys}
+        for index, decision in enumerate(decisions):
+            if decision.operator != AutoscalerDecisionOperator.SCALE_DOWN:
+                continue
+            assert isinstance(decision.target, (int, LogicalScaleDownTarget))
+            victim = id_to_info.get(_scale_down_replica_id(decision.target))
+            if victim is None:
+                continue
+            pool_key = self._fill_pool_key_for_replica(victim, states)
+            if pool_key is not None:
+                victims_by_pool[pool_key].append(index)
+        suppressed: set[int] = set()
+        for key in ordered_keys:
+            if exact_shelter is not None:
+                quotas_by_card, replica_cards = exact_shelter
+                remaining_by_card = dict(quotas_by_card[key])
+                for index in reversed(victims_by_pool[key]):
+                    victim_target = decisions[index].target
+                    assert isinstance(victim_target,
+                                      (int, LogicalScaleDownTarget))
+                    victim = id_to_info[_scale_down_replica_id(victim_target)]
+                    card = replica_cards[victim.replica_id]
+                    if remaining_by_card.get(card, 0) <= 0:
+                        continue
+                    suppressed.add(index)
+                    remaining_by_card[card] = max(
+                        0, remaining_by_card[card] -
+                        self._fill_capacity_units(victim))
+            else:
+                remaining = shelter_quota[key]
+                for index in reversed(victims_by_pool[key]):
+                    if remaining <= 0:
+                        break
+                    victim_target = decisions[index].target
+                    assert isinstance(victim_target,
+                                      (int, LogicalScaleDownTarget))
+                    victim = id_to_info[_scale_down_replica_id(victim_target)]
+                    suppressed.add(index)
+                    remaining -= self._fill_capacity_units(victim)
+        if suppressed:
+            result = [
+                decision for index, decision in enumerate(decisions)
+                if index not in suppressed
+            ]
+
+        num_old_nonterminal = num_nonterminal - num_latest_nonterminal
+        demand_target = self.get_final_target_num_replicas()
+        planned_total = (num_old_nonterminal +
+                         max(num_latest_nonterminal, demand_target))
+        hard_headroom = max(0, self.max_replicas - planned_total)
+        emitted_by_pool: dict[str, int] = {key: 0 for key in ordered_keys}
+        emitted_by_pool_card: dict[str, dict[str, int]] = {
+            key: {} for key in ordered_keys
+        }
+        # Additive round compatibility: a round written before the broker
+        # persisted its exact-card split still carries valid aggregate
+        # authority.  If this autoscaler independently has exact-card
+        # telemetry, use one shared, debit-aware budget across every legacy
+        # pool instead of multiplying it once per pool.  With no exact
+        # telemetry at all, retain the old unshaped launch behavior.
+        global_exact_slots: dict[str, int] | None = None
+        if remaining_global_free_by_card is not None:
+            global_exact_slots = {}
+            for raw_card, raw_count in remaining_global_free_by_card.items():
+                if (isinstance(raw_card, str) and raw_card and
+                        not isinstance(raw_count, bool) and
+                        isinstance(raw_count, int) and raw_count >= 0):
+                    card = raw_card.casefold()
+                    global_exact_slots[card] = (
+                        global_exact_slots.get(card, 0) + raw_count)
+        for key in ordered_keys:
+            if hard_headroom <= 0:
+                break
+            entry = data[key]
+            desired = max(0, launch_targets[key] - int(entry['latest']))
+            count = min(desired, hard_headroom)
+            if count <= 0:
+                continue
+            state = states[key]
+            override: dict[str, Any] = {
+                constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True,
+                constants.RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY:
+                    state.protocol_version,
+                constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY: key,
+                constants.RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY:
+                    state.service_generation,
+                constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY:
+                    state.physical_cluster_uid,
+                constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY: [
+                    location.to_pickleable()
+                    for location in state.zero_cost_locations
+                ],
+            }
+            if state.grant_epoch is not None:
+                override[constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY] = (
+                    state.grant_epoch)
+            exact_slots = pool_exact_slots[key]
+            if exact_slots is None and global_exact_slots is not None:
+                exact_slots = global_exact_slots
+            if exact_slots is None:
+                # No exact-card measurement exists in either authority path.
+                # This is the compatibility behavior for an old v2 round.
+                result.extend(_generate_scale_up_decisions(count, override))
+                emitted_by_pool[key] = count
+                hard_headroom -= count
+                continue
+
+            shapes = pool_shapes[key]
+            if shapes is None:
+                # A present exact-card budget is authoritative.  If it cannot
+                # be expressed as one of this pool's exact location shapes,
+                # never silently fall back to an aggregate launch.
+                continue
+            remaining = count
+            for card, (display_card, gpu_count) in shapes.items():
+                if remaining <= 0 or hard_headroom <= 0:
+                    break
+                available = max(0, int(exact_slots.get(card, 0)))
+                shaped_count = min(remaining, hard_headroom, available)
+                if shaped_count <= 0:
+                    continue
+                shaped_override = dict(override)
+                shaped_override['accelerators'] = {display_card: gpu_count}
+                result.extend(
+                    _generate_scale_up_decisions(shaped_count, shaped_override))
+                exact_slots[card] = available - shaped_count
+                emitted_by_pool_card[key][card] = (
+                    emitted_by_pool_card[key].get(card, 0) + shaped_count)
+                emitted_by_pool[key] += shaped_count
+                remaining -= shaped_count
+                hard_headroom -= shaped_count
+
+        if any(emitted_by_pool.values()):
+            with self._fill_pool_state_lock:
+                for key, emitted in emitted_by_pool.items():
+                    if emitted <= 0:
+                        continue
+                    live = self._fill_pool_states.get(key)
+                    source = states[key]
+                    if (live is None or live.service_generation
+                            != source.service_generation):
+                        continue
+                    live.free_slots = max(0, live.free_slots - emitted)
+                    if live.last_raw_free_slots is not None:
+                        live.last_raw_free_slots = max(
+                            0, live.last_raw_free_slots - emitted)
+                    if live.free_slots_by_accelerator is not None:
+                        for card, card_emitted in emitted_by_pool_card[
+                                key].items():
+                            live.free_slots_by_accelerator[card] = max(
+                                0,
+                                live.free_slots_by_accelerator.get(card, 0) -
+                                card_emitted)
+                self._refresh_legacy_fill_projection_locked()
+        return result
 
     def _apply_reserved_capacity_fill(
         self,
@@ -1018,6 +2021,10 @@ class Autoscaler:
         """
         if not self.reserved_capacity_fill:
             return decisions
+        pool_states = self._pool_fill_states_snapshot()
+        if pool_states:
+            return self._apply_reserved_capacity_fill_v2(
+                replica_infos, decisions, pool_states)
         # Zero-cost accounting is version-asymmetric by design; the
         # four roles use different version scopes:
         # - LAUNCH TARGET: latest-version zero-cost rows only. Old-version
@@ -1079,7 +2086,7 @@ class Autoscaler:
                 # split in count_zero_cost_holdings): they keep their
                 # shelter but stay ceiling-exempt until natural churn
                 # replaces them with flagged rows.
-                if not getattr(info, 'reserved_fill', False):
+                if not info.reserved_fill:
                     zero_cost_demand_placed += capacity_units
                     if is_latest:
                         zero_cost_demand_placed_latest += capacity_units
@@ -1192,9 +2199,8 @@ class Autoscaler:
             # rolling update.
             fill_target_launch = min(fill_target_launch, fill_ceiling_launch)
         desired_fill_up = max(0, fill_target_launch - zero_cost_latest)
-        (demand_reserved_claims,
-         remaining_free_by_card) = self._reserved_slots_claimed_by_demand(
-             replica_infos, decisions)
+        (demand_reserved_claims, remaining_free_by_card,
+         _) = self._reserved_slots_claimed_by_demand(replica_infos, decisions)
         desired_fill_up = max(0, desired_fill_up - demand_reserved_claims)
         if remaining_free_by_card is not None:
             desired_fill_up = min(desired_fill_up,
@@ -1204,6 +2210,25 @@ class Autoscaler:
                          max(num_latest_nonterminal, demand_target))
         hard_ceiling_headroom = max(0, self.max_replicas - planned_total)
         num_fill_up = min(desired_fill_up, hard_ceiling_headroom)
+        if num_fill_up <= 0 and self._fill_grant:
+            # A pool that is granted capacity but launches nothing is
+            # indistinguishable from a pool with nothing to launch, because
+            # the success line below is the only one emitted. That ambiguity
+            # cost a full debugging session against a fleet holding one
+            # replica while the broker fed it thirty. Name the term that is
+            # actually zero.
+            snapshot_age = (None if self._fill_snapshot_time is None else round(
+                time.time() - self._fill_snapshot_time, 1))
+            logger.info(
+                f'Reserved-capacity fill: no launch. spendable free slots '
+                f'{spendable_free_slots} (raw feed {self._fill_free_slots}, '
+                f'fresh {self._fresh_fill_free_slots()}, snapshot age '
+                f'{snapshot_age}s, zero-cost occupying '
+                f'{zero_cost_occupying}), desired {desired_fill_up}, '
+                f'launch target {fill_target_launch}, latest zero-cost '
+                f'{zero_cost_latest}, grant {self._fill_grant}, ceiling '
+                f'{fill_ceiling_launch}, demand target {demand_target}, '
+                f'hard-ceiling headroom {hard_ceiling_headroom}.')
         if num_fill_up > 0:
             logger.info(f'Reserved-capacity fill: launch target '
                         f'{fill_target_launch} (latest zero-cost replicas '
@@ -1231,12 +2256,24 @@ class Autoscaler:
                     fill_override[
                         constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY] = (
                             self._fill_grant_pool_key)
+                    fill_override[
+                        constants.
+                        RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY] = (
+                            self._fill_protocol_version)
+                    fill_override[
+                        constants.
+                        RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY] = (
+                            self._fill_service_generation)
+                    if self._fill_physical_cluster_uid is not None:
+                        fill_override[
+                            constants.
+                            RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY] = (
+                                self._fill_physical_cluster_uid)
             if remaining_free_by_card is None:
                 result.extend(
                     _generate_scale_up_decisions(num_fill_up, fill_override))
             else:
-                configured_shapes = getattr(self,
-                                            'configured_accelerator_shapes', {})
+                configured_shapes = self.configured_accelerator_shapes
                 remaining = num_fill_up
                 for card, raw_gpu_count in configured_shapes.items():
                     if remaining <= 0:
@@ -1305,19 +2342,19 @@ class Autoscaler:
             'target_num_replicas': self.target_num_replicas,
             'min_replicas': self.min_replicas,
             'max_replicas': self.max_replicas,
-            'min_replicas_by_accelerator': dict(
-                getattr(self, 'min_replicas_by_accelerator', {})),
+            'min_replicas_by_accelerator': dict(self.min_replicas_by_accelerator
+                                               ),
             'target_num_replicas_by_accelerator': dict(
-                getattr(self, 'target_num_replicas_by_accelerator', {})),
+                self.target_num_replicas_by_accelerator),
             'demand_target_by_accelerator': dict(
-                getattr(self, 'target_num_replicas_by_accelerator', {})),
+                self.target_num_replicas_by_accelerator),
             'warm_retention_target_by_accelerator': dict(
-                getattr(self, 'warm_retention_target_by_accelerator', {})),
+                self.warm_retention_target_by_accelerator),
             'cold_launch_authority_by_accelerator': dict(
-                getattr(self, 'cold_launch_authority_by_accelerator', {})),
+                self.cold_launch_authority_by_accelerator),
         }
-        request_timestamps = getattr(self, 'request_timestamps', None)
-        request_window_seconds = getattr(self, 'qps_window_size', None)
+        request_timestamps = self.request_timestamps
+        request_window_seconds = self.qps_window_size
         if (isinstance(request_timestamps, list) and
                 isinstance(request_window_seconds, int) and
                 request_window_seconds > 0):
@@ -1340,6 +2377,23 @@ class Autoscaler:
                 'fill_snapshot_age': snapshot_age,
                 'fill_target': self._fill_target,
             })
+            pool_states = self._pool_fill_states_snapshot()
+            if pool_states:
+                now = time.time()
+                info['fill_by_pool'] = {
+                    pool_key: {
+                        'free_slots': state.free_slots,
+                        'snapshot_age':
+                            (None if state.snapshot_time is None else now -
+                             state.snapshot_time),
+                        'fill_target': state.fill_target,
+                        'edge_cap': state.edge_cap,
+                        'grant': state.grant,
+                        'shelter_grant': state.shelter_grant,
+                        'service_generation': state.service_generation,
+                        'physical_cluster_uid': state.physical_cluster_uid,
+                    } for pool_key, state in pool_states.items()
+                }
         return info
 
     def get_ready_replica_capacity(self,
@@ -1379,9 +2433,9 @@ class Autoscaler:
         # TODO(MaoZiming): use NAME to get the class.
         if spec.pool:
             return QueueLengthAutoscaler(service_name, spec, version)
-        # getattr: keep from_spec robust against spec objects predating the
-        # concurrency knob (e.g. specs unpickled from old DB rows).
-        elif getattr(spec, 'target_concurrency_per_replica', None) is not None:
+        # SkyServiceSpec.__setstate__ materializes the concurrency knob for
+        # specs unpickled from old DB rows.
+        elif spec.target_concurrency_per_replica is not None:
             # Checked before the qps branches: the knob is mutually
             # exclusive with target_qps_per_replica (validated at spec
             # load), so a set knob unambiguously selects concurrency-based
@@ -1523,8 +2577,7 @@ class Autoscaler:
         by_id = {info.replica_id: info for info in replica_infos}
         pairs: dict[int, replica_managers.ReplicaInfo] = {}
         for replacement in replica_infos:
-            victim_id = getattr(replacement, 'cost_rebalance_for_replica_id',
-                                None)
+            victim_id = replacement.cost_rebalance_for_replica_id
             if victim_id is None or replacement.is_terminal:
                 continue
             victim = by_id.get(victim_id)
@@ -1587,8 +2640,7 @@ class Autoscaler:
         if placer is None:
             return None
         if (self.reserved_capacity_fill and
-            (getattr(incumbent, 'reserved_fill', False) or
-             getattr(incumbent, 'is_zero_cost', False))):
+            (incumbent.reserved_fill or incumbent.is_zero_cost is True)):
             # The reserved-fill controller exclusively owns convergence to
             # free capacity. Generic rebalance handles paid-to-paid movement.
             return None
@@ -1665,21 +2717,18 @@ class Autoscaler:
             if self.cost_rebalance and replacement_preserves_policy:
                 if (replacement.is_ready and
                         not _replica_is_retiring_card_supply(replacement) and
-                        getattr(victim.status_property, 'sky_down_status',
-                                None) is None):
+                        victim.status_property.sky_down_status is None):
                     decisions.extend(
                         _generate_scale_down_decisions(
                             [victim.replica_id],
                             reason=AutoscalerDecisionReason.COST_REBALANCE))
             elif (replacement.is_ready and
-                  getattr(replacement.status_property, 'sky_down_status',
-                          None) is None):
+                  replacement.status_property.sky_down_status is None):
                 decisions.extend(
                     _generate_scale_down_decisions(
                         [replacement.replica_id],
                         reason=AutoscalerDecisionReason.COST_REBALANCE))
-            elif getattr(replacement.status_property, 'sky_down_status',
-                         None) is None:
+            elif replacement.status_property.sky_down_status is None:
                 decisions.extend(
                     _generate_scale_down_decisions([replacement.replica_id]))
 
@@ -1882,7 +2931,37 @@ class Autoscaler:
         # one decision tick with suppression off could terminate the whole
         # fill fleet. Nested under a single key (in pickleable form) so
         # subclass _load_dynamic_states leftover-logging never sees it.
+        with self._fill_pool_state_lock:
+            fill_state_version = 2 if self._fill_pool_states else 1
+            # Capture the version discriminator and complete v2 pool map from
+            # one critical section. A poller map swap between two independent
+            # reads must not produce a v1 discriminator with v2 contents (or
+            # vice versa).
+            dumped_pools = {
+                key: {
+                    'protocol_version': pool.protocol_version,
+                    'physical_cluster_uid': pool.physical_cluster_uid,
+                    'service_generation': pool.service_generation,
+                    'edge_cap': pool.edge_cap,
+                    # This is non-launching restart shelter only. Feed is never
+                    # restored and the epoch remains DB-authoritative.
+                    'shelter_grant': max(0,
+                                         min(pool.edge_cap,
+                                             pool.shelter_grant)),
+                    'zero_cost_location_keys': [
+                        location.to_pickleable()
+                        for location in pool.zero_cost_locations
+                    ],
+                    'snapshot_time': pool.snapshot_time,
+                } for key, pool in self._fill_pool_states.items()
+            }
         states['reserved_capacity_fill_state'] = {
+            'version': fill_state_version,
+            # A brokered feed is round authority, not durable autoscaler
+            # state. Preserve standalone pre-broker behavior, but make every
+            # brokered v1 swap fail closed until its poller republishes.
+            'broker_authority': (self._fill_grant_pool_key is not None or
+                                 self._fill_grant_epoch is not None),
             'fill_free_slots': self._fill_free_slots,
             'fill_last_raw_free_slots': self._fill_last_raw_free_slots,
             'fill_zero_cost_location_keys': [
@@ -1890,6 +2969,11 @@ class Autoscaler:
                 for location in self._fill_zero_cost_locations
             ],
             'fill_snapshot_time': self._fill_snapshot_time,
+            # Grants/epochs remain DB-authoritative and are deliberately not
+            # restored. Locations and identity are enough to protect existing
+            # replicas during an in-process autoscaler swap; feed resumes only
+            # after the poller publishes an exact-generation round.
+            'pools': dumped_pools,
         }
         states.update(self._dump_dynamic_states())
         return states
@@ -1899,12 +2983,17 @@ class Autoscaler:
         self.latest_version_ever_ready = dynamic_states.pop(
             'latest_version_ever_ready', constants.INITIAL_VERSION)
         # Absent in dumps from builds predating the fill feature: keep
-        # the constructor defaults (empty snapshot).
+        # the constructor defaults (empty snapshot). A disabled destination
+        # is also a lifecycle boundary: do not restore authority that a later
+        # re-enable could mistake for its newly created claim.
         fill_state = dynamic_states.pop('reserved_capacity_fill_state', None)
-        if fill_state is not None:
-            self._fill_free_slots = fill_state.get('fill_free_slots', 0)
-            self._fill_last_raw_free_slots = fill_state.get(
-                'fill_last_raw_free_slots')
+        if fill_state is not None and self.reserved_capacity_fill:
+            broker_authority = bool(fill_state.get('broker_authority', True))
+            self._fill_free_slots = (0 if broker_authority else max(
+                0, int(fill_state.get('fill_free_slots', 0))))
+            self._fill_last_raw_free_slots = (
+                None if broker_authority else
+                fill_state.get('fill_last_raw_free_slots'))
             self._fill_zero_cost_locations = [
                 location for location in
                 (spot_placer.Location.from_pickleable(key)
@@ -1912,6 +3001,108 @@ class Autoscaler:
                 if location is not None
             ]
             self._fill_snapshot_time = fill_state.get('fill_snapshot_time')
+            if fill_state.get('version') == 2:
+                restored: dict[str, _PoolFillState] = {}
+                restored_contexts: set[str] = set()
+                restored_cards_by_uid: dict[str, set[str]] = {}
+                restored_generations: set[int] = set()
+                for pool_key, raw_pool in fill_state.get('pools', {}).items():
+                    try:
+                        if (not isinstance(pool_key, str) or
+                                not isinstance(raw_pool, dict)):
+                            continue
+                        identity = reserved_capacity_broker.parse_pool_identity(
+                            pool_key)
+                        if identity.protocol_version != 2:
+                            continue
+                        canonical_pool_key = (
+                            reserved_capacity_broker.make_pool_key(
+                                '',
+                                identity.gpu_names,
+                                protocol_version=(
+                                    reserved_capacity_broker.PROTOCOL_V2),
+                                physical_cluster_uid=(
+                                    identity.physical_cluster_uid)))
+                        raw_protocol_version = raw_pool['protocol_version']
+                        raw_physical_uid = raw_pool['physical_cluster_uid']
+                        raw_generation = raw_pool['service_generation']
+                        raw_edge_cap = raw_pool['edge_cap']
+                        if (pool_key != canonical_pool_key or
+                                isinstance(raw_protocol_version, bool) or
+                                not isinstance(raw_protocol_version, int) or
+                                raw_protocol_version != 2 or
+                                not isinstance(raw_physical_uid, str) or
+                                not raw_physical_uid or raw_physical_uid
+                                != identity.physical_cluster_uid or
+                                isinstance(raw_generation, bool) or
+                                not isinstance(raw_generation, int) or
+                                raw_generation < 1 or
+                                isinstance(raw_edge_cap, bool) or
+                                not isinstance(raw_edge_cap, int) or
+                                raw_edge_cap < 0):
+                            continue
+                        locations = self._parse_reserved_fill_pool_locations(
+                            identity, raw_pool.get('zero_cost_location_keys'))
+                        restored_edge_cap = raw_edge_cap
+                        raw_snapshot_time = raw_pool.get('snapshot_time')
+                        if (isinstance(raw_snapshot_time, bool) or
+                                not isinstance(raw_snapshot_time,
+                                               (int, float)) or
+                                not math.isfinite(raw_snapshot_time) or
+                                raw_snapshot_time < 0 or
+                                raw_snapshot_time > time.time() +
+                                _RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS):
+                            continue
+                        raw_shelter_grant = raw_pool.get('shelter_grant')
+                        if (isinstance(raw_shelter_grant, bool) or
+                                not isinstance(raw_shelter_grant, int) or
+                                raw_shelter_grant < 0):
+                            # Protocol v2 did not exist before this dump field.
+                            # Missing/malformed authority is corruption, not a
+                            # compatibility shape: retain location identity but
+                            # fail closed to zero shelter.
+                            restored_shelter_grant = 0
+                        else:
+                            restored_shelter_grant = min(
+                                restored_edge_cap, raw_shelter_grant)
+                        context = locations[0].region
+                        physical_cards = restored_cards_by_uid.setdefault(
+                            raw_physical_uid, set())
+                        if (context in restored_contexts or
+                                physical_cards.intersection(
+                                    identity.gpu_names)):
+                            # A restored complete-map conflict has no
+                            # deterministic authoritative subset. Drop the
+                            # whole map rather than making shelter depend on
+                            # serialized edge order.
+                            restored = {}
+                            break
+                        restored_contexts.add(context)
+                        physical_cards.update(identity.gpu_names)
+                        restored_generations.add(raw_generation)
+                        restored[str(pool_key)] = _PoolFillState(
+                            protocol_version=raw_protocol_version,
+                            pool_key=pool_key,
+                            physical_cluster_uid=raw_physical_uid,
+                            service_generation=raw_generation,
+                            edge_cap=restored_edge_cap,
+                            # Feed and epoch fail closed across the swap. The
+                            # prior real grant remains a shelter-only ceiling;
+                            # with zero feed it authorizes no launch.
+                            free_slots=0,
+                            last_raw_free_slots=None,
+                            zero_cost_locations=locations,
+                            snapshot_time=float(raw_snapshot_time),
+                            shelter_grant=restored_shelter_grant,
+                            grant=0,
+                            grant_epoch=None)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                if len(restored_generations) > 1:
+                    restored = {}
+                with self._fill_pool_state_lock:
+                    self._fill_pool_states = restored
+                    self._refresh_legacy_fill_projection_locked()
         self._load_dynamic_states(dynamic_states)
 
 
@@ -2170,16 +3361,25 @@ class _GpuShapeResolverMixin:
     # rules as the shape cache). Backs cost-aware victim ordering in both
     # shape-aware autoscalers.
     _replica_cost_cache: dict[int, float]
+    configured_accelerator_shapes: dict[str, int]
     # Immutable per-decision legacy handle snapshot, populated before the
     # autoscaler state lock is acquired.
     _gpu_shape_handles_for_tick: dict[int, Any] | None
+
+    def _supports_exact_fill_shape_resolution(self) -> bool:
+        return True
+
+    def _resolve_fill_gpu_shape(
+            self, info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
+        """Expose exact GPU shapes to the shared reserved-fill overlay."""
+        return self._get_gpu_shape_from_replica_info(info)
 
     @staticmethod
     def _gpu_shape_from_resources_override(
             replica_info: 'replica_managers.ReplicaInfo'
     ) -> tuple[str, int] | None:
         """Return the exact shape carried by a replica launch override."""
-        resources_override = getattr(replica_info, 'resources_override', None)
+        resources_override = replica_info.resources_override
         if not isinstance(resources_override, dict):
             return None
         accelerators = resources_override.get('accelerators')
@@ -2223,7 +3423,7 @@ class _GpuShapeResolverMixin:
         ]
         if not uncached:
             return {}
-        tick_handles = getattr(self, '_gpu_shape_handles_for_tick', None)
+        tick_handles = self._gpu_shape_handles_for_tick
         if tick_handles is not None:
             return {
                 info.replica_id: tick_handles.get(info.replica_id)
@@ -2287,8 +3487,7 @@ class _GpuShapeResolverMixin:
         resolved = False
         try:
             if handle is _UNRESOLVED_HANDLE:
-                tick_handles = getattr(self, '_gpu_shape_handles_for_tick',
-                                       None)
+                tick_handles = self._gpu_shape_handles_for_tick
                 if tick_handles is not None:
                     handle = tick_handles.get(replica_info.replica_id)
                 else:
@@ -2321,8 +3520,7 @@ class _GpuShapeResolverMixin:
             gpu_type = 'unknown'
             gpu_count = 1
             if handle is _UNRESOLVED_HANDLE:
-                tick_handles = getattr(self, '_gpu_shape_handles_for_tick',
-                                       None)
+                tick_handles = self._gpu_shape_handles_for_tick
                 if tick_handles is not None:
                     handle = tick_handles.get(replica_info.replica_id,
                                               _UNRESOLVED_HANDLE)
@@ -2355,7 +3553,7 @@ class _GpuShapeResolverMixin:
         location: spot_placer.Location,
     ) -> bool:
         """Keep authoritative exact-card targets stable during rebalancing."""
-        configured_shapes = getattr(self, 'configured_accelerator_shapes', {})
+        configured_shapes = self.configured_accelerator_shapes
         if not configured_shapes:
             return True
         canonical_by_name = {
@@ -2979,7 +4177,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 continue
             if info.is_ready:
                 ready[card] += 1
-                if bool(getattr(info, 'is_zero_cost', False)):
+                if info.is_zero_cost is True:
                     ready_zero_cost[card] += 1
             else:
                 # Every nonterminal non-ready row is committed future
@@ -3026,20 +4224,17 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             self.request_timestamps) / self.qps_window_size
         candidate_target_by_accelerator: dict[str, int] | None = None
         latest_capacities: list[float] = []
-        configured_accelerator_shapes = getattr(
-            self, 'configured_accelerator_shapes', {})
-        has_exact_profiles = bool(
-            getattr(self, 'compatibility_profiles', []) or
-            getattr(self, 'queued_compatibility_profiles', []))
-        exact_profiles_available = (
-            has_exact_profiles and
-            (getattr(self, '_compatibility_demand_complete', False) or
-             not configured_accelerator_shapes))
+        configured_accelerator_shapes = self.configured_accelerator_shapes
+        has_exact_profiles = bool(self.compatibility_profiles or
+                                  self.queued_compatibility_profiles)
+        exact_profiles_available = (has_exact_profiles and
+                                    (self._compatibility_demand_complete or
+                                     not configured_accelerator_shapes))
         exact_arrival_qps = 0.0
         if exact_profiles_available:
             exact_arrival_qps = (sum(
                 float(profile.get('count', 1))
-                for profile in getattr(self, 'compatibility_profiles', [])) /
+                for profile in self.compatibility_profiles) /
                                  self.qps_window_size)
         # Completeness describes the current report and its replaceable
         # gauges. It cannot retroactively attribute aggregate arrivals from an
@@ -3048,7 +4243,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         aggregate_fallback_qps = max(
             0.0, num_requests_per_second - exact_arrival_qps)
         if (configured_accelerator_shapes or exact_profiles_available or
-                getattr(self, 'min_replicas_by_accelerator', {})):
+                self.min_replicas_by_accelerator):
             candidate_target_by_accelerator = (
                 self._calculate_target_by_accelerator(
                     replica_infos,
@@ -3085,9 +4280,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                     estimated_qps = max(target_qps_dict.values())
                 if estimated_qps > 0 and remaining_qps > 0:
                     raw_target_num += math.ceil(remaining_qps / estimated_qps)
-            raw_target_num = max(
-                raw_target_num,
-                sum(getattr(self, 'min_replicas_by_accelerator', {}).values()))
+            raw_target_num = max(raw_target_num,
+                                 sum(self.min_replicas_by_accelerator.values()))
             target_num_replicas = self._clip_target_num_replicas(raw_target_num)
         logger.info(f'Instance-aware autoscaling: '
                     f'requests/s: {num_requests_per_second}, '
@@ -3101,9 +4295,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         old_target_num_replicas = self.target_num_replicas
 
         target_map_changed = (candidate_target_by_accelerator is not None and
-                              candidate_target_by_accelerator != getattr(
-                                  self, 'target_num_replicas_by_accelerator',
-                                  {}))
+                              candidate_target_by_accelerator
+                              != self.target_num_replicas_by_accelerator)
         candidate_target_map = candidate_target_by_accelerator or {}
         apply_target = False
         if self._snap_target_on_next_recompute:
@@ -3129,9 +4322,9 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 self.downscale_counter = 0
                 apply_target = True
         elif (target_map_changed and any(
-                candidate_target_map.get(card, 0) > getattr(
-                    self, 'target_num_replicas_by_accelerator', {}).get(
-                        card, 0) for card in candidate_target_map)):
+                candidate_target_map.get(card, 0) >
+                self.target_num_replicas_by_accelerator.get(card, 0)
+                for card in candidate_target_map)):
             # A same-size exact-card migration is an upscale for hysteresis
             # purposes. A LOWER aggregate target is handled by the branch
             # above even when its card mix contains a positive delta: card
@@ -3572,23 +4765,20 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                  spec: 'service_spec.SkyServiceSpec',
                  version: int = constants.INITIAL_VERSION) -> None:
         super().__init__(service_name, spec, version)
-        target_concurrency = getattr(spec, 'target_concurrency_per_replica',
-                                     None)
+        target_concurrency = spec.target_concurrency_per_replica
         assert target_concurrency is not None, (
             'ConcurrencyAutoscaler requires target_concurrency_per_replica')
         # Per-GPU target concurrency; a replica's capacity in concurrency
         # units is this knob x its gpu_count.
         self.target_concurrency_per_replica: float = float(target_concurrency)
-        self.replica_unit: str = getattr(spec, 'replica_unit',
-                                         'physical_backend')
         self.target_utilization_percentage: int = int(
-            getattr(spec, 'target_utilization_percentage', 100))
-        self.expected_request_duration_seconds: float | None = getattr(
-            spec, 'expected_request_duration_seconds', None)
-        self.initial_provision_lead_time_seconds: float | str | None = getattr(
-            spec, 'initial_provision_lead_time_seconds', None)
-        self.adaptive_demand_estimation: bool = (getattr(
-            spec, 'adaptive_demand_estimation', True) is not False)
+            spec.target_utilization_percentage)
+        self.expected_request_duration_seconds: float | None = (
+            spec.expected_request_duration_seconds)
+        self.initial_provision_lead_time_seconds: float | str | None = (
+            spec.initial_provision_lead_time_seconds)
+        self.adaptive_demand_estimation: bool = (spec.adaptive_demand_estimation
+                                                 is not False)
         # Live demand-estimation state. Both estimators supersede their
         # configured counterpart only while they hold enough fresh evidence;
         # configuration remains the fallback and the cold-start value.
@@ -3602,26 +4792,26 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._provision_lead_at: float | None = None
         # Replica rows whose launch-to-ready has already been sampled.
         self._provision_lead_seen_replica_ids: set[int] = set()
-        self.max_scale_up_rate_percentage: int | None = getattr(
-            spec, 'max_scale_up_rate_percentage', None)
-        self.scale_up_rate_min_replicas: int | None = getattr(
-            spec, 'scale_up_rate_min_replicas', None)
-        self.scale_up_rate_period_seconds: int | None = getattr(
-            spec, 'scale_up_rate_period_seconds', None)
-        adaptive_scale_up = getattr(spec, 'adaptive_scale_up', None)
+        self.max_scale_up_rate_percentage: int | None = (
+            spec.max_scale_up_rate_percentage)
+        self.scale_up_rate_min_replicas: int | None = (
+            spec.scale_up_rate_min_replicas)
+        self.scale_up_rate_period_seconds: int | None = (
+            spec.scale_up_rate_period_seconds)
+        adaptive_scale_up = spec.adaptive_scale_up
         self.adaptive_scale_up: dict[str, Any] | None = (
             dict(adaptive_scale_up)
             if isinstance(adaptive_scale_up, dict) else None)
-        queue_config = getattr(spec, 'lb_request_queue', None) or {}
+        queue_config = spec.lb_request_queue or {}
         self._queue_timeout_seconds: float | None = queue_config.get(
             'timeout_seconds')
         self._queue_timeout_thresholds: tuple[tuple[int, float], ...] = tuple(
             (int(entry['min_priority']), float(entry['timeout_seconds']))
             for entry in queue_config.get('timeout_seconds_by_priority', ()))
         # SkyServiceSpec exposes 50 for new specs and restores 100 for old
-        # pickles. Attribute-less test/legacy objects preserve old behavior.
+        # pickles through __setstate__.
         self.max_scale_down_rate_percentage: int = int(
-            getattr(spec, 'max_scale_down_rate_percentage', 100))
+            spec.max_scale_down_rate_percentage)
         self._last_scale_up_wave_at: float | None = None
         # The timestamp opens a rollout window; this ceiling retains the
         # unspent part of that window when placement cannot make progress on
@@ -3769,6 +4959,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self._logical_card_transition_pending: bool = False
         self._logical_actuation_target_by_accelerator: dict[str, int] = {}
         self._logical_actuation_desired_by_accelerator: dict[str, int] = {}
+        # Explicit compatibility/floor ownership carried with the adopted
+        # demand map. A later empty history can retry that exact owned card,
+        # while synthesized aggregate padding remains distinguishable.
+        self._logical_adopted_explicit_target_by_accelerator: dict[str,
+                                                                   int] = {}
+        # Paid-launch ownership is distinct from compatibility proof. An
+        # aggregate minimum or headerless queued request may buy the cheapest
+        # compatible card without proving that old-version work can move to
+        # it during a rollout.
+        self._logical_adopted_paid_target_by_accelerator: dict[str, int] = {}
+        # Absolute paid capacity ceiling for the current actuation map. It is
+        # derived from the separately allocated/adopted ownership map; during
+        # rollout it also includes live same-card old-version backing. The
+        # decision generator subtracts latest committed supply to obtain the
+        # incremental launch authority.
+        self._logical_paid_launch_target_by_accelerator: dict[str, int] = {}
         if (self.replica_unit == 'logical' and
                 self.max_scale_up_rate_percentage is not None):
             # A cold logical service must enter through the configured slot
@@ -3811,6 +5017,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._logical_card_transition_pending = False
             self._logical_actuation_target_by_accelerator = {}
             self._logical_actuation_desired_by_accelerator = {}
+            self._logical_adopted_explicit_target_by_accelerator = {}
+            self._logical_adopted_paid_target_by_accelerator = {}
+            self._logical_paid_launch_target_by_accelerator = {}
             self._compatibility_demand_complete = False
         if not self.configured_accelerator_shapes:
             self.target_num_replicas_by_accelerator = {}
@@ -3823,6 +5032,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._logical_card_transition_pending = False
             self._logical_actuation_target_by_accelerator = {}
             self._logical_actuation_desired_by_accelerator = {}
+            self._logical_adopted_explicit_target_by_accelerator = {}
+            self._logical_adopted_paid_target_by_accelerator = {}
+            self._logical_paid_launch_target_by_accelerator = {}
             self._compatibility_demand_complete = False
             return
         floors = {
@@ -3840,6 +5052,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         while sum(canonical_target.values()) < self.target_num_replicas:
             canonical_target[first] = canonical_target.get(first, 0) + 1
         self.target_num_replicas_by_accelerator = canonical_target
+        self._logical_adopted_explicit_target_by_accelerator = {
+            card: min(canonical_target.get(card, 0),
+                      max(0, int(floors.get(card.casefold(), 0))))
+            for card in canonical_target
+            if floors.get(card.casefold(), 0) > 0
+        }
+        self._logical_adopted_paid_target_by_accelerator = dict(
+            canonical_target)
 
     def set_free_reserved_slots_by_accelerator(self, slots: dict[str,
                                                                  int]) -> None:
@@ -3989,13 +5209,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     continue
                 if not self._replica_on_zero_cost_location(info):
                     continue
-                if not getattr(info, 'reserved_fill', False):
+                if not info.reserved_fill:
                     # Demand-placed zero-cost rows are demand-protected and
                     # already exempt from the grant ceiling, so counting
                     # them here would inflate the need by capacity the gate
                     # can never reclaim anyway.
                     continue
-                if getattr(info, 'status', None) in pre_ready_statuses:
+                if info.status in pre_ready_statuses:
                     pre_ready += 1
                 elif self._replica_is_busy(info):
                     busy += 1
@@ -4330,7 +5550,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         try:
             spec = serve_state.get_spec(self._service_name, version)
             if spec is not None:
-                knob = getattr(spec, 'target_concurrency_per_replica', None)
+                knob = spec.target_concurrency_per_replica
         except Exception as e:  # pylint: disable=broad-except
             logger.warning('Failed to load spec for version '
                            f'{version}: {common_utils.format_exception(e)}')
@@ -4350,7 +5570,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         The knob is resolved for the replica's OWN version after updates.
         """
         if self.replica_unit == 'logical':
-            return float(getattr(info, 'planned_capacity', 1))
+            return float(info.planned_capacity)
         _, gpu_count = self._get_gpu_shape_from_replica_info(info)
         return self._get_knob_for_version(info.version) * gpu_count
 
@@ -4387,8 +5607,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if (self.replica_unit == 'logical' and
                     degraded_since is not None and
                     replacement_age >= replacement_timeout and
-                    getattr(info, 'unknown_capacity_replacement',
-                            False) is not True):
+                    info.unknown_capacity_replacement is not True):
                 return 0
             return planned
         if info.is_ready and observed is not None:
@@ -4702,9 +5921,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             live_ids.add(replica_id)
             if replica_id in self._provision_lead_seen_replica_ids:
                 continue
-            created_at = getattr(info, 'created_at', None)
-            ready_at = getattr(getattr(info, 'status_property', None),
-                               'first_ready_time', None)
+            created_at = info.created_at
+            ready_at = info.status_property.first_ready_time
             if (not isinstance(created_at,
                                (int, float)) or isinstance(created_at, bool) or
                     not isinstance(ready_at,
@@ -4750,9 +5968,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
-            if
-            (not info.is_terminal and info.version == self.latest_version and
-             getattr(info.status_property, 'is_scale_down', False) is not True))
+            if (not info.is_terminal and info.version == self.latest_version and
+                info.status_property.is_scale_down is not True))
 
     def _latest_demand_owned_logical_capacity(
         self,
@@ -4769,8 +5986,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
             if (not info.is_terminal and info.version == self.latest_version and
-                getattr(info.status_property, 'is_scale_down', False)
-                is not True and not getattr(info, 'reserved_fill', False)))
+                info.status_property.is_scale_down is not True and
+                not info.reserved_fill))
 
     def _total_ready_demand_owned_logical_capacity(
         self,
@@ -4780,9 +5997,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
-            if (info.is_ready and not info.is_terminal and getattr(
-                info.status_property, 'is_scale_down', False) is not True and
-                not getattr(info, 'reserved_fill', False)))
+            if (info.is_ready and not info.is_terminal and info.status_property.
+                is_scale_down is not True and not info.reserved_fill))
 
     def _nonterminal_committed_logical_capacity(
         self,
@@ -4801,8 +6017,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return sum(
             max(0, int(self._replica_capacity(info)))
             for info in replica_infos
-            if (not info.is_terminal and getattr(
-                info.status_property, 'is_scale_down', False) is not True))
+            if (not info.is_terminal and
+                info.status_property.is_scale_down is not True))
 
     def _limit_logical_scale_up(
         self,
@@ -4937,8 +6153,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._committed_capacity(info)
             for info in replica_infos
             if (not info.is_terminal and info.version == self.latest_version and
-                info.status in provisioning_statuses and getattr(
-                    info.status_property, 'is_scale_down', False) is not True))
+                info.status in provisioning_statuses and
+                info.status_property.is_scale_down is not True))
 
     def _provisioning_demand_owned_logical_capacity(
         self,
@@ -4954,9 +6170,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._committed_capacity(info)
             for info in replica_infos
             if (not info.is_terminal and info.version == self.latest_version and
-                info.status in provisioning_statuses and
-                getattr(info.status_property, 'is_scale_down', False)
-                is not True and not getattr(info, 'reserved_fill', False)))
+                info.status in provisioning_statuses and info.status_property.
+                is_scale_down is not True and not info.reserved_fill))
 
     def _adopt_scale_down_target(
         self,
@@ -5090,8 +6305,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     original_unknown_floor += fallback_capacity
                 else:
                     capacity = self._unknown_occupancy_work(info)
-                    if getattr(info, 'unknown_capacity_replacement',
-                               False) is True:
+                    if info.unknown_capacity_replacement is True:
                         replacement_unknown_floor += capacity
                     else:
                         original_unknown_floor += capacity
@@ -5183,8 +6397,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             if info is None:
                 complete = False
                 continue
-            destination = (replacement_unknown if getattr(
-                info, 'unknown_capacity_replacement', False) is True else
+            destination = (replacement_unknown
+                           if info.unknown_capacity_replacement is True else
                            original_unknown)
             add(replica_id, self._unknown_occupancy_work(info), destination)
         # Mirror _outstanding_work(): an uncertain bounded replacement wave
@@ -5259,12 +6473,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         use_existing_supply: bool = False,
         pin_running_work: bool = False,
         use_free_reserved: bool = True,
-    ) -> tuple[dict[str, int], bool]:
+    ) -> _CompatibilityTargetResult:
         """Allocate the concurrency target in physical or logical units."""
         configured_cards = self._configured_cards_from_profiles()
         if not configured_cards:
             self.warm_retention_target_by_accelerator = {}
-            return {}, False
+            return _CompatibilityTargetResult({}, {}, {}, False)
         if self.replica_unit == 'logical':
             capacity_per_card = {
                 card: self._effective_logical_capacity_per_gpu()
@@ -5288,11 +6502,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             card = canonical_by_name.get(raw_card.casefold())
             if card is None:
                 continue
-            width = (max(1, int(self._replica_capacity(info)))
+            width = (max(0, self._committed_capacity(info))
                      if self.replica_unit == 'logical' else 1)
+            if width == 0:
+                continue
             if info.is_ready:
                 ready[card] += width
-                if bool(getattr(info, 'is_zero_cost', False)):
+                if info.is_zero_cost is True:
                     ready_zero_cost[card] += width
             else:
                 provisioning[card] += width
@@ -5301,23 +6517,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                      tuple(profile['compatible_accelerators']),
                      float(profile['count']))
                     for profile in self.queued_compatibility_profiles]
+        explicit_profiles = list(profiles)
+        paid_profiles = list(profiles)
         queue_profile_total = sum(work for _, _, work in profiles)
         default_compatible = tuple(configured_cards)
         if self._queue_depth > queue_profile_total:
-            profiles.append(
-                (constants.LB_REQUEST_PRIORITY_MIN, default_compatible,
-                 self._queue_depth - queue_profile_total))
+            default_queue_profile = (constants.LB_REQUEST_PRIORITY_MIN,
+                                     default_compatible,
+                                     self._queue_depth - queue_profile_total)
+            profiles.append(default_queue_profile)
+            paid_profiles.append(default_queue_profile)
         rejected_profiles = self._rejected_compatibility_work()
         profiles.extend(rejected_profiles)
+        explicit_profiles.extend(rejected_profiles)
+        paid_profiles.extend(rejected_profiles)
         rejected_profile_total = sum(work for _, _, work in rejected_profiles)
         rejected_total = self._rejected_work()
         if rejected_total > rejected_profile_total:
-            profiles.append(
-                (constants.LB_REQUEST_PRIORITY_MIN, default_compatible,
-                 rejected_total - rejected_profile_total))
+            default_rejected_profile = (constants.LB_REQUEST_PRIORITY_MIN,
+                                        default_compatible,
+                                        rejected_total - rejected_profile_total)
+            profiles.append(default_rejected_profile)
+            paid_profiles.append(default_rejected_profile)
         retention_fixed, flexible_fixed_overflow, attribution_complete = (
             self._fixed_concurrency_work_by_accelerator(replica_infos))
         allocation_fixed = retention_fixed
+        explicit_fixed = retention_fixed
         if (self.replica_unit == 'logical' and
                 self._compatibility_demand_complete and not pin_running_work):
             # Running work is physically non-preemptive but does not make its
@@ -5326,10 +6551,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # current in-flight population. When that history has aged out,
             # the protocol default remains all configured cards; warm
             # retention and the supply-aware actuation pass still keep the
-            # actual serving cards until their work drains.
+            # actual serving cards until their work drains. The allocation
+            # result marks that fallback as insufficient proof for a
+            # mixed-version cross-card replacement.
             fixed_work = (sum(retention_fixed.values()) +
                           flexible_fixed_overflow)
             allocation_fixed = {}
+            explicit_fixed = {}
             evidence = [(int(profile['priority']),
                          tuple(profile['compatible_accelerators']),
                          float(profile['count']))
@@ -5338,8 +6566,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             evidence_total = sum(work for _, _, work in evidence)
             if fixed_work > 0 and evidence_total > 0:
                 scale = fixed_work / evidence_total
-                profiles.extend((priority, compatible, work * scale)
-                                for priority, compatible, work in evidence)
+                scaled_evidence = [(priority, compatible, work * scale)
+                                   for priority, compatible, work in evidence]
+                profiles.extend(scaled_evidence)
+                explicit_profiles.extend(scaled_evidence)
+                paid_profiles.extend(scaled_evidence)
             elif fixed_work > 0:
                 profiles.append((constants.LB_REQUEST_PRIORITY_MIN,
                                  default_compatible, fixed_work))
@@ -5349,9 +6580,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if self.replica_unit == 'logical' and self._fresh_for_tick():
             allocator_attributed_work = (sum(allocation_fixed.values()) +
                                          sum(work for _, _, work in profiles))
-            profiles.extend(
-                self._arrival_compatibility_work(self._arrival_work(),
-                                                 allocator_attributed_work))
+            arrival_work = self._arrival_work()
+            arrival_profiles = self._arrival_compatibility_work(
+                arrival_work, allocator_attributed_work)
+            profiles.extend(arrival_profiles)
+            explicit_profiles.extend(arrival_profiles)
+            paid_profiles.extend(arrival_profiles)
         floors = {
             card.casefold(): int(floor)
             for card, floor in self.min_replicas_by_accelerator.items()
@@ -5365,22 +6599,48 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             }
         ceiling = (self.max_replicas if target_ceiling is None else min(
             self.max_replicas, target_ceiling))
-        target = _allocate_compatibility_target(
-            configured_cards=configured_cards,
-            capacities=capacity_per_card,
-            floors=floors,
-            min_replicas=min(
+        cold_order = self._cold_paid_card_order(configured_cards)
+
+        def allocate(
+            minimum: int,
+            demand_profiles: list[tuple[int, tuple[str, ...], float]],
+            fixed_work_by_accelerator: dict[str, float],
+        ) -> dict[str, int]:
+            return _allocate_compatibility_target(
+                configured_cards=configured_cards,
+                capacities=capacity_per_card,
+                floors=floors,
+                min_replicas=minimum,
+                max_replicas=ceiling,
+                demand_profiles=demand_profiles,
+                fixed_work_by_accelerator=fixed_work_by_accelerator,
+                ready_zero_cost=ready_zero_cost,
+                ready=ready,
+                provisioning=provisioning,
+                free_reserved=free_reserved,
+                cold_order=cold_order,
+                use_existing_supply=use_existing_supply)
+
+        target = allocate(
+            min(
                 self.min_replicas if min_replicas_override is None else
-                min_replicas_override, ceiling),
-            max_replicas=ceiling,
-            demand_profiles=profiles,
-            fixed_work_by_accelerator=allocation_fixed,
-            ready_zero_cost=ready_zero_cost,
-            ready=ready,
-            provisioning=provisioning,
-            free_reserved=free_reserved,
-            cold_order=self._cold_paid_card_order(configured_cards),
-            use_existing_supply=use_existing_supply)
+                min_replicas_override, ceiling), profiles, allocation_fixed)
+        raw_explicit_target = allocate(0, explicit_profiles, explicit_fixed)
+        raw_paid_target = allocate(min(self.min_replicas, ceiling),
+                                   paid_profiles, {})
+        # Unproven aggregate work can change a flexible profile's marginal
+        # placement under a hard ceiling. Intersect exact cards rather than
+        # transferring ownership to a different card by inference.
+        explicit_target = {
+            card: min(count, target.get(card, 0))
+            for card, count in raw_explicit_target.items()
+            if count > 0 and target.get(card, 0) > 0
+        }
+        paid_target = {
+            card: min(count, target.get(card, 0))
+            for card, count in raw_paid_target.items()
+            if count > 0 and target.get(card, 0) > 0
+        }
         if attribution_complete:
             self.warm_retention_target_by_accelerator = {
                 card: _work_to_slots(work, capacity_per_card[card])
@@ -5389,7 +6649,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             }
         else:
             self.warm_retention_target_by_accelerator = {}
-        return target, attribution_complete
+        return _CompatibilityTargetResult(target, explicit_target, paid_target,
+                                          attribution_complete)
 
     def _logical_committed_capacity_by_accelerator(
         self,
@@ -5531,31 +6792,59 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 sum(demand_target.values()) != self.target_num_replicas):
             self.warm_retention_target_by_accelerator = {}
             self.cold_launch_authority_by_accelerator = {}
+            self._logical_paid_launch_target_by_accelerator = {}
             self._logical_card_transition_pending = False
             return {}, False
         final_target = self.get_final_target_num_replicas()
-        desired_target, attribution_complete = (
-            self._calculate_concurrency_target_by_accelerator(
-                replica_infos,
-                target_ceiling=final_target,
-                min_replicas_override=final_target,
-                use_existing_supply=True,
-                pin_running_work=False,
-                use_free_reserved=False))
         cards = self._configured_cards_from_profiles()
+        allocation = self._calculate_concurrency_target_by_accelerator(
+            replica_infos,
+            target_ceiling=final_target,
+            min_replicas_override=final_target,
+            use_existing_supply=True,
+            pin_running_work=False,
+            use_free_reserved=False)
+        desired_target = allocation.target_by_accelerator
+        explicit_target = allocation.explicit_target_by_accelerator
+        paid_target = allocation.paid_target_by_accelerator
+        attribution_complete = allocation.card_attribution_complete
+        if (not attribution_complete or
+                sum(desired_target.values()) != final_target):
+            self._logical_paid_launch_target_by_accelerator = {}
+            self._logical_card_transition_pending = False
+            return {}, False
+        fresh_complete_attribution = (self._fresh_for_tick() and
+                                      self._compatibility_demand_complete and
+                                      attribution_complete and
+                                      sum(desired_target.values())
+                                      == final_target)
         canonical_by_name = {card.casefold(): card for card in cards}
         nonretiring_supply = {card: 0 for card in cards}
+        # Old-version rows are provenance for the reconciler: they cannot
+        # authorize a launch, but a card they still serve is mid-replacement
+        # rather than gone, and must not be released as vanished capacity
+        # while the rollout drains. Preempted and scale-down rows are excluded
+        # on both versions for the same reason they are excluded from latest
+        # supply: they must not preserve, let alone replace, their card.
+        old_version_supply = {card: 0 for card in cards}
+        has_active_old_version = any(
+            not info.is_terminal and info.version != self.latest_version
+            for info in replica_infos)
         for info in replica_infos:
-            if (info.is_terminal or info.version != self.latest_version or
-                    _replica_is_retiring_card_supply(info)):
+            if info.is_terminal or _replica_is_retiring_card_supply(info):
                 continue
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = canonical_by_name.get(raw_card.casefold())
             if card is None:
                 continue
-            width = (max(1, int(self._replica_capacity(info)))
+            width = (max(0, self._committed_capacity(info))
                      if self.replica_unit == 'logical' else 1)
-            nonretiring_supply[card] += width
+            if width == 0:
+                continue
+            if info.version == self.latest_version:
+                nonretiring_supply[card] += width
+            else:
+                old_version_supply[card] += width
         # Broker-reported free slots are opportunities, not materialized
         # supply. Treating them as backing here can move flexible L4 demand
         # onto A100 during a rollout. If the research slot then disappears,
@@ -5563,20 +6852,165 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # fill owns those opportunities independently and carries the
         # zero-cost-only launch fence; demand actuation may reuse the card only
         # after a latest-version replica row materializes it.
+        downscale_hold = (self._raw_target_num_replicas
+                          < self.target_num_replicas)
+        if self.replica_unit != 'logical':
+            # Physical-backend scaling retains the legacy actuation contract:
+            # its exact-card target is itself the launch decision, so there is
+            # no separate paid-ownership channel to reconcile here.
+            target = _revalidate_actuation_target(
+                adopted_target=demand_target,
+                desired_target=desired_target,
+                nonretiring_supply=nonretiring_supply,
+                configured_cards=cards,
+                final_target=final_target,
+                allow_adopted_reassignment=not has_active_old_version,
+                allow_unbacked_adopted_reassignment=not downscale_hold,
+                old_version_supply=old_version_supply)
+            return target, (attribution_complete and
+                            sum(target.values()) == final_target)
+        # Rollout movement requires explicit compatibility evidence. In the
+        # latest-only case, paid-owned headerless/minimum demand can also move
+        # to its freshly allocated card. Inferred in-flight overflow and
+        # generic overprovision padding remain reconciliation-only.
+        allow_mixed_version_backed_reassignment = (has_active_old_version and
+                                                   not downscale_hold and
+                                                   fresh_complete_attribution
+                                                   and bool(explicit_target))
+        revalidation_desired_target = desired_target
+        if fresh_complete_attribution:
+            if has_active_old_version:
+                reassignment_target = ({}
+                                       if downscale_hold else explicit_target)
+            else:
+                # A downscale hold protects the adopted aggregate and its
+                # unbacked exact-card retry fence.  It must not prevent fresh,
+                # compatibility-owned demand from reusing a compatible
+                # latest-version backend that is already materialized.  The
+                # revalidator's backed-only pass makes this reassignment
+                # non-launching; cold cross-card movement remains disabled
+                # below for the duration of the hold.
+                reassignment_target = paid_target
+                if downscale_hold:
+                    # The public held map has already merged the fresh
+                    # no-supply placement with older exact-card slots. Keep
+                    # that fresh placement as the only eligible source for a
+                    # backed move; otherwise configured-card iteration could
+                    # replace an unrelated held unit that lacks compatibility
+                    # proof for the materialized destination.
+                    fresh_source_allocation = (
+                        self._calculate_concurrency_target_by_accelerator(
+                            replica_infos,
+                            target_ceiling=self._raw_target_num_replicas,
+                            min_replicas_override=(
+                                self._raw_target_num_replicas),
+                            use_existing_supply=False,
+                            pin_running_work=False,
+                            use_free_reserved=False))
+                    if (fresh_source_allocation.card_attribution_complete and
+                            sum(fresh_source_allocation.target_by_accelerator.
+                                values()) == self._raw_target_num_replicas):
+                        backed_reassignment_source = {
+                            card: min(count, demand_target.get(card, 0))
+                            for card, count in fresh_source_allocation.
+                            paid_target_by_accelerator.items()
+                            if count > 0 and demand_target.get(card, 0) > 0
+                        }
+                        bounded_target = (
+                            _bound_materialized_reassignment_target(
+                                adopted_target=demand_target,
+                                desired_target=desired_target,
+                                reassignment_source_by_accelerator=(
+                                    backed_reassignment_source),
+                                reassignment_destination_by_accelerator=(
+                                    paid_target),
+                                configured_cards=cards,
+                                final_target=final_target))
+                        if bounded_target or final_target == 0:
+                            revalidation_desired_target = bounded_target
+                            reassignment_target = bounded_target
+                        else:
+                            reassignment_target = {}
+                    else:
+                        reassignment_target = {}
+        else:
+            reassignment_target = {}
         target = _revalidate_actuation_target(
             adopted_target=demand_target,
-            desired_target=desired_target,
+            desired_target=revalidation_desired_target,
             nonretiring_supply=nonretiring_supply,
             configured_cards=cards,
             final_target=final_target,
-            allow_adopted_reassignment=not any(
-                not info.is_terminal and info.version != self.latest_version
-                for info in replica_infos),
-            allow_unbacked_adopted_reassignment=(self._raw_target_num_replicas
-                                                 >= self.target_num_replicas))
+            allow_adopted_reassignment=(not has_active_old_version and
+                                        fresh_complete_attribution),
+            allow_unbacked_adopted_reassignment=(fresh_complete_attribution and
+                                                 not downscale_hold),
+            allow_mixed_version_backed_reassignment=(
+                allow_mixed_version_backed_reassignment),
+            old_version_supply=old_version_supply,
+            reassignment_target_by_accelerator=reassignment_target)
         if not target and final_target > 0:
+            self._logical_paid_launch_target_by_accelerator = {}
             self._logical_card_transition_pending = False
             return {}, False
+        # Stale reports may preserve a prior exact-card reconciliation fence,
+        # but never authorize paid acquisition.  A downscale hold keeps its
+        # adopted exact-card retry contract; otherwise the fresh supply-aware
+        # placement is the sole economic authority for a new backend.
+        if not fresh_complete_attribution:
+            paid_launch_target: dict[str, int] = {}
+        else:
+            current_ownership = (explicit_target
+                                 if has_active_old_version else paid_target)
+            adopted_ownership = (
+                self._logical_adopted_explicit_target_by_accelerator
+                if has_active_old_version else
+                self._logical_adopted_paid_target_by_accelerator)
+            # Ownership is adopted with the aggregate target and survives a
+            # transiently empty histogram until a later target adoption
+            # replaces it. Current evidence may add ownership immediately;
+            # neither source can exceed the retained exact-card demand map.
+            paid_ownership = {
+                card: min(
+                    int(target.get(card, 0)),
+                    max(
+                        int(current_ownership.get(card, 0)),
+                        min(int(adopted_ownership.get(card, 0)),
+                            int(demand_target.get(card, 0)))))
+                for card in cards
+                if target.get(card, 0) > 0 and (current_ownership.get(
+                    card, 0) > 0 or adopted_ownership.get(card, 0) > 0)
+            }
+            # Paid ownership is separate from compatibility ownership. A
+            # latest-only minimum or headerless queue can buy its allocator-
+            # selected card; a mixed-version rollout requires explicit proof.
+            # Vanished adopted units and inferred in-flight/overprovision
+            # padding own no paid placement.
+            paid_launch_target = {
+                card: count
+                for card, count in paid_ownership.items()
+                if count > 0
+            }
+            if has_active_old_version:
+                for card in cards:
+                    # This is an absolute latest-version ceiling. The decision
+                    # generator subtracts latest committed supply later,
+                    # leaving exactly the live old-version backing as
+                    # same-card retry authority. Using old supply as an
+                    # incremental ceiling would stall a partially completed
+                    # rollout (latest=1, old=1, target=2) at zero authority.
+                    same_card_ceiling = min(
+                        int(target.get(card,
+                                       0)), int(demand_target.get(card, 0)),
+                        int(nonretiring_supply.get(card, 0)) +
+                        int(old_version_supply.get(card, 0)))
+                    if same_card_ceiling > paid_launch_target.get(card, 0):
+                        paid_launch_target[card] = same_card_ceiling
+        self._logical_paid_launch_target_by_accelerator = {
+            card: max(0, int(paid_launch_target.get(card, 0)))
+            for card in cards
+            if paid_launch_target.get(card, 0) > 0
+        }
         wave_budget = self._logical_actuation_wave_budget
         if wave_budget is not None:
             if self._logical_actuation_wave_started:
@@ -5595,6 +7029,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                                      replica_infos,
                                                      wave_budget))
         if not limited_target and final_target > 0:
+            self._logical_paid_launch_target_by_accelerator = {}
             self._logical_card_transition_pending = False
             return {}, False
         self._logical_actuation_target_by_accelerator = dict(limited_target)
@@ -5711,18 +7146,22 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 if best_capacity > 0:
                     raw_target_num += math.ceil(remaining / best_capacity)
 
+        candidate_allocation: _CompatibilityTargetResult | None = None
         candidate_target_by_accelerator: dict[str, int] | None = None
         if self._compatibility_demand_complete:
-            candidate, attribution_complete = (
+            candidate_allocation = (
                 self._calculate_concurrency_target_by_accelerator(replica_infos)
             )
-            if attribution_complete:
-                candidate_target_by_accelerator = candidate
+            if candidate_allocation.card_attribution_complete:
+                candidate_target_by_accelerator = (
+                    candidate_allocation.target_by_accelerator)
                 # Compatibility constraints can require a different physical
                 # packing than the aggregate best-capacity estimate. The
                 # aggregate offered-arrival floor remains independently
                 # authoritative when compatibility evidence is unavailable.
-                raw_target_num = max(raw_target_num, sum(candidate.values()))
+                raw_target_num = max(
+                    raw_target_num,
+                    sum(candidate_allocation.target_by_accelerator.values()))
 
         target_num_replicas = self._clip_concurrency_demand_target(
             raw_target_num)
@@ -5753,6 +7192,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         old_target_num_replicas = self.target_num_replicas
         old_target_by_accelerator = dict(
             self.target_num_replicas_by_accelerator)
+        old_explicit_target_by_accelerator = dict(
+            self._logical_adopted_explicit_target_by_accelerator)
+        old_paid_target_by_accelerator = dict(
+            self._logical_adopted_paid_target_by_accelerator)
         if (self.replica_unit == 'logical' and candidate_covers_raw_target and
                 sum(old_target_by_accelerator.values())
                 != old_target_num_replicas):
@@ -5762,15 +7205,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # aggregate through the fresh compatibility allocator. Committed
             # A100 supply belongs to the separate actuation map and must not
             # become A100 demand merely because it survived the restart.
-            recovered_map, recovered_complete = (
+            recovered_allocation = (
                 self._calculate_concurrency_target_by_accelerator(
                     replica_infos,
                     target_ceiling=old_target_num_replicas,
                     min_replicas_override=old_target_num_replicas))
-            if (recovered_complete and
+            recovered_map = recovered_allocation.target_by_accelerator
+            if (recovered_allocation.card_attribution_complete and
                     sum(recovered_map.values()) == old_target_num_replicas):
                 self.target_num_replicas_by_accelerator = recovered_map
+                self._logical_adopted_explicit_target_by_accelerator = {
+                    card: min(count, recovered_map.get(card, 0))
+                    for card, count in
+                    recovered_allocation.explicit_target_by_accelerator.items()
+                    if count > 0 and recovered_map.get(card, 0) > 0
+                }
+                self._logical_adopted_paid_target_by_accelerator = {
+                    card: min(count, recovered_map.get(card, 0))
+                    for card, count in
+                    recovered_allocation.paid_target_by_accelerator.items()
+                    if count > 0 and recovered_map.get(card, 0) > 0
+                }
                 old_target_by_accelerator = dict(recovered_map)
+                old_explicit_target_by_accelerator = dict(
+                    self._logical_adopted_explicit_target_by_accelerator)
+                old_paid_target_by_accelerator = dict(
+                    self._logical_adopted_paid_target_by_accelerator)
         target_map_changed = (candidate_target_by_accelerator is not None and
                               candidate_target_by_accelerator
                               != old_target_by_accelerator)
@@ -5865,11 +7325,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if ((apply_target or apply_card_transition) and
                 candidate_covers_raw_target):
             if (self._raw_target_num_replicas < self.target_num_replicas):
-                fresh_map, attribution_complete = (
+                fresh_allocation = (
                     self._calculate_concurrency_target_by_accelerator(
                         replica_infos,
                         target_ceiling=self._raw_target_num_replicas,
                         min_replicas_override=self._raw_target_num_replicas))
+                fresh_map = fresh_allocation.target_by_accelerator
                 adopted_map = _merge_fresh_target_into_downscale_hold(
                     adopted_target=old_target_by_accelerator,
                     fresh_target=fresh_map,
@@ -5878,14 +7339,52 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         self._configured_cards_from_profiles()),
                     target_total=self.target_num_replicas)
             else:
-                adopted_map, attribution_complete = (
+                adopted_allocation = (
                     self._calculate_concurrency_target_by_accelerator(
                         replica_infos,
                         target_ceiling=self.target_num_replicas,
                         min_replicas_override=self.target_num_replicas))
-            if (attribution_complete and
+                adopted_map = adopted_allocation.target_by_accelerator
+                fresh_allocation = adopted_allocation
+            if (fresh_allocation.card_attribution_complete and
                     sum(adopted_map.values()) == self.target_num_replicas):
                 self.target_num_replicas_by_accelerator = adopted_map
+                fresh_explicit = {
+                    card: min(count, adopted_map.get(card, 0))
+                    for card, count in
+                    fresh_allocation.explicit_target_by_accelerator.items()
+                    if count > 0 and adopted_map.get(card, 0) > 0
+                }
+                fresh_paid = {
+                    card: min(count, adopted_map.get(card, 0))
+                    for card, count in
+                    fresh_allocation.paid_target_by_accelerator.items()
+                    if count > 0 and adopted_map.get(card, 0) > 0
+                }
+                if self._raw_target_num_replicas < self.target_num_replicas:
+                    self._logical_adopted_explicit_target_by_accelerator = {
+                        card: max(
+                            fresh_explicit.get(card, 0),
+                            min(old_explicit_target_by_accelerator.get(card, 0),
+                                adopted_map.get(card, 0)))
+                        for card in adopted_map
+                        if (fresh_explicit.get(card, 0) > 0 or
+                            old_explicit_target_by_accelerator.get(card, 0) > 0)
+                    }
+                    self._logical_adopted_paid_target_by_accelerator = {
+                        card: max(
+                            fresh_paid.get(card, 0),
+                            min(old_paid_target_by_accelerator.get(card, 0),
+                                adopted_map.get(card, 0)))
+                        for card in adopted_map
+                        if (fresh_paid.get(card, 0) > 0 or
+                            old_paid_target_by_accelerator.get(card, 0) > 0)
+                    }
+                else:
+                    self._logical_adopted_explicit_target_by_accelerator = (
+                        fresh_explicit)
+                    self._logical_adopted_paid_target_by_accelerator = (
+                        fresh_paid)
 
         self._upscale_pending = (
             target_num_replicas > self.target_num_replicas or
@@ -6045,41 +7544,35 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # rejected call either.
             super().update_version(version, spec, update_mode)
             return
-        target_concurrency = getattr(spec, 'target_concurrency_per_replica',
-                                     None)
+        target_concurrency = spec.target_concurrency_per_replica
         if target_concurrency is not None:
             # Assign BEFORE the base update runs so any recompute it
             # triggers sees the new knob.
             self.target_concurrency_per_replica = float(target_concurrency)
             self._knob_by_version[version] = float(target_concurrency)
-        self.replica_unit = getattr(spec, 'replica_unit', 'physical_backend')
         self.target_utilization_percentage = int(
-            getattr(spec, 'target_utilization_percentage', 100))
-        self.expected_request_duration_seconds = getattr(
-            spec, 'expected_request_duration_seconds', None)
-        self.initial_provision_lead_time_seconds = getattr(
-            spec, 'initial_provision_lead_time_seconds', None)
+            spec.target_utilization_percentage)
+        self.expected_request_duration_seconds = (
+            spec.expected_request_duration_seconds)
+        self.initial_provision_lead_time_seconds = (
+            spec.initial_provision_lead_time_seconds)
         # Measurements describe the workload, not the spec revision, so an
         # update keeps them. Disabling the feature must take effect at once.
-        self.adaptive_demand_estimation = (getattr(
-            spec, 'adaptive_demand_estimation', True) is not False)
-        self.max_scale_up_rate_percentage = getattr(
-            spec, 'max_scale_up_rate_percentage', None)
-        self.scale_up_rate_min_replicas = getattr(spec,
-                                                  'scale_up_rate_min_replicas',
-                                                  None)
-        self.scale_up_rate_period_seconds = getattr(
-            spec, 'scale_up_rate_period_seconds', None)
-        adaptive_scale_up = getattr(spec, 'adaptive_scale_up', None)
+        self.adaptive_demand_estimation = (spec.adaptive_demand_estimation
+                                           is not False)
+        self.max_scale_up_rate_percentage = spec.max_scale_up_rate_percentage
+        self.scale_up_rate_min_replicas = spec.scale_up_rate_min_replicas
+        self.scale_up_rate_period_seconds = spec.scale_up_rate_period_seconds
+        adaptive_scale_up = spec.adaptive_scale_up
         self.adaptive_scale_up = (dict(adaptive_scale_up) if isinstance(
             adaptive_scale_up, dict) else None)
-        queue_config = getattr(spec, 'lb_request_queue', None) or {}
+        queue_config = spec.lb_request_queue or {}
         self._queue_timeout_seconds = queue_config.get('timeout_seconds')
         self._queue_timeout_thresholds = tuple(
             (int(entry['min_priority']), float(entry['timeout_seconds']))
             for entry in queue_config.get('timeout_seconds_by_priority', ()))
         self.max_scale_down_rate_percentage = int(
-            getattr(spec, 'max_scale_down_rate_percentage', 100))
+            spec.max_scale_down_rate_percentage)
         super().update_version(version, spec, update_mode)
         self._reset_downscale_hysteresis()
         self._downscale_veto_streak = 0
@@ -6097,6 +7590,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # wave, including any aggregate or per-card floor.
             self.target_num_replicas = 0
             self.target_num_replicas_by_accelerator = {}
+            self._logical_adopted_explicit_target_by_accelerator = {}
+            self._logical_adopted_paid_target_by_accelerator = {}
             # A retained ceiling belongs to the previous version's committed
             # capacity. Keep the shared timer, but fail closed for the rest of
             # that cooldown instead of granting the new version the old
@@ -6166,8 +7661,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             old_nonterminal = [
                 info for info in replica_infos
                 if (info.version < self.latest_version and not info.is_terminal
-                    and getattr(info.status_property, 'is_scale_down',
-                                False) is not True)
+                    and info.status_property.is_scale_down is not True)
             ]
             if not old_nonterminal:
                 return []
@@ -6541,17 +8035,32 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         launch_budget = self._logical_actuation_wave_budget
         launch_authority_left = launch_budget
         if use_card_targets:
+            paid_launch_target = (
+                self._logical_paid_launch_target_by_accelerator)
             for card, card_target in target_by_card.items():
-                shortage = max(0, card_target - committed_by_card.get(card, 0))
+                committed_on_card = committed_by_card.get(card, 0)
+                target_shortage = max(0, card_target - committed_on_card)
+                ownership_shortage = max(
+                    0,
+                    paid_launch_target.get(card, 0) - committed_on_card)
+                # The retained actuation map remains the reconciliation and
+                # retirement fence. Paid acquisition is the intersection of
+                # that shortage with the fresh supply-aware replacement
+                # placement: a warm/old-version card may remain in the former
+                # without becoming purchase authority in the latter.
+                shortage = min(target_shortage, ownership_shortage)
                 if launch_authority_left is not None:
                     shortage = min(shortage, launch_authority_left)
                     launch_authority_left -= shortage
                 if shortage > 0:
                     self.cold_launch_authority_by_accelerator[card] = shortage
-        card_shortage = (use_card_targets and any(
-            committed_by_card.get(card, 0) < card_target
-            for card, card_target in target_by_card.items()))
-        if committed < target or card_shortage:
+        paid_card_shortage = bool(use_card_targets and
+                                  self.cold_launch_authority_by_accelerator)
+        # A proof-free card mismatch with sufficient aggregate committed
+        # capacity is only a zero-cost placement preference. Do not emit a
+        # no-op reconciliation request for it; an aggregate shortage still
+        # emits the exact fence so eligible zero-cost supply can fill it.
+        if committed < target or paid_card_shortage:
             if launch_budget is not None and launch_budget > 0:
                 # Completing the full exact-card fence can consume the map's
                 # transition delta in the first restart tick. Later launch
@@ -6559,12 +8068,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # authorized, even though that complete map no longer changes.
                 self._record_logical_scale_up_wave(replica_infos, launch_budget)
             replace_unknown_replica_ids = tuple(
-                sorted(info.replica_id
-                       for info in latest_nonterminal_replicas
-                       if getattr(info.status_property, 'is_scale_down',
-                                  False) is not True and info.replica_id in
-                       self._degraded_capacity_since_by_replica_id and
-                       self._committed_capacity(info) == 0))
+                sorted(
+                    info.replica_id
+                    for info in latest_nonterminal_replicas
+                    if info.status_property.is_scale_down is not True and info.
+                    replica_id in self._degraded_capacity_since_by_replica_id
+                    and self._committed_capacity(info) == 0))
             launch_priorities_by_accelerator: tuple[tuple[str, int], ...] = ()
             if use_card_targets:
                 current_priorities = (
@@ -6588,7 +8097,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         replace_unknown_replica_ids=replace_unknown_replica_ids,
                         launch_priority=self.current_launch_priority(),
                         launch_priority_by_accelerator=(
-                            launch_priorities_by_accelerator)))
+                            launch_priorities_by_accelerator),
+                        cold_launch_authority_by_accelerator=(tuple(
+                            self.cold_launch_authority_by_accelerator.items())
+                                                              if
+                                                              use_card_targets
+                                                              else None)))
             ]
         if (not self._fresh_for_tick() or self._upscale_pending or
                 self._logical_card_transition_pending or
@@ -6605,8 +8119,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
         candidates = [
             info for info in latest_nonterminal_replicas
-            if (getattr(info.status_property, 'is_scale_down', False)
-                is not True and not self._replica_is_busy(info))
+            if (info.status_property.is_scale_down is not True and
+                not self._replica_is_busy(info))
         ]
         candidates.sort(key=lambda info: (
             _status_rank(info),
@@ -6634,8 +8148,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         remaining_demand_pending = sum(
             self._committed_capacity(info)
             for info in latest_nonterminal_replicas
-            if (info.status in provisioning_statuses and
-                not getattr(info, 'reserved_fill', False)))
+            if (info.status in provisioning_statuses and not info.reserved_fill
+               ))
         decisions: list[AutoscalerDecision] = []
         for info in candidates:
             card = _card(info)
@@ -6647,7 +8161,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             remaining_card_ready = (remaining_ready_by_card.get(card, 0)
                                     if card is not None else 0)
             committed_width = self._committed_capacity(info)
-            demand_owned = not getattr(info, 'reserved_fill', False)
+            demand_owned = not info.reserved_fill
             if (info.status in provisioning_statuses and demand_owned and
                     self._pending_retention_floor is not None and
                     remaining_demand_pending - committed_width

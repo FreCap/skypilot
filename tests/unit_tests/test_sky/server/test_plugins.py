@@ -1,4 +1,7 @@
 """Unit tests for the SkyPilot API server plugins."""
+# pylint: disable=import-outside-toplevel,missing-class-docstring
+# pylint: disable=protected-access,unused-variable
+# pylint: disable=use-implicit-booleaness-not-comparison
 
 import importlib
 import sys
@@ -7,9 +10,13 @@ from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 import yaml
 
 from sky.server import plugins
+from sky.server.requests import postgres as request_postgres
+from sky.server.requests import storage as request_storage
+from sky.server.requests.queues import base as queue_base
 
 
 def test_load_plugins_registers_and_installs(monkeypatch, tmp_path):
@@ -149,6 +156,92 @@ def test_load_plugins_default_loads_in_all_contexts(monkeypatch, tmp_path):
         plugins.load_plugins(plugins.ExtensionContext(context=context))
 
     assert install_count['count'] == len(plugins.PluginContext)
+
+
+@pytest.mark.parametrize('context', [
+    plugins.PluginContext.MAIN,
+    plugins.PluginContext.UVICORN,
+    plugins.PluginContext.EXECUTOR,
+])
+@pytest.mark.parametrize('override', ['storage', 'queue'])
+def test_postgres_plugins_cannot_override_quiescence_backends(
+        monkeypatch, tmp_path, context, override):
+    module_name = f'sky_test_postgres_{context.value}_{override}_plugin'
+
+    class PluginStorage(request_postgres.PostgresRequestBackend):
+        pass
+
+    class PluginQueue(request_postgres.PostgresQueueFactory):
+        pass
+
+    class BackendPlugin(plugins.BasePlugin):
+        load_contexts = frozenset({context})
+
+        def install(self, extension_context):
+            if override == 'storage':
+                extension_context.register_request_storage(PluginStorage())
+            else:
+                extension_context.register_queue_backend_factory(PluginQueue())
+
+    BackendPlugin.__module__ = module_name
+    module = types.ModuleType(module_name)
+    module.BackendPlugin = BackendPlugin
+    monkeypatch.setitem(sys.modules, module_name, module)
+    config_path = tmp_path / 'plugins.yaml'
+    config_path.write_text(
+        yaml.safe_dump({'plugins': [{
+            'class': f'{module_name}.BackendPlugin'
+        }]}))
+    monkeypatch.setenv(plugins._PLUGINS_CONFIG_ENV_VAR, str(config_path))
+    monkeypatch.setenv(request_postgres.REQUEST_BACKEND_ENV_VAR,
+                       request_postgres.POSTGRES_REQUEST_BACKEND)
+    monkeypatch.setenv(
+        request_postgres.EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR, 'true')
+    monkeypatch.setattr(request_storage, '_storage_backend',
+                        request_postgres.PostgresRequestBackend())
+    monkeypatch.setattr(queue_base, '_queue_backend_factory',
+                        request_postgres.PostgresQueueFactory())
+
+    with pytest.raises(RuntimeError, match='exact-generation quiescence'):
+        plugins.load_plugins(plugins.ExtensionContext(context=context))
+
+
+def test_postgres_plugin_override_remains_compatible_without_guard(
+        monkeypatch, tmp_path):
+    module_name = 'sky_test_unguarded_postgres_plugin'
+
+    class PluginStorage(request_postgres.PostgresRequestBackend):
+        pass
+
+    class BackendPlugin(plugins.BasePlugin):
+
+        def install(self, extension_context):
+            extension_context.register_request_storage(PluginStorage())
+
+    BackendPlugin.__module__ = module_name
+    module = types.ModuleType(module_name)
+    module.BackendPlugin = BackendPlugin
+    monkeypatch.setitem(sys.modules, module_name, module)
+    config_path = tmp_path / 'plugins.yaml'
+    config_path.write_text(
+        yaml.safe_dump({'plugins': [{
+            'class': f'{module_name}.BackendPlugin'
+        }]}))
+    monkeypatch.setenv(plugins._PLUGINS_CONFIG_ENV_VAR, str(config_path))
+    monkeypatch.setenv(request_postgres.REQUEST_BACKEND_ENV_VAR,
+                       request_postgres.POSTGRES_REQUEST_BACKEND)
+    monkeypatch.delenv(
+        request_postgres.EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR,
+        raising=False)
+    monkeypatch.setattr(request_storage, '_storage_backend',
+                        request_postgres.PostgresRequestBackend())
+    monkeypatch.setattr(queue_base, '_queue_backend_factory',
+                        request_postgres.PostgresQueueFactory())
+
+    plugins.load_plugins(
+        plugins.ExtensionContext(context=plugins.PluginContext.UVICORN))
+
+    assert type(request_storage.get_request_backend()) is PluginStorage
 
 
 def test_server_import_loads_plugins(monkeypatch):

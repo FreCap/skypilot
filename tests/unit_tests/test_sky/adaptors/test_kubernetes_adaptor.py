@@ -2,10 +2,13 @@
 # pylint: disable=protected-access
 
 import concurrent.futures
+import contextvars
 import gc
 import json
 import os
+import select
 import shlex
+import signal
 import sys
 import tempfile
 import threading
@@ -19,6 +22,7 @@ import pytest
 from sky import exceptions as sky_exceptions
 from sky.adaptors import kubernetes
 from sky.utils import annotations
+from sky.utils import subprocess_utils
 
 
 def _clear_refresh_interval_cache():
@@ -221,6 +225,515 @@ def test_kubeconfig_refresh_interval_invalid_value_disables_refresh(
 
     interval = kubernetes._get_kubeconfig_refresh_interval_seconds()  # pylint: disable=protected-access
     assert interval == 0.0
+
+
+class _IdentityApiClient:
+    """Minimal raw ApiClient target carrying one physical-cluster UID."""
+
+    def __init__(self, uid):
+        self.uid = uid
+        self.identity_reads = 0
+        self.provider_calls = []
+        self.close = MagicMock()
+
+
+class _IdentityCoreApi:
+    """Core facade that separates identity reads from provider calls."""
+
+    def __init__(self, api_client):
+        self.api_client = api_client
+
+    def read_namespace(self, name, **kwargs):
+        del kwargs
+        assert name == 'kube-system'
+        self.api_client.identity_reads += 1
+        return SimpleNamespace(metadata=SimpleNamespace(
+            uid=self.api_client.uid))
+
+    def list_namespaced_pod(self, namespace):
+        self.api_client.provider_calls.append(
+            ('list_namespaced_pod', namespace))
+        return SimpleNamespace(items=[])
+
+
+class _IdentityTypedApi:
+    """Non-Core facade used to prove every typed target is fenced."""
+
+    def __init__(self, api_client):
+        self.api_client = api_client
+
+    def create_namespaced_deployment(self, namespace, body):
+        self.api_client.provider_calls.append(
+            ('create_namespaced_deployment', namespace, body))
+        return SimpleNamespace()
+
+    def create_namespaced_ingress(self, namespace, body):
+        self.api_client.provider_calls.append(
+            ('create_namespaced_ingress', namespace, body))
+        return SimpleNamespace()
+
+
+def _install_identity_client_fakes(monkeypatch, uids):
+    clients = []
+    remaining_uids = iter(uids)
+
+    def get_api_client(_context=None):
+        client = _IdentityApiClient(next(remaining_uids))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'ApiClient',
+                        _IdentityApiClient)
+    monkeypatch.setattr(kubernetes, '_get_api_client', get_api_client)
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'CoreV1Api',
+                        _IdentityCoreApi)
+    return clients
+
+
+def _install_physical_fence_capture(monkeypatch, tmp_path, uid='physical-a'):
+    """Avoid ambient kubeconfig/network dependencies in fence unit tests."""
+    capture_index = 0
+
+    def capture(_context):
+        nonlocal capture_index
+        capture_index += 1
+        path = tmp_path / f'fence-{capture_index}.yaml'
+        path.write_text('captured', encoding='utf-8')
+        return str(path)
+
+    monkeypatch.setattr(kubernetes, '_capture_fenced_kubeconfig', capture)
+    monkeypatch.setattr(kubernetes, '_new_api_client_from_fence_capture',
+                        lambda _context, _path: _IdentityApiClient(uid))
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'CoreV1Api',
+                        _IdentityCoreApi)
+
+
+def test_physical_uid_fence_rechecks_refreshed_exact_client(
+        monkeypatch, tmp_path):
+    """A retarget after the executor read cannot reach a provider method."""
+    annotations.clear_request_level_cache()
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    clients = _install_identity_client_fakes(monkeypatch,
+                                             ['physical-a', 'physical-b'])
+    monkeypatch.setenv(kubernetes.KUBECONFIG_REFRESH_INTERVAL_ENV_VAR, '1')
+    _clear_refresh_interval_cache()
+    monkeypatch.setattr(time, 'time', lambda: 0.0)
+    with kubernetes.physical_cluster_uid_fence('phx-context', 'physical-a'):
+        api = kubernetes.core_api('phx-context')
+        # Models the final executor observation on the initially selected
+        # target. The wrapper records that exact underlying ApiClient proof.
+        api.list_namespaced_pod('default')
+        monkeypatch.setattr(time, 'time', lambda: 2.0)
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError):
+            api.list_namespaced_pod('default')
+    _clear_refresh_interval_cache()
+
+    assert len(clients) == 2
+    assert clients[0].provider_calls == [('list_namespaced_pod', 'default')]
+    assert clients[0].identity_reads == 1
+    # A rejected refresh candidate is closed; the last proved client remains
+    # installed so a later call can retry without a use-after-close race.
+    assert clients[0].close.call_count == 0
+    assert clients[1].identity_reads == 1
+    assert clients[1].provider_calls == []
+    assert clients[1].close.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ('constructor_name', 'api_getter', 'method_name'),
+    [
+        ('AppsV1Api', kubernetes.apps_api, 'create_namespaced_deployment'),
+        ('NetworkingV1Api', kubernetes.networking_api,
+         'create_namespaced_ingress'),
+    ],
+)
+def test_physical_uid_fence_checks_each_typed_client_before_call(
+        monkeypatch, tmp_path, constructor_name, api_getter, method_name):
+    """A newly loaded non-Core client cannot mutate a retargeted cluster."""
+    annotations.clear_request_level_cache()
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    clients = _install_identity_client_fakes(monkeypatch,
+                                             ['physical-a', 'physical-b'])
+    monkeypatch.setattr(kubernetes.kubernetes.client, constructor_name,
+                        _IdentityTypedApi)
+
+    with kubernetes.physical_cluster_uid_fence('phx-context', 'physical-a'):
+        core = kubernetes.core_api('phx-context')
+        core.list_namespaced_pod('default')
+        retargeted_api = api_getter('phx-context')
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError):
+            getattr(retargeted_api, method_name)('default', {})
+
+    assert clients[0].identity_reads == 1
+    assert clients[0].provider_calls == [('list_namespaced_pod', 'default')]
+    assert clients[1].identity_reads == 1
+    assert clients[1].provider_calls == []
+
+
+def test_physical_uid_fence_refcounts_and_rejects_conflicts(
+        monkeypatch, tmp_path):
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'phx-context'
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        assert kubernetes._active_physical_cluster_uid_fence(  # pylint: disable=protected-access
+            context) == 'physical-a'
+        with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+            assert kubernetes._active_physical_cluster_uid_fence(  # pylint: disable=protected-access
+                context) == 'physical-a'
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError):
+            with kubernetes.physical_cluster_uid_fence(context, 'physical-b'):
+                raise AssertionError('conflicting scope must not be entered')
+    assert kubernetes._active_physical_cluster_uid_fence(  # pylint: disable=protected-access
+        context) is None
+
+
+def test_in_cluster_alias_and_provider_none_share_fence(monkeypatch, tmp_path):
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = kubernetes.in_cluster_context_name()
+
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        target = kubernetes.active_physical_cluster_command_target(None)
+        assert target is not None
+        assert target.context_name == context
+        assert target.provider_context is None
+        assert target.in_cluster
+        assert target.kubeconfig_path is None
+        assert kubernetes._active_physical_cluster_uid_fence(  # pylint: disable=protected-access
+            None) == 'physical-a'
+
+
+def test_provider_calls_share_verified_client_concurrently(
+        monkeypatch, tmp_path):
+    """The first proof is exclusive; provider calls are then parallel."""
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    entered = 0
+    entered_lock = threading.Lock()
+    both_entered = threading.Event()
+    release = threading.Event()
+
+    class ConcurrentCoreApi(_IdentityCoreApi):
+
+        def list_namespaced_pod(self, namespace):
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+                if entered == 2:
+                    both_entered.set()
+            assert release.wait(timeout=5)
+            return super().list_namespaced_pod(namespace)
+
+    clients = _install_identity_client_fakes(monkeypatch, ['physical-a'])
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'CoreV1Api',
+                        ConcurrentCoreApi)
+    with kubernetes.physical_cluster_uid_fence('phx-context', 'physical-a'):
+        api = kubernetes.core_api('phx-context')
+        with subprocess_utils.ContextThreadPoolExecutor(
+                max_workers=2) as executor:
+            futures = [
+                executor.submit(api.list_namespaced_pod, 'default')
+                for _ in range(2)
+            ]
+            assert both_entered.wait(timeout=5)
+            release.set()
+            for future in futures:
+                future.result(timeout=5)
+
+    assert clients[0].identity_reads == 1
+    assert len(clients[0].provider_calls) == 2
+
+
+def test_unleased_overlap_cannot_borrow_active_fence(monkeypatch, tmp_path):
+    """A raw worker without the caller lease fails closed during overlap."""
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'unleased-active-overlap-context'
+
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                kubernetes.active_physical_cluster_command_target, context)
+            with pytest.raises(
+                    kubernetes.KubernetesPhysicalClusterFenceBusyError
+            ) as exc_info:
+                future.result(timeout=5)
+            assert exc_info.value.context == context
+            assert exc_info.value.failure_generation == 0
+
+    # Ordinary callers regain ambient behavior once no fenced scope exists.
+    assert kubernetes.active_physical_cluster_command_target(context) is None
+
+
+def test_unleased_overlap_fails_closed_while_fence_initializes(
+        monkeypatch, tmp_path):
+    """Ambient callers cannot race the capture-before-publication window."""
+    context = 'unleased-initializing-overlap-context'
+    capture_started = threading.Event()
+    release_capture = threading.Event()
+    initializer_errors = []
+
+    def _capture(_context):
+        capture_started.set()
+        assert release_capture.wait(timeout=5)
+        path = tmp_path / 'initializing-fence.yaml'
+        path.write_text('captured', encoding='utf-8')
+        return str(path)
+
+    monkeypatch.setattr(kubernetes, '_capture_fenced_kubeconfig', _capture)
+    monkeypatch.setattr(
+        kubernetes, '_new_api_client_from_fence_capture',
+        lambda _context, _path: _IdentityApiClient('physical-a'))
+    monkeypatch.setattr(kubernetes.kubernetes.client, 'CoreV1Api',
+                        _IdentityCoreApi)
+    ambient_loader = MagicMock()
+    monkeypatch.setattr(kubernetes.kubernetes.config, 'new_client_from_config',
+                        ambient_loader)
+
+    def _initialize() -> None:
+        try:
+            with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+                pass
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            initializer_errors.append(error)
+
+    initializer = threading.Thread(target=_initialize, daemon=True)
+    initializer.start()
+    assert capture_started.wait(timeout=5)
+    try:
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterFenceBusyError,
+                           match='being initialized') as exc_info:
+            kubernetes._get_api_client(context)
+        assert exc_info.value.context == context
+        assert exc_info.value.failure_generation == 0
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterFenceBusyError,
+                           match='being initialized'):
+            with kubernetes.physical_cluster_uid_fence(
+                    context, 'physical-a', wait_for_initializer=False):
+                raise AssertionError('nonwaiting fence joined initializer')
+        ambient_loader.assert_not_called()
+    finally:
+        release_capture.set()
+        initializer.join(timeout=5)
+
+    assert not initializer.is_alive()
+    assert not initializer_errors
+    assert kubernetes.active_physical_cluster_command_target(context) is None
+
+
+def test_tokenless_waiter_retries_only_after_owner_retires(
+        monkeypatch, tmp_path):
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'retirement-context'
+    busy_seen = threading.Event()
+    wait_done = threading.Event()
+    result = []
+
+    def wait_for_owner() -> None:
+        try:
+            kubernetes.active_physical_cluster_command_target(context)
+        except kubernetes.KubernetesPhysicalClusterFenceBusyError as error:
+            busy_seen.set()
+            result.append(
+                kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                    context,
+                    time.monotonic() + 2, error.failure_generation))
+        finally:
+            wait_done.set()
+
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        waiter = threading.Thread(target=wait_for_owner)
+        waiter.start()
+        assert busy_seen.wait(timeout=2)
+        assert not wait_done.wait(timeout=0.05)
+    assert wait_done.wait(timeout=2)
+    waiter.join(timeout=2)
+    assert not waiter.is_alive()
+    assert result == [True]
+
+
+def test_physical_fence_retirement_wait_fails_closed(monkeypatch, tmp_path):
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'retirement-failure-context'
+
+    def expired_wait() -> bool:
+        try:
+            kubernetes.active_physical_cluster_command_target(context)
+        except kubernetes.KubernetesPhysicalClusterFenceBusyError as error:
+            return kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                context, time.monotonic(), error.failure_generation)
+        raise AssertionError('active owner was not reported busy')
+
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(expired_wait).result(timeout=2) is False
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError,
+                           match='cannot wait for ambient'):
+            kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                context, time.monotonic(), 0)
+
+    with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS[context] = 1
+    try:
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError,
+                           match='failed before ambient retry'):
+            kubernetes.wait_for_physical_cluster_uid_fence_retirement(
+                context,
+                time.monotonic() + 1, 0)
+    finally:
+        with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+            kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.pop(
+                context, None)
+
+
+def test_fenced_caller_cannot_escape_to_an_unleased_context(
+        monkeypatch, tmp_path):
+    """A fence for A cannot silently fall through to ambient context B."""
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    ambient_loader = MagicMock()
+    monkeypatch.setattr(kubernetes.kubernetes.config, 'new_client_from_config',
+                        ambient_loader)
+
+    with kubernetes.physical_cluster_uid_fence('context-a', 'physical-a'):
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError,
+                           match='unleased context'):
+            kubernetes._get_api_client('context-b')
+
+    ambient_loader.assert_not_called()
+
+
+def test_nested_fence_cannot_expand_authority_to_second_context(
+        monkeypatch, tmp_path):
+    """One launch or cleanup scope has authority for exactly one context."""
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+
+    with kubernetes.physical_cluster_uid_fence('context-a', 'physical-a'):
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError,
+                           match='cannot acquire a second'):
+            with kubernetes.physical_cluster_uid_fence('context-b',
+                                                       'physical-a'):
+                raise AssertionError('Cross-context fence must not be entered')
+        target_a = kubernetes.active_physical_cluster_command_target(
+            'context-a')
+        assert target_a is not None
+        assert target_a.context_name == 'context-a'
+
+
+def test_stale_copied_fence_context_cannot_reenter_or_borrow(
+        monkeypatch, tmp_path):
+    """A copied old token stays invalid across a new same-UID scope."""
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'phx-context'
+
+    def enter_fence() -> None:
+        with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+            raise AssertionError('A stale fence token entered a new scope.')
+
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        stale_context = contextvars.copy_context()
+
+    with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError):
+        stale_context.run(kubernetes.active_physical_cluster_command_target,
+                          context)
+    with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError):
+        stale_context.run(enter_fence)
+
+    with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError):
+            stale_context.run(kubernetes.active_physical_cluster_command_target,
+                              context)
+        with pytest.raises(kubernetes.KubernetesPhysicalClusterIdentityError):
+            stale_context.run(enter_fence)
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='requires os.fork')
+def test_physical_fence_registry_resets_locked_state_after_fork(tmp_path):
+    """A child starts ambient even when a vanished thread owned the mutex."""
+    context = 'fork-context'
+    capture_path = tmp_path / 'parent-capture.yaml'
+    capture_path.write_text('parent-owned', encoding='utf-8')
+    target = kubernetes.PhysicalClusterUidFenceTarget(
+        context_name=context,
+        provider_context=context,
+        expected_uid='parent-uid',
+        kubeconfig_path=str(capture_path),
+        in_cluster=False,
+        token='parent-token')
+    with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCES[context] = (
+            kubernetes._PhysicalClusterUidFenceEntry(target, 1))
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS[
+            'initializing-context'] = 'parent-uid'
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS[context] = 7
+    token_reset = kubernetes._PHYSICAL_CLUSTER_UID_FENCE_TOKENS.set(
+        {context: 'parent-token'})
+
+    parent_locked = threading.Event()
+    parent_release = threading.Event()
+
+    def hold_parent_lock() -> None:
+        with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+            parent_locked.set()
+            assert parent_release.wait(timeout=10)
+
+    holder = threading.Thread(target=hold_parent_lock)
+    holder.start()
+    assert parent_locked.wait(timeout=2)
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        os.close(read_fd)
+        result = b'failure'
+        try:
+            assert kubernetes.active_physical_cluster_command_target(
+                context) is None
+            assert not kubernetes._PHYSICAL_CLUSTER_UID_FENCES
+            assert not kubernetes._PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS
+            assert not kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS
+            assert kubernetes._PHYSICAL_CLUSTER_UID_FENCE_TOKENS.get() is None
+            assert capture_path.exists()
+            result = b'ok'
+        except BaseException:  # pylint: disable=broad-exception-caught
+            pass
+        os.write(write_fd, result)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        readable, _, _ = select.select([read_fd], [], [], 5)
+        if not readable:
+            os.kill(child_pid, signal.SIGKILL)
+            pytest.fail('forked child deadlocked on physical fence registry')
+        assert os.read(read_fd, 16) == b'ok'
+    finally:
+        os.close(read_fd)
+        parent_release.set()
+        holder.join(timeout=2)
+        _, status = os.waitpid(child_pid, 0)
+        kubernetes._PHYSICAL_CLUSTER_UID_FENCE_TOKENS.reset(token_reset)
+        with kubernetes._PHYSICAL_CLUSTER_UID_FENCES_CONDITION:
+            kubernetes._PHYSICAL_CLUSTER_UID_FENCES.clear()
+            kubernetes._PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS.clear()
+            kubernetes._PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.clear()
+    assert not holder.is_alive()
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert capture_path.exists()
+
+
+def test_wrapper_leaves_capture_for_fresh_ambient_client(monkeypatch, tmp_path):
+    """A cached wrapper cannot retain a fence target after scope exit."""
+    annotations.clear_request_level_cache()
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    clients = _install_identity_client_fakes(monkeypatch,
+                                             ['physical-a', 'physical-b'])
+
+    with kubernetes.physical_cluster_uid_fence('phx-context', 'physical-a'):
+        api = kubernetes.core_api('phx-context')
+        api.list_namespaced_pod('fenced')
+    api.list_namespaced_pod('ambient')
+
+    assert clients[0].provider_calls == [('list_namespaced_pod', 'fenced')]
+    assert clients[0].close.call_count == 1
+    assert clients[1].identity_reads == 0
+    assert clients[1].provider_calls == [('list_namespaced_pod', 'ambient')]
 
 
 def _write_exec_kubeconfig(tmp_path, script, *, command=sys.executable):

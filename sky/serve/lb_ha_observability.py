@@ -149,6 +149,12 @@ class RoleRequestTrace:
         self._lock_wait_seconds = max(0.0, now - wait_started_at)
         self._lock_acquired_at = now
 
+    def add_phases(self, phases: dict[str, float]) -> None:
+        """Merge bounded subphase timings collected inside one executor call."""
+        for phase, seconds in phases.items():
+            if isinstance(seconds, (int, float)):
+                self._phases[phase] += max(0.0, float(seconds))
+
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
         lock_hold_seconds = 0.0
@@ -246,7 +252,15 @@ class LbHaRuntimeStats:
             self._observe_known_phases(
                 self._controller_phases, controller.get('phases_seconds'), {
                     'postgresql_owner_read',
+                    'kubernetes_role_snapshot',
+                    'snapshot_postgresql_owner_read',
+                    'snapshot_pod_list',
+                    'snapshot_service_read',
+                    'snapshot_ownership_validation',
+                    'snapshot_parse_routing',
+                    'snapshot_parse_pods',
                     'kubernetes_pod_authority',
+                    'postgresql_role_state_read',
                     'postgresql_fence_read',
                     'postgresql_cutover_state_read',
                     'kubernetes_service_routing_read',

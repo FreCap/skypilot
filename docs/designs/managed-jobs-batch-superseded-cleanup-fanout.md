@@ -30,6 +30,8 @@ cancellation actions after `handle_superseded()` returns.
 - Active and durable cleanup keep at most the default thread-executor width of
   worker pipelines runnable at once. Worker records beyond that bound remain
   unscheduled until an earlier pipeline settles.
+- The executor-width calculation uses the process CPU count on Python versions
+  that expose it and the system CPU count on the supported older worker floor.
 - Within one worker, ordering remains shutdown request, shutdown completion
   when the request succeeded, exact job-ID cancellation, cancellation
   completion, and durable-record removal after confirmed cancellation.
@@ -132,6 +134,7 @@ state and failure semantics without changing a representable production path.
 | Call-count and latency performance: unchanged calls per successful active worker, sibling starts before blocked worker release, and one durable queue call per representable owned cluster | `tests/unit_tests/test_batch_recovery.py` | same focused command |
 | Adjacent Batch takeover, lease, retry, cleanup, and durable-state behavior | `tests/unit_tests/test_batch_recovery.py` | `python -m pytest -q -o addopts='' tests/unit_tests/test_batch_recovery.py` |
 | Adjacent managed-jobs integration surface | `tests/test_jobs_and_serve.py`, `tests/test_jobs_state_async_vs_sync.py` | `python -m pytest -q -o addopts='' tests/test_jobs_and_serve.py tests/test_jobs_state_async_vs_sync.py` |
+| Batch coordinator imports on the supported cluster-worker Python floor | `.github/workflows/static-analysis.yml` | `worker-floor-import` job on Python 3.10 |
 | Python formatting, typing, lint, async lifecycle, and import contracts | production and test paths | `bash format.sh --files sky/batch/coordinator.py tests/unit_tests/test_batch_recovery.py`; repository static-analysis commands; `git diff --check` |
 
 `.github/workflows/pytest.yml` has no pull-request path filter and its

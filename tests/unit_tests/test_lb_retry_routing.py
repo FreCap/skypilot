@@ -91,7 +91,7 @@ class TestRetryExclusion(unittest.TestCase):
 
     def test_proxy_loop_excludes_failed_urls(self):
         policy = self._busy_policy()
-        balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+        balancer = lb_module.SkyServeLoadBalancer('http://controller:8001', 0)
         balancer._load_balancing_policy = policy
         balancer._client_pool_lock = threading.Lock()
         balancer._request_aggregator = mock.MagicMock()
@@ -119,7 +119,7 @@ class TestRetriableStatusCodes(unittest.TestCase):
     """Configured response statuses participate safely in retry routing."""
 
     def _balancer(self, retriable, client):
-        balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+        balancer = lb_module.SkyServeLoadBalancer('http://controller:8001', 0)
         balancer._load_balancing_policy = mock.MagicMock()
         balancer._load_balancing_policy.pre_execute_hook.return_value = None
         balancer._client_pool = {'http://a:8080': client}
@@ -180,7 +180,7 @@ class TestRetryTuning(unittest.TestCase):
     """max_retries and retry backoff are service-configurable."""
 
     def _balancer(self, max_retries=None, backoff=None):
-        balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+        balancer = lb_module.SkyServeLoadBalancer('http://controller:8001', 0)
         policy = lb_policies.LeastLoadPolicy()
         policy.set_ready_replicas(['http://a:8080', 'http://b:8080'])
         balancer._load_balancing_policy = policy
@@ -257,7 +257,7 @@ class TestRoutingSpecSync(unittest.TestCase):
     an LB respawn."""
 
     def _balancer(self):
-        balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+        balancer = lb_module.SkyServeLoadBalancer('http://controller:8001', 0)
         balancer._load_balancing_policy = lb_policies.LeastLoadPolicy()
         balancer._load_balancing_policy_name = 'least_load'
         balancer._client_pool_lock = threading.Lock()
@@ -311,7 +311,7 @@ class TestRetryShortCircuit(unittest.TestCase):
     """
 
     def _balancer(self, replicas, proxy):
-        balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+        balancer = lb_module.SkyServeLoadBalancer('http://controller:8001', 0)
         policy = lb_policies.LeastLoadPolicy()
         policy.set_ready_replicas(list(replicas))
         balancer._load_balancing_policy = policy

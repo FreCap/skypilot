@@ -80,14 +80,39 @@ export function useHistoricalClusterLookup({
   const [historyData, setHistoryData] = useState(null);
   const [isHistoricalCluster, setIsHistoricalCluster] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historySettled, setHistorySettled] = useState(false);
   const requestVersionRef = useRef(0);
+  const activeClusterRef = useRef(cluster);
 
   useEffect(() => {
-    if (!cluster || clusterDetailsLoading || clusterData) {
+    if (activeClusterRef.current !== cluster) {
+      activeClusterRef.current = cluster;
+    }
+
+    if (!cluster) {
       requestVersionRef.current += 1;
       setHistoryData(null);
       setIsHistoricalCluster(false);
       setHistoryLoading(false);
+      setHistorySettled(false);
+      return;
+    }
+
+    if (clusterDetailsLoading) {
+      requestVersionRef.current += 1;
+      setHistoryData(null);
+      setIsHistoricalCluster(false);
+      setHistoryLoading(false);
+      setHistorySettled(false);
+      return;
+    }
+
+    if (clusterData) {
+      requestVersionRef.current += 1;
+      setHistoryData(null);
+      setIsHistoricalCluster(false);
+      setHistoryLoading(false);
+      setHistorySettled(true);
       return;
     }
 
@@ -98,6 +123,7 @@ export function useHistoricalClusterLookup({
     setHistoryLoading(true);
     setHistoryData(null);
     setIsHistoricalCluster(false);
+    setHistorySettled(false);
 
     async function checkHistoryCluster() {
       try {
@@ -128,6 +154,7 @@ export function useHistoricalClusterLookup({
       } finally {
         if (isCurrentRequest()) {
           setHistoryLoading(false);
+          setHistorySettled(true);
         }
       }
     }
@@ -135,7 +162,21 @@ export function useHistoricalClusterLookup({
     checkHistoryCluster();
   }, [cluster, clusterData, clusterDetailsLoading]);
 
-  return { historyData, isHistoricalCluster, historyLoading };
+  const ownsRouteState = activeClusterRef.current === cluster;
+  const currentHistoryData =
+    ownsRouteState &&
+    historyData != null &&
+    (historyData.cluster_hash === cluster || historyData.cluster === cluster)
+      ? historyData
+      : null;
+
+  return {
+    historyData: currentHistoryData,
+    isHistoricalCluster:
+      ownsRouteState && isHistoricalCluster && currentHistoryData != null,
+    historyLoading: !ownsRouteState || historyLoading,
+    historySettled: ownsRouteState && historySettled,
+  };
 }
 
 function ClusterDetails() {
@@ -143,7 +184,6 @@ function ClusterDetails() {
   const { cluster } = router.query; // Access the dynamic part of the URL
 
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isSSHModalOpen, setIsSSHModalOpen] = useState(false);
   const [isVSCodeModalOpen, setIsVSCodeModalOpen] = useState(false);
   // Counter incremented on refresh to force telemetry iframes to reload.
@@ -159,7 +199,7 @@ function ClusterDetails() {
     refreshData,
     refreshClusterJobsOnly,
   } = useClusterDetails({ cluster });
-  const { historyData, isHistoricalCluster, historyLoading } =
+  const { historyData, isHistoricalCluster, historyLoading, historySettled } =
     useHistoricalClusterLookup({
       cluster,
       clusterData,
@@ -177,13 +217,6 @@ function ClusterDetails() {
     };
     checkGrafana();
   }, []);
-
-  // Update isInitialLoad when cluster details are first loaded (not waiting for jobs)
-  React.useEffect(() => {
-    if (!clusterDetailsLoading && isInitialLoad) {
-      setIsInitialLoad(false);
-    }
-  }, [clusterDetailsLoading, isInitialLoad]);
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
@@ -211,6 +244,12 @@ function ClusterDetails() {
   const title = cluster
     ? `Cluster: ${cluster} | SkyPilot Dashboard`
     : 'Cluster Details | SkyPilot Dashboard';
+  const hasActiveClusterData = clusterData != null;
+  const hasHistoricalData = isHistoricalCluster && historyData != null;
+  const isRouteLoading =
+    !router.isReady ||
+    clusterDetailsLoading ||
+    (!hasActiveClusterData && !historySettled);
 
   return (
     <>
@@ -268,12 +307,12 @@ function ClusterDetails() {
           </div>
         </div>
 
-        {(clusterDetailsLoading && isInitialLoad) || historyLoading ? (
+        {isRouteLoading || historyLoading ? (
           <div className="flex justify-center items-center py-12">
             <CircularProgress size={24} className="mr-2" />
             <span className="text-gray-500">Loading cluster details...</span>
           </div>
-        ) : clusterData ? (
+        ) : hasActiveClusterData ? (
           <ActiveTab
             clusterData={clusterData}
             clusterJobData={clusterJobData}
@@ -285,7 +324,7 @@ function ClusterDetails() {
             telemetryRefreshTrigger={telemetryRefreshTrigger}
             isHistoricalCluster={false}
           />
-        ) : isHistoricalCluster && historyData ? (
+        ) : hasHistoricalData ? (
           <ActiveTab
             clusterData={historyData}
             clusterJobData={[]}

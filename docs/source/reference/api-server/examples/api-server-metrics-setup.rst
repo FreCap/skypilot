@@ -61,8 +61,7 @@ You can access Grafana at the ``/grafana`` endpoint:
 Metrics exposed
 ---------------
 
-The endpoint ``/metrics`` on the SkyPilot API server exposes Prometheus-format
-metrics covering:
+The ``/metrics`` endpoint exposes Prometheus-format metrics covering:
 
 * API server health — request rate, latency, queue wait time, per-worker memory.
 * Cluster inventory by workspace, user, status, cloud, and kind
@@ -73,6 +72,16 @@ metrics covering:
 * Managed jobs by workspace, user, status, and cloud (all statuses
   including terminal; use ``delta(...)`` over a window for per-period
   success/failure rate).
+
+In guarded HA mode, API, executor, and controller pods expose independent
+pod-local endpoints. This is necessary because executor workers and controller
+children write to the multiprocess registry in their own pod. Discover every
+annotated role pod; the API Service selects only API pods and cannot expose
+executor- or controller-local series.
+Shared-state collectors (including burn rate, workspace usage, managed jobs,
+and plugin custom collectors) remain on API/all targets so aggregating all role
+targets does not duplicate those series. Plugins emit executor/controller-local
+telemetry with multiprocess-aware Prometheus metric types.
 
 You can also :ref:`setup GPU metric collection <api-server-gpu-metrics-setup>`
 to directly export GPU memory, utilization and power consumption from
@@ -89,11 +98,13 @@ vanilla Prometheus, deploy an `OpenTelemetry Collector
 <https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/prometheusreceiver>`__
 scrapes SkyPilot's endpoints and an OTLP exporter forwards downstream.
 
-The only SkyPilot-specific part is the scrape config — point it at the
-API server Service (``<release>-api-service.<namespace>.svc`` on the
-metrics port, 9090 by default), and give ``/gpu-metrics`` a
-``scrape_timeout`` larger than the API server's per-context federation
-budget (20 s):
+The only SkyPilot-specific part is the scrape config. For a standalone server,
+point it at the API Service (``<release>-api-service.<namespace>.svc`` on the
+metrics port, 9090 by default). In guarded HA mode, configure Kubernetes pod
+discovery for the chart's scrape annotations so the API, executor, and
+controller registries are all collected. The federated ``/gpu-metrics`` route
+remains on the API Service and needs a ``scrape_timeout`` larger than the API
+server's per-context federation budget (20 s):
 
 .. code-block:: yaml
 
@@ -101,10 +112,27 @@ budget (20 s):
      prometheus:
        config:
          scrape_configs:
-           - job_name: skypilot-api
-             metrics_path: /metrics
-             static_configs:
-               - targets: ['<release>-api-service.<namespace>.svc:9090']
+           - job_name: skypilot-roles
+             kubernetes_sd_configs:
+               - role: pod
+                 namespaces:
+                   names: ['<namespace>']
+             relabel_configs:
+               - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                 action: keep
+                 regex: 'true'
+               - source_labels: [__meta_kubernetes_pod_label_app]
+                 action: keep
+                 regex: '<release>-(api|executor|controller)'
+               - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                 action: replace
+                 target_label: __metrics_path__
+               - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port,
+                                 __meta_kubernetes_pod_ip]
+                 action: replace
+                 regex: '(\d+);(.+)'
+                 replacement: '$2:$1'
+                 target_label: __address__
            - job_name: skypilot-gpu
              metrics_path: /gpu-metrics
              scrape_timeout: 25s   # must exceed the 20s per-context budget
@@ -121,12 +149,12 @@ Using existing Prometheus / Grafana
 
 The Helm chart introduces **three new top-level blocks** to provide flexibility in how you set up Prometheus and Grafana:
 
-* ``apiService.metrics.enabled`` – enables the ``/metrics`` HTTP endpoint on the SkyPilot API server.
-* ``prometheus.enabled`` – deploys a prometheus instance configured to scrape the ``/metrics`` endpoint on the SkyPilot API server.
+* ``apiService.metrics.enabled`` – enables the ``/metrics`` HTTP endpoint on API-server role pods.
+* ``prometheus.enabled`` – deploys a Prometheus instance configured to discover the enabled role endpoints.
 * ``grafana.enabled`` – deploys Grafana with a pre-baked dashboard to display the SkyPilot API server metrics from prometheus.
 
 All three default to ``false`` so you can mix & match:
 
 * **Fully managed Prometheus + Grafana** – set ``apiService.metrics.enabled: true``, ``prometheus.enabled: true``, and ``grafana.enabled: true``. The chart will deploy a fully managed Prometheus + Grafana stack.
-* **External Prometheus / Grafana** – set *only* ``apiService.metrics.enabled: true``. The API server will expose the metrics on the ``/metrics`` endpoint and the pod will be annotated with ``prometheus.io/scrape: true`` to enable automatic scraping by prometheus.
+* **External Prometheus / Grafana** – set *only* ``apiService.metrics.enabled: true``. API-server role pods expose ``/metrics`` and are annotated with ``prometheus.io/scrape: true`` for automatic Prometheus discovery.
 * **External Grafana, internal Prometheus** – enable ``prometheus`` but disable ``grafana``. Point your existing Grafana at the Prometheus service created by the chart.

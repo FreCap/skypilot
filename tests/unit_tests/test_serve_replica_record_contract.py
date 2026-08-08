@@ -1,14 +1,20 @@
 """Characterization tests for SkyServe's versioned replica record."""
 # pylint: disable=protected-access
 import copy
+import dataclasses
 import pickle
 from unittest import mock
 
 import pytest
 
+from sky import backends
 from sky import clouds
+from sky import exceptions
+from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import replica_info
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import spot_placer
 from sky.utils import common_utils
@@ -60,6 +66,66 @@ def _replica() -> replica_managers.ReplicaInfo:
     return replica
 
 
+def _protocol_v2_replica() -> replica_managers.ReplicaInfo:
+    replica = _replica()
+    context = 'phx-context'
+    physical_uid = 'physical-uid'
+    replica.location = spot_placer.Location(cloud=clouds.Kubernetes(),
+                                            region=context,
+                                            zone=None,
+                                            accelerators={
+                                                'H200': 1
+                                            },
+                                            use_spot=False).to_pickleable()
+    replica.resources_override = {
+        'cloud': clouds.Kubernetes(),
+        'region': context,
+        'accelerators': {
+            'H200': 1,
+        },
+    }
+    replica.reserved_fill_pool_key = reserved_capacity_broker.make_pool_key(
+        context,
+        'H200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid=physical_uid)
+    replica.reserved_fill_service_generation = 7
+    replica.reserved_fill_physical_cluster_uid = physical_uid
+    replica.reserved_fill_kubernetes_context = context
+    return replica
+
+
+def _protocol_v2_handle(
+        context: str = 'phx-context') -> backends.CloudVmRayResourceHandle:
+    handle = mock.Mock(spec=backends.CloudVmRayResourceHandle)
+    handle.cluster_name = 'svc-7'
+    handle.launched_resources = mock.Mock(cloud=clouds.Kubernetes(),
+                                          region=context)
+    return handle
+
+
+def _status_field_names() -> tuple[str, ...]:
+    return tuple(
+        field.name
+        for field in dataclasses.fields(replica_managers.ReplicaStatusProperty))
+
+
+def _assert_materialized_legacy_status_defaults(
+        status: replica_managers.ReplicaStatusProperty) -> None:
+    expected = dict(vars(replica_managers.ReplicaStatusProperty()))
+    expected['logical_retirement_committed'] = None
+    assert vars(status) == expected
+
+
+def test_constructor_owns_complete_explicit_interface():
+    replica = _replica()
+
+    assert set(vars(replica)) == {
+        '_version', *replica_info._REPLICA_INFO_OWNED_FIELDS
+    }
+    assert set(vars(replica.status_property)) == set(_status_field_names())
+
+
 @pytest.mark.parametrize(('updates', 'expected'), [
     ({}, serve_state.ReplicaStatus.PENDING),
     ({
@@ -99,6 +165,8 @@ def test_storage_round_trip_is_lossless_and_does_not_mutate_source():
     state = replica.to_storage_dict()
     restored = replica_managers.ReplicaInfo.from_storage_dict(state)
 
+    assert state['replica_info_version'] == 14
+    assert set(state) == set(replica_info._REPLICA_INFO_STORAGE_FIELDS)
     assert replica.resources_override['cloud'] is cloud_before
     assert replica.resources_override['image_id'] == image_id_before
     assert restored.to_storage_dict() == state
@@ -110,13 +178,220 @@ def test_storage_round_trip_is_lossless_and_does_not_mutate_source():
     assert restored.status is serve_state.ReplicaStatus.READY
 
 
+def test_legacy_pickle_migration_materializes_zero_cost_provenance():
+    legacy_state = dict(vars(_replica()))
+    legacy_state['_version'] = 10
+    legacy_state.pop('is_zero_cost')
+    restored = replica_managers.ReplicaInfo.__new__(
+        replica_managers.ReplicaInfo)
+
+    restored.__setstate__(legacy_state)
+
+    assert vars(restored)['is_zero_cost'] is False
+
+
+def test_legacy_pickle_migration_materializes_logical_capacity_fields():
+    legacy_state = copy.deepcopy(vars(_replica()))
+    legacy_state['_version'] = 8
+    legacy_state.pop('unknown_capacity_replacement')
+    legacy_state.pop('logical_bridge_capacity_verified')
+    restored = replica_managers.ReplicaInfo.__new__(
+        replica_managers.ReplicaInfo)
+
+    restored.__setstate__(legacy_state)
+
+    assert vars(restored)['unknown_capacity_replacement'] is False
+    assert vars(restored)['logical_bridge_capacity_verified'] is False
+
+
+def test_legacy_pickle_migration_materializes_every_status_field():
+    legacy_state = copy.deepcopy(vars(_replica()))
+    legacy_state['_version'] = 13
+    vars(legacy_state['status_property']).clear()
+    restored = replica_managers.ReplicaInfo.__new__(
+        replica_managers.ReplicaInfo)
+
+    restored.__setstate__(legacy_state)
+
+    assert set(vars(restored.status_property)) == set(_status_field_names())
+    _assert_materialized_legacy_status_defaults(restored.status_property)
+
+
+def test_current_record_requires_explicit_zero_cost_provenance():
+    replica = _replica()
+    del replica.is_zero_cost
+
+    with pytest.raises(AttributeError, match='is_zero_cost'):
+        replica.to_storage_dict()
+
+
+@pytest.mark.parametrize('field', replica_info._REPLICA_INFO_OWNED_FIELDS)
+def test_current_record_requires_complete_owned_interface(field):
+    replica = _replica()
+    delattr(replica, field)
+
+    with pytest.raises(AttributeError, match=field):
+        replica.to_storage_dict()
+
+
+@pytest.mark.parametrize('field', _status_field_names())
+def test_current_record_requires_every_status_field(field):
+    replica = _replica()
+    vars(replica.status_property).pop(field)
+
+    with pytest.raises(AttributeError, match=field):
+        replica.to_storage_dict()
+
+
+@pytest.mark.parametrize('field', replica_info._REPLICA_INFO_OWNED_FIELDS)
+def test_current_pickle_requires_complete_owned_interface(field):
+    current_state = copy.deepcopy(vars(_replica()))
+    current_state.pop(field)
+    restored = replica_managers.ReplicaInfo.__new__(
+        replica_managers.ReplicaInfo)
+
+    with pytest.raises(AttributeError, match=field):
+        restored.__setstate__(current_state)
+
+
+@pytest.mark.parametrize('marker', [0, 1, 'yes'])
+def test_storage_rejects_non_boolean_reserved_fill_marker(marker):
+    replica = _replica()
+    setattr(replica, 'reserved_fill', marker)
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='must be a boolean'):
+        replica.to_storage_dict()
+
+    state = _replica().to_storage_dict()
+    state['reserved_fill'] = marker
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='must be a boolean'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+def test_protocol_v2_storage_round_trip_preserves_strict_cleanup_authority():
+    state = _protocol_v2_replica().to_storage_dict()
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    fence = reserved_capacity.parse_protocol_v2_cleanup_fence(restored)
+    assert fence == reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='physical-uid')
+
+
+def test_deserialized_malformed_v2_tuple_fails_closed_at_cleanup_parser():
+    state = _protocol_v2_replica().to_storage_dict()
+    state['resources_override']['region'] = 'replacement-context'
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='resource pin is malformed'):
+        reserved_capacity.parse_protocol_v2_cleanup_fence(restored)
+
+
+def test_protocol_v2_endpoint_resolution_enters_exact_physical_fence():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle()
+    cluster_record = {'name': 'svc-7', 'handle': handle}
+    uid_fence = mock.MagicMock()
+    uid_fence.return_value.__enter__.return_value = None
+
+    with mock.patch.object(kubernetes_adaptor,
+                           'physical_cluster_uid_fence', uid_fence), \
+         mock.patch.object(replica_managers.backend_utils,
+                           'get_endpoints',
+                           return_value={8080: '10.0.0.1:8080'}) as endpoint:
+        assert replica._resolve_url(  # pylint: disable=protected-access
+            cluster_record=cluster_record,
+            handle=handle) == ('http://10.0.0.1:8080')
+
+    uid_fence.assert_called_once_with('phx-context', 'physical-uid')
+    endpoint.assert_called_once_with('svc-7',
+                                     8080,
+                                     cluster_record=cluster_record)
+
+
+def test_protocol_v2_endpoint_uid_mismatch_precedes_provider_call():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle()
+    cluster_record = {'name': 'svc-7', 'handle': handle}
+    uid_fence = mock.MagicMock()
+    uid_fence.return_value.__enter__.side_effect = (
+        exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+
+    with mock.patch.object(kubernetes_adaptor,
+                           'physical_cluster_uid_fence', uid_fence), \
+         mock.patch.object(replica_managers.backend_utils,
+                           'get_endpoints') as endpoint, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='UID mismatch'):
+        replica._resolve_url(  # pylint: disable=protected-access
+            cluster_record=cluster_record,
+            handle=handle)
+
+    endpoint.assert_not_called()
+
+
+def test_protocol_v2_endpoint_rejects_retargeted_handle_before_uid_lookup():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle(context='replacement-context')
+    cluster_record = {'name': 'svc-7', 'handle': handle}
+
+    with mock.patch.object(
+            kubernetes_adaptor,
+            'physical_cluster_uid_fence') as uid_fence, \
+         mock.patch.object(replica_managers.backend_utils,
+                           'get_endpoints') as endpoint, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='durable replica handle'):
+        replica._resolve_url(  # pylint: disable=protected-access
+            cluster_record=cluster_record,
+            handle=handle)
+
+    uid_fence.assert_not_called()
+    endpoint.assert_not_called()
+
+
+def test_pool_probe_propagates_explicit_provider_phase_admission():
+    replica = _protocol_v2_replica()
+    handle = _protocol_v2_handle()
+    backend = mock.Mock()
+    backend.get_job_status.return_value = {
+        1: replica_info.job_lib.JobStatus.SUCCEEDED
+    }
+    provider_fence = mock.MagicMock()
+    provider_fence.return_value.__enter__.return_value = None
+    admission = mock.sentinel.provider_phase_admission
+
+    with mock.patch.object(replica_info.global_user_state,
+                           'get_handle_from_cluster_name',
+                           return_value=handle), \
+         mock.patch.object(replica_info.backend_utils,
+                           'check_cluster_available',
+                           return_value=handle), \
+         mock.patch.object(replica_info.backend_utils,
+                           'get_backend_from_handle',
+                           return_value=backend), \
+         mock.patch.object(reserved_capacity,
+                           'protocol_v2_provider_fence',
+                           provider_fence):
+        _, ready, _ = replica.probe_pool(provider_phase_admission=admission)
+
+    assert ready
+    assert provider_fence.call_args_list == [
+        mock.call(replica, handle, phase_admission=admission),
+        mock.call(replica, handle, phase_admission=admission),
+    ]
+
+
 def test_legacy_null_image_key_and_missing_fields_remain_compatible():
     state = _replica().to_storage_dict()
+    state['replica_info_version'] = 13
     state['resources_override']['image_id'] = {
         'null': 'global-image',
         'us-east-1': 'regional-image',
     }
     state.pop('planned_capacity')
+    state.pop('unknown_capacity_replacement')
     state.pop('logical_bridge_capacity_verified')
     state['status_property'].pop('logical_retirement_committed')
 
@@ -127,8 +402,38 @@ def test_legacy_null_image_key_and_missing_fields_remain_compatible():
         'us-east-1': 'regional-image',
     }
     assert restored.planned_capacity == 1
+    assert restored.unknown_capacity_replacement is False
     assert restored.logical_bridge_capacity_verified is False
     assert restored.status_property.logical_retirement_committed is None
+
+
+def test_legacy_json_materializes_every_status_field():
+    state = _replica().to_storage_dict()
+    state['replica_info_version'] = 13
+    state['status_property'] = {}
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    assert set(vars(restored.status_property)) == set(_status_field_names())
+    _assert_materialized_legacy_status_defaults(restored.status_property)
+
+
+@pytest.mark.parametrize('field', replica_info._REPLICA_INFO_OWNED_FIELDS)
+def test_current_json_requires_complete_owned_interface(field):
+    state = _replica().to_storage_dict()
+    state.pop(field)
+
+    with pytest.raises(ValueError, match=field):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('field', _status_field_names())
+def test_current_json_requires_every_status_field(field):
+    state = _replica().to_storage_dict()
+    state['status_property'].pop(field)
+
+    with pytest.raises(ValueError, match=field):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
 
 
 def test_public_class_and_pickle_identity_remain_stable():

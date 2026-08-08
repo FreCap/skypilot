@@ -26,6 +26,7 @@ jest.mock('@/data/connectors/services', () => {
   return {
     ...actual,
     getServiceHistory: jest.fn(),
+    getServicePricing: jest.fn(),
     getServiceReplicaSummaries: jest.fn(),
     getServiceReplicas: jest.fn(),
   };
@@ -56,6 +57,7 @@ jest.mock('@/components/service-placement', () => ({
 import dashboardCache from '@/lib/cache';
 import {
   getServiceHistory,
+  getServicePricing,
   getServiceReplicaSummaries,
   getServiceReplicas,
   getServices,
@@ -69,6 +71,7 @@ import ServiceDetailsPage, {
   sortReplicas,
   useServiceDetails,
   useServiceHistory,
+  useServicePricing,
   useServiceReplicaData,
 } from '@/pages/services/[service]';
 
@@ -2142,9 +2145,449 @@ describe('useServiceReplicaData bounded loading', () => {
   });
 });
 
+function pricingAggregateResult(overrides = {}) {
+  return {
+    available: true,
+    serviceName: 'svc',
+    serviceHash: 'hash-a',
+    observedAt: 100,
+    priceBasis: 'version_catalog',
+    aggregate: {
+      available: true,
+      unavailableReason: null,
+      coverage: 'complete',
+      estimatedHourlyCost: 1.25,
+      spotHourlyCost: 0,
+      nonSpotHourlyCost: 1.25,
+      costTrackedReplicaCount: 1,
+      pricedReplicaCount: 1,
+      hourlyCostExcludedReplicaCount: 0,
+      hourlyCostExclusionReasons: {},
+    },
+    replicas: [],
+    legacyFallback: false,
+    ...overrides,
+  };
+}
+
+function pricingRowResult(replicas, overrides = {}) {
+  return {
+    available: true,
+    serviceName: 'svc',
+    serviceHash: 'hash-a',
+    observedAt: 100,
+    priceBasis: 'version_catalog',
+    aggregate: null,
+    replicas,
+    legacyFallback: false,
+    ...overrides,
+  };
+}
+
+describe('useServicePricing independent enrichment', () => {
+  const replica = {
+    id: 7,
+    status: 'READY',
+    pricingFingerprint: 'fp-7',
+  };
+  const currentPage = {
+    serviceHash: 'hash-a',
+    replicas: [replica],
+  };
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+  });
+
+  it('fans out aggregate and fingerprint-fenced row pricing independently', async () => {
+    getServicePricing.mockImplementation(({ replicaIds = [] }) => {
+      if (replicaIds.length === 0) return pricingAggregateResult();
+      return pricingRowResult([
+        {
+          id: 7,
+          pricingFingerprint: 'fp-7',
+          hourlyCost: 0,
+          priceSource: 'zero_cost_provenance',
+          hourlyCostExclusionReason: null,
+        },
+      ]);
+    });
+
+    const { result } = renderHook(() =>
+      useServicePricing({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+        currentPage,
+      })
+    );
+
+    await waitFor(() =>
+      expect(result.current.aggregate?.estimatedHourlyCost).toBe(1.25)
+    );
+    await waitFor(() =>
+      expect(result.current.getReplicaPricing(replica)).toMatchObject({
+        state: 'available',
+        hourlyCost: 0,
+        priceSource: 'zero_cost_provenance',
+      })
+    );
+    expect(getServicePricing).toHaveBeenCalledWith({
+      serviceName: 'svc',
+      serviceHash: 'hash-a',
+    });
+    expect(getServicePricing).toHaveBeenCalledWith({
+      serviceName: 'svc',
+      serviceHash: 'hash-a',
+      replicaIds: [7],
+    });
+  });
+
+  it('retries a row request interrupted by leaving and returning to Overview', async () => {
+    const staleRow = deferred();
+    let rowAttempt = 0;
+    getServicePricing.mockImplementation(({ replicaIds = [] }) => {
+      if (replicaIds.length === 0) return pricingAggregateResult();
+      rowAttempt += 1;
+      if (rowAttempt === 1) return staleRow.promise;
+      return pricingRowResult([
+        {
+          id: 7,
+          pricingFingerprint: 'fp-7',
+          hourlyCost: 2,
+          priceSource: 'version_catalog',
+          hourlyCostExclusionReason: null,
+        },
+      ]);
+    });
+
+    const { result, rerender } = renderHook(
+      ({ enabled }) =>
+        useServicePricing({
+          serviceName: 'svc',
+          serviceHash: 'hash-a',
+          metadataReady: true,
+          currentPage,
+          enabled,
+        }),
+      { initialProps: { enabled: true } }
+    );
+
+    await waitFor(() => expect(rowAttempt).toBe(1));
+    expect(result.current.getReplicaPricing(replica)).toEqual({
+      state: 'loading',
+    });
+
+    rerender({ enabled: false });
+    rerender({ enabled: true });
+
+    await waitFor(() => expect(rowAttempt).toBe(2));
+    await waitFor(() =>
+      expect(result.current.getReplicaPricing(replica)).toMatchObject({
+        state: 'available',
+        hourlyCost: 2,
+      })
+    );
+
+    await act(async () => {
+      staleRow.resolve(
+        pricingRowResult([
+          {
+            id: 7,
+            pricingFingerprint: 'fp-7',
+            hourlyCost: 99,
+            priceSource: 'version_catalog',
+            hourlyCostExclusionReason: null,
+          },
+        ])
+      );
+      await staleRow.promise;
+    });
+    expect(result.current.getReplicaPricing(replica).hourlyCost).toBe(2);
+  });
+
+  it('does not merge a mismatched fingerprint and refreshes the bounded page', async () => {
+    const onRefreshCurrentPage = jest.fn().mockResolvedValue();
+    getServicePricing.mockImplementation(({ replicaIds = [] }) =>
+      replicaIds.length === 0
+        ? pricingAggregateResult()
+        : pricingRowResult([
+            {
+              id: 7,
+              pricingFingerprint: 'new-fingerprint',
+              hourlyCost: 9,
+              priceSource: 'version_catalog',
+              hourlyCostExclusionReason: null,
+            },
+          ])
+    );
+
+    const { result } = renderHook(() =>
+      useServicePricing({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+        currentPage,
+        onRefreshCurrentPage,
+      })
+    );
+
+    await waitFor(() => expect(onRefreshCurrentPage).toHaveBeenCalledTimes(1));
+    expect(result.current.getReplicaPricing(replica)).toEqual({
+      state: 'unavailable',
+    });
+  });
+
+  it('settles a missing-ID result and immediately refreshes the current page', async () => {
+    const onRefreshCurrentPage = jest.fn().mockResolvedValue();
+    getServicePricing.mockImplementation(({ replicaIds = [] }) =>
+      replicaIds.length === 0
+        ? pricingAggregateResult()
+        : pricingRowResult([
+            {
+              id: 7,
+              pricingFingerprint: null,
+              hourlyCost: null,
+              priceSource: null,
+              hourlyCostExclusionReason: 'not_current_or_uncertain',
+            },
+          ])
+    );
+
+    const { result } = renderHook(() =>
+      useServicePricing({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+        currentPage,
+        onRefreshCurrentPage,
+      })
+    );
+
+    await waitFor(() => expect(onRefreshCurrentPage).toHaveBeenCalledTimes(1));
+    expect(result.current.getReplicaPricing(replica)).toEqual({
+      state: 'unavailable',
+    });
+  });
+
+  it('retries negative rows but retains positive rows on pricing refresh', async () => {
+    let rowAttempt = 0;
+    getServicePricing.mockImplementation(({ replicaIds = [] }) => {
+      if (replicaIds.length === 0) return pricingAggregateResult();
+      rowAttempt += 1;
+      return pricingRowResult([
+        rowAttempt === 1
+          ? {
+              id: 7,
+              pricingFingerprint: 'fp-7',
+              hourlyCost: null,
+              priceSource: null,
+              hourlyCostExclusionReason: 'missing_version_catalog',
+            }
+          : {
+              id: 7,
+              pricingFingerprint: 'fp-7',
+              hourlyCost: 2,
+              priceSource: 'version_catalog',
+              hourlyCostExclusionReason: null,
+            },
+      ]);
+    });
+
+    const { result } = renderHook(() =>
+      useServicePricing({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+        currentPage,
+      })
+    );
+    await waitFor(() =>
+      expect(result.current.getReplicaPricing(replica).state).toBe('excluded')
+    );
+
+    await act(async () => result.current.refreshPricing());
+    await waitFor(() =>
+      expect(result.current.getReplicaPricing(replica)).toMatchObject({
+        state: 'available',
+        hourlyCost: 2,
+      })
+    );
+    expect(rowAttempt).toBe(2);
+
+    await act(async () => result.current.refreshPricing());
+    expect(rowAttempt).toBe(2);
+  });
+
+  it('chunks only current-page missing IDs into bounded row requests', async () => {
+    const replicas = Array.from({ length: 205 }, (_, index) => ({
+      id: index + 1,
+      pricingFingerprint: `fp-${index + 1}`,
+    }));
+    getServicePricing.mockImplementation(({ replicaIds = [] }) => {
+      if (replicaIds.length === 0) return pricingAggregateResult();
+      return pricingRowResult(
+        replicaIds.map((id) => ({
+          id,
+          pricingFingerprint: `fp-${id}`,
+          hourlyCost: 1,
+          priceSource: 'version_catalog',
+          hourlyCostExclusionReason: null,
+        }))
+      );
+    });
+
+    renderHook(() =>
+      useServicePricing({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+        currentPage: { serviceHash: 'hash-a', replicas },
+      })
+    );
+
+    await waitFor(() =>
+      expect(
+        getServicePricing.mock.calls.filter(
+          ([options]) => options.replicaIds?.length
+        )
+      ).toHaveLength(3)
+    );
+    expect(
+      getServicePricing.mock.calls
+        .filter(([options]) => options.replicaIds?.length)
+        .map(([options]) => options.replicaIds.length)
+    ).toEqual([100, 100, 5]);
+  });
+
+  it('fences a late aggregate from a previous service incarnation', async () => {
+    const staleAggregate = deferred();
+    getServicePricing.mockImplementation(({ serviceHash, replicaIds = [] }) => {
+      if (replicaIds.length > 0) return pricingRowResult([]);
+      if (serviceHash === 'hash-a') return staleAggregate.promise;
+      return pricingAggregateResult({
+        serviceName: 'svc-b',
+        serviceHash: 'hash-b',
+        aggregate: {
+          ...pricingAggregateResult().aggregate,
+          estimatedHourlyCost: 4,
+          nonSpotHourlyCost: 4,
+        },
+      });
+    });
+
+    const { result, rerender } = renderHook(
+      ({ serviceName, serviceHash }) =>
+        useServicePricing({
+          serviceName,
+          serviceHash,
+          metadataReady: true,
+          currentPage: { serviceHash, replicas: [] },
+        }),
+      {
+        initialProps: { serviceName: 'svc-a', serviceHash: 'hash-a' },
+      }
+    );
+    rerender({ serviceName: 'svc-b', serviceHash: 'hash-b' });
+    await waitFor(() =>
+      expect(result.current.aggregate?.estimatedHourlyCost).toBe(4)
+    );
+
+    await act(async () => {
+      staleAggregate.resolve(
+        pricingAggregateResult({
+          serviceName: 'svc-a',
+          serviceHash: 'hash-a',
+          aggregate: {
+            ...pricingAggregateResult().aggregate,
+            estimatedHourlyCost: 99,
+            nonSpotHourlyCost: 99,
+          },
+        })
+      );
+      await staleAggregate.promise;
+    });
+    expect(result.current.aggregate.estimatedHourlyCost).toBe(4);
+  });
+
+  it('never renders pricing from an older same-name service hash', async () => {
+    const pendingNewIncarnation = deferred();
+    const observations = [];
+    getServicePricing.mockImplementation(({ serviceHash, replicaIds = [] }) => {
+      if (serviceHash === 'hash-b') return pendingNewIncarnation.promise;
+      if (replicaIds.length === 0) return pricingAggregateResult();
+      return pricingRowResult([
+        {
+          id: 7,
+          pricingFingerprint: 'fp-7',
+          hourlyCost: 2,
+          priceSource: 'version_catalog',
+          hourlyCostExclusionReason: null,
+        },
+      ]);
+    });
+
+    const { result, rerender } = renderHook(
+      ({ serviceHash }) => {
+        const pricing = useServicePricing({
+          serviceName: 'svc',
+          serviceHash,
+          metadataReady: true,
+          currentPage: { serviceHash, replicas: [replica] },
+        });
+        observations.push({
+          serviceHash,
+          aggregateCost: pricing.aggregate?.estimatedHourlyCost ?? null,
+          rowCost: pricing.getReplicaPricing(replica).hourlyCost ?? null,
+        });
+        return pricing;
+      },
+      { initialProps: { serviceHash: 'hash-a' } }
+    );
+
+    await waitFor(() =>
+      expect(result.current.aggregate?.estimatedHourlyCost).toBe(1.25)
+    );
+    await waitFor(() =>
+      expect(result.current.getReplicaPricing(replica).hourlyCost).toBe(2)
+    );
+
+    observations.length = 0;
+    rerender({ serviceHash: 'hash-b' });
+
+    expect(observations.length).toBeGreaterThan(0);
+    expect(observations).not.toContainEqual(
+      expect.objectContaining({ aggregateCost: 1.25 })
+    );
+    expect(observations).not.toContainEqual(
+      expect.objectContaining({ rowCost: 2 })
+    );
+    expect(result.current.aggregate).toBeNull();
+    expect(result.current.getReplicaPricing(replica)).toEqual({
+      state: 'loading',
+    });
+  });
+});
+
 describe('ServiceDetails route ownership rendering', () => {
   beforeEach(() => {
     jest.resetAllMocks();
+    getServicePricing.mockResolvedValue(
+      pricingAggregateResult({
+        aggregate: {
+          available: true,
+          unavailableReason: null,
+          coverage: 'empty',
+          estimatedHourlyCost: 0,
+          spotHourlyCost: 0,
+          nonSpotHourlyCost: 0,
+          costTrackedReplicaCount: 0,
+          pricedReplicaCount: 0,
+          hourlyCostExcludedReplicaCount: 0,
+          hourlyCostExclusionReasons: {},
+        },
+      })
+    );
     getServiceHistory.mockResolvedValue({
       available: true,
       serviceHash: 'hash-a',
@@ -2604,6 +3047,85 @@ describe('ServiceDetailCard cost and request estimates', () => {
     ).toBeTruthy();
     expect(screen.getByText('$3.0556')).toBeTruthy();
     expect(screen.getByText('Known cloud compute / 1K requests')).toBeTruthy();
+  });
+
+  it('labels partial version-catalog totals as a known lower bound', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 3,
+          replicasTotal: 3,
+          replicasFailed: 0,
+          targetReplicas: 3,
+          activeVersions: [1, 2],
+          priceBasis: 'version_catalog',
+          pricingCoverage: 'partial',
+          estimatedHourlyCost: 2,
+          spotHourlyCost: 0.5,
+          nonSpotHourlyCost: 1.5,
+          costTrackedReplicaCount: 3,
+          pricedReplicaCount: 2,
+          hourlyCostExcludedReplicaCount: 1,
+          hourlyCostExclusionReasons: { missing_version_catalog: 1 },
+          requestRate: 1,
+          costPerThousandRequests: 0.555555,
+        }}
+      />
+    );
+
+    expect(screen.getByText('$2.00+/hr')).toBeVisible();
+    expect(
+      screen.getByText(
+        "Spot $0.50/hr · Non-Spot $1.50/hr · 1 unpriced replica · 3 active, stopping, or cleanup-uncertain replicas · Each replica version's deployment catalog; reserved $0 from persisted placement provenance; compute estimate, not a provider bill"
+      )
+    ).toBeVisible();
+    expect(screen.getByText('$0.5556+')).toBeVisible();
+    expect(
+      screen.getByText(
+        'Known lower bound at the recent request rate · 1 missing version catalog replica excluded'
+      )
+    ).toBeVisible();
+  });
+
+  it('renders empty version-catalog coverage as an explicit zero', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 0,
+          replicasTotal: 0,
+          replicasFailed: 0,
+          targetReplicas: 0,
+          activeVersions: [1],
+          priceBasis: 'version_catalog',
+          pricingCoverage: 'empty',
+          estimatedHourlyCost: 0,
+          spotHourlyCost: 0,
+          nonSpotHourlyCost: 0,
+          costTrackedReplicaCount: 0,
+          pricedReplicaCount: 0,
+          hourlyCostExcludedReplicaCount: 0,
+          hourlyCostExclusionReasons: {},
+          requestRate: 0,
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.getByText('$0.00/hr')).toBeVisible();
+    expect(
+      screen.getByText(
+        'No cost-tracked replicas; current tracked compute cost is $0.'
+      )
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        "Each replica version's deployment catalog; reserved $0 from persisted placement provenance; compute estimate, not a provider bill"
+      )
+    ).toBeVisible();
   });
 
   it('shows known cloud cost while identifying excluded Kubernetes capacity', () => {
@@ -3097,5 +3619,41 @@ describe('service replica table sorting', () => {
     expect(
       screen.getByText(formatFullTimestamp(new Date(1751600000 * 1000)))
     ).toBeVisible();
+  });
+
+  it('labels reserved zero-cost current rows and never prices past attempts', async () => {
+    const user = userEvent.setup();
+    render(
+      <ReplicasCard
+        replicas={[
+          {
+            id: 7,
+            status: 'READY',
+            version: 2,
+            directProjection: true,
+            hourlyCost: 0,
+            priceSource: 'zero_cost_provenance',
+          },
+        ]}
+        loading={false}
+        currentTotal={1}
+        pastReplicas={[
+          {
+            id: 6,
+            status: 'FAILED_PROVISION',
+            version: 1,
+            directProjection: true,
+            hourlyCost: 8,
+            priceSource: 'version_catalog',
+          },
+        ]}
+        pastTotal={1}
+      />
+    );
+
+    expect(screen.getByText('$0.00 reserved')).toBeVisible();
+    await user.click(screen.getByText('Past attempts (1)'));
+    expect(screen.getByText('Not available')).toBeVisible();
+    expect(screen.queryByText('$8.00')).not.toBeInTheDocument();
   });
 });

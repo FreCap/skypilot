@@ -6,6 +6,9 @@ live control plane as a **full fork wheel** installed onto the pinned upstream
 whole wheel is deliberate — the base is pinned to an older nightly than the fork's tree (which
 rebases on upstream master), so a changed-files-only overlay would mix old-wheel modules with newer
 fork modules. Installing the wheel keeps source, package metadata, and the runtime version consistent.
+The build context includes the complete tracked `sky/` tree and every source declared by
+`setup.py`'s `py_modules`; the build and reuse checks import the authorization bootstrap so a wheel
+cannot silently omit its pre-import trust boundary.
 The dashboard: the base image's `sky/dashboard/out` bundle is baked at nightly-build time, so the
 script always rebuilds the static export from this fork's `sky/dashboard` source and ships it in the
 overlay (otherwise the deployed dashboard lags the fork's python and fork dashboard changes never

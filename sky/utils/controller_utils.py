@@ -213,24 +213,10 @@ def download_and_stream_job_log(
 def shared_controller_vars_to_fill(
         controller: Controllers, remote_user_config_path: str,
         local_user_config: dict[str, Any]) -> dict[str, str]:
+    local_user_config = controller_config_snapshot(local_user_config)
     if not local_user_config:
         local_user_config_path = None
     else:
-        # Remove admin_policy from local_user_config so that it is not applied
-        # again on the controller. This is required since admin_policy is not
-        # installed on the controller.
-        local_user_config.pop('admin_policy', None)
-        # Remove allowed_contexts from local_user_config since the controller
-        # may be running in a Kubernetes cluster with in-cluster auth and may
-        # not have kubeconfig available to it. This is the typical case since
-        # remote_identity default for Kubernetes is SERVICE_ACCOUNT.
-        # TODO(romilb): We should check the cloud the controller is running on
-        # before popping allowed_contexts. If it is not on Kubernetes,
-        # we may be able to use allowed_contexts.
-        local_user_config.pop('allowed_contexts', None)
-        # Remove api_server config so that the controller does not try to use
-        # a remote API server.
-        local_user_config.pop('api_server', None)
         with tempfile.NamedTemporaryFile(
                 delete=False,
                 suffix=_LOCAL_SKYPILOT_CONFIG_PATH_SUFFIX) as temp_file:
@@ -266,6 +252,43 @@ def shared_controller_vars_to_fill(
             skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = remote_user_config_path
     vars_to_fill['controller_envs'].update(env_vars)
     return vars_to_fill
+
+
+def controller_config_snapshot(local_user_config: dict[str, Any],
+                               workspace: str | None = None) -> dict[str, Any]:
+    """Return the config a controller process is allowed to consume.
+
+    Always a plain dict. The API server's own config is a
+    ``config_utils.Config`` (a dict subclass), and yaml.safe_dump refuses to
+    represent subclasses: the update path serializes this snapshot directly,
+    so returning the subclass fails every `sky serve update` on the server
+    with a RepresenterError. Only the top level needs coercion --
+    ``Config.from_dict`` is ``cls(**config)``, so nested values are the plain
+    dicts the YAML loader produced.
+    """
+    config = dict(copy.deepcopy(local_user_config))
+    # These are API-side concerns and must not be re-applied by a controller.
+    config.pop('admin_policy', None)
+    config.pop('api_server', None)
+    config.pop('db', None)
+    # A Kubernetes-hosted controller commonly uses in-cluster auth and may not
+    # have the API server's local kubeconfig contexts.
+    # TODO(romilb): Retain this key when the controller is not on Kubernetes.
+    config.pop('allowed_contexts', None)
+    if workspace is None:
+        active_workspace = config.get('active_workspace')
+        if isinstance(active_workspace, str) and active_workspace:
+            workspace = active_workspace
+    workspaces = config.get('workspaces')
+    if workspace is not None and isinstance(workspaces, dict):
+        workspace_config = workspaces.get(workspace)
+        if isinstance(workspace_config, dict):
+            workspace_config.pop('allowed_users', None)
+            workspace_config.pop('private', None)
+        config['workspaces'] = ({
+            workspace: workspace_config
+        } if workspace_config is not None else {})
+    return config
 
 
 def controller_only_vars_to_fill(controller: Controllers) -> dict[str, str]:

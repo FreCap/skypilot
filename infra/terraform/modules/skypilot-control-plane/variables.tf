@@ -355,6 +355,169 @@ variable "db_connection_secret_name" {
   }
 }
 
+variable "request_store" {
+  description = <<-EOT
+    API request-envelope persistence settings rendered as the chart's
+    requestStore values. The SQLite defaults preserve the chart's compatibility
+    behavior; select PostgreSQL explicitly only after completing the chart's
+    one-way request-store cutover procedure. Enabling built-in execution
+    quiescence enforcement requires the PostgreSQL backend.
+  EOT
+  type = object({
+    backend                                       = optional(string, "sqlite")
+    enforce_builtin_execution_quiescence_backends = optional(bool, false)
+    cutover_gate_path                             = optional(string, "/root/.sky/api-request-cutover.json")
+  })
+  default  = {}
+  nullable = false
+
+  validation {
+    condition     = contains(["sqlite", "postgres"], var.request_store.backend)
+    error_message = "request_store.backend must be either sqlite or postgres."
+  }
+
+  validation {
+    condition     = trimspace(var.request_store.cutover_gate_path) != ""
+    error_message = "request_store.cutover_gate_path must be nonempty."
+  }
+
+  validation {
+    condition = (
+      !var.request_store.enforce_builtin_execution_quiescence_backends ||
+      var.request_store.backend == "postgres"
+    )
+    error_message = "request_store.enforce_builtin_execution_quiescence_backends requires request_store.backend=postgres."
+  }
+}
+
+variable "rwx_authority_fence" {
+  description = <<-EOT
+    Optional steady-state verifier for a completed migration to static RWX
+    storage. Null disables it. When set, the module mounts authority_claim_name
+    read-only into a fail-closed init container on every API, executor, and
+    controller pod. The long-running containers never receive this mount.
+
+    The authority claim must be a dedicated static PVC backed by an EFS access
+    point distinct from the writable state claim/access point. expected_sha256
+    is the SHA-256 of the exact digest-sealed fence bytes emitted by the accepted
+    finalizer and deliberately has no default. The PostgreSQL evidence digest
+    is independently supplied and has no default. identity binds those bytes
+    to the exact source, replacement-state, and authority Kubernetes/AWS
+    objects.
+  EOT
+  type = object({
+    authority_claim_name              = string
+    state_claim_name                  = string
+    expected_sha256                   = string
+    expected_postgres_evidence_sha256 = string
+    identity = object({
+      source = object({
+        pvc_name      = string
+        pvc_uid       = string
+        pv_name       = string
+        pv_uid        = string
+        ebs_volume_id = string
+      })
+      target = object({
+        filesystem_id             = string
+        state_access_point_id     = string
+        state_pv_name             = string
+        state_pv_uid              = string
+        state_pvc_uid             = string
+        authority_access_point_id = string
+        authority_pv_name         = string
+        authority_pv_uid          = string
+        authority_pvc_uid         = string
+      })
+    })
+  })
+  default = null
+
+  validation {
+    condition = var.rwx_authority_fence == null || try(
+      can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$", var.rwx_authority_fence.authority_claim_name)) &&
+      length(var.rwx_authority_fence.authority_claim_name) <= 253 &&
+      can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$", var.rwx_authority_fence.state_claim_name)) &&
+      length(var.rwx_authority_fence.state_claim_name) <= 253 &&
+      var.rwx_authority_fence.authority_claim_name != var.rwx_authority_fence.state_claim_name,
+      false,
+    )
+    error_message = "rwx_authority_fence requires distinct, valid Kubernetes authority_claim_name and state_claim_name values."
+  }
+
+  validation {
+    condition = var.rwx_authority_fence == null || try(
+      can(regex("^[0-9a-f]{64}$", var.rwx_authority_fence.expected_sha256)),
+      false,
+    )
+    error_message = "rwx_authority_fence.expected_sha256 must be exactly 64 lowercase hexadecimal characters."
+  }
+
+  validation {
+    condition = var.rwx_authority_fence == null || try(
+      can(regex("^[0-9a-f]{64}$", var.rwx_authority_fence.expected_postgres_evidence_sha256)),
+      false,
+    )
+    error_message = "rwx_authority_fence.expected_postgres_evidence_sha256 must be exactly 64 lowercase hexadecimal characters."
+  }
+
+  validation {
+    condition = var.rwx_authority_fence == null || try(
+      alltrue([
+        for name in [
+          var.rwx_authority_fence.identity.source.pvc_name,
+          var.rwx_authority_fence.identity.source.pv_name,
+          var.rwx_authority_fence.identity.target.state_pv_name,
+          var.rwx_authority_fence.identity.target.authority_pv_name,
+        ] : can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$", name)) && length(name) <= 253
+      ]) &&
+      alltrue([
+        for uid in [
+          var.rwx_authority_fence.identity.source.pvc_uid,
+          var.rwx_authority_fence.identity.source.pv_uid,
+          var.rwx_authority_fence.identity.target.state_pv_uid,
+          var.rwx_authority_fence.identity.target.state_pvc_uid,
+          var.rwx_authority_fence.identity.target.authority_pv_uid,
+          var.rwx_authority_fence.identity.target.authority_pvc_uid,
+        ] : can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", uid))
+      ]) &&
+      can(regex("^vol-[0-9a-f]{8}([0-9a-f]{9})?$", var.rwx_authority_fence.identity.source.ebs_volume_id)) &&
+      can(regex("^fs-[0-9a-f]{8}([0-9a-f]{9})?$", var.rwx_authority_fence.identity.target.filesystem_id)) &&
+      can(regex("^fsap-[0-9a-f]{8}([0-9a-f]{9})?$", var.rwx_authority_fence.identity.target.state_access_point_id)) &&
+      can(regex("^fsap-[0-9a-f]{8}([0-9a-f]{9})?$", var.rwx_authority_fence.identity.target.authority_access_point_id)),
+      false,
+    )
+    error_message = "rwx_authority_fence.identity must use valid Kubernetes object names, canonical lowercase Kubernetes UIDs, and AWS EBS/EFS resource IDs."
+  }
+
+  validation {
+    condition = var.rwx_authority_fence == null || try(
+      var.rwx_authority_fence.identity.target.state_access_point_id != var.rwx_authority_fence.identity.target.authority_access_point_id &&
+      var.rwx_authority_fence.identity.target.state_pv_name != var.rwx_authority_fence.identity.target.authority_pv_name &&
+      var.rwx_authority_fence.identity.target.state_pv_uid != var.rwx_authority_fence.identity.target.authority_pv_uid &&
+      var.rwx_authority_fence.identity.target.state_pvc_uid != var.rwx_authority_fence.identity.target.authority_pvc_uid &&
+      !contains([
+        var.rwx_authority_fence.state_claim_name,
+        var.rwx_authority_fence.authority_claim_name,
+      ], var.rwx_authority_fence.identity.source.pvc_name) &&
+      !contains([
+        var.rwx_authority_fence.identity.target.state_pv_name,
+        var.rwx_authority_fence.identity.target.authority_pv_name,
+      ], var.rwx_authority_fence.identity.source.pv_name) &&
+      !contains([
+        var.rwx_authority_fence.identity.target.state_pv_uid,
+        var.rwx_authority_fence.identity.target.authority_pv_uid,
+      ], var.rwx_authority_fence.identity.source.pv_uid) &&
+      !contains([
+        var.rwx_authority_fence.identity.target.state_pvc_uid,
+        var.rwx_authority_fence.identity.target.authority_pvc_uid,
+      ], var.rwx_authority_fence.identity.source.pvc_uid),
+      false,
+    )
+    error_message = "rwx_authority_fence must use distinct source, state, and authority claims, access points, PVs, and PVCs."
+  }
+}
+
 # --- Ingress ----------------------------------------------------------------
 
 variable "ingress_enabled" {

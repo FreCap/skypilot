@@ -1,9 +1,10 @@
 """Implementation of the SkyServe core APIs."""
-import base64
 import contextlib
+import hashlib
 import os
 import pathlib
 import re
+import secrets
 import shlex
 import signal
 import tempfile
@@ -29,6 +30,7 @@ from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.serve import constants as serve_constants
 from sky.serve import lb_k8s
+from sky.serve import maintenance
 from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -375,107 +377,6 @@ def _require_service_update_workspace(service_record: dict[str, Any],
     return stored_workspace
 
 
-# Config subtrees that may carry credentials in supported configurations
-# (free-form objects: arbitrary pod specs can hold plaintext env
-# credentials, create_instance_kwargs can hold registry credentials).
-# Stripped from the HA-recovery config embed so they never land in the
-# durable ha_recovery_script DB row; extend as new credential-capable
-# config keys appear. A '*' segment matches every child key (used for the
-# per-context config maps). The controller loses only these subtrees on a
-# pod-replacement recovery — the corresponding launch customizations, not
-# identity or workspace resolution.
-_EMBEDDED_CONFIG_CREDENTIAL_KEYS: list[tuple[str, ...]] = [
-    ('vast', 'create_instance_kwargs'),
-    ('kubernetes', 'pod_config'),
-    ('kubernetes', 'context_configs', '*', 'pod_config'),
-    ('ssh', 'pod_config'),
-    ('ssh', 'context_configs', '*', 'pod_config'),
-]
-
-
-def _sanitized_config_bytes(local_path: str) -> bytes | None:
-    """Read + sanitize the controller config yaml for the recovery embed.
-
-    Returns None (skip the embed; the recovery-side service-dir mkdir still
-    applies) when the file is unreadable or unparsable — a malformed embed
-    is worse than a missing one, since the restore would faithfully
-    recreate garbage.
-    """
-    try:
-        with open(os.path.expanduser(local_path), encoding='utf-8') as f:
-            config = yaml_utils.safe_load(f.read()) or {}
-    except Exception as e:  # pylint: disable=broad-except
-        logger.warning('Skipping HA-recovery config embed (unreadable or '
-                       f'unparsable {local_path}): {e}')
-        return None
-
-    def _strip(node: Any, key_path: tuple[str, ...], trail: str) -> None:
-        if not isinstance(node, dict):
-            return
-        key, rest = key_path[0], key_path[1:]
-        if key == '*':
-            for child_key, child in list(node.items()):
-                _strip_or_pop(node, child_key, child, rest,
-                              f'{trail}.{child_key}')
-            return
-        if key in node:
-            _strip_or_pop(node, key, node[key], rest, f'{trail}.{key}')
-
-    def _strip_or_pop(parent: dict[str, Any], key: str, child: Any,
-                      rest: tuple[str, ...], trail: str) -> None:
-        if not rest:
-            parent.pop(key)
-            logger.info('Stripped credential-capable config subtree '
-                        f'{trail.lstrip(".")} from the HA-recovery embed.')
-        else:
-            _strip(child, rest, trail)
-
-    for credential_key_path in _EMBEDDED_CONFIG_CREDENTIAL_KEYS:
-        _strip(config, credential_key_path, '')
-    return yaml_utils.dump_yaml_str(config).encode('utf-8')
-
-
-def _ha_recovery_restore_cmds(files: dict[str, bytes] | None) -> list[str]:
-    """Shell commands recreating the given files from the given contents
-    (base64-embedded, shell-quoted paths).
-
-    Makes the stored HA recovery script self-contained across POD
-    REPLACEMENT: these files are synced onto pod-local storage (emptyDir),
-    but a replacement pod starts with a fresh filesystem while the recovery
-    script survives in the DB. Without them the recovered controller
-    crash-loops (e.g. FileNotFoundError on SKYPILOT_CONFIG) — measured
-    live: a 224-replica fleet sat CONTROLLER_FAILED for hours after a
-    rolling update.
-
-    Callers must pass an ALLOWLIST of infra files only — never the full
-    controller file_mounts: the mounts can include TLS private keys and
-    (in the two-hop path) arbitrary user files, and everything embedded
-    here lands in a durable DB row and in process command lines. Contents
-    are passed pre-read (and, for the config, pre-sanitized) as bytes;
-    anything over 1MiB is skipped with a warning rather than bloating the
-    DB row.
-    """
-    restore_cmds = []
-    for remote_path, content in sorted((files or {}).items()):
-        if len(content) > 1024 * 1024:
-            logger.warning(f'Skipping HA-recovery embed of {remote_path}: '
-                           f'{len(content)} bytes exceeds the 1MiB cap.')
-            continue
-        content_b64 = base64.b64encode(content).decode('ascii')
-        # shlex.quote treats `~` as unsafe and would quote it, which stops
-        # bash tilde expansion — so splice an explicit "$HOME" for
-        # home-relative paths and quote only the remainder. Hostile
-        # metacharacters in either form end up inside quotes and are inert.
-        if remote_path.startswith('~/'):
-            quoted_path = '"$HOME"' + shlex.quote(remote_path[1:])
-        else:
-            quoted_path = shlex.quote(remote_path)
-        restore_cmds.append(
-            f'mkdir -p -- "$(dirname -- {quoted_path})" && '
-            f'printf %s {content_b64} | base64 -d > {quoted_path}')
-    return restore_cmds
-
-
 def _maybe_display_run_warning(task: 'task_lib.Task') -> None:
     # We do not block the user from creating a pool with a run section
     # in order to enable using the same yaml for pool creation
@@ -549,6 +450,10 @@ def up(
     submitted_yaml_content: str | None = None,
 ) -> tuple[str, str]:
     """Spins up a service or pool under the cross-pod name lifecycle lock."""
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe creation is disabled while the server controller hold '
+            'is active.')
     if service_name is None:
         service_name = serve_utils.generate_service_name(pool)
     lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
@@ -728,6 +633,9 @@ def _up_impl_body(task: 'task_lib.Task',
                 service_name, resource_scope))
         controller_resources = controller_utils.get_controller_resources(
             controller=controller, task_resources=task.resources)
+        controller_user_config = controller_utils.controller_config_snapshot(
+            mutated_user_config, workspace=service_workspace)
+        controller_user_config['active_workspace'] = service_workspace
         controller_job_id = None
         if serve_utils.is_consolidation_mode(pool):
             # We need a unique integer per sky.serve.up call to avoid name
@@ -759,7 +667,7 @@ def _up_impl_body(task: 'task_lib.Task',
             **controller_utils.shared_controller_vars_to_fill(
                 controller=controller_utils.Controllers.SKY_SERVE_CONTROLLER,
                 remote_user_config_path=remote_config_yaml_path,
-                local_user_config=mutated_user_config,
+                local_user_config=controller_user_config,
             ),
         }
         catalog_authority = (
@@ -829,29 +737,12 @@ def _up_impl_body(task: 'task_lib.Task',
             env_cmds = [
                 f'export {k}={v!r}' for k, v in controller_task.envs.items()
             ]
-            # Embed ONLY the controller config yaml so the stored recovery
-            # script is self-contained across pod replacement (fresh
-            # emptyDir). The config is identity-critical: recovering with a
-            # partial config makes the controller activate the WRONG cloud
-            # identity (live incident: replica ops failed with
-            # ClusterOwnerIdentityMismatchError until the full merged config
-            # was restored). Deliberately NOT the full file_mounts: the task
-            # yaml may carry service secrets, and other user mounts may contain
-            # credentials — none of which belong in a durable DB row. The
-            # remaining mounts stay a known pod-replacement gap (two-hop user
-            # mounts; tmp task yaml is only a legacy fallback, since recovery
-            # boots from the DB-committed yaml).
-            # The config is additionally sanitized of known
-            # credential-capable subtrees before the embed.
-            config_files: dict[str, bytes] = {}
-            for remote, local in (controller_task.file_mounts or {}).items():
-                if remote != remote_config_yaml_path:
-                    continue
-                sanitized = _sanitized_config_bytes(local)
-                if sanitized is not None:
-                    config_files[remote] = sanitized
-            restore_cmds = _ha_recovery_restore_cmds(config_files)
-            run_script = '\n'.join(env_cmds + restore_cmds + [run_script])
+            # Config bytes are persisted per immutable version by `_start` and
+            # restored from PostgreSQL before this script is executed. Keeping
+            # them out of the shell command avoids credentials in command logs
+            # and the operating system's argv-size limit.
+            run_script = serve_utils.strip_legacy_ha_recovery_config_payload(
+                '\n'.join(env_cmds + [run_script]), remote_config_yaml_path)
             # Dump script for high availability recovery.
             _assert_lifecycle_lock('publishing the recovery script')
             if not serve_state.set_ha_recovery_script(
@@ -1012,6 +903,10 @@ def update(
     submitted_yaml_content: str | None = None,
 ) -> None:
     """Updates an existing service or pool."""
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe updates are disabled while the server controller hold '
+            'is active.')
     # The lifecycle lock is cross-pod on PostgreSQL and lives outside the
     # service directory. Keep the legacy local lock outermost to match named
     # down's local-lock -> controller-purge lifecycle-lock order; reversing the
@@ -1031,6 +926,10 @@ def update(
 def elect_version(service_name: str, version: int, expected_service_hash: str,
                   expected_elected_version: int | None) -> None:
     """Create a new rollout generation from an immutable stored version."""
+    if maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe version election is disabled while the server '
+            'controller hold is active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
         lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
         with lifecycle_lock:
@@ -1069,6 +968,10 @@ def elect_version(service_name: str, version: int, expected_service_hash: str,
 def set_load_balancer_high_availability(service_name: str, enabled: bool,
                                         expected_service_hash: str) -> None:
     """Change only one service's external-LB topology under lifecycle lock."""
+    if maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe load balancer topology changes are disabled while the '
+            'server controller hold is active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
         lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
         with lifecycle_lock:
@@ -1084,8 +987,9 @@ def set_load_balancer_high_availability(service_name: str, enabled: bool,
                     in serve_state.ServiceStatus.terminal_statuses() or
                     service_status
                     == serve_state.ServiceStatus.CONTROLLER_INIT):
-                status_text = getattr(service_status, 'value',
-                                      str(service_status))
+                status_text = (service_status.value if isinstance(
+                    service_status, serve_state.ServiceStatus) else
+                               str(service_status))
                 raise RuntimeError(
                     f'Service {service_name!r} is not ready for a load '
                     f'balancer topology change (status={status_text}).')
@@ -1244,11 +1148,31 @@ def _update_impl_body(
     # Always apply the policy again here, even though it might have been applied
     # in the CLI. This is to ensure that we apply the policy to the final DAG
     # and get the mutated config.
-    # TODO(cblmemo,zhwu): If a user sets a new skypilot_config, the update
-    # will not apply the config.
-    dag, _ = admin_policy_utils.apply(
+    dag, mutated_user_config = admin_policy_utils.apply(
         task, request_name=request_names.AdminPolicyRequestName.SERVE_UPDATE)
     task = dag.tasks[0]
+    requested_config_workspace = mutated_user_config.get('active_workspace')
+    if (requested_config_workspace is not None and
+            requested_config_workspace != service_workspace):
+        raise RuntimeError(
+            f'Admin policy changed active_workspace while updating {noun} '
+            f'{service_name!r}; expected the owning workspace '
+            f'{service_workspace!r}, got {requested_config_workspace!r}.')
+    controller_config_bytes: bytes | None = None
+    controller_config_digest: str | None = None
+    controller_config_snapshot_id: str | None = None
+    if consolidation_mode:
+        controller_config = controller_utils.controller_config_snapshot(
+            mutated_user_config, workspace=service_workspace)
+        controller_config['active_workspace'] = service_workspace
+        controller_config_bytes = yaml_utils.dump_yaml_str(
+            controller_config).encode('utf-8')
+        # Fail before storage preparation, file sync, or version allocation.
+        # The controller independently repeats this check on exact bytes.
+        serve_utils.sanitize_ha_recovery_config_bytes(controller_config_bytes)
+        controller_config_digest = hashlib.sha256(
+            controller_config_bytes).hexdigest()
+        controller_config_snapshot_id = secrets.token_hex(32)
     serve_utils.snapshot_service_container_images(task,
                                                   workspace=service_workspace)
     if pool:
@@ -1275,6 +1199,12 @@ def _update_impl_body(
     _assert_service_update_fence(service_name, pool, handle, backend,
                                  expected_service_hash, lifecycle_lock,
                                  'preparing the update')
+    if consolidation_mode:
+        # An old controller would ignore the snapshot field and could still
+        # commit the task. Reject before allocating a version or syncing files
+        # while an API-server rollout is mixed.
+        serve_utils.require_update_config_snapshot_capability(
+            service_name, expected_service_hash)
 
     resource_scope = service_record.get('resource_scope')
     storage_scope_id: str | None = None
@@ -1379,9 +1309,16 @@ def _update_impl_body(
             prefix=f'{service_name}-v{current_version}',
             mode='w') as service_file, tempfile.NamedTemporaryFile(
                 prefix=f'{service_name}-submitted-v{current_version}',
-                mode='w') as submitted_service_file:
+                mode='w') as submitted_service_file, \
+            tempfile.NamedTemporaryFile(
+                prefix=f'{service_name}-config-v{current_version}',
+                mode='w') as controller_config_file:
         task_config = task.to_yaml_config()
         yaml_utils.dump_yaml(service_file.name, task_config)
+        if controller_config_bytes is not None:
+            controller_config_file.write(
+                controller_config_bytes.decode('utf-8'))
+            controller_config_file.flush()
         should_sync_submitted_yaml = (consolidation_mode and
                                       submitted_yaml_content is not None)
         if should_sync_submitted_yaml:
@@ -1399,72 +1336,155 @@ def _update_impl_body(
                 current_version,
                 expand_user=False,
                 resource_scope=service_record.get('resource_scope')))
-
-        with sky_logging.silent():
-            _assert_service_update_fence(service_name, pool, handle, backend,
-                                         expected_service_hash, lifecycle_lock,
-                                         'syncing the update YAML')
-            files_to_sync = {remote_task_yaml_path: service_file.name}
-            if should_sync_submitted_yaml:
-                files_to_sync[remote_submitted_task_yaml_path] = (
-                    submitted_service_file.name)
-            backend.sync_file_mounts(handle, files_to_sync, storage_mounts=None)
-
-        if serve_utils.is_consolidation_mode(pool):
-            # Route directly through the shared Serve DB/controller proxy so
-            # the accepted request carries the exact lifecycle epoch. A
-            # name-only skylet RPC could resume after this lock session died
-            # and roll the same incarnation back behind a newer update.
-            _assert_service_update_fence(service_name, pool, handle, backend,
-                                         expected_service_hash, lifecycle_lock,
-                                         'submitting the update')
-            serve_utils.update_service_encoded(
+        staged_config_yaml_path = (
+            serve_utils.generate_staged_config_yaml_file_name(
                 service_name,
                 current_version,
-                mode=mode.value,
-                pool=pool,
-                expected_service_hash=expected_service_hash,
-                expected_lifecycle_epoch=(
-                    serve_utils.get_service_lifecycle_epoch(lifecycle_lock)),
-                has_submitted_yaml=should_sync_submitted_yaml)
-        else:
-            use_legacy = not handle.is_grpc_enabled_with_flag
+                resource_scope=service_record.get('resource_scope'),
+                snapshot_id=controller_config_snapshot_id))
 
-            if not use_legacy:
+        stage_sync_attempted = False
+        submission_started = False
+        try:
+            with sky_logging.silent():
+                _assert_service_update_fence(service_name, pool, handle,
+                                             backend, expected_service_hash,
+                                             lifecycle_lock,
+                                             'syncing the update YAML')
+                files_to_sync = {remote_task_yaml_path: service_file.name}
+                if should_sync_submitted_yaml:
+                    files_to_sync[remote_submitted_task_yaml_path] = (
+                        submitted_service_file.name)
+                if consolidation_mode:
+                    assert controller_config_bytes is not None
+                    files_to_sync[staged_config_yaml_path] = (
+                        controller_config_file.name)
+                    stage_sync_attempted = True
+                backend.sync_file_mounts(handle,
+                                         files_to_sync,
+                                         storage_mounts=None)
+
+            if consolidation_mode:
+                assert controller_config_digest is not None
+                try:
+                    # Consolidated controllers share this API pod's
+                    # filesystem. Verify the raw stage in-process so the
+                    # source digest never appears in a shell argv or command
+                    # log (it may otherwise verify stripped low-entropy
+                    # credentials offline).
+                    serve_utils.secure_staged_controller_config(
+                        staged_config_yaml_path, controller_config_digest)
+                except Exception as e:
+                    raise RuntimeError(
+                        'Failed to secure staged controller config: '
+                        f'{common_utils.format_exception(e)}') from e
+
+                assert controller_config_snapshot_id is not None
+                # Route directly through the shared Serve DB/controller proxy
+                # so the accepted request carries the exact lifecycle epoch.
                 _assert_service_update_fence(service_name, pool, handle,
                                              backend, expected_service_hash,
                                              lifecycle_lock,
                                              'submitting the update')
+                lifecycle_epoch = (
+                    serve_utils.get_service_lifecycle_epoch(lifecycle_lock))
+                submission_started = True
                 try:
-                    serve_rpc_utils.RpcRunner.update_service(
-                        handle, service_name, current_version, mode, pool)
-                except exceptions.SkyletMethodNotImplementedError:
-                    use_legacy = True
+                    serve_utils.update_service_encoded(
+                        service_name,
+                        current_version,
+                        mode=mode.value,
+                        pool=pool,
+                        expected_service_hash=expected_service_hash,
+                        expected_lifecycle_epoch=lifecycle_epoch,
+                        has_submitted_yaml=should_sync_submitted_yaml,
+                        has_config_snapshot=True,
+                        expected_config_snapshot_digest=(
+                            controller_config_digest),
+                        config_snapshot_id=controller_config_snapshot_id)
+                except BaseException:
+                    # The POST helper may have lost the final response after a
+                    # handler committed. Cleanup is another serialized
+                    # controller operation, so it waits behind every replay
+                    # and removes only a still-NULL version with this nonce.
+                    try:
+                        serve_utils.cleanup_staged_config_update_encoded(
+                            service_name, expected_service_hash,
+                            current_version, lifecycle_epoch,
+                            controller_config_snapshot_id)
+                    except Exception as cleanup_error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Could not confirm staged controller config '
+                            f'cleanup for {service_name!r} version '
+                            f'{current_version}; preserving it for '
+                            'controller-side reconciliation: '
+                            f'{common_utils.format_exception(cleanup_error)}')
+                    raise
+            else:
+                use_legacy = not handle.is_grpc_enabled_with_flag
 
-            if use_legacy:
-                _assert_service_update_fence(service_name, pool, handle,
-                                             backend, expected_service_hash,
-                                             lifecycle_lock,
-                                             'submitting the update')
-                code = serve_utils.ServeCodeGen.update_service(service_name,
-                                                               current_version,
-                                                               mode=mode.value,
-                                                               pool=pool)
-                returncode, _, stderr = backend.run_on_head(
-                    handle,
-                    code,
-                    require_outputs=True,
-                    stream_logs=False,
-                    separate_stderr=True)
-                try:
-                    subprocess_utils.handle_returncode(
-                        returncode,
+                if not use_legacy:
+                    _assert_service_update_fence(service_name, pool, handle,
+                                                 backend, expected_service_hash,
+                                                 lifecycle_lock,
+                                                 'submitting the update')
+                    try:
+                        serve_rpc_utils.RpcRunner.update_service(
+                            handle, service_name, current_version, mode, pool)
+                    except exceptions.SkyletMethodNotImplementedError:
+                        use_legacy = True
+
+                if use_legacy:
+                    _assert_service_update_fence(service_name, pool, handle,
+                                                 backend, expected_service_hash,
+                                                 lifecycle_lock,
+                                                 'submitting the update')
+                    code = serve_utils.ServeCodeGen.update_service(
+                        service_name,
+                        current_version,
+                        mode=mode.value,
+                        pool=pool)
+                    returncode, _, stderr = backend.run_on_head(
+                        handle,
                         code,
-                        f'Failed to update {noun}s',
-                        stderr,
-                        stream_logs=True)
-                except exceptions.CommandError as e:
-                    raise RuntimeError(e.error_msg) from e
+                        require_outputs=True,
+                        stream_logs=False,
+                        separate_stderr=True)
+                    try:
+                        subprocess_utils.handle_returncode(
+                            returncode,
+                            code,
+                            f'Failed to update {noun}s',
+                            stderr,
+                            stream_logs=True)
+                    except exceptions.CommandError as e:
+                        raise RuntimeError(e.error_msg) from e
+        except BaseException:
+            if (consolidation_mode and stage_sync_attempted and
+                    not submission_started):
+                cleanup_code = (serve_utils.ServeCodeGen.
+                                remove_uncommitted_staged_controller_config(
+                                    service_name, current_version,
+                                    service_record.get('resource_scope'),
+                                    controller_config_snapshot_id))
+                try:
+                    returncode, _, stderr = backend.run_on_head(
+                        handle,
+                        cleanup_code,
+                        require_outputs=True,
+                        stream_logs=False,
+                        separate_stderr=True)
+                    if returncode:
+                        logger.warning('Remote staged config cleanup failed '
+                                       f'for {service_name!r} version '
+                                       f'{current_version}: {stderr}')
+                except Exception as cleanup_error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Remote staged config cleanup could not '
+                        f'run for {service_name!r} version '
+                        f'{current_version}: '
+                        f'{common_utils.format_exception(cleanup_error)}')
+            raise
 
     cmd = 'sky jobs pool status' if pool else 'sky serve status'
     logger.info(
@@ -1497,6 +1517,10 @@ def apply(
     pool: bool = False,
 ) -> None:
     """Applies the config to the service or pool."""
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe apply is disabled while the server controller hold is '
+            'active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
         lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
         with lifecycle_lock:
@@ -1580,6 +1604,10 @@ def down(
     pool: bool = False,
 ) -> None:
     """Tears down a service or pool."""
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe termination and purge are disabled while the server '
+            'controller hold is active.')
     noun = 'pool' if pool else 'service'
     if service_names is None:
         service_names = []

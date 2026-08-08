@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Card } from '@/components/ui/card';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
@@ -82,6 +82,9 @@ function JobHeader({
 export function JobDetailPage() {
   const router = useRouter();
   const { cluster, job } = router.query;
+  const clusterRouteKey = Array.isArray(cluster) ? cluster[0] : cluster;
+  const jobRouteKey = Array.isArray(job) ? job[0] : job;
+  const routeKey = `${clusterRouteKey ?? ''}:${jobRouteKey ?? ''}`;
   const {
     clusterData,
     clusterJobData,
@@ -93,30 +96,51 @@ export function JobDetailPage() {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isCopied, setIsCopied] = useState(false);
   const [logsRefreshToken, setLogsRefreshToken] = useState(0);
+  const activeRouteKeyRef = useRef(routeKey);
 
   const PENDING_STATUSES = useMemo(() => ['INIT', 'PENDING', 'SETTING_UP'], []);
 
+  useEffect(() => {
+    if (activeRouteKeyRef.current !== routeKey) {
+      activeRouteKeyRef.current = routeKey;
+      setIsRefreshing(false);
+      setIsInitialLoad(true);
+      setIsCopied(false);
+      setLogsRefreshToken(0);
+    }
+  }, [routeKey]);
+
+  const ownsRouteState = activeRouteKeyRef.current === routeKey;
+  const currentIsRefreshing = ownsRouteState ? isRefreshing : false;
+  const currentClusterData = useMemo(() => {
+    if (!clusterData || !clusterRouteKey) {
+      return null;
+    }
+    return clusterData.cluster === clusterRouteKey ? clusterData : null;
+  }, [clusterData, clusterRouteKey]);
   const selectedJob = useMemo(() => {
-    if (!clusterJobData || !job) return null;
-    return clusterJobData.find((candidate) => candidate.id == job) ?? null;
-  }, [clusterJobData, job]);
+    if (!currentClusterData || !clusterJobData || !jobRouteKey) return null;
+    return (
+      clusterJobData.find((candidate) => candidate.id == jobRouteKey) ?? null
+    );
+  }, [currentClusterData, clusterJobData, jobRouteKey]);
   const isPending =
-    !selectedJob || PENDING_STATUSES.includes(selectedJob.status);
+    selectedJob == null || PENDING_STATUSES.includes(selectedJob.status);
 
   // Update isInitialLoad when both cluster and job data are first loaded
   useEffect(() => {
-    if (!loading && !clusterJobsLoading && isInitialLoad) {
+    if (ownsRouteState && !loading && !clusterJobsLoading && isInitialLoad) {
       setIsInitialLoad(false);
     }
-  }, [loading, clusterJobsLoading, isInitialLoad]);
+  }, [ownsRouteState, loading, clusterJobsLoading, isInitialLoad]);
 
   const logStreamArgs = useMemo(
     () => ({
-      clusterName: cluster,
-      jobId: job,
-      workspace: clusterData?.workspace,
+      clusterName: clusterRouteKey,
+      jobId: jobRouteKey,
+      workspace: currentClusterData?.workspace,
     }),
-    [cluster, job, clusterData?.workspace]
+    [clusterRouteKey, jobRouteKey, currentClusterData?.workspace]
   );
 
   const handleStreamError = useCallback((error) => {
@@ -126,7 +150,8 @@ export function JobDetailPage() {
   const { lines: displayLines, isLoading: isLoadingLogs } = useLogStreamer({
     streamFn: streamClusterJobLogs,
     streamArgs: logStreamArgs,
-    enabled: Boolean(cluster && job && selectedJob) && !isPending,
+    enabled:
+      Boolean(clusterRouteKey && jobRouteKey && selectedJob) && !isPending,
     refreshTrigger: logsRefreshToken,
     onError: handleStreamError,
   });
@@ -163,22 +188,29 @@ export function JobDetailPage() {
   }
 
   let jobData = {
-    id: job,
+    id: jobRouteKey,
   };
 
-  if (clusterData && selectedJob) {
+  if (currentClusterData && selectedJob) {
     jobData = {
       ...selectedJob,
-      infra: clusterData.infra,
-      cluster: clusterData.cluster,
-      user: clusterData.user,
-      user_hash: clusterData.user_hash,
+      infra: currentClusterData.infra,
+      cluster: currentClusterData.cluster,
+      user: currentClusterData.user,
+      user_hash: currentClusterData.user_hash,
     };
   }
+  const hasCurrentRouteData = currentClusterData != null && selectedJob != null;
+  const isRouteLoading =
+    !router.isReady ||
+    !ownsRouteState ||
+    (isInitialLoad && !hasCurrentRouteData);
+  const headerLoading =
+    !ownsRouteState || loading || clusterJobsLoading || isInitialLoad;
 
   const title =
-    cluster && job
-      ? `Job: ${job} @ ${cluster} | SkyPilot Dashboard`
+    clusterRouteKey && jobRouteKey
+      ? `Job: ${jobRouteKey} @ ${clusterRouteKey} | SkyPilot Dashboard`
       : 'Job Details | SkyPilot Dashboard';
 
   return (
@@ -188,17 +220,21 @@ export function JobDetailPage() {
       </Head>
       <>
         <JobHeader
-          cluster={cluster}
-          job={job}
+          cluster={clusterRouteKey}
+          job={jobRouteKey}
           jobData={jobData}
           onRefresh={handleManualRefresh}
-          isRefreshing={isRefreshing}
-          loading={loading}
+          isRefreshing={currentIsRefreshing}
+          loading={headerLoading}
         />
-        {isInitialLoad && (loading || clusterJobsLoading) ? (
+        {isRouteLoading ? (
           <div className="flex items-center justify-center h-64">
             <CircularProgress size={24} className="mr-2" />
             <span>Loading...</span>
+          </div>
+        ) : !hasCurrentRouteData ? (
+          <div className="flex items-center justify-center h-64">
+            <span>Job not found</span>
           </div>
         ) : (
           <div className="space-y-8">
@@ -362,9 +398,9 @@ export function JobDetailPage() {
                       <button
                         onClick={() =>
                           downloadJobLogs({
-                            clusterName: cluster,
-                            jobIds: job ? [job] : null,
-                            workspace: clusterData?.workspace,
+                            clusterName: clusterRouteKey,
+                            jobIds: jobRouteKey ? [jobRouteKey] : null,
+                            workspace: currentClusterData?.workspace,
                           })
                         }
                         className="text-sky-blue hover:text-sky-blue-bright flex items-center"

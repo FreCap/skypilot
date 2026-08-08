@@ -25,15 +25,28 @@ def _request(*, status=requests.RequestStatus.WAITING):
         request_id='wire-contract',
         name='wire-contract-request',
         entrypoint=_entrypoint,
-        request_body=payloads.RequestBody(),
+        request_body=payloads.RequestBody(
+            env_vars={'WIRE_CONTRACT_SECRET': 'must-not-appear-in-status'},
+            entrypoint='wire-contract-entrypoint',
+            entrypoint_command='wire-contract-command',
+            using_remote_api_server=True,
+            override_skypilot_config={'api_server': {
+                'endpoint': 'private'
+            }},
+            override_skypilot_config_path='/private/config.yaml',
+            file_mounts_blob_id='body-blob-1'),
         status=status,
         created_at=123.5,
         user_id='user-1',
         cluster_name='cluster-1',
-        status_msg='waiting',
+        status_msg='private retry detail',
         should_retry=True,
         finished_at=None,
         file_mounts_blob_id='blob-1',
+        execution_generation=7,
+        execution_quiescence_required=True,
+        execution_quiesced_generation=7,
+        execution_quiesced_at=124.5,
     )
 
 
@@ -81,20 +94,34 @@ def test_wire_projection_round_trip_and_late_bound_seams(monkeypatch):
 
     assert display_payload.status == requests.RequestStatus.RUNNING.value
     assert display_payload.user_name == 'Wire User'
-    assert display_payload.entrypoint == '_entrypoint'
-    assert display_payload.request_body == request.request_body.model_dump_json(
-    )
+    assert display_payload.entrypoint == ''
+    assert display_payload.request_body == 'null'
     assert display_payload.return_value == 'null'
     assert display_payload.error == 'null'
     assert display_payload.pid is None
-    assert display_payload.file_mounts_blob_id == 'blob-1'
+    assert display_payload.status_msg is None
+    assert display_payload.file_mounts_blob_id is None
+    assert display_payload.execution_generation == 7
+    assert display_payload.execution_quiescence_required is True
+    assert display_payload.execution_quiesced_generation == 7
+    assert display_payload.execution_quiesced_at == 124.5
     assert full_payload.status == requests.RequestStatus.RUNNING.value
+    assert full_payload.entrypoint
+    assert full_payload.request_body != 'null'
+    assert full_payload.status_msg == request.status_msg
+    assert full_payload.file_mounts_blob_id == request.file_mounts_blob_id
     assert decoded.request_id == request.request_id
     assert decoded.entrypoint is _entrypoint
     assert decoded.status is requests.RequestStatus.RUNNING
     assert decoded.schedule_type is requests.ScheduleType.LONG
     assert decoded.request_body == request.request_body
     assert decoded.file_mounts_blob_id == request.file_mounts_blob_id
+    assert decoded.execution_generation == request.execution_generation
+    assert (decoded.execution_quiescence_required ==
+            request.execution_quiescence_required)
+    assert (decoded.execution_quiesced_generation ==
+            request.execution_quiesced_generation)
+    assert decoded.execution_quiesced_at == request.execution_quiesced_at
     user_lookup.assert_called_once_with()
     assert version_lookup.call_count == 2
 

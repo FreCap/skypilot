@@ -17,7 +17,7 @@ on:
 
 jobs:
   dashboard:
-    runs-on: namespace-profile-ci-2x4
+    runs-on: namespace-profile-skypilot-ci-2x4
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies and check
@@ -45,6 +45,7 @@ jobs:
           src/components/job-detail-logs.test.jsx \
           src/components/job-log-actions.test.jsx \
           src/components/jobs.test.jsx \
+          src/components/cluster-operational-events.test.jsx \
           src/components/pools-table.test.jsx \
           src/components/users.test.jsx \
           src/components/workspace-editor.test.jsx \
@@ -65,7 +66,10 @@ jobs:
           src/data/connectors/stream-decoders.test.jsx \
           src/data/connectors/volumes.test.js \
           src/tests/managed-job-details.test.jsx \
+          src/tests/task-details-route.test.jsx \
+          src/tests/cluster-job-details.test.jsx \
           src/tests/service-details.test.jsx \
+          src/tests/cluster-details-route.test.jsx \
           src/tests/cluster-history-details.test.jsx \
           src/tests/volume-details.test.jsx \
           src/tests/pool-details.test.jsx \

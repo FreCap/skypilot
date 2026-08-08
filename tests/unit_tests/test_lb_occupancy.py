@@ -159,7 +159,7 @@ class TestOccupancyParsing(unittest.TestCase):
 
 
 def _make_balancer(policy):
-    balancer = object.__new__(lb_module.SkyServeLoadBalancer)
+    balancer = lb_module.SkyServeLoadBalancer('http://controller:8001', 0)
     balancer._load_balancing_policy = policy
     balancer._client_pool_lock = threading.Lock()
     balancer._ready = True

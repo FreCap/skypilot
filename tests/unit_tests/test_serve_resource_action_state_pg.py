@@ -619,7 +619,7 @@ def _gate_evidence(
         approved_image_digest='sha256:' + '1' * 64,
         api_schema_revision=(('007' if authority_ready else '005')
                              if api_revision is None else api_revision),
-        serve_schema_revision='034',
+        serve_schema_revision='035',
         global_user_state_schema_revision=global_revision,
         handler_registered_everywhere=True,
         image_inventory_sha256='2' * 64,
@@ -1676,6 +1676,7 @@ def test_promotion_recomputes_match_and_counts_only_success(
         actions.ResourceActionMode.AUTHORITATIVE,
         gate_evidence=_gate_evidence(
             candidate_since=old_window,
+            api_revision='008',
             coverage_inventory_sha256=report.coverage_inventory_sha256),
         expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
     assert promoted.record.mode is actions.ResourceActionMode.AUTHORITATIVE

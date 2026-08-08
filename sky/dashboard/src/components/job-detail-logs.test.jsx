@@ -71,6 +71,25 @@ jest.mock('@/plugins/PluginSlot', () => ({
   PluginSlot: jest.fn(({ fallback = null }) => fallback),
 }));
 
+jest.mock('@/components/ui/select', () => ({
+  Select: ({ value, onValueChange, children }) => (
+    <select
+      value={value}
+      onChange={(event) => onValueChange?.(event.target.value)}
+    >
+      {children}
+    </select>
+  ),
+  SelectContent: ({ children }) => <>{children}</>,
+  SelectItem: ({ children, value, disabled = false }) => (
+    <option value={value} disabled={disabled}>
+      {children}
+    </option>
+  ),
+  SelectTrigger: () => null,
+  SelectValue: () => null,
+}));
+
 jest.mock('@/components/elements/UserDisplay', () => ({
   UserDisplay: () => null,
 }));
@@ -80,7 +99,12 @@ jest.mock('@/utils/grafana', () => ({
 }));
 
 jest.mock('@/components/TelemetrySection', () => ({
-  TelemetrySection: jest.fn(() => null),
+  TelemetrySection: jest.fn(({ displayName, headerExtra = null }) => (
+    <div data-testid="telemetry-section">
+      <span>{displayName}</span>
+      {headerExtra}
+    </div>
+  )),
 }));
 
 const mockScanLines = jest.fn();
@@ -243,6 +267,77 @@ it('does not start a mismatched stream across cluster-job route changes', () => 
         options.streamArgs.clusterName === 'cluster-b'
     )
   ).toBe(false);
+});
+
+it('keeps the cluster-job route in loading instead of rendering a partial detail card while a new route is fetching', async () => {
+  const refreshA = jest.fn().mockResolvedValue(undefined);
+  const refreshB = jest.fn().mockResolvedValue(undefined);
+  let clusterBLoading = true;
+  useClusterDetails.mockImplementation(({ cluster }) => {
+    if (cluster === 'cluster-a') {
+      return {
+        clusterData: {
+          cluster: 'cluster-a',
+          workspace: 'workspace-a',
+          infra: 'AWS',
+          user: 'alice',
+          user_hash: 'user-a',
+        },
+        clusterJobData: [{ id: 7, status: 'RUNNING', job: 'training-a' }],
+        loading: false,
+        clusterJobsLoading: false,
+        refreshData: refreshA,
+      };
+    }
+    return {
+      clusterData: null,
+      clusterJobData: null,
+      loading: clusterBLoading,
+      clusterJobsLoading: clusterBLoading,
+      refreshData: refreshB,
+    };
+  });
+
+  router.query = { cluster: 'cluster-a', job: '7' };
+  const { rerender } = render(<ClusterJobDetails />);
+  await screen.findByText('Job ID');
+
+  router.query = { cluster: 'cluster-b', job: '8' };
+  rerender(<ClusterJobDetails />);
+
+  expect(screen.queryByText('Job ID')).not.toBeInTheDocument();
+  expect(screen.queryByText('training-a')).not.toBeInTheDocument();
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(2);
+  expect(refreshA).not.toHaveBeenCalled();
+  expect(refreshB).not.toHaveBeenCalled();
+
+  clusterBLoading = false;
+  rerender(<ClusterJobDetails />);
+  await screen.findByText('Job not found');
+});
+
+it('keeps matching cluster-job detail visible during background loading', async () => {
+  router.query = { cluster: 'cluster-a', job: '7' };
+  useClusterDetails.mockReturnValue({
+    clusterData: {
+      cluster: 'cluster-a',
+      workspace: 'workspace-a',
+      infra: 'AWS',
+      user: 'alice',
+      user_hash: 'user-a',
+    },
+    clusterJobData: [{ id: 7, status: 'RUNNING', job: 'training-a' }],
+    loading: true,
+    clusterJobsLoading: false,
+    refreshData: jest.fn().mockResolvedValue(undefined),
+  });
+
+  render(<ClusterJobDetails />);
+
+  expect(await screen.findByText('Job ID')).toBeInTheDocument();
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
+  expect(screen.getAllByRole('progressbar')).toHaveLength(1);
 });
 
 it('uses the current job rows for its pool-link snapshot', async () => {
@@ -481,6 +576,162 @@ it('preserves the managed-job log stream and plugin contract', async () => {
     refreshTrigger: 0,
   });
   expect(mockScanLines).toHaveBeenCalledWith(workerLines);
+});
+
+it('resets route-owned job log, telemetry, and extracted-link state', async () => {
+  const makeTask = (jobId, index, nodeSuffix) => ({
+    ...job,
+    id: Number(jobId),
+    task_job_id: Number(jobId) * 10 + index,
+    task: `task-${jobId}-${index}`,
+    name: `job-${jobId}`,
+    full_infra: 'Kubernetes (context-a)',
+    cluster_name_on_cloud: `cluster-${jobId}-${index}`,
+    node_names: ['head', `worker${nodeSuffix}`],
+  });
+  const jobsById = {
+    42: [
+      makeTask('42', 0, '1'),
+      makeTask('42', 1, '1'),
+      makeTask('42', 2, '1'),
+    ],
+    43: [
+      makeTask('43', 0, '2'),
+      makeTask('43', 1, '2'),
+      makeTask('43', 2, '2'),
+    ],
+  };
+  const logsByJobId = {
+    42: ['(head, 0) job-42', '(worker1, 0) task-2'],
+    43: ['(head, 0) job-43', '(worker2, 0) task-0'],
+  };
+  const extractedLinksByJobId = {
+    42: { 'W&B Run': 'https://wandb.ai/acme/project/runs/run-42' },
+    43: {},
+  };
+  checkGrafanaAvailability.mockResolvedValue(true);
+  useSingleManagedJob.mockImplementation((jobId) => ({
+    jobData: { jobs: jobsById[String(jobId)] },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  }));
+  useLogStreamer.mockImplementation(({ streamArgs }) => ({
+    lines: streamArgs.controller
+      ? controllerLines
+      : logsByJobId[String(streamArgs.jobId)],
+    isLoading: false,
+    hasReceivedFirstChunk: true,
+  }));
+  useLogLinkExtractor.mockImplementation(() => ({
+    extractedLinks: extractedLinksByJobId[String(router.query.job)],
+    scanLines: mockScanLines,
+  }));
+
+  const { rerender } = render(<JobDetails />);
+  await screen.findByRole('link', { name: 'W&B Run' });
+  await waitFor(() =>
+    expect(screen.getByTestId('telemetry-section')).toBeInTheDocument()
+  );
+
+  let logsSection = document.querySelector('#logs-section');
+  let [taskSelect, nodeSelect] = within(logsSection).getAllByRole('combobox');
+  fireEvent.change(taskSelect, { target: { value: '2' } });
+  fireEvent.change(nodeSelect, { target: { value: 'worker1' } });
+  fireEvent.change(
+    within(screen.getByTestId('telemetry-section')).getByRole('combobox'),
+    {
+      target: { value: '2' },
+    }
+  );
+
+  await waitFor(() =>
+    expect(latestEnabledStreamCall(false)).toMatchObject({
+      streamArgs: { jobId: 42, controller: false, task: 2 },
+    })
+  );
+
+  router.query = { job: '43' };
+  rerender(<JobDetails />);
+
+  logsSection = document.querySelector('#logs-section');
+  [taskSelect, nodeSelect] = within(logsSection).getAllByRole('combobox');
+  expect(taskSelect).toHaveValue('0');
+  expect(nodeSelect).toHaveValue('all');
+  expect(
+    within(screen.getByTestId('telemetry-section')).getByRole('combobox')
+  ).toHaveValue('0');
+  expect(
+    screen.queryByRole('link', { name: 'W&B Run' })
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole('option', { name: 'Task 2: task-42-2' })
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole('option', { name: 'worker1' })
+  ).not.toBeInTheDocument();
+
+  await waitFor(() =>
+    expect(latestEnabledStreamCall(false)).toMatchObject({
+      streamArgs: { jobId: 43, controller: false, task: 0 },
+    })
+  );
+  expect(
+    useLogStreamer.mock.calls.some(
+      ([options]) =>
+        options.enabled === true &&
+        options.streamArgs.jobId === 43 &&
+        options.streamArgs.task === 2
+    )
+  ).toBe(false);
+});
+
+it('clamps a stale task selection before a shorter destination route owns logs', async () => {
+  const makeTask = (jobId, index) => ({
+    ...job,
+    id: Number(jobId),
+    task_job_id: Number(jobId) * 10 + index,
+    task: `task-${jobId}-${index}`,
+    name: `job-${jobId}`,
+  });
+  const jobsById = {
+    42: [makeTask('42', 0), makeTask('42', 1), makeTask('42', 2)],
+    43: [makeTask('43', 0), makeTask('43', 1)],
+  };
+  const workerRouteLogs = ['(head, 0) log line'];
+  useSingleManagedJob.mockImplementation((jobId) => ({
+    jobData: { jobs: jobsById[String(jobId)] },
+    loading: false,
+    refreshJobData: jest.fn().mockResolvedValue(undefined),
+  }));
+  useLogStreamer.mockImplementation(({ streamArgs }) => ({
+    lines: streamArgs.controller ? controllerLines : workerRouteLogs,
+    isLoading: false,
+    hasReceivedFirstChunk: true,
+  }));
+
+  const { rerender } = render(<JobDetails />);
+  let logsSection = document.querySelector('#logs-section');
+  let [taskSelect] = within(logsSection).getAllByRole('combobox');
+  fireEvent.change(taskSelect, { target: { value: '2' } });
+
+  await waitFor(() =>
+    expect(latestEnabledStreamCall(false)).toMatchObject({
+      streamArgs: { jobId: 42, controller: false, task: 2 },
+    })
+  );
+
+  router.query = { job: '43' };
+  rerender(<JobDetails />);
+
+  logsSection = document.querySelector('#logs-section');
+  [taskSelect] = within(logsSection).getAllByRole('combobox');
+  expect(taskSelect).toHaveValue('0');
+  await waitFor(() =>
+    expect(latestEnabledStreamCall(false)).toMatchObject({
+      streamArgs: { jobId: 43, controller: false, task: 0 },
+    })
+  );
+  expect(screen.queryByText('Job not found')).not.toBeInTheDocument();
 });
 
 it('preserves expanded controller-log streaming and plugin context', async () => {

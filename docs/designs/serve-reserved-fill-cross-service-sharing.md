@@ -128,10 +128,35 @@ keeps the two concerns separate:
   replacement authority; compatibility demand ownership selects the cold card;
 - old replicas never satisfy the latest-version launch target;
 - the latest version emits the existing fenced logical scale target;
-- a mixed-version rollout preserves the adopted compatibility-owned card map
-  for paid actuation; once the rollout completes, only materialized,
-  non-retiring latest-version replicas may move compatible demand from its
-  adopted paid card onto another card in the demand actuator;
+- on a fresh, complete, non-downscale mixed-version tick, the supply-aware
+  compatible placement may move only its per-card explicitly owned subset,
+  even when a non-retiring old replica still backs the prior card. The old row
+  protects active work and fences nonpreemptive retirement until
+  latest-version READY coverage exists; it never selects the paid replacement
+  card. Synthesized default-all and aggregate padding own no paid placement;
+  a backed remainder retains only same-card rollout authority;
+- old-version provenance remains tri-state. A complete map permits units absent
+  from every generation to move only toward explicit ownership and gives an
+  unproven remainder no paid authority; unknown provenance preserves the
+  adopted map and publishes explicit zero paid authority. Preempted and
+  scale-down rows never count as backing;
+- a downscale hold keeps its adopted exact-card retry assignment instead of
+  applying mixed-version reassignment;
+- the logical reconciliation target and paid cold-launch authority are
+  separate fields. A retained target is not spending authority;
+- the compatibility allocator returns separate full reconciliation,
+  explicit-reassignment, and paid-ownership maps. Latest-only aggregate
+  minimums and headerless queued demand may buy the selected cheapest card;
+  inferred in-flight overflow and generic padding may not. A mixed-version
+  cross-card move still requires the explicit-reassignment subset;
+- logical READY/provisioning supply uses the same committed-capacity value as
+  shortage suppression. A persistently degraded zero-capacity row cannot steer
+  paid placement after its bounded replacement timeout, while the explicitly
+  marked bounded replacement remains committed to prevent recursive waves;
+- placement returns explicit typed funding provenance and planned capacity.
+  The manager debits paid authority only for a `PAID` launch result and never
+  infers the debit from an appended `ReplicaInfo`; `ZERO_COST` demand placement
+  does not consume paid authority;
 - unmaterialized broker-reported free slots never back demand actuation and
   never create paid cold-launch authority for their accelerator;
 - reserved-fill decisions remain the only path that materializes those free
@@ -187,15 +212,31 @@ The rolling-progress regression covers the production deadlock shape:
 - a latest-version fenced logical scale target is emitted;
 - the demand target and paid cold-launch authority remain L4-only;
 - A100-family launches, if any, are separate zero-cost-only fill decisions;
-- cross-card supply reuse resumes only after no old-version replicas remain;
+- fresh, complete, explicitly-proven non-downscale compatibility placement can
+  move an adopted old-backed unit to the allocator-owned replacement card
+  before all old rows disappear;
 - busy old-version A100-family replicas remain retained until their work
-  completes without requiring a latest-version A100-family replacement;
-- no old replica drains before same-card latest-version ready coverage exists;
+  completes without requiring a latest-version A100-family replacement for
+  L4-compatible work;
+- no old replica drains before compatible latest-version ready coverage exists;
 - partial latest-version L4 coverage retires only the matching amount of idle
   old-version L4 capacity instead of waiting for the complete L4 target;
-- latest-version capacity on a different card cannot retire old L4 capacity;
+- latest-version capacity on an incompatible different card cannot retire old
+  L4-only capacity;
 - fill cannot exceed the broker grant or aggregate ceiling while demand surge
   is pending.
+
+The paid-authority regression additionally covers the production-shaped mixed
+card case: old A100 rows back adopted units, current compatible ownership puts
+their replacements on L4, and the first fresh tick emits only L4 paid
+authority. After the L4 wave commits, a second tick progresses retirement of
+idle old A100 rows rather than deadlocking on an empty authority map. Stale or
+incomplete input emits explicit zero paid authority; a downscale-held retry
+retains its adopted exact card; 40 old L4-only units remain L4. Manager tests
+prove that only typed `PAID` results debit authority and typed `ZERO_COST`
+results do not. A fresh report with running old A100 work but no accepted
+compatibility history keeps A100 as the same-card replacement; only an explicit
+flexible profile permits the cross-card L4 replacement.
 
 The existing suite also covers identical multi-accelerator pool keys,
 overlapping-but-nonidentical pool rejection, floor scaling, weighted splits,

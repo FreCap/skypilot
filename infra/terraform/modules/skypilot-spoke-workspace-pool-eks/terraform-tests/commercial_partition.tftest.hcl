@@ -135,3 +135,18 @@ run "commercial_pool_preserves_partition_identity_shapes" {
     error_message = "The partition output must expose the effective RBAC groups."
   }
 }
+
+# The pool ServiceAccount is what a node runs as, so it is the identity that
+# performs an idle teardown. Every partition gets it: a pool namespace whose
+# nodes cannot delete themselves silently breaks `sky launch -i N --down`.
+run "every_partition_gets_node_self_teardown" {
+  command = plan
+
+  assert {
+    condition = (
+      module.rbac["training"].self_teardown_role_name == "training-self-teardown" &&
+      module.rbac["inference"].self_teardown_role_name == "inference-self-teardown"
+    )
+    error_message = "Every partition must receive the node self-teardown grant."
+  }
+}

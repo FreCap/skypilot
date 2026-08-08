@@ -25,7 +25,17 @@ kind: ClusterRole
 metadata:
   name: {{ $fullName }}-api-role
 rules:
-{{ toYaml .Values.rbac.clusterRules | indent 2 }}
+{{/* Protocol-v2 reserved fill identifies a physical Kubernetes cluster by
+     the immutable kube-system Namespace UID. Keep this exact rule in the
+     template instead of only in clusterRules: --reuse-values can retain a
+     pre-feature list during an upgrade. */}}
+  - apiGroups: [ "" ]
+    resources: [ "namespaces" ]
+    resourceNames: [ "kube-system" ]
+    verbs: [ "get" ]
+{{- with .Values.rbac.clusterRules }}
+{{ toYaml . | indent 2 }}
+{{- end }}
 {{- if .Values.rbac.manageRbacPolicies }}
   - apiGroups: [ "rbac.authorization.k8s.io" ]
     resources: [ "clusterroles", "clusterrolebindings" ]
@@ -136,6 +146,12 @@ rules:
       - patch
       {{- end }}
       - delete
+  # Reserved-fill protocol transitions bind the activating Pod to this
+  # release's API Deployment through Pod -> ReplicaSet -> Deployment owner
+  # UIDs.  A selector-only proof could be redirected to an unrelated rollout.
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets" ]
+    verbs: [ "get" ]
   - apiGroups: [ "" ]
     resources: [ "services" ]
     verbs:

@@ -17,8 +17,9 @@ def test_postgres_record_schema_topology() -> None:
              'execution_generation', 'claim_token', 'worker_instance_id',
              'controller_generation', 'lease_expires_at', 'heartbeat_at',
              'cancel_requested_at', 'cancel_acknowledged_at',
-             'interrupted_reason', 'event_context', 'resource_action_id',
-             'resource_action_attempt', 'updated_at'),
+             'execution_quiescence_required', 'execution_quiesced_generation',
+             'execution_quiesced_at', 'interrupted_reason', 'event_context',
+             'resource_action_id', 'resource_action_attempt', 'updated_at'),
         'api_resource_actions':
             ('action_id', 'domain', 'resource_type', 'resource_identity',
              'desired_generation', 'action_type', 'immutable_spec',
@@ -43,8 +44,9 @@ def test_postgres_record_schema_topology() -> None:
         'api_server_instances':
             ('instance_id', 'role', 'pod_name', 'pod_uid', 'pod_ip', 'version',
              'started_at', 'heartbeat_at', 'draining_at', 'ready',
-             'health_detail', 'supported_handlers', 'supported_payload_versions'
-            ),
+             'health_detail', 'supported_handlers',
+             'supported_payload_versions', 'request_storage_backend',
+             'request_queue_backend', 'execution_quiescence_capable'),
         'api_controller_leadership':
             ('leadership_key', 'generation', 'instance_id', 'lock_backend_pid',
              'generation_lock_key', 'acquired_at', 'heartbeat_at', 'released_at'
@@ -83,3 +85,10 @@ def test_postgres_schema_objects_keep_historical_facade_identity() -> None:
     assert (postgres.CONTROLLER_ACTION_RESERVATIONS
             is postgres_schema.CONTROLLER_ACTION_RESERVATIONS)
     assert postgres._PG_LOCKS is postgres_schema.PG_LOCKS
+
+
+def test_execution_quiescence_required_keeps_api007_insert_default() -> None:
+    column = postgres_schema.REQUESTS.c.execution_quiescence_required
+
+    assert column.server_default is not None
+    assert str(column.server_default.arg) == 'false'

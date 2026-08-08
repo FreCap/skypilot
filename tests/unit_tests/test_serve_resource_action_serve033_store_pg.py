@@ -523,22 +523,39 @@ def test_store_and_activation_contract_fail_closed_on_old_dialects() -> None:
             sqlalchemy.create_engine('sqlite://'))
 
     legacy_shadow = _activation_evidence(api_revision='005',
-                                         serve_revision='034')
+                                         serve_revision='035')
     assert legacy_shadow.shadow_ready
     assert not legacy_shadow.private_handler_dispatch_ready
     private_dispatch = _activation_evidence(api_revision='007',
-                                            serve_revision='034',
+                                            serve_revision='035',
                                             authority_ready=True)
     assert private_dispatch.private_handler_dispatch_ready
     assert private_dispatch.authority_ready
-    with pytest.raises(ValueError, match='Serve schema revision 034'):
-        _activation_evidence(api_revision='007', serve_revision='033')
+    api008_dispatch = _activation_evidence(api_revision='008',
+                                           serve_revision='035',
+                                           authority_ready=True)
+    assert api008_dispatch.private_handler_dispatch_ready
+    assert api008_dispatch.authority_ready
+    schema036_dispatch = _activation_evidence(api_revision='008',
+                                              serve_revision='036',
+                                              authority_ready=True)
+    assert schema036_dispatch.private_handler_dispatch_ready
+    assert schema036_dispatch.authority_ready
+    schema037_dispatch = _activation_evidence(api_revision='008',
+                                              serve_revision='037',
+                                              authority_ready=True)
+    assert schema037_dispatch.private_handler_dispatch_ready
+    assert schema037_dispatch.authority_ready
+    with pytest.raises(ValueError,
+                       match='Serve schema revision 035, 036, or 037'):
+        _activation_evidence(api_revision='007', serve_revision='034')
 
 
 def test_api006_cannot_authorize_m4() -> None:
-    with pytest.raises(ValueError, match='API schema revision 005 or 007'):
+    with pytest.raises(ValueError,
+                       match='API schema revision 005 or a 007-compatible'):
         _activation_evidence(api_revision='006',
-                             serve_revision='034',
+                             serve_revision='035',
                              authority_ready=True)
 
 
@@ -1619,7 +1636,7 @@ def test_authority_transition_requires_locked_inventory_hash_equality(
                                       actions.ResourceActionMode.AUTHORITATIVE,
                                       gate_evidence=_activation_evidence(
                                           api_revision='007',
-                                          serve_revision='034',
+                                          serve_revision='035',
                                           authority_ready=True,
                                           candidate_since=candidate_since,
                                           coverage_inventory_sha256='b' * 64),
@@ -1632,7 +1649,7 @@ def test_authority_transition_requires_locked_inventory_hash_equality(
         actions.ResourceActionMode.AUTHORITATIVE,
         gate_evidence=_activation_evidence(
             api_revision='007',
-            serve_revision='034',
+            serve_revision='035',
             authority_ready=True,
             candidate_since=candidate_since,
             coverage_inventory_sha256=locked_hash),

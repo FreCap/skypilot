@@ -8,11 +8,14 @@ import argparse
 from collections.abc import Callable
 from collections.abc import Iterator
 import contextlib
+import contextvars
 import dataclasses
+import hashlib
 import json
 import multiprocessing
 import os
 import pathlib
+import secrets
 import shutil
 import socket
 import sys
@@ -33,7 +36,9 @@ from sky.data import data_utils
 from sky.serve import constants
 from sky.serve import controller
 from sky.serve import lb_k8s
+from sky.serve import maintenance
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -430,34 +435,100 @@ def _cleanup(service_name: str,
     # controller from registering a new cluster, while the owner check and
     # the fenced delete below reject a successor service or controller.
     _assert_owner('after cluster inventory snapshot')
-    absent_replica_infos = [
-        info for info in replica_infos
-        if info.cluster_name not in existing_cluster_names
-    ]
-    if absent_replica_infos:
+
+    def _set_to_failed_cleanup(info: replica_managers.ReplicaInfo,
+                               reason: str | None = None) -> None:
+        nonlocal failed
+        # Set replica status to `FAILED_CLEANUP` and preserve its durable row.
+        # In particular, absence from SkyPilot's cluster table is not proof
+        # that a protocol-v2 Kubernetes object is absent.
+        if info.status_property.sky_launch_status in (
+                None, replica_managers.common_utils.ProcessStatus.SCHEDULED,
+                replica_managers.common_utils.ProcessStatus.INTERRUPTED):
+            # These launch states otherwise dominate ``sky_down_status`` in
+            # status rendering (PENDING/SHUTTING_DOWN). The launch barrier has
+            # already quiesced them, so publish the retained row accurately as
+            # FAILED_CLEANUP.
+            info.status_property.sky_launch_status = (
+                replica_managers.common_utils.ProcessStatus.FAILED)
+        info.status_property.sky_down_status = (
+            replica_managers.common_utils.ProcessStatus.FAILED)
+        _persist_replica(info)
+        failed = True
+        suffix = '' if reason is None else f': {reason}'
+        logger.error(f'Replica {info.replica_id} failed to terminate{suffix}.')
+
+    absent_legacy_infos: list[replica_managers.ReplicaInfo] = []
+    cleanup_entries: list[tuple[replica_managers.ReplicaInfo,
+                                reserved_capacity.ProtocolV2CleanupFence |
+                                None]] = []
+    for info in replica_infos:
+        try:
+            cleanup_fence = (
+                reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            _set_to_failed_cleanup(
+                info, 'durable Kubernetes cleanup identity is malformed or '
+                f'incomplete ({common_utils.format_exception(error)})')
+            continue
+        if info.cluster_name not in existing_cluster_names:
+            if cleanup_fence is None:
+                absent_legacy_infos.append(info)
+            else:
+                _set_to_failed_cleanup(
+                    info, 'the SkyPilot cluster record is absent but '
+                    'provider absence is not independently proven')
+            continue
+        cleanup_entries.append((info, cleanup_fence))
+
+    if absent_legacy_infos:
         removed = serve_state.remove_replicas(
-            service_name, [info.replica_id for info in absent_replica_infos],
+            service_name, [info.replica_id for info in absent_legacy_infos],
             expected_service_hash=service_hash,
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=expected_owner,
             expected_replica_record_ids={
                 info.replica_id: info.replica_record_id
-                for info in absent_replica_infos
+                for info in absent_legacy_infos
             })
         if not removed:
             raise ServiceOwnershipLostError(
                 'Lost lifecycle ownership while bulk-removing absent '
                 'replicas.')
-        logger.info(f'Removed {len(absent_replica_infos)} replica records '
-                    'whose clusters are absent from the cluster inventory.')
-    # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove this
-    # whole-service thread loop at M5 for eligible authoritative services after
-    # durable down actions cover cleanup and rollback.
+        logger.info(f'Removed {len(absent_legacy_infos)} legacy replica '
+                    'records whose clusters are absent from the cluster '
+                    'inventory.')
+
+    teardown_identities: dict[int, serve_state.ReplicaResourceActionIdentity |
+                              None] = {}
+    if cleanup_entries:
+        cleanup_replica_ids = [info.replica_id for info, _ in cleanup_entries]
+        try:
+            # Snapshot every action-owned cluster-record UUID before starting
+            # any worker.  Context/physical-UID fencing prevents a kubeconfig
+            # alias from changing clusters, while this independent fence
+            # prevents a same-name cluster-table replacement on that cluster
+            # from being consumed by stale service cleanup.
+            teardown_identities = (
+                serve_state.get_replica_resource_action_identities(
+                    service_name, cleanup_replica_ids))
+            if set(teardown_identities) != set(cleanup_replica_ids):
+                raise RuntimeError(
+                    'Replica inventory changed while snapshotting teardown '
+                    'identities.')
+        except Exception as error:  # pylint: disable=broad-except
+            reason = ('durable replica teardown identities could not be '
+                      'verified '
+                      f'({common_utils.format_exception(error)})')
+            for info, _ in cleanup_entries:
+                _set_to_failed_cleanup(info, reason)
+            cleanup_entries = []
+    # This remains the whole-service teardown owner.  Cleanup intent and exact
+    # replica identity are durable; the retired action-authority proposal does
+    # not replace this thread loop.
     info2thr: dict[replica_managers.ReplicaInfo,
                    thread_utils.SafeThread] = dict()
-    for info in replica_infos:
-        if info.cluster_name not in existing_cluster_names:
-            continue
+    for info, cleanup_fence in cleanup_entries:
         _assert_owner(f'before scheduling replica {info.replica_id} cleanup')
         # Use the durable exact cluster identity from the replica row. New
         # incarnation-scoped names truncate long service prefixes to stay
@@ -465,9 +536,18 @@ def _cleanup(service_name: str,
         # with the full service name can miss a live, billable cluster.
         log_file_name = serve_utils.generate_replica_log_file_name(
             service_name, info.replica_id, resource_scope)
+        teardown_identity = teardown_identities[info.replica_id]
+        terminate_kwargs: dict[str, Any] = {
+            'continue_guard': _still_owns,
+            'expected_cluster_record_uuid':
+                (str(teardown_identity.sky_cluster_record_uuid)
+                 if teardown_identity is not None else None),
+        }
+        if cleanup_fence is not None:
+            terminate_kwargs['cleanup_fence'] = cleanup_fence
         t = thread_utils.SafeThread(target=replica_managers.terminate_cluster,
                                     args=(info.cluster_name, log_file_name),
-                                    kwargs={'continue_guard': _still_owns})
+                                    kwargs=terminate_kwargs)
         info2thr[info] = t
         # Set replica status to `SHUTTING_DOWN`
         info.status_property.sky_launch_status = (
@@ -476,15 +556,6 @@ def _cleanup(service_name: str,
             replica_managers.common_utils.ProcessStatus.SCHEDULED)
         _persist_replica(info)
         logger.info(f'Scheduling to terminate replica {info.replica_id} ...')
-
-    def _set_to_failed_cleanup(info: replica_managers.ReplicaInfo) -> None:
-        nonlocal failed
-        # Set replica status to `FAILED_CLEANUP`
-        info.status_property.sky_down_status = (
-            replica_managers.common_utils.ProcessStatus.FAILED)
-        _persist_replica(info)
-        failed = True
-        logger.error(f'Replica {info.replica_id} failed to terminate.')
 
     # Please reference to sky/serve/replica_managers.py::_refresh_process_pool.
     # TODO(tian): Refactor to use the same logic and code.
@@ -1036,6 +1107,22 @@ def _respawn_controller(
     The external LB continues serving its last routing view while the proxy
     reports 503 during the controller gap.
     """
+    if maintenance.is_controller_hold_active():
+        try:
+            identity = serve_state.get_service_mode_and_hash(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            # The hold applies unless the durable row positively identifies a
+            # pool.  A DB error is not permission to resume a Serve child.
+            logger.warning(
+                f'Could not prove {service_name!r} is a pool while the server '
+                f'deployment hold is active: '
+                f'{common_utils.format_exception(e)}')
+            return None
+        if identity is None or not identity[0]:
+            logger.warning(f'Refusing to respawn the controller child for '
+                           f'{service_name!r} while the server deployment hold '
+                           'is active.')
+            return None
     if not _reap_dead_controller_for_respawn(service_name, dead_controller):
         return None
 
@@ -1055,6 +1142,56 @@ def _respawn_controller(
                      'will retry on the next tick.')
         return None
     version, service_spec = snapshot
+
+    # A child can die after the version/catalog/recovery transaction commits
+    # but before it promotes the matching config. Reconcile that generation in
+    # the long-lived parent before every respawn, then atomically publish the
+    # already-validated bytes so forked children cannot inherit the old or a
+    # transient empty process config.
+    try:
+        live_path = serve_utils.generate_versioned_config_yaml_file_name(
+            service_name, version, resource_scope)
+        config_snapshot = serve_state.get_version_controller_config(
+            service_name, version)
+        if config_snapshot is not None:
+            staged_path = serve_utils.generate_staged_config_yaml_file_name(
+                service_name,
+                version,
+                resource_scope,
+                snapshot_id=config_snapshot[2])
+            recovery_identity = (
+                serve_state.get_service_config_recovery_identity(service_name))
+            if (recovery_identity is None or
+                    recovery_identity[0] != service_hash):
+                raise RuntimeError('Service incarnation changed before '
+                                   'controller config recovery.')
+            expected_workspace = recovery_identity[1]
+            with filelock.FileLock(
+                    skypilot_config.get_skypilot_config_lock_path()):
+                config_bytes = serve_utils.restore_version_controller_config(
+                    service_name,
+                    version,
+                    live_path,
+                    staged_path,
+                    expected_workspace=expected_workspace)
+                assert config_bytes is not None
+                config = (
+                    serve_utils.parse_and_validate_version_controller_config(
+                        config_bytes, expected_workspace,
+                        'committed Serve controller recovery config'))
+
+                def _publish_config() -> None:
+                    skypilot_config.install_internal_config_snapshot(
+                        config, live_path)
+
+                contextvars.Context().run(_publish_config)
+                serve_utils.scrub_obsolete_controller_config_files(
+                    service_name, version, resource_scope)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error('Failed to reconcile the committed controller config for '
+                     f'{service_name}: {common_utils.format_exception(e)}; '
+                     'will retry on the next tick.')
+        return None
 
     new_controller = None
     try:
@@ -1112,13 +1249,14 @@ def _respawn_controller(
 
 def _get_latest_committed_lb_termination_grace_seconds(
         service_name: str) -> int | None:
-    """Return LB termination grace seconds from the latest committed spec.
+    """Return LB termination grace seconds from the recovery-elected spec.
 
     The external-LB supervision loop runs for the lifetime of the service, so
-    it should reuse the one-row committed `(version, spec)` snapshot instead of
-    re-issuing separate latest-version and spec reads on every upkeep round.
+    it should reuse the quarantine-aware `(version, spec)` snapshot instead of
+    re-issuing separate latest-version and spec reads on every upkeep round or
+    applying grace from an unproven intermediate generation.
     """
-    snapshot = serve_state.get_latest_applicable_version_spec(service_name)
+    snapshot = serve_state.get_recovery_version_spec(service_name)
     if snapshot is None:
         return None
     _, latest_spec = snapshot
@@ -1187,7 +1325,10 @@ def _run_cleanup_and_finalize(service_name: str,
             service_name,
             replica_infos,
             continue_guard=lambda: serve_state.service_owner_matches(
-                service_name, service_hash, (controller_pid, controller_ip))):
+                service_name, service_hash, (controller_pid, controller_ip)),
+            include_terminal_history=(
+                serve_utils.replica_cleanup_requires_terminal_history(
+                    replica_infos))):
         logger.warning(f'Refusing to acknowledge teardown of {service_name!r} '
                        'until all replica launch requests are terminal.')
         return
@@ -1380,7 +1521,7 @@ def _prepare_placement_catalog(
     recovery_version: int | None,
 ) -> dict[str, Any] | None:
     """Build a fresh catalog or load/backfill one legacy version."""
-    if service_spec.spot_placer is None:
+    if not service_spec.placement_contract.enabled:
         return None
     if is_recovery:
         if recovery_version is None:
@@ -1427,15 +1568,55 @@ def _start(service_name: str,
            created_by: str | None = None,
            submitted_task_yaml: str | None = None):
     """Start the service controller and reconcile its external LB."""
+    # This check precedes every DB mutation and, critically, the destructive
+    # cleanup ``finally`` below. Both fresh and persisted recovery scripts use
+    # this entrypoint. Pools remain available, but an unprovable mode is held.
+    if maintenance.is_controller_hold_active():
+        identity = serve_state.get_service_mode_and_hash(service_name)
+        is_pool = identity is not None and identity[0]
+        if identity is None:
+            try:
+                with open(os.path.expanduser(tmp_task_yaml),
+                          encoding='utf-8') as task_file:
+                    raw_task = yaml_utils.safe_load(task_file.read())
+                is_pool = (isinstance(raw_task, dict) and
+                           raw_task.get('pool') is not None)
+            except Exception as e:
+                raise RuntimeError(
+                    f'Refusing to start controller {service_name!r}: its mode '
+                    'cannot be proven while the server deployment hold is '
+                    'active.') from e
+        if not is_pool:
+            raise RuntimeError(
+                'Refusing to start a SkyServe controller while the server '
+                'deployment hold is active.')
+    raw_recovery_owner_fence = os.environ.pop(
+        constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR, None)
+    recovery_owner_fence = (
+        serve_utils.parse_ha_recovery_owner_fence(raw_recovery_owner_fence)
+        if raw_recovery_owner_fence is not None else None)
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
     auth_utils.get_or_generate_keys()
 
     service = serve_state.get_service_from_name(service_name)
     is_recovery = service is not None
+    if recovery_owner_fence is not None and not is_recovery:
+        raise RuntimeError(f'Refusing an HA recovery launch for absent service '
+                           f'{service_name!r}.')
     if service is not None:
         _validate_recovery_target(service_name, service, requested_incarnation,
                                   job_id)
+        if recovery_owner_fence is not None:
+            if recovery_owner_fence['service_hash'] != service.get('hash'):
+                raise RuntimeError(
+                    f'Refusing stale HA recovery ownership for '
+                    f'{service_name!r}: its service incarnation changed.')
+            if (recovery_owner_fence['lifecycle_epoch']
+                    != service.get('lifecycle_epoch')):
+                raise RuntimeError(
+                    f'Refusing stale HA recovery ownership for '
+                    f'{service_name!r}: its lifecycle epoch changed.')
         workspace_hint = workspace
         if (workspace_hint is None and
                 skypilot_config.is_active_workspace_set()):
@@ -1464,11 +1645,24 @@ def _start(service_name: str,
     service_incarnation: str | None
     recovery_expected_controller_pid: int | None = None
     recovery_expected_controller_ip: str | None = None
+    recovery_expected_lifecycle_epoch: int | None = None
+    recovery_expected_status: serve_state.ServiceStatus | None = None
+    recovery_expected_version: int | None = None
     if is_recovery:
         assert service is not None
         service_incarnation = service.get('hash')
-        recovery_expected_controller_pid = service.get('controller_pid')
-        recovery_expected_controller_ip = service.get('controller_ip')
+        if recovery_owner_fence is not None:
+            recovery_expected_controller_pid = recovery_owner_fence[
+                'controller_pid']
+            recovery_expected_controller_ip = recovery_owner_fence[
+                'controller_ip']
+            recovery_expected_lifecycle_epoch = recovery_owner_fence[
+                'lifecycle_epoch']
+            recovery_expected_status = recovery_owner_fence['status']
+            recovery_expected_version = recovery_owner_fence['recovery_version']
+        else:
+            recovery_expected_controller_pid = service.get('controller_pid')
+            recovery_expected_controller_ip = service.get('controller_ip')
         resource_scope = service.get('resource_scope')
     else:
         # add_service accepts the caller-generated UUID while preserving its
@@ -1493,6 +1687,51 @@ def _start(service_name: str,
                          if is_recovery else None)
     recovery_version = (recovery_snapshot[0]
                         if recovery_snapshot is not None else None)
+    if (recovery_expected_version is not None and
+            recovery_version != recovery_expected_version):
+        raise RuntimeError(
+            f'Refusing stale HA recovery ownership for {service_name!r}: '
+            f'elected version changed from {recovery_expected_version} to '
+            f'{recovery_version}.')
+
+    # The HA daemon restores before launching this process so imports see a
+    # valid file. Reconcile again after selecting the quarantine-aware version:
+    # an update or quarantine transition may have raced the daemon's snapshot.
+    if is_recovery and recovery_version is not None:
+        live_config_path = (
+            serve_utils.generate_versioned_config_yaml_file_name(
+                service_name, recovery_version, resource_scope))
+        recovery_config_snapshot = serve_state.get_version_controller_config(
+            service_name, recovery_version)
+        if recovery_config_snapshot is not None:
+            staged_config_path = (
+                serve_utils.generate_staged_config_yaml_file_name(
+                    service_name,
+                    recovery_version,
+                    resource_scope,
+                    snapshot_id=recovery_config_snapshot[2]))
+            with filelock.FileLock(
+                    skypilot_config.get_skypilot_config_lock_path()):
+                recovery_config_bytes = (
+                    serve_utils.restore_version_controller_config(
+                        service_name,
+                        recovery_version,
+                        live_config_path,
+                        staged_config_path,
+                        expected_workspace=workspace))
+                assert recovery_config_bytes is not None
+                recovered_config = (
+                    serve_utils.parse_and_validate_version_controller_config(
+                        recovery_config_bytes, workspace,
+                        'committed Serve controller recovery config'))
+
+                def _publish_recovery_config() -> None:
+                    skypilot_config.install_internal_config_snapshot(
+                        recovered_config, live_config_path)
+
+                contextvars.Context().run(_publish_recovery_config)
+                serve_utils.scrub_obsolete_controller_config_files(
+                    service_name, recovery_version, resource_scope)
 
     if is_recovery:
         assert service is not None
@@ -1541,7 +1780,10 @@ def _start(service_name: str,
             expected_controller_pid=recovery_expected_controller_pid,
             expected_controller_ip=recovery_expected_controller_ip,
             controller_pid=os.getpid(),
-            controller_ip=pod_ip)
+            controller_ip=pod_ip,
+            expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
+            expected_status=recovery_expected_status,
+            expected_recovery_version=recovery_expected_version)
         _exit_on_ownership_loss(claimed, service_name,
                                 'claiming teardown recovery', None)
         logger.info(f'Recovering service {service_name} in status '
@@ -1579,6 +1821,30 @@ def _start(service_name: str,
     # service/version write too. This protects direct/older API callers and
     # admin-policy mutations that bypassed an earlier server-side validation.
     serve_utils.validate_logical_replica_task(task, service_spec)
+
+    initial_controller_config: bytes | None = None
+    initial_controller_config_digest: str | None = None
+    initial_controller_config_snapshot_id: str | None = None
+    if not is_recovery and lifecycle_epoch is not None:
+        live_config_path = (serve_utils.generate_remote_config_yaml_file_name(
+            service_name, resource_scope))
+        try:
+            with open(os.path.expanduser(live_config_path),
+                      'rb') as config_file:
+                raw_controller_config = config_file.read()
+        except OSError as e:
+            raise RuntimeError(
+                'Consolidated controller config is unavailable before '
+                'service registration.') from e
+        initial_controller_config = (
+            serve_utils.sanitize_ha_recovery_config_bytes(raw_controller_config)
+        )
+        initial_controller_config_digest = hashlib.sha256(
+            initial_controller_config).hexdigest()
+        initial_controller_config_snapshot_id = secrets.token_hex(32)
+        serve_utils.parse_and_validate_version_controller_config(
+            initial_controller_config, workspace,
+            'initial durable Serve controller config')
 
     placement_catalog = _prepare_placement_catalog(
         service_name,
@@ -1627,7 +1893,11 @@ def _start(service_name: str,
                     resource_scope=resource_scope,
                     created_by=created_by,
                     submitted_yaml_content=submitted_yaml_content,
-                    placement_catalog=placement_catalog)
+                    placement_catalog=placement_catalog,
+                    controller_config=initial_controller_config,
+                    controller_config_digest=(initial_controller_config_digest),
+                    controller_config_snapshot_id=(
+                        initial_controller_config_snapshot_id))
             except (serve_state.OrphanedReplicaRecordsError,
                     serve_state.OrphanedStorageCleanupIntentsError,
                     serve_state.OrphanedVersionRecordsError):
@@ -1692,7 +1962,10 @@ def _start(service_name: str,
             expected_controller_pid=recovery_expected_controller_pid,
             expected_controller_ip=recovery_expected_controller_ip,
             controller_pid=os.getpid(),
-            controller_ip=pod_ip)
+            controller_ip=pod_ip,
+            expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
+            expected_status=recovery_expected_status,
+            expected_recovery_version=recovery_expected_version)
         _exit_on_ownership_loss(claimed, service_name, 'preclaiming recovery',
                                 None)
 

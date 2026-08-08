@@ -1,7 +1,6 @@
 """Tests for server-owned SkyServe system-OOM recovery profiles."""
 
 import json
-from unittest import mock
 
 import pytest
 
@@ -19,7 +18,9 @@ _SERVICE_NAME = 'boltz-l4-fleet'
 _SERVICE_HASH = 'incarnation-123'
 
 
-def _task(run: str = f'exec docker run --rm {_PINNED_IMAGE}') -> sky.Task:
+def _task(run: str | None = None) -> sky.Task:
+    if run is None:
+        run = _owned_spec().render()
     task = sky.Task(run=run, envs={'MODEL': 'boltz'})
     task.set_resources(sky.Resources(instance_type='g2-standard-4'))
     return task
@@ -33,20 +34,16 @@ def _owned_spec() -> runtime_recovery.OwnedContainerSpec:
         inherited_environment_names=('MODEL',))
 
 
-def _profile(task: sky.Task,
-             profile_version: int = 1,
-             profile_id: str | None = None) -> dict[str, object]:
-    value: dict[str, object] = {
-        'profile_id': profile_id or f'boltz-l4-v{profile_version}',
-        'workspace': 'default',
-        'service_name': _SERVICE_NAME,
-        'service_hash': _SERVICE_HASH,
-        'task_digest': system_oom_recovery.safety_profile_digest(task),
-        'runtime_image_digest': _IMAGE_DIGEST,
-    }
-    if profile_version == 2:
-        value['owned_container_spec'] = _owned_spec().to_dict()
-    return value
+def _v3_task(run: str | None = None) -> sky.Task:
+    task = sky.Task(run=run or _owned_spec().render(), envs={'MODEL': 'boltz'})
+    task.set_resources(
+        sky.Resources(cloud=clouds.AWS(),
+                      instance_type='g6.xlarge',
+                      region='us-east-1',
+                      zone='us-east-1a',
+                      memory='16',
+                      use_spot=False))
+    return task
 
 
 def _install_profiles(monkeypatch, profile_version: int, *profiles:
@@ -83,7 +80,7 @@ def _v3_authorization(task: sky.Task) -> dict[str, object]:
                 'region': 'us-east-1',
                 'availability_zones': ['us-east-1a'],
             }],
-            'allowed_market_types': ['on_demand', 'spot'],
+            'allowed_market_types': ['on_demand'],
             'allowed_instance_types': ['g6.xlarge'],
             'max_host_memory_gib': 16,
             'num_nodes': 1,
@@ -112,17 +109,29 @@ def _v3_intent(requested, *, nonce: str = 'b' * 64):
     return intent
 
 
-def _launch_context(*,
-                    profile_id: str = 'boltz-l4-v1',
-                    profile_version: int = 1,
-                    contract_version: object = 1) -> dict[str, object]:
+def _legacy_launch_context() -> dict[str, object]:
+    """Return a historical context without importing removed constants."""
     return {
         constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: _SERVICE_NAME,
         constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: _SERVICE_HASH,
-        constants.SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY: contract_version,
-        constants.SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY: profile_id,
-        constants.SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY: profile_version,
+        constants.SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY: 1,
+        constants.SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY: 'boltz-l4-v1',
+        'sky_serve_system_oom_recovery_profile_version': 1,
     }
+
+
+def _bound_v3_context(monkeypatch, task: sky.Task) -> dict[str, object]:
+    _install_v3(monkeypatch, task)
+    requested = system_oom_recovery.resolve_requested_authorization_v3(
+        task, service_name=_SERVICE_NAME, service_hash=_SERVICE_HASH)
+    assert requested is not None
+    unbound = system_oom_recovery.create_unbound_launch_context(
+        _v3_intent(requested),
+        service_name=_SERVICE_NAME,
+        service_version=5,
+        controller_pid=123,
+        controller_ip='10.0.0.2')
+    return system_oom_recovery.bind_launch_context(unbound, 'request-123')
 
 
 def _resolved_container_task() -> sky.Task:
@@ -160,48 +169,40 @@ def test_safety_profile_digest_ignores_placement_but_binds_command():
 
 def test_runtime_image_digest_requires_the_actual_operand_to_be_pinned():
     assert system_oom_recovery.runtime_image_digest(_task()) == _IMAGE_DIGEST
-    assert system_oom_recovery.runtime_image_digest(
-        _task('docker run --rm example.invalid/model:mutable')) is None
-    decoy = (f'docker run --env DECOY=repo.invalid/decoy@{_IMAGE_DIGEST} '
-             'example.invalid/model:mutable')
-    assert system_oom_recovery.runtime_image_digest(_task(decoy)) is None
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f'evil-docker run --rm {_PINNED_IMAGE}')) is None
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f'echo docker run --rm {_PINNED_IMAGE}')) is None
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f"echo '; docker run --rm {_PINNED_IMAGE}'")) is None
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f'echo ";" docker run --rm {_PINNED_IMAGE}')) is None
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f'echo \\; docker run --rm {_PINNED_IMAGE}')) is None
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f'# docker run --rm {_PINNED_IMAGE}\necho ready')) is None
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f'cat <<EOF\ndocker run --rm {_PINNED_IMAGE}\nEOF')) is None
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f'docker run --unknown {_PINNED_IMAGE}')) is None
-    escaped_image = _PINNED_IMAGE.replace('aaaa', r'\aaaa', 1)
-    assert system_oom_recovery.runtime_image_digest(
-        _task(f'docker run "{escaped_image}"')) is None
-    assert (system_oom_recovery.runtime_image_digest(
-        _task(f'sudo docker run --rm {_PINNED_IMAGE}')) == _IMAGE_DIGEST)
-    assert (system_oom_recovery.runtime_image_digest(
-        _task(f'echo ready\ndocker run --rm {_PINNED_IMAGE}')) == _IMAGE_DIGEST)
+    rejected_commands = (
+        'docker run --rm example.invalid/model:mutable',
+        f'docker run --env DECOY=repo.invalid/decoy@{_IMAGE_DIGEST} '
+        'example.invalid/model:mutable',
+        f'evil-docker run --rm {_PINNED_IMAGE}',
+        f'echo docker run --rm {_PINNED_IMAGE}',
+        f"echo '; docker run --rm {_PINNED_IMAGE}'",
+        f'echo ";" docker run --rm {_PINNED_IMAGE}',
+        f'echo \\; docker run --rm {_PINNED_IMAGE}',
+        f'# docker run --rm {_PINNED_IMAGE}\necho ready',
+        f'cat <<EOF\ndocker run --rm {_PINNED_IMAGE}\nEOF',
+        f'docker run --unknown {_PINNED_IMAGE}',
+        f'docker run "{_PINNED_IMAGE}"',
+        f'sudo docker run --rm {_PINNED_IMAGE}',
+        f'echo ready\ndocker run --rm {_PINNED_IMAGE}',
+        f'exec docker run --rm {_PINNED_IMAGE}',
+        _owned_spec().render().replace('docker run ', 'docker run  ', 1),
+    )
+    for command in rejected_commands:
+        assert system_oom_recovery.runtime_image_digest(_task(command)) is None
 
 
 def test_generic_task_container_image_is_ineligible(monkeypatch):
     task = _resolved_container_task()
-    _install_profiles(monkeypatch, 1, _profile(task))
+    _install_v3(monkeypatch, task)
 
     assert system_oom_recovery.runtime_image_digest(task) is None
-    assert system_oom_recovery.match_trusted_profile(task,
-                                                     _launch_context()) is None
+    assert system_oom_recovery.resolve_requested_authorization_v3(
+        task, service_name=_SERVICE_NAME, service_hash=_SERVICE_HASH) is None
 
 
 def test_managed_secret_reference_is_ineligible(monkeypatch):
     task = sky.Task.from_yaml_config({
-        'run': f'exec docker run --rm {_PINNED_IMAGE}',
+        'run': _owned_spec().render(),
         'envs': {
             'MODEL': 'boltz'
         },
@@ -210,11 +211,11 @@ def test_managed_secret_reference_is_ineligible(monkeypatch):
             'instance_type': 'g2-standard-4'
         },
     })
-    _install_profiles(monkeypatch, 1, _profile(task))
+    _install_v3(monkeypatch, task)
 
     assert task.managed_secret_refs
-    assert system_oom_recovery.match_trusted_profile(task,
-                                                     _launch_context()) is None
+    assert system_oom_recovery.resolve_requested_authorization_v3(
+        task, service_name=_SERVICE_NAME, service_hash=_SERVICE_HASH) is None
 
 
 def test_safety_profile_binds_effective_policy_mutations(tmp_path):
@@ -274,88 +275,42 @@ def test_safety_profile_binds_legacy_resource_volumes():
             != system_oom_recovery.safety_profile_digest(with_volume))
 
 
-@pytest.mark.parametrize('profile_version', [1, 2])
-def test_match_trusted_profile_maps_exact_capability(monkeypatch,
-                                                     profile_version):
-    task = (_task() if profile_version == 1 else _task(_owned_spec().render()))
-    profile_id = f'boltz-l4-v{profile_version}'
-    _install_profiles(monkeypatch, profile_version,
-                      _profile(task, profile_version))
-    record = mock.MagicMock()
-    monkeypatch.setattr(system_oom_recovery.system_oom_recovery_observability,
-                        'record', record)
-
-    profile = system_oom_recovery.match_trusted_profile(
-        task,
-        _launch_context(profile_id=profile_id, profile_version=profile_version))
-
-    assert profile is not None
-    assert profile.profile_version == profile_version
-    assert profile.capability == (
-        runtime_recovery.CAPABILITY_BY_PROFILE_VERSION[profile_version])
-    assert profile.launch_plan().capability == profile.capability
-    if profile_version == 2:
-        assert profile.owned_container_spec == _owned_spec()
-    record.assert_called_once_with(f'authorization_v{profile_version}_selected')
-
-
-@pytest.mark.parametrize('contract_version', [None, 0, 2, True, '1'])
-def test_match_requires_exact_controller_contract(monkeypatch,
-                                                  contract_version):
+@pytest.mark.parametrize('document_version', [1, 2])
+def test_pre_v3_authorization_documents_are_ignored(monkeypatch,
+                                                    document_version):
     task = _task()
-    _install_profiles(monkeypatch, 1, _profile(task))
+    _install_profiles(monkeypatch, document_version, _v3_authorization(task))
 
+    assert system_oom_recovery.resolve_requested_authorization_v3(
+        task, service_name=_SERVICE_NAME, service_hash=_SERVICE_HASH) is None
     assert system_oom_recovery.match_trusted_profile(
-        task, _launch_context(contract_version=contract_version)) is None
+        task, _legacy_launch_context()) is None
 
 
-def test_match_requires_exact_persisted_profile_identity(monkeypatch):
-    task = _task()
-    _install_profiles(monkeypatch, 1, _profile(task))
-
-    assert system_oom_recovery.match_trusted_profile(
-        task, _launch_context(profile_id='other')) is None
-    assert system_oom_recovery.match_trusted_profile(
-        task, _launch_context(profile_version=2)) is None
-
-
-def test_resolve_requested_profile_does_not_require_launch_contract(
-        monkeypatch):
-    task = _task()
-    _install_profiles(monkeypatch, 1, _profile(task))
-
-    requested = system_oom_recovery.resolve_requested_profile(
-        task, service_name=_SERVICE_NAME, service_hash=_SERVICE_HASH)
-
-    assert requested == system_oom_recovery.RequestedRecoveryProfile(
-        profile_id='boltz-l4-v1', profile_version=1)
-
-
-def test_v2_requires_exact_canonical_owned_container_render(monkeypatch):
-    canonical_task = _task(_owned_spec().render())
-    noncanonical_task = _task(f'docker run  --gpus all --publish 8080:8080 '
-                              f'--env MODEL {_PINNED_IMAGE} serve --port 8080')
-    # Bind the profile to the noncanonical effective task so only the canonical
-    # renderer check, not the broad safety digest, can reject it.
-    _install_profiles(monkeypatch, 2, _profile(noncanonical_task, 2))
+def test_v3_requires_exact_canonical_owned_container_render(monkeypatch):
+    canonical_task = _task()
+    noncanonical_task = _task(_owned_spec().render().replace(
+        'docker run ', 'docker run  ', 1))
+    authorization = _v3_authorization(noncanonical_task)
+    _install_profiles(monkeypatch, 3, authorization)
 
     assert _owned_spec().render() == canonical_task.run
-    assert system_oom_recovery.match_trusted_profile(
+    assert system_oom_recovery.resolve_requested_authorization_v3(
         noncanonical_task,
-        _launch_context(profile_id='boltz-l4-v2', profile_version=2)) is None
+        service_name=_SERVICE_NAME,
+        service_hash=_SERVICE_HASH) is None
 
 
 def test_exact_incarnation_workspace_and_task_are_bound(monkeypatch):
-    task = _task()
-    _install_profiles(monkeypatch, 1, _profile(task))
-    context = _launch_context()
+    task = _v3_task()
+    context = _bound_v3_context(monkeypatch, task)
 
     changed_context = dict(context)
     changed_context[constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY] = 'other'
     assert system_oom_recovery.match_trusted_profile(task,
                                                      changed_context) is None
     assert system_oom_recovery.match_trusted_profile(
-        _task('systemctl start escaped.service'), context) is None
+        _v3_task('systemctl start escaped.service'), context) is None
     with skypilot_config.local_active_workspace_ctx('another-workspace'):
         assert system_oom_recovery.match_trusted_profile(task, context) is None
 
@@ -367,7 +322,7 @@ def test_exact_incarnation_workspace_and_task_are_bound(monkeypatch):
         'profiles': [],
     }),
     json.dumps({
-        'version': 1,
+        'version': 3,
         'profiles': [{
             'profile_id': 'duplicate',
         }, {
@@ -377,12 +332,12 @@ def test_exact_incarnation_workspace_and_task_are_bound(monkeypatch):
 ])
 def test_invalid_server_profile_document_fails_closed(monkeypatch, document):
     monkeypatch.setenv(constants.SYSTEM_OOM_RECOVERY_PROFILES_ENV_VAR, document)
-    assert system_oom_recovery.match_trusted_profile(_task(),
-                                                     _launch_context()) is None
+    assert system_oom_recovery.resolve_requested_authorization_v3(
+        _task(), service_name=_SERVICE_NAME, service_hash=_SERVICE_HASH) is None
 
 
 def test_authorization_v3_maps_explicitly_to_runtime_profile_two(monkeypatch):
-    task = _task(_owned_spec().render())
+    task = _v3_task()
     _install_v3(monkeypatch, task)
 
     requested = system_oom_recovery.resolve_requested_authorization_v3(
@@ -403,14 +358,14 @@ def test_authorization_v3_maps_explicitly_to_runtime_profile_two(monkeypatch):
 
     assert matched is not None
     assert matched.authorization_version == 3
-    assert matched.profile_version == 2
+    assert matched.runtime_profile_version == 2
     assert matched.capability == runtime_recovery.CAPABILITY_V2
     assert matched.launch_plan(
     ) == runtime_recovery.RecoveryLaunchPlan.owned_container(_owned_spec())
 
 
 def test_v3_context_is_closed_and_nonce_becomes_server_request_id(monkeypatch):
-    task = _task(_owned_spec().render())
+    task = _v3_task()
     _install_v3(monkeypatch, task)
     requested = system_oom_recovery.resolve_requested_authorization_v3(
         task, service_name=_SERVICE_NAME, service_hash=_SERVICE_HASH)
@@ -433,7 +388,7 @@ def test_v3_context_is_closed_and_nonce_becomes_server_request_id(monkeypatch):
     with pytest.raises(ValueError, match='invalid fields'):
         system_oom_recovery.validate_unbound_launch_context({
             **unbound,
-            constants.SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY: 2,
+            'sky_serve_system_oom_recovery_profile_version': 2,
         })
     with pytest.raises(ValueError, match='invalid fields'):
         system_oom_recovery.validate_bound_launch_context({
@@ -443,7 +398,7 @@ def test_v3_context_is_closed_and_nonce_becomes_server_request_id(monkeypatch):
 
 
 def test_v3_context_preserves_empty_workspace_text(monkeypatch):
-    task = _task(_owned_spec().render())
+    task = _v3_task()
     authorization = _v3_authorization(task)
     authorization['workspace'] = ''
     _install_profiles(monkeypatch, 3, authorization)
@@ -467,18 +422,21 @@ def test_v3_context_preserves_empty_workspace_text(monkeypatch):
                                                          bound) is not None
 
 
-def test_v3_detector_preserves_exact_legacy_context():
-    legacy = _launch_context()
+def test_v3_detector_routes_historical_context_to_closed_validation():
+    legacy = _legacy_launch_context()
 
-    assert not system_oom_recovery.has_v3_system_oom_recovery_context(legacy)
+    assert system_oom_recovery.has_v3_system_oom_recovery_context(legacy)
     assert system_oom_recovery.has_v3_system_oom_recovery_context({
         **legacy,
         constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY: 'b' * 64,
     })
+    assert system_oom_recovery.has_v3_system_oom_recovery_context({
+        'sky_serve_system_oom_recovery_unknown': True,
+    })
 
 
-def test_v3_candidate_prefilter_rejects_exact_non_aws_override(monkeypatch):
-    gcp_task = _task(_owned_spec().render())
+def test_v3_candidate_requires_exact_singleton_aws_resource(monkeypatch):
+    gcp_task = _v3_task()
     gcp_task.set_resources(
         sky.Resources(cloud=clouds.GCP(), instance_type='g2-standard-4'))
     _install_v3(monkeypatch, gcp_task)
@@ -487,7 +445,7 @@ def test_v3_candidate_prefilter_rejects_exact_non_aws_override(monkeypatch):
         gcp_task, service_name=_SERVICE_NAME,
         service_hash=_SERVICE_HASH) is None
 
-    mixed_task = _task(_owned_spec().render())
+    mixed_task = _v3_task()
     mixed_task.set_resources({
         sky.Resources(cloud=clouds.GCP(), instance_type='g2-standard-4'),
         sky.Resources(cloud=clouds.AWS(), instance_type='g6.xlarge'),
@@ -497,4 +455,55 @@ def test_v3_candidate_prefilter_rejects_exact_non_aws_override(monkeypatch):
     _install_v3(monkeypatch, mixed_task)
     assert system_oom_recovery.resolve_requested_authorization_v3(
         mixed_task, service_name=_SERVICE_NAME,
-        service_hash=_SERVICE_HASH) is not None
+        service_hash=_SERVICE_HASH) is None
+
+    provider_unset_task = _v3_task()
+    provider_unset_task.set_resources(
+        sky.Resources(instance_type='g6.xlarge',
+                      region='us-east-1',
+                      zone='us-east-1a',
+                      use_spot=False))
+    _install_v3(monkeypatch, provider_unset_task)
+    assert system_oom_recovery.resolve_requested_authorization_v3(
+        provider_unset_task,
+        service_name=_SERVICE_NAME,
+        service_hash=_SERVICE_HASH) is None
+
+    stale_multivalue_task = _v3_task()
+    stale_multivalue_authorization = _v3_authorization(stale_multivalue_task)
+    stale_resource_envelope = stale_multivalue_authorization[
+        'resource_envelope']
+    assert isinstance(stale_resource_envelope, dict)
+    stale_resource_envelope['allowed_market_types'] = ['on_demand', 'spot']
+    _install_profiles(monkeypatch, 3, stale_multivalue_authorization)
+    assert system_oom_recovery.resolve_requested_authorization_v3(
+        stale_multivalue_task,
+        service_name=_SERVICE_NAME,
+        service_hash=_SERVICE_HASH) is None
+
+    for stale_resource in (sky.Resources(cloud=clouds.AWS(),
+                                         instance_type='g5.xlarge',
+                                         region='us-east-1',
+                                         zone='us-east-1a',
+                                         use_spot=False),
+                           sky.Resources(cloud=clouds.AWS(),
+                                         instance_type='g6.xlarge',
+                                         region='us-west-2',
+                                         zone='us-west-2a',
+                                         use_spot=False),
+                           sky.Resources(cloud=clouds.AWS(),
+                                         instance_type='g6.xlarge',
+                                         region='us-east-1',
+                                         zone='us-east-1b',
+                                         use_spot=False),
+                           sky.Resources(cloud=clouds.AWS(),
+                                         instance_type='g6.xlarge',
+                                         region='us-east-1',
+                                         zone='us-east-1a',
+                                         use_spot=True)):
+        stale_task = _v3_task()
+        stale_task.set_resources(stale_resource)
+        _install_v3(monkeypatch, stale_task)
+        assert system_oom_recovery.resolve_requested_authorization_v3(
+            stale_task, service_name=_SERVICE_NAME,
+            service_hash=_SERVICE_HASH) is None

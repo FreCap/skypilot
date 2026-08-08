@@ -6,10 +6,12 @@ a behavioral no-op versus #108 (grant None, feed = raw measured free); the
 #108 overlay suite itself (test_reserved_capacity_fill.py) pins the
 downstream identity.
 """
-# pylint: disable=protected-access,invalid-name
+# pylint: disable=protected-access,invalid-name,missing-class-docstring
+# pylint: disable=redefined-outer-name,not-callable
 import contextlib
 import json
 import pickle
+import threading
 from unittest import mock
 
 import pytest
@@ -29,6 +31,48 @@ from sky.utils import locks
 _POOL = broker.make_pool_key('research-ctx', 'A100')
 
 
+def test_protocol_v2_pool_key_uses_physical_identity_not_context_alias():
+    first = broker.make_pool_key('research-alias', ('H200', 'A100'),
+                                 protocol_version=broker.PROTOCOL_V2,
+                                 physical_cluster_uid='cluster-uid')
+    second = broker.make_pool_key('phx-alias', ('a100', 'h200'),
+                                  protocol_version=broker.PROTOCOL_V2,
+                                  physical_cluster_uid='cluster-uid')
+
+    assert first == second
+    identity = broker.parse_pool_identity(first)
+    assert identity.protocol_version == broker.PROTOCOL_V2
+    assert identity.access_context is None
+    assert identity.physical_cluster_uid == 'cluster-uid'
+    assert identity.gpu_names == ('a100', 'h200')
+    with pytest.raises(ValueError, match='do not contain'):
+        broker.parse_pool_key(first)
+
+
+def test_protocol_v1_pool_key_encoding_is_unchanged():
+    assert broker.make_pool_key('research-ctx',
+                                'A100') == json.dumps(['research-ctx', 'a100'])
+
+
+def test_phase_owner_can_make_broker_lock_admission_zero_wait():
+    timeout_lock = mock.MagicMock()
+    timeout_lock.__enter__.side_effect = locks.LockTimeout('busy')
+    query = mock.Mock()
+
+    with mock.patch.object(broker.locks, 'get_lock',
+                           return_value=timeout_lock) as get_lock:
+        allocation = broker.run_round_if_stale('svc',
+                                               _POOL,
+                                               query,
+                                               60.0,
+                                               lock_timeout_seconds=0)
+
+    assert allocation is None
+    get_lock.assert_called_once_with(
+        serve_constants.RESERVED_FILL_BROKER_LOCK_ID, timeout=0)
+    query.assert_not_called()
+
+
 def _replica(replica_id: int = 1) -> replica_managers.ReplicaInfo:
     return replica_managers.ReplicaInfo(replica_id=replica_id,
                                         cluster_name=f'svc-{replica_id}',
@@ -37,6 +81,14 @@ def _replica(replica_id: int = 1) -> replica_managers.ReplicaInfo:
                                         location=None,
                                         version=1,
                                         resources_override=None)
+
+
+def _fill_replica(replica_id: int = 1,
+                  pool_key: str = _POOL) -> replica_managers.ReplicaInfo:
+    info = _replica(replica_id)
+    info.reserved_fill = True
+    info.reserved_fill_pool_key = pool_key
+    return info
 
 
 def _claim(floor=0,
@@ -449,6 +501,54 @@ def _run(name, free=0, interval=60.0, observation=None, pool=_POOL):
     return broker.run_round_if_stale(name, pool, lambda: obs, interval)
 
 
+def _add_replica_if_round_epoch(*args, **kwargs):
+    """Call the state fence with the production-required PG persist token.
+
+    The same state-contract cases are inherited by the real-PostgreSQL test
+    module.  Those direct state calls do not own a broker lock session, so the
+    test mints a token on a short raw session immediately before exercising
+    the ordinary ORM transaction.  SQLite intentionally retains its
+    historical tokenless path.
+    """
+    engine = serve_state._db_manager.get_engine()
+    if engine.dialect.name != 'sqlite':
+        raw_connection = engine.raw_connection()
+        try:
+            token = serve_state.advance_reserved_fill_persist_token(
+                raw_connection)
+        finally:
+            raw_connection.close()
+        assert token is not None
+        kwargs['expected_lease_token'] = token
+    return serve_state.add_replica_if_round_epoch(*args, **kwargs)
+
+
+def test_exact_card_feed_partition_is_deterministic_and_conserved():
+    assert broker._allocate_feed_by_accelerator({
+        'svc-b': 1,
+        'svc-a': 2,
+    }, {
+        'h200': 1,
+        'l4': 2,
+    }, 3) == {
+        'svc-a': {
+            'h200': 1,
+            'l4': 1,
+        },
+        'svc-b': {
+            'l4': 1,
+        },
+    }
+    # An aggregate debit with no card identity clips the exact-card budget;
+    # it never leaves more shaped authority than the already-conserved feed.
+    clipped = broker._allocate_feed_by_accelerator({'svc-a': 3}, {
+        'h200': 2,
+        'l4': 2,
+    }, 2)
+    assert clipped == {'svc-a': {'h200': 2}}
+    assert sum(clipped['svc-a'].values()) == 2
+
+
 def _replica_stub(is_ready=True,
                   is_terminal=False,
                   created_at=None,
@@ -457,18 +557,22 @@ def _replica_stub(is_ready=True,
                   reserved_fill=False,
                   status=None,
                   launched=True):
-    info = mock.Mock()
-    info.is_ready = is_ready
-    info.is_terminal = is_terminal
+    info = _replica()
     info.created_at = created_at
     info.reserved_fill = reserved_fill
-    info.status = status
     # launched=False models a launch-cancelled row (sky.launch interrupted
     # before a pod was provisioned).
-    info.status_property = mock.Mock()
     info.status_property.sky_launch_status = (
         common_utils.ProcessStatus.SUCCEEDED
         if launched else common_utils.ProcessStatus.INTERRUPTED)
+    if is_ready:
+        info.status_property.service_ready_now = True
+        info.status_property.first_ready_time = 1.0
+    if status == serve_state.ReplicaStatus.SHUTTING_DOWN:
+        info.status_property.sky_down_status = common_utils.ProcessStatus.RUNNING
+    elif (status == serve_state.ReplicaStatus.FAILED_CLEANUP or
+          (is_terminal and status is None)):
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
     info.location = {
         'cloud': 'Kubernetes',
         'region': region,
@@ -478,6 +582,111 @@ def _replica_stub(is_ready=True,
         },
     }
     return info
+
+
+class TestProtocolV2ReplicaPoolProvenance:
+    """Broker occupancy uses the same complete origin fence as shelter."""
+
+    _POOL = broker.make_pool_key('phx-context',
+                                 'H200',
+                                 protocol_version=broker.PROTOCOL_V2,
+                                 physical_cluster_uid='phx-cluster')
+
+    @classmethod
+    def _explicit_row(cls,
+                      *,
+                      pool_key=None,
+                      generation=4,
+                      physical_cluster_uid='phx-cluster',
+                      region='phx-context',
+                      gpu='H200'):
+        info = _replica_stub(region=region, gpu=gpu, reserved_fill=True)
+        info.reserved_fill_pool_key = pool_key or cls._POOL
+        info.reserved_fill_service_generation = generation
+        info.reserved_fill_physical_cluster_uid = physical_cluster_uid
+        return info
+
+    @classmethod
+    def _matches(cls, info, current_service_generation=5):
+        return broker._replica_row_on_pool(
+            info, ('phx-context',), ('h200',),
+            pool_key=cls._POOL,
+            physical_cluster_uid='phx-cluster',
+            current_service_generation=current_service_generation,
+            pool_gpus_per_replica=1)
+
+    def test_complete_matching_tuple_accepts_current_and_older_generation(self):
+        assert self._matches(self._explicit_row(generation=5))
+        assert self._matches(self._explicit_row(generation=4))
+
+    def test_complete_former_claimant_tuple_remains_physical_occupancy(self):
+        assert self._matches(self._explicit_row(),
+                             current_service_generation=None)
+
+    def test_partial_malformed_or_contradictory_tuple_fails_closed(self):
+        other_pool = broker.make_pool_key(
+            'phx-context',
+            'H200',
+            protocol_version=broker.PROTOCOL_V2,
+            physical_cluster_uid='replacement-cluster')
+        cases = []
+
+        partial = _replica_stub(region='phx-context',
+                                gpu='H200',
+                                reserved_fill=True)
+        partial.reserved_fill_pool_key = self._POOL
+        cases.append(partial)
+        cases.extend([
+            self._explicit_row(generation=True),
+            self._explicit_row(generation=6),
+            self._explicit_row(pool_key=other_pool),
+            self._explicit_row(physical_cluster_uid='replacement-cluster'),
+            self._explicit_row(region='other-context'),
+            self._explicit_row(gpu='A100'),
+        ])
+        shapeless = self._explicit_row()
+        shapeless.location['accelerators'] = {}
+        cases.append(shapeless)
+        wrong_width = self._explicit_row()
+        wrong_width.location['accelerators'] = {'H200': 8}
+        cases.append(wrong_width)
+        mixed_cards = self._explicit_row()
+        mixed_cards.location['accelerators'] = {'H200': 1, 'A100': 1}
+        cases.append(mixed_cards)
+
+        assert all(not self._matches(info) for info in cases)
+
+    def test_genuinely_legacy_row_retains_location_fallback(self):
+        legacy = _replica_stub(region='phx-context',
+                               gpu='H200',
+                               reserved_fill=True)
+        assert self._matches(legacy)
+        legacy.location['accelerators'] = {}
+        assert self._matches(legacy)
+
+    def test_occupancy_scan_applies_generation_only_to_live_claimant(
+            self, monkeypatch):
+        future_claimant = self._explicit_row(generation=6)
+        former_claimant = self._explicit_row(generation=6)
+        monkeypatch.setattr(
+            serve_state, 'get_replica_infos_grouped',
+            mock.Mock(return_value={
+                'svc-a': [future_claimant],
+                'svc-gone': [former_claimant],
+            }))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1)
+
+        # The future claimant row receives no holding.  A former claimant has
+        # no current generation fence, but its complete immutable launch tuple
+        # still proves one unclaimed physical occupant of this pool.
+        assert result == (0, 0, {'svc-a': 0}, 1)
 
 
 def _live_fill_rows(count):
@@ -490,6 +699,683 @@ def _live_fill_rows(count):
     return [
         _replica_stub(reserved_fill=True, created_at=1.0) for _ in range(count)
     ]
+
+
+def _v2_edge(pool_key,
+             *,
+             access_context='phx-context',
+             physical_cluster_uid='phx-cluster',
+             generation=7,
+             effective_cap=3):
+    return {
+        'service_name': 'svc-a',
+        'pool_key': pool_key,
+        'legacy_pool_key': broker.make_pool_key(access_context, 'H200'),
+        'pool_position': 0,
+        'access_context': access_context,
+        'physical_cluster_uid': physical_cluster_uid,
+        'accelerator_names': ['H200'],
+        'service_generation': generation,
+        'weight': 1.0,
+        'floor_replicas': 0,
+        'gpus_per_replica': 1,
+        'holdings_fill': 0,
+        'effective_cap': effective_cap,
+        'launchable': 1,
+        'heartbeat_ts': 1000.0,
+    }
+
+
+def test_replace_claim_set_overlap_withdraws_previous_generation(monkeypatch):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    overlapping = broker.make_pool_key('phx-alias', ('H200', 'H100'),
+                                       protocol_version=broker.PROTOCOL_V2,
+                                       physical_cluster_uid='phx-cluster')
+    peer_edge = _v2_edge(overlapping)
+    peer_edge['service_name'] = 'peer'
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[peer_edge]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    remove = mock.Mock(return_value=True)
+    monkeypatch.setattr(serve_state, 'remove_reserved_fill_claim_set', remove)
+    replace = mock.Mock()
+    monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set', replace)
+    monkeypatch.setattr(broker.locks, 'get_lock',
+                        lambda *args, **kwargs: _InertLock())
+
+    assert broker.replace_claim_set('svc-a',
+                                    semantic_hash='changed-set',
+                                    global_headroom=1,
+                                    utilization_ceiling=1,
+                                    utilization_state=None,
+                                    edges=[_v2_edge(pool)],
+                                    expected_service_hash='owner-hash') is None
+    replace.assert_not_called()
+    remove.assert_called_once_with('svc-a',
+                                   expected_service_hash='owner-hash',
+                                   expected_controller_owner=None)
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    removed_pool = broker.make_pool_key('east-context',
+                                        'H100',
+                                        protocol_version=broker.PROTOCOL_V2,
+                                        physical_cluster_uid='east-cluster')
+    replace = mock.Mock(return_value=7)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set', replace)
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(broker.locks, 'get_lock',
+                        lambda *args, **kwargs: _InertLock())
+    monkeypatch.setattr(broker.time, 'time', mock.Mock(return_value=1234.0))
+    broker._GRANT_CACHE[('svc-a', pool)] = broker._GrantCacheEntry(
+        3, 1000.0, 'phx-context', ('h200',), 'phx-cluster', 7)
+    broker._GRANT_CACHE[('svc-a', removed_pool)] = broker._GrantCacheEntry(
+        2, 1000.0, 'east-context', ('h100',), 'east-cluster', 7)
+    broker._GRANT_CACHE[('peer', removed_pool)] = broker._GrantCacheEntry(
+        1, 1000.0, 'east-context', ('h100',), 'east-cluster', 1)
+
+    assert broker.replace_claim_set('svc-a',
+                                    semantic_hash='semantic-v1',
+                                    global_headroom=3,
+                                    utilization_ceiling=3,
+                                    utilization_state={},
+                                    edges=[_v2_edge(pool)],
+                                    expected_service_hash='owner-hash') == 7
+    assert ('svc-a', pool) in broker._GRANT_CACHE
+    assert ('svc-a', removed_pool) not in broker._GRANT_CACHE
+    assert ('peer', removed_pool) in broker._GRANT_CACHE
+    replace.assert_called_once()
+    assert replace.call_args.kwargs['heartbeat_ts'] == 1234.0
+    assert (broker.replace_claim_set('svc-a',
+                                     semantic_hash='semantic-v1',
+                                     global_headroom=3,
+                                     utilization_ceiling=3,
+                                     utilization_state={},
+                                     edges=[_v2_edge(pool)],
+                                     expected_service_hash=None) is None)
+    assert replace.call_count == 1
+    assert all(service != 'svc-a' for service, _pool in broker._GRANT_CACHE)
+    assert ('peer', removed_pool) in broker._GRANT_CACHE
+
+    broker._GRANT_CACHE[('svc-a', pool)] = broker._GrantCacheEntry(
+        3, 1000.0, 'phx-context', ('h200',), 'phx-cluster', 7)
+    replace.return_value = None
+    assert broker.replace_claim_set('svc-a',
+                                    semantic_hash='semantic-v1',
+                                    global_headroom=3,
+                                    utilization_ceiling=3,
+                                    utilization_state={},
+                                    edges=[_v2_edge(pool)],
+                                    expected_service_hash='owner-hash') is None
+    assert all(service != 'svc-a' for service, _pool in broker._GRANT_CACHE)
+    assert ('peer', removed_pool) in broker._GRANT_CACHE
+    broker.clear_caches()
+
+
+def test_v2_round_single_claimant_is_integer_generation_fenced(
+        _broker_db, monkeypatch):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    edge = _v2_edge(pool)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[edge]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    publish = mock.Mock(return_value=True)
+    monkeypatch.setattr(serve_state, 'publish_reserved_fill_round', publish)
+
+    allocation = broker.run_round_if_stale(
+        'svc-a',
+        pool,
+        lambda: broker.PoolObservation(10, ('H200',), (('h200', 10),)),
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+
+    assert allocation is not None
+    assert allocation.grant == 3
+    assert isinstance(allocation.grant, int)
+    assert allocation.feed == 3
+    assert allocation.protocol_version == broker.PROTOCOL_V2
+    assert allocation.service_generation == 7
+    assert allocation.physical_cluster_uid == 'phx-cluster'
+    assert allocation.edge_cap == 3
+    assert allocation.pool_key == pool
+    assert allocation.feed_by_accelerator == {'h200': 3}
+    assert allocation.observed_free == 10
+    assert allocation.observed_free_by_accelerator == {'h200': 10}
+    assert allocation.observed_at == allocation.snapshot_time
+    assert publish.call_args.kwargs['protocol_version'] == broker.PROTOCOL_V2
+    assert json.loads(publish.call_args.kwargs['feed_by_accelerator']) == {
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 10
+        },
+        'svc-a': {
+            'h200': 3
+        }
+    }
+    assert json.loads(publish.call_args.kwargs['claim_generations']) == {
+        'svc-a': 7
+    }
+    cached = broker.get_cached_pool_grants('svc-a', 60.0)
+    assert cached[pool] == broker.CachedPoolGrant(
+        grant=3,
+        access_context='phx-context',
+        accelerator_names=('h200',),
+        physical_cluster_uid='phx-cluster',
+        service_generation=7)
+
+
+def test_cas_lost_writer_returns_no_measured_capacity(_broker_db, monkeypatch):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    edge = _v2_edge(pool)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[edge]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                        mock.Mock(return_value=False))
+    query = mock.Mock(
+        return_value=broker.PoolObservation(10, ('H200',), (('h200', 10),)))
+
+    allocation = broker.run_round_if_stale(
+        'svc-a',
+        pool,
+        query,
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+
+    assert allocation is None
+    query.assert_called_once_with()
+
+
+def test_v2_confirmed_phantom_preserves_generation_and_healthy_sibling(
+        _broker_db, monkeypatch, clock):
+    phantom_pool = broker.make_pool_key('phx-context',
+                                        'H200',
+                                        protocol_version=broker.PROTOCOL_V2,
+                                        physical_cluster_uid='phx-cluster')
+    healthy_pool = broker.make_pool_key('east-context',
+                                        'H100',
+                                        protocol_version=broker.PROTOCOL_V2,
+                                        physical_cluster_uid='east-cluster')
+    phantom_edge = _v2_edge(phantom_pool)
+    healthy_edge = _v2_edge(healthy_pool,
+                            access_context='east-context',
+                            physical_cluster_uid='east-cluster')
+    healthy_edge.update({
+        'legacy_pool_key': broker.make_pool_key('east-context', 'H100'),
+        'pool_position': 1,
+        'accelerator_names': ['H100'],
+    })
+    edges = {
+        phantom_pool: phantom_edge,
+        healthy_pool: healthy_edge,
+    }
+    previous_phantom_round = {
+        'protocol_version': broker.PROTOCOL_V2,
+        'claim_generations': json.dumps({'svc-a': 7}),
+        'grants': json.dumps({'svc-a': 3}),
+        'feeds': json.dumps({'svc-a': 3}),
+        'feed_by_accelerator': json.dumps({'svc-a': {
+            'h200': 3
+        }}),
+        'raw_grants': json.dumps({'svc-a': 3}),
+        'feed_state': json.dumps({}),
+        'utilization_state': None,
+        'round_id': 2,
+        'epoch': 4,
+        'snapshot_time': clock.now - 100,
+        'sum_holdings': 0,
+        'last_observed_free': 3,
+        'last_observed_free_ts': clock.now - 100,
+        'phantom_streak':
+            (serve_constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS - 1),
+        'shrink_baseline': None,
+        'fence_pending': False,
+    }
+
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(
+        serve_state, 'get_authoritative_reserved_fill_claims',
+        mock.Mock(side_effect=lambda pool_key=None: ([edges[
+            pool_key]] if pool_key is not None else list(edges.values()))))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(
+        serve_state, 'get_reserved_fill_round',
+        mock.Mock(side_effect=lambda pool_key: previous_phantom_round
+                  if pool_key == phantom_pool else None))
+    publish = mock.Mock(return_value=True)
+    monkeypatch.setattr(serve_state, 'publish_reserved_fill_round', publish)
+    remove_pool = mock.Mock()
+    monkeypatch.setattr(broker, '_remove_legacy_claims_for_pool', remove_pool)
+
+    phantom = broker.run_round_if_stale(
+        'svc-a',
+        phantom_pool,
+        lambda: broker.PoolObservation(0, (), ()),
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+    assert phantom is not None
+    assert phantom.grant == 0
+    assert phantom.feed == 0
+    assert phantom.observed_free is None
+    assert phantom.observed_free_by_accelerator is None
+    assert phantom.service_generation == 7
+    remove_pool.assert_not_called()
+    phantom_publish = publish.call_args
+    assert json.loads(phantom_publish.kwargs['claim_generations']) == {
+        'svc-a': 7
+    }
+    assert json.loads(phantom_publish.kwargs['grants']) == {'svc-a': 0}
+    assert json.loads(phantom_publish.kwargs['feeds']) == {'svc-a': 0}
+
+    healthy = broker.run_round_if_stale(
+        'svc-a',
+        healthy_pool,
+        lambda: broker.PoolObservation(4, ('H100',), (('h100', 4),)),
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+    assert healthy is not None
+    assert healthy.grant == 3
+    assert healthy.feed == 3
+    assert healthy.service_generation == 7
+
+
+def test_v2_mixed_width_blackout_preserves_generation_and_healthy_sibling(
+        _broker_db, monkeypatch):
+    mixed_pool = broker.make_pool_key('phx-context',
+                                      'H200',
+                                      protocol_version=broker.PROTOCOL_V2,
+                                      physical_cluster_uid='phx-cluster')
+    healthy_pool = broker.make_pool_key('east-context',
+                                        'H100',
+                                        protocol_version=broker.PROTOCOL_V2,
+                                        physical_cluster_uid='east-cluster')
+    loser = _v2_edge(mixed_pool, generation=7)
+    loser['gpus_per_replica'] = 8
+    first_winner = _v2_edge(mixed_pool, generation=8, effective_cap=4)
+    first_winner['service_name'] = 'svc-b'
+    second_winner = _v2_edge(mixed_pool, generation=9, effective_cap=4)
+    second_winner['service_name'] = 'svc-c'
+    healthy_sibling = _v2_edge(healthy_pool,
+                               access_context='east-context',
+                               physical_cluster_uid='east-cluster',
+                               generation=7)
+    healthy_sibling.update({
+        'legacy_pool_key': broker.make_pool_key('east-context', 'H100'),
+        'pool_position': 1,
+        'accelerator_names': ['H100'],
+        'gpus_per_replica': 8,
+    })
+    claims = {
+        mixed_pool: [loser, first_winner, second_winner],
+        healthy_pool: [healthy_sibling],
+    }
+
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(
+        serve_state, 'get_authoritative_reserved_fill_claims',
+        mock.Mock(side_effect=lambda pool_key=None: list(claims[pool_key])))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    remove_edge = mock.Mock()
+    monkeypatch.setattr(serve_state, 'remove_authoritative_reserved_fill_claim',
+                        remove_edge)
+    publish = mock.Mock(return_value=True)
+    monkeypatch.setattr(serve_state, 'publish_reserved_fill_round', publish)
+
+    loser_query = mock.Mock(
+        return_value=broker.PoolObservation(1, ('H200',), (('h200', 1),)))
+    rejected = broker.run_round_if_stale(
+        'svc-a',
+        mixed_pool,
+        loser_query,
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+    assert rejected is not None
+    assert rejected.grant == 0
+    assert rejected.feed == 0
+    assert rejected.service_generation == 7
+    loser_query.assert_not_called()
+    publish.assert_not_called()
+    remove_edge.assert_not_called()
+
+    winner = broker.run_round_if_stale(
+        'svc-b',
+        mixed_pool,
+        lambda: broker.PoolObservation(10, ('H200',), (('h200', 10),)),
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=8)
+    assert winner is not None
+    assert winner.grant > 0
+    mixed_publish = publish.call_args
+    assert json.loads(mixed_publish.kwargs['claim_generations']) == {
+        'svc-a': 7,
+        'svc-b': 8,
+        'svc-c': 9,
+    }
+    assert json.loads(mixed_publish.kwargs['grants'])['svc-a'] == 0
+    assert json.loads(mixed_publish.kwargs['feeds'])['svc-a'] == 0
+    remove_edge.assert_not_called()
+
+    healthy = broker.run_round_if_stale(
+        'svc-a',
+        healthy_pool,
+        lambda: broker.PoolObservation(4, ('H100',), (('h100', 4),)),
+        60.0,
+        expected_protocol_version=broker.PROTOCOL_V2,
+        expected_service_generation=7)
+    assert healthy is not None
+    assert healthy.grant == 3
+    assert healthy.feed == 3
+    assert healthy.service_generation == 7
+    assert loser['service_generation'] == 7
+    assert healthy_sibling['service_generation'] == 7
+    remove_edge.assert_not_called()
+
+
+def test_cached_pool_grants_snapshot_blocks_concurrent_replacement(monkeypatch):
+    """A placement read must not combine entries from two cache epochs."""
+    first_pool = broker.make_pool_key('first-context',
+                                      'H200',
+                                      protocol_version=broker.PROTOCOL_V2,
+                                      physical_cluster_uid='first-cluster')
+    second_pool = broker.make_pool_key('second-context',
+                                       'H100',
+                                       protocol_version=broker.PROTOCOL_V2,
+                                       physical_cluster_uid='second-cluster')
+    now = broker.time.time()
+    reader_paused = threading.Event()
+    resume_reader = threading.Event()
+    writer_started = threading.Event()
+    writer_done = threading.Event()
+
+    class _BlockingItemsDict(dict):
+
+        def items(self):
+            iterator = iter(dict.items(self))
+            try:
+                first_item = next(iterator)
+            except StopIteration:
+                return
+            yield first_item
+            reader_paused.set()
+            if not resume_reader.wait(timeout=5):
+                raise TimeoutError('cache snapshot reader was not resumed')
+            yield from iterator
+
+    cache = _BlockingItemsDict({
+        ('svc-a', first_pool): broker._GrantCacheEntry(1, now, 'first-context',
+                                                       ('h200',),
+                                                       'first-cluster', 1),
+        ('svc-a', second_pool): broker._GrantCacheEntry(2, now,
+                                                        'second-context',
+                                                        ('h100',),
+                                                        'second-cluster', 1),
+    })
+    monkeypatch.setattr(broker, '_GRANT_CACHE', cache)
+    reader_results = []
+    thread_errors = []
+
+    def _read_snapshot():
+        try:
+            reader_results.append(
+                broker.get_cached_pool_grants('svc-a', max_age_seconds=60))
+        except BaseException as exc:  # pylint: disable=broad-except
+            thread_errors.append(exc)
+
+    replacement = broker.Allocation(grant=9,
+                                    feed=9,
+                                    round_id=2,
+                                    epoch=2,
+                                    snapshot_time=now,
+                                    demand_gate_grant=9,
+                                    protocol_version=broker.PROTOCOL_V2,
+                                    service_generation=2,
+                                    physical_cluster_uid='second-cluster',
+                                    edge_cap=9,
+                                    pool_key=second_pool)
+
+    def _replace_entry():
+        writer_started.set()
+        try:
+            broker._cache_allocation('svc-a', replacement,
+                                     {'access_context': 'new-context'})
+        except BaseException as exc:  # pylint: disable=broad-except
+            thread_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    reader = threading.Thread(target=_read_snapshot)
+    writer = threading.Thread(target=_replace_entry)
+    reader.start()
+    try:
+        assert reader_paused.wait(timeout=5)
+        writer.start()
+        assert writer_started.wait(timeout=5)
+        # The reader is paused midway through dict iteration while holding the
+        # cache lock. Replacement must wait rather than expose a mixed epoch.
+        assert not writer_done.wait(timeout=0.25)
+    finally:
+        resume_reader.set()
+        reader.join(timeout=5)
+        if writer.ident is not None:
+            writer.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert not writer.is_alive()
+    assert not thread_errors
+    assert reader_results == [{
+        first_pool: broker.CachedPoolGrant(1, 'first-context', ('h200',),
+                                           'first-cluster', 1),
+        second_pool: broker.CachedPoolGrant(2, 'second-context', ('h100',),
+                                            'second-cluster', 1),
+    }]
+    assert broker.get_cached_pool_grants(
+        'svc-a',
+        60)[second_pool] == broker.CachedPoolGrant(9, 'new-context', ('h100',),
+                                                   'second-cluster', 2)
+
+
+def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
+    broker.clear_caches()
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    round_row = {
+        'protocol_version': broker.PROTOCOL_V2,
+        'claim_generations': json.dumps({'svc-a': 6}),
+        'grants': json.dumps({'svc-a': 20}),
+        'feeds': json.dumps({'svc-a': 20}),
+        'raw_grants': json.dumps({'svc-a': 20}),
+        'round_id': 3,
+        'epoch': 9,
+        'snapshot_time': 1000.0,
+    }
+    edge = _v2_edge(pool, generation=7, effective_cap=2)
+    assert broker._allocation_from_round('svc-a',
+                                         pool,
+                                         round_row,
+                                         protocol_version=broker.PROTOCOL_V2,
+                                         service_generation=7,
+                                         claim_row=edge) is None
+
+    round_row['claim_generations'] = json.dumps({'svc-a': 7})
+    allocation = broker._allocation_from_round(
+        'svc-a',
+        pool,
+        round_row,
+        protocol_version=broker.PROTOCOL_V2,
+        service_generation=7,
+        claim_row=edge)
+    assert allocation is not None
+    assert allocation.grant == 2
+    assert allocation.feed == 2
+    assert allocation.feed_by_accelerator is None
+    assert allocation.demand_gate_grant == 2
+
+    round_row['last_observed_free'] = 3
+    round_row['last_observed_free_ts'] = round_row['snapshot_time']
+    round_row['feed_by_accelerator'] = json.dumps({
+        'svc-a': {
+            'h200': 1
+        },
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 3
+        },
+    })
+    allocation = broker._allocation_from_round(
+        'svc-a',
+        pool,
+        round_row,
+        protocol_version=broker.PROTOCOL_V2,
+        service_generation=7,
+        claim_row=edge)
+    assert allocation is not None
+    assert allocation.feed == 1
+    assert allocation.feed_by_accelerator == {'h200': 1}
+    assert allocation.observed_free == 3
+    assert allocation.observed_free_by_accelerator == {'h200': 3}
+    assert allocation.observed_at == round_row['snapshot_time']
+
+    # Observation corruption suppresses only bench-release evidence; valid
+    # service launch authority remains intact.
+    round_row['feed_by_accelerator'] = json.dumps({
+        'svc-a': {
+            'h200': 1
+        },
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 2
+        },
+    })
+    allocation = broker._allocation_from_round(
+        'svc-a',
+        pool,
+        round_row,
+        protocol_version=broker.PROTOCOL_V2,
+        service_generation=7,
+        claim_row=edge)
+    assert allocation is not None
+    assert allocation.feed == 1
+    assert allocation.feed_by_accelerator == {'h200': 1}
+    assert allocation.observed_free is None
+
+    # Service corruption still fails launch authority closed, independently
+    # of a valid committed observation.
+    round_row['feed_by_accelerator'] = json.dumps({
+        'svc-a': {
+            'h200': 'bad'
+        },
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 3
+        },
+    })
+    allocation = broker._allocation_from_round(
+        'svc-a',
+        pool,
+        round_row,
+        protocol_version=broker.PROTOCOL_V2,
+        service_generation=7,
+        claim_row=edge)
+    assert allocation is not None
+    assert allocation.feed == 0
+    assert allocation.feed_by_accelerator == {}
+    assert allocation.observed_free == 3
+    assert allocation.observed_free_by_accelerator == {'h200': 3}
+
+    round_row['feed_by_accelerator'] = '{malformed'
+    allocation = broker._allocation_from_round(
+        'svc-a',
+        pool,
+        round_row,
+        protocol_version=broker.PROTOCOL_V2,
+        service_generation=7,
+        claim_row=edge)
+    assert allocation is not None
+    assert allocation.feed == 0
+    assert allocation.feed_by_accelerator == {}
+    assert allocation.observed_free is None
+    assert allocation.observed_free_by_accelerator is None
+    broker.clear_caches()
+
+
+def test_v2_unambiguous_lookup_compares_only_its_pool_claim_set(monkeypatch):
+    broker.clear_caches()
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    other_pool = broker.make_pool_key('east-context',
+                                      'H100',
+                                      protocol_version=broker.PROTOCOL_V2,
+                                      physical_cluster_uid='east-cluster')
+    edge = _v2_edge(pool)
+    peer = _v2_edge(other_pool,
+                    access_context='east-context',
+                    physical_cluster_uid='east-cluster',
+                    generation=9)
+    peer['service_name'] = 'peer'
+    peer['accelerator_names'] = ['H100']
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[edge, peer]))
+    monkeypatch.setattr(
+        serve_state, 'get_reserved_fill_round',
+        mock.Mock(
+            return_value={
+                'protocol_version': broker.PROTOCOL_V2,
+                'claim_generations': json.dumps({'svc-a': 7}),
+                'grants': json.dumps({'svc-a': 2}),
+                'feeds': json.dumps({'svc-a': 1}),
+                'raw_grants': json.dumps({'svc-a': 2}),
+                'round_id': 1,
+                'epoch': 1,
+                'snapshot_time': 1000.0,
+            }))
+    monkeypatch.setattr(broker.time, 'time', mock.Mock(return_value=1000.0))
+
+    allocation = broker.get_my_allocation('svc-a')
+    assert allocation is not None
+    assert allocation.pool_key == pool
+    broker.clear_caches()
 
 
 @pytest.mark.usefixtures('_broker_db')
@@ -516,6 +1402,31 @@ class TestSingleClaimantFastPath:
         assert alloc is not None
         assert alloc.grant is None
         assert alloc.feed == 0
+        assert alloc.observed_free is None
+        assert alloc.observed_free_by_accelerator is None
+
+    def test_v1_publishes_committed_exact_card_observation(self):
+        _upsert('svc-a')
+        alloc = _run('svc-a',
+                     observation=broker.PoolObservation(7, ('A100',),
+                                                        (('a100', 7),)))
+        assert alloc is not None
+        assert alloc.grant is None
+        assert alloc.feed == 7
+        assert alloc.feed_by_accelerator == {'a100': 7}
+        assert alloc.observed_free == 7
+        assert alloc.observed_free_by_accelerator == {'a100': 7}
+        assert alloc.observed_at == alloc.snapshot_time
+
+    def test_invalid_exact_card_split_is_a_blackout(self):
+        _upsert('svc-a')
+        alloc = _run('svc-a',
+                     observation=broker.PoolObservation(7, ('A100',),
+                                                        (('a100', 6),)))
+        assert alloc is not None
+        assert alloc.feed == 0
+        assert alloc.observed_free is None
+        assert alloc.observed_free_by_accelerator is None
 
 
 @pytest.mark.usefixtures('_broker_db')
@@ -613,14 +1524,22 @@ class TestMultiClaimantRounds:
     def test_fresh_round_is_read_not_redriven(self, clock):
         _upsert('svc-a')
         _upsert('svc-b')
-        first = _run('svc-a', free=10)
+        observation = broker.PoolObservation(10, ('A100',), (('a100', 10),))
+        first = _run('svc-a', observation=observation)
         assert first is not None
+        assert first.observed_free == 10
+        assert first.observed_free_by_accelerator == {'a100': 10}
         query = mock.Mock(side_effect=AssertionError('must not re-query'))
         clock.advance(10)  # well inside the freshness window
         again = broker.run_round_if_stale('svc-b', _POOL, query, 60.0)
         assert again is not None
         assert again.round_id == first.round_id
         assert again.epoch == first.epoch
+        assert again.observed_free == first.observed_free
+        assert (again.observed_free_by_accelerator ==
+                first.observed_free_by_accelerator)
+        assert again.observed_at == first.observed_at
+        query.assert_not_called()
 
     def test_claimant_after_round_waits_for_next(self, clock):
         _upsert('svc-a')
@@ -963,6 +1882,62 @@ class TestClaimLifecycle:
 @pytest.mark.usefixtures('_broker_db')
 class TestEpochFencing:
 
+    def test_raw_observation_only_change_does_not_bump_v2_epoch(
+            self, clock, monkeypatch):
+        pool = broker.make_pool_key('phx-context', ('H200', 'H100'),
+                                    protocol_version=broker.PROTOCOL_V2,
+                                    physical_cluster_uid='phx-cluster')
+        edge = _v2_edge(pool, effective_cap=3)
+        edge['accelerator_names'] = ['H200', 'H100']
+        rounds = {}
+
+        def _publish(pool_key, **kwargs):
+            rounds[pool_key] = dict(kwargs)
+            rounds[pool_key]['fence_pending'] = False
+            return True
+
+        monkeypatch.setattr(broker, 'get_protocol_version',
+                            mock.Mock(return_value=broker.PROTOCOL_V2))
+        monkeypatch.setattr(serve_state,
+                            'get_authoritative_reserved_fill_claims',
+                            mock.Mock(return_value=[edge]))
+        monkeypatch.setattr(serve_state,
+                            'prune_authoritative_reserved_fill_claim_sets',
+                            mock.Mock(return_value=[]))
+        monkeypatch.setattr(serve_state, 'get_reserved_fill_round',
+                            mock.Mock(side_effect=rounds.get))
+        monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                            _publish)
+
+        def _run_v2(by_card):
+            observation = broker.PoolObservation(sum(by_card.values()),
+                                                 tuple(by_card),
+                                                 tuple(by_card.items()))
+            return broker.run_round_if_stale(
+                'svc-a',
+                pool,
+                mock.Mock(return_value=observation),
+                60.0,
+                expected_protocol_version=broker.PROTOCOL_V2,
+                expected_service_generation=7)
+
+        first = _run_v2({'h200': 10, 'h100': 0})
+        assert first is not None
+        assert first.feed_by_accelerator == {'h200': 3}
+
+        clock.advance(61)
+        raw_only = _run_v2({'h200': 11, 'h100': 0})
+        assert raw_only is not None
+        assert raw_only.observed_free == 11
+        assert raw_only.feed_by_accelerator == {'h200': 3}
+        assert raw_only.epoch == first.epoch
+
+        clock.advance(61)
+        card_changed = _run_v2({'h200': 0, 'h100': 11})
+        assert card_changed is not None
+        assert card_changed.feed_by_accelerator == {'h100': 3}
+        assert card_changed.epoch == first.epoch + 1
+
     def test_epoch_bumps_only_on_allocation_change(self, clock):
         _upsert('svc-a')
         _upsert('svc-b')
@@ -1197,7 +2172,7 @@ class TestStaleWriterFence:
 class TestAtomicPersistFence:
     """The launch-path epoch recheck is atomic with the replica persist."""
 
-    _STUB_INFO = _replica()
+    _STUB_INFO = _fill_replica()
 
     def _replica_row_count(self):
         engine = serve_state._db_manager.get_engine()
@@ -1211,12 +2186,11 @@ class TestAtomicPersistFence:
         _upsert('svc-b')
         alloc = _run('svc-a', free=4)
         assert alloc is not None
-        assert not serve_state.add_replica_if_round_epoch(
-            'svc-a',
-            1,
-            self._STUB_INFO,
-            pool_key=_POOL,
-            expected_epoch=alloc.epoch - 1)
+        assert not _add_replica_if_round_epoch('svc-a',
+                                               1,
+                                               self._STUB_INFO,
+                                               pool_key=_POOL,
+                                               expected_epoch=alloc.epoch - 1)
         assert self._replica_row_count() == 0
 
     def test_current_epoch_persists_and_missing_round_fails_open(self):
@@ -1224,32 +2198,63 @@ class TestAtomicPersistFence:
         _upsert('svc-b')
         alloc = _run('svc-a', free=4)
         assert alloc is not None
-        assert serve_state.add_replica_if_round_epoch(
-            'svc-a',
-            1,
-            self._STUB_INFO,
-            pool_key=_POOL,
-            expected_epoch=alloc.epoch)
+        assert _add_replica_if_round_epoch('svc-a',
+                                           1,
+                                           self._STUB_INFO,
+                                           pool_key=_POOL,
+                                           expected_epoch=alloc.epoch)
         # No round row for the pool: fail open, like the pre-check (the
         # claimant must still hold a live claim on that pool).
         pool_b = broker.make_pool_key('other-ctx', 'H100')
         _upsert('svc-c', pool_key=pool_b)
-        assert serve_state.add_replica_if_round_epoch('svc-c',
-                                                      2,
-                                                      _replica(2),
-                                                      pool_key=pool_b,
-                                                      expected_epoch=99)
+        assert _add_replica_if_round_epoch('svc-c',
+                                           2,
+                                           _fill_replica(2, pool_b),
+                                           pool_key=pool_b,
+                                           expected_epoch=99)
         assert self._replica_row_count() == 2
+
+    def test_persist_requires_exact_fill_and_protocol_attribution(self):
+        _upsert('svc-a')
+        _upsert('svc-b')
+        alloc = _run('svc-a', free=4)
+        assert alloc is not None
+
+        assert not _add_replica_if_round_epoch(
+            'svc-a', 1, _replica(1), pool_key=_POOL, expected_epoch=alloc.epoch)
+        wrong_pool = _fill_replica(
+            2, broker.make_pool_key('other-context', 'A100'))
+        assert not _add_replica_if_round_epoch(
+            'svc-a', 2, wrong_pool, pool_key=_POOL, expected_epoch=alloc.epoch)
+
+        # Even an exact live legacy claim cannot attribute a v1 persist to a
+        # key whose embedded identity is protocol v2.
+        v2_pool = broker.make_pool_key('alias',
+                                       'H200',
+                                       protocol_version=broker.PROTOCOL_V2,
+                                       physical_cluster_uid='physical-cluster')
+        _upsert('svc-v2-key', pool_key=v2_pool)
+        assert not _add_replica_if_round_epoch(
+            'svc-v2-key',
+            3,
+            _fill_replica(3, v2_pool),
+            pool_key=v2_pool,
+            expected_epoch=99,
+            expected_protocol_version=broker.PROTOCOL_V1)
+        assert self._replica_row_count() == 0
 
     def test_persist_writes_readable_authoritative_state(self):
         _upsert('svc-a')
         _upsert('svc-b')
         alloc = _run('svc-a', free=4)
         assert alloc is not None
-        info = _replica(7)
+        info = _fill_replica(7)
 
-        assert serve_state.add_replica_if_round_epoch(
-            'svc-a', 7, info, pool_key=_POOL, expected_epoch=alloc.epoch)
+        assert _add_replica_if_round_epoch('svc-a',
+                                           7,
+                                           info,
+                                           pool_key=_POOL,
+                                           expected_epoch=alloc.epoch)
 
         stored = serve_state.get_replica_info_from_id('svc-a', 7)
         assert stored is not None
@@ -1260,11 +2265,11 @@ class TestAtomicPersistFence:
         # key. Recovery instead refreshes the durable object and uses the
         # identity-fenced expected-existing update path.
         with pytest.raises(sqlalchemy_exc.IntegrityError):
-            serve_state.add_replica_if_round_epoch('svc-a',
-                                                   7,
-                                                   _replica(7),
-                                                   pool_key=_POOL,
-                                                   expected_epoch=alloc.epoch)
+            _add_replica_if_round_epoch('svc-a',
+                                        7,
+                                        _fill_replica(7),
+                                        pool_key=_POOL,
+                                        expected_epoch=alloc.epoch)
         unchanged = serve_state.get_replica_info_from_id('svc-a', 7)
         assert unchanged is not None
         assert unchanged.replica_record_id == info.replica_record_id
@@ -1317,28 +2322,25 @@ class TestAtomicPersistFence:
         alloc = _run('svc-a', free=4)
         assert alloc is not None
         # No claim at all (former claimant, rows-only service).
-        assert not serve_state.add_replica_if_round_epoch(
-            'svc-gone',
-            1,
-            self._STUB_INFO,
-            pool_key=_POOL,
-            expected_epoch=alloc.epoch)
+        assert not _add_replica_if_round_epoch('svc-gone',
+                                               1,
+                                               self._STUB_INFO,
+                                               pool_key=_POOL,
+                                               expected_epoch=alloc.epoch)
         # Claim moved to a different pool.
         _upsert('svc-moved', pool_key=broker.make_pool_key('other', 'H100'))
-        assert not serve_state.add_replica_if_round_epoch(
-            'svc-moved',
-            1,
-            self._STUB_INFO,
-            pool_key=_POOL,
-            expected_epoch=alloc.epoch)
+        assert not _add_replica_if_round_epoch('svc-moved',
+                                               1,
+                                               self._STUB_INFO,
+                                               pool_key=_POOL,
+                                               expected_epoch=alloc.epoch)
         assert self._replica_row_count() == 0
         # The live claimant itself still persists.
-        assert serve_state.add_replica_if_round_epoch(
-            'svc-a',
-            1,
-            self._STUB_INFO,
-            pool_key=_POOL,
-            expected_epoch=alloc.epoch)
+        assert _add_replica_if_round_epoch('svc-a',
+                                           1,
+                                           self._STUB_INFO,
+                                           pool_key=_POOL,
+                                           expected_epoch=alloc.epoch)
         assert self._replica_row_count() == 1
 
     def test_round_published_between_precheck_and_persist_fences(
@@ -1381,7 +2383,7 @@ class TestAtomicPersistFence:
             return real_execute(session, statement, *args, **kwargs)
 
         monkeypatch.setattr(orm.Session, 'execute', racing_execute)
-        assert not serve_state.add_replica_if_round_epoch(
+        assert not _add_replica_if_round_epoch(
             'svc-a', 1, self._STUB_INFO, pool_key=_POOL, expected_epoch=carried)
         assert raced['done']
         assert self._replica_row_count() == 0
@@ -1401,7 +2403,7 @@ class TestRoundPersistExclusion:
     (fenced by the bumped epoch).
     """
 
-    _STUB_INFO = _replica()
+    _STUB_INFO = _fill_replica()
 
     def _replica_row_count(self):
         engine = serve_state._db_manager.get_engine()
@@ -1411,17 +2413,34 @@ class TestRoundPersistExclusion:
                     serve_state.replicas_table)).scalar()
 
     def test_persist_skips_while_round_holds_the_lock(self, monkeypatch):
-        # Real file locks (the fixture's inert lock cannot contend); the
-        # lock file resolves under SKY_LOCKS_DIR, unique per test run.
+        # Use the real lock for the active database backend (the fixture's
+        # inert lock cannot contend).  PostgreSQL persists must mint their
+        # fencing token on the exact advisory-lock session, so substituting a
+        # FileLock there would correctly fail closed even after its release.
         lock_id = f'test-broker-round-{id(self)}'
-        monkeypatch.setattr(
-            broker.locks, 'get_lock',
-            lambda *args, **kwargs: locks.FileLock(lock_id, timeout=0.0))
+        engine = serve_state._db_manager.get_engine()
+        if engine.dialect.name == 'postgresql':
+            monkeypatch.setattr(locks.global_user_state,
+                                'initialize_and_get_db', lambda: engine)
+
+            def lock_factory(*args, **kwargs):
+                del args
+                return locks.PostgresLock(lock_id,
+                                          timeout=kwargs.get('timeout'))
+
+            round_lock = locks.PostgresLock(lock_id)
+        else:
+
+            def lock_factory(*args, **kwargs):
+                del args
+                return locks.FileLock(lock_id, timeout=kwargs.get('timeout'))
+
+            round_lock = locks.FileLock(lock_id)
+        monkeypatch.setattr(broker.locks, 'get_lock', lock_factory)
         _upsert('svc-a')
         _upsert('svc-b')
         alloc = _run('svc-a', free=4)
         assert alloc is not None
-        round_lock = locks.FileLock(lock_id)
         with round_lock.acquire():  # a round is in flight
             assert not broker.persist_fill_replica('svc-a',
                                                    1,
@@ -1447,8 +2466,11 @@ class TestRoundPersistExclusion:
                     rounds_table.c.pool_key == _POOL).values(epoch=alloc.epoch +
                                                              1))
             session.commit()
-        assert not broker.persist_fill_replica(
-            'svc-a', 2, _replica(2), pool_key=_POOL, expected_epoch=alloc.epoch)
+        assert not broker.persist_fill_replica('svc-a',
+                                               2,
+                                               _fill_replica(2),
+                                               pool_key=_POOL,
+                                               expected_epoch=alloc.epoch)
         assert self._replica_row_count() == 1
 
 
@@ -1463,7 +2485,7 @@ class TestFencePendingFailsClosed:
     must fail closed while the marker is set.
     """
 
-    _STUB_INFO = _replica()
+    _STUB_INFO = _fill_replica()
 
     def _replica_row_count(self):
         engine = serve_state._db_manager.get_engine()
@@ -1489,12 +2511,11 @@ class TestFencePendingFailsClosed:
         assert epoch_read is not None and epoch_read != alloc.epoch
         # Atomic persist: refused, nothing written -- even with the
         # matching epoch.
-        assert not serve_state.add_replica_if_round_epoch(
-            'svc-a',
-            1,
-            self._STUB_INFO,
-            pool_key=_POOL,
-            expected_epoch=alloc.epoch)
+        assert not _add_replica_if_round_epoch('svc-a',
+                                               1,
+                                               self._STUB_INFO,
+                                               pool_key=_POOL,
+                                               expected_epoch=alloc.epoch)
         assert self._replica_row_count() == 0
         # An epoch-bumping publish clears the marker; the NEW epoch
         # actuates again (the old one stays fenced by the bump itself).
@@ -1505,12 +2526,11 @@ class TestFencePendingFailsClosed:
         assert fresh is not None
         assert fresh.epoch == alloc.epoch + 1
         assert broker.current_epoch(_POOL) == fresh.epoch
-        assert serve_state.add_replica_if_round_epoch(
-            'svc-a',
-            1,
-            self._STUB_INFO,
-            pool_key=_POOL,
-            expected_epoch=fresh.epoch)
+        assert _add_replica_if_round_epoch('svc-a',
+                                           1,
+                                           self._STUB_INFO,
+                                           pool_key=_POOL,
+                                           expected_epoch=fresh.epoch)
         assert self._replica_row_count() == 1
 
 
@@ -1664,7 +2684,11 @@ class TestSqliteFenceBusySkip:
 
         monkeypatch.setattr(orm.Session, 'execute', busy_execute)
         assert not serve_state.add_replica_if_round_epoch(
-            'svc-a', 1, _replica(), pool_key=_POOL, expected_epoch=alloc.epoch)
+            'svc-a',
+            1,
+            _fill_replica(),
+            pool_key=_POOL,
+            expected_epoch=alloc.epoch)
         assert attempts['count'] == serve_state._SQLITE_FENCE_BUSY_RETRIES
         monkeypatch.setattr(orm.Session, 'execute', real_execute)
         engine = serve_state._db_manager.get_engine()

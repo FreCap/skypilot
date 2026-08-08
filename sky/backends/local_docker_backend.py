@@ -329,11 +329,17 @@ class LocalDockerBackend(backends.Backend['LocalDockerResourceHandle']):
                   terminate: bool,
                   purge: bool = False,
                   *,
-                  expected_cluster_record_uuid: str | None = None):
+                  expected_cluster_record_uuid: str | None = None,
+                  expected_cluster_hash: str | None = None,
+                  continue_guard: typing.Callable[[], bool] | None = None):
         """Teardown kills the container."""
-        if expected_cluster_record_uuid is not None:
-            raise RuntimeError('Action-aware expected-UUID teardown is not '
-                               'supported by the local Docker backend.')
+        if (expected_cluster_record_uuid is not None or
+                expected_cluster_hash is not None):
+            raise RuntimeError('Identity-fenced teardown is not supported by '
+                               'the local Docker backend.')
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError('Teardown continuation guard rejected the '
+                               'local Docker operation.')
         del purge  # Unused.
         if not terminate:
             logger.warning(

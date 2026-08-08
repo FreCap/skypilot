@@ -140,121 +140,140 @@ class SkyServeLoadBalancer:
     policy.
     """
 
-    # Demand-feed state also gets class-level zero-defaults: the demand
-    # gauges are touched from every request path, so they must degrade to
-    # "no demand" rather than AttributeError on a partially-initialized
-    # instance (this fork's tests build the LB via object.__new__ with
-    # only the attrs under test). All defaults are immutable -- the
-    # reject dict defaults to None and is materialized per-instance by
-    # _prune_reject_window (the single funnel every read and write goes
-    # through), so instances cannot leak reject state into one another.
-    _queue_depth: int = 0
-    _queue_depth_by_priority: dict[int, int] | None = None
-    _request_queue_config: dict[str, Any] | None = None
-    _request_queue_condition: asyncio.Condition | None = None
-    _active_request_count: int = 0
-    _waiting_request_count: int = 0
-    _waiting_request_body_bytes: int = 0
-    _request_queue_waiters: dict[int, dict[int,
-                                           _RequestQueueWaiter]] | None = None
-    _request_queue_sequence: int = 0
-    _draining: bool = False
-    _reject_last_seen: dict[str, tuple[float, int]] | None = None
-    _reject_compatibility_by_key: dict[str, tuple[int,
-                                                  tuple[str,
-                                                        ...]]] | None = None
-    _reject_fallback_seq: int = 0
-    _offered_arrivals_by_job: dict[str, float] | None = None
-    _headerless_offered_arrivals: collections.deque[float] | None = None
-    _offered_arrival_saturated_until: float | None = None
-    _capacity_hint: dict[str, Any] | None = None
-    _configured_accelerators: tuple[str, ...] | None = None
-    _request_accelerator_compatibility_version: int | None = None
+    # Process-local state is declared here for readability and initialized in
+    # full by __init__.  Tests use the real constructor as well: supporting
+    # partially initialized ``object.__new__`` instances would create a second,
+    # implicit state contract and hide missing fields behind fallback values.
+    _app: fastapi.FastAPI
+    _controller_url: str
+    _load_balancer_port: int
+    _service_hash: str | None
+    _lb_slot: lb_ha.LbSlot | None
+    _lb_role: lb_ha.LbRole
+    _lb_role_generation: int
+    _lb_ha_rollout_evidence: dict[str, Any] | None
+    _armed_generation: int | None
+    _routing_version: int | None
+    _background_tasks: set[asyncio.Task]
+    _load_balancing_policy_name: str
+    _load_balancing_policy: lb_policies.LoadBalancingPolicy
+    _request_aggregator: serve_utils.RequestsAggregator
+    _request_history_session_id: str
+    _completed_async_prediction_ids: collections.OrderedDict[str, None]
+    _stream_timeout_seconds: float
+    _retriable_status_codes: frozenset[int]
+    _max_retries: int
+    _retry_initial_backoff_seconds: float
+    _queue_depth: int
+    _queue_depth_by_priority: dict[int, int]
+    _request_queue_config: dict[str, Any] | None
+    _request_queue_condition: asyncio.Condition
+    _active_request_count: int
+    _waiting_request_count: int
+    _waiting_request_body_bytes: int
+    _request_queue_waiters: dict[int, dict[int, _RequestQueueWaiter]]
+    _request_queue_sequence: int
+    _draining: bool
+    _reject_last_seen: dict[str, tuple[float, int]]
+    _reject_compatibility_by_key: dict[str, tuple[int, tuple[str, ...]]]
+    _reject_fallback_seq: int
+    _offered_arrivals_by_job: dict[str, float]
+    _headerless_offered_arrivals: collections.deque[float]
+    _offered_arrival_saturated_until: float | None
+    _capacity_hint: dict[str, Any] | None
+    _configured_accelerators: tuple[str, ...] | None
+    _request_accelerator_compatibility_version: int | None
     # Fail open for mixed-version availability: until a controller explicitly
     # acknowledges the replaceable queue gauge, publish the legacy arrival
     # event before admission so an old controller can cold-start an empty
     # fleet. A successful old-controller response also downgrades this flag.
-    _queued_compatibility_demand_supported: bool = False
-    _replica_info_by_url: dict[str, dict[str, Any]] | None = None
-    _draining_clients: dict[str, list[httpx.AsyncClient]] | None = None
-    _occupancy_capable: set[str] | None = None
+    _queued_compatibility_demand_supported: bool
+    _replica_info_by_url: dict[str, dict[str, Any]]
+    _draining_clients: dict[str, list[httpx.AsyncClient]]
+    _occupancy_capable: set[str]
     # Subset explicitly declared by the per-version service contract. Unlike
     # inferred capability, declaration is fail-closed: any dispatched request
     # may outlive its envelope, including custom request shapes the LB cannot
     # recognize.
-    _occupancy_declared_urls: set[str] | None = None
+    _occupancy_declared_urls: set[str]
     # Explicit disable is two-phase: a service-only update can flip true ->
     # false while old async work still runs on the same replica URL. Retain
     # capability until a generation-valid zero proves that work drained.
-    _occupancy_disable_pending: set[str] | None = None
+    _occupancy_disable_pending: set[str]
     # Authoritative false persists after pending old work drains. Generic
     # probes cannot re-enable it; a recognized async request may temporarily
     # override false until the next generation-valid zero.
-    _occupancy_explicitly_disabled_urls: set[str] | None = None
+    _occupancy_explicitly_disabled_urls: set[str]
     # url -> monotonic time of the FIRST probe round that observed the
     # capable url off-ready and unanswered (cleared whenever the url is
     # confirmed again). Bounds how long such a url survives consecutive
     # probe misses -- and, because it starts at retirement rather than at
     # the last pre-retirement confirmation, guarantees the retention
     # outlives any allowed graceful_drain_seconds deadline.
-    _occupancy_off_ready_since: dict[str, float] | None = None
+    _occupancy_off_ready_since: dict[str, float]
     # urls whose occupancy sample in the LAST completed probe round was
     # taken while the url was off-ready. Only such samples can prove
     # post-retirement idleness: a sample taken while the url was still
     # routed may predate work that arrived just before retirement.
-    _occupancy_sampled_off_ready: set[str] | None = None
+    _occupancy_sampled_off_ready: set[str]
     # Per-url ordering between async dispatches and occupancy probes. A sample
     # is valid only when its captured generation still equals the current
     # generation; this prevents a probe begun before a fast-ack submit from
     # publishing a stale zero after that submit lands.
-    _occupancy_dispatch_generation: dict[str, int] | None = None
-    _occupancy_sample_generation: dict[str, int] | None = None
-    _occupancy_sample_time: dict[str, float] | None = None
+    _occupancy_dispatch_generation: dict[str, int]
+    _occupancy_sample_generation: dict[str, int]
+    _occupancy_sample_time: dict[str, float]
     # Current-round, generation-valid samples are the only controller-facing
     # idle proof. The longer-lived maps above may retain a last-good sample for
     # bounded LB-local admission, but must never cross this boundary.
-    _occupancy_current_round_sampled_urls: set[str] | None = None
+    _occupancy_current_round_sampled_urls: set[str]
     # Local admission epoch under which each sample was taken. It advances on
     # every transition into a changed ARMED/ACTIVE role, including role changes
     # that reuse one controller cutover generation.
-    _occupancy_role_epoch: int = 0
-    _occupancy_sample_role_epoch: dict[str, int] | None = None
-    _occupancy_probe_lock: asyncio.Lock | None = None
+    _occupancy_role_epoch: int
+    _occupancy_sample_role_epoch: dict[str, int]
+    _occupancy_probe_lock: asyncio.Lock
     # Optimistic reservations bridge the interval between a fast async
     # acknowledgement and the first post-dispatch occupancy probe. The active
     # attempt count rejects a probe that overtakes an in-progress POST before
     # the trailing generation fence can invalidate it.
-    _occupancy_pending_reservations: dict[str, int] | None = None
-    _occupancy_active_attempts: dict[str, int] | None = None
+    _occupancy_pending_reservations: dict[str, int]
+    _occupancy_active_attempts: dict[str, int]
     # Last generation-valid predict concurrency reported per replica URL.
     # Stored separately from free slots because a draining worker may report
     # running work while advertising zero serving capacity.
-    _replica_total_slots: dict[str, int] | None = None
+    _replica_total_slots: dict[str, int]
     # Fleet slot admitted by the request queue but not yet transferred to a
     # selected URL. Normally lives for one event-loop turn; tracking it makes
     # admission correct even if scheduling changes or a test deliberately
     # pauses between admission and selection.
-    _occupancy_unassigned_reservations: int = 0
-    _ha_runtime_stats: lb_ha_obs.LbHaRuntimeStats | None = None
-    _drain_history_flush_task: asyncio.Task | None = None
-    _drain_history_flush_generation: int = 0
-    # Recovery-route lease state is immutable-by-default at class scope so
-    # lightweight ``object.__new__`` tests fail closed instead of sharing
-    # mutable state between instances.
+    _occupancy_unassigned_reservations: int
+    _ha_runtime_stats: lb_ha_obs.LbHaRuntimeStats
+    _drain_history_flush_task: asyncio.Task | None
+    _drain_history_flush_generation: int
     _system_recovery_route_markers: dict[
-        str, system_recovery_route_lease.RouteMarker] | None = None
-    _system_recovery_invalid_route_marker_urls: set[str] | None = None
-    _system_recovery_route_fenced_urls: set[str] | None = None
-    _system_recovery_route_marker_generations: dict[str, int] | None = None
-    _system_recovery_route_lease_deadlines: dict[str, float] | None = None
-    _system_recovery_route_lease_last_applied_sequences: dict[str,
-                                                              int] | None = None
-    _system_recovery_route_marker_generation: int = 0
-    _system_recovery_route_lease_heartbeat_sequence: int = 0
-    _system_recovery_route_lease_heartbeat_lock: asyncio.Lock | None = None
-    _client_pool_generations: dict[str, tuple[httpx.AsyncClient,
-                                              int]] | None = None
-    _client_pool_generation: int = 0
+        str, system_recovery_route_lease.RouteMarker]
+    _system_recovery_invalid_route_marker_urls: set[str]
+    _system_recovery_route_fenced_urls: set[str]
+    _system_recovery_route_marker_generations: dict[str, int]
+    _system_recovery_route_lease_deadlines: dict[str, float]
+    _system_recovery_route_lease_last_applied_sequences: dict[str, int]
+    _system_recovery_route_marker_generation: int
+    _system_recovery_route_lease_heartbeat_sequence: int
+    _system_recovery_route_lease_heartbeat_lock: asyncio.Lock
+    _client_pool_generations: dict[str, tuple[httpx.AsyncClient, int]]
+    _client_pool_generation: int
+    _client_pool: dict[str, httpx.AsyncClient]
+    _replica_ssl_context_cached: ssl.SSLContext | bool | None
+    _client_pool_lock: threading.Lock
+    _replica_dead_failures: dict[str, int]
+    _replica_quarantine_until: dict[str, float]
+    _ready: bool
+    _last_sync_time: float | None
+    _replica_occupancy: dict[str, int]
+    _replica_free_slots: dict[str, int]
+    _last_occupancy_probe_time: float | None
+    _client_close_tasks: set[asyncio.Task]
 
     def __init__(
         self,
@@ -363,6 +382,7 @@ class SkyServeLoadBalancer:
         # connection is available.
         # Reference: https://github.com/encode/httpcore/blob/a8f80980daaca98d556baea1783c5568775daadc/httpcore/_async/connection_pool.py#L69-L71 # pylint: disable=line-too-long
         self._client_pool: dict[str, httpx.AsyncClient] = dict()
+        self._draining_clients = {}
         # Built once: an SSLContext is thread-safe, reusable across clients,
         # and parsing the pinned certificate per replica would be wasted work.
         # None means plaintext, which is what `verify=` is ignored for.
@@ -445,6 +465,12 @@ class SkyServeLoadBalancer:
         self._replica_occupancy: dict[str, int] = {}
         self._replica_total_slots: dict[str, int] = {}
         self._replica_free_slots: dict[str, int] = {}
+        self._occupancy_capable = set()
+        self._occupancy_declared_urls = set()
+        self._occupancy_disable_pending = set()
+        self._occupancy_explicitly_disabled_urls = set()
+        self._occupancy_off_ready_since = {}
+        self._occupancy_sampled_off_ready = set()
         self._occupancy_dispatch_generation = {}
         self._occupancy_sample_generation = {}
         self._occupancy_sample_time = {}
@@ -464,12 +490,8 @@ class SkyServeLoadBalancer:
         self._client_close_tasks: set[asyncio.Task] = set()
 
     def _ha_stats(self) -> lb_ha_obs.LbHaRuntimeStats:
-        """Return process-local HA stats, including for partial test objects."""
-        stats = getattr(self, '_ha_runtime_stats', None)
-        if stats is None:
-            stats = lb_ha_obs.LbHaRuntimeStats()
-            self._ha_runtime_stats = stats
-        return stats
+        """Return the process-local HA stats initialized at construction."""
+        return self._ha_runtime_stats
 
     def _replace_system_recovery_route_markers_locked(
             self, replica_info: dict[str, dict[str, Any]]) -> set[str]:
@@ -481,20 +503,14 @@ class SkyServeLoadBalancer:
         Deadlines and response-order fences survive only an exact unchanged
         URL/marker generation.
         """
-        old_markers = dict(
-            getattr(self, '_system_recovery_route_markers', None) or {})
-        old_generations = dict(
-            getattr(self, '_system_recovery_route_marker_generations', None) or
-            {})
-        old_deadlines = dict(
-            getattr(self, '_system_recovery_route_lease_deadlines', None) or {})
+        old_markers = dict(self._system_recovery_route_markers)
+        old_generations = dict(self._system_recovery_route_marker_generations)
+        old_deadlines = dict(self._system_recovery_route_lease_deadlines)
         old_sequences = dict(
-            getattr(self, '_system_recovery_route_lease_last_applied_sequences',
-                    None) or {})
+            self._system_recovery_route_lease_last_applied_sequences)
         markers: dict[str, system_recovery_route_lease.RouteMarker] = {}
         invalid_urls: set[str] = set()
-        fenced_urls = set(
-            getattr(self, '_system_recovery_route_fenced_urls', None) or ())
+        fenced_urls = set(self._system_recovery_route_fenced_urls)
         for url, info in replica_info.items():
             fields_present, marker = (
                 system_recovery_route_lease.parse_route_marker(info))
@@ -510,14 +526,12 @@ class SkyServeLoadBalancer:
         # A removed capable URL may remain in the off-ready occupancy/draining
         # overlay.  Retain only those bounded live references so that overlay
         # cannot probe a same-address replacement after marker removal.
-        relevant_urls = (set(replica_info) |
-                         set(getattr(self, '_client_pool', None) or {}) |
-                         set(getattr(self, '_draining_clients', None) or {}) |
-                         set(getattr(self, '_occupancy_capable', None) or ()))
+        relevant_urls = (set(replica_info) | set(self._client_pool) |
+                         set(self._draining_clients) |
+                         set(self._occupancy_capable))
         fenced_urls &= relevant_urls
 
-        marker_generation = int(
-            getattr(self, '_system_recovery_route_marker_generation', 0))
+        marker_generation = self._system_recovery_route_marker_generation
         generations: dict[str, int] = {}
         deadlines: dict[str, float] = {}
         sequences: dict[str, int] = {}
@@ -548,19 +562,15 @@ class SkyServeLoadBalancer:
                                                    now: float | None = None
                                                   ) -> bool:
         """Whether the current exact URL marker permits data-plane use."""
-        if url in set(
-                getattr(self, '_system_recovery_invalid_route_marker_urls',
-                        None) or ()):
+        if url in self._system_recovery_invalid_route_marker_urls:
             return False
-        markers = (getattr(self, '_system_recovery_route_markers', None) or {})
-        if (url in set(
-                getattr(self, '_system_recovery_route_fenced_urls', None) or
-            ()) and url not in markers):
+        markers = self._system_recovery_route_markers
+        if (url in self._system_recovery_route_fenced_urls and
+                url not in markers):
             return False
         if url not in markers:
             return True
-        deadlines = (getattr(self, '_system_recovery_route_lease_deadlines',
-                             None) or {})
+        deadlines = self._system_recovery_route_lease_deadlines
         deadline = deadlines.get(url)
         if (not isinstance(deadline, (int, float)) or
                 isinstance(deadline, bool) or not math.isfinite(deadline)):
@@ -585,11 +595,11 @@ class SkyServeLoadBalancer:
     def _client_generation_locked(self, url: str,
                                   client: httpx.AsyncClient) -> int:
         """Return the object-identity generation for one pooled client."""
-        generations = (getattr(self, '_client_pool_generations', None) or {})
+        generations = self._client_pool_generations
         existing = generations.get(url)
         if existing is not None and existing[0] is client:
             return existing[1]
-        generation = int(getattr(self, '_client_pool_generation', 0)) + 1
+        generation = self._client_pool_generation + 1
         generations[url] = (client, generation)
         self._client_pool_generations = generations
         self._client_pool_generation = generation
@@ -598,14 +608,12 @@ class SkyServeLoadBalancer:
     def _capture_selected_replica_locked(
             self, url: str, *, require_current_route: bool) -> _SelectedReplica:
         """Capture the exact client and marker generation chosen under lock."""
-        client = (getattr(self, '_client_pool', None) or {}).get(url)
+        client = self._client_pool.get(url)
         client_generation = (None if client is None else
                              self._client_generation_locked(url, client))
-        marker = (getattr(self, '_system_recovery_route_markers', None) or
-                  {}).get(url)
-        marker_generation = (getattr(
-            self, '_system_recovery_route_marker_generations', None) or
-                             {}).get(url)
+        marker = self._system_recovery_route_markers.get(url)
+        marker_generation = self._system_recovery_route_marker_generations.get(
+            url)
         return _SelectedReplica(url=url,
                                 client=client,
                                 client_generation=client_generation,
@@ -620,17 +628,15 @@ class SkyServeLoadBalancer:
         This is the final pre-transport fence after all request-body awaits.
         It never substitutes a newly looked-up client for the selected object.
         """
-        if getattr(self, '_draining',
-                   False) or not self._accepts_new_requests():
+        if self._draining or not self._accepts_new_requests():
             return None
         if (selected.require_current_route and
                 selected.url not in self._load_balancing_policy.ready_replicas):
             return None
         if not self._system_recovery_route_is_available_locked(selected.url):
             return None
-        markers = (getattr(self, '_system_recovery_route_markers', None) or {})
-        generations = (getattr(
-            self, '_system_recovery_route_marker_generations', None) or {})
+        markers = self._system_recovery_route_markers
+        generations = self._system_recovery_route_marker_generations
         if (markers.get(selected.url) != selected.route_marker or
                 generations.get(
                     selected.url) != selected.route_marker_generation):
@@ -638,8 +644,7 @@ class SkyServeLoadBalancer:
         client = selected.client
         if client is None:
             return None
-        current_client = (getattr(self, '_client_pool', None) or
-                          {}).get(selected.url)
+        current_client = self._client_pool.get(selected.url)
         if current_client is not client:
             return None
         current_generation = self._client_generation_locked(
@@ -659,14 +664,11 @@ class SkyServeLoadBalancer:
     ) -> tuple[int, float, dict[str, tuple[
             system_recovery_route_lease.RouteMarker, int]]]:
         """Capture one ordered heartbeat request against the current snapshot."""
-        sequence = int(
-            getattr(self, '_system_recovery_route_lease_heartbeat_sequence',
-                    0)) + 1
+        sequence = self._system_recovery_route_lease_heartbeat_sequence + 1
         self._system_recovery_route_lease_heartbeat_sequence = sequence
         started_at = time.monotonic()
-        markers = (getattr(self, '_system_recovery_route_markers', None) or {})
-        generations = (getattr(
-            self, '_system_recovery_route_marker_generations', None) or {})
+        markers = self._system_recovery_route_markers
+        generations = self._system_recovery_route_marker_generations
         snapshot = {
             url: (marker, generations[url])
             for url, marker in markers.items()
@@ -694,17 +696,12 @@ class SkyServeLoadBalancer:
         now = time.monotonic()
         changed = False
         with self._client_pool_lock:
-            current_markers = (getattr(self, '_system_recovery_route_markers',
-                                       None) or {})
-            current_generations = (getattr(
-                self, '_system_recovery_route_marker_generations', None) or {})
-            deadlines = dict(
-                getattr(self, '_system_recovery_route_lease_deadlines', None) or
-                {})
+            current_markers = self._system_recovery_route_markers
+            current_generations = (
+                self._system_recovery_route_marker_generations)
+            deadlines = dict(self._system_recovery_route_lease_deadlines)
             applied_sequences = dict(
-                getattr(self,
-                        '_system_recovery_route_lease_last_applied_sequences',
-                        None) or {})
+                self._system_recovery_route_lease_last_applied_sequences)
             for url, (marker, generation) in marker_snapshot.items():
                 if (current_markers.get(url) != marker or
                         current_generations.get(url) != generation or
@@ -760,14 +757,9 @@ class SkyServeLoadBalancer:
         # the autoscaler and, worse, as 'drained' to a retirement waiting on
         # the in-flight gauge. A post-quarantine re-add creates a fresh
         # client; the old one closes once its in-flight work finishes.
-        client_pool = getattr(self, '_client_pool', None)
-        client = client_pool.pop(url, None) if client_pool else None
+        client = self._client_pool.pop(url, None)
         if client is not None:
-            generations = getattr(self, '_client_pool_generations', None)
-            if generations is not None:
-                generations.pop(url, None)
-            if self._draining_clients is None:
-                self._draining_clients = {}
+            self._client_pool_generations.pop(url, None)
             self._draining_clients.setdefault(url, []).append(client)
             task = asyncio.create_task(self._drain_and_close_client(
                 url, client))
@@ -945,29 +937,25 @@ class SkyServeLoadBalancer:
         """Whether one sample is valid for bounded LB-local admission."""
         if not self._system_recovery_route_is_available_locked(url):
             return False
-        free_slots = getattr(self, '_replica_free_slots', None) or {}
-        if url not in free_slots:
+        if (url not in self._replica_occupancy or
+                url not in self._replica_total_slots or
+                url not in self._replica_free_slots):
             return False
-        dispatch_generation = (getattr(self, '_occupancy_dispatch_generation',
-                                       None) or {})
-        sample_generation = (getattr(self, '_occupancy_sample_generation', None)
-                             or {})
-        pending = (getattr(self, '_occupancy_pending_reservations', None) or {})
-        if (sample_generation and
-                sample_generation.get(url) != dispatch_generation.get(
-                    url, 0) and pending.get(url, 0) <= 0):
+        sample_generation = self._occupancy_sample_generation.get(url)
+        if sample_generation is None:
+            return False
+        if (sample_generation != self._occupancy_dispatch_generation.get(
+                url, 0) and
+                self._occupancy_pending_reservations.get(url, 0) <= 0):
             return False
 
-        sample_times = getattr(self, '_occupancy_sample_time', None)
-        if sample_times:
-            sampled_at = sample_times.get(url)
-            if (sampled_at is None or time.monotonic() - sampled_at
-                    > constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS):
-                return False
+        sampled_at = self._occupancy_sample_time.get(url)
+        if (sampled_at is None or time.monotonic() - sampled_at
+                > constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS):
+            return False
 
-        sample_roles = getattr(self, '_occupancy_sample_role_epoch', None)
-        if (sample_roles and sample_roles.get(url) != getattr(
-                self, '_occupancy_role_epoch', 0)):
+        if (self._occupancy_sample_role_epoch.get(url)
+                != self._occupancy_role_epoch):
             return False
         return True
 
@@ -979,37 +967,23 @@ class SkyServeLoadBalancer:
         current-round proof exported to the controller, but it never survives
         a dispatch fence, HA role generation change, or the per-URL TTL.
         """
-        free_slots = getattr(self, '_replica_free_slots', None) or {}
         return {
-            url for url in free_slots
+            url for url in self._replica_free_slots
             if self._occupancy_sample_is_locally_usable_locked(url)
         }
 
     def _controller_occupancy_proof_urls_locked(self) -> set[str]:
         """Return only current-round samples safe as controller idle proof."""
-        proof_urls = getattr(self, '_occupancy_current_round_sampled_urls',
-                             None)
-        sample_times = getattr(self, '_occupancy_sample_time', None)
-        if proof_urls is None or (not proof_urls and not sample_times and
-                                  self._replica_occupancy):
-            # Compatibility for older partially initialized test instances.
-            proof_urls = set(self._replica_occupancy)
-        dispatch_generation = (getattr(self, '_occupancy_dispatch_generation',
-                                       None) or {})
-        sample_generation = (getattr(self, '_occupancy_sample_generation', None)
-                             or {})
+        proof_urls = self._occupancy_current_round_sampled_urls
         proof_urls = {
             url for url in proof_urls if url in self._replica_occupancy and
-            (not sample_generation or
-             sample_generation.get(url) == dispatch_generation.get(url, 0))
+            self._occupancy_sample_generation.get(
+                url) == self._occupancy_dispatch_generation.get(url, 0)
         }
-        sample_roles = getattr(self, '_occupancy_sample_role_epoch', None)
-        if sample_roles:
-            role_generation = getattr(self, '_occupancy_role_epoch', 0)
-            proof_urls = {
-                url for url in proof_urls
-                if sample_roles.get(url) == role_generation
-            }
+        proof_urls = {
+            url for url in proof_urls if self._occupancy_sample_role_epoch.get(
+                url) == self._occupancy_role_epoch
+        }
         return proof_urls
 
     def _invalidate_occupancy_samples_locked(self) -> None:
@@ -1032,33 +1006,30 @@ class SkyServeLoadBalancer:
         baseline has a reservation, so subtracting reservations preserves the
         still-usable slots without treating stale capacity as fresh.
         """
-        pending = self._occupancy_pending_reservations or {}
-        observed_free = getattr(self, '_replica_free_slots', {}) or {}
         usable_urls = self._locally_usable_occupancy_urls_locked()
         return {
-            url: max(0, slots - pending.get(url, 0))
-            for url, slots in observed_free.items()
+            url:
+                max(0, slots - self._occupancy_pending_reservations.get(url, 0))
+            for url, slots in self._replica_free_slots.items()
             if url in usable_urls
         }
 
     def _effective_free_slots_for_replica_locked(self, url: str) -> int | None:
         """Return one URL's free slots without scanning the whole fleet."""
-        observed_free = getattr(self, '_replica_free_slots', {}) or {}
         if not self._occupancy_sample_is_locally_usable_locked(url):
             return None
-        slots = observed_free.get(url)
+        slots = self._replica_free_slots.get(url)
         if slots is None:
             return None
-        pending = (self._occupancy_pending_reservations or {}).get(url, 0)
+        pending = self._occupancy_pending_reservations.get(url, 0)
         return max(0, slots - pending)
 
     def _effective_replica_occupancy_locked(self, url: str) -> int | None:
         """Return routing occupancy including optimistic reservations."""
-        pending = (self._occupancy_pending_reservations or {}).get(url, 0)
-        observed = (getattr(self, '_replica_occupancy', {}) or {}).get(url)
-        dispatch_generation = (self._occupancy_dispatch_generation or
-                               {}).get(url, 0)
-        sample_generation = (self._occupancy_sample_generation or {}).get(url)
+        pending = self._occupancy_pending_reservations.get(url, 0)
+        observed = self._replica_occupancy.get(url)
+        dispatch_generation = self._occupancy_dispatch_generation.get(url, 0)
+        sample_generation = self._occupancy_sample_generation.get(url)
         locally_usable = self._occupancy_sample_is_locally_usable_locked(url)
         if pending > 0:
             return (observed or 0) + pending
@@ -1068,8 +1039,8 @@ class SkyServeLoadBalancer:
         return None
 
     def _effective_occupancy_locked(self) -> dict[str, int]:
-        urls = (set(getattr(self, '_replica_occupancy', {}) or {}) |
-                set(self._occupancy_pending_reservations or {}))
+        urls = (set(self._replica_occupancy) |
+                set(self._occupancy_pending_reservations))
         effective: dict[str, int] = {}
         for url in urls:
             value = self._effective_replica_occupancy_locked(url)
@@ -1128,7 +1099,7 @@ class SkyServeLoadBalancer:
                 # attempt consumes one replica reservation; admissions that
                 # have not reached selection consume the fleet-wide remainder.
                 effective = self._effective_replica_free_slots_locked()
-                total_slots = getattr(self, '_replica_total_slots', None) or {}
+                total_slots = self._replica_total_slots
                 hint = self._capacity_hint or {}
                 logical_replicas = hint.get('replica_unit') == 'logical_slot'
                 planned_capacity = hint.get('planned_capacity_by_url', {})
@@ -1173,9 +1144,6 @@ class SkyServeLoadBalancer:
     def _change_queue_depth(self, priority: int, delta: int) -> None:
         self._queue_depth = max(0, self._queue_depth + delta)
         depths = self._queue_depth_by_priority
-        if depths is None:
-            depths = {}
-            self._queue_depth_by_priority = depths
         next_count = depths.get(priority, 0) + delta
         if next_count <= 0:
             depths.pop(priority, None)
@@ -1184,8 +1152,9 @@ class SkyServeLoadBalancer:
 
     def _queue_depth_priority_snapshot(self) -> dict[str, int]:
         return {
-            str(priority): count for priority, count in sorted((
-                self._queue_depth_by_priority or {}).items()) if count > 0
+            str(priority): count
+            for priority, count in sorted(self._queue_depth_by_priority.items())
+            if count > 0
         }
 
     def _current_dispatch_load(self) -> int:
@@ -1212,11 +1181,7 @@ class SkyServeLoadBalancer:
 
     def _request_queue_waiters_for_instance(
             self) -> dict[int, dict[int, _RequestQueueWaiter]]:
-        waiters = self._request_queue_waiters
-        if waiters is None:
-            waiters = {}
-            self._request_queue_waiters = waiters
-        return waiters
+        return self._request_queue_waiters
 
     def _remove_request_queue_waiter_locked(
             self, waiter: _RequestQueueWaiter) -> bool:
@@ -1471,17 +1436,17 @@ class SkyServeLoadBalancer:
         # Once the controller advertises the exact-card capability, missing
         # identity is zero compatible capacity, never permission to fall back
         # to aggregate admission. This fails closed during partial syncs.
-        replica_info = self._replica_info_by_url or {}
+        replica_info = self._replica_info_by_url
         with self._client_pool_lock:
             ready_urls = self._routable_ready_urls_locked()
             if self._queue_uses_async_occupancy():
                 free_by_url = self._effective_replica_free_slots_locked()
             else:
                 in_flight = self._load_balancing_policy.snapshot_in_flight()
+                config = self._request_queue_config
+                assert config is not None
                 per_replica_limit = max(
-                    1,
-                    int((self._request_queue_config or
-                         {}).get('max_concurrency_per_replica', 1)))
+                    1, int(config.get('max_concurrency_per_replica', 1)))
                 free_by_url = {
                     url: max(0, per_replica_limit -
                              (in_flight or {}).get(url, 0)) for url in ready_urls
@@ -1580,8 +1545,7 @@ class SkyServeLoadBalancer:
 
     def _set_queued_compatibility_demand_support(self, supported: bool) -> None:
         """Apply controller queue-gauge capability and rollback fallback."""
-        previous = getattr(self, '_queued_compatibility_demand_supported',
-                           False)
+        previous = self._queued_compatibility_demand_supported
         self._queued_compatibility_demand_supported = supported
         if not previous or supported:
             return
@@ -1603,8 +1567,7 @@ class SkyServeLoadBalancer:
                 self._load_balancing_policy.snapshot_in_flight() or {})
         result: dict[str, int] = {}
         for url, count in in_flight_by_url.items():
-            card = (self._replica_info_by_url or {}).get(url,
-                                                         {}).get('gpu_type')
+            card = self._replica_info_by_url.get(url, {}).get('gpu_type')
             if (not isinstance(card, str) or
                     card not in (self._configured_accelerators or ())):
                 continue
@@ -1690,10 +1653,7 @@ class SkyServeLoadBalancer:
             self._grant_request_queue_waiter_locked(queued_waiter)
 
     async def _notify_request_queue(self) -> None:
-        condition = self._request_queue_condition
-        if condition is None:
-            return
-        async with condition:
+        async with self._request_queue_condition:
             self._dispatch_request_queue_locked()
 
     @staticmethod
@@ -1755,10 +1715,7 @@ class SkyServeLoadBalancer:
 
     async def _cleanup_request_queue_waiter(
             self, waiter: _RequestQueueWaiter) -> None:
-        condition = self._request_queue_condition
-        if condition is None:
-            return
-        async with condition:
+        async with self._request_queue_condition:
             waiter.abandoned = True
             self._remove_request_queue_waiter_locked(waiter)
             self._reclaim_request_queue_grant_locked(waiter)
@@ -1780,15 +1737,11 @@ class SkyServeLoadBalancer:
         if priority is None:
             priority = getattr(request, _REQUEST_PRIORITY_ATTR,
                                constants.LB_REQUEST_PRIORITY_MIN)
-        condition = self._request_queue_condition
-        if condition is None:
-            condition = asyncio.Condition()
-            self._request_queue_condition = condition
         deadline = time.monotonic() + self._request_queue_timeout(
             config, priority)
         waiter: _RequestQueueWaiter | None = None
         try:
-            async with condition:
+            async with self._request_queue_condition:
                 if self._draining:
                     raise self._draining_request_error()
                 if not self._accepts_new_requests():
@@ -1845,7 +1798,7 @@ class SkyServeLoadBalancer:
                     except asyncio.TimeoutError:
                         pass
                 disconnected = await request.is_disconnected()
-                async with condition:
+                async with self._request_queue_condition:
                     if waiter.terminal_error is not None:
                         raise waiter.terminal_error
                     if waiter.granted:
@@ -1911,25 +1864,24 @@ class SkyServeLoadBalancer:
             with self._client_pool_lock:
                 self._release_unassigned_occupancy_admission_locked(request)
         self._active_request_count = max(0, self._active_request_count - 1)
-        condition = self._request_queue_condition
-        if condition is not None:
-            # Keep notification alive independently of this request task. A
-            # second cancellation can arrive while it waits for the condition
-            # lock; the released state is safe already, but an envelope-mode
-            # waiter still needs the wakeup because it has no occupancy probe
-            # to provide a later one.
-            async def _notify() -> None:
-                await self._notify_request_queue()
 
-            try:
-                await _notify()
-            except asyncio.CancelledError:
-                notification = asyncio.create_task(_notify())
-                # The event loop only keeps weak task references. Retain this
-                # rare cancellation fallback until its condition notification
-                # finishes, then consume any shutdown-time exception.
-                self._retain_background_task(notification)
-                raise
+        # Keep notification alive independently of this request task. A
+        # second cancellation can arrive while it waits for the condition
+        # lock; the released state is safe already, but an envelope-mode
+        # waiter still needs the wakeup because it has no occupancy probe
+        # to provide a later one.
+        async def _notify() -> None:
+            await self._notify_request_queue()
+
+        try:
+            await _notify()
+        except asyncio.CancelledError:
+            notification = asyncio.create_task(_notify())
+            # The event loop only keeps weak task references. Retain this
+            # rare cancellation fallback until its condition notification
+            # finishes, then consume any shutdown-time exception.
+            self._retain_background_task(notification)
+            raise
 
     def _release_waiting_body_budget(self,
                                      request: fastapi.Request,
@@ -2012,11 +1964,10 @@ class SkyServeLoadBalancer:
         # patch, the target is already able to serve. Direct Pod-IP access is
         # unsupported, so this does not create a second supported authority.
         return (not self._draining and
-                getattr(self, '_lb_role', lb_ha.LbRole.ACTIVE)
-                in (lb_ha.LbRole.ARMED, lb_ha.LbRole.ACTIVE))
+                self._lb_role in (lb_ha.LbRole.ARMED, lb_ha.LbRole.ACTIVE))
 
     def _inactive_role_request_error(self) -> fastapi.HTTPException:
-        role = getattr(self, '_lb_role', lb_ha.LbRole.STANDBY)
+        role = self._lb_role
         headers = {'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)}
         if role is lb_ha.LbRole.DRAINING:
             # Role-driven cutovers can fence the old active slot before its
@@ -2135,11 +2086,10 @@ class SkyServeLoadBalancer:
                 for url, count in self._replica_occupancy.items()
                 if url in proof_urls
             }
-            sampled_off_ready = set(self._occupancy_sampled_off_ready or ())
-            capable = set(self._occupancy_capable or ())
-            dispatch_generation = dict(self._occupancy_dispatch_generation or
-                                       {})
-            sample_generation = dict(self._occupancy_sample_generation or {})
+            sampled_off_ready = set(self._occupancy_sampled_off_ready)
+            capable = set(self._occupancy_capable)
+            dispatch_generation = dict(self._occupancy_dispatch_generation)
+            sample_generation = dict(self._occupancy_sample_generation)
             # Sampled under the same lock as the gauge: the controller's
             # retirement drain uses this to prove the gauge was taken
             # against a routing view that already excluded the retiring
@@ -2158,13 +2108,6 @@ class SkyServeLoadBalancer:
             for url, count in occupancy.items()
             if url in routing_set or url in sampled_off_ready
         }
-        if not sample_generation and occupancy:
-            # Compatibility for partially initialized/test instances created
-            # before generation tracking existed. Real probe rounds always
-            # publish the generation map atomically with occupancy.
-            sample_generation = {
-                url: dispatch_generation.get(url, 0) for url in occupancy
-            }
         sampled_urls = sorted(
             url for url in occupancy if url in proof_urls and
             sample_generation.get(url) == dispatch_generation.get(url, 0))
@@ -2174,7 +2117,7 @@ class SkyServeLoadBalancer:
         # Fold draining refcounts into the envelope totals first: a
         # draining client's streams and the current client's are
         # DISJOINT request sets on the same replica, so they add.
-        for url, clients in (self._draining_clients or {}).items():
+        for url, clients in self._draining_clients.items():
             draining = sum(
                 getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
             if draining > 0:
@@ -2239,9 +2182,6 @@ class SkyServeLoadBalancer:
         expired entries regardless of position.
         """
         current = self._reject_last_seen
-        if current is None:
-            current = {}
-            self._reject_last_seen = current
         cutoff = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS
         profiles = self._reject_compatibility_by_key
         while current:
@@ -2249,8 +2189,7 @@ class SkyServeLoadBalancer:
             if self._reject_entry_seen(current[key]) > cutoff:
                 break
             del current[key]
-            if profiles is not None:
-                profiles.pop(key, None)
+            profiles.pop(key, None)
         return current
 
     def _prune_reject_window(self) -> dict[str, tuple[float, int]]:
@@ -2264,9 +2203,8 @@ class SkyServeLoadBalancer:
         write path's front-eviction ordering does not hold (the rebuild
         preserves the existing order, it does not re-sort). Writes must
         NOT come through here -- see _reject_window_for_write.
-        Always assigns a fresh instance dict (materializing it from the
-        None class default on first touch), so the class default stays
-        immutable and cannot leak state across instances.
+        Always assigns a fresh instance dict so readers cannot mutate the
+        writer's ordered snapshot while iterating it.
         """
         cutoff = time.monotonic() - constants.LB_REJECT_WINDOW_SECONDS
         current = self._reject_last_seen
@@ -2321,31 +2259,24 @@ class SkyServeLoadBalancer:
                 not all(isinstance(card, str) and card for card in compatible)):
             compatible = None
         profiles = self._reject_compatibility_by_key
-        if profiles is None:
-            profiles = {}
-            self._reject_compatibility_by_key = profiles
         if compatible:
             profiles[key] = (priority, tuple(compatible))
         else:
             profiles.pop(key, None)
-        request_aggregator = getattr(self, '_request_aggregator', None)
-        if request_aggregator is not None:
-            self._record_request_classification_once(request, rejected=True)
-            request_aggregator.add_rejection()
+        self._record_request_classification_once(request, rejected=True)
+        self._request_aggregator.add_rejection()
 
     def _clear_rejection(self, request: fastapi.Request) -> None:
         """Release stale backlog pressure once the same stable job lands."""
         key = request.headers.get(constants.LB_JOB_ID_HEADER)
         if key is not None:
             self._reject_window_for_write().pop(key, None)
-            profiles = self._reject_compatibility_by_key
-            if profiles is not None:
-                profiles.pop(key, None)
+            self._reject_compatibility_by_key.pop(key, None)
 
     def _rejected_compatibility_profiles(self) -> list[dict[str, Any]]:
         """Return the replaceable recent-rejection gauge by exact profile."""
         retained = self._prune_reject_window()
-        profiles = self._reject_compatibility_by_key or {}
+        profiles = self._reject_compatibility_by_key
         cutoff = (time.monotonic() -
                   constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
         grouped: dict[tuple[int, tuple[str, ...]], tuple[int, int]] = {}
@@ -2526,35 +2457,15 @@ class SkyServeLoadBalancer:
         Must be called while holding `_client_pool_lock`, in the same critical
         section as replica selection. No network operation is performed here.
         """
-        self._occupancy_capable = set(self._occupancy_capable or ()) | {url}
-        if url in set(self._occupancy_explicitly_disabled_urls or ()):
-            self._occupancy_disable_pending = set(
-                self._occupancy_disable_pending or ()) | {url}
+        self._occupancy_capable.add(url)
+        if url in self._occupancy_explicitly_disabled_urls:
+            self._occupancy_disable_pending.add(url)
         dispatch_generation = self._occupancy_dispatch_generation
-        if dispatch_generation is None:
-            dispatch_generation = {}
-            self._occupancy_dispatch_generation = dispatch_generation
-        sample_generation = self._occupancy_sample_generation
-        if sample_generation is None:
-            sample_generation = {}
-            self._occupancy_sample_generation = sample_generation
-        replica_occupancy = getattr(self, '_replica_occupancy', {}) or {}
-        if not sample_generation and replica_occupancy:
-            sample_generation.update({
-                sampled_url: dispatch_generation.get(sampled_url, 0)
-                for sampled_url in replica_occupancy
-            })
         dispatch_generation[url] = dispatch_generation.get(url, 0) + 1
 
         pending = self._occupancy_pending_reservations
-        if pending is None:
-            pending = {}
-            self._occupancy_pending_reservations = pending
         pending[url] = pending.get(url, 0) + 1
         active = self._occupancy_active_attempts
-        if active is None:
-            active = {}
-            self._occupancy_active_attempts = active
         active[url] = active.get(url, 0) + 1
 
         # Transfer the fleet-wide queue reservation to this concrete URL. The
@@ -2600,15 +2511,9 @@ class SkyServeLoadBalancer:
             before_free = self._effective_free_slots_for_replica_locked(
                 url) or 0
             dispatch_generation = self._occupancy_dispatch_generation
-            if dispatch_generation is None:
-                dispatch_generation = {}
-                self._occupancy_dispatch_generation = dispatch_generation
             dispatch_generation[url] = dispatch_generation.get(url, 0) + 1
 
             active = self._occupancy_active_attempts
-            if active is None:
-                active = {}
-                self._occupancy_active_attempts = active
             active_count = active.get(url, 0)
             if active_count <= 1:
                 active.pop(url, None)
@@ -2618,9 +2523,6 @@ class SkyServeLoadBalancer:
             rejected, invalidate_capacity = self._async_attempt_rejection(
                 outcome)
             pending = self._occupancy_pending_reservations
-            if pending is None:
-                pending = {}
-                self._occupancy_pending_reservations = pending
             if rejected:
                 pending_count = pending.get(url, 0)
                 if pending_count <= 1:
@@ -2637,22 +2539,15 @@ class SkyServeLoadBalancer:
                     # cleanup.
                     self._record_unassigned_occupancy_admission_locked(request)
                 if invalidate_capacity:
-                    replica_free_slots = getattr(self, '_replica_free_slots',
-                                                 None)
-                    if replica_free_slots is not None:
-                        replica_free_slots.pop(url, None)
-                elif (
-                        url not in active and url not in pending and
-                    (url in (getattr(self, '_replica_occupancy', {}) or {}) or
-                     url in (getattr(self, '_replica_free_slots', {}) or {}))):
+                    self._replica_free_slots.pop(url, None)
+                elif (url not in active and url not in pending and
+                      (url in self._replica_occupancy or
+                       url in self._replica_free_slots)):
                     # A local/non-capacity rejection cannot have changed
                     # replica occupancy. Revalidate the retained baseline at
                     # the new trailing generation once no other attempt is
                     # crossing it.
                     sample_generation = self._occupancy_sample_generation
-                    if sample_generation is None:
-                        sample_generation = {}
-                        self._occupancy_sample_generation = sample_generation
                     sample_generation[url] = dispatch_generation[url]
 
             self._publish_replica_occupancy_locked(url)
@@ -2702,18 +2597,12 @@ class SkyServeLoadBalancer:
         """
         cutoff = now - constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS
         jobs = self._offered_arrivals_by_job
-        if jobs is None:
-            jobs = {}
-            self._offered_arrivals_by_job = jobs
         while jobs:
             key = next(iter(jobs))
             if jobs[key] > cutoff:
                 break
             del jobs[key]
         headerless = self._headerless_offered_arrivals
-        if headerless is None:
-            headerless = collections.deque()
-            self._headerless_offered_arrivals = headerless
         while headerless and headerless[0] <= cutoff:
             headerless.popleft()
         saturated_until = self._offered_arrival_saturated_until
@@ -2727,14 +2616,11 @@ class SkyServeLoadBalancer:
     ) -> tuple[dict[str, float], collections.deque[float]]:
         current = time.monotonic() if now is None else now
         cutoff = current - constants.LB_OFFERED_ARRIVAL_WINDOW_SECONDS
-        jobs = self._offered_arrivals_by_job or {}
+        jobs = self._offered_arrivals_by_job
         self._offered_arrivals_by_job = {
             key: seen for key, seen in jobs.items() if seen > cutoff
         }
         headerless = self._headerless_offered_arrivals
-        if headerless is None:
-            headerless = collections.deque()
-            self._headerless_offered_arrivals = headerless
         while headerless and headerless[0] <= cutoff:
             headerless.popleft()
         saturated_until = self._offered_arrival_saturated_until
@@ -2851,8 +2737,7 @@ class SkyServeLoadBalancer:
             }
             materialized_slots = (sum(planned_logical_capacity.values())
                                   if logical_replicas else ready_replicas)
-            total_slots_by_url = getattr(self, '_replica_total_slots',
-                                         None) or {}
+            total_slots_by_url = self._replica_total_slots
             # [boltz fork] Occupancy aggregates, over probed AND ready
             # replicas only: a probe entry for a since-pruned replica must
             # not count, and an unprobed replica contributes no free slot
@@ -2868,8 +2753,7 @@ class SkyServeLoadBalancer:
             probed_backend_count = len(probed)
             usable_sample_times = {
                 url: sampled_at
-                for url, sampled_at in
-                (getattr(self, '_occupancy_sample_time', None) or {}).items()
+                for url, sampled_at in self._occupancy_sample_time.items()
                 if url in probed
             }
             oldest_usable_sample_age: float | None = None
@@ -2896,8 +2780,8 @@ class SkyServeLoadBalancer:
                     planned_capacity_by_url[url] > 0)
             else:
                 total_slots = sum(total_slots_by_url[url] for url in probed)
-            observed_occupancy = getattr(self, '_replica_occupancy', {}) or {}
-            pending_reservations = self._occupancy_pending_reservations or {}
+            observed_occupancy = self._replica_occupancy
+            pending_reservations = self._occupancy_pending_reservations
             # Reported work is meaningful only for the probed set, while an
             # accepted post-probe reservation remains real work even if the
             # next probe misses and its capacity baseline fails closed.
@@ -3007,7 +2891,7 @@ class SkyServeLoadBalancer:
             max_capacity = (max(max_replicas, current_capacity)
                             if max_replicas is not None and
                             max_capacity_is_usable else None)
-        role = getattr(self, '_lb_role', lb_ha.LbRole.ACTIVE)
+        role = self._lb_role
         if role not in (lb_ha.LbRole.ARMED, lb_ha.LbRole.ACTIVE):
             # Direct Pod access is unsupported, but fail closed even if a
             # caller bypasses the stable Service selector.
@@ -3017,15 +2901,15 @@ class SkyServeLoadBalancer:
             max_replicas = 0
             request_queue_capacity = 0
             request_queue_dispatch_limit = 0
-        slot: lb_ha.LbSlot | None = getattr(self, '_lb_slot', None)
+        slot = self._lb_slot
         return fastapi.responses.JSONResponse({
             'lb_role': role.value,
-            'lb_role_generation': getattr(self, '_lb_role_generation', 0),
+            'lb_role_generation': self._lb_role_generation,
             'lb_slot': slot.value if slot is not None else None,
             'lb_pod_uid': os.environ.get(constants.LB_POD_UID_ENV_VAR),
             'lb_image_digest': os.environ.get(constants.LB_IMAGE_DIGEST_ENV_VAR
                                              ),
-            'lb_ha_rollout': getattr(self, '_lb_ha_rollout_evidence', None),
+            'lb_ha_rollout': self._lb_ha_rollout_evidence,
             'replica_unit': replica_unit,
             'ready_replicas': ready_replicas,
             'in_flight': in_flight,
@@ -3217,11 +3101,7 @@ class SkyServeLoadBalancer:
 
     async def _probe_replica_occupancy_once(self) -> None:
         """Serialize ordinary and HA-promotion occupancy probe rounds."""
-        probe_lock = getattr(self, '_occupancy_probe_lock', None)
-        if probe_lock is None:
-            probe_lock = asyncio.Lock()
-            self._occupancy_probe_lock = probe_lock
-        async with probe_lock:
+        async with self._occupancy_probe_lock:
             await self._probe_replica_occupancy_once_unlocked()
 
     async def _probe_replica_occupancy_once_unlocked(self) -> None:
@@ -3240,11 +3120,11 @@ class SkyServeLoadBalancer:
             ready_urls = list(self._routable_ready_urls_locked())
             probe_urls = list(
                 set(ready_urls) | {
-                    url for url in (self._occupancy_capable or set())
+                    url for url in self._occupancy_capable
                     if self._system_recovery_route_is_available_locked(url)
                 })
             probe_generation = {
-                url: (self._occupancy_dispatch_generation or {}).get(url, 0)
+                url: self._occupancy_dispatch_generation.get(url, 0)
                 for url in probe_urls
             }
             probe_role_epoch = self._occupancy_role_epoch
@@ -3315,8 +3195,8 @@ class SkyServeLoadBalancer:
             url: slots for url, slots in free_slots.items() if url in ready_set
         }
         with self._client_pool_lock:
-            current_generation = self._occupancy_dispatch_generation or {}
-            active_attempts = self._occupancy_active_attempts or {}
+            current_generation = self._occupancy_dispatch_generation
+            active_attempts = self._occupancy_active_attempts
             valid_sample_urls = {
                 url for url in occupancy
                 if probe_generation.get(url, 0) == current_generation.get(
@@ -3330,13 +3210,12 @@ class SkyServeLoadBalancer:
             # conservative while preserving the other slots. A probe miss
             # retains that baseline only through the bounded per-URL TTL.
             merged_occupancy = dict(self._replica_occupancy)
-            merged_total_slots = dict(self._replica_total_slots or {})
+            merged_total_slots = dict(self._replica_total_slots)
             merged_free_slots = dict(self._replica_free_slots)
-            merged_sample_generation = dict(self._occupancy_sample_generation or
-                                            {})
-            merged_sample_time = dict(self._occupancy_sample_time or {})
-            merged_sample_roles = dict(self._occupancy_sample_role_epoch or {})
-            pending = dict(self._occupancy_pending_reservations or {})
+            merged_sample_generation = dict(self._occupancy_sample_generation)
+            merged_sample_time = dict(self._occupancy_sample_time)
+            merged_sample_roles = dict(self._occupancy_sample_role_epoch)
+            pending = dict(self._occupancy_pending_reservations)
             missed_urls = set(probe_urls) - set(occupancy)
             now = time.monotonic()
             for url in missed_urls:
@@ -3402,16 +3281,15 @@ class SkyServeLoadBalancer:
             # envelope's explicit zero, which would let the drain paths
             # kill it mid-job (see _in_flight_with_draining). Pruned to
             # urls still relevant so the set stays bounded to the fleet.
-            explicitly_disabled = set(
-                self._occupancy_explicitly_disabled_urls or ())
+            explicitly_disabled = set(self._occupancy_explicitly_disabled_urls)
             positive_disabled = {
                 url for url in explicitly_disabled if occupancy.get(url, 0) > 0
             }
-            capable = ((self._occupancy_capable or set()) |
+            capable = (self._occupancy_capable |
                        (set(occupancy) - explicitly_disabled) |
                        positive_disabled)
-            disable_pending = (set(self._occupancy_disable_pending or
-                                   ()) | positive_disabled)
+            disable_pending = (set(self._occupancy_disable_pending) |
+                               positive_disabled)
             disable_ready = {
                 url for url in disable_pending
                 if url in valid_sample_urls and occupancy.get(url) == 0
@@ -3427,7 +3305,7 @@ class SkyServeLoadBalancer:
             # drain stays bounded by its own deadline regardless.
             now = time.monotonic()
             confirmed = set(ready_urls) | set(occupancy)
-            off_ready_since = dict(self._occupancy_off_ready_since or {})
+            off_ready_since = dict(self._occupancy_off_ready_since)
             for url in capable:
                 if url in confirmed:
                     off_ready_since.pop(url, None)
@@ -3438,7 +3316,7 @@ class SkyServeLoadBalancer:
                 if (now - off_ready_since.get(url, now) <=
                     constants.LB_OFF_READY_OCCUPANCY_RETENTION_SECONDS)
             }
-            keep = (confirmed | set(self._draining_clients or {}) | retained)
+            keep = (confirmed | set(self._draining_clients) | retained)
             self._replica_occupancy = {
                 url: count
                 for url, count in self._replica_occupancy.items()
@@ -3456,8 +3334,7 @@ class SkyServeLoadBalancer:
             }
             self._occupancy_capable = {url for url in capable if url in keep}
             self._occupancy_declared_urls = {
-                url for url in (self._occupancy_declared_urls or set())
-                if url in keep
+                url for url in self._occupancy_declared_urls if url in keep
             }
             self._occupancy_disable_pending = {
                 url for url in disable_pending if url in keep
@@ -3466,42 +3343,34 @@ class SkyServeLoadBalancer:
                 url for url in explicitly_disabled if url in keep
             }
             self._occupancy_dispatch_generation = {
-                url: generation
-                for url, generation in (
-                    self._occupancy_dispatch_generation or {}).items()
-                if url in keep
+                url: generation for url, generation in
+                self._occupancy_dispatch_generation.items() if url in keep
             }
             self._occupancy_sample_generation = {
-                url: generation
-                for url, generation in (
-                    self._occupancy_sample_generation or {}).items()
-                if url in keep
+                url: generation for url, generation in
+                self._occupancy_sample_generation.items() if url in keep
             }
             self._occupancy_sample_time = {
-                url: sampled_at for url, sampled_at in (
-                    self._occupancy_sample_time or {}).items() if url in keep
+                url: sampled_at
+                for url, sampled_at in self._occupancy_sample_time.items()
+                if url in keep
             }
             self._occupancy_current_round_sampled_urls = {
-                url
-                for url in (self._occupancy_current_round_sampled_urls or set())
+                url for url in self._occupancy_current_round_sampled_urls
                 if url in keep
             }
             self._occupancy_sample_role_epoch = {
-                url: generation
-                for url, generation in (
-                    self._occupancy_sample_role_epoch or {}).items()
-                if url in keep
+                url: generation for url, generation in
+                self._occupancy_sample_role_epoch.items() if url in keep
             }
             self._occupancy_pending_reservations = {
                 url: count
-                for url, count in (
-                    self._occupancy_pending_reservations or {}).items()
+                for url, count in self._occupancy_pending_reservations.items()
                 if url in keep and count > 0
             }
             self._occupancy_active_attempts = {
                 url: count
-                for url, count in (
-                    self._occupancy_active_attempts or {}).items()
+                for url, count in self._occupancy_active_attempts.items()
                 if url in keep and count > 0
             }
             self._occupancy_off_ready_since = {
@@ -3578,14 +3447,12 @@ class SkyServeLoadBalancer:
             sampled_set = set(occupancy_sampled_urls)
             total_slots_by_url = {
                 url: int(slots)
-                for url, slots in (self._replica_total_slots or {}).items()
+                for url, slots in self._replica_total_slots.items()
                 if url in sampled_set
             }
             occupancy_sample_generation = {
-                url: int(generation)
-                for url, generation in (
-                    self._occupancy_sample_generation or {}).items()
-                if url in sampled_set
+                url: int(generation) for url, generation in
+                self._occupancy_sample_generation.items() if url in sampled_set
             }
         session_id = self._get_lb_session_id()
         async with aiohttp.ClientSession() as session:
@@ -3622,7 +3489,7 @@ class SkyServeLoadBalancer:
                 'occupancy_sampled_urls': occupancy_sampled_urls,
                 'total_slots_by_url': total_slots_by_url,
                 'occupancy_sample_generation': occupancy_sample_generation,
-                'draining_urls': list(self._draining_clients or {}),
+                'draining_urls': list(self._draining_clients),
                 'lb_session_id': session_id,
                 'queue_depth': self._queue_depth,
                 'queued_requests_by_compatibility':
@@ -3778,34 +3645,31 @@ class SkyServeLoadBalancer:
                         'false' and url not in invalid_marker_urls
                     }
                     self._occupancy_declared_urls = (
-                        set(self._occupancy_declared_urls or
-                            ()) - explicitly_sync_urls | declared_async_urls)
+                        self._occupancy_declared_urls - explicitly_sync_urls |
+                        declared_async_urls)
                     previously_disabled = set(
-                        self._occupancy_explicitly_disabled_urls or ())
+                        self._occupancy_explicitly_disabled_urls)
                     newly_disabled = explicitly_sync_urls - previously_disabled
                     self._occupancy_explicitly_disabled_urls = (
                         previously_disabled |
                         explicitly_sync_urls) - declared_async_urls
                     disable_with_possible_work = {
                         url for url in explicitly_sync_urls
-                        if (url in set(self._occupancy_capable or ()) or
+                        if (url in self._occupancy_capable or
                             self._replica_occupancy.get(url, 0) > 0)
                     } | newly_disabled
-                    self._occupancy_disable_pending = (set(
-                        self._occupancy_disable_pending or
-                        ()) | disable_with_possible_work) - declared_async_urls
+                    self._occupancy_disable_pending = (
+                        self._occupancy_disable_pending |
+                        disable_with_possible_work) - declared_async_urls
                     # A cold LB that first learns the replica after a
                     # service-only true->false version bump has no local
                     # evidence of the old async work. Treat the transition as
                     # capable until its first generation-valid zero; a miss is
                     # unknown and remains bounded by the retention/drain TTLs.
                     if newly_disabled:
-                        self._occupancy_capable = set(self._occupancy_capable or
-                                                      ()) | newly_disabled
+                        self._occupancy_capable |= newly_disabled
                     if declared_async_urls:
-                        self._occupancy_capable = (
-                            set(self._occupancy_capable or
-                                ()) | declared_async_urls)
+                        self._occupancy_capable |= declared_async_urls
                     # Keep quarantined (locally-evicted) replicas out of
                     # routing even if the controller still lists them as
                     # ready, until their TTL expires -- otherwise a dead
@@ -3866,8 +3730,7 @@ class SkyServeLoadBalancer:
                     for replica_url in urls_to_close:
                         client_to_close.append(
                             (replica_url, self._client_pool.pop(replica_url)))
-                        if self._client_pool_generations is not None:
-                            self._client_pool_generations.pop(replica_url, None)
+                        self._client_pool_generations.pop(replica_url, None)
                 for replica_url, client in client_to_close:
                     # Fire-and-forget: a drain can legitimately take as long
                     # as the longest in-flight prediction; the sync loop must
@@ -3876,8 +3739,6 @@ class SkyServeLoadBalancer:
                     # Registered in _draining_clients first so the demand
                     # feed keeps attributing the still-running work to the
                     # pruned url (see _in_flight_with_draining).
-                    if self._draining_clients is None:
-                        self._draining_clients = {}
                     self._draining_clients.setdefault(replica_url,
                                                       []).append(client)
                     task = asyncio.create_task(
@@ -3996,12 +3857,11 @@ class SkyServeLoadBalancer:
             # Deregister from the demand feed: the drained client's work
             # is finished (or force-closed) and must stop counting as
             # in-flight for this url.
-            clients = (self._draining_clients or {}).get(url)
+            clients = self._draining_clients.get(url)
             if clients is not None:
                 with contextlib.suppress(ValueError):
                     clients.remove(client)
                 if not clients:
-                    assert self._draining_clients is not None
                     del self._draining_clients[url]
 
     async def _sync_with_controller(self):
@@ -4050,13 +3910,7 @@ class SkyServeLoadBalancer:
 
     async def _sync_system_recovery_route_lease_once(self) -> bool:
         """Fetch and apply one authenticated bounded route-lease heartbeat."""
-        heartbeat_lock = getattr(self,
-                                 '_system_recovery_route_lease_heartbeat_lock',
-                                 None)
-        if heartbeat_lock is None:
-            heartbeat_lock = asyncio.Lock()
-            self._system_recovery_route_lease_heartbeat_lock = heartbeat_lock
-        async with heartbeat_lock:
+        async with self._system_recovery_route_lease_heartbeat_lock:
             with self._client_pool_lock:
                 sequence, request_started_at, marker_snapshot = (
                     self._begin_system_recovery_route_lease_heartbeat_locked())
@@ -4149,7 +4003,7 @@ class SkyServeLoadBalancer:
                 unknown_urls = sorted(set(unknown_urls) | set(routing_urls))
             else:
                 http_in_flight = dict(http_in_flight)
-            for url, clients in (self._draining_clients or {}).items():
+            for url, clients in self._draining_clients.items():
                 count = sum(
                     getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
                 if count > 0:
@@ -4161,19 +4015,16 @@ class SkyServeLoadBalancer:
                 if url in sampled_set
             }
             sample_generations = {
-                url: int(generation)
-                for url, generation in (
-                    self._occupancy_sample_generation or {}).items()
-                if url in sampled_set
+                url: int(generation) for url, generation in
+                self._occupancy_sample_generation.items() if url in sampled_set
             }
             now = time.monotonic()
             sample_ages = {
                 url: max(0.0, now - sampled_at)
-                for url, sampled_at in (
-                    self._occupancy_sample_time or {}).items()
+                for url, sampled_at in self._occupancy_sample_time.items()
                 if url in sampled_set
             }
-        # Fail closed if an old/partial object has generation evidence but no
+        # Fail closed if a live observation has generation evidence but no
         # per-url sample timestamp. The controller rejects unequal key sets.
         reported_urls = (set(async_occupancy) | set(sample_generations) |
                          set(sample_ages))
@@ -4207,7 +4058,7 @@ class SkyServeLoadBalancer:
             'occupancy_sample_age_seconds': sample_ages,
             'routing_urls': routing_urls,
             'unknown_in_flight_urls': unknown_urls,
-            'draining_urls': list(self._draining_clients or {}),
+            'draining_urls': list(self._draining_clients),
         }
 
     async def _sync_role_with_controller_once(self) -> None:
@@ -4630,7 +4481,7 @@ class SkyServeLoadBalancer:
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:
         """Try to proxy the request to the endpoint replica with retries."""
-        if getattr(self, '_draining', False):
+        if self._draining:
             # The readiness change needs time to propagate through the
             # Kubernetes Service/ingress. Reject requests that arrive in that
             # window instead of starting new work while this Pod terminates.
@@ -4669,8 +4520,7 @@ class SkyServeLoadBalancer:
             # work without occupying a queue slot.
             if self._request_queue_config is not None:
                 await self._request_body(request)
-            legacy_demand = (not getattr(
-                self, '_queued_compatibility_demand_supported', False) or
+            legacy_demand = (not self._queued_compatibility_demand_supported or
                              self._configured_accelerators is None)
             if legacy_demand:
                 # Until capability negotiation succeeds, retain the old
@@ -4789,12 +4639,12 @@ class SkyServeLoadBalancer:
             track_async_attempt = False
             if async_occupancy_request is None:
                 with self._client_pool_lock:
-                    if getattr(self, '_draining', False):
+                    if self._draining:
                         raise self._draining_request_error()
                     if not self._accepts_new_requests():
                         raise self._inactive_role_request_error()
                     queue_tracks_occupancy = self._queue_uses_async_occupancy()
-                    declared_urls = set(self._occupancy_declared_urls or ())
+                    declared_urls = set(self._occupancy_declared_urls)
                     routable_urls = self._routable_ready_urls_locked()
                     needs_async_inference = bool(
                         not queue_tracks_occupancy and
@@ -4810,7 +4660,7 @@ class SkyServeLoadBalancer:
                 # Every attempt owns a fresh role/drain fence.  An admitted
                 # handler cannot select a replacement replica after this LB
                 # begins draining or loses its serving role during backoff.
-                if getattr(self, '_draining', False):
+                if self._draining:
                     raise self._draining_request_error()
                 if not self._accepts_new_requests():
                     raise self._inactive_role_request_error()
@@ -4838,8 +4688,8 @@ class SkyServeLoadBalancer:
                                        set(compatible_accelerators))
                     compatible_urls = {
                         url for url in ready_urls
-                        if (self._replica_info_by_url or {}
-                           ).get(url, {}).get('gpu_type') in requested_cards
+                        if self._replica_info_by_url.get(url, {}).get(
+                            'gpu_type') in requested_cards
                     }
                     # A queue grant is a best-effort reservation against one
                     # current card. If that exact ready set changed before
@@ -4848,8 +4698,8 @@ class SkyServeLoadBalancer:
                     if granted_accelerator is not None and not compatible_urls:
                         compatible_urls = {
                             url for url in ready_urls
-                            if (self._replica_info_by_url or {}).get(url, {}).
-                            get('gpu_type') in set(compatible_accelerators)
+                            if self._replica_info_by_url.get(url, {}).get(
+                                'gpu_type') in set(compatible_accelerators)
                         }
                     eligible_urls = (compatible_urls if eligible_urls is None
                                      else eligible_urls & compatible_urls)
@@ -4872,8 +4722,8 @@ class SkyServeLoadBalancer:
                     selected = self._capture_selected_replica_locked(
                         ready_replica_url, require_current_route=True)
                     vars(request)[_SELECTED_REPLICA_ATTR] = selected
-                    occupancy_declared = ready_replica_url in set(
-                        self._occupancy_declared_urls or ())
+                    occupancy_declared = (ready_replica_url
+                                          in self._occupancy_declared_urls)
                     track_async_attempt = bool(queue_tracks_occupancy or
                                                occupancy_declared or
                                                async_occupancy_request)

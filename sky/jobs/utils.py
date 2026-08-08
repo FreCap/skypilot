@@ -47,6 +47,7 @@ from sky.utils import context_utils
 from sky.utils import controller_utils
 from sky.utils import debug_dump_helpers
 from sky.utils import message_utils
+from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 
@@ -435,11 +436,9 @@ async def get_job_status(
         transient_error_reason: None if successful or fatal error; otherwise,
             the detailed reason for the transient error.
     """
-    # TODO(zhwu, cooperc): Make this get job status aware of cluster status, so
-    # that it can exit retry early if the cluster is down.
     # TODO(luca) make this async
-    handle = await asyncio.to_thread(
-        global_user_state.get_handle_from_cluster_name, cluster_name)
+    handle, cluster_status = await asyncio.to_thread(
+        global_user_state.get_cluster_handle_status_from_name, cluster_name)
 
     def _log_job_status(status: Optional['job_lib.JobStatus']) -> None:
         if status is None:
@@ -450,6 +449,17 @@ async def get_job_status(
 
     logger.info('=== Checking the job status... ===')
 
+    if handle is None:
+        # This can happen if the cluster was preempted and background status
+        # refresh already noticed and cleaned it up.
+        logger.info(f'Cluster {cluster_name} not found.')
+        return None, None
+    if cluster_status not in (status_lib.ClusterStatus.UP,
+                              status_lib.ClusterStatus.AUTOSTOPPING):
+        logger.info(f'Cluster {cluster_name} is not UP-like '
+                    f'(status: {cluster_status.value}); skipping remote job '
+                    'status check.')
+        return None, f'Cluster is not UP-like ({cluster_status.value})'
     if managed_job_runtime.is_registered():
         result = await asyncio.to_thread(managed_job_runtime.get_job_status,
                                          handle, cluster_name)
@@ -457,12 +467,6 @@ async def get_job_status(
             status, _ = result
             _log_job_status(status)
             return result
-
-    if handle is None:
-        # This can happen if the cluster was preempted and background status
-        # refresh already noticed and cleaned it up.
-        logger.info(f'Cluster {cluster_name} not found.')
-        return None, None
     assert isinstance(handle, backends.CloudVmRayResourceHandle), handle
     job_ids = None if job_id is None else [job_id]
     try:
@@ -696,10 +700,67 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
             logger.info(f'Job {job_id} changed while terminal cleanup was in '
                         'progress; deferring DONE to the next status update.')
 
+    def _get_done_jobs_with_cluster_rows(
+            excluded_job_ids: set[int]) -> dict[int, dict[str, Any]]:
+        """Find terminal DONE jobs whose managed cluster row still exists.
+
+        DONE terminal jobs are normally excluded from status checks. Older
+        controllers could nevertheless mark cleanup-failed jobs DONE, leaving
+        a current cluster row (and its usage interval) behind permanently.
+        Modern rows carry a workload id. For legacy rows without attribution,
+        derive only a candidate id from the name and then require an exact
+        match against a cluster name generated from that job's task snapshot.
+        """
+        cluster_candidates = (
+            global_user_state.get_managed_job_cluster_cleanup_candidates())
+        cluster_names_by_job_id: dict[int, set[str]] = {}
+        for cluster_name, workload_id in cluster_candidates.items():
+            candidate_id = workload_id
+            if candidate_id is None:
+                _, separator, suffix = cluster_name.rpartition('-')
+                if not separator:
+                    continue
+                candidate_id = suffix
+            try:
+                job_id = int(candidate_id)
+            except (TypeError, ValueError):
+                continue
+            if job_id in excluded_job_ids:
+                continue
+            cluster_names_by_job_id.setdefault(job_id, set()).add(cluster_name)
+
+        candidates = managed_job_state.get_jobs_status_check_info(
+            list(cluster_names_by_job_id))
+        result = {}
+        for job_id, info in candidates.items():
+            if (info['schedule_state']
+                    != managed_job_state.ManagedJobScheduleState.DONE or
+                    info['pool'] is not None or
+                    not all(task['status'].is_terminal()
+                            for task in info['tasks'])):
+                continue
+            expected_cluster_names = {
+                cluster_name for task in info['tasks']
+                if _task_has_launch_attempt(task) for cluster_name in
+                [generate_managed_job_cluster_name(task['task_name'], job_id)]
+                if cluster_name is not None
+            }
+            if expected_cluster_names.isdisjoint(
+                    cluster_names_by_job_id[job_id]):
+                continue
+            result[job_id] = info
+        return result
+
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
     jobs_info = managed_job_state.get_jobs_to_check_status_info(job_ids)
+    if job_ids is None:
+        # The periodic global sweep also repairs rows orphaned by older
+        # controllers that finalized the scheduler despite cleanup failure.
+        for job_id, info in _get_done_jobs_with_cluster_rows(
+                set(jobs_info)).items():
+            jobs_info.setdefault(job_id, info)
     if not jobs_info:
         # The given jobs are already terminal, or if job_ids is None, there
         # are no jobs that need to be checked.

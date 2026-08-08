@@ -55,11 +55,12 @@ apiService:
   upgradeStrategy: Recreate
   # Rolling update tuning, only applied when upgradeStrategy is RollingUpdate.
   # Defaults reproduce the previous hard-coded behavior: surge a new pod before
-  # removing an old one (zero-downtime). For deployments whose api-server pod
-  # requests most or all of a node's allocatable resources, a surge replica
-  # cannot be scheduled and the rollout stalls; set maxSurge: 0 and
-  # maxUnavailable: 1 to roll in place without surging. Values may be integers
-  # or percentage strings (e.g. "25%").
+  # removing an old one (zero-downtime). Guarded high availability requires the
+  # absolute maxSurge: 1 and zero maxUnavailable (0 or "0%"). In compatibility
+  # mode, a deployment whose api-server pod requests most or all of a node's
+  # allocatable resources can instead set maxSurge: 0 and maxUnavailable: 1 to
+  # roll in place without surging. Compatibility-mode values may be integers or
+  # percentage strings (e.g. "25%").
   # @schema type: [object, null]
   rollingUpdate:
     # @schema type: [integer, string]
@@ -184,12 +185,14 @@ apiService:
   # Optional secret that contains SSH keys for the API server to use, all the entries in the secret will be mounted to ~/.ssh/ directory in the API server.
   # @schema type: [string, null]
   sshKeySecret: null
-  # Metrics configuration for the API server.
+  # Metrics configuration for API-server roles. In guarded HA mode the API,
+  # executor, and controller pods each expose their own process-local
+  # multiprocess registry on this port and are discovered independently.
   # Refer to https://docs.skypilot.co/en/latest/reference/api-server/examples/api-server-metrics-setup.html for more details.
   metrics:
     # Whether to enable metrics collection, default to false. If this is enabled and the API server image does not support metrics, the deployment will fail.
     enabled: false
-    # The port to expose the metrics on, default to 9090.
+    # The port to expose metrics on in every API-server role pod, default to 9090.
     port: 9090
     # NOTE: model-serving (/endpoints-metrics) federation + dashboards are
     # gated separately by prometheus.scrapeEndpointMetrics.
@@ -354,61 +357,6 @@ controllerService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: kubernetes.io/hostname
 
-# Dedicated preflight-only authority cohorts for private Serve resource
-# actions. This surface stays dark until an immutable image has been built and
-# its separately reviewed OCI qualification artifact is packaged by the chart.
-resourceActions:
-  # @schema additionalProperties: false
-  authorityWorker:
-    # @schema type: [boolean]
-    enabled: false
-    # Immutable installation UUID used to derive database-wide cohort IDs.
-    # Never reuse or change this value while cohort or tombstone rows exist.
-    # @schema type: string; pattern: ^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
-    installationId: ""
-    # Cohort selected for new preparation references.  Existing DRAINING
-    # cohorts remain listed until all of their frozen work is released.
-    # @schema type: string; maxLength: 42
-    activeCohort: ""
-    # Each cohort requires a <=42-character DNS-label suffix, exactly two
-    # replicas, a manifest-digest-pinned image and distinct OCI config digest,
-    # one chart-packaged qualification ref, and three installed-package refs.
-    # @schema type: array; item: object
-    # @schema itemProperties: {"id":{"type":"string","minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"},"replicas":{"type":"integer","const":2},"image":{"type":"string","minLength":1,"pattern":"^.+@sha256:[0-9a-f]{64}$"},"imagePullPolicy":{"type":"string","const":"Always"},"ociConfigDigest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"qualificationArtifact":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","minLength":1,"maxLength":253,"pattern":"^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"},"byteSize":{"type":"integer","minimum":1,"maximum":65536},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"podTemplateContract":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_provider_preflight.py"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"artifactInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"callableInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
-    # @schema allOf: [{"type":"array","items":{"properties":{"id":{},"replicas":{},"image":{},"imagePullPolicy":{},"ociConfigDigest":{},"qualificationArtifact":{},"podTemplateContract":{},"artifactInventory":{},"callableInventory":{}},"additionalProperties":false,"required":["id","replicas","image","imagePullPolicy","ociConfigDigest","qualificationArtifact","podTemplateContract","artifactInventory","callableInventory"]}}]
-    cohorts: []
-    # Cohort IDs whose removed Deployment/ServiceAccount names remain visible
-    # to the surviving API retirement verifier.  After the last cohort is
-    # removed, keep enabled=true, activeCohort="", cohorts=[], and at least one
-    # tombstone until every matching central row is RETIRED.
-    # @schema type: array; item: string; uniqueItems: true
-    # @schema allOf: [{"type":"array","items":{"minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"}}]
-    retirementTombstones: []
-    # @schema type: [integer]; minimum: 1; maximum: 65535
-    healthPort: 46581
-    # The future authenticated preflight endpoint.  The routing slice exposes
-    # no mutation service and does not treat this Service as activation proof.
-    # @schema type: [integer]; minimum: 1; maximum: 65535; const: 46583
-    preflightPort: 46583
-    # @schema additionalProperties: false
-    auth:
-      # This purpose-only Secret/key must differ from every external-LB auth
-      # Secret/key. The controller also rejects equal mounted token bytes.
-      # @schema type: string
-      existingSecret: ""
-      # @schema type: string
-      key: tokens
-    # @schema additionalProperties: false
-    tls:
-      # @schema type: string
-      existingSecret: ""
-      # @schema type: string
-      certKey: tls.crt
-      # @schema type: string
-      privateKeyKey: tls.key
-      # @schema type: string
-      caKey: ca.crt
-
 # Environment and files required by every central PostgreSQL client. Use these
 # for private CA bundles, client certificates, or shared libpq settings instead
 # of apiService.extra* so the migration Job and managed image workers receive
@@ -427,6 +375,12 @@ databaseConnection:
 requestStore:
   # @schema enum: [sqlite, postgres]; required: true
   backend: sqlite
+  # Opt into exact built-in PostgreSQL storage/queue enforcement in every
+  # request process before activating multi-pool reserved-capacity fill.
+  # This remains optional so --reuse-values upgrades from older chart
+  # revisions safely render the compatibility default.
+  # @schema type: boolean
+  enforceBuiltinExecutionQuiescenceBackends: false
   # Shared maintenance gate used by the one-way SQLite cutover command.
   # @schema type: string; minLength: 1; required: true
   cutoverGatePath: /root/.sky/api-request-cutover.json
@@ -435,10 +389,8 @@ requestStore:
 # API replicas verify the resulting revision and never execute deployment DDL.
 # A PostgreSQL request store backed by a pre-existing
 # apiService.dbConnectionSecretName runs the Job as a blocking pre-install and
-# pre-upgrade hook, including after HA and authority-worker values are cleared.
-# That hook validates the proposed authority release inventory before Helm
-# mutates workloads. Compatibility mode keeps a regular Job so a chart-managed
-# dbConnectionString Secret can be created first.
+# pre-upgrade hook, including after HA is cleared. Compatibility mode keeps a
+# regular Job so a chart-managed dbConnectionString Secret can be created first.
 databaseMigration:
   # @schema type: [boolean]
   enabled: true
@@ -616,6 +568,13 @@ imageCanaryWorker:
 
 # SkyServe (model serving) configuration.
 serve:
+  # Operator-only control-plane fence for persisted-state maintenance. When
+  # true, the API pod rejects non-pool Serve mutations and does not start,
+  # recover, or respawn service controllers. Existing external load balancers
+  # keep their last routing view. Keep false outside a documented maintenance
+  # window; pools are intentionally unaffected.
+  # @schema type: [boolean]
+  controllerHold: false
   # Portable external load balancer support for controller-owned SkyServe LBs.
   # When enabled, each service's LB runs in its own Deployment and syncs through
   # a route implemented on every API pod. The shared api-server Service is the
@@ -629,6 +588,12 @@ serve:
     # and verify no skypilot-serve-lb labeled Deployment or Service remains in
     # the Helm release namespace.
     enabled: false
+    # Exact PriorityClass assigned to every controller-generated external-LB
+    # Pod. Empty preserves the historical behavior. Guarded installations
+    # should use a dedicated immutable class whose admission and quota policy
+    # binds the LB workload identity and resource profile.
+    # @schema type: string; maxLength: 253; pattern: ^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
+    priorityClassName: ""
     # Resources for each per-service LB container. Explicit requests keep LBs
     # out of the BestEffort QoS class and make fleet-scale scheduling visible.
     # Set this to null to omit resource requests and limits.
@@ -771,6 +736,15 @@ storage:
   # - storage.enabled=false: Supported - but file mounts and logs will be lost on pod restart. Consider configuring
   #   'jobs.bucket' in the SkyPilot config to use cloud storage for file mounts.
   enabled: true
+  # Mount a pre-existing PersistentVolumeClaim instead of creating the
+  # release-owned <fullname>-state claim. This is useful when storage is
+  # provisioned independently or when migrating an existing release to a new
+  # volume without deleting the legacy claim. The referenced claim must exist
+  # in the release namespace before Helm rolls any pod. storage.accessMode
+  # remains the operator's declared capability and must be ReadWriteMany in HA
+  # mode; the chart cannot inspect the referenced claim at render time.
+  # @schema type: string
+  existingClaim: ""
   # Storage class name - leave empty to use cluster default
   # For RWX storage with RollingUpdate, use a storage class that supports ReadWriteMany access mode:
   # - GKE: Create a Filestore-backed storage class (https://cloud.google.com/filestore/docs/accessing-fileshares)
@@ -949,7 +923,10 @@ rbac:
     - apiGroups: [""]
       resources: ["persistentvolumeclaims"]
       verbs: ["*"]
-  # Cluster-scoped rules for API server.
+  # Configurable cluster-scoped rules for API server. The template also adds
+  # exact get access to the kube-system Namespace for reserved-fill physical
+  # cluster identity; keeping that required rule outside this list makes it
+  # survive upgrades that reuse values from a pre-feature release.
   clusterRules:
     # Required for getting node resources.
     - apiGroups: [ "" ]
@@ -1131,11 +1108,21 @@ prometheus:
     retentionSize: "43GB"
   # Configure additional scrape configs using extraScrapeConfigs
   extraScrapeConfigs: |
-    # Static scrape target for SkyPilot API server GPU metrics
+    # Discover the API Service's named metrics port so custom
+    # apiService.metrics.port values remain consistent.
     - job_name: 'skypilot-api-server-gpu-metrics'
-      static_configs:
-        # Use the API service created by this Helm chart
-        - targets: ['{{ include "skypilot.fullname" . }}-api-service.{{ .Release.Namespace }}.svc.cluster.local:9090']
+      kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - '{{ .Release.Namespace }}'
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_service_name]
+          action: keep
+          regex: '{{ include "skypilot.fullname" . }}-api-service'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: metrics
       metrics_path: '/gpu-metrics'
       scrape_interval: 60s
       scrape_timeout: 45s
@@ -1147,7 +1134,7 @@ prometheus:
         target_label: node
         replacement: $1
     {{- if .Values.scrapeEndpointMetrics }}
-    # Static scrape target for SkyPilot API server endpoint serving
+    # Service-discovered target for SkyPilot API server endpoint serving
     # metrics. The /endpoints-metrics endpoint federates the serving
     # engines' native series (vllm:* today) from every remote Kubernetes
     # context the API server can see, with a cluster=<context> label
@@ -1155,8 +1142,18 @@ prometheus:
     # filter by cluster.
     - job_name: 'skypilot-api-server-endpoints-metrics'
       honor_labels: true
-      static_configs:
-        - targets: ['{{ include "skypilot.fullname" . }}-api-service.{{ .Release.Namespace }}.svc.cluster.local:9090']
+      kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names:
+            - '{{ .Release.Namespace }}'
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_service_name]
+          action: keep
+          regex: '{{ include "skypilot.fullname" . }}-api-service'
+        - source_labels: [__meta_kubernetes_service_port_name]
+          action: keep
+          regex: metrics
       metrics_path: '/endpoints-metrics'
       scrape_interval: 60s
       scrape_timeout: 45s

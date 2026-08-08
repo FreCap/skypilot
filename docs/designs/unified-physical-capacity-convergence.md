@@ -2,12 +2,13 @@
 
 Status: C1 foundation implemented, verified, and retained; C2.1 and C2.2 are
 historical-complete; C2.3 was cancelled without activation and C2.4 will not
-run; the C2-only evidence scanner is retired and its exact cleanup is locally
-implemented and verified, with merge and deployment pending; no payoff gate
+run; the C2-only evidence scanner is retired and its exact cleanup normally
+merged in PR #1107 at `1edab50b5201da05544a5acd895044eddad25071`
+(tag `v1.1.1053`), with the disabled deployment verification still pending; no payoff gate
 was satisfied, and every materialized or authoritative capacity product remains
 unauthorized
 
-Last updated: 2026-08-02
+Last updated: 2026-08-03
 
 Canonical owner: this file. Rejected materialized/active-control drafts remain
 recoverable from branch history and the review record; they are not a second
@@ -72,6 +73,32 @@ exactly `disabled` before any cleanup Pod starts; a stale `shadow` value is an
 explicit startup and rollout blocker rather than silently accepted inert
 configuration.
 
+### Forward-only continuation after retirement
+
+Retirement is not a rollback target and does not restore the scanner. Keep
+capacity001 and its five empty additive tables while the C2 runtime remains
+absent. The proposed Serve M4/M5a authority continuation was never activated
+and is now also retired; it supplied no evidence for the capacity hypothesis.
+
+The only surviving Serve issue is localized ordinary-launch API request
+binding across controller restart. Its bounded design explicitly reuses the
+ordinary request executor and does not introduce a shared capacity projector,
+reservation/occupancy ledger, provider renderer, or mutation authority.
+
+No capacity runtime may return without a newly accepted design based on
+30--60 days of production evidence across at least two domains. That design
+must name one read-only consumer and specify exact materialized schema,
+ownership, freshness, absence, rollout, compatible-binary recovery, and value
+gates. Mutation or admission authority cannot follow automatically from read
+convergence.
+
+The archived universal B0--B8 graph is rejected, not deployed state. The
+forward path adds no universal lifecycle DAG, API008 capacity plane,
+lifecycle002 coordinator, coupled multi-schema migration transaction, shared
+mutation scheduler, or per-decision fallback. Any later proposal must preserve
+separate domain desired-state owners and prove one read-only consumer before it
+can ask for mutation or admission authority.
+
 ## Why convergence could pay off
 
 If production evidence clears a gate, the likely restructuring is a narrow
@@ -83,21 +110,25 @@ Jobs  ─┼─ owner adapters ─ physical-generation identity
 Pools ─┘                         │
                  ┌───────────────┼────────────────┐
           observation cache  action journal  occupancy ledger
+             (separately gated products; none authorized by Step 3)
 ```
 
 - A shared observation cache could deduplicate provider reads and give all
   owners one freshness/certainty model.
 - An action journal could make stop/down/retry idempotent across controller
   crashes and record which owner authorized each effect.
-- An occupancy ledger could make pool-worker assignment transactional instead
-  of inferred from mutable links.
+- A future occupancy ledger could make pool-worker assignment transactional
+  instead of inferred from mutable links, but it is not part of the accepted
+  read-only projection sequence and requires its own mutation-authority design.
 - Exact pre-effect physical identity could prevent a stale owner from acting
   on a same-name successor.
 
 Those benefits do not require one component to own Serve, jobs, and pools.
 Each workload remains the source of logical desired state. Shared code would
 own only physical-generation identity, observation, action durability, or
-occupancy, with an explicit contract between those layers.
+occupancy, with an explicit contract between those layers. The next bounded
+projection may materialize immutable read observations; it does not own a
+mutable current-occupancy balance or authorize admission from that projection.
 
 ## Payoff hypothesis and go/no-go gates
 
@@ -1533,10 +1564,12 @@ each rebase. The prior rebase's broader local evidence was:
 On the 2026-08-02 refresh, the retained capacity model/state and migration
 test set passed with `SKYPILOT_CONFIG=/dev/null`; `git diff --check` passed;
 and the repository formatter completed YAPF, mypy, pylint, dashboard lint, and
-Prettier. CI must qualify the refreshed PR head before merge.
+Prettier. PR #1107 subsequently normally merged that cleanup as
+`1edab50b5201da05544a5acd895044eddad25071`; this record does not yet contain
+its exact disabled staged-deployment evidence.
 
 This is implementation evidence only. It does not claim that the cleanup image
-has been merged or deployed; the retirement rollout checks above remain open.
+has been built or deployed; the retirement rollout checks above remain open.
 
 Before retirement, automated tests covered:
 
@@ -1606,9 +1639,11 @@ Cancelled C2.3 manual activation plan (not executed):
   existed. Its canary and restart/handoff test will not run.
 - C2.4 not run: no measurement manifest or 30-day comparison window was
   frozen, and no gate decision can claim production evidence.
-- C2 cleanup implemented locally: the exact ledger is removed and retained C1
-  tests pass. Merge and the disabled staged rollout remain pending; deployment
-  must add no schema/data deletion and must record exact live evidence here.
+- C2 cleanup normally merged in PR #1107 at
+  `1edab50b5201da05544a5acd895044eddad25071` (tag `v1.1.1053`): the exact
+  ledger is removed and retained C1 tests pass. The disabled staged rollout
+  remains pending; deployment must add no schema/data deletion and must record
+  exact live evidence here.
 
 The activated-pilot 14-day decision and 45-day removal clocks never started.
 The explicit no-go decision authorizes earlier cleanup without fabricating an

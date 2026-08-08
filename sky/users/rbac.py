@@ -65,6 +65,13 @@ _DEFAULT_USER_BLOCKLIST = [{
 # endpoint NOT on this list is denied for viewers, including any new
 # endpoints added in the future.
 _DEFAULT_VIEWER_ALLOWLIST = [
+    # --- Public reads ---
+    {
+        # This route is also available to unauthenticated callers. Keep an
+        # explicit viewer decision so the route inventory remains fail-closed.
+        'path': '/api/v1/public/capacity',
+        'method': 'GET'
+    },
     # --- Authentication / session ---
     {
         'path': '/users/role',
@@ -196,6 +203,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
     },
     {
         'path': '/serve/:service_name/replicas',
+        'method': 'GET'
+    },
+    {
+        'path': '/serve/:service_name/pricing',
         'method': 'GET'
     },
     {
@@ -346,6 +357,49 @@ _DEFAULT_VIEWER_ALLOWLIST = [
     },
     {
         'path': '/api/plugins',
+        'method': 'GET'
+    },
+    # --- Request lifecycle reads ---
+    # Full request results and streams remain owner-scoped in the endpoint;
+    # status and completion expose shared metadata only.
+    {
+        'path': '/api/get',
+        'method': 'GET'
+    },
+    {
+        'path': '/api/stream',
+        'method': 'GET'
+    },
+    {
+        'path': '/api/status',
+        'method': 'GET'
+    },
+    {
+        'path': '/api/status/query',
+        'method': 'POST'
+    },
+    {
+        'path': '/api/health',
+        'method': 'GET'
+    },
+    {
+        'path': '/api/health/ready',
+        'method': 'GET'
+    },
+    {
+        'path': '/api/completion/cluster_name',
+        'method': 'GET'
+    },
+    {
+        'path': '/api/completion/storage_name',
+        'method': 'GET'
+    },
+    {
+        'path': '/api/completion/volume_name',
+        'method': 'GET'
+    },
+    {
+        'path': '/api/completion/api_request',
         'method': 'GET'
     },
 ]

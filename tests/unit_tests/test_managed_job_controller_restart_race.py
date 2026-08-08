@@ -56,6 +56,15 @@ def _make_job_status_check_state(schedule_state,
     }
 
 
+def _make_done_terminal_status_check_info(task_name='job'):
+    info = _make_status_check_info()
+    info[1]['schedule_state'] = managed_job_state.ManagedJobScheduleState.DONE
+    info[1]['tasks'][0]['status'] = (
+        managed_job_state.ManagedJobStatus.FAILED_CONTROLLER)
+    info[1]['tasks'][0]['task_name'] = task_name
+    return info
+
+
 def _forbid_split_snapshot_helpers(monkeypatch):
     monkeypatch.setattr(
         managed_job_state, 'get_jobs_to_check_status', lambda *a, **k:
@@ -65,6 +74,58 @@ def _forbid_split_snapshot_helpers(monkeypatch):
         managed_job_state, 'get_jobs_status_check_info', lambda *a, **k:
         (_ for _ in ()).throw(
             AssertionError('refresh must use get_jobs_to_check_status_info')))
+
+
+def test_global_sweep_reconciles_done_terminal_legacy_cluster(monkeypatch):
+    info = _make_done_terminal_status_check_info(task_name='legacy-task')
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    monkeypatch.setattr(managed_job_state, 'get_current_controller_owner',
+                        lambda: None)
+    monkeypatch.setattr(managed_job_state, 'get_jobs_to_check_status_info',
+                        lambda job_ids: {})
+    monkeypatch.setattr(utils.global_user_state,
+                        'get_managed_job_cluster_cleanup_candidates',
+                        lambda: {'legacy-task-1': None})
+    monkeypatch.setattr(managed_job_state, 'get_jobs_status_check_info',
+                        lambda job_ids: info if job_ids == [1] else {})
+    monkeypatch.setattr(
+        managed_job_state, 'get_job_status_check_state',
+        lambda job_id: _make_job_status_check_state(
+            managed_job_state.ManagedJobScheduleState.DONE,
+            all_tasks_terminal=True))
+    terminated = []
+    finished = []
+    monkeypatch.setattr(utils, 'terminate_cluster', terminated.append)
+    monkeypatch.setattr(managed_job_state,
+                        'finish_controller_cleanup_if_current_snapshot',
+                        lambda *a, **k: finished.append((a, k)) or True)
+
+    utils.update_managed_jobs_statuses()
+
+    assert terminated == ['legacy-task-1']
+    assert len(finished) == 1
+
+
+def test_global_sweep_ignores_unproven_legacy_cluster_name(monkeypatch):
+    info = _make_done_terminal_status_check_info(task_name='actual-task')
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    monkeypatch.setattr(managed_job_state, 'get_current_controller_owner',
+                        lambda: None)
+    monkeypatch.setattr(managed_job_state, 'get_jobs_to_check_status_info',
+                        lambda job_ids: {})
+    monkeypatch.setattr(utils.global_user_state,
+                        'get_managed_job_cluster_cleanup_candidates',
+                        lambda: {'unrelated-cluster-1': None})
+    monkeypatch.setattr(managed_job_state, 'get_jobs_status_check_info',
+                        lambda job_ids: info if job_ids == [1] else {})
+    monkeypatch.setattr(
+        managed_job_state, 'get_job_status_check_state', lambda job_id:
+        (_ for _ in ()).throw(AssertionError('unproven row must be ignored')))
+    monkeypatch.setattr(
+        utils, 'terminate_cluster', lambda name:
+        (_ for _ in ()).throw(AssertionError('unproven row must be ignored')))
+
+    utils.update_managed_jobs_statuses()
 
 
 def _wire_dead_controller(monkeypatch,

@@ -1,9 +1,11 @@
 """Regression tests for external-only service-controller supervision."""
 # pylint: disable=protected-access
+import hashlib
 from types import SimpleNamespace
 
 import pytest
 
+from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import service
 from sky.utils import subprocess_utils
@@ -129,6 +131,37 @@ def test_respawn_recreates_only_controller_on_fresh_port(monkeypatch):
     # proxy resolves the newly published port on its next request.
 
 
+def test_controller_hold_blocks_service_respawn_before_reap(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: (False, _HASH))
+    monkeypatch.setattr(service, '_reap_dead_controller_for_respawn',
+                        lambda *unused_args: pytest.fail('reaped held child'))
+
+    result = service._respawn_controller('svc',
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111),
+                                         service_hash=_HASH)
+
+    assert result is None
+
+
+def test_controller_hold_preserves_pool_respawn(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: (True, _HASH))
+    dead = _FakeProc(False, 111)
+    replacement = _FakeProc(True, 333)
+    _setup(monkeypatch, new_controller=replacement)
+
+    result = service._respawn_controller('pool-a',
+                                         '127.0.0.1',
+                                         dead,
+                                         service_hash=_HASH)
+
+    assert result == (replacement, _PORT)
+
+
 def test_respawn_releases_port_lock_before_readiness_wait(monkeypatch):
     events = []
     dead = _FakeProc(False, 111, events=events)
@@ -203,6 +236,71 @@ def test_respawn_reloads_latest_committed_spec(monkeypatch):
 
     assert spawn_calls[0]['version'] == 7
     assert spawn_calls[0]['spec'] is latest_spec
+
+
+def test_respawn_restores_db_config_before_child_spawn(monkeypatch, tmp_path):
+    events = []
+    replacement = _FakeProc(True, 333)
+    spawn_calls, _ = _setup(monkeypatch,
+                            new_controller=replacement,
+                            latest_snapshot=(7, _spec()),
+                            events=events)
+    base_path = tmp_path / 'config.yaml'
+    historical_path = tmp_path / 'config.yaml.v6'
+    live_path = str(tmp_path / 'config.yaml.v7')
+    staged_path = str(tmp_path / ('config.yaml.v7.' + 'c' * 64 + '.staged'))
+    credential_sentinel_one = b'aws_secret_access_key: base-secret\n'
+    credential_sentinel_two = b'api_token: historical-secret\n'
+    old_bytes = b'active_workspace: old\nworkspaces: {old: {}}\n'
+    new_bytes = (b'active_workspace: research\n'
+                 b'workspaces: {research: {}}\n'
+                 b'kubernetes: {allowed_contexts: [east, phx]}\n')
+    base_path.write_bytes(credential_sentinel_one)
+    historical_path.write_bytes(credential_sentinel_two)
+    (tmp_path / 'config.yaml.v6.receipt').write_text('historical source digest',
+                                                     encoding='utf-8')
+    (tmp_path / 'config.yaml.v7').write_bytes(old_bytes)
+    (tmp_path / 'config.yaml.v7.receipt').write_text('current source digest',
+                                                     encoding='utf-8')
+    snapshot_id = 'c' * 64
+    durable_bytes = service.serve_utils.sanitize_ha_recovery_config_bytes(
+        new_bytes)
+    durable_digest = hashlib.sha256(durable_bytes).hexdigest()
+    monkeypatch.setattr(
+        serve_state, 'get_version_controller_config', lambda *unused_args:
+        (durable_bytes, durable_digest, snapshot_id))
+    monkeypatch.setattr(serve_state, 'get_service_config_recovery_identity',
+                        lambda unused_name: (_HASH, 'research'))
+    monkeypatch.setattr(service.serve_utils,
+                        'generate_versioned_config_yaml_file_name',
+                        lambda *unused_args: live_path)
+    monkeypatch.setattr(service.serve_utils,
+                        'generate_remote_config_yaml_file_name',
+                        lambda *unused_args: str(base_path))
+    monkeypatch.setattr(service.serve_utils,
+                        'generate_staged_config_yaml_file_name',
+                        lambda *unused_args, **unused_kwargs: staged_path)
+
+    def _install(unused_config, unused_path):
+        events.append('publish_config')
+
+    monkeypatch.setattr(service.skypilot_config,
+                        'install_internal_config_snapshot', _install)
+
+    result = service._respawn_controller('svc',
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111, events=events),
+                                         service_hash=_HASH)
+
+    assert result == (replacement, _PORT)
+    assert spawn_calls[0]['version'] == 7
+    assert (tmp_path / 'config.yaml.v7').read_bytes() == durable_bytes
+    assert not base_path.exists()
+    assert not historical_path.exists()
+    assert not (tmp_path / 'config.yaml.v6.receipt').exists()
+    assert not (tmp_path / 'config.yaml.v7.receipt').exists()
+    assert not (tmp_path / ('config.yaml.v7.' + 'c' * 64 + '.staged')).exists()
+    assert events.index('publish_config') < events.index('spawn')
 
 
 def test_respawn_preserves_authoritative_launch_fence_bit(monkeypatch):

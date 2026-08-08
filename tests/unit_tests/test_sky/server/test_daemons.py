@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 
 from sky import skypilot_config
+from sky.serve import constants as serve_constants
 from sky.server import daemons
 
 
@@ -263,6 +264,35 @@ class TestConsolidationEventInstancePersistence:
             # run() is invoked on the SAME instance once per iteration,
             # so its internal `_n` counter accumulates as designed.
             assert mock_event.return_value.run.call_count == 3
+
+    def test_serve_hold_skips_lock_recovery_and_status(self, monkeypatch):
+        monkeypatch.setenv(serve_constants.SERVE_CONTROLLER_HOLD_ENV_VAR,
+                           'true')
+        with mock.patch.object(daemons, '_ensure_leader_lock') as ensure_lock, \
+             mock.patch(
+                 'sky.serve.serve_utils.ha_recovery_for_consolidation_mode'
+             ) as recovery, \
+             mock.patch('sky.skylet.events.ServiceUpdateEvent') as event, \
+             mock.patch.object(daemons.time, 'sleep') as sleep:
+            daemons._serve_status_refresh_event(pool=False)
+
+        ensure_lock.assert_not_called()
+        recovery.assert_not_called()
+        event.assert_not_called()
+        sleep.assert_called_once()
+
+    def test_serve_hold_does_not_block_pool_daemon(self, monkeypatch):
+        monkeypatch.setenv(serve_constants.SERVE_CONTROLLER_HOLD_ENV_VAR,
+                           'true')
+        with mock.patch(
+                'sky.serve.serve_utils.ha_recovery_for_consolidation_mode'
+        ) as recovery, \
+             mock.patch('sky.skylet.events.ServiceUpdateEvent') as event, \
+             mock.patch.object(daemons.time, 'sleep'):
+            daemons._serve_status_refresh_event(pool=True)
+
+        recovery.assert_called_once()
+        event.assert_called_once_with(pool=True)
 
     def test_pool_event_instance_is_reused_across_iterations(self):
         with mock.patch(

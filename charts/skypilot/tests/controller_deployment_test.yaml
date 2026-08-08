@@ -3,6 +3,52 @@ suite: controller_deployment_test
 templates:
   - templates/controller-deployment.yaml
 tests:
+  - it: should mount a pre-existing state claim
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      storage.existingClaim: production-rwx-state
+      executorService.replicas: 2
+      controllerService.replicas: 2
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            persistentVolumeClaim:
+              claimName: production-rwx-state
+
+  - it: should gate controller startup on a separately mounted read-only authority claim
+    values:
+      - fixtures/rwx-authority-fence-values.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: verify-rwx-authority-fence
+      - equal:
+          path: spec.template.spec.initContainers[0].volumeMounts
+          value:
+            - name: skypilot-rwx-authority-fence
+              mountPath: /var/run/skypilot/rwx-authority
+              readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-rwx-authority-fence
+            persistentVolumeClaim:
+              claimName: skypilot-state-authority
+              readOnly: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          any: true
+          content:
+            name: skypilot-rwx-authority-fence
+
   - it: should not render an controller deployment in compatibility mode
     asserts:
       - hasDocuments:
@@ -15,6 +61,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       apiService.dbConnectionSecretName: external-db
       requestStore.backend: postgres
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
       storage.enabled: true
       storage.accessMode: ReadWriteMany
       controllerService.replicas: 2
@@ -23,6 +70,12 @@ tests:
       - equal:
           path: metadata.name
           value: RELEASE-NAME-controller
+      - equal:
+          path: metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
       - equal:
           path: spec.replicas
           value: 2
@@ -37,6 +90,11 @@ tests:
           content:
             name: SKYPILOT_API_SERVER_ROLE
             value: controller
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "true"
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -93,6 +151,79 @@ tests:
             name: state-volume
             mountPath: /root/.sky
             subPath: .sky
+      - notExists:
+          path: spec.template.metadata.annotations["skypilot.co/scrape"]
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKY_API_SERVER_METRICS_ENABLED
+      - notContains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9090
+
+  - it: should expose controller multiprocess metrics from leaders and standbys
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      apiService.metrics.enabled: true
+      prometheus.useDedicatedScrapeConfig: true
+      requestStore.backend: postgres
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["skypilot.co/scrape"]
+          value: "true"
+      - equal:
+          path: spec.template.metadata.annotations["skypilot.co/path"]
+          value: /metrics
+      - equal:
+          path: spec.template.metadata.annotations["skypilot.co/port"]
+          value: "9090"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKY_API_SERVER_METRICS_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PROMETHEUS_MULTIPROC_DIR
+            value: /tmp/metrics
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: metrics
+            containerPort: 9090
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "export PROMETHEUS_MULTIPROC_DIR=/tmp/metrics\\s+rm -rf /tmp/metrics\\s+mkdir -p /tmp/metrics\\s+exec python[\\s\\S]+--metrics-port 9090"
+
+  - it: should discard stale controller metric files after hooks before exec
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.metrics.enabled: true
+      apiService.preDeployHook: |
+        touch /tmp/metrics/counter_123.db
+        touch /tmp/metrics/histogram_123.db
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "mkdir -p /tmp/metrics[\\s\\S]+touch /tmp/metrics/counter_123.db[\\s\\S]+touch /tmp/metrics/histogram_123.db[\\s\\S]+export PROMETHEUS_MULTIPROC_DIR=/tmp/metrics\\s+rm -rf /tmp/metrics\\s+mkdir -p /tmp/metrics\\s+exec python"
+
+  - it: should reject a controller health and metrics port collision
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.metrics.enabled: true
+      apiService.metrics.port: 9090
+      controllerService.healthPort: 9090
+    asserts:
+      - failedTemplate:
+          errorMessage: controllerService.healthPort must differ from apiService.metrics.port when metrics are enabled
 
   - it: should allow an explicit controller topology-spread opt-out
     set:
@@ -101,122 +232,6 @@ tests:
     asserts:
       - notExists:
           path: spec.template.spec.topologySpreadConstraints
-
-  - it: should leave authority purpose names available while disabled
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    set:
-      resourceActions.authorityWorker.enabled: false
-      controllerService.extraEnvs:
-        - name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
-          value: /compat/tokens
-      controllerService.extraVolumes:
-        - name: skypilot-resource-action-authority-auth
-          emptyDir: {}
-        - name: skypilot-resource-action-authority-ca
-          emptyDir: {}
-        - name: skypilot-resource-action-authority-manifest
-          emptyDir: {}
-      controllerService.extraVolumeMounts:
-        - name: skypilot-resource-action-authority-auth
-          mountPath: /etc/skypilot/resource-action-authority/auth
-        - name: skypilot-resource-action-authority-ca
-          mountPath: /etc/skypilot/resource-action-authority/tls
-        - name: skypilot-resource-action-authority-manifest
-          mountPath: /etc/skypilot/resource-action-authority/manifest.json
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
-            value: /compat/tokens
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
-      - contains:
-          path: spec.template.spec.volumes
-          content:
-            name: skypilot-resource-action-authority-manifest
-            emptyDir: {}
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: skypilot-resource-action-authority-manifest
-            mountPath: /etc/skypilot/resource-action-authority/manifest.json
-
-  - it: should emit the activation marker with live preflight wiring
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
-            value: "true"
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
-            value: /etc/skypilot/resource-action-authority/auth/tokens
-
-  - it: should omit controller activation for a tombstone-only release
-    values:
-      - fixtures/resource-action-authority-values.yaml
-      - fixtures/resource-action-authority-tombstone-values.yaml
-    asserts:
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
-
-  - it: should reserve the authority purpose env while enabled
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    set:
-      controllerService.extraEnvs:
-        - name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
-          value: /compat/tokens
-    asserts:
-      - failedTemplate:
-          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE" is duplicated or reserved by the chart
-
-  - it: should reserve the chart-owned activation marker
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    set:
-      controllerService.extraEnvs:
-        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
-          value: "true"
-    asserts:
-      - failedTemplate:
-          errorMessage: environment variable "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" is duplicated or reserved by the chart
-
-  - it: should reserve authority purpose volume names while enabled
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    set:
-      controllerService.extraVolumes:
-        - name: skypilot-resource-action-authority-manifest
-          emptyDir: {}
-    asserts:
-      - failedTemplate:
-          errorMessage: volume name "skypilot-resource-action-authority-manifest" is duplicated or reserved by the chart
-
-  - it: should reserve authority purpose mount paths while enabled
-    values:
-      - fixtures/resource-action-authority-values.yaml
-    set:
-      controllerService.extraVolumeMounts:
-        - name: compatibility-manifest
-          mountPath: /etc/skypilot/resource-action-authority/manifest.json
-    asserts:
-      - failedTemplate:
-          errorMessage: volume mount path "/etc/skypilot/resource-action-authority/manifest.json" is duplicated or reserved by the chart
 
   - it: should reject a custom controller API endpoint
     set:

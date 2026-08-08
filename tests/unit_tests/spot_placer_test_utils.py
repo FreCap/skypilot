@@ -6,6 +6,7 @@ helpers; the semantics are identical, so they live here once.
 from typing import Dict, Optional
 from unittest import mock
 
+from sky.serve import placement_policy
 from sky.serve import spot_placer
 
 
@@ -40,9 +41,13 @@ def make_placer(
     """
     placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
         spot_placer.DynamicFallbackSpotPlacer)
+    placer._placement_contract = placement_policy.resolve_fresh_contract(  # pylint: disable=protected-access
+        placement_policy.SPOT_HEDGE_PLACER,
+        pool=False)
     placer.location2status = {
         location: spot_placer.LocationStatus.ACTIVE for location in costs
     }
     placer.location2preempted_at = {}
     placer.location2cost = dict(costs)
+    placer.num_nodes = 1
     return placer

@@ -31,6 +31,16 @@ active ordinary-worker gate. M5-S0b1a1 remains the next M5 gate and is still
 subject to its separate public-package authority; no coordinated-worker
 capability or runtime is active.
 
+The bounded Serve P2a preflight-only authority cohort and Serve034 release
+ledger shipped in PR #1232, but the proposed dedicated authority architecture
+never reached production admission, execution, or provider I/O. PRs #1112,
+#1239, #1240, #1336, #1338, and #1343 are closed. PRs #1332, #1333, #1335,
+and #1342 merged only dark contracts, forward schema, preflight, and renderer
+evidence. The cleanup retains the forward-only Serve038/039 schema and generic
+API request/action substrate while atomically removing those uncalled runtime
+islands and PR #1232's disabled activation surface. A monitoring-gated stacked
+PR removes the temporary disabled-value/private-handler quarantine afterward.
+
 Canonical owner: this file. The implementation, stacked commits, removal
 ledger, rollout evidence, and any contract corrections must stay synchronized
 here.
@@ -43,6 +53,15 @@ execution lease. References below to migrating Serve onto the proposed generic
 M3 action lease are superseded for central SkyServe launch/down; the broader
 provider ownership, placement, volume, cluster, jobs, image, and SQLite
 compatibility program remains owned here.
+
+Last updated: 2026-08-08. The dedicated Serve M4/M5a authority stack is
+retired. The only accepted continuation is the evidence-gated, localized
+ordinary-launch request-binding/adoption contract in the two companion files.
+It reuses the existing API request executor and provider path. It does not
+activate or write the retained Serve038/039 schema, or add a dedicated
+worker/cohort, private transport, native provider rendering, or an
+authority-policy rotation. Existing pool, SQLite, cleanup, paid-capacity,
+reserved-fill, spot/fallback, and placement behavior is unchanged.
 
 ## Summary
 
@@ -72,8 +91,9 @@ convert an ambiguous provider mutation into success.
 
 Every milestone is independently deployable to the isolated `skypilot-ha`
 release in Kubernetes context `boltz-test`. The final migration removes the
-legacy paths listed in the removal ledger after objective usage and rollback
-gates close.
+legacy paths listed in the removal ledger after objective usage and the
+documented forward-rollout, compatible-binary recovery, and evidence gates
+close. It never restores an ownership path that has become authoritative.
 
 ## Current State
 
@@ -1280,9 +1300,8 @@ controllers make no direct `backend.get_job_status`, `sdk.launch`,
 adapter, plus passing recovery, cancellation, same-name recreation, rollout,
 mixed-version, and cleanup qualification.
 
-Before child-workload actuation can replace Serve mutation, the existing
-process-local mutation path needs one explicit deletion boundary. A
-behavior-preserving preparatory slice therefore moves its launch-completion
+The existing process-local Serve mutation path has one explicit encapsulation
+boundary. A behavior-preserving preparatory slice moved its launch-completion
 queue and event, launch and down thread pools, request, cancellation, and
 logical-fence maps, and failed-cleanup retry maps into
 `_LegacyReplicaMutationRuntime`. `SkyPilotReplicaManager` keeps temporary proxy
@@ -1298,30 +1317,15 @@ controller feedback for already-committed provider observations, not legacy
 worker bookkeeping.
 
 This isolation changes no authority selection, persistence, retry timing,
-transport, provider effect, or caller-visible lifecycle behavior. It is a
-mergeable removal seam, but it is not evidence that any M5 legacy path is
-removed. Keeping the fields spread across the manager until final deletion was
-considered and rejected because later migration could not prove that all
-process-local launch and down ownership had been retired as one unit.
+transport, provider effect, or caller-visible lifecycle behavior. The retired
+authority proposal no longer makes these symbols deprecated and no accepted
+design requires deleting the wrapper, its thread owner, or its characterization
+tests. Former removal rows `PLA-M5-001`--`PLA-M5-014` and
+`PLA-M5-017`--`PLA-M5-021` are removed from the executable ledger. A future
+change may simplify this encapsulation only with its own concrete replacement,
+tests, telemetry, and rollout gate.
 
-The exact removal order is executable. `PLA-M5-017` first removes the inherited
-legacy launch-completion call sites, and `PLA-M5-018` then deletes
-`_ReplicaLaunchThread`, `_launch_completion_state()`, and
-`_join_notified_launch_workers()`. `PLA-M5-019` next removes every initializer,
-publication, proxy, recovery, refresh, and direct runtime-state route across
-`SkyPilotReplicaManager`; only then may `PLA-M5-020` delete
-`_LegacyReplicaMutationRuntime`, its publication lock, field map, publication
-helpers, nine proxy properties, `_legacy_mutation_runtime_state()`,
-`_recover_legacy_replica_operations()`, and
-`_refresh_legacy_mutation_runtime()`. `PLA-M5-021` finally deletes the
-temporary characterization file after final durable-runtime recovery,
-cancellation, completion, retry, mixed-version, and same-name recreation
-coverage replaces it. No owner symbol may disappear while a recorded route
-still names it.
-
-These rows remain present until all supported Serve stores either use the
-qualified durable action and child-workload owners or are explicitly retired.
-They make the future deletion complete, but do not claim that any M5 legacy
+This boundary does not claim that any M5 legacy
 path is removed in this preparatory slice.
 
 The implementation order is Skylet capability negotiation first, then the
@@ -7667,16 +7671,32 @@ after its observation carries identity and scope and its shared effect owner is
 fenced. Until then, preserving a visible limitation is safer than silently
 widening legacy authority.
 
-### M5: Serve and pools
+### M5: Serve compatibility and pools
+
+The dedicated non-pool Serve authority migration previously called M4/M5a is
+retired before activation. Its hypothetical transitional router symbols and
+removal bundle 022--025 never existed in the merged runtime and are removed
+from the executable ledger. Serve038/039 remains only as inert forward-only
+schema; its runtime, writers, activation, and authority-policy rotation are not
+authorized continuations.
+
+Current code already persists cleanup intent and exact replica-record identity.
+Its process-local cleanup retry maps preserve backoff only; losing them on
+restart cannot forget cleanup. The remaining accepted issue is narrower:
+ordinary replica launches do not durably bind and adopt the exact API request
+ID, although the system-OOM recovery subset does. Any implementation must reuse
+the ordinary API request executor, preserve the current weighted provider-work
+limits, and follow the companion design's evidence and crash-test gates.
+
+The pool `M5-S*` labels below remain unchanged because they describe a separate
+already-merged pooled-worker program. A non-pool request-binding canary cannot
+satisfy a pool, SQLite, provider-global, or compatibility-runtime removal gate.
 
 - shadow `ChildWorkloadObservationV1` against current replica job-status
   polling before shared child launch or teardown is reachable;
-- implement central PostgreSQL replica launch/down through the bounded
-  companion designs, using their action/attempt journal above the existing
-  API-request queue and execution lease rather than the proposed M3 action
-  lease;
-- extract the companion's pure planners and reducers and persist central
-  replica launch/down attempts;
+- if the companion evidence gate authorizes it, bind each ordinary launch to
+  its exact existing API request and adopt that request after restart; do not
+  add an action/attempt journal or another execution lease;
 - keep lifecycle epoch, immutable versions, and incarnation inventory;
 - make the jobs and Serve pool handoff an explicit fenced contract;
 - retain the officially supported SQLite Serve path until a separate
@@ -12918,6 +12938,13 @@ verified human summary. Every manifest row has a stable
 - the only retained-reference allowlist, recorded evidence, any external
   blocker, and the final removal commit and deployment proof.
 
+Manifest schema version 1 intentionally has no hypothetical Serve authority
+bundle. Rows `PLA-M5-022`--`PLA-M5-025` and their nonexistent transitional
+router locators were removed when the unactivated dedicated authority design
+was retired. A future bounded request-binding implementation must add removal
+rows only for temporary symbols it actually introduces, in the same feature
+stack and with exact source, test, telemetry, rollout, and merge evidence.
+
 Known inventory that cannot yet be assigned safely to an executable removal
 row is never omitted. It is recorded under the required top-level
 `coverage_gaps` list with a stable `PLA-GAP-NNN` ID, exact candidate symbols,
@@ -13038,7 +13065,7 @@ still incomplete until the code is deleted and the row reaches `removed`.
 | future `LEGACY_OPEN` and `DRAINING` routing branches plus `LEGACY_ADMISSION_V1` capability handling | every lifecycle ownership scope is permanently `ACTION_OPEN` and pre-action rollback is prohibited or retired | transition and mixed-version corpora pass, no scope or process advertises a legacy capability for one compatibility release, and a forward schema contraction removes only the legacy states and token while retaining action capability heartbeats |
 | central-PostgreSQL cluster process-local provisioning and teardown retry loops | M4 action runtime owns them | crash-at-every-phase tests and test-cluster cleanup pass |
 | local or controller SQLite cluster provisioning and teardown retry loops | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and repository inventory finds no supported SQLite caller |
-| central-PostgreSQL Serve in-memory replica request retry ownership and duplicate scheduling loops | the bounded Serve action journal owns logical identity/retry/reduction while the existing API-request lease owns execution | lifecycle-epoch, same-name recreation, rollout, scale, failed-cleanup, request-correlation, and controller-handoff tests pass with no second queue or action lease |
+| ordinary central-PostgreSQL Serve launch request correlation across controller restart | an evidence-gated neutral association binds `replica_record_id` to the exact existing API request; the ordinary API-request lease remains the sole executor | bind-before-schedule, same-record adoption, same-name recreation, owner-loss cancellation, duplicate-service-job, result-before-reduction, and controller-handoff tests pass without another queue, action journal, or provider renderer |
 | local or controller SQLite Serve retry and scheduling ownership | a dialect-capable durable runtime is deployed or the product deprecates that path | the separate compatibility or deprecation window closes and SQLite Serve qualification is retired |
 | central-PostgreSQL pool assignment inside `get_next_cluster_name()` under a service `FileLock` | `PoolWorkerCoordinator` owns exact worker reservation and selected-resource binding while SQLite has an explicitly named compatibility implementation | assignment, retirement, capacity, identity, crash recovery, writer-fence, and exact-effect tests pass, one release records no legacy PostgreSQL entry, and PLA-M5-015 reaches `removed` |
 | direct central-PostgreSQL pool teardown admission through `_terminate_replica()` callers and failed-service purge | every graceful and forced source closes the exact worker through `PoolWorkerCoordinator` before scheduling or producing a destructive effect | every inventoried source passes pre-effect close-token and stale-incarnation tests, one release records no unfenced admission, and PLA-M5-016 reaches `removed` |
@@ -13405,6 +13432,11 @@ Each stacked commit follows this gate:
     forward fix or drain plus permanent destruction of every affected worker,
     never an in-place old-image rollback.
 
+The M5 restriction in step 12 applies to the fenced pooled-worker coordination
+subprogram. The retired non-pool Serve authority stack has no promotion or
+authority-policy rollback protocol. Its cleanup is an application-only rollout
+over retained forward-only schema, with authority disabled and absent.
+
 No deployment result is inferred from a successful image push or Helm command.
 The final live revision is re-read after monitoring. Until the health endpoint
 contains a stamped commit, source identity is proven by the immutable image
@@ -13429,6 +13461,11 @@ identity evidence.
   but image rollback is permitted only after the current-image preflight proves
   every `placement_attempt_fence` is null.
 - New schema is expand-first. Old readers ignore new tables and columns.
+- The retired non-pool Serve authority stack never gained mutation ownership.
+  Remove its application-only contracts with authority disabled, retain
+  forward-only additive schema, and roll back only by compatible application
+  image. Any later bounded request-binding rollout follows the companion
+  design's drain-and-adopt contract and cannot clear persisted request IDs.
 - Mutation ownership switches behind a server-side gate and can return to the
   old writer only before the new writer performs an irreversible action.
 - Ownership epochs are independent rows keyed by domain, dependency-closed
@@ -14600,3 +14637,35 @@ v42 bundle and the v40-to-v42 ordinary update boundary separately, and inherits
 PR 1194's exact v42 passive-schema assertion. This correction activates no
 coordinated mode and grants no additional authority. It requires a new exact-
 design and exact-head review before merge.
+
+### Review 36
+
+Verdict: `PURSUE` for the dependency-closed `ProviderDescriptorV1` and
+DigitalOcean actuation design at canonical-design SHA-256
+`f84eecfd29c8fe0fd775b60c650ef6e0d270e0ddaa2dac09cb06710cbfe27fc2`
+and removal-ledger SHA-256
+`7513b8af918bb608ff334ce1dd268f573accb5fe1f0be429ed88676bd8e0f05d`.
+This review covers the exact merge with the 2026-08-08 integration tree. It
+does not close or authorize the separately pending M5-S0b review above.
+
+The adversarial review challenged partial capability inference, mixed
+descriptor generations, mutation replay after a lost response, same-name
+resource replacement, incomplete DigitalOcean pagination, foreign associated
+resource deletion, SSH-key creation, and provider-local retry ownership. The
+accepted contract fails each case closed: operation eligibility requires one
+dependency-complete descriptor generation; every effect locator and
+provider-visible attempt marker commits before provider I/O; locator-only
+readback never licenses a new create; mutation and absence evidence use exact
+provider IDs and incarnation; incomplete discovery blocks mutation; foreign
+resources are inventory evidence but never delete targets; V1 binds only a
+preexisting SSH key; and the shared durable runtime remains the sole retry,
+lease, and transaction owner.
+
+The integration conflict was additive rather than an architectural choice.
+The resolved ledger retains all DigitalOcean rows `PLA-M4-107` through
+`PLA-M4-119` and all newer M5 rows through `PLA-M5-016`; all 338 artifact IDs
+are unique and the current-phase checker passes. No implementation, provider
+mutation authority, feature flag, schema change, or deployment is authorized
+by this design-only verdict. Runtime work still requires exact-SHA tests,
+credentialed DigitalOcean qualification, rollback evidence, and the explicit
+promotion gates above.

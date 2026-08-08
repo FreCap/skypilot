@@ -43,8 +43,9 @@ from sky.server import constants as server_constants
 from sky.skylet import constants as skylet_constants
 
 logger = logging.getLogger(__name__)
+_process_cpu_count = getattr(os, 'process_cpu_count', os.cpu_count)
 _SUPERSEDED_CLEANUP_MAX_CONCURRENCY = max(
-    1, min(32, (os.process_cpu_count() or 1) + 4))
+    1, min(32, (_process_cpu_count() or 1) + 4))
 
 
 async def _run_bounded_async(items: list[Any], *, func) -> list[Any]:
@@ -230,14 +231,24 @@ class BatchCoordinator:
         """
         workers_snapshot = self._begin_cleanup()
         shutdown_threads = []
+        synchronous_fallbacks: list[tuple[str, int]] = []
         for cluster_name, worker_job_id in workers_snapshot:
-            thread_ctx = contextvars.copy_context()
-            shutdown_thread = threading.Thread(target=thread_ctx.run,
-                                               args=(self._cancel_worker,
-                                                     cluster_name,
-                                                     worker_job_id))
-            shutdown_thread.start()
-            shutdown_threads.append(shutdown_thread)
+            try:
+                thread_ctx = contextvars.copy_context()
+                shutdown_thread = threading.Thread(target=thread_ctx.run,
+                                                   args=(self._cancel_worker,
+                                                         cluster_name,
+                                                         worker_job_id))
+                shutdown_thread.start()
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to start shutdown thread for %s; shutting down '
+                    'synchronously: %s', cluster_name, e)
+                synchronous_fallbacks.append((cluster_name, worker_job_id))
+            else:
+                shutdown_threads.append(shutdown_thread)
+        for cluster_name, worker_job_id in synchronous_fallbacks:
+            self._cancel_worker(cluster_name, worker_job_id)
         for shutdown_thread in shutdown_threads:
             shutdown_thread.join()
 
@@ -486,18 +497,28 @@ class BatchCoordinator:
             if worker_job_id is None:
                 return True, None
             worker_job_id = int(worker_job_id)
-            within_deadline, _, _ = await _run_call(
+            within_deadline, succeeded, persisted = await _run_call(
                 'worker job ID persistence',
                 managed_job_state.record_batch_worker_job_id,
                 self._managed_job_id, record['coordinator_token'],
                 record['worker_cluster'], worker_job_id)
             if not within_deadline:
                 return False, None
+            if not succeeded:
+                return True, None
+            if not persisted:
+                logger.info(
+                    'Skipping superseded Batch cleanup for %s on %s '
+                    'after its durable worker record disappeared',
+                    record['worker_job_name'], record['worker_cluster'])
+                return True, None
             return True, worker_job_id
 
         within_deadline, succeeded, records = await _run_call(
-            'worker record read', managed_job_state.get_batch_worker_records,
-            self._managed_job_id)
+            'worker record read',
+            managed_job_state.get_batch_worker_records,
+            self._managed_job_id,
+            owner_token=self._worker_token)
         if not within_deadline:
             return
         if succeeded:
@@ -1226,9 +1247,15 @@ class BatchCoordinator:
         if worker_job_id is None:
             return None
         worker_job_id = int(worker_job_id)
-        managed_job_state.record_batch_worker_job_id(
+        persisted = managed_job_state.record_batch_worker_job_id(
             self._managed_job_id, record['coordinator_token'],
             record['worker_cluster'], worker_job_id)
+        if not persisted:
+            logger.info(
+                'Skipping Batch worker cleanup for %s on %s after its '
+                'durable record disappeared', record['worker_job_name'],
+                record['worker_cluster'])
+            return None
         return worker_job_id
 
     def _cancel_worker_record(
@@ -1256,7 +1283,7 @@ class BatchCoordinator:
         worker_filter = set(workers) if workers is not None else None
         if records is None:
             records = managed_job_state.get_batch_worker_records(
-                self._managed_job_id)
+                self._managed_job_id, owner_token=worker_token)
         for record in records:
             if record['coordinator_token'] != worker_token:
                 continue
@@ -1269,9 +1296,14 @@ class BatchCoordinator:
                                        workers: list[str] | None = None,
                                        strict: bool = False) -> None:
         """Clean exact old-token workers after their attempt leases expire."""
-        worker_records = managed_job_state.get_batch_worker_records(
-            self._managed_job_id)
-        self._refresh_stale_worker_tokens(worker_records)
+        stale_records_by_token: dict[str, list[dict[str, Any]]] = {}
+        for record in managed_job_state.get_batch_worker_records(
+                self._managed_job_id):
+            token = record['coordinator_token']
+            if token == self._worker_token:
+                continue
+            self._stale_worker_tokens.add(token)
+            stale_records_by_token.setdefault(token, []).append(record)
         if not self._stale_worker_tokens:
             return
         if not self._stale_attempt_leases_drained:
@@ -1280,9 +1312,9 @@ class BatchCoordinator:
         queue_jobs_by_cluster: dict[str, list[Any]] = {}
         for worker_token in sorted(self._stale_worker_tokens):
             try:
-                self._cleanup_worker_services_for_token(worker_token, workers,
-                                                        queue_jobs_by_cluster,
-                                                        worker_records)
+                self._cleanup_worker_services_for_token(
+                    worker_token, workers, queue_jobs_by_cluster,
+                    stale_records_by_token.get(worker_token, []))
             except Exception as e:  # pylint: disable=broad-except
                 if strict:
                     raise

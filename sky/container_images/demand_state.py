@@ -5,7 +5,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import dataclasses
+import hashlib
 import json
+import re
 from typing import Any
 import uuid
 
@@ -21,6 +23,7 @@ _TERMINAL_CONFIRMATION_SECONDS = 60 * 60
 _UNATTACHED_REQUEST_RETENTION_SECONDS = 24 * 60 * 60
 _TERMINAL_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _MAX_POSTGRES_BIGINT = (1 << 63) - 1
+_MAX_SERVICE_VERSION_DEMAND_EVIDENCE_ROWS = 10000
 
 
 class StaleConsumerGenerationError(ValueError):
@@ -71,6 +74,14 @@ class ConsumerWatermark:
     owner_deleted_at: int | None
     created_at: int
     updated_at: int
+
+
+@dataclasses.dataclass(frozen=True)
+class LiveServiceVersionDemandEvidence:
+    """Bounded exact-incarnation image-demand proof for Serve retirement."""
+
+    count: int
+    digest: str
 
 
 def validate_controller_epoch(value: str) -> str:
@@ -540,6 +551,114 @@ def get_live_demand(*, workspace: str, consumer_kind: str, consumer_owner: str,
                     models.ImageDemandState.FAILED.value,
                 ]))).mappings().first()
     return _demand(row) if row is not None else None
+
+
+def get_live_service_version_demand_evidence(
+        service_name: str, version: int,
+        service_hash: str) -> LiveServiceVersionDemandEvidence:
+    """Returns exact live image-demand evidence for one Serve version.
+
+    One version may have an unscoped owner and target-scoped derivatives.  The
+    explicit delimiter prevents a same-prefix service, hash, or version from
+    being included in the retirement proof.
+    """
+    if (not isinstance(service_name, str) or not service_name or
+            any(character.isspace() for character in service_name)):
+        raise ValueError('Service name for image-demand evidence is invalid.')
+    if type(version) is not int or version < 1:
+        raise ValueError(
+            'Service version for image-demand evidence is invalid.')
+    if (not isinstance(service_hash, str) or not service_hash or
+            any(character.isspace() for character in service_hash)):
+        raise ValueError('Service hash for image-demand evidence is invalid.')
+    owner = f'{service_name}:incarnation:{service_hash}:v{version}'
+    target_prefix = f'{owner}:target:'
+    demands = schema.demands
+    with orm.Session(catalog_state.engine()) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                demands.c.id, demands.c.consumer_owner,
+                demands.c.consumer_generation, demands.c.target_key,
+                demands.c.state).where(
+                    demands.c.consumer_kind == 'service_version',
+                    sqlalchemy.or_(
+                        demands.c.consumer_owner == owner,
+                        demands.c.consumer_owner.startswith(target_prefix,
+                                                            autoescape=True)),
+                    demands.c.state.in_([
+                        models.ImageDemandState.WARMING.value,
+                        models.ImageDemandState.READY.value,
+                        models.ImageDemandState.FAILED.value,
+                    ])).order_by(demands.c.id).limit(
+                        _MAX_SERVICE_VERSION_DEMAND_EVIDENCE_ROWS + 1)).all()
+    if len(rows) > _MAX_SERVICE_VERSION_DEMAND_EVIDENCE_ROWS:
+        raise RuntimeError(
+            'Live Serve version image-demand evidence exceeds its explicit '
+            'row bound.')
+    canonical = json.dumps(
+        [(str(row.id), str(row.consumer_owner), int(
+            row.consumer_generation), str(row.target_key), str(row.state))
+         for row in rows],
+        separators=(',', ':')).encode()
+    return LiveServiceVersionDemandEvidence(
+        count=len(rows), digest=hashlib.sha256(canonical).hexdigest())
+
+
+def get_live_service_version_demand_evidence_any_incarnation(
+        service_name: str, version: int) -> LiveServiceVersionDemandEvidence:
+    """Returns live demand for a Serve version across every service hash.
+
+    Historical ``version_specs`` rows predate durable per-version incarnation
+    identity.  Retirement must therefore prove absence for every hash, not
+    merely the hash on the current same-name service row.
+    """
+    if (not isinstance(service_name, str) or not service_name or
+            any(character.isspace() for character in service_name)):
+        raise ValueError('Service name for image-demand evidence is invalid.')
+    if type(version) is not int or version < 1:
+        raise ValueError(
+            'Service version for image-demand evidence is invalid.')
+    owner_prefix = f'{service_name}:incarnation:'
+    version_suffix = f':v{version}'
+    target_marker = f'{version_suffix}:target:'
+    owner_pattern = re.compile(rf'^{re.escape(owner_prefix)}[^:]+:v{version}'
+                               r'(?::target:[^:]+)?$')
+    demands = schema.demands
+    with orm.Session(catalog_state.engine()) as session:
+        candidates = session.execute(
+            sqlalchemy.select(
+                demands.c.id, demands.c.consumer_owner,
+                demands.c.consumer_generation, demands.c.target_key,
+                demands.c.state).where(
+                    demands.c.consumer_kind == 'service_version',
+                    demands.c.consumer_owner.startswith(owner_prefix,
+                                                        autoescape=True),
+                    sqlalchemy.or_(
+                        demands.c.consumer_owner.endswith(version_suffix,
+                                                          autoescape=True),
+                        demands.c.consumer_owner.contains(target_marker,
+                                                          autoescape=True)),
+                    demands.c.state.in_([
+                        models.ImageDemandState.WARMING.value,
+                        models.ImageDemandState.READY.value,
+                        models.ImageDemandState.FAILED.value,
+                    ])).order_by(demands.c.id).limit(
+                        _MAX_SERVICE_VERSION_DEMAND_EVIDENCE_ROWS + 1)).all()
+    if len(candidates) > _MAX_SERVICE_VERSION_DEMAND_EVIDENCE_ROWS:
+        raise RuntimeError(
+            'Live Serve version image-demand evidence exceeds its explicit '
+            'row bound.')
+    rows = [
+        row for row in candidates
+        if owner_pattern.fullmatch(str(row.consumer_owner)) is not None
+    ]
+    canonical = json.dumps(
+        [(str(row.id), str(row.consumer_owner), int(
+            row.consumer_generation), str(row.target_key), str(row.state))
+         for row in rows],
+        separators=(',', ':')).encode()
+    return LiveServiceVersionDemandEvidence(
+        count=len(rows), digest=hashlib.sha256(canonical).hexdigest())
 
 
 def get_current_demand_for_controller_epoch(

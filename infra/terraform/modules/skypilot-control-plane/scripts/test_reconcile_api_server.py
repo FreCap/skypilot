@@ -64,18 +64,29 @@ class ReconcileApiServerTest(unittest.TestCase):
         )
         aws.chmod(0o755)
 
+        self._kubectl_args_path = temp_path / 'kubectl-args'
         kubectl = bin_dir / 'kubectl'
-        kubectl.write_text('#!/usr/bin/env bash\nexit 0\n', encoding='utf-8')
+        kubectl.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf \'%s\\0\' "$@" >> "$KUBECTL_ARGS_PATH"\n'
+            'printf \'\\n\' >> "$KUBECTL_ARGS_PATH"\n',
+            encoding='utf-8',
+        )
         kubectl.chmod(0o755)
 
         self._env = os.environ.copy()
         self._env['PATH'] = f'{bin_dir}{os.pathsep}{self._env["PATH"]}'
         self._env['AWS_ARGS_PATH'] = str(self._aws_args_path)
+        self._env['KUBECTL_ARGS_PATH'] = str(self._kubectl_args_path)
 
     def _run(
-        self, proxy_url: str | None
+        self,
+        proxy_url: str | None,
+        high_availability: bool = False
     ) -> tuple[list[str], subprocess.CompletedProcess[str]]:
         env = self._env.copy()
+        env['SKYPILOT_HIGH_AVAILABILITY_ENABLED'] = str(
+            high_availability).lower()
         if proxy_url is None:
             env.pop('KUBE_PROXY_URL', None)
         else:
@@ -96,6 +107,13 @@ class ReconcileApiServerTest(unittest.TestCase):
         ]
         return args, result
 
+    def _kubectl_invocations(self) -> list[list[str]]:
+        if not self._kubectl_args_path.exists():
+            return []
+        return [[
+            arg.decode() for arg in invocation.split(b'\0') if arg
+        ] for invocation in self._kubectl_args_path.read_bytes().splitlines()]
+
     def test_unset_proxy_preserves_direct_update_kubeconfig_command(
             self) -> None:
         args, _ = self._run(None)
@@ -111,6 +129,18 @@ class ReconcileApiServerTest(unittest.TestCase):
         self.assertEqual(args[6], '--kubeconfig')
         self.assertEqual(len(args), 8)
         self.assertNotIn('--proxy-url', args)
+        self.assertEqual(
+            [args[4:] for args in self._kubectl_invocations()],
+            [
+                ['rollout', 'restart', 'deployment/skypilot-api-server'],
+                [
+                    'rollout',
+                    'status',
+                    'deployment/skypilot-api-server',
+                    '--timeout=600s',
+                ],
+            ],
+        )
 
     def test_set_proxy_is_passed_as_one_argument_without_output(self) -> None:
         proxy_url = 'http://proxy.example:18080/path?left=1&right=2'
@@ -119,6 +149,36 @@ class ReconcileApiServerTest(unittest.TestCase):
         self.assertEqual(args[-2:], ['--proxy-url', proxy_url])
         self.assertNotIn(proxy_url, result.stdout)
         self.assertNotIn(proxy_url, result.stderr)
+
+    def test_high_availability_restarts_and_waits_for_every_role(self) -> None:
+        self._run(None, high_availability=True)
+
+        self.assertEqual(
+            [args[4:] for args in self._kubectl_invocations()],
+            [
+                ['rollout', 'restart', 'deployment/skypilot-api-server'],
+                ['rollout', 'restart', 'deployment/skypilot-executor'],
+                ['rollout', 'restart', 'deployment/skypilot-controller'],
+                [
+                    'rollout',
+                    'status',
+                    'deployment/skypilot-api-server',
+                    '--timeout=600s',
+                ],
+                [
+                    'rollout',
+                    'status',
+                    'deployment/skypilot-executor',
+                    '--timeout=600s',
+                ],
+                [
+                    'rollout',
+                    'status',
+                    'deployment/skypilot-controller',
+                    '--timeout=600s',
+                ],
+            ],
+        )
 
 
 if __name__ == '__main__':

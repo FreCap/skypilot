@@ -2,8 +2,9 @@
 
 import asyncio
 import json
-import time
 from unittest import mock
+
+from load_balancer_test_utils import publish_current_occupancy_snapshot
 
 from sky.serve import constants
 from sky.serve import lb_ha_observability as lb_ha_obs
@@ -19,26 +20,15 @@ def _role_payload(replica_count: int) -> dict:
         f'http://10.{index // 65536}.{(index // 256) % 256}.{index % 256}:8080'
         for index in range(replica_count)
     ]
-    now = time.monotonic()
     with lb._client_pool_lock:  # pylint: disable=protected-access
         lb._load_balancing_policy.set_ready_replicas(  # pylint: disable=protected-access
             urls)
-        lb._occupancy_capable = set(urls)  # pylint: disable=protected-access
-        lb._replica_occupancy = {url: 0 for url in urls}  # pylint: disable=protected-access
-        lb._occupancy_dispatch_generation = {  # pylint: disable=protected-access
-            url: 1 for url in urls
-        }
-        lb._occupancy_sample_generation = {  # pylint: disable=protected-access
-            url: 1 for url in urls
-        }
-        lb._occupancy_sample_time = {  # pylint: disable=protected-access
-            url: now for url in urls
-        }
-        lb._occupancy_current_round_sampled_urls = set(  # pylint: disable=protected-access
-            urls)
-        lb._occupancy_sample_role_epoch = {  # pylint: disable=protected-access
-            url: lb._occupancy_role_epoch for url in urls  # pylint: disable=protected-access
-        }
+        publish_current_occupancy_snapshot(
+            lb,
+            occupancy={url: 0 for url in urls},
+            total_slots={url: 1 for url in urls},
+            free_slots={url: 1 for url in urls},
+            dispatch_generation_by_url={url: 1 for url in urls})
     return lb._ha_role_payload()  # pylint: disable=protected-access
 
 
@@ -119,13 +109,10 @@ def test_active_role_transition_invalidates_then_immediately_reprobes(
                                             lb_slot='a')
     url = 'http://worker:8080'
     lb._load_balancing_policy.set_ready_replicas([url])  # pylint: disable=protected-access
-    lb._replica_occupancy = {url: 0}  # pylint: disable=protected-access
-    lb._replica_total_slots = {url: 4}  # pylint: disable=protected-access
-    lb._replica_free_slots = {url: 4}  # pylint: disable=protected-access
-    lb._occupancy_sample_generation = {url: 0}  # pylint: disable=protected-access
-    lb._occupancy_sample_time = {url: time.monotonic()}  # pylint: disable=protected-access
-    lb._occupancy_current_round_sampled_urls = {url}  # pylint: disable=protected-access
-    lb._occupancy_sample_role_epoch = {url: 0}  # pylint: disable=protected-access
+    publish_current_occupancy_snapshot(lb,
+                                       occupancy={url: 0},
+                                       total_slots={url: 4},
+                                       free_slots={url: 4})
 
     class _RoleResponse:
         """Minimal successful controller role response."""

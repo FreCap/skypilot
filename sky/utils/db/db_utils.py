@@ -64,14 +64,12 @@ _POSTGRES_LOCK_APPLICATION_NAME = 'skypilot-advisory-lock'
 # or unexpectedly long transaction must not leave a worker waiting forever for
 # another connection from its process-local budget.
 _POSTGRES_POOL_TIMEOUT_SECONDS = 15
-
 _API_SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
 _POSTGRES_CONNECTION_METRIC_PROCESS_ROLES = frozenset({
     'all',
     'api',
     'executor',
     'controller',
-    'authority-worker',
     'managed-job-controller',
     'serve-controller',
     'unknown',
@@ -81,7 +79,6 @@ _POSTGRES_CONNECTION_METRIC_BASE_PROCESS_ROLES = frozenset({
     'api',
     'executor',
     'controller',
-    'authority-worker',
 })
 _POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES = frozenset({
     'shared',
@@ -247,7 +244,12 @@ def add_all_tables_to_db_sqlalchemy(
     blindly creating every current index would make historical upgrades fail.
     """
     reconcile_indexes = frozenset(reconcile_indexes_for)
-    for table in metadata.tables.values():
+    # Historical bootstrap revisions import the current metadata graph and
+    # create its tables one at a time so index reconciliation can remain
+    # selective.  Follow the graph's foreign-key topology: declaration order
+    # is not a dependency contract, and a newly added parent may be declared
+    # after an older child table.
+    for table in metadata.sorted_tables:
         try:
             table.create(bind=engine, checkfirst=True)
         except (sqlalchemy_exc.OperationalError,
@@ -629,7 +631,11 @@ class DatabaseManager:
         # Use asyncio.to_thread to avoid blocking the event loop, matching the
         # original _init_db_async pattern.
         await asyncio.to_thread(init_db)
-        return self._engine_async
+        engine = self._engine_async
+        if engine is None:
+            raise RuntimeError('Async database engine initialization '
+                               'completed without an engine.')
+        return engine
 
 
 _max_connections = 0

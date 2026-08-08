@@ -532,6 +532,7 @@ export function ManagedJobsTable({
   // Guards multiple concurrent fetches: only latest response should commit
   const requestSeqRef = useRef(0);
   const directoryRequestVersionRef = useRef(0);
+  const activeRequestRef = useRef(null);
 
   // Sync page/pageSize to URL query params.
   // Use window.history.replaceState instead of router.replace to avoid
@@ -634,11 +635,10 @@ export function ManagedJobsTable({
     });
   };
 
-  // Fetch data using jobsCacheManager directly
-  const fetchData = React.useCallback(
-    async (options = {}) => {
-      const includeStatus = options.includeStatus !== false;
-      // Bump request sequence and capture a version for this fetch
+  // Fetch data using jobsCacheManager directly.
+  const performFetch = React.useCallback(
+    async (includeStatus) => {
+      // Bump request sequence and capture a version for this fetch.
       const version = requestSeqRef.current + 1;
       requestSeqRef.current = version;
       setLocalLoading(true);
@@ -788,17 +788,51 @@ export function ManagedJobsTable({
     ]
   );
 
+  const fetchData = React.useCallback(
+    (options = {}) => {
+      // Interactive callers own a new UI snapshot by default. Background
+      // polls opt into coalescing explicitly so they cannot satisfy a later
+      // filter, pagination, sort, or controller-restart transition.
+      const supersede = options.supersede !== false;
+      if (!supersede && activeRequestRef.current) {
+        return activeRequestRef.current.promise;
+      }
+
+      const request = performFetch(options.includeStatus !== false);
+      const owner = {
+        kind: options.requestKind ?? 'interactive',
+        promise: request,
+      };
+      activeRequestRef.current = owner;
+      const clearOwner = () => {
+        if (activeRequestRef.current === owner) {
+          activeRequestRef.current = null;
+        }
+      };
+      void request.then(clearOwner, clearOwner);
+      return request;
+    },
+    [performFetch]
+  );
+
   // Expose fetchData to parent component
   React.useEffect(() => {
     if (refreshDataRef) {
-      refreshDataRef.current = fetchData;
+      const refresh = (options = {}) =>
+        fetchData({ ...options, supersede: true, requestKind: 'manual' });
+      refreshDataRef.current = refresh;
+      return () => {
+        if (refreshDataRef.current === refresh) {
+          refreshDataRef.current = null;
+        }
+      };
     }
+    return undefined;
   }, [refreshDataRef, fetchData]);
 
   // Keep a ref to latest fetchData to avoid stale closures in interval
   const fetchDataRef = React.useRef(fetchData);
   const currentPageRef = React.useRef(currentPage);
-  const automaticRefreshRef = React.useRef(null);
   const pendingPageFetchOptionsRef = React.useRef(null);
   const pageChangeOriginRef = React.useRef(null);
   React.useEffect(() => {
@@ -826,7 +860,11 @@ export function ManagedJobsTable({
   React.useEffect(() => {
     if (!isInitialFetch.current) return;
     if (!userResolved) return;
-    fetchDataRef.current({ includeStatus: true });
+    fetchDataRef.current({
+      includeStatus: true,
+      supersede: true,
+      requestKind: 'interactive',
+    });
     isInitialFetch.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userResolved]);
@@ -858,7 +896,13 @@ export function ManagedJobsTable({
       if (origin === 'page-reset' && pendingOptions == null) {
         return;
       }
-      fetchDataRef.current(pendingOptions ?? { includeStatus: false });
+      fetchDataRef.current(
+        pendingOptions ?? {
+          includeStatus: false,
+          supersede: true,
+          requestKind: 'interactive',
+        }
+      );
     }
   }, [currentPage, preloadingComplete]);
 
@@ -875,7 +919,11 @@ export function ManagedJobsTable({
       if (pageChangeOriginRef.current === 'page-reset') {
         pageChangeOriginRef.current = null;
       }
-      fetchDataRef.current({ includeStatus: true });
+      fetchDataRef.current({
+        includeStatus: true,
+        supersede: true,
+        requestKind: 'interactive',
+      });
     }
   }, [filters, pageSize, preloadingComplete]);
 
@@ -892,7 +940,11 @@ export function ManagedJobsTable({
       if (pageChangeOriginRef.current === 'page-reset') {
         pageChangeOriginRef.current = null;
       }
-      fetchDataRef.current({ includeStatus: true });
+      fetchDataRef.current({
+        includeStatus: true,
+        supersede: true,
+        requestKind: 'interactive',
+      });
     }
   }, [userScope, activeTab, selectedStatuses, showAllMode, preloadingComplete]);
 
@@ -909,7 +961,11 @@ export function ManagedJobsTable({
       if (pageChangeOriginRef.current === 'page-reset') {
         pageChangeOriginRef.current = null;
       }
-      fetchDataRef.current({ includeStatus: false });
+      fetchDataRef.current({
+        includeStatus: false,
+        supersede: true,
+        requestKind: 'interactive',
+      });
     }
   }, [sortConfig, preloadingComplete]);
 
@@ -925,27 +981,30 @@ export function ManagedJobsTable({
 
   const effectiveRefreshInterval = hasRunningBatches ? 1000 : refreshInterval;
 
-  const refreshJobsWhenVisible = React.useCallback(() => {
-    if (!fetchDataRef.current) {
-      return;
-    }
-    if (automaticRefreshRef.current) {
-      return;
-    }
-    if (hasRunningBatches) {
-      jobsCacheManager.invalidateCache();
-    }
-    const refresh = fetchDataRef.current({
-      includeStatus: !hasRunningBatches,
-    });
-    automaticRefreshRef.current = refresh;
-    const clearRefresh = () => {
-      if (automaticRefreshRef.current === refresh) {
-        automaticRefreshRef.current = null;
+  const refreshJobsWhenVisible = React.useCallback(
+    (source) => {
+      if (!fetchDataRef.current) {
+        return;
       }
-    };
-    void refresh.then(clearRefresh, clearRefresh);
-  }, [hasRunningBatches]);
+      const activeKind = activeRequestRef.current?.kind;
+      if (source === 'visibilitychange') {
+        if (activeKind && activeKind !== 'automatic') {
+          return activeRequestRef.current.promise;
+        }
+      } else if (activeRequestRef.current) {
+        return activeRequestRef.current.promise;
+      }
+      if (hasRunningBatches) {
+        jobsCacheManager.invalidateCache();
+      }
+      return fetchDataRef.current({
+        includeStatus: !hasRunningBatches,
+        supersede: source === 'visibilitychange' && activeKind === 'automatic',
+        requestKind: source === 'visibilitychange' ? 'visibility' : 'automatic',
+      });
+    },
+    [hasRunningBatches]
+  );
 
   // Set up periodic refresh interval only after preloading is complete
   useVisibleRefreshInterval(

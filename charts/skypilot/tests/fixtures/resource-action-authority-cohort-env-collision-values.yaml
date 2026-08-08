@@ -1,4 +1,0 @@
-global:
-  extraEnvs:
-    - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
-      value: '[]'

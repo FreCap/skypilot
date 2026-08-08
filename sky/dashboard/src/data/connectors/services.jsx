@@ -3,6 +3,7 @@ import {
   API_VERSION_HEADER,
   CLUSTER_NOT_UP_ERROR,
   SERVE_DASHBOARD_DIRECT_READS_API_VERSION,
+  SERVE_DASHBOARD_PRICING_READS_API_VERSION,
   SERVE_DASHBOARD_REPLICA_READS_API_VERSION,
 } from '@/data/connectors/constants';
 
@@ -55,6 +56,12 @@ export function normalizeReplica(replica) {
     plannedCapacity,
     hourlyCost: Number.isFinite(hourlyCost) ? hourlyCost : null,
     hourlyCostExclusionReason: replica.hourly_cost_exclusion_reason || null,
+    pricingFingerprint:
+      typeof replica.pricing_fingerprint === 'string' &&
+      replica.pricing_fingerprint
+        ? replica.pricing_fingerprint
+        : null,
+    priceSource: replica.price_source || null,
   };
 }
 
@@ -1020,6 +1027,317 @@ export async function getServiceReplicas({
       (replica) => ({ ...normalizeReplica(replica), directProjection: true })
     ),
   };
+}
+
+const PRICING_COVERAGE = new Set(['empty', 'complete', 'partial', 'none']);
+const PRICE_SOURCES = new Set(['zero_cost_provenance', 'version_catalog']);
+
+function nonnegativeIntegerOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : null;
+}
+
+function nonnegativeFiniteOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function normalizePricingExclusionReasons(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const reasons = {};
+  for (const [reason, rawCount] of Object.entries(value)) {
+    const count = nonnegativeIntegerOrNull(rawCount);
+    if (typeof reason !== 'string' || !reason || count === null) return null;
+    reasons[reason] = count;
+  }
+  return reasons;
+}
+
+function normalizePricingAggregate(aggregate) {
+  if (!aggregate || typeof aggregate !== 'object') return null;
+  if (typeof aggregate.available !== 'boolean') return null;
+  const available = aggregate.available;
+  if (!available) {
+    if (
+      aggregate.unavailable_reason !== 'projection_too_large' ||
+      aggregate.coverage !== null ||
+      aggregate.known_hourly_cost !== null ||
+      aggregate.spot_hourly_cost !== null ||
+      aggregate.non_spot_hourly_cost !== null ||
+      aggregate.tracked_replica_count !== null ||
+      aggregate.priced_replica_count !== null ||
+      aggregate.excluded_replica_count !== null
+    ) {
+      return null;
+    }
+    return {
+      available: false,
+      unavailableReason: aggregate.unavailable_reason,
+      coverage: null,
+      estimatedHourlyCost: null,
+      spotHourlyCost: null,
+      nonSpotHourlyCost: null,
+      costTrackedReplicaCount: null,
+      pricedReplicaCount: null,
+      hourlyCostExcludedReplicaCount: null,
+      hourlyCostExclusionReasons: null,
+    };
+  }
+  if (!PRICING_COVERAGE.has(aggregate.coverage)) return null;
+  const estimatedHourlyCost = nonnegativeFiniteOrNull(
+    aggregate.known_hourly_cost
+  );
+  const spotHourlyCost = nonnegativeFiniteOrNull(aggregate.spot_hourly_cost);
+  const nonSpotHourlyCost = nonnegativeFiniteOrNull(
+    aggregate.non_spot_hourly_cost
+  );
+  const costTrackedReplicaCount = nonnegativeIntegerOrNull(
+    aggregate.tracked_replica_count
+  );
+  const pricedReplicaCount = nonnegativeIntegerOrNull(
+    aggregate.priced_replica_count
+  );
+  const hourlyCostExcludedReplicaCount = nonnegativeIntegerOrNull(
+    aggregate.excluded_replica_count
+  );
+  const hourlyCostExclusionReasons = normalizePricingExclusionReasons(
+    aggregate.exclusion_reasons
+  );
+  if (
+    costTrackedReplicaCount === null ||
+    pricedReplicaCount === null ||
+    hourlyCostExcludedReplicaCount === null ||
+    pricedReplicaCount + hourlyCostExcludedReplicaCount !==
+      costTrackedReplicaCount ||
+    hourlyCostExclusionReasons === null ||
+    Object.values(hourlyCostExclusionReasons).reduce(
+      (sum, count) => sum + count,
+      0
+    ) !== hourlyCostExcludedReplicaCount
+  ) {
+    return null;
+  }
+  const hasKnownTotal = ['empty', 'complete', 'partial'].includes(
+    aggregate.coverage
+  );
+  if (
+    hasKnownTotal !== (estimatedHourlyCost !== null) ||
+    hasKnownTotal !== (spotHourlyCost !== null) ||
+    hasKnownTotal !== (nonSpotHourlyCost !== null)
+  ) {
+    return null;
+  }
+  const subtotal = (spotHourlyCost ?? 0) + (nonSpotHourlyCost ?? 0);
+  if (
+    estimatedHourlyCost !== null &&
+    Math.abs(subtotal - estimatedHourlyCost) >
+      1e-9 * Math.max(1, subtotal, estimatedHourlyCost)
+  ) {
+    return null;
+  }
+  if (
+    (aggregate.coverage === 'empty' &&
+      (costTrackedReplicaCount !== 0 ||
+        pricedReplicaCount !== 0 ||
+        hourlyCostExcludedReplicaCount !== 0 ||
+        estimatedHourlyCost !== 0)) ||
+    (aggregate.coverage === 'complete' &&
+      (costTrackedReplicaCount === 0 ||
+        pricedReplicaCount !== costTrackedReplicaCount ||
+        hourlyCostExcludedReplicaCount !== 0)) ||
+    (aggregate.coverage === 'partial' &&
+      (pricedReplicaCount === 0 || hourlyCostExcludedReplicaCount === 0)) ||
+    (aggregate.coverage === 'none' &&
+      (costTrackedReplicaCount === 0 ||
+        pricedReplicaCount !== 0 ||
+        hourlyCostExcludedReplicaCount !== costTrackedReplicaCount))
+  ) {
+    return null;
+  }
+  return {
+    available: true,
+    unavailableReason: null,
+    coverage: aggregate.coverage,
+    estimatedHourlyCost,
+    spotHourlyCost,
+    nonSpotHourlyCost,
+    costTrackedReplicaCount,
+    pricedReplicaCount,
+    hourlyCostExcludedReplicaCount,
+    hourlyCostExclusionReasons,
+  };
+}
+
+function normalizeReplicaPricing(replica) {
+  if (!replica || typeof replica !== 'object') return null;
+  const id = Number(replica.replica_id);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const pricingFingerprint =
+    typeof replica.pricing_fingerprint === 'string' &&
+    replica.pricing_fingerprint
+      ? replica.pricing_fingerprint
+      : null;
+  const hourlyCost = nonnegativeFiniteOrNull(replica.hourly_cost);
+  const priceSource = PRICE_SOURCES.has(replica.price_source)
+    ? replica.price_source
+    : null;
+  const hourlyCostExclusionReason =
+    typeof replica.hourly_cost_exclusion_reason === 'string' &&
+    replica.hourly_cost_exclusion_reason
+      ? replica.hourly_cost_exclusion_reason
+      : null;
+  if (
+    (hourlyCost !== null &&
+      (pricingFingerprint === null ||
+        priceSource === null ||
+        hourlyCostExclusionReason !== null)) ||
+    (hourlyCost === null &&
+      (priceSource !== null || hourlyCostExclusionReason === null)) ||
+    (pricingFingerprint === null &&
+      !['not_current_or_uncertain', 'pricing_identity_too_large'].includes(
+        hourlyCostExclusionReason
+      )) ||
+    (pricingFingerprint !== null &&
+      ['not_current_or_uncertain', 'pricing_identity_too_large'].includes(
+        hourlyCostExclusionReason
+      ))
+  ) {
+    return null;
+  }
+  return {
+    id,
+    pricingFingerprint,
+    hourlyCost,
+    priceSource,
+    hourlyCostExclusionReason,
+  };
+}
+
+export function normalizeServicePricing(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const serviceName = payload.service_name;
+  const serviceHash = payload.service_hash;
+  if (
+    typeof serviceName !== 'string' ||
+    !serviceName ||
+    typeof serviceHash !== 'string' ||
+    !serviceHash ||
+    typeof payload.available !== 'boolean' ||
+    !Array.isArray(payload.replicas)
+  ) {
+    return null;
+  }
+  const available = payload.available;
+  const replicas = payload.replicas
+    .map(normalizeReplicaPricing)
+    .filter(Boolean);
+  if (replicas.length !== payload.replicas.length) return null;
+  const aggregate =
+    payload.aggregate === null || payload.aggregate === undefined
+      ? null
+      : normalizePricingAggregate(payload.aggregate);
+  if (payload.aggregate != null && aggregate === null) return null;
+  return {
+    available,
+    reason: payload.reason || null,
+    serviceName,
+    serviceHash,
+    observedAt: finiteOrNull(payload.observed_at),
+    priceBasis: payload.price_basis || null,
+    aggregate,
+    replicas,
+  };
+}
+
+export async function getServicePricing({
+  serviceName,
+  serviceHash,
+  replicaIds = [],
+}) {
+  if (!Array.isArray(replicaIds) || replicaIds.length > 100) {
+    throw new Error('Service pricing accepts at most 100 replica IDs');
+  }
+  const uniqueReplicaIds = [];
+  const seenReplicaIds = new Set();
+  for (const rawReplicaId of replicaIds) {
+    const replicaId = Number(rawReplicaId);
+    if (!Number.isInteger(replicaId) || replicaId <= 0) {
+      throw new Error('Service pricing replica IDs must be positive integers');
+    }
+    if (!seenReplicaIds.has(replicaId)) {
+      seenReplicaIds.add(replicaId);
+      uniqueReplicaIds.push(replicaId);
+    }
+  }
+  const params = new URLSearchParams({ expected_service_hash: serviceHash });
+  uniqueReplicaIds.forEach((replicaId) =>
+    params.append('replica_id', String(replicaId))
+  );
+  const response = await apiClient.get(
+    `/serve/${encodeURIComponent(serviceName)}/pricing?${params.toString()}`
+  );
+  if (response.status === 404) {
+    const unsupported = directReadFallback(
+      response,
+      SERVE_DASHBOARD_PRICING_READS_API_VERSION
+    );
+    return {
+      available: false,
+      reason: unsupported ? 'unsupported' : 'not_found',
+      legacyFallback: false,
+      serviceName,
+      serviceHash,
+      aggregate: null,
+      replicas: [],
+    };
+  }
+  if (response.status === 409) {
+    const error = new Error('The service incarnation changed.');
+    error.code = 'SERVICE_HASH_MISMATCH';
+    throw error;
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Service pricing request failed with status ${response.status}`
+    );
+  }
+  const pricing = normalizeServicePricing(await response.json());
+  if (!pricing) {
+    throw new Error('Service pricing response was malformed');
+  }
+  if (
+    pricing.serviceName !== serviceName ||
+    pricing.serviceHash !== serviceHash ||
+    (pricing.available && pricing.priceBasis !== 'version_catalog')
+  ) {
+    throw new Error('Service pricing response identity was malformed');
+  }
+  if (!pricing.available) {
+    return {
+      ...pricing,
+      legacyFallback: pricing.reason === 'non_consolidated',
+    };
+  }
+  const aggregateMode = uniqueReplicaIds.length === 0;
+  if (
+    aggregateMode !== (pricing.aggregate !== null) ||
+    (aggregateMode && pricing.replicas.length !== 0)
+  ) {
+    throw new Error('Service pricing response mode was malformed');
+  }
+  if (!aggregateMode) {
+    const responseIds = new Set(pricing.replicas.map((replica) => replica.id));
+    if (
+      pricing.replicas.length !== uniqueReplicaIds.length ||
+      responseIds.size !== uniqueReplicaIds.length ||
+      uniqueReplicaIds.some((replicaId) => !responseIds.has(replicaId))
+    ) {
+      throw new Error('Service pricing response did not settle every replica');
+    }
+  }
+  return { ...pricing, legacyFallback: false };
 }
 
 function finiteOrNull(value) {

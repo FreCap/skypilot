@@ -14,16 +14,23 @@ Focused on the helpers added for HA leader-aware routing:
 """
 # pylint: disable=import-outside-toplevel,missing-class-docstring
 # pylint: disable=protected-access,unreachable
+import contextlib
+import json
 import multiprocessing
 import socket
 import threading
 import time
+import types
 from unittest import mock
+import uuid
 
 import pytest
 
+from sky.serve import constants
+from sky.serve import placement_policy
 from sky.serve import serve_state
 from sky.serve import service
+from sky.serve import service_spec as service_spec_lib
 
 
 def _bind_socket_async(host, port, delay):
@@ -61,6 +68,51 @@ def _listen_on_transferred_socket(controller_socket, ready):
     connection, _ = controller_socket.accept()
     connection.close()
     controller_socket.close()
+
+
+def test_controller_hold_rejects_service_before_boot_mutation(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: (False, 'incarnation-a'))
+    keys = mock.Mock()
+    monkeypatch.setattr(service.auth_utils, 'get_or_generate_keys', keys)
+
+    with pytest.raises(RuntimeError, match='Refusing to start a SkyServe'):
+        service._start('svc', '/unused/task.yaml', 1, 'sky serve up')
+
+    keys.assert_not_called()
+
+
+def test_controller_hold_preserves_recovering_pool(monkeypatch):
+
+    class PoolBootReached(RuntimeError):
+        pass
+
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: (True, 'incarnation-a'))
+    monkeypatch.setattr(service.auth_utils, 'get_or_generate_keys',
+                        mock.Mock(side_effect=PoolBootReached('pool boot')))
+
+    with pytest.raises(PoolBootReached, match='pool boot'):
+        service._start('pool-a', '/unused/task.yaml', 1, 'pool apply')
+
+
+def test_controller_hold_preserves_fresh_pool_from_yaml(monkeypatch, tmp_path):
+
+    class PoolBootReached(RuntimeError):
+        pass
+
+    task_yaml = tmp_path / 'pool.yaml'
+    task_yaml.write_text('pool:\n  workers: 1\n', encoding='utf-8')
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(serve_state, 'get_service_mode_and_hash',
+                        lambda unused_name: None)
+    monkeypatch.setattr(service.auth_utils, 'get_or_generate_keys',
+                        mock.Mock(side_effect=PoolBootReached('pool boot')))
+
+    with pytest.raises(PoolBootReached, match='pool boot'):
+        service._start('pool-a', str(task_yaml), 1, 'pool apply')
 
 
 class TestWaitForControllerReady:
@@ -143,7 +195,7 @@ class TestLatestCommittedLbTerminationGraceSeconds:
 
     def test_returns_none_without_committed_snapshot(self):
         with mock.patch('sky.serve.service.serve_state.'
-                        'get_latest_applicable_version_spec',
+                        'get_recovery_version_spec',
                         return_value=None), \
              mock.patch('sky.serve.service.serve_state.'
                         'get_latest_committed_version',
@@ -164,7 +216,7 @@ class TestLatestCommittedLbTerminationGraceSeconds:
         spec.graceful_drain_seconds = 23
 
         with mock.patch('sky.serve.service.serve_state.'
-                        'get_latest_applicable_version_spec',
+                        'get_recovery_version_spec',
                         return_value=(7, spec)) as snapshot, \
              mock.patch('sky.serve.service.serve_state.'
                         'get_latest_committed_version',
@@ -536,6 +588,34 @@ class TestRunCleanupAndFinalizeDeletesLb:
             expected_api_deployment_uid='api-deployment-uid',
             high_availability=False)
 
+    def test_protocol_v2_requires_terminal_history_before_cleanup(self):
+        replica = mock.Mock(cluster_name='svc-a-r1')
+        with mock.patch(
+                'sky.serve.service.serve_state.'
+                'set_service_status_and_active_versions_if_owner',
+                return_value=True), \
+             mock.patch('sky.serve.service.serve_state.get_replica_infos',
+                        return_value=[replica]), \
+             mock.patch(
+                 'sky.serve.service.serve_utils.'
+                 'replica_cleanup_requires_terminal_history',
+                 return_value=True), \
+             mock.patch(
+                 'sky.serve.service.serve_utils.'
+                 'quiesce_service_replica_launch_requests',
+                 return_value=False) as quiesce, \
+             mock.patch(
+                 'sky.serve.service.serve_state.'
+                 'acknowledge_service_controller_teardown_if_owner') as ack, \
+             mock.patch('sky.serve.service._cleanup') as cleanup:
+            service._run_cleanup_and_finalize('svc', self._spec(), '/tmp/svc',
+                                              1, 'incarnation-a', 123,
+                                              '10.0.0.1')
+
+        assert quiesce.call_args.kwargs['include_terminal_history'] is True
+        ack.assert_not_called()
+        cleanup.assert_not_called()
+
     def test_failed_cleanup_lb_delete_error_is_swallowed(self):
         with mock.patch('sky.serve.service._cleanup',
                         return_value=True) as mock_cleanup, \
@@ -732,31 +812,89 @@ run: echo hi
 """
 
 
+def _make_persisted_per_gpu_spec(
+        uses_logical_replicas: bool) -> service_spec_lib.SkyServiceSpec:
+    spec = service_spec_lib.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=1,
+        readiness_timeout_seconds=2,
+        endpoint_probe_interval_seconds=3,
+        lb_stream_timeout_seconds=4,
+        min_replicas=1,
+        max_replicas=8,
+        target_concurrency_per_replica=(1 if uses_logical_replicas else 2),
+        graceful_drain_async_occupancy=True,
+        spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+        lb_high_availability=False)
+    if uses_logical_replicas:
+        return spec
+    legacy_state = dict(spec.__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        legacy_state.pop(field)
+    legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+    legacy_state['_graceful_drain_async_occupancy'] = None
+    restored = service_spec_lib.SkyServiceSpec.__new__(
+        service_spec_lib.SkyServiceSpec)
+    restored.__setstate__(legacy_state)
+    assert restored.placement_contract.is_legacy_physical_per_gpu
+    return restored
+
+
+@contextlib.contextmanager
+def _mock_external_lb_recovery():
+    """Stub the platform boundary activated by a real non-pool spec."""
+    with mock.patch.object(service.serve_state,
+                           'get_lb_cutover_state',
+                           return_value=None), \
+         mock.patch.object(service.lb_k8s, 'require_external_lb_runtime'), \
+         mock.patch.object(service.lb_k8s,
+                           'lb_termination_grace_period_seconds',
+                           return_value=0), \
+         mock.patch.object(service.lb_k8s,
+                           'create_lb_deployment_and_service'), \
+         mock.patch.object(
+             service.serve_state,
+             'set_service_load_balancer_port_if_owner',
+             return_value=True):
+        yield
+
+
 @pytest.mark.parametrize('persisted_logical,yaml_content', [
     (False, _LEGACY_PER_GPU_YAML),
     (True, _CURRENT_PER_GPU_YAML),
 ])
 def test_recovery_spawns_controller_with_persisted_semantics(
         persisted_logical, yaml_content):
-    persisted = mock.MagicMock()
-    persisted.pool = True
-    persisted.uses_logical_replicas = persisted_logical
-    persisted.spot_placer = 'dynamic_fallback_per_gpu'
+    persisted = _make_persisted_per_gpu_spec(persisted_logical)
     record = {
         'hash': 'incarnation-a',
         'controller_job_id': 1,
         'controller_pid': 123,
         'controller_ip': '10.0.0.2',
+        'lifecycle_epoch': 8,
         'workspace': 'default',
         'resource_scope': 'incarnation-a',
-        'pool': True,
+        'pool': False,
         'status': serve_state.ServiceStatus.READY,
         'yaml_content': yaml_content,
     }
     process = mock.MagicMock(pid=456)
     controller_context = mock.MagicMock()
     controller_context.__enter__.return_value = (process, 20001)
-    with mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
+    recovery_fence = json.dumps({
+        'service_hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.2',
+        'status': serve_state.ServiceStatus.READY.value,
+        'recovery_version': 3,
+    })
+    with mock.patch.dict(
+            service.os.environ, {
+                service.constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR:
+                    recovery_fence
+            }), \
+         mock.patch.object(service.auth_utils, 'get_or_generate_keys'), \
          mock.patch.object(service.serve_state,
                            'get_service_from_name',
                            return_value=record), \
@@ -775,6 +913,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
              'build_catalog',
              side_effect=AssertionError(
                  'persisted recovery must not rebuild the catalog')), \
+         _mock_external_lb_recovery(), \
          mock.patch.object(service.serve_utils,
                            'generate_remote_service_dir_name',
                            return_value='/tmp/legacy-service'), \
@@ -783,7 +922,7 @@ def test_recovery_spawns_controller_with_persisted_semantics(
                            return_value=3), \
          mock.patch.object(service.serve_state,
                            'update_service_controller_pid_if_owner',
-                           return_value=True), \
+                           return_value=True) as preclaim, \
          mock.patch.object(service,
                            '_spawn_controller_on_reserved_port',
                            return_value=controller_context) as spawn, \
@@ -812,6 +951,16 @@ def test_recovery_spawns_controller_with_persisted_semantics(
 
     assert spawn.call_args.args[1] is persisted
     assert spawn.call_args.args[2] == 3
+    preclaim.assert_called_once_with(
+        'svc',
+        expected_service_hash='incarnation-a',
+        expected_controller_pid=123,
+        expected_controller_ip='10.0.0.2',
+        controller_pid=service.os.getpid(),
+        controller_ip=None,
+        expected_lifecycle_epoch=8,
+        expected_status=serve_state.ServiceStatus.READY,
+        expected_recovery_version=3)
 
 
 def test_start_releases_port_lock_before_readiness_wait():
@@ -858,10 +1007,7 @@ def test_start_releases_port_lock_before_readiness_wait():
         events.append('spawn')
         return process
 
-    persisted = mock.MagicMock()
-    persisted.pool = True
-    persisted.uses_logical_replicas = True
-    persisted.spot_placer = 'dynamic_fallback_per_gpu'
+    persisted = _make_persisted_per_gpu_spec(uses_logical_replicas=True)
     record = {
         'hash': 'incarnation-a',
         'controller_job_id': 1,
@@ -869,7 +1015,7 @@ def test_start_releases_port_lock_before_readiness_wait():
         'controller_ip': '10.0.0.2',
         'workspace': 'default',
         'resource_scope': 'incarnation-a',
-        'pool': True,
+        'pool': False,
         'status': serve_state.ServiceStatus.READY,
         'yaml_content': _CURRENT_PER_GPU_YAML,
     }
@@ -889,6 +1035,7 @@ def test_start_releases_port_lock_before_readiness_wait():
          mock.patch.object(service.serve_state,
                            'get_placement_catalog',
                            return_value={'schema_version': 1, 'entries': []}), \
+         _mock_external_lb_recovery(), \
          mock.patch.object(service.serve_state,
                            'get_latest_version',
                            return_value=3), \
@@ -932,7 +1079,9 @@ def test_start_releases_port_lock_before_readiness_wait():
 
 def test_legacy_recovery_backfills_catalog_once():
     task = mock.Mock()
-    service_spec = mock.Mock(spot_placer='dynamic_fallback')
+    service_spec = types.SimpleNamespace(
+        placement_contract=placement_policy.resolve_fresh_contract(
+            placement_policy.SPOT_HEDGE_PLACER, pool=False))
     catalog = mock.Mock()
     catalog.to_dict.return_value = {
         'schema_version': 1,
@@ -957,6 +1106,26 @@ def test_legacy_recovery_backfills_catalog_once():
     assert result == {'schema_version': 1, 'entries': []}
     build.assert_called_once_with(service_spec, task, workspace='default')
     persist.assert_called_once_with('svc', 3, result)
+
+
+def test_disabled_placement_contract_skips_catalog_state_and_build():
+    service_spec = types.SimpleNamespace(
+        placement_contract=placement_policy.resolve_fresh_contract(None,
+                                                                   pool=False))
+    with mock.patch.object(service.serve_state,
+                           'get_placement_catalog') as get_catalog, \
+         mock.patch.object(service.spot_placer.SpotPlacer,
+                           'build_catalog') as build:
+        result = service._prepare_placement_catalog('svc',
+                                                    service_spec,
+                                                    mock.Mock(),
+                                                    workspace='default',
+                                                    is_recovery=True,
+                                                    recovery_version=3)
+
+    assert result is None
+    get_catalog.assert_not_called()
+    build.assert_not_called()
 
 
 class TestCleanupAuditLog:
@@ -1083,6 +1252,13 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
         status_property=mock.Mock())
     lifecycle_lock = mock.Mock(epoch=31)
     expected_owner = (4242, '10.4.7.7')
+    cluster_record_uuid = uuid.UUID('33333333-3333-4333-8333-333333333333')
+    teardown_identity = serve_state.ReplicaResourceActionIdentity(
+        replica_id=2,
+        cluster_name='svc-a-r2',
+        replica_incarnation=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+        desired_generation=1,
+        sky_cluster_record_uuid=cluster_record_uuid)
     with mock.patch.object(serve_state,
                            'get_replica_infos', return_value=[absent,
                                                               present]), \
@@ -1100,6 +1276,10 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
              return_value={'svc-a-r2': ('UP', 1)}), \
          mock.patch.object(serve_state,
                            'remove_replicas', return_value=True) as remove, \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={2: teardown_identity}) as identity_snapshot, \
          mock.patch.object(serve_state,
                            'add_or_update_replica', return_value=True
                           ) as persist, \
@@ -1125,6 +1305,9 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
         expected_replica_record_ids={1: absent.replica_record_id})
     terminate.assert_called_once()
     assert terminate.call_args.args[0] == 'svc-a-r2'
+    assert terminate.call_args.kwargs['expected_cluster_record_uuid'] == str(
+        cluster_record_uuid)
+    identity_snapshot.assert_called_once_with('svc', [2])
     assert persist.call_count == 2
     for call in persist.call_args_list:
         assert call.args == ('svc', 2, present)
@@ -1141,6 +1324,132 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
         expected_lifecycle_epoch=31,
         expected_controller_owner=expected_owner,
         expected_replica_record_id=(present.replica_record_id))
+
+
+def test_cleanup_retains_replica_when_teardown_identity_snapshot_changes():
+    status_property = mock.Mock(
+        sky_launch_status=service.common_utils.ProcessStatus.SUCCEEDED)
+    replica = mock.Mock(
+        replica_id=1,
+        replica_record_id='00000000-0000-4000-8000-000000000001',
+        cluster_name='svc-a-r1',
+        status_property=status_property)
+    lifecycle_lock = mock.Mock(epoch=31)
+    expected_owner = (4242, '10.4.7.7')
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[replica]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value={'svc-a-r1'}), \
+         mock.patch.object(service.reserved_capacity,
+                           'parse_protocol_v2_cleanup_fence',
+                           return_value=None), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={}), \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica',
+                           return_value=True) as persist, \
+         mock.patch.object(serve_state, 'remove_replica') as remove, \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True), \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as terminate:
+        failed = service._cleanup('svc', True, 'incarnation-a',
+                                  expected_owner[0], expected_owner[1],
+                                  lifecycle_lock)
+
+    assert failed
+    assert status_property.sky_down_status == (
+        service.common_utils.ProcessStatus.FAILED)
+    persist.assert_called_once_with('svc',
+                                    1,
+                                    replica,
+                                    expected_service_hash='incarnation-a',
+                                    expected_lifecycle_epoch=31,
+                                    expected_controller_owner=expected_owner,
+                                    expected_replica_exists=True)
+    remove.assert_not_called()
+    terminate.assert_not_called()
+
+
+def test_cleanup_retains_absent_protocol_v2_replica_as_failed_cleanup():
+    legacy = mock.Mock(replica_id=1,
+                       replica_record_id='00000000-0000-4000-8000-000000000001',
+                       cluster_name='svc-a-r1',
+                       status_property=mock.Mock())
+    protocol_v2 = mock.Mock(
+        replica_id=2,
+        replica_record_id='00000000-0000-4000-8000-000000000002',
+        cluster_name='svc-a-r2',
+        status_property=mock.Mock())
+    cleanup_fence = service.reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='phx-uid')
+    lifecycle_lock = mock.Mock(epoch=31)
+    expected_owner = (4242, '10.4.7.7')
+
+    def parse_cleanup_fence(info):
+        return cleanup_fence if info is protocol_v2 else None
+
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[legacy, protocol_v2]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value=set()), \
+         mock.patch.object(service.reserved_capacity,
+                           'parse_protocol_v2_cleanup_fence',
+                           side_effect=parse_cleanup_fence), \
+         mock.patch.object(serve_state,
+                           'remove_replicas', return_value=True) as remove, \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True) as persist, \
+         mock.patch.object(serve_state, 'remove_replica') as remove_one, \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True), \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as terminate:
+        failed = service._cleanup('svc', True, 'incarnation-a',
+                                  expected_owner[0], expected_owner[1],
+                                  lifecycle_lock)
+
+    assert failed
+    remove.assert_called_once_with(
+        'svc', [legacy.replica_id],
+        expected_service_hash='incarnation-a',
+        expected_lifecycle_epoch=31,
+        expected_controller_owner=expected_owner,
+        expected_replica_record_ids={
+            legacy.replica_id: legacy.replica_record_id
+        })
+    persist.assert_called_once_with('svc',
+                                    protocol_v2.replica_id,
+                                    protocol_v2,
+                                    expected_service_hash='incarnation-a',
+                                    expected_lifecycle_epoch=31,
+                                    expected_controller_owner=expected_owner,
+                                    expected_replica_exists=True)
+    assert (protocol_v2.status_property.sky_down_status ==
+            service.common_utils.ProcessStatus.FAILED)
+    remove_one.assert_not_called()
+    terminate.assert_not_called()
 
 
 def test_cleanup_skips_tail_sleep_after_final_success():
@@ -1186,6 +1495,10 @@ def test_cleanup_skips_tail_sleep_after_final_success():
          mock.patch.object(service.serve_utils,
                            'get_existing_replica_cluster_names',
                            return_value={'svc-a-r1'}), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={1: None}), \
          mock.patch.object(serve_state,
                            'add_or_update_replica', return_value=True), \
          mock.patch.object(serve_state,
@@ -1249,6 +1562,10 @@ def test_cleanup_skips_tail_sleep_after_final_start_failure():
          mock.patch.object(service.serve_utils,
                            'get_existing_replica_cluster_names',
                            return_value={'svc-a-r1'}), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={1: None}), \
          mock.patch.object(serve_state,
                            'add_or_update_replica', return_value=True), \
          mock.patch.object(serve_state, 'remove_replica') as remove, \
@@ -1302,6 +1619,9 @@ class TestFailedStartupCleansOnlyScopedStorage:
     def _task():
         spec = mock.MagicMock()
         spec.pool = True
+        spec.placement_contract = placement_policy.resolve_fresh_contract(
+            None, pool=True)
+        spec.uses_logical_replicas = False
         spec.autoscaling_policy_str.return_value = 'policy'
         spec.load_balancing_policy = 'round_robin'
         spec.tls_credential = None
@@ -1309,6 +1629,13 @@ class TestFailedStartupCleansOnlyScopedStorage:
         return mock.MagicMock(service=spec)
 
     def _common_patches(self, task):
+
+        def _open(_path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get('mode', 'r')
+            data = (b'active_workspace: default\n'
+                    if 'b' in mode else 'service: {}')
+            return mock.mock_open(read_data=data)()
+
         return [
             mock.patch.object(service.auth_utils, 'get_or_generate_keys'),
             mock.patch.object(service.serve_state,
@@ -1317,8 +1644,7 @@ class TestFailedStartupCleansOnlyScopedStorage:
             mock.patch.object(service.task_lib.Task,
                               'from_yaml_str',
                               return_value=task),
-            mock.patch('builtins.open',
-                       mock.mock_open(read_data='service: {}')),
+            mock.patch('builtins.open', side_effect=_open),
             mock.patch.object(service.serve_utils,
                               'generate_remote_service_dir_name',
                               return_value='/tmp/scoped-service'),
@@ -1352,11 +1678,12 @@ class TestFailedStartupCleansOnlyScopedStorage:
 
     def test_multi_node_logical_service_is_rejected_before_registration(self):
         task = self._task()
-        task.service.uses_logical_replicas = True
+        task.service = _make_persisted_per_gpu_spec(uses_logical_replicas=True)
         task.num_nodes = 2
         patches = self._common_patches(task)
         with mock.patch.object(service.serve_state,
-                               'add_service') as add_service:
+                               'add_service') as add_service, \
+             _mock_external_lb_recovery():
             for patcher in patches:
                 patcher.start()
             try:

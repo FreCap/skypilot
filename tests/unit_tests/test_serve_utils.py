@@ -1,7 +1,9 @@
 # pylint: disable=missing-module-docstring,protected-access,import-outside-toplevel,missing-class-docstring,unused-argument,redefined-outer-name,reimported,confusing-with-statement
 import contextlib
+import hashlib
 import os
 import pathlib
+import shlex
 import tempfile
 import threading
 import types
@@ -15,9 +17,11 @@ from sqlalchemy import create_engine
 from sqlalchemy import orm
 
 from sky import clouds
+from sky import exceptions
 from sky.resources import Resources
 from sky.serve import constants
 from sky.serve import controller_transport
+from sky.serve import maintenance
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -25,6 +29,863 @@ from sky.serve import serve_utils
 # mock.patch needs the dotted path to the attribute being patched.
 _SIGNAL_FILE_CONST = (
     'sky.jobs.constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE')
+
+
+@pytest.mark.parametrize(('value', 'expected'),
+                         [(None, False), ('false', False), ('true', True)])
+def test_serve_controller_hold_requires_explicit_boolean(
+        monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR,
+                           raising=False)
+    else:
+        monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, value)
+
+    assert maintenance.is_controller_hold_active() is expected
+
+
+def test_serve_controller_hold_rejects_malformed_value(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'TRUE')
+
+    with pytest.raises(RuntimeError, match='must be exactly'):
+        maintenance.is_controller_hold_active()
+
+
+def test_serve_controller_hold_blocks_ha_recovery_before_state_reads(
+        monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    with mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner, \
+         mock.patch.object(serve_utils.serve_state,
+                           'get_glob_service_names') as get_names:
+        serve_utils.ha_recovery_for_consolidation_mode(pool=False)
+
+    runner.assert_not_called()
+    get_names.assert_not_called()
+
+
+def test_serve_controller_hold_blocks_termination_before_state_reads(
+        monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    with mock.patch.object(serve_utils.serve_state,
+                           'get_glob_service_names') as get_names, \
+         pytest.raises(RuntimeError, match='termination and purge'):
+        serve_utils.terminate_services(['svc'], purge=True, pool=False)
+
+    get_names.assert_not_called()
+
+
+def test_serve_controller_hold_does_not_block_pool_termination(monkeypatch):
+    monkeypatch.setenv(constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    with mock.patch.object(serve_utils.serve_state,
+                           'get_glob_service_names',
+                           return_value=[]):
+        message = serve_utils.terminate_services([], purge=False, pool=True)
+
+    assert message == 'No pool to terminate.'
+
+
+def test_update_config_capability_rejects_old_controller_before_mutation():
+    response = mock.Mock(status_code=404)
+    with mock.patch.object(serve_utils,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        with pytest.raises(RuntimeError, match='does not support atomic'):
+            serve_utils.require_update_config_snapshot_capability(
+                'svc', 'incarnation-a')
+
+
+def test_update_config_capability_accepts_matching_protocol():
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'config_snapshot_protocol_version':
+            constants.SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+    }
+    with mock.patch.object(serve_utils,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        serve_utils.require_update_config_snapshot_capability(
+            'svc', 'incarnation-a')
+
+
+@pytest.mark.parametrize('malformed_version', [True, 1.0])
+def test_update_config_capability_rejects_non_integer_protocol(
+        malformed_version):
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'config_snapshot_protocol_version': malformed_version,
+    }
+    with mock.patch.object(serve_utils,
+                           '_get_to_controller_with_retry',
+                           return_value=response), \
+         pytest.raises(RuntimeError, match='incompatible'):
+        serve_utils.require_update_config_snapshot_capability(
+            'svc', 'incarnation-a')
+
+
+def test_update_config_snapshot_uses_new_endpoint_and_exact_digest():
+    digest = 'a' * 64
+    snapshot_id = 'c' * 64
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'message': 'update accepted',
+        'config_snapshot_id': snapshot_id,
+    }
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={'hash': 'incarnation-a'}), \
+         mock.patch.object(serve_utils,
+                           '_post_to_controller_with_retry',
+                           return_value=response) as post:
+        serve_utils.update_service_encoded(
+            'svc',
+            2,
+            'rolling',
+            pool=False,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=7,
+            has_config_snapshot=True,
+            expected_config_snapshot_digest=digest,
+            config_snapshot_id=snapshot_id)
+    assert post.call_args.args[2] == (
+        constants.CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH)
+
+
+def test_update_config_snapshot_rejects_stale_snapshot_ack():
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'message': 'update accepted',
+        'config_snapshot_id': 'b' * 64,
+    }
+    with mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value={'hash': 'incarnation-a'}), \
+         mock.patch.object(serve_utils,
+                           '_post_to_controller_with_retry',
+                           return_value=response), \
+         pytest.raises(RuntimeError, match='different config snapshot'):
+        serve_utils.update_service_encoded(
+            'svc',
+            2,
+            'rolling',
+            pool=False,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=7,
+            has_config_snapshot=True,
+            expected_config_snapshot_digest='a' * 64,
+            config_snapshot_id='c' * 64)
+
+
+def test_secure_staged_controller_config_verifies_digest_and_tightens_mode(
+        tmp_path):
+    staged = tmp_path / 'config.yaml.staged'
+    config_bytes = b'active_workspace: research\n'
+    staged.write_bytes(config_bytes)
+    staged.chmod(0o644)
+
+    result = serve_utils.secure_staged_controller_config(
+        str(staged),
+        hashlib.sha256(config_bytes).hexdigest())
+
+    assert result == config_bytes
+    assert staged.stat().st_mode & 0o777 == 0o600
+
+
+def test_secure_staged_controller_config_rejects_digest_mismatch(tmp_path):
+    staged = tmp_path / 'config.yaml.staged'
+    staged.write_bytes(b'active_workspace: research\n')
+    staged.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match='digest does not match'):
+        serve_utils.secure_staged_controller_config(str(staged), '0' * 64)
+
+    # Tighten the raw snapshot before parsing or reporting a digest failure.
+    assert staged.stat().st_mode & 0o777 == 0o600
+
+
+def test_secure_staged_controller_config_rejects_symlink(tmp_path):
+    target = tmp_path / 'outside.yaml'
+    target.write_bytes(b'active_workspace: research\n')
+    staged = tmp_path / 'config.yaml.staged'
+    staged.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match='not a regular file'):
+        serve_utils.secure_staged_controller_config(
+            str(staged),
+            hashlib.sha256(target.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize('nonregular_kind', ['directory', 'fifo'])
+def test_secure_staged_controller_config_rejects_nonregular_without_blocking(
+        tmp_path, nonregular_kind):
+    staged = tmp_path / 'config.yaml.staged'
+    if nonregular_kind == 'directory':
+        staged.mkdir()
+    else:
+        os.mkfifo(staged)
+
+    with pytest.raises(RuntimeError, match='not a regular file'):
+        serve_utils.secure_staged_controller_config(str(staged), '0' * 64)
+
+
+def test_secure_staged_controller_config_rejects_oversize(tmp_path):
+    staged = tmp_path / 'config.yaml.staged'
+    config_bytes = b'x' * (1024 * 1024 + 1)
+    staged.write_bytes(config_bytes)
+
+    with pytest.raises(RuntimeError, match='exceeds the 1MiB limit'):
+        serve_utils.secure_staged_controller_config(
+            str(staged),
+            hashlib.sha256(config_bytes).hexdigest())
+
+
+def test_orphaned_config_stage_gc_is_nonce_and_commit_safe(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    now = 10_000.0
+    old_mtime = (now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1)
+    fresh_mtime = (now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS + 1)
+
+    def _write_stage(version, snapshot_id, mtime):
+        path = pathlib.Path(
+            serve_utils.generate_staged_config_yaml_file_name(
+                'svc', version, 'scope-a', snapshot_id=snapshot_id))
+        path.write_text('credential: raw\n', encoding='utf-8')
+        receipt = pathlib.Path(
+            serve_utils.generate_config_snapshot_receipt_file_name(str(path)))
+        receipt.write_text('receipt', encoding='utf-8')
+        os.utime(path, (mtime, mtime))
+        os.utime(receipt, (mtime, mtime))
+        return path, receipt
+
+    orphan_a = _write_stage(2, 'a' * 64, old_mtime)
+    orphan_b = _write_stage(2, 'b' * 64, old_mtime)
+    committed = _write_stage(3, 'c' * 64, old_mtime)
+    fresh = _write_stage(4, 'd' * 64, fresh_mtime)
+    missing_row = _write_stage(5, 'e' * 64, old_mtime)
+    legacy = _write_stage(6, None, old_mtime)
+    unrelated = tmp_path / 'config.yaml.v7.not-a-stage'
+    unrelated.write_text('preserve', encoding='utf-8')
+    monkeypatch.setattr(
+        serve_state, 'get_yaml_contents', lambda _service, _versions: {
+            2: None,
+            3: 'service: committed',
+            4: None,
+            6: None,
+        })
+
+    removed = serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                                'scope-a',
+                                                                now=now)
+
+    assert removed == [2, 6]
+    for stage, receipt in (orphan_a, orphan_b, legacy):
+        assert not stage.exists()
+        assert not receipt.exists()
+    for stage, receipt in (committed, fresh, missing_row):
+        assert stage.exists()
+        assert receipt.exists()
+    assert unrelated.read_text(encoding='utf-8') == 'preserve'
+
+
+def test_orphaned_config_stage_gc_preserves_concurrently_refreshed_path(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    snapshot_id = 'a' * 64
+    stage = pathlib.Path(
+        serve_utils.generate_staged_config_yaml_file_name(
+            'svc', 2, 'scope-a', snapshot_id=snapshot_id))
+    stage.write_text('old raw bytes', encoding='utf-8')
+    now = 10_000.0
+    old_mtime = (now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1)
+    os.utime(stage, (old_mtime, old_mtime))
+
+    def _refresh_during_db_read(_service, _versions):
+        stage.write_text('new request bytes', encoding='utf-8')
+        return {2: None}
+
+    monkeypatch.setattr(serve_state, 'get_yaml_contents',
+                        _refresh_during_db_read)
+
+    removed = serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                                'scope-a',
+                                                                now=now)
+
+    assert removed == []
+    assert stage.read_text(encoding='utf-8') == 'new request bytes'
+
+
+def test_orphaned_config_stage_gc_preserves_on_database_error(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    stage = pathlib.Path(
+        serve_utils.generate_staged_config_yaml_file_name('svc',
+                                                          2,
+                                                          'scope-a',
+                                                          snapshot_id='a' * 64))
+    stage.write_text('credential: raw\n', encoding='utf-8')
+    now = 10_000.0
+    old_mtime = (now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1)
+    os.utime(stage, (old_mtime, old_mtime))
+    monkeypatch.setattr(serve_state, 'get_yaml_contents',
+                        mock.Mock(side_effect=RuntimeError('database down')))
+
+    with pytest.raises(RuntimeError, match='database down'):
+        serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                          'scope-a',
+                                                          now=now)
+
+    assert stage.exists()
+
+
+def test_orphaned_receipt_temp_gc_cleans_crashed_writer_only_after_age_gate(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    old_receipt_temp = tmp_path / ('.config-receipt-' + 'a' * 32 + '.tmp')
+    fresh_receipt_temp = tmp_path / ('.config-receipt-' + 'b' * 32 + '.tmp')
+    old_receipt_temp.write_bytes(b'{"source_digest":"offline-verifier"}')
+    fresh_receipt_temp.write_bytes(b'{"source_digest":"in-flight"}')
+    malformed_neighbor = tmp_path / '.config-receipt-not-ours'
+    malformed_neighbor.write_text('preserve', encoding='utf-8')
+    now = 10_000.0
+    old_mtime = now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1
+    fresh_mtime = now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS + 1
+    os.utime(old_receipt_temp, (old_mtime, old_mtime))
+    os.utime(fresh_receipt_temp, (fresh_mtime, fresh_mtime))
+    get_yaml_contents = mock.Mock(side_effect=AssertionError(
+        'receipt temporaries do not require a database lookup'))
+    monkeypatch.setattr(serve_state, 'get_yaml_contents', get_yaml_contents)
+
+    removed = serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                                'scope-a',
+                                                                now=now)
+
+    assert removed == []
+    assert not old_receipt_temp.exists()
+    assert fresh_receipt_temp.exists()
+    assert malformed_neighbor.read_text(encoding='utf-8') == 'preserve'
+    get_yaml_contents.assert_not_called()
+
+
+def test_orphaned_receipt_temp_gc_preserves_concurrently_refreshed_path(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(config_path))
+    receipt_temp = tmp_path / ('.config-receipt-' + 'c' * 32 + '.tmp')
+    receipt_temp.write_text('old verifier', encoding='utf-8')
+    now = 10_000.0
+    old_mtime = now - constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS - 1
+    os.utime(receipt_temp, (old_mtime, old_mtime))
+    real_stat = os.stat
+    refreshed = False
+
+    def _refresh_before_recheck(path, *, follow_symlinks=True):
+        nonlocal refreshed
+        if os.fspath(path) == str(receipt_temp) and not refreshed:
+            refreshed = True
+            receipt_temp.write_text('new in-flight verifier', encoding='utf-8')
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, 'stat', _refresh_before_recheck)
+
+    removed = serve_utils.gc_orphaned_staged_controller_configs('svc',
+                                                                'scope-a',
+                                                                now=now)
+
+    assert removed == []
+    assert receipt_temp.read_text(encoding='utf-8') == 'new in-flight verifier'
+
+
+def test_version_controller_config_requires_custom_workspace_definition():
+    config_bytes = (b'active_workspace: research\n'
+                    b'workspaces: {}\n'
+                    b'kubernetes: {allowed_contexts: [east, phx]}\n')
+
+    with pytest.raises(RuntimeError,
+                       match="does not define durable workspace 'research'"):
+        serve_utils.parse_and_validate_version_controller_config(
+            config_bytes, 'research', 'deleted workspace test')
+
+
+def test_version_controller_config_allows_implicit_default_workspace():
+    parsed = serve_utils.parse_and_validate_version_controller_config(
+        b'active_workspace: default\n', 'default', 'default workspace test')
+
+    assert parsed.get_nested(('active_workspace',), None) == 'default'
+
+
+def test_ha_recovery_owner_fence_is_inserted_immediately_before_launch():
+    script = ('export EXISTING=value\n'
+              'python \\\n'
+              ' -u -m sky.serve.service --service-name svc\n')
+
+    bound = serve_utils.bind_ha_recovery_owner_fence(
+        script,
+        service_hash='incarnation-a',
+        lifecycle_epoch=8,
+        controller_pid=123,
+        controller_ip='10.4.0.1',
+        status=serve_state.ServiceStatus.CONTROLLER_FAILED,
+        recovery_version=7)
+
+    lines = bound.splitlines()
+    launch_index = lines.index('python \\')
+    fence_line = lines[launch_index - 1]
+    prefix = f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}='
+    assert fence_line.startswith(prefix)
+    encoded = shlex.split(fence_line[len('export '):].split('=', 1)[1])[0]
+    assert serve_utils.parse_ha_recovery_owner_fence(encoded) == {
+        'service_hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'controller_pid': 123,
+        'controller_ip': '10.4.0.1',
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'recovery_version': 7,
+    }
+
+
+def test_ha_recovery_owner_fence_rejects_partial_or_malformed_payload():
+    with pytest.raises(ValueError, match='invalid schema'):
+        serve_utils.parse_ha_recovery_owner_fence('{}')
+    with pytest.raises(ValueError, match='invalid version'):
+        serve_utils.parse_ha_recovery_owner_fence(
+            '{"service_hash":"i","lifecycle_epoch":1,'
+            '"controller_pid":null,"controller_ip":null,'
+            '"status":"CONTROLLER_FAILED","recovery_version":true}')
+
+
+@pytest.mark.parametrize('forged_location', ['staged', 'live'])
+def test_restore_uses_exact_db_bytes_over_forged_local_files(
+        tmp_path, forged_location):
+    live_path = str(tmp_path / 'config.yaml')
+    staged_path = str(tmp_path / 'config.yaml.v2.staged')
+    snapshot_id = 'c' * 64
+    durable = (b'active_workspace: research\n'
+               b'workspaces: {research: {}}\n'
+               b'kubernetes: {allowed_contexts: [east, phx]}\n')
+    forged = (b'active_workspace: research\n'
+              b'workspaces: {research: {}}\n'
+              b'kubernetes: {allowed_contexts: [attacker]}\n')
+    pathlib.Path(live_path).write_bytes(forged if forged_location ==
+                                        'live' else b'stale live config\n')
+    pathlib.Path(staged_path).write_bytes(
+        forged if forged_location == 'staged' else b'stale staged config\n')
+    live_receipt = pathlib.Path(
+        serve_utils.generate_config_snapshot_receipt_file_name(live_path))
+    staged_receipt = pathlib.Path(
+        serve_utils.generate_config_snapshot_receipt_file_name(staged_path))
+    live_receipt.write_text('forged live receipt', encoding='utf-8')
+    staged_receipt.write_text('forged staged receipt', encoding='utf-8')
+
+    snapshot = (durable, hashlib.sha256(durable).hexdigest(), snapshot_id)
+    with mock.patch.object(serve_state,
+                           'get_version_controller_config',
+                           return_value=snapshot) as get_snapshot:
+        restored = serve_utils.restore_version_controller_config(
+            'svc', 2, live_path, staged_path)
+
+    get_snapshot.assert_called_once_with('svc', 2)
+    assert restored == durable
+    assert pathlib.Path(live_path).read_bytes() == durable
+    assert pathlib.Path(live_path).stat().st_mode & 0o777 == 0o600
+    assert not pathlib.Path(staged_path).exists()
+    assert not live_receipt.exists()
+    assert not staged_receipt.exists()
+    assert b'attacker' not in pathlib.Path(live_path).read_bytes()
+
+
+def test_recovery_scrubs_raw_live_configs_but_preserves_stages(
+        tmp_path, monkeypatch):
+    base_path = tmp_path / 'config.yaml'
+    monkeypatch.setattr(serve_utils, 'generate_remote_config_yaml_file_name',
+                        lambda *_args, **_kwargs: str(base_path))
+    preserved_safe = tmp_path / 'config.yaml.v2'
+    paths = {
+        'config.yaml': b'credential: initial-secret\n',
+        'config.yaml.receipt': b'initial-source-digest',
+        'config.yaml.v1': b'credential: old-secret\n',
+        'config.yaml.v1.receipt': b'old-source-digest',
+        'config.yaml.v2': b'active_workspace: research\n',
+        'config.yaml.v2.receipt': b'current-source-digest',
+        'config.yaml.v3': b'credential: newer-secret\n',
+        'config.yaml.v3.receipt': b'newer-source-digest',
+        'config.yaml.v4.' + 'a' * 64 + '.staged': b'fresh-request',
+        'config.yaml.v4.' + 'a' * 64 + '.staged.receipt': b'fresh-receipt',
+        'config.yaml.v7.not-a-stage': b'unrelated',
+        '.config-receipt-' + 'b' * 32 + '.tmp': b'orphaned-source-digest',
+        '.config-receipt-not-ours': b'unrelated-dotfile',
+    }
+    for name, content in paths.items():
+        (tmp_path / name).write_bytes(content)
+
+    removed = serve_utils.scrub_obsolete_controller_config_files(
+        'svc', 2, 'scope-a')
+
+    assert removed == sorted([
+        'config.yaml',
+        'config.yaml.receipt',
+        'config.yaml.v1',
+        'config.yaml.v1.receipt',
+        'config.yaml.v2.receipt',
+        'config.yaml.v3',
+        'config.yaml.v3.receipt',
+        '.config-receipt-' + 'b' * 32 + '.tmp',
+    ])
+    assert preserved_safe.read_bytes() == b'active_workspace: research\n'
+    assert (tmp_path / ('config.yaml.v4.' + 'a' * 64 + '.staged')
+           ).read_bytes() == b'fresh-request'
+    assert (tmp_path / ('config.yaml.v4.' + 'a' * 64 + '.staged.receipt')
+           ).read_bytes() == b'fresh-receipt'
+    assert (tmp_path /
+            'config.yaml.v7.not-a-stage').read_bytes() == b'unrelated'
+    assert (tmp_path /
+            '.config-receipt-not-ours').read_bytes() == (b'unrelated-dotfile')
+
+
+def test_full_pod_ha_restores_versioned_db_config_before_runner(tmp_path):
+    service_dir = tmp_path / 'service-dir'
+    live_path = tmp_path / 'config.yaml'
+    staged_path = tmp_path / 'config.yaml.v7.staged'
+    live_path.write_text('active_workspace: stale\n', encoding='utf-8')
+    durable = (b'active_workspace: research\n'
+               b'workspaces: {research: {}}\n'
+               b'kubernetes: {allowed_contexts: [east, phx]}\n')
+    durable_digest = hashlib.sha256(durable).hexdigest()
+    recovery_script = serve_utils.strip_legacy_ha_recovery_config_payload(
+        'export SKYPILOT_CONFIG=/old/config.yaml\n'
+        '/usr/bin/python -u -m sky.serve.service --service-name svc\n',
+        '/old/config.yaml')
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+        'recovery_version': 7,
+        'config_protocol_active': True,
+    }
+    config_snapshot = (durable, durable_digest, 'c' * 64)
+    recovery_snapshot = {
+        **record,
+        'service_name': 'svc',
+        'controller_config_snapshot': config_snapshot,
+        'ha_recovery_script': recovery_script,
+    }
+    runner = mock.Mock()
+
+    def _run(script, require_outputs):
+        assert require_outputs is True
+        assert live_path.read_bytes() == durable
+        assert live_path.stat().st_mode & 0o777 == 0o600
+        assert f'export SKYPILOT_CONFIG={live_path}' in script
+        assert 'base64 -d' not in script
+        fence_prefix = (f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}=')
+        fence_line = next(line for line in script.splitlines()
+                          if line.startswith(fence_prefix))
+        encoded_fence = shlex.split(fence_line[len('export '):].split('=',
+                                                                      1)[1])[0]
+        assert serve_utils.parse_ha_recovery_owner_fence(
+            encoded_fence)['recovery_version'] == 7
+        return 0, '', ''
+
+    runner.run.side_effect = _run
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(serve_state,
+                           'get_latest_committed_versions',
+                           return_value={}), \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hashes',
+                           return_value={}), \
+         mock.patch.object(serve_state,
+                           'get_ha_recovery_script',
+                           return_value='legacy lookup must not run') as legacy, \
+         mock.patch.object(
+             serve_state,
+             'get_service_ha_recovery_snapshot',
+             return_value=recovery_snapshot) as authorize, \
+         mock.patch.object(serve_state,
+                           'get_recovery_version_spec') as recovery_lookup, \
+         mock.patch.object(
+             serve_state,
+             'get_version_controller_config') as get_snapshot, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value=str(service_dir)), \
+         mock.patch.object(serve_utils,
+                           'generate_versioned_config_yaml_file_name',
+                           return_value=str(live_path)), \
+         mock.patch.object(serve_utils,
+                           'generate_staged_config_yaml_file_name',
+                           return_value=str(staged_path)), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner',
+                           return_value=runner), \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    runner.run.assert_called_once()
+    authorize.assert_called_once_with('svc',
+                                      expected_service_hash='incarnation-a')
+    legacy.assert_not_called()
+    recovery_lookup.assert_not_called()
+    get_snapshot.assert_not_called()
+
+
+def test_full_pod_ha_refuses_corrupt_versioned_db_config(tmp_path):
+    live_path = tmp_path / 'config.yaml'
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+        'recovery_version': 7,
+        'config_protocol_active': True,
+    }
+    corrupt = b'active_workspace: attacker\nworkspaces: {attacker: {}}\n'
+    recovery_script = serve_utils.strip_legacy_ha_recovery_config_payload(
+        'export SKYPILOT_CONFIG=/old/config.yaml\n'
+        '/usr/bin/python -u -m sky.serve.service --service-name svc\n',
+        '/old/config.yaml')
+    recovery_snapshot = {
+        **record,
+        'service_name': 'svc',
+        'controller_config_snapshot':
+            (corrupt, hashlib.sha256(corrupt).hexdigest(), 'c' * 64),
+        'ha_recovery_script': recovery_script,
+    }
+    runner = mock.Mock()
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(serve_state,
+                           'get_latest_committed_versions',
+                           return_value={}), \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hashes',
+                           return_value={}), \
+         mock.patch.object(
+             serve_state,
+             'get_service_ha_recovery_snapshot',
+             return_value=recovery_snapshot) as authorize, \
+         mock.patch.object(serve_state,
+                           'get_version_controller_config') as get_snapshot, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value=str(tmp_path / 'service-dir')), \
+         mock.patch.object(serve_utils,
+                           'generate_versioned_config_yaml_file_name',
+                           return_value=str(live_path)), \
+         mock.patch.object(serve_utils,
+                           'generate_staged_config_yaml_file_name',
+                           return_value=str(tmp_path / 'config.staged')), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner',
+                           return_value=runner), \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    runner.run.assert_not_called()
+    authorize.assert_called_once_with('svc',
+                                      expected_service_hash='incarnation-a')
+    get_snapshot.assert_not_called()
+    assert not live_path.exists()
+    assert "belongs to workspace 'attacker', expected 'research'" in (
+        tmp_path / 'recovery_pool_.log').read_text(encoding='utf-8')
+
+
+def test_full_pod_ha_refuses_protocol_row_without_selected_config(tmp_path):
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+        'recovery_version': 7,
+        'config_protocol_active': True,
+    }
+    recovery_snapshot = {
+        **record,
+        'service_name': 'svc',
+        'controller_config_snapshot': None,
+        'ha_recovery_script': 'recover',
+    }
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(
+             serve_state,
+             'get_service_ha_recovery_snapshot',
+             return_value=recovery_snapshot) as authorize, \
+         mock.patch.object(serve_state,
+                           'get_version_controller_config') as get_snapshot, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_utils,
+                           'generate_remote_service_dir_name',
+                           return_value=str(tmp_path / 'service-dir')), \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner_cls, \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    get_snapshot.assert_not_called()
+    authorize.assert_called_once_with('svc',
+                                      expected_service_hash='incarnation-a')
+    runner_cls.return_value.run.assert_not_called()
+    assert 'has no complete controller config snapshot' in (
+        tmp_path / 'recovery_pool_.log').read_text(encoding='utf-8')
+
+
+def test_full_pod_ha_skips_owner_changed_after_liveness_sweep(tmp_path):
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+        'recovery_version': 7,
+        'config_protocol_active': True,
+    }
+    current_snapshot = {
+        **record,
+        'service_name': 'svc',
+        'controller_pid': 9876,
+        'controller_ip': '10.4.0.8',
+        'controller_config_snapshot': None,
+        'ha_recovery_script': 'must not run',
+    }
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(
+             serve_state,
+             'get_service_ha_recovery_snapshot',
+             return_value=current_snapshot) as authorize, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(serve_utils,
+                           'generate_remote_service_dir_name') as service_dir, \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner_cls, \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    authorize.assert_called_once_with('svc',
+                                      expected_service_hash='incarnation-a')
+    service_dir.assert_not_called()
+    runner_cls.return_value.run.assert_not_called()
+    assert 'changed recovery owner metadata (controller_pid, controller_ip)' in (
+        tmp_path / 'recovery_pool_.log').read_text(encoding='utf-8')
+
+
+def test_cleanup_staged_config_update_uses_nonce_and_lifecycle_fence():
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {'removed': True}
+    with mock.patch.object(serve_utils,
+                           '_post_to_controller_with_retry',
+                           return_value=response) as post:
+        removed = serve_utils.cleanup_staged_config_update_encoded(
+            'svc', 'incarnation-a', 2, 7, 'c' * 64)
+
+    assert removed
+    assert post.call_args.args[2] == (
+        constants.CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH)
+    assert post.call_args.kwargs['json'] == {
+        'version': 2,
+        'expected_lifecycle_epoch': 7,
+        'config_snapshot_id': 'c' * 64,
+    }
+
+
+def test_cleanup_staged_config_update_fails_closed_on_controller_error():
+    response = mock.Mock(status_code=409, text='version already committed')
+    with mock.patch.object(serve_utils,
+                           '_post_to_controller_with_retry',
+                           return_value=response), \
+         pytest.raises(RuntimeError, match='could not safely clean'):
+        serve_utils.cleanup_staged_config_update_encoded(
+            'svc', 'incarnation-a', 2, 7, 'c' * 64)
+
+
+def test_cleanup_history_mode_is_strong_for_v2_and_malformed_rows():
+    info = mock.Mock()
+    with mock.patch(
+            'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+            return_value=None):
+        assert not serve_utils.replica_cleanup_requires_terminal_history([info])
+    with mock.patch(
+            'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+            return_value=types.SimpleNamespace()):
+        assert serve_utils.replica_cleanup_requires_terminal_history([info])
+    with mock.patch(
+            'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+            side_effect=exceptions.KubernetesPhysicalClusterIdentityError(
+                'partial v2 state')):
+        assert serve_utils.replica_cleanup_requires_terminal_history([info])
 
 
 @contextlib.contextmanager
@@ -173,6 +1034,42 @@ def test_resolve_legacy_service_workspace_requires_trusted_empty_hint():
     set_workspace.assert_called_once_with('svc', 'research', 'incarnation-a')
 
 
+def test_resolve_service_workspace_rechecks_with_status_snapshot_only():
+    replicas = [types.SimpleNamespace(cluster_name='svc-r1')]
+    cluster_records = {
+        'svc-r1': {
+            'workspace': 'research'
+        },
+    }
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=replicas), \
+         mock.patch.object(serve_utils.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=cluster_records), \
+         mock.patch.object(serve_state,
+                           'set_service_workspace_if_owner',
+                           return_value=False), \
+         mock.patch.object(serve_state,
+                           'get_service_status_snapshot',
+                           return_value={
+                               'hash': 'incarnation-a',
+                               'workspace': 'research',
+                           }) as get_snapshot, \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           side_effect=AssertionError(
+                               'joined service read used')):
+        workspace = serve_utils.resolve_service_workspace(
+            'svc', {
+                'workspace': None,
+                'hash': 'incarnation-a'
+            }, 'research')
+
+    assert workspace == 'research'
+    get_snapshot.assert_called_once_with('svc')
+
+
 def test_resolve_service_workspace_rejects_stored_workspace_mismatch():
     with pytest.raises(RuntimeError, match="belongs to workspace 'research'"):
         serve_utils.resolve_service_workspace('svc', {
@@ -181,21 +1078,97 @@ def test_resolve_service_workspace_rejects_stored_workspace_mismatch():
         }, 'production')
 
 
+def test_get_yaml_content_uses_status_snapshot_for_resource_scope_fallback(
+        tmp_path):
+    yaml_path = tmp_path / 'svc.yaml'
+    yaml_path.write_text('service: yaml\n', encoding='utf-8')
+
+    with mock.patch.object(serve_state,
+                           'get_yaml_content',
+                           return_value=None), \
+         mock.patch.object(serve_state,
+                           'get_service_status_snapshot',
+                           return_value={
+                               'resource_scope': 'scope-a',
+                           }) as get_snapshot, \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           side_effect=AssertionError(
+                               'joined service read used')), \
+         mock.patch.object(serve_utils,
+                           'generate_task_yaml_file_name',
+                           return_value=str(yaml_path)) as get_yaml_path:
+        content = serve_utils.get_yaml_content('svc', 7)
+
+    assert content == 'service: yaml\n'
+    get_snapshot.assert_called_once_with('svc')
+    get_yaml_path.assert_called_once_with('svc', 7, resource_scope='scope-a')
+
+
 def test_launch_quiesce_awaits_cancel_request_before_reporting_success():
     replicas = [
-        mock.Mock(cluster_name='svc-a-r1'),
-        mock.Mock(cluster_name='svc-a-r2'),
+        mock.Mock(cluster_name='svc-a-r1', created_at=100.0),
+        mock.Mock(cluster_name='svc-a-r2', created_at=100.0),
     ]
-    launch_request = mock.Mock(request_id='launch-request')
-    launch_request.name = 'sky.launch'
-    launch_request.cluster_name = 'svc-a-r1'
     cancellation_completed = False
+    quiescence_polls = 0
     events = []
 
-    def _status(*, all_status, fields):
-        assert all_status is False
-        assert fields == ['request_id', 'name', 'cluster_name']
-        return [] if cancellation_completed else [launch_request]
+    def _status(**kwargs):
+        nonlocal quiescence_polls
+        if 'request_ids' not in kwargs:
+            assert kwargs == {
+                'all_status': True,
+                'cluster_names': ['svc-a-r1', 'svc-a-r2'],
+                '_include_request_names': ['sky.launch'],
+                '_execution_quiescence_candidates_only': True,
+                'fields': [
+                    'request_id', 'name', 'cluster_name',
+                    'execution_generation', 'status',
+                    'execution_quiescence_required',
+                    'execution_quiesced_generation', 'execution_quiesced_at'
+                ],
+            }
+            events.append('discovery-status')
+            return [
+                types.SimpleNamespace(
+                    request_id='launch-request',
+                    name='sky.launch',
+                    cluster_name='svc-a-r1',
+                    created_at=101.0,
+                    execution_generation=7,
+                    status=('CANCELLED'
+                            if cancellation_completed else 'RUNNING'),
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=(7 if cancellation_completed
+                                                   else None),
+                    execution_quiesced_at=(1.0
+                                           if cancellation_completed else None))
+            ]
+        assert kwargs == {
+            'request_ids': ['launch-request'],
+            'fields': [
+                'request_id', 'name', 'cluster_name', 'status',
+                'execution_generation', 'execution_quiescence_required',
+                'execution_quiesced_generation', 'execution_quiesced_at'
+            ],
+            '_exact_request_ids': True,
+            '_use_body': True,
+        }
+        events.append('quiescence-status')
+        quiescence_polls += 1
+        return [
+            types.SimpleNamespace(
+                request_id='launch-request',
+                name='sky.launch',
+                cluster_name='svc-a-r1',
+                status='CANCELLED',
+                execution_generation=7,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=(None
+                                               if quiescence_polls == 1 else 7),
+                execution_quiesced_at=(None if quiescence_polls == 1 else 1.0))
+        ]
 
     def _cancel(request_ids, *, all_users, silent):
         assert request_ids == ['launch-request']
@@ -214,13 +1187,177 @@ def test_launch_quiesce_awaits_cancel_request_before_reporting_success():
          mock.patch.object(serve_utils.sdk,
                            'api_cancel', side_effect=_cancel), \
          mock.patch.object(serve_utils.sdk,
-                           'stream_and_get', side_effect=_await):
+                           'stream_and_get', side_effect=_await), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION), \
+         mock.patch.object(serve_utils, '_LAUNCH_QUIESCE_POLL_SECONDS', 0):
         quiesced = serve_utils.quiesce_service_replica_launch_requests(
-            'svc', replicas, continue_guard=lambda: True)
+            'svc',
+            replicas,
+            continue_guard=lambda: True,
+            include_terminal_history=True)
 
     assert quiesced
-    assert events == ['cancel-enqueued', 'cancel-awaited']
-    assert status.call_count == 2
+    assert events == [
+        'discovery-status', 'cancel-enqueued', 'cancel-awaited',
+        'quiescence-status', 'quiescence-status', 'discovery-status'
+    ]
+    assert status.call_count == 4
+
+
+@pytest.mark.parametrize('terminal_status', ['SUCCEEDED', 'FAILED'])
+def test_launch_quiesce_accepts_handler_terminal_race(terminal_status):
+    replica = mock.Mock(cluster_name='svc-a-r1', created_at=100.0)
+    active_request = types.SimpleNamespace(request_id='launch-request',
+                                           name='sky.launch',
+                                           cluster_name='svc-a-r1',
+                                           created_at=101.0,
+                                           execution_generation=7,
+                                           status='RUNNING',
+                                           execution_quiescence_required=True,
+                                           execution_quiesced_generation=None,
+                                           execution_quiesced_at=None)
+    terminal_request = types.SimpleNamespace(request_id='launch-request',
+                                             name='sky.launch',
+                                             cluster_name='svc-a-r1',
+                                             created_at=101.0,
+                                             status=terminal_status,
+                                             execution_generation=7,
+                                             execution_quiescence_required=True,
+                                             execution_quiesced_generation=7,
+                                             execution_quiesced_at=1.0)
+    status_results = [[active_request], [terminal_request], []]
+    with mock.patch.object(serve_utils.sdk,
+                           'api_status', side_effect=status_results), \
+         mock.patch.object(serve_utils.sdk,
+                           'api_cancel', return_value='cancel-request'), \
+         mock.patch.object(serve_utils.sdk, 'stream_and_get'), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+        assert serve_utils.quiesce_service_replica_launch_requests(
+            'svc', [replica],
+            continue_guard=lambda: True,
+            include_terminal_history=True)
+
+
+def test_launch_quiesce_missing_terminal_request_fails_closed():
+    replica = mock.Mock(cluster_name='svc-a-r1', created_at=100.0)
+    active_request = types.SimpleNamespace(request_id='launch-request',
+                                           name='sky.launch',
+                                           cluster_name='svc-a-r1',
+                                           created_at=101.0,
+                                           execution_generation=7,
+                                           status='RUNNING',
+                                           execution_quiescence_required=True,
+                                           execution_quiesced_generation=None,
+                                           execution_quiesced_at=None)
+    with mock.patch.object(serve_utils.sdk,
+                           'api_status', side_effect=[[active_request], []]), \
+         mock.patch.object(serve_utils.sdk,
+                           'api_cancel', return_value='cancel-request'), \
+         mock.patch.object(serve_utils.sdk, 'stream_and_get'), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+        assert not serve_utils.quiesce_service_replica_launch_requests(
+            'svc', [replica],
+            continue_guard=lambda: True,
+            include_terminal_history=True)
+
+
+def test_launch_quiesce_old_server_fails_closed():
+    replica = mock.Mock(cluster_name='svc-a-r1', created_at=100.0)
+    active_request = types.SimpleNamespace(request_id='launch-request',
+                                           name='sky.launch',
+                                           cluster_name='svc-a-r1',
+                                           created_at=101.0,
+                                           execution_generation=7,
+                                           status='RUNNING',
+                                           execution_quiescence_required=False,
+                                           execution_quiesced_generation=None,
+                                           execution_quiesced_at=None)
+    cancelled_request = types.SimpleNamespace(
+        request_id='launch-request',
+        name='sky.launch',
+        cluster_name='svc-a-r1',
+        created_at=101.0,
+        status='CANCELLED',
+        execution_generation=7,
+        execution_quiescence_required=False,
+        execution_quiesced_generation=None,
+        execution_quiesced_at=None)
+    with mock.patch.object(
+            serve_utils.sdk,
+            'api_status',
+            side_effect=[[active_request], [cancelled_request]]), \
+         mock.patch.object(serve_utils.sdk,
+                           'api_cancel', return_value='cancel-request'), \
+         mock.patch.object(serve_utils.sdk, 'stream_and_get'), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=(serve_utils.server_constants.
+                           MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION - 1)):
+        assert not serve_utils.quiesce_service_replica_launch_requests(
+            'svc', [replica],
+            continue_guard=lambda: True,
+            include_terminal_history=True)
+
+
+def test_launch_quiesce_history_catches_arbitrarily_old_cancelled_handler():
+    replica = mock.Mock(cluster_name='svc-a-r1', created_at=100.0)
+    unproven = types.SimpleNamespace(request_id='launch-request',
+                                     name='sky.launch',
+                                     cluster_name='svc-a-r1',
+                                     created_at=-1_000_000.0,
+                                     status='CANCELLED',
+                                     execution_generation=7,
+                                     execution_quiescence_required=True,
+                                     execution_quiesced_generation=None,
+                                     execution_quiesced_at=None)
+    proven = types.SimpleNamespace(request_id='launch-request',
+                                   name='sky.launch',
+                                   cluster_name='svc-a-r1',
+                                   created_at=-1_000_000.0,
+                                   status='CANCELLED',
+                                   execution_generation=7,
+                                   execution_quiescence_required=True,
+                                   execution_quiesced_generation=7,
+                                   execution_quiesced_at=1.0)
+    with mock.patch.object(
+            serve_utils.sdk,
+            'api_status',
+            side_effect=[[unproven], [proven], [proven]]) as status, \
+         mock.patch.object(serve_utils.sdk, 'api_cancel') as cancel, \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+        assert serve_utils.quiesce_service_replica_launch_requests(
+            'svc', [replica],
+            continue_guard=lambda: True,
+            include_terminal_history=True)
+
+    assert status.call_args_list[0] == mock.call(
+        all_status=True,
+        cluster_names=['svc-a-r1'],
+        _include_request_names=['sky.launch'],
+        _execution_quiescence_candidates_only=True,
+        fields=[
+            'request_id', 'name', 'cluster_name', 'execution_generation',
+            'status', 'execution_quiescence_required',
+            'execution_quiesced_generation', 'execution_quiesced_at'
+        ])
+    cancel.assert_not_called()
 
 
 def test_launch_quiesce_large_inventory_uses_one_active_request_snapshot():
@@ -233,7 +1370,12 @@ def test_launch_quiesce_large_inventory_uses_one_active_request_snapshot():
                           cluster_name='another-service-r1')
     with mock.patch.object(serve_utils.sdk,
                            'api_status', return_value=[unrelated]) as status, \
-         mock.patch.object(serve_utils.sdk, 'api_cancel') as cancel:
+         mock.patch.object(serve_utils.sdk, 'api_cancel') as cancel, \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
         quiesced = serve_utils.quiesce_service_replica_launch_requests(
             'svc', replicas, continue_guard=lambda: True)
 
@@ -248,13 +1390,19 @@ def test_launch_quiesce_failure_retains_cleanup_inventory():
     launch_request = mock.Mock(request_id='launch-request')
     launch_request.name = 'sky.launch'
     launch_request.cluster_name = 'svc-a-r1'
+    launch_request.execution_generation = 7
     with mock.patch.object(serve_utils.sdk,
                            'api_status', return_value=[launch_request]), \
          mock.patch.object(serve_utils.sdk,
                            'api_cancel', return_value='cancel-request'), \
          mock.patch.object(serve_utils.sdk,
                            'stream_and_get',
-                           side_effect=RuntimeError('cancel worker down')):
+                           side_effect=RuntimeError('cancel worker down')), \
+         mock.patch.object(
+             serve_utils.versions,
+             'get_remote_api_version',
+             return_value=serve_utils.server_constants.
+             MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
         assert not serve_utils.quiesce_service_replica_launch_requests(
             'svc', [replica], continue_guard=lambda: True)
 
@@ -1305,6 +2453,49 @@ def test_child_only_purge_skips_absent_clusters_with_one_inventory_snapshot():
     remove.assert_called_once_with('orphan', 9)
 
 
+def test_child_only_purge_retains_absent_protocol_v2_cluster():
+    lifecycle_lock = mock.MagicMock(epoch=9)
+    replica = mock.Mock(replica_id=1, cluster_name='orphan-r1')
+    cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                          physical_cluster_uid='phx-uid')
+    with mock.patch.object(serve_utils,
+                           'get_service_lifecycle_lock',
+                           return_value=lifecycle_lock), \
+         mock.patch.object(serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hash', return_value=None), \
+         mock.patch.object(serve_state,
+                           'get_orphaned_service_child_mode',
+                           return_value=True), \
+         mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[replica]), \
+         mock.patch.object(
+             serve_utils,
+             'quiesce_service_replica_launch_requests',
+             return_value=True) as quiesce, \
+         mock.patch.object(serve_state,
+                           'get_ephemeral_storage_cleanup_intents',
+                           return_value=[]), \
+         mock.patch.object(serve_utils.global_user_state,
+                           'get_cluster_status_fields', return_value={}), \
+         mock.patch(
+             'sky.serve.reserved_capacity.'
+             'parse_protocol_v2_cleanup_fence',
+             return_value=cleanup_fence), \
+         mock.patch('sky.serve.replica_managers.terminate_cluster'
+                   ) as terminate, \
+         mock.patch.object(serve_state,
+                           'remove_orphaned_service_children') as remove:
+        message = serve_utils._terminate_orphaned_service_children_impl(
+            'orphan', True)
+
+    assert message is not None and 'cluster termination failed' in message
+    assert quiesce.call_args.kwargs['include_terminal_history'] is True
+    terminate.assert_not_called()
+    remove.assert_not_called()
+
+
 def test_orphaned_service_cluster_fields_require_consolidation():
     with mock.patch.object(serve_utils,
                            'is_consolidation_mode',
@@ -1723,6 +2914,58 @@ class TestServiceStatusEndpointSnapshot:
         info.handle = mock.Mock(return_value=handle)
         return info, handle
 
+    def _v2_replica(self, name):
+        # pylint: disable=import-outside-toplevel
+        from sky import backends
+        from sky.serve import replica_managers
+        from sky.serve import reserved_capacity_broker
+
+        info = replica_managers.ReplicaInfo(replica_id=int(name.split('-')[-1]),
+                                            cluster_name=name,
+                                            replica_port='8080',
+                                            is_spot=False,
+                                            location=None,
+                                            version=1,
+                                            resources_override=None)
+        info.status_property.sky_launch_status = (
+            replica_managers.common_utils.ProcessStatus.SUCCEEDED)
+        info.status_property.service_ready_now = True
+        info.status_property.first_ready_time = 1.0
+        info.reserved_fill = True
+        info.reserved_fill_pool_key = reserved_capacity_broker.make_pool_key(
+            'phx-context',
+            'H200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-uid')
+        info.reserved_fill_service_generation = 7
+        info.reserved_fill_physical_cluster_uid = 'physical-uid'
+        info.reserved_fill_kubernetes_context = 'phx-context'
+        info.location = {
+            'cloud': 'Kubernetes',
+            'region': 'phx-context',
+            'zone': None,
+            'accelerators': {
+                'H200': 1,
+            },
+        }
+        info.resources_override = {
+            'cloud': 'Kubernetes',
+            'region': 'phx-context',
+            'accelerators': {
+                'H200': 1,
+            },
+        }
+        handle = mock.Mock(spec=backends.CloudVmRayResourceHandle)
+        handle.cluster_name = name
+        handle.cluster_yaml = '/tmp/phx.yaml'
+        handle.launched_resources = Resources(
+            cloud=clouds.Kubernetes(),
+            instance_type=('4CPU--16GB--H200:1'),
+            region='phx-context',
+            accelerators={'H200': 1})
+        handle.launched_nodes = 1
+        return info, handle
+
     def test_summary_reports_logical_and_physical_capacity_counts(self):
         service_record = {
             'name': 'svc-a',
@@ -1827,6 +3070,261 @@ class TestServiceStatusEndpointSnapshot:
         for info, _ in replicas_and_handles:
             info.handle.assert_called_once_with(
                 cluster_records[info.cluster_name])
+
+    def test_service_status_tolerates_missing_cluster_record_in_snapshot(self):
+        replicas_and_handles = [self._replica(f'r-{i}') for i in (1, 2)]
+        replicas = [info for info, _ in replicas_and_handles]
+        cluster_records = {
+            replicas[0].cluster_name: {
+                'launched_at': 1,
+                'handle': replicas_and_handles[0][1],
+            },
+        }
+        endpoint_calls = []
+
+        def _get_endpoints(cluster, port, **kwargs):
+            endpoint_calls.append((cluster, port, kwargs))
+            return {port: f'{cluster}.svc:{port}'}
+
+        record = {
+            'name': 'svc-a',
+            'pool': False,
+            'version': 1,
+        }
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_service_from_name',
+                return_value=record), \
+             mock.patch('sky.serve.serve_utils.serve_state.get_replica_infos',
+                        return_value=replicas), \
+             mock.patch('sky.serve.serve_utils.global_user_state.'
+                        'get_clusters_from_names',
+                        return_value=cluster_records) as mock_clusters, \
+             mock.patch('sky.serve.replica_managers.global_user_state.'
+                        'get_cluster_from_name',
+                        side_effect=AssertionError(
+                            'per-replica cluster reread used')), \
+             mock.patch('sky.serve.replica_managers.backend_utils.'
+                        'get_endpoints',
+                        side_effect=_get_endpoints):
+            status = serve_utils._get_service_status(
+                'svc-a',
+                pool=False,
+                with_yaml=False,
+                with_target_num_replicas=False)
+
+        assert status is not None
+        mock_clusters.assert_called_once_with(['r-1', 'r-2'])
+        assert [replica['endpoint'] for replica in status['replica_info']
+               ] == ['http://r-1.svc:8080', None]
+        assert endpoint_calls == [
+            ('r-1', 8080, {
+                'cluster_record': cluster_records['r-1']
+            }),
+        ]
+        replicas[0].handle.assert_called_once_with(cluster_records['r-1'])
+        replicas[1].handle.assert_not_called()
+
+    def test_v2_status_group_uses_one_uid_read_for_all_replicas(self):
+        replicas_and_handles = [
+            self._v2_replica(f'r-{index}') for index in (1, 2)
+        ]
+        replicas = [info for info, _ in replicas_and_handles]
+        cluster_records = {
+            info.cluster_name: {
+                'name': info.cluster_name,
+                'launched_at': index,
+                'handle': handle,
+            } for index, (info,
+                         handle) in enumerate(replicas_and_handles, start=1)
+        }
+        depth = 0
+        uid_reads = 0
+
+        @contextlib.contextmanager
+        def _physical_fence(context, physical_uid):
+            nonlocal depth, uid_reads
+            assert (context, physical_uid) == ('phx-context', 'physical-uid')
+            if depth == 0:
+                uid_reads += 1
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+        record = {'name': 'svc-a', 'pool': False, 'version': 1}
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=replicas), \
+             mock.patch.object(serve_utils.global_user_state,
+                               'get_clusters_from_names',
+                               return_value=cluster_records), \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence',
+                 side_effect=_physical_fence), \
+             mock.patch('sky.backends.backend_utils.get_endpoints',
+                        return_value={8080: '10.0.0.1:8080'}):
+            status = serve_utils._get_service_status(
+                'svc-a', pool=False, with_target_num_replicas=False)
+
+        assert status is not None
+        assert uid_reads == 1
+        assert [item['endpoint'] for item in status['replica_info']] == [
+            'http://10.0.0.1:8080',
+            'http://10.0.0.1:8080',
+        ]
+
+    def test_v2_pool_status_group_still_proves_uid_once(self):
+        replicas_and_handles = [
+            self._v2_replica(f'r-{index}') for index in (1, 2)
+        ]
+        replicas = [info for info, _ in replicas_and_handles]
+        for info in replicas:
+            info.replica_port = '-'
+        cluster_records = {
+            info.cluster_name: {
+                'name': info.cluster_name,
+                'launched_at': index,
+                'handle': handle,
+            } for index, (info,
+                         handle) in enumerate(replicas_and_handles, start=1)
+        }
+        depth = 0
+        uid_reads = 0
+
+        @contextlib.contextmanager
+        def _physical_fence(context, physical_uid):
+            nonlocal depth, uid_reads
+            assert (context, physical_uid) == ('phx-context', 'physical-uid')
+            if depth == 0:
+                uid_reads += 1
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+        record = {'name': 'pool-a', 'pool': True, 'version': 1}
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=replicas), \
+             mock.patch.object(serve_utils.global_user_state,
+                               'get_clusters_from_names',
+                               return_value=cluster_records), \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence',
+                 side_effect=_physical_fence), \
+             mock.patch('sky.backends.backend_utils.get_endpoints') as endpoint, \
+             mock.patch.object(
+                 serve_utils.managed_job_state,
+                 'get_nonterminal_job_status_counts_by_pool',
+                 return_value={}), \
+             mock.patch.object(
+                 serve_utils.managed_job_state,
+                 'get_nonterminal_job_ids_by_pool_grouped',
+                 return_value={}):
+            status = serve_utils._get_service_status(
+                'pool-a',
+                pool=True,
+                with_yaml=False,
+                with_target_num_replicas=False)
+
+        assert status is not None
+        assert uid_reads == 1
+        assert [item['endpoint'] for item in status['replica_info']
+               ] == [None, None]
+        endpoint.assert_not_called()
+
+    def test_v2_status_uid_mismatch_omits_replacement_provider_data(self):
+        info, handle = self._v2_replica('r-1')
+        cluster_record = {
+            'name': info.cluster_name,
+            'launched_at': 9,
+            'handle': handle,
+        }
+        provider_fence = mock.MagicMock()
+        provider_fence.return_value.__enter__.side_effect = (
+            exceptions.KubernetesPhysicalClusterIdentityError('UID mismatch'))
+        record = {'name': 'svc-a', 'pool': False, 'version': 1}
+
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(serve_utils.global_user_state,
+                               'get_clusters_from_names',
+                               return_value={info.cluster_name: cluster_record}), \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence',
+                 provider_fence), \
+             mock.patch('sky.backends.backend_utils.get_endpoints') as endpoint:
+            status = serve_utils._get_service_status(
+                'svc-a', pool=False, with_target_num_replicas=False)
+
+        assert status is not None
+        replica = status['replica_info'][0]
+        assert replica['status'] is serve_state.ReplicaStatus.UNKNOWN
+        assert replica['endpoint'] is None
+        assert replica['handle'] is None
+        assert replica['launched_at'] is None
+        assert replica['provider_identity_uncertain'] is True
+        assert replica['cloud'] == 'Kubernetes'
+        assert 'hourly_cost' not in replica
+        endpoint.assert_not_called()
+
+    def test_malformed_v2_status_is_unknown_without_provider_admission(self):
+        info, handle = self._v2_replica('r-1')
+        info.reserved_fill_kubernetes_context = 'contradictory-context'
+        cluster_record = {
+            'name': info.cluster_name,
+            'launched_at': 9,
+            'handle': handle,
+        }
+        record = {'name': 'svc-a', 'pool': False, 'version': 1}
+
+        with mock.patch.object(serve_state,
+                               'get_service_from_name',
+                               return_value=record), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[info]), \
+             mock.patch.object(
+                 serve_utils.global_user_state,
+                 'get_clusters_from_names',
+                 return_value={info.cluster_name: cluster_record}), \
+             mock.patch.object(serve_utils.provider_phase,
+                               'provider_phase') as phase, \
+             mock.patch(
+                 'sky.adaptors.kubernetes.physical_cluster_uid_fence') as uid, \
+             mock.patch('sky.backends.backend_utils.get_endpoints') as endpoint:
+            status = serve_utils._get_service_status(
+                'svc-a',
+                pool=False,
+                with_yaml=False,
+                with_target_num_replicas=False)
+
+        assert status is not None
+        replica = status['replica_info'][0]
+        assert replica['status'] is serve_state.ReplicaStatus.UNKNOWN
+        assert replica['provider_identity_uncertain'] is True
+        assert replica['endpoint'] is None
+        assert replica['handle'] is None
+        assert replica['launched_at'] is None
+        # Durable placement remains useful and is not replacement-provider
+        # evidence; live endpoint/handle/cost metadata stays absent.
+        assert replica['cloud'] == 'Kubernetes'
+        assert 'hourly_cost' not in replica
+        phase.assert_not_called()
+        uid.assert_not_called()
+        endpoint.assert_not_called()
 
 
 class TestTerminalStatuses:
@@ -1960,6 +3458,181 @@ class TestStreamReplicaLogsZeroByteFallback:
         captured = capsys.readouterr()
         assert 'MAIN-CONTENT' in captured.out
         assert 'SHOULD-NOT-APPEAR' not in captured.out
+
+
+class TestStreamReplicaLogsPhysicalIdentityFence:
+
+    def test_remote_tail_runs_inside_exact_replica_fence(self, tmp_path):
+
+        class _FakeHandle:
+            pass
+
+        main_log = tmp_path / 'replica_1.log'
+        launch_log = tmp_path / 'replica_1_launch.log'
+        launch_log.write_text('launch complete\n')
+        info = types.SimpleNamespace(replica_id=1,
+                                     cluster_name='replica-cluster',
+                                     status=serve_state.ReplicaStatus.READY)
+        handle = _FakeHandle()
+        entered = False
+        phase_entered = False
+
+        @contextlib.contextmanager
+        def _phase():
+            nonlocal phase_entered
+            phase_entered = True
+            try:
+                yield mock.sentinel.admission
+            finally:
+                phase_entered = False
+
+        @contextlib.contextmanager
+        def _fence():
+            nonlocal entered
+            assert phase_entered
+            entered = True
+            try:
+                yield
+            finally:
+                entered = False
+
+        backend = mock.Mock()
+
+        def _tail_logs(*args, **kwargs):
+            del args, kwargs
+            assert entered, 'remote log command escaped its physical fence'
+            return (0, 'remote output\n')
+
+        backend.tail_logs.side_effect = _tail_logs
+        with mock.patch(
+                'sky.serve.serve_utils._get_healthy_service_log_owner_record',
+                return_value=({
+                    'pool': True,
+                    'resource_scope': None,
+                    'status': serve_state.ServiceStatus.READY,
+                }, None)), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_replica_log_file_name',
+                 return_value=str(main_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_replica_launch_log_file_name',
+                 return_value=str(launch_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_replica_info_from_id',
+                 return_value=info), \
+             mock.patch(
+                 'sky.serve.serve_utils.global_user_state.'
+                 'get_handle_from_cluster_name',
+                 return_value=handle), \
+             mock.patch.object(serve_utils.backends,
+                               'CloudVmRayResourceHandle', _FakeHandle), \
+             mock.patch.object(serve_utils.backends,
+                               'CloudVmRayBackend', return_value=backend), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+                 return_value=mock.sentinel.cleanup_fence), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.protocol_v2_provider_fence',
+                 return_value=_fence()) as provider_fence, \
+             mock.patch.object(
+                 serve_utils.provider_phase,
+                 'provider_phase', return_value=_phase()) as phase:
+            serve_utils.stream_replica_logs('svc',
+                                            replica_id=1,
+                                            follow=False,
+                                            tail=1,
+                                            pool=True)
+
+        provider_fence.assert_called_once_with(info,
+                                               handle,
+                                               include_provider_phase=False)
+        phase.assert_called_once_with(
+            serve_utils.provider_phase.ProviderPhaseMode.V2_FENCED)
+        backend.tail_logs.assert_called_once_with(handle,
+                                                  job_id=None,
+                                                  follow=False,
+                                                  tail=1,
+                                                  stream_logs=False,
+                                                  require_outputs=True,
+                                                  process_stream=True)
+
+    def test_interactive_v2_follow_holds_fence_without_provider_phase(
+            self, tmp_path):
+
+        class _FakeHandle:
+            pass
+
+        main_log = tmp_path / 'replica_1.log'
+        launch_log = tmp_path / 'replica_1_launch.log'
+        launch_log.write_text('launch complete\n')
+        info = types.SimpleNamespace(replica_id=1,
+                                     cluster_name='replica-cluster',
+                                     status=serve_state.ReplicaStatus.READY)
+        handle = _FakeHandle()
+        fence_entered = False
+
+        @contextlib.contextmanager
+        def _fence():
+            nonlocal fence_entered
+            fence_entered = True
+            try:
+                yield
+            finally:
+                fence_entered = False
+
+        backend = mock.Mock()
+
+        def _tail_logs(*_args, **_kwargs):
+            assert fence_entered
+            return 0
+
+        backend.tail_logs.side_effect = _tail_logs
+        with mock.patch(
+                'sky.serve.serve_utils._get_healthy_service_log_owner_record',
+                return_value=({
+                    'pool': True,
+                    'resource_scope': None,
+                    'status': serve_state.ServiceStatus.READY,
+                }, None)), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_replica_log_file_name',
+                 return_value=str(main_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils.generate_replica_launch_log_file_name',
+                 return_value=str(launch_log)), \
+             mock.patch(
+                 'sky.serve.serve_utils._follow_logs_with_provision_expanding',
+                 return_value=iter(())), \
+             mock.patch(
+                 'sky.serve.serve_utils.serve_state.get_replica_info_from_id',
+                 return_value=info), \
+             mock.patch(
+                 'sky.serve.serve_utils.global_user_state.'
+                 'get_handle_from_cluster_name',
+                 return_value=handle), \
+             mock.patch.object(serve_utils.backends,
+                               'CloudVmRayResourceHandle', _FakeHandle), \
+             mock.patch.object(serve_utils.backends,
+                               'CloudVmRayBackend', return_value=backend), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.parse_protocol_v2_cleanup_fence',
+                 return_value=mock.sentinel.cleanup_fence), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.protocol_v2_provider_fence',
+                 return_value=_fence()), \
+             mock.patch.object(serve_utils.provider_phase,
+                               'provider_phase') as phase:
+            result = serve_utils.stream_replica_logs('svc',
+                                                     replica_id=1,
+                                                     follow=True,
+                                                     tail=None,
+                                                     pool=True)
+
+        assert result == ''
+        phase.assert_not_called()
+        backend.tail_logs.assert_called_once_with(handle,
+                                                  job_id=None,
+                                                  follow=True)
 
 
 class TestStartInFlight:
@@ -2872,7 +4545,7 @@ class TestTerminateFailedServices:
              mock.patch(
                  'sky.serve.serve_utils.'
                  'quiesce_service_replica_launch_requests',
-                 return_value=True), \
+                 return_value=True) as quiesce, \
              mock.patch(
                  'sky.serve.serve_utils.global_user_state.'
                  'get_cluster_status_fields',
@@ -2918,6 +4591,7 @@ class TestTerminateFailedServices:
                         side_effect=lb_side_effect) as delete_lb:
             result = serve_utils._terminate_failed_services(
                 'svc', 'incarnation-a', None)
+        self.quiesce = quiesce
         return (terminated, remove_service, delete_lb, result.message,
                 set_owner_status, remove_directory)
 
@@ -3117,6 +4791,45 @@ class TestTerminateFailedServices:
                                                'incarnation-a',
                                                expected_lifecycle_epoch=17)
         assert message is None
+
+    def test_protocol_v2_absent_cluster_retains_parent_and_history_barrier(
+            self):
+        info = self._replica(1, 'svc-1')
+        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                              physical_cluster_uid='phx-uid')
+        with mock.patch(
+                'sky.serve.reserved_capacity.'
+                'parse_protocol_v2_cleanup_fence',
+                return_value=cleanup_fence):
+            (terminated, remove_service, _, message, set_owner_status,
+             _) = self._run([info], exists=lambda _name: False)
+
+        assert not terminated
+        remove_service.assert_not_called()
+        assert message is not None and 'could not be purged' in message
+        assert set_owner_status.call_args.args[4] == (
+            serve_state.ServiceStatus.FAILED_CLEANUP)
+        assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
+
+    def test_protocol_v2_present_cluster_forwards_exact_cleanup_fence(self):
+        info = self._replica(1, 'svc-1')
+        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                              physical_cluster_uid='phx-uid')
+        with mock.patch(
+                'sky.serve.reserved_capacity.'
+                'parse_protocol_v2_cleanup_fence',
+                return_value=cleanup_fence):
+            _, remove_service, _, message, _, _ = self._run(
+                [info], exists=lambda _name: True)
+
+        assert message is None
+        remove_service.assert_called_once()
+        assert self.termination_kwargs == [{
+            'continue_guard': mock.ANY,
+            'expected_cluster_record_uuid': None,
+            'cleanup_fence': cleanup_fence,
+        }]
+        assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
 
     def test_failed_final_cas_never_restores_over_successor(self, tmp_path):
         incarnation_a = tmp_path / 'svc-inc-a'
@@ -3594,8 +5307,9 @@ class TestHaRecoveryFencesOnLeadershipLoss:
 
     def test_leadership_lost_midway_stops_remaining(self, tmp_path,
                                                     monkeypatch):
-        # Leader for the first launch, lost before the second.
-        answers = iter([True, False])
+        # Leader through the first launch's preflight and final fence, then
+        # lost before the second service begins recovery.
+        answers = iter([True, True, False])
         run = self._run(lambda: next(answers), tmp_path, monkeypatch)
         assert run.call_count == 1
 

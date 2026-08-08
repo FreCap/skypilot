@@ -12,6 +12,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import controller
 from sky.serve import lb_ha
 from sky.serve import lb_k8s
+from sky.serve import serve_utils
 
 
 def _state(phase: lb_ha.LbCutoverPhase,
@@ -23,7 +24,7 @@ def _state(phase: lb_ha.LbCutoverPhase,
                                 generation=generation,
                                 pending_slot=pending,
                                 phase=phase,
-                                lifecycle_epoch=9)
+                                lifecycle_epoch=7)
 
 
 def _report(http: dict[str, int], asynchronous: dict[str, int],
@@ -579,12 +580,37 @@ def test_ha_slots_require_cross_host_placement_and_prefer_cross_zone():
         'topologyKey'] == 'topology.kubernetes.io/zone'
 
 
+def _role_owner_record(
+    fence: tuple[str, tuple[int | None, str | None], int],
+    state: lb_ha.LbCutoverState,
+) -> dict[str, object]:
+    return {
+        'hash': fence[0],
+        'controller_pid': fence[1][0],
+        'controller_ip': fence[1][1],
+        'lifecycle_epoch': fence[2],
+        'resource_scope': None,
+        'lb_ha_enabled': state.enabled,
+        'lb_active_slot':
+            (state.active_slot.value if state.active_slot is not None else None
+            ),
+        'lb_cutover_generation': state.generation,
+        'lb_pending_slot': (
+            state.pending_slot.value if state.pending_slot is not None else None
+        ),
+        'lb_cutover_phase': state.phase.value,
+        'lb_drain_started_at': state.drain_started_at,
+    }
+
+
 def _role_controller() -> controller.SkyServeController:
     ctrl = controller.SkyServeController.__new__(controller.SkyServeController)
     ctrl._service_name = 'service'
     ctrl._resource_scope = None
     ctrl._lb_ha_enabled = True
     ctrl._lb_role_lock = None
+    ctrl._lb_role_snapshot_task = None
+    ctrl._lb_role_snapshot_key = None
     ctrl._lb_demand_lock = None
     ctrl._lb_session_ledger = lb_ha.LbSessionLedger(10, 10)
     ctrl._lb_expected_occupancy_urls = set()
@@ -595,12 +621,52 @@ def _role_controller() -> controller.SkyServeController:
     ctrl._applied_version = 1
     ctrl._routing_state_lock = threading.RLock()
     ctrl._owns_current_service = mock.Mock(return_value=True)
+    ctrl._controller_owner = (123, '10.0.0.1')
+    ctrl._controller_owner_fingerprint = 'controller-owner-fingerprint'
     ctrl._lb_cutover_fence = mock.Mock(return_value=('incarnation',
                                                      (123, '10.0.0.1'), 7))
+
+    def database_snapshot():
+        fence = ctrl._lb_cutover_fence()
+        if fence is None:
+            return None
+        state = controller.serve_state.get_lb_cutover_state('service')
+        if state is None:
+            return None
+        owner = _role_owner_record(fence, state)
+        return controller._LbRoleDatabaseSnapshot(fence, state, owner)
+
+    ctrl._lb_role_database_snapshot = mock.Mock(side_effect=database_snapshot)
     ctrl._replica_manager = mock.Mock()
     ctrl._publish_ha_drain_view = mock.Mock()
     ctrl._finish_ha_drain_if_safe = mock.Mock(return_value=False)
     return ctrl
+
+
+@pytest.fixture(autouse=True)
+def _adapt_existing_role_handler_mocks(monkeypatch):
+    """Keep saga tests focused while the handler consumes one snapshot."""
+
+    def read_snapshot(service_name,
+                      unused_fence,
+                      state,
+                      unused_owner,
+                      unused_timings=None):
+        authority = lb_k8s.get_lb_pod_authority(service_name)
+        if authority is None:
+            return None
+        try:
+            if state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
+                               lb_ha.LbCutoverPhase.ROLLING_BACK):
+                routing = lb_k8s.get_lb_service_transition_routing(service_name)
+            else:
+                routing = lb_k8s.get_lb_service_routing(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            raise lb_k8s.LbRoleSnapshotRoutingError(str(e)) from e
+        return lb_k8s.LbRoleSnapshot(authority, routing)
+
+    monkeypatch.setattr(controller.lb_k8s, 'get_lb_role_snapshot',
+                        read_snapshot)
 
 
 def _configure_sync_controller(ctrl: controller.SkyServeController,
@@ -733,6 +799,479 @@ def test_ordinary_role_heartbeat_does_not_wait_for_sync_demand_head():
     assert sync_response.status_code == 200
 
 
+def test_role_heartbeat_uses_one_shared_authority_snapshot():
+    ctrl = _role_controller()
+    ctrl._controller_owner = (123, '10.0.0.1')
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1', 'runtime-new')
+    snapshot = lb_k8s.LbRoleSnapshot(_authority(), routing)
+
+    def read_snapshot(service_name, fence, state, owner, timings):
+        assert service_name == 'service'
+        assert fence == ('incarnation', (123, '10.0.0.1'), 7)
+        assert state == stable
+        assert owner['lb_cutover_generation'] == 1
+        timings['snapshot_pod_list'] = 0.02
+        timings['snapshot_service_read'] = 0.03
+        return snapshot
+
+    with (mock.patch.object(controller.lb_k8s,
+                            'get_lb_role_snapshot',
+                            side_effect=read_snapshot) as snapshot_read,
+          mock.patch.object(
+              controller.lb_k8s,
+              'get_lb_pod_authority',
+              side_effect=AssertionError('duplicate Pod authority read')),
+          mock.patch.object(
+              controller.lb_k8s,
+              'get_lb_service_routing',
+              side_effect=AssertionError('duplicate Service routing read')),
+          mock.patch.object(controller.serve_state,
+                            'get_lb_cutover_state',
+                            return_value=stable)):
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body['role'] == lb_ha.LbRole.ACTIVE.value
+    assert body['observability']['phases_seconds'][
+        'postgresql_role_state_read'] >= 0
+    assert body['observability']['phases_seconds'][
+        'snapshot_pod_list'] == pytest.approx(0.02)
+    assert body['observability']['phases_seconds'][
+        'snapshot_service_read'] == pytest.approx(0.03)
+    snapshot_read.assert_called_once()
+    ctrl._owns_current_service.assert_not_called()
+    assert response.headers[
+        serve_constants.LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER] == (
+            ctrl._controller_owner_fingerprint)
+    assert ctrl._lb_role_database_snapshot.call_count == 2
+    assert ctrl._lb_cutover_fence.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ('error', 'outcome'),
+    [(lb_k8s.LbRoleSnapshotStateMismatchError('owner changed'),
+      'cutover_state_unavailable'),
+     (lb_k8s.LbRoleSnapshotRoutingError('Service malformed'),
+      'routing_unavailable')])
+def test_role_snapshot_errors_keep_deterministic_outcomes(error, outcome):
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           side_effect=error), mock.patch.object(
+                               controller.serve_state,
+                               'get_lb_cutover_state',
+                               return_value=stable):
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert response.status_code == 503
+    assert json.loads(response.body)['outcome'] == outcome
+
+
+def test_concurrent_slot_heartbeats_keep_shared_snapshot_fencing():
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    authority = lb_k8s.LbPodAuthority(
+        ready_nonterminating_uids={'active', 'standby'},
+        live_uids={'active', 'standby'},
+        slot_by_uid={
+            'active': lb_ha.LbSlot.A,
+            'standby': lb_ha.LbSlot.B,
+        },
+        selected_slot=lb_ha.LbSlot.A)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        authority, lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    observed_fences = []
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    backend_urls = [f'http://replica-{index}' for index in range(143)]
+    large_report = _report({url: 1 for url in backend_urls},
+                           {url: 1 for url in backend_urls},
+                           {url: 1 for url in backend_urls},
+                           {url: 0.0 for url in backend_urls})
+
+    def read_snapshot(unused_name, fence, state, unused_owner, unused_timings):
+        observed_fences.append((fence, state))
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2)
+        return snapshot
+
+    async def run_both_slots():
+        active_request = _role_request('active', lb_ha.LbSlot.A)
+        standby_request = _role_request('standby', lb_ha.LbSlot.B)
+        active_request.update(large_report)
+        standby_request.update(large_report)
+        active_task = asyncio.create_task(
+            ctrl._handle_load_balancer_role(active_request))
+        while not snapshot_started.is_set():
+            await asyncio.sleep(0.001)
+        standby_task = asyncio.create_task(
+            ctrl._handle_load_balancer_role(standby_request))
+        while ctrl._lb_cutover_fence.call_count < 2:
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.01)
+        release_snapshot.set()
+        return await asyncio.gather(active_task, standby_task)
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_role_snapshot',
+            side_effect=read_snapshot) as snapshot_read, mock.patch.object(
+                controller.serve_state,
+                'get_lb_cutover_state',
+                return_value=stable):
+        try:
+            active_response, standby_response = asyncio.run(run_both_slots())
+        finally:
+            release_snapshot.set()
+
+    assert json.loads(active_response.body)['role'] == 'ACTIVE'
+    assert json.loads(standby_response.body)['role'] == 'STANDBY'
+    assert snapshot_read.call_count == 1
+    assert observed_fences == [
+        (('incarnation', (123, '10.0.0.1'), 7), stable),
+    ]
+    assert ctrl._lb_cutover_fence.call_count == 4
+
+
+@pytest.mark.parametrize('changed_key', ['fence', 'state', 'owner'])
+def test_concurrent_stable_snapshots_with_different_keys_never_share(
+        changed_key):
+    ctrl = _role_controller()
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    changed_fence = ('other-incarnation', (123, '10.0.0.1'), 7)
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    changed_state = _state(lb_ha.LbCutoverPhase.STABLE, generation=2)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    snapshot_barrier = threading.Barrier(2)
+
+    def read_snapshot(*_args):
+        snapshot_barrier.wait(timeout=2)
+        return snapshot
+
+    async def run_different_keys():
+        loop = asyncio.get_running_loop()
+        owner = _role_owner_record(fence, stable)
+        first = asyncio.create_task(
+            ctrl._get_shared_stable_lb_role_snapshot(loop, fence, stable,
+                                                     owner))
+        if changed_key == 'fence':
+            second_key = (changed_fence, stable,
+                          _role_owner_record(changed_fence, stable))
+        elif changed_key == 'state':
+            second_key = (fence, changed_state,
+                          _role_owner_record(fence, changed_state))
+        else:
+            second_key = (fence, stable,
+                          dict(owner, resource_scope='successor-scope'))
+        second = asyncio.create_task(
+            ctrl._get_shared_stable_lb_role_snapshot(loop, *second_key))
+        return await asyncio.gather(first, second)
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           side_effect=read_snapshot) as snapshot_read:
+        reads = asyncio.run(run_different_keys())
+
+    assert [read.snapshot for read in reads] == [snapshot, snapshot]
+    assert snapshot_read.call_count == 2
+    assert ctrl._lb_role_snapshot_task is None
+    assert ctrl._lb_role_snapshot_key is None
+
+
+def test_completed_stable_snapshot_is_never_reused():
+    ctrl = _role_controller()
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    owner = _role_owner_record(fence, stable)
+
+    async def read_twice():
+        loop = asyncio.get_running_loop()
+        first = await ctrl._get_shared_stable_lb_role_snapshot(
+            loop, fence, stable, owner)
+        second = await ctrl._get_shared_stable_lb_role_snapshot(
+            loop, fence, stable, owner)
+        return first, second
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           return_value=snapshot) as snapshot_read:
+        reads = asyncio.run(read_twice())
+
+    assert [read.snapshot for read in reads] == [snapshot, snapshot]
+    assert snapshot_read.call_count == 2
+
+
+def test_old_snapshot_completion_cannot_clear_new_key_task():
+    ctrl = _role_controller()
+    first_fence = ('incarnation', (123, '10.0.0.1'), 7)
+    second_fence = ('other-incarnation', (123, '10.0.0.1'), 7)
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    first_owner = _role_owner_record(first_fence, stable)
+    second_owner = _role_owner_record(second_fence, stable)
+
+    def read_snapshot(unused_name, fence, *_args):
+        if fence == first_fence:
+            first_started.set()
+            assert release_first.wait(timeout=2)
+        else:
+            assert fence == second_fence
+            second_started.set()
+            assert release_second.wait(timeout=2)
+        return snapshot
+
+    async def complete_in_order():
+        loop = asyncio.get_running_loop()
+        first = asyncio.create_task(
+            ctrl._get_shared_stable_lb_role_snapshot(loop, first_fence, stable,
+                                                     first_owner))
+        while not first_started.is_set():
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(
+            ctrl._get_shared_stable_lb_role_snapshot(loop, second_fence, stable,
+                                                     second_owner))
+        while not second_started.is_set():
+            await asyncio.sleep(0.001)
+        release_first.set()
+        await first
+        await asyncio.sleep(0)
+        assert ctrl._lb_role_snapshot_key == (second_fence, stable,
+                                              tuple(sorted(
+                                                  second_owner.items())))
+        assert ctrl._lb_role_snapshot_task is not None
+        assert not ctrl._lb_role_snapshot_task.done()
+        release_second.set()
+        await second
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           side_effect=read_snapshot):
+        try:
+            asyncio.run(complete_in_order())
+        finally:
+            release_first.set()
+            release_second.set()
+
+    assert ctrl._lb_role_snapshot_task is None
+    assert ctrl._lb_role_snapshot_key is None
+
+
+def test_cancelled_stable_snapshot_waiter_does_not_poison_peer():
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    def read_snapshot(*_args):
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2)
+        return snapshot
+
+    async def cancel_then_join():
+        first = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        while not snapshot_started.is_set():
+            await asyncio.sleep(0.001)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        peer = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        while ctrl._lb_cutover_fence.call_count < 2:
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.01)
+        release_snapshot.set()
+        return await peer
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_role_snapshot',
+            side_effect=read_snapshot) as snapshot_read, mock.patch.object(
+                controller.serve_state,
+                'get_lb_cutover_state',
+                return_value=stable):
+        try:
+            response = asyncio.run(cancel_then_join())
+        finally:
+            release_snapshot.set()
+
+    assert response.status_code == 200
+    assert snapshot_read.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ('error', 'outcome'),
+    [(lb_k8s.LbRoleSnapshotStateMismatchError('owner changed'),
+      'cutover_state_unavailable'),
+     (lb_k8s.LbRoleSnapshotRoutingError('Service malformed'),
+      'routing_unavailable')])
+def test_concurrent_stable_snapshot_errors_are_shared(error, outcome):
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    def read_snapshot(*_args):
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2)
+        raise error
+
+    async def run_both_slots():
+        first = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        while not snapshot_started.is_set():
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('standby', lb_ha.LbSlot.B)))
+        while ctrl._lb_cutover_fence.call_count < 2:
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.01)
+        release_snapshot.set()
+        return await asyncio.gather(first, second)
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_role_snapshot',
+            side_effect=read_snapshot) as snapshot_read, mock.patch.object(
+                controller.serve_state,
+                'get_lb_cutover_state',
+                return_value=stable):
+        try:
+            responses = asyncio.run(run_both_slots())
+        finally:
+            release_snapshot.set()
+
+    assert [json.loads(response.body)['outcome'] for response in responses
+           ] == [outcome, outcome]
+    assert snapshot_read.call_count == 1
+
+
+@pytest.mark.parametrize('changed_authority', ['fence', 'state'])
+def test_stable_role_prefetch_fails_closed_if_authority_changes(
+        changed_authority):
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    preparing = _state(lb_ha.LbCutoverPhase.PREPARING,
+                       pending=lb_ha.LbSlot.B,
+                       generation=2)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    changed_fence = ('incarnation', (456, '10.0.0.2'), 7)
+    if changed_authority == 'fence':
+        ctrl._lb_cutover_fence.side_effect = [fence, changed_fence]
+        states = [stable, stable]
+    else:
+        ctrl._lb_cutover_fence.side_effect = [fence, fence]
+        states = [stable, preparing]
+    ctrl._lb_session_ledger.update = mock.Mock(
+        side_effect=AssertionError('stale prefetch reached decision tail'))
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_role_snapshot',
+            return_value=snapshot) as snapshot_read, mock.patch.object(
+                controller.serve_state,
+                'get_lb_cutover_state',
+                side_effect=states):
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert response.status_code == 503
+    assert json.loads(response.body)['outcome'] == 'cutover_state_unavailable'
+    snapshot_read.assert_called_once_with('service', fence, stable, mock.ANY,
+                                          mock.ANY)
+    ctrl._lb_session_ledger.update.assert_not_called()
+
+
+def test_stable_role_prefetch_rejects_nonfence_owner_record_change():
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    owner = {
+        'hash': 'incarnation',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lifecycle_epoch': 7,
+        'resource_scope': None,
+        'lb_ha_enabled': True,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 1,
+        'lb_pending_slot': None,
+        'lb_cutover_phase': 'STABLE',
+        'lb_drain_started_at': None,
+    }
+    changed_owner = dict(owner, resource_scope='successor-scope')
+    ctrl._lb_role_database_snapshot.side_effect = [
+        controller._LbRoleDatabaseSnapshot(fence, stable, owner),
+        controller._LbRoleDatabaseSnapshot(fence, stable, changed_owner),
+    ]
+    ctrl._lb_session_ledger.update = mock.Mock(
+        side_effect=AssertionError('changed owner reached decision tail'))
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           return_value=snapshot):
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert response.status_code == 503
+    assert json.loads(response.body)['outcome'] == 'cutover_state_unavailable'
+    ctrl._lb_session_ledger.update.assert_not_called()
+
+
+def test_nonstable_role_snapshot_stays_behind_transition_lock():
+    ctrl = _role_controller()
+    preparing = _state(lb_ha.LbCutoverPhase.PREPARING,
+                       pending=lb_ha.LbSlot.B,
+                       generation=2)
+
+    async def drive(snapshot_read):
+        role_lock = asyncio.Lock()
+        ctrl._lb_role_lock = role_lock
+        await role_lock.acquire()
+        role = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        await asyncio.sleep(0.05)
+        snapshot_read.assert_not_called()
+        role_lock.release()
+        return await asyncio.wait_for(role, timeout=2)
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_role_snapshot',
+            return_value=None) as snapshot_read, mock.patch.object(
+                controller.serve_state,
+                'get_lb_cutover_state',
+                return_value=preparing):
+        response = asyncio.run(drive(snapshot_read))
+
+    assert response.status_code == 503
+    assert json.loads(response.body)['outcome'] == 'pod_authority_unavailable'
+    snapshot_read.assert_called_once()
+
+
 def test_steady_ha_sync_disclosure_does_not_wait_for_role_lock():
     ctrl = _role_controller()
     _configure_sync_controller(ctrl, mock.Mock(return_value=True))
@@ -847,6 +1386,123 @@ def test_cutover_fence_accepts_parent_owner_from_controller_wiring():
     assert json.loads(response.body)['role'] == 'ACTIVE'
 
 
+def test_role_database_snapshot_reads_owner_and_complete_state_once():
+    ctrl = _role_controller()
+    del ctrl.__dict__['_lb_role_database_snapshot']
+    owner = {
+        'hash': 'incarnation',
+        'status': controller.serve_state.ServiceStatus.READY,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'controller_port': 20001,
+        'lifecycle_epoch': 7,
+        'pool': False,
+        'resource_scope': 'scope',
+        'lb_ha_enabled': True,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+        'lb_cutover_phase': 'STABLE',
+        'lb_drain_started_at': 123.5,
+    }
+    owner_read = mock.Mock(return_value=owner)
+    ctrl._controller_owner_fingerprint = (
+        serve_utils.make_controller_owner_fingerprint(owner['hash'],
+                                                      owner['controller_pid'],
+                                                      owner['controller_ip'],
+                                                      owner['controller_port']))
+
+    with mock.patch.object(controller.serve_state,
+                           'get_service_controller_owner', owner_read):
+        snapshot = ctrl._lb_role_database_snapshot()
+
+    assert snapshot == controller._LbRoleDatabaseSnapshot(
+        ('incarnation', (123, '10.0.0.1'), 7),
+        lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
+                             lb_ha.LbCutoverPhase.STABLE, 7, 123.5), owner)
+    owner_read.assert_called_once_with('service', include_lb_state=True)
+
+
+@pytest.mark.parametrize(('field', 'changed'),
+                         [('hash', 'successor-incarnation'),
+                          ('controller_pid', 456),
+                          ('controller_ip', '10.0.0.2'),
+                          ('controller_port', 20002)])
+def test_role_database_snapshot_rejects_bootstrap_owner_mismatch(
+        field, changed):
+    ctrl = _role_controller()
+    del ctrl.__dict__['_lb_role_database_snapshot']
+    owner = {
+        'hash': 'incarnation',
+        'status': controller.serve_state.ServiceStatus.READY,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'controller_port': 20001,
+        'lifecycle_epoch': 7,
+        'pool': False,
+        'resource_scope': 'scope',
+        'lb_ha_enabled': True,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+        'lb_cutover_phase': 'STABLE',
+        'lb_drain_started_at': None,
+    }
+    ctrl._controller_owner_fingerprint = (
+        serve_utils.make_controller_owner_fingerprint(owner['hash'],
+                                                      owner['controller_pid'],
+                                                      owner['controller_ip'],
+                                                      owner['controller_port']))
+    changed_owner = dict(owner, **{field: changed})
+
+    with mock.patch.object(controller.serve_state,
+                           'get_service_controller_owner',
+                           return_value=changed_owner):
+        snapshot = ctrl._lb_role_database_snapshot()
+
+    assert snapshot is None
+
+
+def test_role_handler_rejects_bootstrap_owner_mismatch_before_prefetch():
+    ctrl = _role_controller()
+    del ctrl.__dict__['_lb_role_database_snapshot']
+    owner = {
+        'hash': 'successor-incarnation',
+        'status': controller.serve_state.ServiceStatus.READY,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'controller_port': 20001,
+        'lifecycle_epoch': 7,
+        'pool': False,
+        'resource_scope': 'scope',
+        'lb_ha_enabled': True,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+        'lb_cutover_phase': 'STABLE',
+        'lb_drain_started_at': None,
+    }
+    ctrl._controller_owner_fingerprint = (
+        serve_utils.make_controller_owner_fingerprint('incarnation',
+                                                      owner['controller_pid'],
+                                                      owner['controller_ip'],
+                                                      owner['controller_port']))
+
+    with mock.patch.object(controller.serve_state,
+                           'get_service_controller_owner',
+                           return_value=owner), mock.patch.object(
+                               ctrl,
+                               '_get_shared_stable_lb_role_snapshot',
+                               new_callable=mock.AsyncMock) as snapshot_read:
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert response.status_code == 503
+    assert json.loads(response.body)['outcome'] == 'controller_not_owner'
+    snapshot_read.assert_not_awaited()
+
+
 def _authority(*, target_ready: bool = True) -> lb_k8s.LbPodAuthority:
     ready = {'active', 'standby'} if target_ready else {'active'}
     return lb_k8s.LbPodAuthority(ready_nonterminating_uids=ready,
@@ -899,7 +1555,7 @@ def test_role_saga_arms_then_patches_and_commits_selected_standby():
                     controller.serve_state,
                     'get_lb_cutover_state',
                     side_effect=[
-                        stable, preparing, draining
+                        stable, stable, preparing, preparing, draining
                     ]), mock.patch.object(
                         controller.serve_state,
                         'begin_lb_cutover',
@@ -934,19 +1590,23 @@ def test_role_saga_recovers_selector_patch_before_database_commit():
                       pending=lb_ha.LbSlot.A,
                       generation=2)
     routing_target = lb_k8s.LbServiceRouting(lb_ha.LbSlot.B, 2, 'rv-2')
-    with mock.patch.object(
-            controller.lb_k8s, 'get_lb_pod_authority',
-            return_value=_authority()), mock.patch.object(
-                controller.lb_k8s,
-                'get_lb_service_routing',
-                return_value=routing_target), mock.patch.object(
-                    controller.serve_state,
-                    'get_lb_cutover_state',
-                    side_effect=[preparing, draining]), mock.patch.object(
-                        controller.lb_k8s, 'patch_lb_service_active_slot'
-                    ) as patch, mock.patch.object(controller.serve_state,
-                                                  'commit_lb_cutover',
-                                                  return_value=True) as commit:
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_pod_authority',
+                           return_value=_authority()), mock.patch.object(
+                               controller.lb_k8s,
+                               'get_lb_service_routing',
+                               return_value=routing_target), mock.patch.object(
+                                   controller.serve_state,
+                                   'get_lb_cutover_state',
+                                   side_effect=[
+                                       preparing, preparing, draining
+                                   ]), mock.patch.object(
+                                       controller.lb_k8s,
+                                       'patch_lb_service_active_slot'
+                                   ) as patch, mock.patch.object(
+                                       controller.serve_state,
+                                       'commit_lb_cutover',
+                                       return_value=True) as commit:
         response = asyncio.run(
             ctrl._handle_load_balancer_role(
                 _role_request('standby', lb_ha.LbSlot.B, 2)))
@@ -1146,9 +1806,9 @@ def test_role_saga_keeps_blocking_view_when_post_commit_read_is_cancelled():
     release_read = threading.Event()
     reads = []
 
-    def blocking_second_read(_service_name):
+    def blocking_post_commit_read(_service_name):
         reads.append(threading.get_ident())
-        if len(reads) == 1:
+        if len(reads) < 3:
             return preparing
         read_started.set()
         assert release_read.wait(timeout=2)
@@ -1175,7 +1835,7 @@ def test_role_saga_keeps_blocking_view_when_post_commit_read_is_cancelled():
                 return_value=routing_target), mock.patch.object(
                     controller.serve_state,
                     'get_lb_cutover_state',
-                    side_effect=blocking_second_read), mock.patch.object(
+                    side_effect=blocking_post_commit_read), mock.patch.object(
                         controller.serve_state,
                         'commit_lb_cutover',
                         return_value=True):
@@ -1184,7 +1844,7 @@ def test_role_saga_keeps_blocking_view_when_post_commit_read_is_cancelled():
         finally:
             release_read.set()
 
-    assert len(reads) == 2
+    assert len(reads) == 3
     ctrl._replica_manager.update_lb_in_flight.assert_called_once_with(
         {}, None, [], [], 'ha-transition-2')
     ctrl._publish_ha_drain_view.assert_not_called()
@@ -1256,10 +1916,11 @@ def test_role_saga_aborts_unselected_target_that_lost_readiness():
                     return_value=True), mock.patch.object(
                         controller.serve_state,
                         'get_lb_cutover_state',
-                        side_effect=[preparing, stable]), mock.patch.object(
-                            controller.serve_state,
-                            'abort_lb_cutover_preparation',
-                            return_value=True) as abort:
+                        side_effect=[preparing, preparing,
+                                     stable]), mock.patch.object(
+                                         controller.serve_state,
+                                         'abort_lb_cutover_preparation',
+                                         return_value=True) as abort:
         response = asyncio.run(
             ctrl._handle_load_balancer_role(
                 _role_request('active', lb_ha.LbSlot.A)))
@@ -1286,10 +1947,11 @@ def test_role_saga_recovers_abort_patch_before_database_commit():
                 ) as patch, mock.patch.object(
                     controller.serve_state,
                     'get_lb_cutover_state',
-                    side_effect=[preparing, stable]), mock.patch.object(
-                        controller.serve_state,
-                        'abort_lb_cutover_preparation',
-                        return_value=True) as abort:
+                    side_effect=[preparing, preparing,
+                                 stable]), mock.patch.object(
+                                     controller.serve_state,
+                                     'abort_lb_cutover_preparation',
+                                     return_value=True) as abort:
         response = asyncio.run(
             ctrl._handle_load_balancer_role(
                 _role_request('active', lb_ha.LbSlot.A)))
@@ -1517,7 +2179,9 @@ def test_migration_commits_without_blocking_role_on_cleanup():
                 return_value=routing), mock.patch.object(
                     controller.serve_state,
                     'get_lb_cutover_state',
-                    side_effect=[migrating, stable]), mock.patch.object(
+                    side_effect=[
+                        migrating, migrating, stable
+                    ]), mock.patch.object(
                         controller.serve_state,
                         'finish_lb_ha_migration',
                         return_value=True) as finish, mock.patch.object(
@@ -1673,6 +2337,7 @@ def test_role_failures_have_deterministic_outcome_categories():
     assert json.loads(invalid.body)['outcome'] == 'invalid_report'
 
     ctrl._owns_current_service.return_value = False
+    ctrl._lb_cutover_fence.return_value = None
     stale_owner = asyncio.run(
         ctrl._handle_load_balancer_role(_role_request('active',
                                                       lb_ha.LbSlot.A)))
@@ -1733,6 +2398,5 @@ def test_role_observability_measures_second_slot_lock_queueing():
     observation = body['observability']
     assert observation['lock_wait_seconds'] >= 0.01
     assert observation['lock_hold_seconds'] >= 0
-    assert observation['phases_seconds']['kubernetes_pod_authority'] >= 0
-    assert observation['phases_seconds']['postgresql_cutover_state_read'] >= 0
-    assert observation['phases_seconds']['kubernetes_service_routing_read'] >= 0
+    assert observation['phases_seconds']['kubernetes_role_snapshot'] >= 0
+    assert observation['phases_seconds']['postgresql_role_state_read'] >= 0

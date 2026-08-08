@@ -15,7 +15,19 @@ from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
 from sky.container_images import models as container_image_models
+from sky.serve import placement_policy
+from sky.serve import service_spec as service_spec_lib
 from sky.serve import spot_placer
+
+
+def _physical_contract():
+    return placement_policy.resolve_fresh_contract(
+        placement_policy.SPOT_HEDGE_PLACER, pool=False)
+
+
+def _logical_contract():
+    return placement_policy.resolve_fresh_contract(
+        placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
 
 
 class TestCentralPlacementCatalog:
@@ -91,6 +103,48 @@ run: echo hi
         restored = spot_placer.PlacementCatalog.from_dict(serialized)
         assert restored.to_dict() == serialized
 
+    def test_new_catalog_round_trip_persists_strict_node_count(self):
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        catalog = spot_placer.PlacementCatalog(((paid, 0.2),), num_nodes=3)
+
+        serialized = catalog.to_dict()
+
+        assert serialized['num_nodes'] == 3
+        assert spot_placer.PlacementCatalog.from_dict(serialized).num_nodes == 3
+
+    @pytest.mark.parametrize('num_nodes', [True, False, 0, -1, 1.5, '2'])
+    def test_catalog_rejects_invalid_node_count(self, num_nodes):
+        serialized = self._single_catalog_dict()
+        serialized['num_nodes'] = num_nodes
+
+        with pytest.raises(ValueError, match='num_nodes'):
+            spot_placer.PlacementCatalog.from_dict(serialized)
+
+    def test_catalog_rejects_overflowing_hourly_cost(self):
+        serialized = self._single_catalog_dict()
+        serialized['entries'][0]['hourly_cost'] = 10**1000
+
+        with pytest.raises(ValueError, match='hourly cost'):
+            spot_placer.PlacementCatalog.from_dict(serialized)
+
+    @staticmethod
+    def _single_catalog_dict():
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        return spot_placer.PlacementCatalog(((paid, 0.2),)).to_dict()
+
+    def test_catalog_rejects_boolean_schema_version(self):
+        serialized = self._single_catalog_dict()
+        serialized['schema_version'] = True
+
+        with pytest.raises(ValueError, match='schema version'):
+            spot_placer.PlacementCatalog.from_dict(serialized)
+
     def test_runtime_lookup_never_resolves_a_complete_catalog(self):
         reserved = make_location('research-ctx',
                                  accelerators={'A100': 1},
@@ -108,7 +162,9 @@ run: echo hi
                 '_get_possible_location_from_task',
                 side_effect=AssertionError(
                     'persisted catalog load must not enumerate providers')):
-            placer = spot_placer.SpotPlacer(task, placement_catalog=catalog)
+            placer = spot_placer.SpotPlacer(task,
+                                            _physical_contract(),
+                                            placement_catalog=catalog)
 
         assert placer.cost_per_hour(paid) == 0.2
         assert placer.zero_cost_locations() == [reserved]
@@ -284,7 +340,10 @@ run: echo hi
                             lambda cloud, workspace: {})
 
         placer = spot_placer.DynamicFallbackSpotPlacer(
-            task, placement_catalog=catalog, workspace='default')
+            task,
+            _physical_contract(),
+            placement_catalog=catalog,
+            workspace='default')
 
         # The immutable version catalog remains intact, but every runtime
         # placement/reserved-fill view contains eligible locations only.
@@ -339,7 +398,10 @@ run: echo hi
         monkeypatch.setattr(spot_placer.skypilot_config, 'get_workspace_cloud',
                             _workspace_cloud)
         placer = spot_placer.DynamicFallbackSpotPlacer(
-            task, placement_catalog=catalog, workspace='research')
+            task,
+            _physical_contract(),
+            placement_catalog=catalog,
+            workspace='research')
 
         with mock.patch.object(spot_placer.skypilot_config,
                                'safe_reload_config') as reload_config:
@@ -404,7 +466,10 @@ run: echo hi
             if cloud == cloud_name.lower() else {})
 
         placer = spot_placer.DynamicFallbackSpotPlacer(
-            task, placement_catalog=catalog, workspace='research')
+            task,
+            _physical_contract(),
+            placement_catalog=catalog,
+            workspace='research')
 
         assert placer.known_locations() == []
         assert placer.active_locations() == []
@@ -433,8 +498,9 @@ def hybrid_placer():
 
 
 def _make_per_gpu_placer(costs):
-    placer = spot_placer.CapacityAwareDynamicFallbackSpotPlacer.__new__(
-        spot_placer.CapacityAwareDynamicFallbackSpotPlacer)
+    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
+        spot_placer.DynamicFallbackSpotPlacer)
+    placer._placement_contract = _logical_contract()
     placer.location2status = {
         location: spot_placer.LocationStatus.ACTIVE for location in costs
     }
@@ -485,6 +551,23 @@ class TestInstanceTypeLocationIdentity:
             legacy, allow_ambiguous_legacy_shape=True) == first
         assert placer.is_launch_admissible(legacy, selected_at=100)
 
+    def test_strict_catalog_match_reports_legacy_ambiguity(self):
+        first = make_location('us-east-1', {'L4': 1},
+                              cloud_name='AWS',
+                              instance_type='g6.xlarge')
+        second = make_location('us-east-1', {'L4': 1},
+                               cloud_name='AWS',
+                               instance_type='g6.2xlarge')
+        legacy = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+
+        assert spot_placer.match_catalog_location_strict(
+            legacy, [first, second]) == (None, True)
+        assert spot_placer.match_catalog_location_strict(legacy,
+                                                         [first]) == (first,
+                                                                      False)
+        assert spot_placer.match_catalog_location_strict(
+            second, [first, second]) == (second, False)
+
     def test_ambiguous_legacy_failure_benches_cheapest_matching_shape(self):
         first = make_location('us-east-1', {'L4': 1},
                               cloud_name='AWS',
@@ -511,6 +594,25 @@ class TestInstanceTypeLocationIdentity:
         assert make_placer({
             current: 1.0
         }).resolve_location(equivalent) == equivalent
+
+    def test_exact_mapping_match_does_not_scan_catalog(self):
+        current = make_location('us-east-1', {'L4': 1},
+                                cloud_name='AWS',
+                                instance_type='g6.xlarge')
+        equivalent = make_location('us-east-1', {'L4': 1},
+                                   cloud_name='AWS',
+                                   instance_type='g6.xlarge')
+
+        class _ExactOnlyMapping(dict):
+
+            def __iter__(self):
+                raise AssertionError('exact mapping lookup must not iterate')
+
+        candidates = _ExactOnlyMapping(
+            {current: spot_placer.LocationStatus.ACTIVE})
+
+        assert spot_placer.match_catalog_location_strict(
+            equivalent, candidates) == (equivalent, False)
 
     def test_failed_type_can_fall_back_to_sibling_type_in_same_region(self):
         cheapest = make_location('us-east-1', {'L4': 1},
@@ -796,7 +898,7 @@ class TestProvisionTimeoutWarning:
         warning = mock.MagicMock()
         monkeypatch.setattr(spot_placer.logger, 'warning', warning)
 
-        spot_placer.DynamicFallbackSpotPlacer(task)
+        spot_placer.DynamicFallbackSpotPlacer(task, _physical_contract())
 
         warning.assert_not_called()
         assert get_timeout.call_args.kwargs['override_configs'] == task_override
@@ -1104,9 +1206,8 @@ class TestMixedValidation:
 
 
 class TestReservedFillPoolValidation:
-    """validate_service_task groups accelerators in one k8s context.
+    """validate_service_task groups accelerators per k8s context.
 
-    Multiple contexts remain ambiguous broker pools and fail at submit time.
     All Kubernetes entries are treated as candidate pool shapes because
     zero-cost-ness is not knowable client-side.
     """
@@ -1147,11 +1248,18 @@ run: echo hi
 """
         return sky.Task.from_yaml_str(yaml_str)
 
-    def test_multiple_contexts_rejected(self):
+    def test_multiple_physical_contexts_with_independent_widths_accepted(self):
         # pylint: disable=import-outside-toplevel
         from sky.serve import serve_utils
-        entries = [('ctx-a', 'A100'), ('ctx-b', 'A100')]
-        with pytest.raises(ValueError, match='one Kubernetes context'):
+        entries = [('ctx-a', 'A100', 1), ('ctx-b', 'H200', 8)]
+        serve_utils.validate_service_task(self._task(entries), pool=False)
+
+    def test_same_context_mixed_widths_rejected(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        entries = [('ctx-a', 'A100', 1), ('ctx-a', 'H100', 2)]
+        with pytest.raises(ValueError,
+                           match='one GPU count within each Kubernetes'):
             serve_utils.validate_service_task(self._task(entries), pool=False)
 
     def test_single_pool_accepted(self):
@@ -1171,6 +1279,13 @@ run: echo hi
         # pylint: disable=import-outside-toplevel
         from sky.serve import serve_utils
         task = self._task([('ctx-a', 'A100', 1), ('ctx-a', 'H100', 1.0)],
+                          logical=True)
+        serve_utils.validate_service_task(task, pool=False)
+
+    def test_logical_multiple_contexts_exact_one_gpu_accepted(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        task = self._task([('ctx-a', 'A100', 1), ('ctx-b', 'H200', 1)],
                           logical=True)
         serve_utils.validate_service_task(task, pool=False)
 
@@ -1196,6 +1311,24 @@ run: echo hi
         k8s_resource._accelerators = {  # pylint: disable=protected-access
             'A100': gpu_count
         }
+
+        with pytest.raises(ValueError, match='one-GPU Kubernetes fill shapes'):
+            serve_utils.validate_service_task(task, pool=False)
+
+    def test_historical_physical_per_gpu_contract_still_requires_one_gpu(self):
+        # pylint: disable=import-outside-toplevel
+        from sky.serve import serve_utils
+        task = self._task([('ctx-a', 'A100', 2)], logical=True)
+        assert task.service is not None
+        legacy_state = dict(task.service.__dict__)
+        for field in placement_policy.CONTRACT_FIELDS:
+            legacy_state.pop(field)
+        legacy_state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+        legacy = service_spec_lib.SkyServiceSpec.__new__(
+            service_spec_lib.SkyServiceSpec)
+        legacy.__setstate__(legacy_state)
+        assert legacy.placement_contract.is_legacy_physical_per_gpu
+        task.set_service(legacy)
 
         with pytest.raises(ValueError, match='one-GPU Kubernetes fill shapes'):
             serve_utils.validate_service_task(task, pool=False)

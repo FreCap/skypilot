@@ -67,7 +67,8 @@ class TestProbeRoundBatching(unittest.TestCase):
         warning.assert_called_once()
 
     def _make_manager(self):
-        manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
         manager._ownership_lost = threading.Event()
         manager.lock = threading.Lock()
         manager._service_name = 'svc'
@@ -86,7 +87,7 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager._cloud_instance_looks_alive = mock.Mock(return_value=True)
         manager._terminate_replica = mock.Mock()
         manager._resolve_probe_urls = mock.Mock(
-            side_effect=lambda infos:
+            side_effect=lambda infos, *, phase_admission:
             {info.replica_id: info.url for info in infos})
         return manager
 
@@ -511,18 +512,19 @@ class TestProbeRoundBatching(unittest.TestCase):
             replica_managers.SkyPilotReplicaManager.
             _readiness_persistence_fingerprint(info), (False, 3.0, 4.0, 5.0))
 
-        source = textwrap.dedent(
-            inspect.getsource(
-                inspect.unwrap(replica_managers.SkyPilotReplicaManager.
-                               _probe_all_replicas)))
         assignments = set()
-        for node in ast.walk(ast.parse(source)):
-            if not isinstance(node, ast.Assign):
-                continue
-            for target in node.targets:
-                target_source = ast.unparse(target)
-                if target_source.startswith('info.'):
-                    assignments.add(target_source)
+        for method in (
+                replica_managers.SkyPilotReplicaManager._probe_all_replicas,
+                replica_managers.SkyPilotReplicaManager.
+                _probe_all_replicas_with_snapshot):
+            source = textwrap.dedent(inspect.getsource(inspect.unwrap(method)))
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(node, ast.Assign):
+                    continue
+                for target in node.targets:
+                    target_source = ast.unparse(target)
+                    if target_source.startswith('info.'):
+                        assignments.add(target_source)
         self.assertEqual(
             assignments, {
                 'info.status_property.service_ready_now',
@@ -620,7 +622,8 @@ class TestProbeRoundBatching(unittest.TestCase):
             manager._probe_all_replicas()
 
         mock_get_specs.assert_not_called()
-        info.probe_pool.assert_called_once_with()
+        info.probe_pool.assert_called_once_with(
+            provider_phase_admission=mock.ANY)
 
     def test_probe_round_returns_fleet_snapshot_without_second_full_read(self):
         manager = self._make_manager()
@@ -689,8 +692,8 @@ class TestProbeRoundBatching(unittest.TestCase):
                  replica_managers.serve_utils,
                  'set_service_status_and_active_versions_from_replica'
              ) as status_update, \
-             mock.patch.object(manager._ownership_lost,
-                               'wait', side_effect=_StopLoop) as ownership_wait:
+             mock.patch.object(manager._manager_daemon_stop,
+                               'wait', side_effect=_StopLoop) as daemon_wait:
             manager._get_endpoint_probe_interval_seconds = mock.Mock(
                 return_value=10)
             with self.assertRaises(_StopLoop):
@@ -703,7 +706,7 @@ class TestProbeRoundBatching(unittest.TestCase):
         status_update.assert_called_once_with('svc', [info],
                                               manager._update_mode,
                                               target_num_replicas=None)
-        ownership_wait.assert_called_once_with(10)
+        daemon_wait.assert_called_once_with(10)
 
     def test_no_tracked_replicas_skips_probe_round_work(self):
         manager = self._make_manager()

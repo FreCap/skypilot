@@ -51,7 +51,11 @@ def test_legacy_runtime_owns_process_local_mutation_state() -> None:
 
 
 def test_legacy_runtime_adopts_pre_refactor_manager_fields() -> None:
-    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    # Simulate an object reconstructed from the pre-runtime layout while still
+    # exercising the manager's supported allocation path.
+    manager.__dict__.pop('_legacy_mutation_runtime')
     old_completion_queue: queue.SimpleQueue[int] = queue.SimpleQueue()
     old_completion_event = threading.Event()
     old_launch_pool = thread_utils.ThreadSafeDict()
@@ -94,7 +98,8 @@ def test_legacy_runtime_adopts_pre_refactor_manager_fields() -> None:
 
 
 def test_legacy_runtime_proxies_restore_instance_patch_by_identity() -> None:
-    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     runtime = manager._legacy_mutation_runtime_state()
 
     for create in (False, True):
@@ -115,7 +120,8 @@ def test_legacy_runtime_proxies_restore_instance_patch_by_identity() -> None:
 
 
 def test_legacy_runtime_proxies_recreate_defaults_after_delete() -> None:
-    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     runtime = manager._legacy_mutation_runtime_state()
 
     for legacy_name, runtime_name in manager._LEGACY_MUTATION_FIELD_MAP.items():
@@ -127,7 +133,10 @@ def test_legacy_runtime_proxies_recreate_defaults_after_delete() -> None:
 
 
 def test_legacy_runtime_adoption_is_atomic_across_first_callers() -> None:
-    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    # Simulate a pre-runtime reconstruction with only the legacy fields below.
+    manager.__dict__.pop('_legacy_mutation_runtime')
     old_completion_queue: queue.SimpleQueue[int] = queue.SimpleQueue()
     old_completion_queue.put(17)
     old_completion_event = threading.Event()
@@ -173,8 +182,10 @@ def test_legacy_runtime_adoption_is_atomic_across_first_callers() -> None:
 
 
 def test_recovery_and_refresh_route_through_legacy_runtime() -> None:
-    manager = object.__new__(replica_managers.SkyPilotReplicaManager)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
     manager.lock = threading.Lock()
+    manager._superseded_prune_pending = False
     runtime = replica_managers._LegacyReplicaMutationRuntime()
     runtime.recover = mock.Mock()
     runtime.refresh = mock.Mock()

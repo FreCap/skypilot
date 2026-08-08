@@ -7,6 +7,7 @@ as a double N+1 inside ReplicaInfo.to_info_dict.
 # pylint: disable=protected-access
 from unittest import mock
 
+import pytest
 import sqlalchemy
 from sqlalchemy import event
 
@@ -41,7 +42,8 @@ def _add_cluster(name: str,
                  *,
                  is_managed: bool = False,
                  ready: bool = False,
-                 workload_type: str | None = None) -> None:
+                 workload_type: str | None = None,
+                 workload_id: str | None = None) -> None:
     global_user_state.add_or_update_cluster(
         cluster_name=name,
         cluster_handle=_MinimalHandle(),
@@ -49,6 +51,7 @@ def _add_cluster(name: str,
         ready=ready,
         is_managed=is_managed,
         workload_type=workload_type,
+        workload_id=workload_id,
     )
 
 
@@ -167,6 +170,53 @@ def test_get_handles_from_cluster_names_retries_transient_db_failure(
     assert isinstance(result['alive-1'], _MinimalHandle)
 
 
+def test_get_cluster_handle_status_from_name_returns_handle_and_status(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('alive-1', ready=True)
+
+    handle, status = global_user_state.get_cluster_handle_status_from_name(
+        'alive-1')
+
+    assert isinstance(handle, _MinimalHandle)
+    assert status == global_user_state.status_lib.ClusterStatus.UP
+
+
+def test_get_cluster_handle_status_from_name_missing_cluster_returns_nones(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+
+    handle, status = global_user_state.get_cluster_handle_status_from_name(
+        'missing')
+
+    assert handle is None
+    assert status is None
+
+
+def test_get_cluster_handle_status_from_name_uses_one_select(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('alive-1', ready=True)
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        handle, status = global_user_state.get_cluster_handle_status_from_name(
+            'alive-1')
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert isinstance(handle, _MinimalHandle)
+    assert status == global_user_state.status_lib.ClusterStatus.UP
+    assert len(select_statements) == 1
+
+
 def test_get_clusters_from_names_chunks_large_input(tmp_path, monkeypatch):
     """Names beyond a single batch must still be resolved. Shrink the chunk
     size to 2 so we exercise the loop with only 5 clusters."""
@@ -245,6 +295,37 @@ def test_get_cluster_status_fields_all_unmanaged_uses_one_select(
     assert len(select_statements) == 1
 
 
+def test_get_cluster_status_fields_by_prefix_is_filtered_and_bounded(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('sky-serve-controller-old')
+    _add_cluster('ordinary-cluster')
+    _add_cluster('sky-serve-controller-current')
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        result = global_user_state.get_cluster_status_fields_by_prefix(
+            'sky-serve-controller-', row_limit=2)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert list(result) == [
+        'sky-serve-controller-current',
+        'sky-serve-controller-old',
+    ]
+    assert len(select_statements) == 1
+    with pytest.raises(ValueError, match='exceeds'):
+        global_user_state.get_cluster_status_fields_by_prefix(
+            'sky-serve-controller-', row_limit=1)
+
+
 def test_get_managed_cluster_status_fields_filters_workload_type(
         tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
@@ -258,6 +339,26 @@ def test_get_managed_cluster_status_fields_filters_workload_type(
 
     assert set(result) == {'managed-service'}
     assert result['managed-service'][0] == 'INIT'
+
+
+def test_get_managed_job_cluster_cleanup_candidates_includes_legacy(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('user-cluster')
+    _add_cluster('managed-service', is_managed=True, workload_type='service')
+    _add_cluster('managed-pool', is_managed=True, workload_type='pool')
+    _add_cluster('managed-job',
+                 is_managed=True,
+                 workload_type='managed_job',
+                 workload_id='42')
+    _add_cluster('managed-legacy', is_managed=True)
+
+    result = global_user_state.get_managed_job_cluster_cleanup_candidates()
+
+    assert result == {
+        'managed-job': '42',
+        'managed-legacy': None,
+    }
 
 
 def test_get_clusters_from_names_matches_single_helper(tmp_path, monkeypatch):

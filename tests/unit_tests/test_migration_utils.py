@@ -53,6 +53,76 @@ def test_older_rollback_target_accepts_newer_additive_revision(
     migration_utils.verify_alembic_revision(engine, 'serve_db', '026')
 
 
+@pytest.mark.parametrize(('dialect', 'expected'), [
+    ('postgresql', migration_utils.SERVE_VERSION),
+    ('sqlite', migration_utils.SERVE_NON_POSTGRES_VERSION),
+])
+def test_serve_target_version_is_dialect_safe(monkeypatch: pytest.MonkeyPatch,
+                                              dialect: str,
+                                              expected: str) -> None:
+    engine = mock.Mock()
+    engine.dialect.name = dialect
+    monkeypatch.delenv(migration_utils.SERVE_MIGRATION_CEILING_ENV_VAR,
+                       raising=False)
+
+    assert migration_utils.serve_target_version(engine) == expected
+
+
+def test_serve_target_version_honors_exact_retirement_ceiling(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = mock.Mock()
+    engine.dialect.name = 'postgresql'
+    monkeypatch.setenv(migration_utils.SERVE_MIGRATION_CEILING_ENV_VAR, '037')
+
+    assert migration_utils.serve_target_version(engine) == '037'
+
+
+def test_serve_target_version_rejects_ambiguous_retirement_ceiling(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = mock.Mock()
+    engine.dialect.name = 'postgresql'
+    monkeypatch.setenv(migration_utils.SERVE_MIGRATION_CEILING_ENV_VAR, '35')
+
+    with pytest.raises(RuntimeError, match='must be exactly'):
+        migration_utils.serve_target_version(engine)
+
+
+def test_safe_alembic_retirement_ceiling_requires_exact_serve_head(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = mock.Mock()
+    verify = mock.Mock()
+    monkeypatch.setenv(migration_utils.SERVE_MIGRATION_CEILING_ENV_VAR, '037')
+    monkeypatch.setattr(migration_utils, 'get_current_alembic_revision',
+                        lambda *_args, **_kwargs: '038')
+    monkeypatch.setattr(migration_utils, 'verify_alembic_revision', verify)
+
+    with pytest.raises(RuntimeError, match='requires exact revision 037'):
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SERVE_DB_NAME,
+                                             '037',
+                                             mode='verify')
+
+    verify.assert_not_called()
+
+
+def test_safe_alembic_retirement_ceiling_allows_exact_serve_head(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = mock.Mock()
+    verify = mock.Mock()
+    monkeypatch.setenv(migration_utils.SERVE_MIGRATION_CEILING_ENV_VAR, '037')
+    monkeypatch.setattr(migration_utils, 'get_current_alembic_revision',
+                        lambda *_args, **_kwargs: '037')
+    monkeypatch.setattr(migration_utils, 'verify_alembic_revision', verify)
+
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SERVE_DB_NAME,
+                                         '037',
+                                         mode='verify')
+
+    verify.assert_called_once_with(engine, migration_utils.SERVE_DB_NAME, '037',
+                                   None)
+
+
 def test_global_state_create_table_uses_configured_migration_mode(
         monkeypatch: pytest.MonkeyPatch) -> None:
     engine = sqlalchemy.create_engine('sqlite://')
@@ -71,7 +141,7 @@ def test_global_state_create_table_uses_configured_migration_mode(
 
 @pytest.mark.parametrize(('create_table', 'database_name', 'version'), [
     (serve_state.create_table, migration_utils.SERVE_DB_NAME,
-     migration_utils.SERVE_VERSION),
+     migration_utils.SERVE_NON_POSTGRES_VERSION),
     (state_storage.create_table, migration_utils.SPOT_JOBS_DB_NAME,
      migration_utils.SPOT_JOBS_VERSION),
 ])

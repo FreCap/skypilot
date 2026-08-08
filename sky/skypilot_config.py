@@ -174,11 +174,15 @@ def _get_config_context() -> ConfigContext:
         return _global_config_context
     if ctx.config_context is None:
         # Config context for current context is not initialized, inherit from
-        # the global one.
+        # one captured global generation.  A concurrent internal controller
+        # refresh swaps this reference atomically; reading it once prevents a
+        # request context from combining one generation's config with another
+        # generation's path metadata.
+        global_context = _global_config_context
         ctx.config_context = ConfigContext(
-            config=copy.deepcopy(_global_config_context.config),
-            config_path=_global_config_context.config_path,
-            config_overridden=_global_config_context.config_overridden,
+            config=copy.deepcopy(global_context.config),
+            config_path=global_context.config_path,
+            config_overridden=global_context.config_overridden,
         )
     return ctx.config_context
 
@@ -203,7 +207,13 @@ def _get_loaded_config_path() -> list[str | None]:
 
 def _set_loaded_config_path(path: str | list[str | None] | None) -> None:
     if not path:
+        # Must return: falling through re-assigned json.dumps(None), i.e. the
+        # literal string 'null'. That is not "no path" to any consumer that
+        # only checks for None -- it round-trips through the request body and
+        # decodes back to None on the API server, where it is concatenated to
+        # a list. See override_skypilot_config.
         _get_config_context().config_path = None
+        return
     if isinstance(path, str):
         path = [path]
     _get_config_context().config_path = json.dumps(path)
@@ -219,6 +229,40 @@ def _is_config_overridden() -> bool:
 
 def _set_config_overridden(config_overridden: bool) -> None:
     _get_config_context().config_overridden = config_overridden
+
+
+def _replace_config_context(config: config_utils.Config,
+                            config_path: str | list[str | None] | None,
+                            *,
+                            config_overridden: bool | None = None) -> None:
+    """Publish a complete config generation to the applicable context.
+
+    Config reloads can run either process-wide or inside an API request's
+    context.  Replacing the ``ConfigContext`` reference, rather than mutating
+    its config and path fields separately, prevents concurrent readers from
+    observing fields from different generations.
+    """
+    global _global_config_context
+    current_sky_context = context.get()
+    current_config_context = _global_config_context
+    if (current_sky_context is not None and
+            current_sky_context.config_context is not None):
+        current_config_context = typing.cast(ConfigContext,
+                                             current_sky_context.config_context)
+
+    if isinstance(config_path, str):
+        config_path = [config_path]
+    serialized_path = json.dumps(config_path)
+    if config_overridden is None:
+        config_overridden = current_config_context.config_overridden
+    replacement = ConfigContext(config=config,
+                                config_path=serialized_path,
+                                config_overridden=config_overridden)
+
+    if current_sky_context is None:
+        _global_config_context = replacement
+    else:
+        current_sky_context.config_context = replacement
 
 
 def get_user_config_path() -> str:
@@ -392,14 +436,13 @@ def get_effective_server_config() -> config_utils.Config:
     """The LIVE server config (server file + DB overlay), snapshot-immune.
 
     Consolidation-mode controller processes run under a per-service
-    ``SKYPILOT_CONFIG`` snapshot frozen at `serve up` (embedded in the HA
-    recovery script and never refreshed — not even by `serve update`), so
-    their *loaded* config can disagree with the server's for keys that
-    changed after the service was created. Control-plane TOPOLOGY decisions
-    (e.g. whether the serve load balancer runs as an external Deployment)
-    must instead agree across the server and every controller in the pod:
-    this resolves the same config the API server itself uses, ignoring the
-    per-service snapshot.
+    ``SKYPILOT_CONFIG`` snapshot created at `serve up` and refreshed only by a
+    successfully committed `serve update`. Their *loaded* config can therefore
+    disagree with the server between a central config change and the next
+    service update. Control-plane TOPOLOGY decisions (e.g. whether the serve
+    load balancer runs as an external Deployment) must instead agree across
+    the server and every controller in the pod: this resolves the same config
+    the API server itself uses, ignoring the per-service snapshot.
     """
     server_config_path = _resolve_server_config_path()
     server_config = _get_config_from_path(server_config_path)
@@ -822,31 +865,64 @@ def reload_config() -> None:
         _reload_config_as_client()
 
 
-def parse_and_validate_config_file(config_path: str) -> config_utils.Config:
+def parse_and_validate_config_bytes(
+        config_bytes: bytes,
+        config_source: str,
+        *,
+        log_config: bool = True,
+        apply_db_env: bool = True) -> config_utils.Config:
+    """Parse one immutable config byte string and validate it."""
     config = config_utils.Config()
     try:
-        config_dict = yaml_utils.read_yaml(config_path,
-                                           reject_duplicate_keys=True)
+        config_dict = yaml_utils.read_yaml_str(config_bytes.decode('utf-8'),
+                                               reject_duplicate_keys=True)
         config = config_utils.Config.from_dict(config_dict)
         # pop the db url from the config, and set it to the env var.
         # this is to avoid db url (considered a sensitive value)
         # being printed with the rest of the config.
         db_url = config.pop_nested(('db',), None)
-        if db_url:
+        if db_url and apply_db_env:
             os.environ[constants.ENV_VAR_DB_CONNECTION_URI] = db_url
-        if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+        if (log_config and
+                sky_logging.logging_enabled(logger, sky_logging.DEBUG)):
             safe_config = _redact_container_image_config_for_logging(config)
-            logger.debug(f'Config loaded from {config_path}:\n'
+            logger.debug(f'Config loaded from {config_source}:\n'
                          f'{yaml_utils.dump_yaml_str(safe_config)}')
-    except yaml.YAMLError:
+    except (UnicodeDecodeError, yaml.YAMLError):
         # read_yaml() converts parser failures to a value-free ValueError.
         # Keep this defensive branch for alternate YAML implementations.
         raise ValueError('Invalid config YAML syntax.') from None
     if config:
-        _validate_config(config, config_path)
+        _validate_config(config, config_source)
 
-    logger.debug(f'Config syntax check passed for path: {config_path}')
+    logger.debug(f'Config syntax check passed for path: {config_source}')
     return config
+
+
+def parse_and_validate_config_file(config_path: str) -> config_utils.Config:
+    with open(config_path, 'rb') as config_file:
+        return parse_and_validate_config_bytes(config_file.read(), config_path)
+
+
+def install_internal_config_snapshot(config: config_utils.Config,
+                                     config_path: str) -> None:
+    """Atomically publish an already-validated internal process config.
+
+    The caller must serialize file promotion separately. This function must be
+    called without a request-local SkyPilot context so one reference swap
+    updates long-lived controller threads without exposing reload_config()'s
+    temporary empty state.
+    """
+    if context.get() is not None:
+        raise RuntimeError('Internal config snapshots must be installed in '
+                           'the process-global SkyPilot context.')
+    expanded_path = os.path.expanduser(config_path)
+    if not os.path.exists(expanded_path):
+        raise FileNotFoundError(expanded_path)
+    os.environ[ENV_VAR_SKYPILOT_CONFIG] = expanded_path
+    _replace_config_context(copy.deepcopy(config),
+                            expanded_path,
+                            config_overridden=False)
 
 
 def _parse_dotlist(dotlist: list[str]) -> config_utils.Config:
@@ -875,10 +951,6 @@ def _parse_dotlist(dotlist: list[str]) -> config_utils.Config:
 
 
 def _reload_config_from_internal_file(internal_config_path: str) -> None:
-    # Reset the global variables, to avoid using stale values.
-    _set_loaded_config(config_utils.Config())
-    _set_loaded_config_path(None)
-
     config_path = os.path.expanduser(internal_config_path)
     if not os.path.exists(config_path):
         with ux_utils.print_exception_no_traceback():
@@ -888,15 +960,17 @@ def _reload_config_from_internal_file(internal_config_path: str) -> None:
                 'exist. Please double check the path or unset the env var: '
                 f'unset {ENV_VAR_SKYPILOT_CONFIG}')
     logger.debug(f'Using config path: {config_path}')
-    _set_loaded_config(parse_and_validate_config_file(config_path))
-    _set_loaded_config_path(config_path)
+    loaded_config = parse_and_validate_config_file(config_path)
+    _replace_config_context(loaded_config, config_path)
 
 
 def _create_table(engine: sqlalchemy.engine.Engine):
     """Initialize the config database with migrations."""
     migration_utils.safe_alembic_upgrade(
-        engine, migration_utils.SKYPILOT_CONFIG_DB_NAME,
-        migration_utils.SKYPILOT_CONFIG_VERSION)
+        engine,
+        migration_utils.SKYPILOT_CONFIG_DB_NAME,
+        migration_utils.SKYPILOT_CONFIG_VERSION,
+        mode=migration_utils.configured_migration_mode())
 
 
 # We only store config in the DB when using Postgres,
@@ -907,10 +981,6 @@ initialize_and_get_db = _db_manager.get_engine
 
 
 def _reload_config_as_server() -> None:
-    # Reset the global variables, to avoid using stale values.
-    _set_loaded_config(config_utils.Config())
-    _set_loaded_config_path(None)
-
     server_config_path = _resolve_server_config_path()
     server_config = _get_config_from_path(server_config_path)
     # Get the db url from the env var. _get_config_from_path should have moved
@@ -930,15 +1000,10 @@ def _reload_config_as_server() -> None:
             server_config)
         logger.debug(f'server config: \n'
                      f'{yaml_utils.dump_yaml_str(safe_server_config)}')
-    _set_loaded_config(server_config)
-    _set_loaded_config_path(server_config_path)
+    _replace_config_context(server_config, server_config_path)
 
 
 def _reload_config_as_client() -> None:
-    # Reset the global variables, to avoid using stale values.
-    _set_loaded_config(config_utils.Config())
-    _set_loaded_config_path(None)
-
     overrides: list[config_utils.Config] = []
     user_config_path = resolve_user_config_path()
     user_config = _get_config_from_path(user_config_path)
@@ -959,8 +1024,8 @@ def _reload_config_as_client() -> None:
             overlaid_client_config)
         logger.debug(f'client config (before task and CLI overrides): \n'
                      f'{yaml_utils.dump_yaml_str(safe_client_config)}')
-    _set_loaded_config(overlaid_client_config)
-    _set_loaded_config_path([user_config_path, project_config_path])
+    _replace_config_context(overlaid_client_config,
+                            [user_config_path, project_config_path])
 
 
 def loaded_config_path() -> str | None:
@@ -1005,10 +1070,17 @@ def override_skypilot_config(
     original_config = _get_loaded_config()
     original_config_path = loaded_config_path_serialized()
     override_configs = config_utils.Config(override_configs)
+    override_config_path: list[str | None]
     if override_config_path_serialized is None:
         override_config_path = []
     else:
-        override_config_path = json.loads(override_config_path_serialized)
+        # `or []`: a serialized JSON null decodes to None, not to a list. Older
+        # clients (and any request body already in flight) can carry the string
+        # 'null' here, and concatenating that below raised
+        # "can only concatenate list (not NoneType) to list" -- inside the
+        # request executor's context manager, before the request log was even
+        # opened, so every affected launch failed with no diagnosable output.
+        override_config_path = json.loads(override_config_path_serialized) or []
 
     skipped_keys = config_utils.expand_nested_key_patterns(
         override_configs, constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
@@ -1112,6 +1184,21 @@ def replace_skypilot_config(new_configs: config_utils.Config) -> Iterator[None]:
             os.environ.pop(ENV_VAR_SKYPILOT_CONFIG, None)
     else:
         yield
+
+
+@contextlib.contextmanager
+def replace_skypilot_config_in_memory(
+        new_configs: config_utils.Config) -> Iterator[None]:
+    """Replace only the current in-process context, without a temp file."""
+    original_config = _get_loaded_config()
+    original_config_path = loaded_config_path_serialized()
+    _set_loaded_config(new_configs)
+    _set_loaded_config_path(None)
+    try:
+        yield
+    finally:
+        _set_loaded_config(original_config)
+        _set_loaded_config_path_serialized(original_config_path)
 
 
 _QUEUE_NAME_KEYS: list[tuple[str, ...]] = [

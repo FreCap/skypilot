@@ -5,6 +5,7 @@ import base64
 import os
 import time
 from unittest.mock import AsyncMock
+from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -377,6 +378,55 @@ async def test_metrics_endpoint_with_multiprocess():
             mock_gen.assert_called_once_with(mock_registry_instance)
 
 
+@pytest.mark.parametrize('role', ['all', 'api'])
+def test_multiprocess_metrics_register_api_owned_collectors(role):
+    """Shared-state and plugin collectors remain on API-owned targets."""
+    registry = MagicMock()
+    burn_rate = MagicMock()
+    workspace_usage = MagicMock()
+    managed_jobs = MagicMock()
+    plugin = MagicMock()
+    with patch.dict(os.environ, {
+            'PROMETHEUS_MULTIPROC_DIR': '/tmp/prom',
+            'SKYPILOT_API_SERVER_ROLE': role,
+    }), patch('sky.server.metrics.prom.CollectorRegistry',
+              return_value=registry), patch(
+                  'sky.server.metrics.multiprocess.MultiProcessCollector'), \
+         patch.object(metrics, '_BURN_RATE_COLLECTOR', burn_rate), \
+         patch.object(metrics, '_WORKSPACE_USAGE_COLLECTOR', workspace_usage), \
+         patch.object(metrics, '_MANAGED_JOBS_COLLECTOR', managed_jobs), \
+         patch.object(metrics, '_plugin_collectors', [plugin]), \
+         patch('sky.server.metrics.generate_latest', return_value=b''):
+        metrics.metrics()
+
+    assert registry.register.call_args_list == [
+        call(burn_rate),
+        call(workspace_usage),
+        call(managed_jobs),
+        call(plugin),
+    ]
+
+
+@pytest.mark.parametrize('role', ['executor', 'controller'])
+def test_multiprocess_metrics_omit_api_owned_collectors_from_split_roles(role):
+    """Role targets expose only their pod-local multiprocess registry."""
+    registry = MagicMock()
+    with patch.dict(os.environ, {
+            'PROMETHEUS_MULTIPROC_DIR': '/tmp/prom',
+            'SKYPILOT_API_SERVER_ROLE': role,
+    }), patch('sky.server.metrics.prom.CollectorRegistry',
+              return_value=registry), patch(
+                  'sky.server.metrics.multiprocess.MultiProcessCollector'), \
+         patch.object(metrics, '_BURN_RATE_COLLECTOR', MagicMock()), \
+         patch.object(metrics, '_WORKSPACE_USAGE_COLLECTOR', MagicMock()), \
+         patch.object(metrics, '_MANAGED_JOBS_COLLECTOR', MagicMock()), \
+         patch.object(metrics, '_plugin_collectors', [MagicMock()]), \
+         patch('sky.server.metrics.generate_latest', return_value=b''):
+        metrics.metrics()
+
+    registry.register.assert_not_called()
+
+
 @pytest.fixture
 def prometheus_middleware():
     """Create PrometheusMiddleware instance for testing."""
@@ -533,8 +583,8 @@ def test_get_user_label_with_auth_user():
 
 def test_get_user_label_anonymous():
     """Test _get_user_label with no auth_user."""
-    request = MagicMock(spec=['state'])
-    request.state = MagicMock(spec=[])  # No auth_user attribute
+    request = MagicMock()
+    request.state.auth_user = None
 
     result = metrics._get_user_label(request)
     assert result == 'anonymous'
@@ -639,7 +689,8 @@ async def test_middleware_records_anonymous_user_metrics(
     request = MagicMock(spec=['url', 'method', 'state'])
     request.url.path = '/api/v1/status'
     request.method = 'GET'
-    request.state = MagicMock(spec=[])  # No auth_user attribute
+    request.state = MagicMock()
+    request.state.auth_user = None
 
     response = MagicMock()
     response.status_code = 200

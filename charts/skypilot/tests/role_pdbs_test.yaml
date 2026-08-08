@@ -8,7 +8,7 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: should protect one API, executor, and controller in HA mode
+  - it: should preserve desired replicas minus one for every HA role
     set:
       apiService.highAvailability.enabled: true
     asserts:
@@ -22,8 +22,11 @@ tests:
           value: RELEASE-NAME-api
         documentIndex: 0
       - equal:
-          path: spec.minAvailable
+          path: spec.maxUnavailable
           value: 1
+        documentIndex: 0
+      - notExists:
+          path: spec.minAvailable
         documentIndex: 0
       - equal:
           path: spec.selector.matchLabels.app
@@ -37,8 +40,11 @@ tests:
           value: RELEASE-NAME-executor
         documentIndex: 1
       - equal:
-          path: spec.minAvailable
+          path: spec.maxUnavailable
           value: 1
+        documentIndex: 1
+      - notExists:
+          path: spec.minAvailable
         documentIndex: 1
       - equal:
           path: spec.selector.matchLabels.app
@@ -52,8 +58,11 @@ tests:
           value: RELEASE-NAME-controller
         documentIndex: 2
       - equal:
-          path: spec.minAvailable
+          path: spec.maxUnavailable
           value: 1
+        documentIndex: 2
+      - notExists:
+          path: spec.minAvailable
         documentIndex: 2
       - equal:
           path: spec.selector.matchLabels.app

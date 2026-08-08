@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 69  # Action-fenced internal cluster teardown
+API_VERSION = 73  # Owner-scoped persisted request access
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -128,10 +128,35 @@ MIN_SERVE_DASHBOARD_DIRECT_READS_API_VERSION = (
 # Minimum API version with batched summaries and paginated replica reads.
 MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION = 67
 
+# Minimum API version with bounded persisted SkyServe pricing reads.
+MIN_SERVE_DASHBOARD_PRICING_API_VERSION = 71
+
+# Minimum server API version that exposes GET /api/v1/public/capacity.
+MIN_PUBLIC_CAPACITY_API_VERSION = 72
+
+# Minimum API version that scopes persisted request payload access by owner.
+MIN_OWNER_SCOPED_REQUEST_ACCESS_API_VERSION = 73
+
+# This exact method/path pair is the only unauthenticated capacity surface.
+# Keep the predicate centralized so every authentication middleware applies
+# the same boundary.
+PUBLIC_CAPACITY_PATH = '/api/v1/public/capacity'
+
+
+def is_unauthenticated_public_request(method: str, path: str) -> bool:
+    """Return whether one request is the exact public capacity read."""
+    return method == 'GET' and path == PUBLIC_CAPACITY_PATH
+
+
 # Minimum server version accepting the private expected-cluster-record UUID on
 # controller-originated down requests. Older servers ignore unknown payload
 # fields, which would silently discard the teardown fence.
 MIN_RESOURCE_ACTION_EXPECTED_CLUSTER_UUID_API_VERSION = 69
+
+# Minimum server API version whose request status payload exposes exact-
+# generation ``execution_quiesced_*`` evidence. The legacy
+# ``cancel_acknowledged_at`` field continues to mean signal delivery only.
+MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION = 70
 
 # Minimum server API version that exposes the admin-only, low-cardinality
 # operator notification inbox used by the dashboard.

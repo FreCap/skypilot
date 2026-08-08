@@ -81,6 +81,30 @@ class TestCleanServerEnvCapture:
         # os.environ inheritance.
         assert clean_env_module.get_clean_server_env() is None
 
+    def test_restore_replaces_polluted_worker_environment(self):
+        original = dict(os.environ)
+        clean = {
+            'PATH': original.get('PATH', ''),
+            'SKYPILOT_API_REQUEST_BACKEND': 'postgres',
+            'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS': 'true',
+            'SKY_TEST_CLEAN_ONLY': 'clean',
+        }
+        try:
+            clean_env_module._clean_server_env = {'STALE': 'snapshot'}
+            os.environ['SKYPILOT_API_REQUEST_BACKEND'] = 'sqlite'
+            os.environ[
+                'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS'] = 'false'
+            os.environ['SKY_TEST_POLLUTED_ONLY'] = 'polluted'
+
+            clean_env_module.restore_clean_server_env(clean)
+
+            assert dict(os.environ) == clean
+            assert clean_env_module.get_clean_server_env() == clean
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+            clean_env_module._clean_server_env = None
+
 
 class TestPopenEnvOverrideMechanism:
     """The fundamental mechanism: subprocess.Popen with env= breaks the

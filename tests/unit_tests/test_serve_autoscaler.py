@@ -17,6 +17,34 @@ from sky.utils import common_utils
 from sky.utils import operator_notifications
 
 
+def _autoscaler_spec(**overrides):
+    """Build a complete mutable SkyServiceSpec test interface."""
+    values = {
+        'min_replicas': 0,
+        'min_replicas_by_accelerator': {},
+        'max_replicas': 10,
+        'num_overprovision': None,
+        'replica_unit': 'physical_backend',
+        'target_qps_per_replica': None,
+        'target_concurrency_per_replica': None,
+        'pool': False,
+        'use_ondemand_fallback': False,
+        'queue_length_threshold': None,
+        'upscale_delay_seconds': None,
+        'downscale_delay_seconds': None,
+        'reserved_capacity_fill': False,
+        'reserved_fill_floor_replicas': 0,
+        'reserved_fill_weight': 1.0,
+        'reserved_fill_utilization_gate': False,
+        'cost_rebalance': False,
+        'cost_rebalance_min_savings_fraction': 0.3,
+        'cost_rebalance_max_parallel_replacements': 1,
+        'cost_rebalance_stabilization_seconds': 300.0,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
 class TestSelectNonterminalReplicasToScaleDown(unittest.TestCase):
     """Test cases for _select_nonterminal_replicas_to_scale_down."""
 
@@ -175,9 +203,7 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
     """
 
     def test_base_init_sets_latest_version_from_arg(self):
-        spec = types.SimpleNamespace(min_replicas=1,
-                                     max_replicas=3,
-                                     num_overprovision=None)
+        spec = _autoscaler_spec(min_replicas=1, max_replicas=3)
         autoscaler = object.__new__(autoscalers.Autoscaler)
         autoscalers.Autoscaler.__init__(autoscaler, 'svc', spec, version=5)
         self.assertEqual(autoscaler.latest_version, 5)
@@ -186,9 +212,7 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         self.assertEqual(autoscaler.latest_version_ever_ready, 4)
 
     def test_base_init_defaults_to_initial_version(self):
-        spec = types.SimpleNamespace(min_replicas=1,
-                                     max_replicas=3,
-                                     num_overprovision=None)
+        spec = _autoscaler_spec(min_replicas=1, max_replicas=3)
         autoscaler = object.__new__(autoscalers.Autoscaler)
         autoscalers.Autoscaler.__init__(autoscaler, 'svc', spec)
         self.assertEqual(autoscaler.latest_version, constants.INITIAL_VERSION)
@@ -199,10 +223,9 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
                     pool=False,
                     use_ondemand_fallback=False,
                     target_qps_per_replica=2.0):
-        return types.SimpleNamespace(
-            pool=pool,
-            use_ondemand_fallback=use_ondemand_fallback,
-            target_qps_per_replica=target_qps_per_replica)
+        return _autoscaler_spec(pool=pool,
+                                use_ondemand_fallback=use_ondemand_fallback,
+                                target_qps_per_replica=target_qps_per_replica)
 
     def test_from_spec_forwards_version_to_every_variant(self):
         # Each `from_spec` dispatch branch is a separate call site that could
@@ -236,7 +259,10 @@ class TestAutoscalerVersionInitialization(unittest.TestCase):
         with mock.patch.object(serve_controller.replica_managers,
                                'SkyPilotReplicaManager'), \
              mock.patch.object(serve_controller.autoscalers.Autoscaler,
-                               'from_spec') as mock_from_spec:
+                               'from_spec') as mock_from_spec, \
+             mock.patch.object(
+                 serve_controller.SkyServeController,
+                 '_acknowledge_pending_placement_normalization'):
             serve_controller.SkyServeController(
                 'svc',
                 mock.MagicMock(),
@@ -255,12 +281,9 @@ class TestRolloutBlockedNotifications(unittest.TestCase):
 
     @staticmethod
     def _autoscaler():
-        spec = types.SimpleNamespace(min_replicas=1,
-                                     max_replicas=1,
-                                     num_overprovision=None,
-                                     target_qps_per_replica=1.0,
-                                     upscale_delay_seconds=None,
-                                     downscale_delay_seconds=None)
+        spec = _autoscaler_spec(min_replicas=1,
+                                max_replicas=1,
+                                target_qps_per_replica=1.0)
         return autoscalers.RequestRateAutoscaler('svc', spec, version=2)
 
     @staticmethod
@@ -349,6 +372,10 @@ class TestAutoscalerInfo(unittest.TestCase):
         autoscaler.target_num_replicas = 2
         autoscaler.min_replicas = 1
         autoscaler.max_replicas = 4
+        autoscaler.min_replicas_by_accelerator = {}
+        autoscaler.target_num_replicas_by_accelerator = {}
+        autoscaler.warm_retention_target_by_accelerator = {}
+        autoscaler.cold_launch_authority_by_accelerator = {}
         autoscaler.reserved_capacity_fill = False
         autoscaler.qps_window_size = 60
         autoscaler.request_timestamps = [900.0, 940.0, 950.0, 999.0]
@@ -365,12 +392,9 @@ class TestQueueLengthAutoscalerIdleReplicas(unittest.TestCase):
     """Idle detection should use one grouped pool lookup."""
 
     def _spec(self):
-        return types.SimpleNamespace(min_replicas=0,
-                                     max_replicas=10,
-                                     num_overprovision=None,
-                                     queue_length_threshold=1,
-                                     upscale_delay_seconds=None,
-                                     downscale_delay_seconds=None)
+        return _autoscaler_spec(min_replicas=0,
+                                max_replicas=10,
+                                queue_length_threshold=1)
 
     def _replica(self, replica_id, cluster_name):
         info = mock.Mock(spec=replica_managers.ReplicaInfo)
@@ -475,10 +499,24 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
             autoscalers.InstanceAwareRequestRateAutoscaler)
         autoscaler._gpu_shape_cache = {}
         autoscaler._replica_cost_cache = {}
+        autoscaler._gpu_shape_handles_for_tick = None
         autoscaler._bare_key_warned = set()
         autoscaler._snap_target_on_next_recompute = False
         autoscaler._qps_dict_by_version = {}
         autoscaler._qps_dict_unavailable_versions_for_tick = None
+        autoscaler.min_replicas_by_accelerator = {}
+        autoscaler.target_num_replicas_by_accelerator = {}
+        autoscaler.warm_retention_target_by_accelerator = {}
+        autoscaler.cold_launch_authority_by_accelerator = {}
+        autoscaler.compatibility_profiles = []
+        autoscaler.queued_compatibility_profiles = []
+        autoscaler.rejected_compatibility_profiles = []
+        autoscaler._compatibility_demand_complete = False
+        autoscaler.configured_accelerator_shapes = {}
+        autoscaler.free_reserved_slots_by_accelerator = {}
+        autoscaler.request_timestamps = []
+        autoscaler.qps_window_size = (
+            constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
         autoscaler.latest_version = 1
         return autoscaler
 
@@ -814,12 +852,9 @@ class TestInstanceAwareUpdateVersion(unittest.TestCase):
     """
 
     def _spec(self, qps_dict, min_replicas=1, max_replicas=20):
-        return types.SimpleNamespace(min_replicas=min_replicas,
-                                     max_replicas=max_replicas,
-                                     num_overprovision=None,
-                                     target_qps_per_replica=qps_dict,
-                                     upscale_delay_seconds=None,
-                                     downscale_delay_seconds=None)
+        return _autoscaler_spec(min_replicas=min_replicas,
+                                max_replicas=max_replicas,
+                                target_qps_per_replica=qps_dict)
 
     def _make_autoscaler(self, qps_dict):
         return autoscalers.InstanceAwareRequestRateAutoscaler(
@@ -937,12 +972,9 @@ class TestInstanceAwareUpdateRolloutSafety(unittest.TestCase):
     """
 
     def _spec(self, qps_dict, min_replicas=1, max_replicas=20):
-        return types.SimpleNamespace(min_replicas=min_replicas,
-                                     max_replicas=max_replicas,
-                                     num_overprovision=None,
-                                     target_qps_per_replica=qps_dict,
-                                     upscale_delay_seconds=None,
-                                     downscale_delay_seconds=None)
+        return _autoscaler_spec(min_replicas=min_replicas,
+                                max_replicas=max_replicas,
+                                target_qps_per_replica=qps_dict)
 
     def _make_autoscaler(self, qps_dict):
         return autoscalers.InstanceAwareRequestRateAutoscaler(
@@ -1073,12 +1105,9 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
     """
 
     def _spec(self, qps_dict, min_replicas=1, max_replicas=200):
-        return types.SimpleNamespace(min_replicas=min_replicas,
-                                     max_replicas=max_replicas,
-                                     num_overprovision=None,
-                                     target_qps_per_replica=qps_dict,
-                                     upscale_delay_seconds=None,
-                                     downscale_delay_seconds=None)
+        return _autoscaler_spec(min_replicas=min_replicas,
+                                max_replicas=max_replicas,
+                                target_qps_per_replica=qps_dict)
 
     def _replica(self, replica_id, gpu_type, version, is_ready=True):
         info = mock.Mock()
@@ -1302,19 +1331,18 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
               reserved_capacity_fill=False,
               upscale_delay_seconds=0,
               downscale_delay_seconds=0):
-        return types.SimpleNamespace(
-            min_replicas=0,
-            min_replicas_by_accelerator=floors or {},
-            max_replicas=max_replicas,
-            num_overprovision=num_overprovision,
-            target_qps_per_replica={
-                'L4': 1.0,
-                'A100': 1.0,
-                'H100': 1.0,
-            },
-            upscale_delay_seconds=upscale_delay_seconds,
-            downscale_delay_seconds=downscale_delay_seconds,
-            reserved_capacity_fill=reserved_capacity_fill)
+        return _autoscaler_spec(min_replicas=0,
+                                min_replicas_by_accelerator=floors or {},
+                                max_replicas=max_replicas,
+                                num_overprovision=num_overprovision,
+                                target_qps_per_replica={
+                                    'L4': 1.0,
+                                    'A100': 1.0,
+                                    'H100': 1.0,
+                                },
+                                upscale_delay_seconds=upscale_delay_seconds,
+                                downscale_delay_seconds=downscale_delay_seconds,
+                                reserved_capacity_fill=reserved_capacity_fill)
 
     def _autoscaler(self, **kwargs):
         return autoscalers.InstanceAwareRequestRateAutoscaler(

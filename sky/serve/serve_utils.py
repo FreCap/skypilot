@@ -4,10 +4,12 @@ import collections
 from collections.abc import Callable
 from collections.abc import Iterator
 import concurrent.futures
+import contextlib
 import contextvars
 import dataclasses
 import datetime
 import enum
+import errno
 import hashlib
 import json
 import logging
@@ -18,6 +20,8 @@ import pickle
 import re
 import shlex
 import shutil
+import stat
+import tempfile
 import threading
 import time
 import traceback
@@ -41,17 +45,21 @@ from sky.jobs import state as managed_job_state
 from sky.serve import auth_tokens
 from sky.serve import constants
 from sky.serve import controller_transport
+from sky.serve import maintenance
+from sky.serve import provider_phase
 from sky.serve import request_aggregator
 from sky.serve import serve_state
 from sky.serve import serve_status_formatter
 from sky.serve import spot_placer
 from sky.server import constants as server_constants
+from sky.server import versions
 from sky.server.requests import request_names
 from sky.skylet import constants as skylet_constants
 from sky.skylet import job_lib
 from sky.utils import annotations
 from sky.utils import command_runner
 from sky.utils import common_utils
+from sky.utils import context as sky_context
 from sky.utils import controller_utils
 from sky.utils import debug_dump_helpers
 from sky.utils import locks
@@ -70,6 +78,7 @@ if typing.TYPE_CHECKING:
     import requests
 
     import sky
+    from sky.data import storage as storage_lib
     from sky.serve import replica_managers
     from sky.serve import service_spec as service_spec_lib
     WorkerHandle = backends.CloudVmRayResourceHandle | None
@@ -80,6 +89,332 @@ else:
 
 logger: logging.Logger = sky_logging.init_logger(__name__)
 controller_transport.logger = logger
+
+_LEGACY_HA_CONFIG_BLOCK_BEGIN = '# SKY_SERVE_CONFIG_SNAPSHOT_BEGIN'
+_LEGACY_HA_CONFIG_BLOCK_END = '# SKY_SERVE_CONFIG_SNAPSHOT_END'
+_VERSIONED_HA_CONFIG_MARKER = constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER
+# This grammar is owned by ``write_config_snapshot_receipt()``. Keep it
+# deliberately exact: recovery and GC must never treat an arbitrary dotfile
+# that merely shares the prefix as one of our receipts.
+_CONFIG_RECEIPT_TEMP_FILE_PATTERN = re.compile(
+    r'\.config-receipt-[0-9a-f]{32}\.tmp\Z')
+_HA_CONFIG_SAFE_TOP_LEVEL_KEYS = frozenset({
+    'active_workspace',
+    'allowed_clouds',
+    'aws',
+    'azure',
+    'container_registries',
+    'data',
+    'gcp',
+    'jobs',
+    'kubernetes',
+    'nebius',
+    'nvidia_gpus',
+    'oci',
+    'provision',
+    'serve',
+    'slurm',
+    'ssh',
+    'vast',
+    'workspaces',
+})
+_HA_CONFIG_RECURSIVE_SENSITIVE_KEYS = frozenset({
+    '_metadata',
+    'additional_labels',
+    'additional_tags',
+    'annotations',
+    'external_id',
+    'create_instance_kwargs',
+    'custom_metadata',
+    'instance_tags',
+    'labels',
+    'pod_config',
+    'post_provision_runcmd',
+    'sbatch_options',
+    'ssh_proxy_command',
+})
+# Plugin-registered Kubernetes properties are intentionally absent. They may
+# have arbitrary schemas and credential semantics, so they cannot be placed in
+# a durable DB script without an explicit safe-persistence contract.
+_HA_CONFIG_SAFE_KUBERNETES_KEYS = frozenset({
+    'allowed_contexts',
+    'allowed_nodes',
+    'apt_mirrors',
+    'auto_mounts',
+    'autoscaler',
+    'context_configs',
+    'dws',
+    'disabled',
+    'enable_docker',
+    'high_availability',
+    'kueue',
+    'namespace',
+    'networking',
+    'ports',
+    'pricing',
+    'provision_timeout',
+    'quota',
+    'remote_identity',
+    'set_pod_resource_limits',
+})
+_HA_CONFIG_SAFE_CONTROLLER_KEYS = frozenset({
+    'autostop',
+    'consolidation_mode',
+    'controller_logs_gc_retention_hours',
+    'high_availability',
+    'task_logs_gc_retention_hours',
+})
+_HA_CONFIG_SAFE_JOBS_KEYS = frozenset({'controller'})
+
+
+def sanitize_ha_recovery_config_bytes(config_bytes: bytes) -> bytes:
+    """Project a controller config onto its safe durable-recovery subset."""
+    if len(config_bytes) > 1024 * 1024:
+        raise ValueError('Controller config snapshot exceeds the 1MiB '
+                         'HA-recovery limit.')
+    try:
+        config = yaml_utils.safe_load_value_free(
+            config_bytes.decode('utf-8')) or {}
+    except (UnicodeDecodeError, ValueError) as e:
+        raise ValueError('Controller config snapshot is not valid YAML.') from e
+
+    if not isinstance(config, dict):
+        raise ValueError('Controller config snapshot must be a YAML mapping.')
+    for key in list(config):
+        if key not in _HA_CONFIG_SAFE_TOP_LEVEL_KEYS:
+            config.pop(key)
+
+    visited: set[int] = set()
+    visiting: set[int] = set()
+
+    def _strip_sensitive(node: Any) -> None:
+        if not isinstance(node, (dict, list)):
+            return
+        node_id = id(node)
+        if node_id in visiting:
+            raise ValueError('Controller config snapshot contains a cyclic '
+                             'YAML alias.')
+        if node_id in visited:
+            return
+        visiting.add(node_id)
+        if isinstance(node, dict):
+            for key, child in list(node.items()):
+                if key in _HA_CONFIG_RECURSIVE_SENSITIVE_KEYS:
+                    node.pop(key)
+                else:
+                    _strip_sensitive(child)
+        else:
+            for child in node:
+                _strip_sensitive(child)
+        visiting.remove(node_id)
+        visited.add(node_id)
+
+    def _project_kubernetes(block: Any) -> None:
+        if not isinstance(block, dict):
+            return
+        for key in list(block):
+            if key not in _HA_CONFIG_SAFE_KUBERNETES_KEYS:
+                block.pop(key)
+        context_configs = block.get('context_configs')
+        if isinstance(context_configs, dict):
+            for context_config in context_configs.values():
+                _project_kubernetes(context_config)
+        quota = block.get('quota')
+        if isinstance(quota, dict):
+            queue = quota.get('queue')
+            quota.clear()
+            if isinstance(queue, str):
+                quota['queue'] = queue
+
+    def _project_controller_block(block: Any) -> None:
+        if not isinstance(block, dict):
+            return
+        for key in list(block):
+            if key not in _HA_CONFIG_SAFE_JOBS_KEYS:
+                block.pop(key)
+        controller = block.get('controller')
+        if isinstance(controller, dict):
+            for key in list(controller):
+                if key not in _HA_CONFIG_SAFE_CONTROLLER_KEYS:
+                    controller.pop(key)
+
+    _strip_sensitive(config)
+    _project_kubernetes(config.get('kubernetes'))
+    _project_controller_block(config.get('jobs'))
+    _project_controller_block(config.get('serve'))
+    # A controller is permanently bound to one durable workspace. Persisting
+    # every workspace would unnecessarily copy other tenants' policy (and
+    # potentially their provider identity metadata) into this service row.
+    active_workspace = config.get('active_workspace')
+    workspaces = config.get('workspaces')
+    if isinstance(active_workspace, str) and isinstance(workspaces, dict):
+        active_workspace_config = workspaces.get(active_workspace)
+        if isinstance(active_workspace_config, dict):
+            active_workspace_config.pop('allowed_users', None)
+            active_workspace_config.pop('private', None)
+            _project_kubernetes(active_workspace_config.get('kubernetes'))
+            config['workspaces'] = {
+                active_workspace: active_workspace_config,
+            }
+        else:
+            config.pop('workspaces', None)
+    else:
+        config.pop('workspaces', None)
+    return yaml_utils.dump_yaml_str(config).encode('utf-8')
+
+
+def strip_legacy_ha_recovery_config_payload(script: str,
+                                            remote_path: str) -> str:
+    """Remove historical config bytes and retain the controller launch.
+
+    Consolidation-mode recovery scripts have only ever embedded the controller
+    config. New binaries restore the per-version safe projection from
+    PostgreSQL before executing this script, so retaining the old one-line
+    base64 restore would both duplicate secrets and risk the operating system
+    command-argument limit.
+    """
+    begin_count = script.count(_LEGACY_HA_CONFIG_BLOCK_BEGIN)
+    end_count = script.count(_LEGACY_HA_CONFIG_BLOCK_END)
+    if begin_count != end_count or begin_count > 1:
+        raise ValueError('Malformed legacy Serve HA config markers.')
+    if begin_count:
+        marked = re.compile(
+            rf'(?m)^{re.escape(_LEGACY_HA_CONFIG_BLOCK_BEGIN)}[^\n]*\n.*?^'
+            rf'{re.escape(_LEGACY_HA_CONFIG_BLOCK_END)}\n?', re.DOTALL)
+        script, count = marked.subn('', script, count=1)
+        if count != 1:
+            raise ValueError('Malformed legacy Serve HA config block.')
+
+    # Match only the exact historical one-line restore primitive. Recovery
+    # scripts may legitimately contain unrelated base64 decoding in an
+    # entrypoint; deleting every such line would silently change user code.
+    # The path is captured once and must be byte-for-byte identical in the
+    # mkdir and redirect positions.
+    legacy_restore = re.compile(
+        r'^mkdir -p -- "\$\(dirname -- (?P<path>.+)\)" && '
+        r'printf %s [A-Za-z0-9+/]+={0,2} \| base64 -d > (?P=path)$')
+    original_lines = script.splitlines()
+    export_prefix = f'export {skypilot_config.ENV_VAR_SKYPILOT_CONFIG}='
+    lines = []
+    for index, line in enumerate(original_lines):
+        # Remove only our generated marker grammar: immediately followed by
+        # the generated config export. An identical line inside arbitrary user
+        # shell text is not a protocol signal and must be preserved.
+        if (line == _VERSIONED_HA_CONFIG_MARKER and
+                index + 1 < len(original_lines) and
+                original_lines[index + 1].startswith(export_prefix)):
+            continue
+        if legacy_restore.fullmatch(line) is not None:
+            continue
+        lines.append(line)
+    config_export = export_prefix + shlex.quote(remote_path)
+    rewritten: list[str] = []
+    wrote_export = False
+    for line in lines:
+        if line.startswith(export_prefix):
+            if not wrote_export:
+                rewritten.append(config_export)
+                wrote_export = True
+            continue
+        rewritten.append(line)
+    if not wrote_export:
+        launch_index = next(
+            (index for index, line in enumerate(rewritten)
+             if 'python' in line and
+             'sky.serve.service' in '\n'.join(rewritten[index:index + 6])),
+            None)
+        if launch_index is None:
+            raise ValueError('Cannot locate the SkyServe controller launch in '
+                             'the HA recovery script.')
+        rewritten.insert(launch_index, config_export)
+    export_index = rewritten.index(config_export)
+    rewritten.insert(export_index, _VERSIONED_HA_CONFIG_MARKER)
+    scrubbed = '\n'.join(rewritten).rstrip() + '\n'
+    if (_LEGACY_HA_CONFIG_BLOCK_BEGIN in scrubbed or
+            _LEGACY_HA_CONFIG_BLOCK_END in scrubbed or
+            f'{_VERSIONED_HA_CONFIG_MARKER}\n{config_export}' not in scrubbed):
+        raise ValueError('Legacy Serve HA config payload was not removed.')
+    return scrubbed
+
+
+def bind_ha_recovery_owner_fence(
+    script: str,
+    *,
+    service_hash: str,
+    lifecycle_epoch: int | None,
+    controller_pid: int | None,
+    controller_ip: str | None,
+    status: serve_state.ServiceStatus,
+    recovery_version: int,
+) -> str:
+    """Bind one HA launch to the exact JIT owner and version snapshot."""
+    payload = {
+        'service_hash': service_hash,
+        'lifecycle_epoch': lifecycle_epoch,
+        'controller_pid': controller_pid,
+        'controller_ip': controller_ip,
+        'status': status.value,
+        'recovery_version': recovery_version,
+    }
+    # Reuse the strict decoder as the single validation contract before the
+    # payload is placed in a shell export.
+    parse_ha_recovery_owner_fence(
+        json.dumps(payload, separators=(',', ':'), sort_keys=True))
+    export_prefix = f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}='
+    lines = script.splitlines()
+    if any(line.startswith(export_prefix) for line in lines):
+        raise ValueError('HA recovery script already contains an owner fence.')
+    launch_index = next(
+        (index for index, line in enumerate(lines) if 'python' in line and
+         'sky.serve.service' in '\n'.join(lines[index:index + 6])), None)
+    if launch_index is None:
+        raise ValueError('Cannot locate the SkyServe controller launch in the '
+                         'HA recovery script.')
+    encoded = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+    lines.insert(launch_index, export_prefix + shlex.quote(encoded))
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def parse_ha_recovery_owner_fence(payload: str) -> dict[str, Any]:
+    """Decode and strictly validate one invocation-local HA owner fence."""
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise ValueError('HA recovery owner fence is not valid JSON.') from e
+    expected_keys = {
+        'service_hash', 'lifecycle_epoch', 'controller_pid', 'controller_ip',
+        'status', 'recovery_version'
+    }
+    if not isinstance(decoded, dict) or set(decoded) != expected_keys:
+        raise ValueError('HA recovery owner fence has an invalid schema.')
+    service_hash = decoded['service_hash']
+    lifecycle_epoch = decoded['lifecycle_epoch']
+    controller_pid = decoded['controller_pid']
+    controller_ip = decoded['controller_ip']
+    recovery_version = decoded['recovery_version']
+    if not isinstance(service_hash, str) or not service_hash:
+        raise ValueError('HA recovery owner fence has an invalid service hash.')
+    if (lifecycle_epoch is not None and
+        (type(lifecycle_epoch) is not int or lifecycle_epoch < 1)):
+        raise ValueError(
+            'HA recovery owner fence has an invalid lifecycle epoch.')
+    if (controller_pid is not None and
+        (type(controller_pid) is not int or controller_pid < 1)):
+        raise ValueError('HA recovery owner fence has an invalid controller '
+                         'PID.')
+    if (controller_ip is not None and
+        (not isinstance(controller_ip, str) or not controller_ip)):
+        raise ValueError('HA recovery owner fence has an invalid controller '
+                         'IP.')
+    if type(recovery_version) is not int or recovery_version < 1:
+        raise ValueError('HA recovery owner fence has an invalid version.')
+    try:
+        decoded['status'] = serve_state.ServiceStatus(decoded['status'])
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            'HA recovery owner fence has an invalid status.') from e
+    return decoded
+
 
 # Keep the established serve_utils import and pickle identities while the
 # presentation-only implementation lives in its own low-state module.
@@ -98,8 +433,16 @@ for _status_formatter_symbol in (
 del _status_formatter_symbol
 
 
+class _ClusterYamlHandle(typing.Protocol):
+    """Handle interface needed by the batched provider-config reader."""
+
+    @property
+    def cluster_yaml(self) -> str | None:
+        ...
+
+
 def get_provider_configs_for_handles(
-        handles_by_key: 'typing.Mapping[Any, Any]'
+    handles_by_key: 'typing.Mapping[Any, _ClusterYamlHandle | None]'
 ) -> dict[Any, dict[str, Any]]:
     """Fetch provider configs once per unique cluster YAML path.
 
@@ -111,7 +454,9 @@ def get_provider_configs_for_handles(
     yaml_paths: list[str] = []
     keys_by_yaml: dict[str, list[Any]] = collections.defaultdict(list)
     for key, handle in handles_by_key.items():
-        cluster_yaml = getattr(handle, 'cluster_yaml', None)
+        if handle is None:
+            continue
+        cluster_yaml = handle.cluster_yaml
         if not isinstance(cluster_yaml, str):
             continue
         if cluster_yaml not in keys_by_yaml:
@@ -155,6 +500,8 @@ for _auth_token_symbol in (
 del _auth_token_symbol
 
 _LAUNCH_QUIESCE_MAX_CANCEL_ROUNDS = 3
+_LAUNCH_QUIESCE_TIMEOUT_SECONDS = 60
+_LAUNCH_QUIESCE_POLL_SECONDS = 0.5
 
 # Bound on the per-call thread pool used by `get_service_status_pickled` to
 # fan out across services/pools. The per-service work is dominated by I/O
@@ -580,6 +927,11 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             means the caller has no revocable leadership concept (e.g. a
             single-pod filelock deployment).
     """
+    if not pool and maintenance.is_controller_hold_active():
+        logger.warning('Skipping SkyServe controller HA recovery while the '
+                       'server deployment hold is active.')
+        return
+
     # No setup recovery is needed in consolidation mode, as the API server
     # already has all runtime installed. Directly start jobs recovery here.
     # Refers to sky/templates/kubernetes-ray.yml.j2 for more details.
@@ -703,11 +1055,6 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                         f'round.\n')
                 continue
 
-            script = serve_state.get_ha_recovery_script(service_name)
-            if script is None:
-                f.write(f'{capnoun} {service_name}\'s recovery script does '
-                        'not exist. Skipping recovery.\n')
-                continue
             # Fence right before the launch: the leader-lock session may have
             # died since the caller's top-of-iteration probe (this sweep can
             # take a while with many services). Without leadership, another
@@ -719,6 +1066,59 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                 f.write(msg + '\n')
                 logger.error(msg)
                 break
+            # Production liveness records carry the protocol marker. Bind the
+            # current service owner, recovery-version election, exact config
+            # bytes, and recovery script in one just-in-time statement. This
+            # prevents a long fleet sweep from launching a stale same-name
+            # incarnation or pairing a pre-update script with post-update
+            # config. Missing metadata is accepted only for legacy mocked/read
+            # records and uses the historical script lookup.
+            recovery_snapshot = svc
+            recovery_version: int | None = None
+            if 'config_protocol_active' in svc:
+                if not isinstance(service_hash, str) or not service_hash:
+                    f.write(f'{capnoun} {service_name} has no durable '
+                            'incarnation identity. Skipping recovery.\n')
+                    continue
+                try:
+                    current_snapshot = (
+                        serve_state.get_service_ha_recovery_snapshot(
+                            service_name, expected_service_hash=service_hash))
+                except Exception as e:  # pylint: disable=broad-except
+                    f.write(f'Failed to authorize recovery for '
+                            f'{service_name}: {e}. Skipping recovery.\n')
+                    continue
+                if current_snapshot is None:
+                    f.write(f'{capnoun} {service_name} changed incarnation '
+                            'during the recovery sweep. Skipping recovery.\n')
+                    continue
+                owner_fields = ('hash', 'lifecycle_epoch', 'controller_pid',
+                                'controller_ip', 'workspace', 'resource_scope',
+                                'status')
+                changed_fields = [
+                    field for field in owner_fields
+                    if field in svc and svc[field] != current_snapshot[field]
+                ]
+                if changed_fields:
+                    f.write(f'{capnoun} {service_name} changed recovery owner '
+                            f'metadata ({", ".join(changed_fields)}) during '
+                            'the recovery sweep. Skipping recovery.\n')
+                    continue
+                recovery_snapshot = current_snapshot
+                script = current_snapshot['ha_recovery_script']
+                recovery_version = current_snapshot.get('recovery_version')
+                if (isinstance(recovery_version, bool) or
+                        not isinstance(recovery_version, int) or
+                        recovery_version < 1):
+                    f.write(f'{capnoun} {service_name} has no applicable '
+                            'recovery version. Skipping recovery.\n')
+                    continue
+            else:
+                script = serve_state.get_ha_recovery_script(service_name)
+            if script is None:
+                f.write(f'{capnoun} {service_name}\'s recovery script does '
+                        'not exist. Skipping recovery.\n')
+                continue
             # Recreate the service working directory before running the
             # recovery script. It lives on pod-local storage (emptyDir), so a
             # pod REPLACEMENT (rolling update, reschedule) wipes it while the
@@ -733,11 +1133,84 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             try:
                 os.makedirs(os.path.expanduser(
                     generate_remote_service_dir_name(
-                        service_name, svc.get('resource_scope'))),
+                        service_name, recovery_snapshot.get('resource_scope'))),
                             exist_ok=True)
             except OSError as e:
                 f.write(f'Failed to recreate the service dir for '
                         f'{service_name}: {e}\n')
+                continue
+            # The one-statement liveness snapshot carries both protocol
+            # activation and the quarantine-aware elected generation. Avoid
+            # recomputing the election in a later transaction, which could
+            # pair one generation with another snapshot's controller owner.
+            # Missing keys preserve compatibility with legacy mocked/read
+            # records and therefore select the legacy HA script path.
+            uses_versioned_config = bool(
+                recovery_snapshot.get('config_protocol_active', False))
+            if uses_versioned_config:
+                recovery_version = recovery_snapshot.get('recovery_version')
+                assert isinstance(recovery_version, int)
+                config_snapshot = recovery_snapshot.get(
+                    'controller_config_snapshot')
+                if config_snapshot is None:
+                    f.write(f'{capnoun} {service_name} recovery version '
+                            f'{recovery_version} has no complete controller '
+                            'config snapshot. Skipping recovery.\n')
+                    continue
+                live_config_path: str | None = None
+                try:
+                    live_config_path = generate_versioned_config_yaml_file_name(
+                        service_name, recovery_version,
+                        recovery_snapshot.get('resource_scope'))
+                    staged_config_path = (generate_staged_config_yaml_file_name(
+                        service_name,
+                        recovery_version,
+                        recovery_snapshot.get('resource_scope'),
+                        snapshot_id=config_snapshot[2]))
+                    restore_controller_config_snapshot(
+                        config_snapshot,
+                        live_config_path,
+                        staged_config_path,
+                        expected_workspace=recovery_snapshot.get('workspace'))
+                    # Never pass historical embedded config bytes through
+                    # `/bin/sh -c`, argv, or debug logging. The exact selected
+                    # version is already restored above.
+                    script = strip_legacy_ha_recovery_config_payload(
+                        script, live_config_path)
+                except Exception as e:  # pylint: disable=broad-except
+                    if live_config_path is not None:
+                        try:
+                            os.unlink(os.path.expanduser(live_config_path))
+                        except FileNotFoundError:
+                            pass
+                    f.write('Failed to restore committed controller config for '
+                            f'{service_name}: {e}. Skipping recovery.\n')
+                    continue
+            if 'config_protocol_active' in svc:
+                assert isinstance(recovery_version, int)
+                try:
+                    script = bind_ha_recovery_owner_fence(
+                        script,
+                        service_hash=recovery_snapshot['hash'],
+                        lifecycle_epoch=recovery_snapshot['lifecycle_epoch'],
+                        controller_pid=recovery_snapshot['controller_pid'],
+                        controller_ip=recovery_snapshot['controller_ip'],
+                        status=recovery_snapshot['status'],
+                        recovery_version=recovery_version)
+                except (KeyError, TypeError, ValueError) as e:
+                    f.write(f'Failed to bind recovery ownership for '
+                            f'{service_name}: {e}. Skipping recovery.\n')
+                    continue
+            # Config restoration and local filesystem repair can take time.
+            # Recheck the revocable leader session immediately before process
+            # creation for both legacy and versioned recovery paths.
+            if still_leader is not None and not still_leader():
+                msg = ('Consolidation leader lock session lost before '
+                       'recovery launch; aborting the rest of this recovery '
+                       'sweep.')
+                f.write(msg + '\n')
+                logger.error(msg)
+                break
             rc, out, err = runner.run(script, require_outputs=True)
             if rc:
                 f.write(f'Recovery script returned {rc}. '
@@ -958,7 +1431,7 @@ def resolve_service_workspace(
 
     if not serve_state.set_service_workspace_if_owner(service_name, workspace,
                                                       expected_service_hash):
-        refreshed = serve_state.get_service_from_name(service_name)
+        refreshed = serve_state.get_service_status_snapshot(service_name)
         if (refreshed is None or
                 refreshed.get('hash') != expected_service_hash or
                 refreshed.get('workspace') != workspace):
@@ -977,8 +1450,7 @@ def validate_logical_replica_task(
     if service_spec is None:
         service_spec = task.service
     if (service_spec is not None and
-            getattr(service_spec, 'uses_logical_replicas', False) is True and
-            task.num_nodes != 1):
+            service_spec.uses_logical_replicas is True and task.num_nodes != 1):
         with ux_utils.print_exception_no_traceback():
             raise ValueError(
                 'dynamic_fallback_per_gpu currently supports only single-node '
@@ -1030,7 +1502,7 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
         resource for resource in task.resources if resource.use_spot
     ]
     has_spot_placer = (task.service is not None and
-                       task.service.spot_placer is not None)
+                       task.service.placement_contract.enabled)
     # A spot placer may manage a heterogeneous set that mixes spot cloud
     # entries with non-spot reserved-capacity entries (e.g. a zero-cost
     # Kubernetes pool): each launch is pinned to its location's spot-ness.
@@ -1075,13 +1547,13 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                                  f'{sys_name} will replenish preempted spot '
                                  f'with {policy_description} instances.')
 
-    # Reserved fill supports one Kubernetes context per service. Multiple
-    # accelerator names in that context form one brokered capacity group,
-    # provided they use the same GPU count per backend. Zero-cost-ness is not
-    # fully knowable client-side, so all Kubernetes entries are the safe
-    # conservative candidate set.
+    # Every Kubernetes context is one reserved-fill pool edge.  Accelerator
+    # names in that context share one brokered capacity group and therefore
+    # must use the same physical GPU width.  Different physical contexts may
+    # use different widths.  Zero-cost-ness is not fully knowable client-side,
+    # so all Kubernetes entries are the safe conservative candidate set.
     if task.service.reserved_capacity_fill:
-        pool_shapes: dict[tuple[str | None, str], int] = {}
+        pool_widths: dict[str | None, set[int]] = {}
         for requested_resources in task.resources:
             if str(requested_resources.cloud).lower() != 'kubernetes':
                 continue
@@ -1093,13 +1565,14 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                           isinstance(gpu_count, (int, float)))
             is_finite = is_numeric and math.isfinite(float(gpu_count))
             is_whole = is_finite and float(gpu_count).is_integer()
-            if (task.service.uses_logical_replicas and
+            if (task.service.placement_contract.
+                    requires_single_gpu_reserved_fill and
                 (not is_whole or float(gpu_count) != 1.0)):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
-                        'dynamic_fallback_per_gpu with '
+                        'The per-GPU placement contract with '
                         'reserved_capacity_fill requires one-GPU Kubernetes '
-                        'fill shapes so broker slots equal logical slots. '
+                        'fill shapes so broker slots equal placement slots. '
                         f'Got {gpu_name}:{gpu_count!r}.')
             if not is_whole or float(gpu_count) < 1:
                 with ux_utils.print_exception_no_traceback():
@@ -1107,24 +1580,29 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                         'reserved_capacity_fill requires each Kubernetes GPU '
                         'count to be a positive whole number. '
                         f'Got {gpu_name}:{gpu_count!r}.')
-            key = (requested_resources.region, gpu_name.lower())
-            pool_shapes[key] = max(pool_shapes.get(key, 1), int(gpu_count))
-        contexts = {context for context, _ in pool_shapes}
-        gpu_counts = set(pool_shapes.values())
-        if len(contexts) > 1 or len(gpu_counts) > 1:
-            shapes = sorted(pool_shapes.items(), key=repr)
+            context = requested_resources.region
+            exact_gpu_count = int(gpu_count)
+            pool_widths.setdefault(context, set()).add(exact_gpu_count)
+        inconsistent_contexts = {
+            context: sorted(widths)
+            for context, widths in pool_widths.items()
+            if len(widths) > 1
+        }
+        if inconsistent_contexts:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
-                    'reserved_capacity_fill requires one Kubernetes context '
-                    'and one GPU count per backend; the resources span '
-                    f'{shapes}.')
-        if (task.service.uses_logical_replicas and gpu_counts and
-                gpu_counts != {1}):
+                    'reserved_capacity_fill requires one GPU count within '
+                    'each Kubernetes context; got context widths '
+                    f'{inconsistent_contexts}.')
+        if (task.service.placement_contract.requires_single_gpu_reserved_fill
+                and pool_widths and
+                any(widths != {1} for widths in pool_widths.values())):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
-                    'dynamic_fallback_per_gpu with reserved_capacity_fill '
+                    'The per-GPU placement contract with '
+                    'reserved_capacity_fill '
                     'requires one-GPU Kubernetes fill shapes so broker slots '
-                    'equal logical slots.')
+                    'equal placement slots.')
 
     # Validate the placer contract without enumerating providers. The final
     # policy-mutated task gets one complete catalog immediately before its
@@ -1140,7 +1618,7 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     '`use_ondemand_fallback` is only supported '
                     'for spot resources. Please explicitly specify '
                     '`use_spot: true` in resources for on-demand fallback.')
-        if (task.service.spot_placer is not None and
+        if (task.service.placement_contract.enabled and
                 not requested_resources.use_spot and not spot_resources):
             # Non-spot entries are fine under a placer as the reserved
             # zero-cost tier of a mixed set — but a placer over a set with
@@ -1174,14 +1652,14 @@ def generate_ephemeral_storage_scope_id(resource_scope: str,
     return f'sv{_resource_scope_tag(identity, length=10)}'
 
 
-def ephemeral_storage_identity_matches_scope(storage: Any,
+def ephemeral_storage_identity_matches_scope(storage: 'storage_lib.Storage',
                                              scope_id: str) -> bool:
     """Whether a storage object's bucket/subpath carries ``scope_id``."""
     suffix = f'-{scope_id}'
-    name = getattr(storage, 'name', None)
+    name = storage.name
     if isinstance(name, str) and name.endswith(suffix):
         return True
-    source = getattr(storage, 'source', None)
+    source = storage.source
     if isinstance(source, str):
         # Covers provider URI shapes (bucket in netloc for S3/GCS/R2, path
         # segment for Azure/COS/OCI) without treating a substring inside a
@@ -1191,7 +1669,7 @@ def ephemeral_storage_identity_matches_scope(storage: Any,
                 segment.endswith(suffix)
                 for segment in source_without_query.split('/')):
             return True
-    bucket_sub_path = getattr(storage, '_bucket_sub_path', None)
+    bucket_sub_path = storage._bucket_sub_path  # pylint: disable=protected-access
     if isinstance(bucket_sub_path, str):
         scoped_prefix = f'job-{scope_id}'
         normalized = bucket_sub_path.strip('/')
@@ -1265,6 +1743,559 @@ def generate_remote_config_yaml_file_name(service_name: str,
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     # Don't expand here since it is used for remote machine.
     return os.path.join(dir_name, 'config.yaml')
+
+
+def generate_versioned_config_yaml_file_name(
+        service_name: str,
+        version: int,
+        resource_scope: str | None = None) -> str:
+    """Immutable config path inherited by one exact controller version."""
+    if type(version) is not int or version <= 0:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Controller config version must be a positive int.')
+    return (
+        generate_remote_config_yaml_file_name(service_name, resource_scope) +
+        f'.v{version}')
+
+
+def generate_staged_config_yaml_file_name(
+        service_name: str,
+        version: int,
+        resource_scope: str | None = None,
+        snapshot_id: str | None = None) -> str:
+    """Path for a complete config snapshot awaiting controller admission."""
+    if snapshot_id is not None and re.fullmatch(r'[0-9a-f]{64}',
+                                                snapshot_id) is None:
+        raise ValueError('Controller config snapshot ID is malformed.')
+    nonce_suffix = '' if snapshot_id is None else f'.{snapshot_id}'
+    return (
+        generate_remote_config_yaml_file_name(service_name, resource_scope) +
+        f'.v{version}{nonce_suffix}.staged')
+
+
+def secure_staged_controller_config(config_path: str,
+                                    expected_digest: str) -> bytes:
+    """Tighten and verify one raw stage without following a symlink."""
+    if re.fullmatch(r'[0-9a-f]{64}', expected_digest) is None:
+        raise ValueError('Expected controller config digest is malformed.')
+    expanded_path = os.path.expanduser(config_path)
+    no_follow_flag = getattr(os, 'O_NOFOLLOW', 0)
+    pre_open_stat = None
+    if no_follow_flag == 0:
+        # O_NOFOLLOW is available on the Linux controller image. Keep the
+        # helper fail-closed on other platforms too, while checking inode
+        # identity below to detect a replacement between lstat() and open().
+        pre_open_stat = os.lstat(expanded_path)
+        if not stat.S_ISREG(pre_open_stat.st_mode):
+            raise RuntimeError('Staged controller config snapshot is not a '
+                               'regular file.')
+    open_flags = (os.O_RDONLY | no_follow_flag | getattr(os, 'O_NONBLOCK', 0))
+    try:
+        config_fd = os.open(expanded_path, open_flags)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise RuntimeError('Staged controller config snapshot is not a '
+                               'regular file.') from None
+        raise
+    try:
+        staged_stat = os.fstat(config_fd)
+        if not stat.S_ISREG(staged_stat.st_mode):
+            raise RuntimeError('Staged controller config snapshot is not a '
+                               'regular file.')
+        if (pre_open_stat is not None and
+            (pre_open_stat.st_dev, pre_open_stat.st_ino)
+                != (staged_stat.st_dev, staged_stat.st_ino)):
+            raise RuntimeError('Staged controller config snapshot changed '
+                               'while it was being opened.')
+        if staged_stat.st_size > 1024 * 1024:
+            raise RuntimeError('Staged controller config snapshot exceeds '
+                               'the 1MiB limit.')
+        os.fchmod(config_fd, 0o600)
+        with os.fdopen(config_fd, 'rb') as config_file:
+            config_fd = -1
+            config_bytes = config_file.read(1024 * 1024 + 1)
+    finally:
+        if config_fd >= 0:
+            os.close(config_fd)
+    if len(config_bytes) > 1024 * 1024:
+        raise RuntimeError('Staged controller config snapshot exceeds the '
+                           '1MiB limit.')
+    if hashlib.sha256(config_bytes).hexdigest() != expected_digest:
+        raise RuntimeError('Staged controller config snapshot digest does '
+                           'not match the API-server submission.')
+    return config_bytes
+
+
+def generate_config_snapshot_receipt_file_name(config_path: str) -> str:
+    return f'{config_path}.receipt'
+
+
+def remove_staged_controller_config(staged_path: str) -> None:
+    """Remove one exact uncommitted raw snapshot and its local receipt."""
+    for path in (staged_path,
+                 generate_config_snapshot_receipt_file_name(staged_path)):
+        try:
+            os.unlink(os.path.expanduser(path))
+        except FileNotFoundError:
+            pass
+
+
+def scrub_obsolete_controller_config_files(
+        service_name: str,
+        elected_version: int,
+        resource_scope: str | None = None) -> list[str]:
+    """Remove raw live config generations after safe DB recovery.
+
+    The elected version must already have been replaced with its sanitized,
+    digest-verified PostgreSQL snapshot while holding the process-wide config
+    lock.  Preserve that safe file and every ``.staged`` candidate, but remove
+    the initial unversioned source, all non-elected live generations, and all
+    live receipts and interrupted receipt-write temporaries (whose source
+    digests are offline credential verifiers).
+    """
+    if type(elected_version) is not int or elected_version <= 0:  # pylint: disable=unidiomatic-typecheck
+        raise ValueError('Elected controller config version must be positive.')
+    base_path = os.path.expanduser(
+        generate_remote_config_yaml_file_name(service_name, resource_scope))
+    directory = os.path.dirname(base_path)
+    base_name = os.path.basename(base_path)
+    version_pattern = re.compile(
+        rf'{re.escape(base_name)}\.v([1-9][0-9]*)(\.receipt)?\Z')
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return []
+    removed: list[str] = []
+    for entry in entries:
+        should_remove = entry.name in (base_name, f'{base_name}.receipt')
+        is_receipt_temporary = (_CONFIG_RECEIPT_TEMP_FILE_PATTERN.fullmatch(
+            entry.name) is not None and entry.is_file(follow_symlinks=False))
+        should_remove = should_remove or is_receipt_temporary
+        match = version_pattern.fullmatch(entry.name)
+        if match is not None:
+            version = int(match.group(1))
+            is_receipt = match.group(2) is not None
+            should_remove = is_receipt or version != elected_version
+        if not should_remove:
+            continue
+        try:
+            os.unlink(entry.path)
+        except FileNotFoundError:
+            continue
+        removed.append(entry.name)
+    return sorted(removed)
+
+
+def remove_uncommitted_staged_controller_config(
+        service_name: str,
+        version: int,
+        resource_scope: str | None,
+        snapshot_id: str | None = None) -> bool:
+    """Delete one exact staged raw snapshot only while its version is NULL.
+
+    A database read failure deliberately propagates so callers preserve the
+    file. If a controller already wrote a receipt, its nonce must match the
+    cleanup request; a missing receipt is the expected pre-delivery state.
+    """
+    if serve_state.get_yaml_content(service_name, version) is not None:
+        return False
+    staged_path = generate_staged_config_yaml_file_name(service_name,
+                                                        version,
+                                                        resource_scope,
+                                                        snapshot_id=snapshot_id)
+    if snapshot_id is not None:
+        receipt = _read_config_snapshot_receipt(staged_path)
+        if receipt is not None and receipt['snapshot_id'] != snapshot_id:
+            return False
+    remove_staged_controller_config(staged_path)
+    return True
+
+
+def gc_orphaned_staged_controller_configs(
+        service_name: str,
+        resource_scope: str | None,
+        *,
+        now: float | None = None) -> list[int]:
+    """Delete expired raw stages for DB-confirmed uncommitted versions.
+
+    The protocol's nonce-bearing path makes different API requests disjoint.
+    The caller serializes this sweep with controller update handlers; the age
+    gate additionally covers a request that synced bytes but has not POSTed to
+    the controller yet. Missing rows, committed rows, fresh paths, malformed
+    filenames, and every database error are preserved.
+    """
+    config_path = os.path.expanduser(
+        generate_remote_config_yaml_file_name(service_name, resource_scope))
+    config_dir = os.path.dirname(config_path)
+    config_basename = os.path.basename(config_path)
+    stage_pattern = re.compile(
+        rf'^{re.escape(config_basename)}\.v([1-9][0-9]{{0,9}})'
+        r'(?:\.([0-9a-f]{64}))?\.staged(?:\.receipt)?$')
+    try:
+        directory_entries = list(os.scandir(config_dir))
+    except FileNotFoundError:
+        return []
+
+    # Key by both version and nonce. Legacy fixed-name stages are accepted for
+    # cleanup after rollout, but every new writer uses a nonce-bearing path.
+    candidates: dict[tuple[int, str | None], dict[str, tuple[int, int, int,
+                                                             int]]] = {}
+    receipt_temporaries: dict[str, tuple[int, int, int, int, int]] = {}
+    for entry in directory_entries:
+        if (_CONFIG_RECEIPT_TEMP_FILE_PATTERN.fullmatch(entry.name)
+                is not None):
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(entry_stat.st_mode):
+                continue
+            receipt_temporaries[entry.path] = (entry_stat.st_dev,
+                                               entry_stat.st_ino,
+                                               entry_stat.st_mtime_ns,
+                                               entry_stat.st_size,
+                                               entry_stat.st_mode)
+            continue
+        match = stage_pattern.fullmatch(entry.name)
+        if match is None:
+            continue
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        try:
+            version = int(match.group(1))
+        except ValueError:
+            continue
+        fingerprint = (entry_stat.st_dev, entry_stat.st_ino,
+                       entry_stat.st_mtime_ns, entry_stat.st_size)
+        candidates.setdefault((version, match.group(2)),
+                              {})[entry.path] = (fingerprint)
+
+    wall_time = time.time() if now is None else now
+
+    # A hard-killed receipt writer cannot run its exception cleanup. These
+    # temporaries are never durable protocol inputs, so unlike raw stages they
+    # need no database lookup. The same generous age gate protects a paused
+    # writer, and an identity recheck lets a concurrent refresh win.
+    for temporary_path, receipt_observed in receipt_temporaries.items():
+        age_seconds = wall_time - receipt_observed[2] / 1_000_000_000
+        if age_seconds < constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS:
+            continue
+        try:
+            current_stat = os.stat(temporary_path, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        receipt_current = (current_stat.st_dev, current_stat.st_ino,
+                           current_stat.st_mtime_ns, current_stat.st_size,
+                           current_stat.st_mode)
+        if (receipt_current != receipt_observed or
+                not stat.S_ISREG(current_stat.st_mode)):
+            continue
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+    expired: dict[tuple[int, str | None], dict[str, tuple[int, int, int,
+                                                          int]]] = {}
+    for identity, paths in candidates.items():
+        newest_mtime_ns = max(fingerprint[2] for fingerprint in paths.values())
+        age_seconds = wall_time - newest_mtime_ns / 1_000_000_000
+        if age_seconds >= constants.ORPHANED_CONFIG_STAGE_MIN_AGE_SECONDS:
+            expired[identity] = paths
+    if not expired:
+        return []
+
+    expired_versions = sorted({version for version, _ in expired})
+    yaml_contents = serve_state.get_yaml_contents(service_name,
+                                                  expired_versions)
+    removed_versions: set[int] = set()
+    for (version, snapshot_id), observed_paths in sorted(expired.items()):
+        if version not in yaml_contents or yaml_contents[version] is not None:
+            continue
+        staged_path = os.path.expanduser(
+            generate_staged_config_yaml_file_name(service_name,
+                                                  version,
+                                                  resource_scope,
+                                                  snapshot_id=snapshot_id))
+        candidate_paths = (
+            staged_path,
+            generate_config_snapshot_receipt_file_name(staged_path))
+        # Re-prove the exact path identities immediately before unlinking. A
+        # sync that refreshed either file after the directory scan wins and is
+        # left for a later sweep.
+        unchanged = True
+        for candidate_path in candidate_paths:
+            observed = observed_paths.get(candidate_path)
+            try:
+                current_stat = os.stat(candidate_path, follow_symlinks=False)
+            except FileNotFoundError:
+                if observed is not None:
+                    unchanged = False
+                continue
+            current = (current_stat.st_dev, current_stat.st_ino,
+                       current_stat.st_mtime_ns, current_stat.st_size)
+            if observed != current:
+                unchanged = False
+        if not unchanged:
+            continue
+        for candidate_path in candidate_paths:
+            try:
+                os.unlink(candidate_path)
+            except FileNotFoundError:
+                pass
+        removed_versions.add(version)
+    return sorted(removed_versions)
+
+
+def write_config_snapshot_receipt(config_path: str, version: int,
+                                  snapshot_id: str, source_digest: str) -> None:
+    """Atomically record a pod-local receipt next to raw config bytes."""
+    if (re.fullmatch(r'[0-9a-f]{64}', snapshot_id) is None or
+            re.fullmatch(r'[0-9a-f]{64}', source_digest) is None):
+        raise ValueError('Config snapshot receipt is malformed.')
+    receipt_path = os.path.expanduser(
+        generate_config_snapshot_receipt_file_name(config_path))
+    receipt_dir = os.path.dirname(receipt_path)
+    os.makedirs(receipt_dir, exist_ok=True)
+    # Own the basename grammar instead of depending on tempfile's private
+    # random-name length. O_EXCL makes a pre-created path lose safely; retries
+    # handle the vanishingly unlikely UUID collision without unlinking it.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_CLOEXEC', 0)
+    fd = -1
+    temporary_path = ''
+    for _ in range(3):
+        temporary_path = os.path.join(
+            receipt_dir, f'.config-receipt-{uuid.uuid4().hex}.tmp')
+        try:
+            fd = os.open(temporary_path, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise RuntimeError('Failed to allocate a config receipt temporary.')
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as receipt_file:
+            json.dump(
+                {
+                    'version': version,
+                    'snapshot_id': snapshot_id,
+                    'source_digest': source_digest,
+                },
+                receipt_file,
+                separators=(',', ':'))
+            receipt_file.flush()
+            os.fsync(receipt_file.fileno())
+        os.replace(temporary_path, receipt_path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_config_snapshot_receipt(config_path: str) -> dict[str, Any] | None:
+    receipt_path = os.path.expanduser(
+        generate_config_snapshot_receipt_file_name(config_path))
+    try:
+        with open(receipt_path, encoding='utf-8') as receipt_file:
+            receipt = json.load(receipt_file)
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+    if (not isinstance(receipt, dict) or
+            not isinstance(receipt.get('version'), int) or
+            isinstance(receipt.get('version'), bool) or
+            not isinstance(receipt.get('snapshot_id'), str) or
+            re.fullmatch(r'[0-9a-f]{64}', receipt['snapshot_id']) is None or
+            not isinstance(receipt.get('source_digest'), str) or
+            re.fullmatch(r'[0-9a-f]{64}', receipt['source_digest']) is None):
+        return None
+    return receipt
+
+
+def get_config_snapshot_receipt(config_path: str) -> dict[str, Any] | None:
+    """Return one validated pod-local config receipt, if present."""
+    return _read_config_snapshot_receipt(config_path)
+
+
+def _read_verified_config_with_receipt(config_path: str, version: int,
+                                       snapshot_id: str) -> bytes | None:
+    receipt = _read_config_snapshot_receipt(config_path)
+    if (receipt is None or receipt['version'] != version or
+            receipt['snapshot_id'] != snapshot_id):
+        return None
+    try:
+        with open(os.path.expanduser(config_path), 'rb') as config_file:
+            config_bytes = config_file.read()
+    except OSError:
+        return None
+    if hashlib.sha256(config_bytes).hexdigest() != receipt['source_digest']:
+        return None
+    return config_bytes
+
+
+def read_verified_controller_config(config_path: str, version: int,
+                                    snapshot_id: str,
+                                    source_digest: str) -> bytes | None:
+    """Read raw bytes only when receipt identity and exact digest agree."""
+    receipt = _read_config_snapshot_receipt(config_path)
+    if receipt is None or receipt['source_digest'] != source_digest:
+        return None
+    return _read_verified_config_with_receipt(config_path, version, snapshot_id)
+
+
+def promote_staged_controller_config(live_path: str, staged_path: str,
+                                     version: int, snapshot_id: str,
+                                     source_digest: str) -> bytes:
+    """Verify and atomically promote one raw staged config and receipt."""
+    config_bytes = _read_verified_config_with_receipt(staged_path, version,
+                                                      snapshot_id)
+    if (config_bytes is None or
+            hashlib.sha256(config_bytes).hexdigest() != source_digest):
+        raise RuntimeError('Staged controller config snapshot or receipt is '
+                           'missing or changed before installation.')
+    expanded_live = os.path.expanduser(live_path)
+    expanded_staged = os.path.expanduser(staged_path)
+    expanded_staged_receipt = os.path.expanduser(
+        generate_config_snapshot_receipt_file_name(staged_path))
+    expanded_live_receipt = os.path.expanduser(
+        generate_config_snapshot_receipt_file_name(live_path))
+    os.makedirs(os.path.dirname(expanded_live), exist_ok=True)
+    # Tighten permissions before either rename. A crash between publication
+    # steps must never leave the raw policy-admitted config world-readable.
+    os.chmod(expanded_staged, 0o600)
+    os.chmod(expanded_staged_receipt, 0o600)
+    os.replace(expanded_staged, expanded_live)
+    os.chmod(expanded_live, 0o600)
+    os.replace(expanded_staged_receipt, expanded_live_receipt)
+    os.chmod(expanded_live_receipt, 0o600)
+    with open(expanded_live, 'rb') as live_file:
+        installed_bytes = live_file.read()
+    if hashlib.sha256(installed_bytes).hexdigest() != source_digest:
+        raise RuntimeError('Installed controller config changed during '
+                           'atomic promotion.')
+    return installed_bytes
+
+
+def _atomic_write_controller_config(live_path: str,
+                                    config_bytes: bytes) -> None:
+    """Write exact DB-verified config bytes atomically with mode 0600."""
+    expanded_live = os.path.expanduser(live_path)
+    os.makedirs(os.path.dirname(expanded_live), exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix='.config-recovery-',
+                                          dir=os.path.dirname(expanded_live))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'wb') as config_file:
+            config_file.write(config_bytes)
+            config_file.flush()
+            os.fsync(config_file.fileno())
+        os.replace(temporary_path, expanded_live)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+    os.chmod(expanded_live, 0o600)
+
+
+def restore_version_controller_config(
+    service_name: str,
+    version: int,
+    live_path: str,
+    staged_path: str | None = None,
+    expected_workspace: str | None = None,
+) -> bytes | None:
+    """Restore the PostgreSQL-bound safe config for an exact version.
+
+    None is the compatibility signal for a pre-protocol version whose legacy
+    HA script still owns config restoration. Corruption raises and recovery
+    fails closed before a controller is spawned.
+    """
+    snapshot = serve_state.get_version_controller_config(service_name, version)
+    if snapshot is None:
+        return None
+    return restore_controller_config_snapshot(snapshot, live_path, staged_path,
+                                              expected_workspace)
+
+
+def restore_controller_config_snapshot(
+    snapshot: tuple[bytes, str, str],
+    live_path: str,
+    staged_path: str | None = None,
+    expected_workspace: str | None = None,
+) -> bytes:
+    """Restore one already-authorized durable controller-config snapshot.
+
+    Callers that authorize a recovery generation and select its exact config
+    in one database statement use this helper so installation cannot re-read
+    and accidentally pair that decision with a later database generation.
+    """
+    config_bytes, durable_digest, _ = snapshot
+    if hashlib.sha256(config_bytes).hexdigest() != durable_digest:
+        raise RuntimeError('Committed controller config snapshot failed its '
+                           'integrity check.')
+    if expected_workspace is not None:
+        parse_and_validate_version_controller_config(
+            config_bytes, expected_workspace,
+            'committed Serve controller recovery config')
+    _atomic_write_controller_config(live_path, config_bytes)
+    obsolete_paths = [
+        generate_config_snapshot_receipt_file_name(live_path),
+    ]
+    if staged_path is not None:
+        obsolete_paths.extend((
+            staged_path,
+            generate_config_snapshot_receipt_file_name(staged_path),
+        ))
+    for obsolete_path in obsolete_paths:
+        try:
+            os.unlink(os.path.expanduser(obsolete_path))
+        except FileNotFoundError:
+            pass
+    return config_bytes
+
+
+def parse_and_validate_version_controller_config(config_bytes: bytes,
+                                                 expected_workspace: str,
+                                                 source: str) -> Any:
+    """Parse a version snapshot in isolation and enforce workspace identity."""
+    if not isinstance(expected_workspace, str) or not expected_workspace:
+        raise RuntimeError('Durable service workspace is unavailable.')
+
+    def _parse() -> Any:
+        sky_context.initialize()
+        parsed = skypilot_config.parse_and_validate_config_bytes(
+            config_bytes, source, log_config=False, apply_db_env=False)
+        actual_workspace = parsed.get_nested(keys=('active_workspace',),
+                                             default_value=None)
+        if actual_workspace != expected_workspace:
+            raise RuntimeError(
+                f'Committed controller config belongs to workspace '
+                f'{actual_workspace!r}, expected {expected_workspace!r}.')
+        if expected_workspace != skylet_constants.SKYPILOT_DEFAULT_WORKSPACE:
+            workspaces = parsed.get_nested(keys=('workspaces',),
+                                           default_value=None)
+            workspace_config = (workspaces.get(expected_workspace)
+                                if isinstance(workspaces, dict) else None)
+            if not isinstance(workspace_config, dict):
+                raise RuntimeError(
+                    f'Committed controller config does not define durable '
+                    f'workspace {expected_workspace!r}.')
+        return parsed
+
+    return contextvars.Context().run(_parse)
 
 
 def generate_remote_controller_log_file_name(service_name: str,
@@ -1469,13 +2500,63 @@ def update_service_status(pool: bool) -> None:
             expected_status=service_status)
 
 
+def require_update_config_snapshot_capability(service_name: str,
+                                              service_hash: str) -> None:
+    """Fail before version allocation if a live controller is too old."""
+    response = _get_to_controller_with_retry(
+        service_name, service_hash,
+        constants.CONTROLLER_UPDATE_CAPABILITIES_ENDPOINT_PATH)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f'Service {service_name!r} controller does not support atomic '
+            'config refresh. Finish the API-server rollout so its controller '
+            'is recovered on the new image, then retry the update.')
+    try:
+        version = response.json()['config_snapshot_protocol_version']
+    except (KeyError, TypeError, ValueError) as e:
+        raise RuntimeError(
+            f'Service {service_name!r} controller returned an invalid config '
+            'refresh capability response.') from e
+    if (type(version) is not int or  # pylint: disable=unidiomatic-typecheck
+            version != constants.SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION):
+        raise RuntimeError(
+            f'Service {service_name!r} controller config refresh protocol '
+            f'{version!r} is incompatible with this API server.')
+
+
+def cleanup_staged_config_update_encoded(service_name: str, service_hash: str,
+                                         version: int,
+                                         expected_lifecycle_epoch: int,
+                                         config_snapshot_id: str) -> bool:
+    """Serialize cleanup behind any ambiguous controller update attempt."""
+    response = _post_to_controller_with_retry(
+        service_name,
+        service_hash,
+        constants.CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH,
+        json={
+            'version': version,
+            'expected_lifecycle_epoch': expected_lifecycle_epoch,
+            'config_snapshot_id': config_snapshot_id,
+        },
+        timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
+                 constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
+    if response.status_code != 200:
+        raise RuntimeError(
+            f'Controller could not safely clean staged config for service '
+            f'{service_name!r}: {response.text}')
+    return bool(response.json().get('removed', False))
+
+
 def update_service_encoded(service_name: str,
                            version: int,
                            mode: str,
                            pool: bool,
                            expected_service_hash: str | None = None,
                            expected_lifecycle_epoch: int | None = None,
-                           has_submitted_yaml: bool = False) -> str:
+                           has_submitted_yaml: bool = False,
+                           has_config_snapshot: bool = False,
+                           expected_config_snapshot_digest: str | None = None,
+                           config_snapshot_id: str | None = None) -> str:
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     # Only existence and the incarnation hash are consumed here; skip the
@@ -1503,10 +2584,24 @@ def update_service_encoded(service_name: str,
         request_body['lifecycle_epoch'] = expected_lifecycle_epoch
     if has_submitted_yaml:
         request_body['has_submitted_yaml'] = True
+    if has_config_snapshot:
+        if (expected_config_snapshot_digest is None or re.fullmatch(
+                r'[0-9a-f]{64}', expected_config_snapshot_digest) is None):
+            raise ValueError('A valid expected config snapshot digest is '
+                             'required for an atomic config refresh.')
+        if (config_snapshot_id is None or
+                re.fullmatch(r'[0-9a-f]{64}', config_snapshot_id) is None):
+            raise ValueError('A valid config snapshot ID is required for an '
+                             'atomic config refresh.')
+        request_body['has_config_snapshot'] = True
+        request_body['config_snapshot_digest'] = (
+            expected_config_snapshot_digest)
+        request_body['config_snapshot_id'] = config_snapshot_id
     resp = _post_to_controller_with_retry(
         service_name,
         service_hash,
-        '/controller/update_service',
+        (constants.CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH
+         if has_config_snapshot else '/controller/update_service'),
         json=request_body,
         # Keep the compatibility timeout for controllers predating the
         # commit-then-reconcile protocol, whose handler may still wait behind
@@ -1515,6 +2610,11 @@ def update_service_encoded(service_name: str,
                  constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
     if resp.status_code == 404:
         with ux_utils.print_exception_no_traceback():
+            if has_config_snapshot:
+                raise RuntimeError(
+                    f'{capnoun} {service_name!r} controller changed during '
+                    'the update and no longer supports atomic config '
+                    'refresh. Finish the API-server rollout and retry.')
             # This only happens for services since pool is added after the
             # update feature is introduced.
             raise ValueError(
@@ -1535,7 +2635,15 @@ def update_service_encoded(service_name: str,
         with ux_utils.print_exception_no_traceback():
             raise ValueError(f'Failed to update {noun}: {resp.text}')
 
-    service_msg = resp.json()['message']
+    response_body = resp.json()
+    if has_config_snapshot:
+        activated_snapshot_id = response_body.get('config_snapshot_id')
+        if activated_snapshot_id != config_snapshot_id:
+            raise RuntimeError(
+                f'{capnoun} {service_name!r} controller acknowledged a '
+                'different config snapshot. Inspect controller health before '
+                'retrying.')
+    service_msg = response_body['message']
     return message_utils.encode_payload(service_msg)
 
 
@@ -1641,7 +2749,7 @@ def get_yaml_content(service_name: str,
     # does not dump the yaml content to version database.
     # TODO(tian): Remove this after 2 minor releases, i.e. 0.13.0.
     if resource_scope is None:
-        record = serve_state.get_service_from_name(service_name)
+        record = serve_state.get_service_status_snapshot(service_name)
         resource_scope = record.get('resource_scope') if record else None
     latest_yaml_path = generate_task_yaml_file_name(
         service_name, version, resource_scope=resource_scope)
@@ -1675,15 +2783,51 @@ def _set_replica_status_aggregates(record: dict[str, Any],
     })
 
 
-def _get_service_status(
+_PROVIDER_STATUS_FIELDS = (
+    'cloud',
+    'region',
+    'hourly_cost',
+    'hourly_cost_exclusion_reason',
+    'resources_str',
+    'resources_str_full',
+    'infra',
+)
+
+
+@dataclasses.dataclass
+class _PreparedServiceStatus:
+    """Provider-free inputs and mutable outputs for one status snapshot."""
+
+    record: dict[str, Any]
+    pool: bool
+    include_replica_info: bool
+    replica_infos: list[Any] = dataclasses.field(default_factory=list)
+    cluster_records: dict[str, Any] = dataclasses.field(default_factory=dict)
+    ordinary_infos: list[Any] = dataclasses.field(default_factory=list)
+    fenced_groups: dict[tuple[str, str],
+                        list[Any]] = dataclasses.field(default_factory=dict)
+    validated_handles: dict[int, Any] = dataclasses.field(default_factory=dict)
+    identity_uncertain_infos: list[Any] = dataclasses.field(
+        default_factory=list)
+    serialized_by_id: dict[int,
+                           dict[str,
+                                Any]] = dataclasses.field(default_factory=dict)
+    rate_cache: dict[str, float] = dataclasses.field(default_factory=dict)
+    rate_cache_lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock)
+    job_status_counts: dict[str, int] | None = None
+    jobs_by_cluster: dict[str | None, list[int]] | None = None
+
+
+def _prepare_service_status(
         service_name: str,
         pool: bool,
         with_replica_info: bool = True,
         with_replica_counts: bool = False,
         with_yaml: bool = True,
         with_target_num_replicas: bool = False,
-        status_snapshot_only: bool = False) -> dict[str, Any] | None:
-    """Get the status dict of the service.
+        status_snapshot_only: bool = False) -> _PreparedServiceStatus | None:
+    """Build one complete status snapshot without contacting providers.
 
     Args:
         service_name: The name of the service.
@@ -1709,8 +2853,7 @@ def _get_service_status(
             YAML-free lifecycle paths still inspect latest-version metadata.
 
     Returns:
-        A dictionary describing the status of the service if the service exists.
-        Otherwise, return None.
+        Provider-free state for the service if it exists, otherwise None.
     """
     if status_snapshot_only:
         if (with_replica_info or with_replica_counts or with_yaml or
@@ -1857,49 +3000,53 @@ def _get_service_status(
         record['replica_status_counts'] = status_counts
         _set_replica_status_aggregates(record, status_counts, capacity_counts)
 
+    prepared = _PreparedServiceStatus(record=record,
+                                      pool=pool,
+                                      include_replica_info=with_replica_info)
     if with_replica_info:
-        replica_infos = serve_state.get_replica_infos(service_name)
-        full_status_counts: collections.defaultdict[str, int] = (
-            collections.defaultdict(int))
-        full_capacity_counts: collections.defaultdict[str, int] = (
-            collections.defaultdict(int))
-        logical = bool(record.get('logical_replica_semantics'))
-        for info in replica_infos:
-            status = info.status.value
-            full_status_counts[status] += 1
-            planned_capacity = getattr(info, 'planned_capacity', 1)
-            if (not isinstance(planned_capacity, int) or
-                    isinstance(planned_capacity, bool) or planned_capacity < 1):
-                planned_capacity = 1
-            full_capacity_counts[status] += planned_capacity if logical else 1
-        _set_replica_status_aggregates(record, dict(full_status_counts),
-                                       dict(full_capacity_counts))
+        prepared.replica_infos = serve_state.get_replica_infos(service_name)
         # Pre-fetch cluster records in one batched DB query instead of
         # letting each to_info_dict() do its own. With a long failure
         # history this was an N+1.
-        cluster_names = [info.cluster_name for info in replica_infos]
-        cluster_records = global_user_state.get_clusters_from_names(
+        cluster_names = [info.cluster_name for info in prepared.replica_infos]
+        prepared.cluster_records = global_user_state.get_clusters_from_names(
             cluster_names)
-        rate_cache: dict[str, float] = {}
-        record['replica_info'] = [
-            info.to_info_dict(
-                with_handle=True,
-                with_url=not pool,
-                cluster_record=cluster_records[info.cluster_name],
-                rate_cache=rate_cache,
-            ) for info in replica_infos
-        ]
+        # Local import avoids the serve_utils -> reserved_capacity ->
+        # serve_state cycle. Group protocol-v2 rows by physical target so a
+        # later global provider phase can perform one UID proof per pool even
+        # when several services share it. Merely constructing the context
+        # manager below validates durable row/handle agreement; it performs no
+        # provider I/O until entered by the phased serializer.
+        # pylint: disable-next=import-outside-toplevel
+        from sky.serve import reserved_capacity
+
+        for info in prepared.replica_infos:
+            cluster_record = prepared.cluster_records.get(info.cluster_name)
+            try:
+                cleanup_fence = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                if cleanup_fence is None:
+                    prepared.ordinary_infos.append(info)
+                    continue
+                handle = (cluster_record.get('handle') if isinstance(
+                    cluster_record, dict) else None)
+                reserved_capacity.protocol_v2_provider_fence(info, handle)
+            except exceptions.KubernetesPhysicalClusterIdentityError:
+                prepared.identity_uncertain_infos.append(info)
+                continue
+            prepared.validated_handles[info.replica_id] = handle
+            group_key = (cleanup_fence.kubernetes_context,
+                         cleanup_fence.physical_cluster_uid)
+            prepared.fenced_groups.setdefault(group_key, []).append(info)
+
         if pool:
-            record['job_status_counts'] = (
+            prepared.job_status_counts = (
                 managed_job_state.get_nonterminal_job_status_counts_by_pool(
                     service_name))
             # Fetch all nonterminal job ids in the pool in a single query,
             # grouped by current_cluster_name. Avoids the N+1 pattern of
             # (1 + len(replicas)) per-pool queries against a job_info table
             # that may contain tens of thousands of finished rows.
-            jobs_by_cluster = (
-                managed_job_state.get_nonterminal_job_ids_by_pool_grouped(
-                    service_name))
             # Pool-level jobs (e.g. batch coordinators) span every worker.
             # They have pool set but no cluster_name, so they live under the
             # None bucket of the grouped result. Note: the prior per-call
@@ -1909,19 +3056,337 @@ def _get_service_status(
             # surfaced unrelated replicas' jobs as `used_by` on each READY
             # worker. The grouped query lets us implement the intended
             # semantic exactly.
+            prepared.jobs_by_cluster = (
+                managed_job_state.get_nonterminal_job_ids_by_pool_grouped(
+                    service_name))
+    return prepared
+
+
+_PreparedReplicaStatus = tuple[_PreparedServiceStatus, Any]
+
+
+def _sanitize_provider_uncertain_status(
+        replica_record: dict[str, Any],
+        *,
+        strip_placement_metadata: bool = False) -> dict[str, Any]:
+    """Fail a provider partition closed without dropping its durable row."""
+    replica_record['status'] = serve_state.ReplicaStatus.UNKNOWN
+    replica_record['endpoint'] = None
+    replica_record['handle'] = None
+    replica_record['launched_at'] = None
+    replica_record['provider_identity_uncertain'] = True
+    if strip_placement_metadata:
+        for field in _PROVIDER_STATUS_FIELDS:
+            replica_record.pop(field, None)
+    return replica_record
+
+
+def _provider_uncertain_replica_status(info: Any,
+                                       *,
+                                       strip_placement_metadata: bool = False
+                                      ) -> dict[str, Any]:
+    """Serialize durable fields only; no provider or replacement metadata."""
+    replica_record = info.to_info_dict(with_handle=True,
+                                       with_url=False,
+                                       cluster_record=None,
+                                       rate_cache=None)
+    return _sanitize_provider_uncertain_status(
+        replica_record, strip_placement_metadata=strip_placement_metadata)
+
+
+def _serialize_prepared_replica(prepared: _PreparedServiceStatus,
+                                info: Any) -> dict[str, Any]:
+    """Serialize one admitted replica from the prepared cluster snapshot."""
+    # Separate physical groups of one service can run concurrently. Protect
+    # its pricing memo while retaining provider fanout across services.
+    with prepared.rate_cache_lock:
+        replica_record = info.to_info_dict(
+            with_handle=True,
+            with_url=not prepared.pool,
+            cluster_record=prepared.cluster_records.get(info.cluster_name),
+            rate_cache=prepared.rate_cache,
+        )
+    if replica_record.get('provider_identity_uncertain'):
+        return _sanitize_provider_uncertain_status(replica_record)
+    return replica_record
+
+
+def _store_serialized_results(
+        results: list[tuple[_PreparedServiceStatus, int, dict[str,
+                                                              Any]]]) -> None:
+    for prepared, replica_id, replica_record in results:
+        prepared.serialized_by_id[replica_id] = replica_record
+
+
+def _uncertain_results(
+    entries: list[_PreparedReplicaStatus],
+    *,
+    strip_placement_metadata: bool = False,
+) -> list[tuple[_PreparedServiceStatus, int, dict[str, Any]]]:
+    return [(prepared, info.replica_id,
+             _provider_uncertain_replica_status(
+                 info, strip_placement_metadata=strip_placement_metadata))
+            for prepared, info in entries]
+
+
+def _serialize_v2_status_group(
+    entries: list[_PreparedReplicaStatus],
+    admission: provider_phase.ProviderPhaseAdmission | None = None,
+) -> list[tuple[_PreparedServiceStatus, int, dict[str, Any]]]:
+    """Serialize one physical v2 pool under one UID proof."""
+    assert entries
+    join_context: contextlib.AbstractContextManager[Any] = (
+        contextlib.nullcontext()
+        if admission is None else provider_phase.join_provider_phase(admission))
+    representative_prepared, representative = entries[0]
+    # Local import avoids the serve_utils -> reserved_capacity -> serve_state
+    # initialization cycle.
+    # pylint: disable-next=import-outside-toplevel
+    from sky.serve import reserved_capacity
+    try:
+        with join_context:
+            with reserved_capacity.protocol_v2_provider_fence(
+                    representative, representative_prepared.validated_handles[
+                        representative.replica_id]):
+                return [(prepared, info.replica_id,
+                         _serialize_prepared_replica(prepared, info))
+                        for prepared, info in entries]
+    except exceptions.KubernetesPhysicalClusterIdentityError as error:
+        logger.warning(
+            'Service status fenced off a protocol-v2 provider partition: %s',
+            common_utils.format_exception(error))
+        return _uncertain_results(entries)
+    except exceptions.ProviderPhaseTimeoutError as error:
+        logger.warning(
+            'Service status timed out joining a protocol-v2 provider phase: '
+            '%s', common_utils.format_exception(error))
+        return _uncertain_results(entries, strip_placement_metadata=True)
+
+
+def _serialize_ordinary_status_partition(
+    entries: list[_PreparedReplicaStatus],
+    admission: provider_phase.ProviderPhaseAdmission | None = None,
+) -> list[tuple[_PreparedServiceStatus, int, dict[str, Any]]]:
+    """Serialize one service's ordinary replicas in the ambient phase."""
+    assert entries
+    join_context: contextlib.AbstractContextManager[Any] = (
+        contextlib.nullcontext()
+        if admission is None else provider_phase.join_provider_phase(admission))
+    try:
+        with join_context:
+            return [(prepared, info.replica_id,
+                     _serialize_prepared_replica(prepared, info))
+                    for prepared, info in entries]
+    except exceptions.ProviderPhaseTimeoutError as error:
+        logger.warning(
+            'Service status fenced off an ambient provider partition: %s',
+            common_utils.format_exception(error))
+        return _uncertain_results(entries, strip_placement_metadata=True)
+
+
+def _seed_identity_uncertain_statuses(
+        prepared_statuses: list[_PreparedServiceStatus]) -> None:
+    for prepared in prepared_statuses:
+        _store_serialized_results(
+            _uncertain_results([
+                (prepared, info) for info in prepared.identity_uncertain_infos
+            ]))
+
+
+def _global_v2_status_groups(
+    prepared_statuses: list[_PreparedServiceStatus],
+) -> dict[tuple[str, str], list[_PreparedReplicaStatus]]:
+    groups: dict[tuple[str, str], list[_PreparedReplicaStatus]] = {}
+    for prepared in prepared_statuses:
+        for key, infos in prepared.fenced_groups.items():
+            groups.setdefault(key, []).extend(
+                (prepared, info) for info in infos)
+    return groups
+
+
+def _reject_conflicting_v2_status_groups(
+    groups: dict[tuple[str, str], list[_PreparedReplicaStatus]],) -> None:
+    """Fail every contradictory UID for one mutable context closed."""
+    keys_by_context: dict[str, list[tuple[str, str]]] = {}
+    for key in groups:
+        keys_by_context.setdefault(key[0], []).append(key)
+    conflicted_keys = [
+        key for keys in keys_by_context.values()
+        if len({candidate[1] for candidate in keys}) > 1 for key in keys
+    ]
+    for key in conflicted_keys:
+        entries = groups.pop(key)
+        logger.warning(
+            'Service status rejected conflicting physical-cluster '
+            'UIDs for Kubernetes context %r.', key[0])
+        _store_serialized_results(_uncertain_results(entries))
+
+
+def _ordinary_status_partitions(
+    prepared_statuses: list[_PreparedServiceStatus],
+) -> list[list[_PreparedReplicaStatus]]:
+    return [[(prepared, info)
+             for info in prepared.ordinary_infos]
+            for prepared in prepared_statuses
+            if prepared.ordinary_infos]
+
+
+def _mark_phase_timeout(partitions: typing.Iterable[
+    list[_PreparedReplicaStatus]], mode: provider_phase.ProviderPhaseMode,
+                        error: exceptions.ProviderPhaseTimeoutError) -> None:
+    logger.warning('Service status timed out waiting for provider phase %s: %s',
+                   mode.value, common_utils.format_exception(error))
+    for entries in partitions:
+        _store_serialized_results(
+            _uncertain_results(entries, strip_placement_metadata=True))
+
+
+def _serialize_prepared_statuses_synchronously(
+        prepared_statuses: list[_PreparedServiceStatus]) -> None:
+    """Run v2 then ambient serialization without child-thread admission."""
+    _seed_identity_uncertain_statuses(prepared_statuses)
+    v2_groups = _global_v2_status_groups(prepared_statuses)
+    _reject_conflicting_v2_status_groups(v2_groups)
+    if v2_groups:
+        try:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED):
+                for entries in v2_groups.values():
+                    _store_serialized_results(
+                        _serialize_v2_status_group(entries))
+        except exceptions.ProviderPhaseTimeoutError as error:
+            _mark_phase_timeout(v2_groups.values(),
+                                provider_phase.ProviderPhaseMode.V2_FENCED,
+                                error)
+
+    ordinary_partitions = _ordinary_status_partitions(prepared_statuses)
+    if ordinary_partitions:
+        try:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+                for entries in ordinary_partitions:
+                    _store_serialized_results(
+                        _serialize_ordinary_status_partition(entries))
+        except exceptions.ProviderPhaseTimeoutError as error:
+            _mark_phase_timeout(ordinary_partitions,
+                                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY,
+                                error)
+
+
+def _run_status_phase_fanout(
+    work: list[list[_PreparedReplicaStatus]],
+    worker: Callable[
+        [list[_PreparedReplicaStatus], provider_phase.ProviderPhaseAdmission],
+        list[tuple[_PreparedServiceStatus, int, dict[str, Any]]],
+    ],
+    admission: provider_phase.ProviderPhaseAdmission,
+    parent_ctx: contextvars.Context,
+) -> None:
+    """Run and fully join one admitted status-provider fanout."""
+    max_workers = min(len(work), _STATUS_FANOUT_MAX_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(parent_ctx.copy().run, worker, entries, admission)
+            for entries in work
+        ]
+        for future in futures:
+            _store_serialized_results(future.result())
+
+
+def _serialize_prepared_statuses_with_fanout(
+        prepared_statuses: list[_PreparedServiceStatus],
+        parent_ctx: contextvars.Context) -> None:
+    """Serialize a batch under one fully joined v2 and ambient root each."""
+    _seed_identity_uncertain_statuses(prepared_statuses)
+    v2_groups = _global_v2_status_groups(prepared_statuses)
+    _reject_conflicting_v2_status_groups(v2_groups)
+    if v2_groups:
+        v2_work = list(v2_groups.values())
+        try:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
+                _run_status_phase_fanout(v2_work, _serialize_v2_status_group,
+                                         admission, parent_ctx)
+        except exceptions.ProviderPhaseTimeoutError as error:
+            _mark_phase_timeout(v2_work,
+                                provider_phase.ProviderPhaseMode.V2_FENCED,
+                                error)
+
+    ordinary_work = _ordinary_status_partitions(prepared_statuses)
+    if ordinary_work:
+        try:
+            with provider_phase.provider_phase(provider_phase.ProviderPhaseMode.
+                                               AMBIENT_LEGACY) as admission:
+                _run_status_phase_fanout(ordinary_work,
+                                         _serialize_ordinary_status_partition,
+                                         admission, parent_ctx)
+        except exceptions.ProviderPhaseTimeoutError as error:
+            _mark_phase_timeout(ordinary_work,
+                                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY,
+                                error)
+
+
+def _finalize_prepared_service_status(
+        prepared: _PreparedServiceStatus) -> dict[str, Any]:
+    """Attach provider results and aggregates without further I/O."""
+    record = prepared.record
+    if prepared.include_replica_info:
+        replica_records = [
+            prepared.serialized_by_id[info.replica_id]
+            for info in prepared.replica_infos
+        ]
+        record['replica_info'] = replica_records
+        full_status_counts: collections.defaultdict[str, int] = (
+            collections.defaultdict(int))
+        full_capacity_counts: collections.defaultdict[str, int] = (
+            collections.defaultdict(int))
+        logical = bool(record.get('logical_replica_semantics'))
+        for info, replica_record in zip(prepared.replica_infos,
+                                        replica_records):
+            status = replica_record['status'].value
+            full_status_counts[status] += 1
+            full_capacity_counts[status] += (info.planned_capacity
+                                             if logical else 1)
+        _set_replica_status_aggregates(record, dict(full_status_counts),
+                                       dict(full_capacity_counts))
+        if prepared.pool:
+            record['job_status_counts'] = prepared.job_status_counts
+            jobs_by_cluster = prepared.jobs_by_cluster or {}
             pool_level_job_ids = list(jobs_by_cluster.get(None, []))
-            for replica_info in record['replica_info']:
-                job_ids = list(jobs_by_cluster.get(replica_info['name'], []))
-                # Show pool-level jobs on READY workers only.
-                if (replica_info.get('status') ==
+            for replica_record in replica_records:
+                job_ids = list(jobs_by_cluster.get(replica_record['name'], []))
+                if (replica_record.get('status') ==
                         serve_state.ReplicaStatus.READY):
                     job_ids = list(dict.fromkeys(pool_level_job_ids + job_ids))
-                replica_info['used_by'] = job_ids
+                replica_record['used_by'] = job_ids
     observed_ready = record.get('observed_ready_replicas')
     if ('ready_replicas' in record and isinstance(observed_ready, int) and
             not isinstance(observed_ready, bool) and observed_ready >= 0):
         record['ready_replicas'] = observed_ready
     return record
+
+
+def _get_service_status(
+        service_name: str,
+        pool: bool,
+        with_replica_info: bool = True,
+        with_replica_counts: bool = False,
+        with_yaml: bool = True,
+        with_target_num_replicas: bool = False,
+        status_snapshot_only: bool = False) -> dict[str, Any] | None:
+    """Get one service status using synchronous v2-before-ambient phases."""
+    prepared = _prepare_service_status(
+        service_name,
+        pool,
+        with_replica_info=with_replica_info,
+        with_replica_counts=with_replica_counts,
+        with_yaml=with_yaml,
+        with_target_num_replicas=with_target_num_replicas,
+        status_snapshot_only=status_snapshot_only)
+    if prepared is None:
+        return None
+    _serialize_prepared_statuses_synchronously([prepared])
+    return _finalize_prepared_service_status(prepared)
 
 
 def resolve_target_qps_for_gpu_shape(
@@ -1974,9 +3439,10 @@ def get_service_status_pickled(
         return []
     if include_target_num_replicas is None:
         include_target_num_replicas = not summary_only and not metadata_only
-    # Fan out across services. Each `_get_service_status` is dominated by
-    # I/O (controller HTTP + DB reads) so threads parallelize well; the
-    # cap on max_workers keeps memory and DB-connection pressure bounded.
+    # Fan out the provider-free service/replica/cluster snapshots first. The
+    # resulting immutable work set is then serialized under one process-wide
+    # v2 phase followed by one ambient phase; no worker can independently
+    # interleave the two authority modes.
     # Each task gets a fresh `Context.copy()` because the same Context
     # can't be entered from multiple threads (Context.run raises
     # RuntimeError otherwise) — but the values (request_id / user_id)
@@ -1985,7 +3451,7 @@ def get_service_status_pickled(
     # aborts the whole call).
     parent_ctx = contextvars.copy_context()
 
-    def _run_in_context(name: str) -> dict[str, Any] | None:
+    def _run_in_context(name: str) -> _PreparedServiceStatus | None:
         kwargs = {
             'pool': pool,
             'with_replica_info': not summary_only and not metadata_only,
@@ -2000,17 +3466,22 @@ def get_service_status_pickled(
         # lifecycle consumers parse it back into a launchable task.
         if (summary_only and not pool) or metadata_only:
             kwargs['with_yaml'] = False
-        status = parent_ctx.copy().run(_get_service_status, name, **kwargs)
-        if status is not None and metadata_only:
-            status['metadata_only'] = True
-        return status
+        prepared = parent_ctx.copy().run(_prepare_service_status, name,
+                                         **kwargs)
+        if prepared is not None and metadata_only:
+            prepared.record['metadata_only'] = True
+        return prepared
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        statuses = list(ex.map(_run_in_context, service_names))
-    live_statuses = sorted(
-        (status for status in statuses if status is not None),
-        key=lambda status: status['name'])
+        prepared_statuses = list(ex.map(_run_in_context, service_names))
+    live_prepared = [
+        prepared for prepared in prepared_statuses if prepared is not None
+    ]
+    _serialize_prepared_statuses_with_fanout(live_prepared, parent_ctx)
+    live_statuses = sorted((_finalize_prepared_service_status(prepared)
+                            for prepared in live_prepared),
+                           key=lambda status: status['name'])
     for status in live_statuses:
         # The rendered YAML carries plaintext secrets (replicas need it
         # launchable), so it never leaves the controller for services:
@@ -2396,18 +3867,25 @@ def quiesce_service_replica_launch_requests(
     service_name: str,
     replica_infos: list['replica_managers.ReplicaInfo'],
     continue_guard: Callable[[], bool] | None = None,
+    *,
+    include_terminal_history: bool = False,
 ) -> bool:
-    """Cancel and await every active launch backed by replica inventory.
+    """Cancel and execution-quiesce launches backed by replica inventory.
 
-    ``sdk.api_cancel`` only schedules a cancellation request.  Teardown may
-    remove replica/service rows only after that cancellation request itself
-    has completed and a fresh status query proves that no launch request for
-    any incarnation-scoped replica cluster remains active.  The caller must
-    first stop the controller child (or receive its teardown acknowledgement),
-    so no producer can enqueue a new launch after this barrier begins.
+    ``sdk.api_cancel`` publishes ``CANCELLED`` before a remote executor has
+    necessarily stopped its handler. Teardown may remove replica/service rows
+    only after every retained target request proves that its exact execution
+    generation is quiescent. The caller must first stop the controller child
+    (or receive its teardown acknowledgement), so no producer can enqueue a
+    new launch after this barrier begins.
 
-    Returns False on any transport/status/ownership uncertainty.  Callers then
-    retain the durable service and replica rows for a later retry.
+    ``include_terminal_history`` uses one server-side cluster-name batch to
+    discover already-terminal but unproven requests. Protocol-v2 interrupted
+    fill recovery requires it; compatibility teardown leaves it disabled while
+    pre-v70 request history ages out.
+
+    Returns False on any transport/status/identity/ownership uncertainty.
+    Callers then retain all durable service and replica rows for a later retry.
     """
 
     def _guard_allows() -> bool:
@@ -2425,47 +3903,172 @@ def quiesce_service_replica_launch_requests(
                            request_names.RequestName.CLUSTER_LAUNCH.value)
     cluster_names = {info.cluster_name for info in replica_infos}
 
-    def _active_launch_request_ids() -> set[str]:
+    def _discover_launch_requests() -> tuple[dict[str, int], dict[str, int]]:
         if not cluster_names:
-            return set()
-        # The service is already durably terminal, so the controller cannot
-        # schedule more launches. A launch request racing this snapshot is
-        # caught by the next cancellation round. Return only the three small
-        # fields needed for that convergence proof. This is bounded by the
-        # API's active queue rather than by retained replica history (2,159
-        # stale rows previously meant 2,159 HTTP requests per round).
-        active_requests = sdk.api_status(
-            all_status=False, fields=['request_id', 'name', 'cluster_name'])
-        return {
-            request.request_id
-            for request in active_requests
-            if request.name == launch_request_name and
-            request.cluster_name in cluster_names
-        }
+            return {}, {}
+        # The caller has stopped the launch producer (and generic teardown has
+        # already durably terminalized the service). A launch request racing
+        # this snapshot is caught by the next cancellation round. The
+        # protocol-v2 recovery path asks PostgreSQL for all statuses of the
+        # whole incarnation-scoped cluster-name set in one bounded query;
+        # compatibility teardown scans only the active queue.
+        fields = ['request_id', 'name', 'cluster_name']
+        if include_terminal_history:
+            fields.extend([
+                'execution_generation', 'status',
+                'execution_quiescence_required',
+                'execution_quiesced_generation', 'execution_quiesced_at'
+            ])
+            requests = sdk.api_status(
+                all_status=True,
+                cluster_names=sorted(cluster_names),
+                _include_request_names=[launch_request_name],
+                fields=fields,
+                _execution_quiescence_candidates_only=(True))
+        else:
+            requests = sdk.api_status(all_status=False, fields=fields)
+
+        if include_terminal_history:
+            remote_api_version = versions.get_remote_api_version()
+            if (remote_api_version is None or
+                    remote_api_version < server_constants.
+                    MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+                raise RuntimeError(
+                    'API server cannot expose exact request execution '
+                    'quiescence; finish the server rollout first.')
+
+        active: dict[str, int] = {}
+        terminal_unproven: dict[str, int] = {}
+        for request in requests:
+            if (request.name != launch_request_name or
+                    request.cluster_name not in cluster_names):
+                continue
+            if not include_terminal_history:
+                active[request.request_id] = 0
+                continue
+            execution_generation = request.execution_generation
+            if (not isinstance(execution_generation, int) or
+                    execution_generation < 0):
+                raise RuntimeError(
+                    'API server did not return an execution generation for '
+                    f'launch request {request.request_id}.')
+            if request.status in ('CANCELLED', 'SUCCEEDED', 'FAILED'):
+                if request.execution_quiescence_required is not True:
+                    # Pre-v70 terminal history has no completion-receipt
+                    # contract. Protocol v2 cannot create those rows, and
+                    # replica creation time excludes reused cluster names.
+                    continue
+                if (request.execution_quiesced_generation
+                        != execution_generation or
+                        request.execution_quiesced_at is None):
+                    terminal_unproven[request.request_id] = (
+                        execution_generation)
+                continue
+            active[request.request_id] = execution_generation
+        return active, terminal_unproven
+
+    def _await_execution_quiescence(
+            request_generations: dict[str, int]) -> bool:
+        """Wait for exact target generations, not just terminal status."""
+        request_ids = set(request_generations)
+        deadline = time.monotonic() + _LAUNCH_QUIESCE_TIMEOUT_SECONDS
+        while True:
+            if not _guard_allows():
+                return False
+            requests = sdk.api_status(request_ids=sorted(request_ids),
+                                      fields=[
+                                          'request_id', 'name', 'cluster_name',
+                                          'status', 'execution_generation',
+                                          'execution_quiescence_required',
+                                          'execution_quiesced_generation',
+                                          'execution_quiesced_at'
+                                      ],
+                                      _exact_request_ids=True,
+                                      _use_body=True)
+            exact_requests = {
+                request.request_id: request
+                for request in requests
+                if request.request_id in request_ids
+            }
+            missing = request_ids - exact_requests.keys()
+            if missing:
+                logger.error('Launch requests disappeared before execution '
+                             f'quiescence was proven for {service_name!r}: '
+                             f'{sorted(missing)}')
+                return False
+
+            waiting: list[str] = []
+            for request_id, request in exact_requests.items():
+                if (request.name != launch_request_name or
+                        request.cluster_name not in cluster_names):
+                    logger.error(
+                        'Launch request identity changed while quiescing '
+                        f'{service_name!r}: {request_id}')
+                    return False
+                expected_generation = request_generations[request_id]
+                if request.execution_generation != expected_generation:
+                    logger.error(
+                        'Launch request execution generation changed while '
+                        f'quiescing {service_name!r}: {request_id} '
+                        f'({request.execution_generation} != '
+                        f'{expected_generation})')
+                    return False
+                if request.status not in ('CANCELLED', 'SUCCEEDED', 'FAILED'):
+                    logger.error(
+                        'Launch request did not reach a terminal state while '
+                        f'quiescing {service_name!r}: {request_id} '
+                        f'({request.status})')
+                    return False
+                if (request.execution_quiescence_required is not True or
+                        request.execution_quiesced_generation
+                        != expected_generation or
+                        request.execution_quiesced_at is None):
+                    waiting.append(request_id)
+
+            if not waiting:
+                return True
+            if time.monotonic() >= deadline:
+                logger.error(
+                    'Timed out waiting for cancelled launch handlers to '
+                    f'quiesce for {service_name!r}: {sorted(waiting)}')
+                return False
+            time.sleep(_LAUNCH_QUIESCE_POLL_SECONDS)
 
     try:
-        # A completed cancellation request makes the target terminal before it
-        # returns. The caller has already published SHUTTING_DOWN, and both the
-        # scheduler precondition and persisted execution entrypoint reject any
-        # launch row that appears after this scan.
+        # The caller has already stopped the producer (and generic service
+        # teardown has published SHUTTING_DOWN). Both the scheduler
+        # precondition and persisted execution entrypoint reject a launch row
+        # that appears after the final empty scan.
         cancel_rounds = 0
         while True:
             if not _guard_allows():
                 return False
-            active_request_ids = _active_launch_request_ids()
-            if not active_request_ids:
-                return True
+            active_requests, terminal_unproven = (_discover_launch_requests())
 
-            if cancel_rounds >= _LAUNCH_QUIESCE_MAX_CANCEL_ROUNDS:
-                logger.error('Replica launch requests remained active after '
-                             f'cancellation for {service_name!r}: '
-                             f'{sorted(active_request_ids)}')
+            if active_requests:
+                if cancel_rounds >= _LAUNCH_QUIESCE_MAX_CANCEL_ROUNDS:
+                    logger.error(
+                        'Replica launch requests remained active after '
+                        f'cancellation for {service_name!r}: '
+                        f'{sorted(active_requests)}')
+                    return False
+                cancel_request_id = sdk.api_cancel(sorted(active_requests),
+                                                   all_users=True,
+                                                   silent=True)
+                sdk.stream_and_get(cancel_request_id)
+                cancel_rounds += 1
+                if not include_terminal_history:
+                    # Compatibility path for local/SQLite and pre-v70
+                    # deployments. Protocol-v2 fill recovery always enables
+                    # the generation-stamped PostgreSQL history barrier.
+                    continue
+
+            targets = dict(terminal_unproven)
+            targets.update(active_requests)
+            if not targets:
+                return True
+            if not _await_execution_quiescence(targets):
                 return False
-            cancel_request_id = sdk.api_cancel(sorted(active_request_ids),
-                                               all_users=True,
-                                               silent=True)
-            sdk.stream_and_get(cancel_request_id)
-            cancel_rounds += 1
     except Exception as e:  # pylint: disable=broad-except
         logger.error('Failed to quiesce replica launch requests for '
                      f'{service_name!r}: '
@@ -2504,6 +4107,71 @@ def get_orphaned_service_cluster_status_fields(
         for cluster_name, status_fields in candidates.items()
         if cluster_name not in owned_cluster_names
     }
+
+
+def replica_cleanup_requires_terminal_history(
+        replica_infos: list['replica_managers.ReplicaInfo']) -> bool:
+    """Whether cleanup must quiesce terminal launch-request history.
+
+    Protocol-v2 launch handlers can remain unproved after their request row is
+    terminal. Partial v2 authority is treated identically: cleanup cannot
+    safely downgrade malformed durable state to the legacy active-only scan.
+    """
+    # Local to avoid the Serve/request payload import cycle documented below.
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import reserved_capacity
+
+    # pylint: enable=import-outside-toplevel
+
+    for info in replica_infos:
+        try:
+            if (reserved_capacity.parse_protocol_v2_cleanup_fence(info)
+                    is not None):
+                return True
+        except exceptions.KubernetesPhysicalClusterIdentityError:
+            return True
+    return False
+
+
+def _partition_replica_cleanup_targets(
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    existing_cluster_names: set[str],
+) -> tuple[list[tuple['replica_managers.ReplicaInfo', Any]], list[str]]:
+    """Separate cleanup targets from rows whose provider absence is unknown.
+
+    Legacy rows retain the historical cluster-table absence behavior. A
+    protocol-v2 row is removable only after its exact context/UID-fenced down
+    succeeds; local cluster-record absence is not provider-absence evidence.
+    Malformed v2 authority is likewise retained for operator repair.
+    """
+    # Local to avoid payloads -> task -> service_spec -> serve_utils ->
+    # reserved_capacity_broker -> request_wire -> payloads during import.
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import reserved_capacity
+
+    # pylint: enable=import-outside-toplevel
+
+    to_terminate: list[tuple[replica_managers.ReplicaInfo, Any]] = []
+    unresolved_cluster_names: list[str] = []
+    for info in replica_infos:
+        try:
+            cleanup_fence = (
+                reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            logger.error('Refusing name-only cleanup for replica cluster '
+                         f'{info.cluster_name!r}: '
+                         f'{common_utils.format_exception(error)}')
+            unresolved_cluster_names.append(info.cluster_name)
+            continue
+        if info.cluster_name in existing_cluster_names:
+            to_terminate.append((info, cleanup_fence))
+        elif cleanup_fence is not None:
+            logger.error(
+                'Retaining protocol-v2 replica cluster '
+                f'{info.cluster_name!r}: its SkyPilot cluster record is '
+                'absent but provider absence is not independently proven.')
+            unresolved_cluster_names.append(info.cluster_name)
+    return to_terminate, unresolved_cluster_names
 
 
 def _terminate_failed_services(service_name: str,
@@ -2631,7 +4299,11 @@ def _terminate_failed_services_locked(
 
     replica_infos = serve_state.get_replica_infos(service_name)
     if not quiesce_service_replica_launch_requests(
-            service_name, replica_infos, continue_guard=_still_owns):
+            service_name,
+            replica_infos,
+            continue_guard=_still_owns,
+            include_terminal_history=(
+                replica_cleanup_requires_terminal_history(replica_infos))):
         return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
                 'could not be purged because its replica launch requests '
                 'could not be quiesced; durable cleanup inventory was '
@@ -2696,20 +4368,20 @@ def _terminate_failed_services_locked(
     if not _still_owns():
         return _purge_ownership_failure(
             service_name, 'ownership lost after cluster inventory snapshot')
-    # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove this
-    # failed-service purge submission path at M5 for eligible authoritative
-    # services after durable down actions cover purge and rollback.
-    to_terminate = [
-        info for info in replica_infos
-        if info.cluster_name in existing_cluster_names
-    ]
+    # This remains the failed-service purge submission owner.  The retired
+    # action-authority proposal does not replace it.
+    to_terminate, unresolved_cluster_names = (
+        _partition_replica_cleanup_targets(replica_infos,
+                                           existing_cluster_names))
+    remaining_replica_clusters.extend(unresolved_cluster_names)
     if to_terminate:
         try:
             teardown_identities = (
                 serve_state.get_replica_resource_action_identities(
-                    service_name, [info.replica_id for info in to_terminate]))
+                    service_name,
+                    [info.replica_id for info, _ in to_terminate]))
             if set(teardown_identities) != {
-                    info.replica_id for info in to_terminate
+                    info.replica_id for info, _ in to_terminate
             }:
                 raise RuntimeError(
                     'Replica inventory changed while snapshotting teardown '
@@ -2739,20 +4411,26 @@ def _terminate_failed_services_locked(
                 return _still_owns()
 
         def _terminate_replica_cluster(
-                info: 'replica_managers.ReplicaInfo') -> str | None:
+            cleanup_target: tuple['replica_managers.ReplicaInfo', Any]
+        ) -> str | None:
             # Reuse the normal replica down path (sdk.down with retries);
             # logs go to the replica's log file like a regular teardown.
+            info, cleanup_fence = cleanup_target
             log_file_name = generate_replica_log_file_name(
                 service_name, info.replica_id, resource_scope)
             try:
                 identity = teardown_identities[info.replica_id]
-                replica_managers.terminate_cluster(
-                    info.cluster_name,
-                    log_file_name,
-                    continue_guard=(_worker_still_owns),
-                    expected_cluster_record_uuid=(str(
-                        identity.sky_cluster_record_uuid) if identity
-                                                  is not None else None))
+                terminate_kwargs: dict[str, Any] = {
+                    'continue_guard': _worker_still_owns,
+                    'expected_cluster_record_uuid':
+                        (str(identity.sky_cluster_record_uuid)
+                         if identity is not None else None),
+                }
+                if cleanup_fence is not None:
+                    terminate_kwargs['cleanup_fence'] = cleanup_fence
+                replica_managers.terminate_cluster(info.cluster_name,
+                                                   log_file_name,
+                                                   **terminate_kwargs)
                 return None
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate replica cluster '
@@ -2763,9 +4441,8 @@ def _terminate_failed_services_locked(
 
         termination_failures = subprocess_utils.run_in_parallel(
             _terminate_replica_cluster, to_terminate)
-        remaining_replica_clusters = [
-            f'{name!r}' for name in termination_failures if name is not None
-        ]
+        remaining_replica_clusters.extend(
+            name for name in termination_failures if name is not None)
 
     if not _still_owns():
         return _purge_ownership_failure(service_name,
@@ -2785,7 +4462,8 @@ def _terminate_failed_services_locked(
                 expected_lifecycle_epoch=lifecycle_epoch):
             return _purge_ownership_failure(
                 service_name, 'ownership lost while retaining failed cleanup')
-        remaining_identity = ', '.join(remaining_replica_clusters)
+        remaining_identity = ', '.join(
+            repr(name) for name in remaining_replica_clusters)
         return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
                 'could not be purged because some replica clusters could not '
                 'be terminated. The service name and cleanup metadata remain '
@@ -2867,7 +4545,11 @@ def _terminate_orphaned_service_children_impl(
 
         replica_infos = serve_state.get_replica_infos(service_name)
         if not quiesce_service_replica_launch_requests(
-                service_name, replica_infos, continue_guard=_still_orphaned):
+                service_name,
+                replica_infos,
+                continue_guard=_still_orphaned,
+                include_terminal_history=(
+                    replica_cleanup_requires_terminal_history(replica_infos))):
             return (f'{colorama.Fore.YELLOW}orphaned service '
                     f'{service_name!r} could not be purged because its replica '
                     'launch requests could not be quiesced; durable child '
@@ -2932,19 +4614,18 @@ def _terminate_orphaned_service_children_impl(
             return _purge_ownership_failure(
                 service_name,
                 'ownership lost after orphan cluster inventory snapshot')
-        # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove
-        # this orphan purge submission path at M5 for eligible authoritative
-        # services after durable down actions cover purge and rollback.
-        to_terminate = [
-            info for info in replica_infos
-            if info.cluster_name in existing_cluster_names
-        ]
+        # This remains the orphan purge submission owner.  The retired
+        # action-authority proposal does not replace it.
+        to_terminate, unresolved_cluster_names = (
+            _partition_replica_cleanup_targets(replica_infos,
+                                               existing_cluster_names))
         try:
             teardown_identities = (
                 serve_state.get_replica_resource_action_identities(
-                    service_name, [info.replica_id for info in to_terminate]))
+                    service_name,
+                    [info.replica_id for info, _ in to_terminate]))
             if set(teardown_identities) != {
-                    info.replica_id for info in to_terminate
+                    info.replica_id for info, _ in to_terminate
             }:
                 raise RuntimeError(
                     'Replica inventory changed while snapshotting teardown '
@@ -2955,22 +4636,27 @@ def _terminate_orphaned_service_children_impl(
                     'replica teardown identities could not be verified: '
                     f'{common_utils.format_exception(e)}.'
                     f'{colorama.Style.RESET_ALL}')
-        termination_failures = []
-        for info in to_terminate:
+        termination_failures = list(unresolved_cluster_names)
+        for info, cleanup_fence in to_terminate:
             if not _still_orphaned():
                 return _purge_ownership_failure(
                     service_name,
                     'ownership lost before orphan replica cleanup')
             try:
                 identity = teardown_identities[info.replica_id]
+                terminate_kwargs: dict[str, Any] = {
+                    'continue_guard': _still_orphaned,
+                    'expected_cluster_record_uuid':
+                        (str(identity.sky_cluster_record_uuid)
+                         if identity is not None else None),
+                }
+                if cleanup_fence is not None:
+                    terminate_kwargs['cleanup_fence'] = cleanup_fence
                 replica_managers.terminate_cluster(
                     info.cluster_name,
                     generate_replica_log_file_name(service_name,
                                                    info.replica_id),
-                    continue_guard=_still_orphaned,
-                    expected_cluster_record_uuid=(str(
-                        identity.sky_cluster_record_uuid) if identity
-                                                  is not None else None))
+                    **terminate_kwargs)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate orphan replica cluster '
                              f'{info.cluster_name!r}: '
@@ -3001,6 +4687,10 @@ def _terminate_orphaned_service_children_impl(
 
 def terminate_services(service_names: list[str] | None, purge: bool,
                        pool: bool) -> str:
+    if not pool and maintenance.is_controller_hold_active():
+        raise RuntimeError(
+            'SkyServe termination and purge are disabled while the server '
+            'controller hold is active.')
     noun = 'pool' if pool else 'service'
     capnoun = noun.capitalize()
     requested_service_names = service_names
@@ -3546,7 +5236,7 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
 
     matching_info = serve_state.get_replica_info_from_id(
         service_name, replica_id)
-    recorded_cluster_name = (getattr(matching_info, 'cluster_name', None)
+    recorded_cluster_name = (matching_info.cluster_name
                              if matching_info is not None else None)
     replica_cluster_name = (recorded_cluster_name if isinstance(
         recorded_cluster_name, str) else generate_replica_cluster_name(
@@ -3601,6 +5291,23 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     backend = backends.CloudVmRayBackend()
     handle = global_user_state.get_handle_from_cluster_name(
         replica_cluster_name)
+    provider_fence: contextlib.AbstractContextManager[None] = (
+        contextlib.nullcontext())
+    provider_mode = provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
+    if matching_info is not None:
+        # Imported lazily to avoid the serve_utils -> reserved_capacity ->
+        # serve_state import cycle during module initialization.  Log tailing
+        # is a remote command just like status and cleanup: a protocol-v2
+        # reserved-fill row must prove that its durable handle still targets
+        # the same physical Kubernetes cluster before any output is read.
+        # pylint: disable-next=import-outside-toplevel
+        from sky.serve import reserved_capacity
+        cleanup_fence = reserved_capacity.parse_protocol_v2_cleanup_fence(
+            matching_info)
+        provider_fence = reserved_capacity.protocol_v2_provider_fence(
+            matching_info, handle, include_provider_phase=False)
+        if cleanup_fence is not None:
+            provider_mode = provider_phase.ProviderPhaseMode.V2_FENCED
     if handle is None:
         if tail is not None:
             for line in final_lines_to_print:
@@ -3614,20 +5321,29 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     print(f'{colorama.Fore.YELLOW}Start streaming logs for task job '
           f'of {repnoun} {replica_id}...{colorama.Style.RESET_ALL}')
 
-    # Always tail the latest logs, which represent user setup & run.
+    # Always tail the latest logs, which represent user setup & run. A
+    # bounded read participates in the normal provider phases. Interactive
+    # follow deliberately holds only its immutable physical fence: keeping a
+    # process-wide phase open for an unbounded stream would starve every
+    # opposite-mode operation in the API process.
+    phase_context: contextlib.AbstractContextManager = (
+        contextlib.nullcontext()
+        if follow else provider_phase.provider_phase(provider_mode))
     if tail is None:
-        returncode = backend.tail_logs(handle, job_id=None, follow=follow)
+        with phase_context, provider_fence:
+            returncode = backend.tail_logs(handle, job_id=None, follow=follow)
         if returncode != 0:
             return (f'{colorama.Fore.RED}Failed to stream logs for {repnoun} '
                     f'{replica_id}.{colorama.Style.RESET_ALL}')
     elif not follow and tail > 0:
-        final = backend.tail_logs(handle,
-                                  job_id=None,
-                                  follow=follow,
-                                  tail=tail,
-                                  stream_logs=False,
-                                  require_outputs=True,
-                                  process_stream=True)
+        with phase_context, provider_fence:
+            final = backend.tail_logs(handle,
+                                      job_id=None,
+                                      follow=follow,
+                                      tail=tail,
+                                      stream_logs=False,
+                                      require_outputs=True,
+                                      process_stream=True)
         if isinstance(final, int) or (final[0] != 0 and final[0] != 101):
             if tail is not None:
                 for line in final_lines_to_print:
@@ -3765,6 +5481,22 @@ class ServeCodeGen:
         code = [
             f'msg = serve_utils.add_version_encoded({service_name!r})',
             'print(msg, end="", flush=True)'
+        ]
+        return cls._build(code)
+
+    @classmethod
+    def remove_uncommitted_staged_controller_config(
+            cls,
+            service_name: str,
+            version: int,
+            resource_scope: str | None,
+            snapshot_id: str | None = None) -> str:
+        code = [
+            ('removed = serve_utils.'
+             'remove_uncommitted_staged_controller_config('
+             f'{service_name!r}, {version!r}, {resource_scope!r}, '
+             f'{snapshot_id!r})'),
+            'print(str(int(removed)), end="", flush=True)',
         ]
         return cls._build(code)
 

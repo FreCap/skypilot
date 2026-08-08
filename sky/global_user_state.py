@@ -32,6 +32,7 @@ from sky import global_user_state_cluster_yaml
 from sky import global_user_state_notifications
 from sky import global_user_state_schema
 from sky import global_user_state_service_account_tokens
+from sky import global_user_state_skylet_tunnels
 from sky import global_user_state_storage
 from sky import global_user_state_system_config
 from sky import global_user_state_users
@@ -375,6 +376,10 @@ class ClusterRecordIdentityConflictError(RuntimeError):
     """A cluster name or record UUID is already committed incompatibly."""
 
 
+class ClusterRecordHandleChangedError(ClusterRecordIdentityConflictError):
+    """The handle changed while an exact-record action was being prepared."""
+
+
 class ClusterRecordRemovalOutcome(enum.Enum):
     """Successful outcomes of expected-identity cluster-row removal."""
 
@@ -382,19 +387,10 @@ class ClusterRecordRemovalOutcome(enum.Enum):
     ALREADY_ABSENT = 'already_absent'
 
 
-SkyletSSHTunnelMetadata = tuple[int, int] | tuple[int, int, str]
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class ClusterSkyletSSHTunnelSnapshotV1:
-    """One same-row cluster incarnation and exact tunnel metadata read."""
-
-    cluster_hash: str | None
-    metadata: object | None
-    serialized_metadata: bytes | None
-
-
-_MALFORMED_SKYLET_SSH_TUNNEL_METADATA = object()
+SkyletSSHTunnelMetadata = (
+    global_user_state_skylet_tunnels.SkyletSSHTunnelMetadata)
+ClusterSkyletSSHTunnelSnapshotV1 = (
+    global_user_state_skylet_tunnels.ClusterSkyletSSHTunnelSnapshotV1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1677,6 +1673,27 @@ def get_handle_from_cluster_name(
 
 @db_retries.retry
 @metrics_lib.time_me
+def get_cluster_handle_status_from_name(
+    cluster_name: str,
+    existing_cluster_hash: str | None = None
+) -> tuple[Optional['backends.ResourceHandle'], status_lib.ClusterStatus |
+           None]:
+    """Returns one cluster row's handle and status from a single query."""
+    engine = _db_manager.get_engine()
+    assert cluster_name is not None, 'cluster_name cannot be None'
+    with orm.Session(engine) as session:
+        query = session.query(cluster_table.c.handle, cluster_table.c.status)
+        query = query.filter_by(name=cluster_name)
+        if existing_cluster_hash is not None:
+            query = query.filter_by(cluster_hash=existing_cluster_hash)
+        row = query.first()
+    if row is None:
+        return None, None
+    return pickle.loads(row.handle), status_lib.ClusterStatus[row.status]
+
+
+@db_retries.retry
+@metrics_lib.time_me
 def get_handles_from_cluster_names(
         cluster_names: set[str]
 ) -> dict[str, Optional['backends.ResourceHandle']]:
@@ -1941,34 +1958,9 @@ def set_cluster_storage_mounts_metadata(
 @metrics_lib.time_me
 def get_cluster_skylet_ssh_tunnel_snapshot(
         cluster_name: str) -> ClusterSkyletSSHTunnelSnapshotV1 | None:
-    """Returns the cluster hash and exact tunnel blob from one row read."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(
-            cluster_table.c.cluster_hash,
-            cluster_table.c.skylet_ssh_tunnel_metadata).filter_by(
-                name=cluster_name).first()
-    if row is None:
-        return None
-    serialized_metadata = row.skylet_ssh_tunnel_metadata
-    if serialized_metadata is not None:
-        serialized_metadata = bytes(serialized_metadata)
-        try:
-            metadata = pickle.loads(serialized_metadata)
-        except Exception:  # pylint: disable=broad-except
-            # Keep the exact bytes available for an explicitly fenced repair,
-            # but never let automatic tunnel recovery reinterpret corruption
-            # as missing metadata.
-            metadata = _MALFORMED_SKYLET_SSH_TUNNEL_METADATA
-        if metadata is None:
-            metadata = _MALFORMED_SKYLET_SSH_TUNNEL_METADATA
-    else:
-        metadata = None
-    return ClusterSkyletSSHTunnelSnapshotV1(
-        cluster_hash=row.cluster_hash,
-        metadata=metadata,
-        serialized_metadata=serialized_metadata,
-    )
+    return (
+        global_user_state_skylet_tunnels.get_cluster_skylet_ssh_tunnel_snapshot(
+            _db_manager.get_engine, orm.Session, cluster_table, cluster_name))
 
 
 @metrics_lib.time_me
@@ -1987,37 +1979,15 @@ def compare_and_set_cluster_skylet_ssh_tunnel_metadata(
     observed: ClusterSkyletSSHTunnelSnapshotV1,
     replacement: SkyletSSHTunnelMetadata | None,
 ) -> 'skylet_transport.TunnelMutationResult':
-    """Fenced compare-and-set for one exact tunnel metadata observation."""
-    if not isinstance(observed, ClusterSkyletSSHTunnelSnapshotV1):
-        raise TypeError('observed must be a tunnel metadata snapshot.')
-
-    if observed.cluster_hash is None:
-        return skylet_transport.TunnelMutationResult.UNFENCED_CLUSTER_INCARNATION
-
-    # A null-to-null row recreation has no incarnation fence and has already
-    # returned above, before obtaining an engine or SQL session.
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        predicate = (cluster_table.c.skylet_ssh_tunnel_metadata.is_(None)
-                     if observed.serialized_metadata is None else
-                     cluster_table.c.skylet_ssh_tunnel_metadata
-                     == observed.serialized_metadata)
-        replacement_blob = (pickle.dumps(replacement)
-                            if replacement is not None else None)
-        result = session.execute(
-            sqlalchemy.update(cluster_table).where(
-                cluster_table.c.name == cluster_name,
-                cluster_table.c.cluster_hash == observed.cluster_hash,
-                predicate,
-            ).values(skylet_ssh_tunnel_metadata=replacement_blob))
-        session.commit()
-    count = result.rowcount
-    if count == 1:
-        return skylet_transport.TunnelMutationResult.UPDATED
-    if count == 0:
-        return skylet_transport.TunnelMutationResult.CONFLICT
-    raise RuntimeError('Tunnel metadata compare-and-set affected an invalid '
-                       f'number of rows: {count}.')
+    return (global_user_state_skylet_tunnels.
+            compare_and_set_cluster_skylet_ssh_tunnel_metadata(
+                _db_manager.get_engine,
+                orm.Session,
+                cluster_table,
+                cluster_name,
+                observed=observed,
+                replacement=replacement,
+            ))
 
 
 @metrics_lib.time_me
@@ -2423,6 +2393,38 @@ def get_cluster_status_fields(
 
 
 @metrics_lib.time_me
+def get_cluster_status_fields_by_prefix(
+    cluster_name_prefix: str,
+    *,
+    row_limit: int,
+) -> dict[str, tuple[str | None, int | None]]:
+    """Return a bounded, ordered plain-column cluster prefix inventory.
+
+    This applies the namespace predicate in the database, so callers proving
+    facts about one reserved prefix never load unrelated cluster rows.  The
+    extra selected row makes overflow fail closed without an unbounded query.
+    """
+    if (not isinstance(cluster_name_prefix, str) or not cluster_name_prefix or
+            type(row_limit) is not int or row_limit < 1):
+        raise ValueError('A nonempty cluster prefix and positive integer row '
+                         'limit are required.')
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.query(
+            cluster_table.c.name,
+            cluster_table.c.status,
+            cluster_table.c.status_updated_at,
+        ).filter(
+            cluster_table.c.name.startswith(
+                cluster_name_prefix, autoescape=True)).order_by(
+                    cluster_table.c.name).limit(row_limit + 1).all()
+    if len(rows) > row_limit:
+        raise ValueError('Cluster prefix inventory exceeds its explicit row '
+                         'limit.')
+    return {row.name: (row.status, row.status_updated_at) for row in rows}
+
+
+@metrics_lib.time_me
 def get_managed_cluster_status_fields(
     workload_type: str,) -> dict[str, tuple[str | None, int | None]]:
     """Returns plain status fields for one managed workload type.
@@ -2443,6 +2445,31 @@ def get_managed_cluster_status_fields(
             cluster_table.c.workload_type == workload_type,
         ).all()
     return {row.name: (row.status, row.status_updated_at) for row in rows}
+
+
+@metrics_lib.time_me
+def get_managed_job_cluster_cleanup_candidates() -> dict[str, str | None]:
+    """Returns managed-job cluster names and their durable workload ids.
+
+    Rows written before workload attribution was added have a NULL
+    ``workload_type`` and ``workload_id``. Include those legacy managed rows so
+    the managed-jobs reconciler can prove ownership from the generated cluster
+    name before attempting cleanup. Rows attributed to another workload type
+    are excluded here.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.query(
+            cluster_table.c.name,
+            cluster_table.c.workload_id,
+        ).filter(
+            cluster_table.c.is_managed == int(True),
+            sqlalchemy.or_(
+                cluster_table.c.workload_type == 'managed_job',
+                cluster_table.c.workload_type.is_(None),
+            ),
+        ).all()
+    return {row.name: row.workload_id for row in rows}
 
 
 @metrics_lib.time_me

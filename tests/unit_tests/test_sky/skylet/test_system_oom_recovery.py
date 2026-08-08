@@ -22,12 +22,7 @@ _IMAGE = 'repo/image@sha256:' + 'a' * 64
 
 
 @pytest.fixture()
-def v1_plan():
-    return system_oom_recovery.RecoveryLaunchPlan.direct_shell()
-
-
-@pytest.fixture()
-def v2_plan():
+def recovery_plan():
     spec = system_oom_recovery.OwnedContainerSpec(
         image=_IMAGE,
         create_options=('--gpus', 'all', '--shm-size=8g'),
@@ -37,11 +32,11 @@ def v2_plan():
 
 
 @pytest.fixture()
-def attempt_context(tmp_path, monkeypatch, v1_plan):
+def attempt_context(tmp_path, monkeypatch, recovery_plan):
     monkeypatch.setattr(system_oom_recovery, 'RECOVERY_ROOT',
                         str(tmp_path / 'recovery'))
     monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: 'boot-id')
-    return system_oom_recovery.new_attempt_context(7, 0, 0, v1_plan)
+    return system_oom_recovery.new_attempt_context(7, 0, 0, recovery_plan)
 
 
 @pytest.fixture()
@@ -70,9 +65,7 @@ def _bound(context, parent_pid=77):
 
 
 def _publish_markers(context, *, forced=False, owned_container_id=None):
-    if (context['profile_version']
-            == system_oom_recovery.PROFILE_VERSION_OWNED_CONTAINER and
-            owned_container_id is None):
+    if owned_container_id is None:
         owned_container_id = 'a' * 64
     identity = _docker_identity()
     supervisor = {'pid': 123, 'pid_create_time': 456.0}
@@ -110,8 +103,8 @@ def _publish_markers(context, *, forced=False, owned_container_id=None):
     return capability, cleanup
 
 
-def test_owned_spec_canonical_round_trip(v2_plan):
-    spec = v2_plan.owned_container_spec
+def test_owned_spec_canonical_round_trip(recovery_plan):
+    spec = recovery_plan.owned_container_spec
     assert spec is not None
     assert system_oom_recovery.OwnedContainerSpec.parse(spec.render()) == spec
     assert spec.render().startswith('docker run --gpus all --shm-size=8g ')
@@ -128,21 +121,22 @@ def test_owned_spec_rejects_unsafe_or_unknown_options(options):
                                                create_options=options)
 
 
-def test_launch_plan_round_trip_and_capability(v1_plan, v2_plan):
-    for plan in (v1_plan, v2_plan):
-        assert system_oom_recovery.RecoveryLaunchPlan.from_dict(
-            plan.to_dict(), allow_bound=False) == plan
-        assert plan.capability == (
-            system_oom_recovery.CAPABILITY_BY_PROFILE_VERSION[
-                plan.profile_version])
+def test_launch_plan_round_trip_and_capability(recovery_plan):
+    assert system_oom_recovery.RecoveryLaunchPlan.from_dict(
+        recovery_plan.to_dict(), allow_bound=False) == recovery_plan
+    assert recovery_plan.capability == system_oom_recovery.CAPABILITY_V2
 
 
-def test_launch_plan_and_context_reject_boolean_versions(v1_plan):
+def test_launch_plan_and_context_reject_boolean_versions(recovery_plan):
     with pytest.raises(ValueError, match='profile_version'):
         system_oom_recovery.RecoveryLaunchPlan(profile_version=True)
-    payload = v1_plan.to_dict()
+    payload = recovery_plan.to_dict()
     payload['profile_version'] = True
     with pytest.raises(ValueError, match='profile_version'):
+        system_oom_recovery.RecoveryLaunchPlan.from_dict(payload)
+    payload = recovery_plan.to_dict()
+    payload['profile_version'] = 1
+    with pytest.raises(ValueError, match='unsupported recovery profile'):
         system_oom_recovery.RecoveryLaunchPlan.from_dict(payload)
     with pytest.raises(ValueError, match='execution envelope schema'):
         system_oom_recovery.RecoveryExecutionEnvelope(
@@ -152,27 +146,28 @@ def test_launch_plan_and_context_reject_boolean_versions(v1_plan):
             postlude_script='exit $?')
 
 
-def test_context_rejects_empty_boot_identity(tmp_path, monkeypatch, v1_plan):
+def test_context_rejects_empty_boot_identity(tmp_path, monkeypatch,
+                                             recovery_plan):
     monkeypatch.setattr(system_oom_recovery, 'RECOVERY_ROOT',
                         str(tmp_path / 'recovery'))
     monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: '')
     with pytest.raises(system_oom_recovery.RecoveryError, match='boot ID'):
-        system_oom_recovery.new_attempt_context(7, 0, 0, v1_plan)
+        system_oom_recovery.new_attempt_context(7, 0, 0, recovery_plan)
 
 
 def test_replacement_context_requires_and_binds_original_identity(
-        attempt_context, v1_plan):
+        attempt_context, recovery_plan):
     with pytest.raises(ValueError, match='Docker identity'):
         system_oom_recovery.new_attempt_context(7,
                                                 0,
                                                 1,
-                                                v1_plan,
+                                                recovery_plan,
                                                 expected_boot_id='boot-id')
     replacement = system_oom_recovery.new_attempt_context(
         7,
         0,
         1,
-        v1_plan,
+        recovery_plan,
         expected_boot_id='boot-id',
         expected_docker_identity=_docker_identity())
     assert replacement['require_armed_start'] is True
@@ -181,17 +176,13 @@ def test_replacement_context_requires_and_binds_original_identity(
     ).to_dict()
 
 
-def test_private_plan_hides_environment_from_argv(attempt_context, v2_plan):
+def test_private_plan_hides_environment_from_argv(attempt_context,
+                                                  recovery_plan):
     secret = 'super-secret-value'
-    bound = v2_plan.bind_environment({'TOKEN': secret})
+    bound = recovery_plan.bind_environment({'TOKEN': secret})
     supervisor_context = _bound(attempt_context)
     command = system_oom_recovery.build_supervisor_command(
-        None, supervisor_context | {
-            'schema_version': 2,
-            'profile_version': 2,
-            'capability': system_oom_recovery.CAPABILITY_V2,
-            'require_armed_start': True,
-        }, bound)
+        supervisor_context, bound)
     assert secret not in ' '.join(command)
     plan_path = os.path.join(attempt_context['marker_dir'], 'plan.json')
     assert os.stat(plan_path).st_mode & 0o077 == 0
@@ -200,14 +191,8 @@ def test_private_plan_hides_environment_from_argv(attempt_context, v2_plan):
         launch_script = launch_file.read()
     assert launch_script.count('source ~/.bashrc') == 1
     assert secret in launch_script
-    context = supervisor_context | {
-        'schema_version': 2,
-        'profile_version': 2,
-        'capability': system_oom_recovery.CAPABILITY_V2,
-        'require_armed_start': True,
-    }
     consumed = system_oom_recovery.consume_private_recovery_plan(
-        plan_path, context)
+        plan_path, supervisor_context)
     assert consumed == bound
     assert not os.path.exists(plan_path)
 
@@ -233,6 +218,14 @@ def test_context_rejects_invalid_creation_time(attempt_context, created_at):
 
     with pytest.raises(system_oom_recovery.RecoveryError,
                        match='creation time'):
+        system_oom_recovery._validate_attempt_context(malformed_context)
+
+
+def test_context_requires_armed_start(attempt_context):
+    malformed_context = dict(attempt_context, require_armed_start=False)
+
+    with pytest.raises(system_oom_recovery.RecoveryError,
+                       match='must require an armed start'):
         system_oom_recovery._validate_attempt_context(malformed_context)
 
 
@@ -284,12 +277,12 @@ def test_cleanup_marker_rejects_nonfinite_or_boolean_timestamps(
     stable.assert_not_called()
 
 
-def test_v2_cleanup_marker_requires_same_full_container_id(
-        tmp_path, monkeypatch, v2_plan):
+def test_cleanup_marker_requires_same_full_container_id(tmp_path, monkeypatch,
+                                                        recovery_plan):
     monkeypatch.setattr(system_oom_recovery, 'RECOVERY_ROOT',
                         str(tmp_path / 'recovery'))
     monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: 'boot-id')
-    context = system_oom_recovery.new_attempt_context(7, 0, 0, v2_plan)
+    context = system_oom_recovery.new_attempt_context(7, 0, 0, recovery_plan)
     _, cleanup = _publish_markers(context, owned_container_id='a' * 64)
     cleanup['owned_container_id'] = 'b' * 64
     system_oom_recovery.atomic_write_marker(context['cleanup_path'], cleanup)
@@ -306,12 +299,12 @@ def test_v2_cleanup_marker_requires_same_full_container_id(
 
 
 def test_pruning_removes_only_old_terminal_attempts(tmp_path, monkeypatch,
-                                                    v1_plan):
+                                                    recovery_plan):
     monkeypatch.setattr(system_oom_recovery, 'RECOVERY_ROOT',
                         str(tmp_path / 'recovery'))
     monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: 'boot-id')
-    terminal = system_oom_recovery.new_attempt_context(7, 0, 0, v1_plan)
-    incomplete = system_oom_recovery.new_attempt_context(8, 0, 0, v1_plan)
+    terminal = system_oom_recovery.new_attempt_context(7, 0, 0, recovery_plan)
+    incomplete = system_oom_recovery.new_attempt_context(8, 0, 0, recovery_plan)
     _publish_markers(terminal)
     cleanup = json.loads(
         open(terminal['cleanup_path'], encoding='utf-8').read())
@@ -323,7 +316,7 @@ def test_pruning_removes_only_old_terminal_attempts(tmp_path, monkeypatch,
     assert os.path.isdir(incomplete['marker_dir'])
 
 
-def _patch_v1_supervisor(monkeypatch, *, docker_error=None):
+def _patch_supervisor_startup(monkeypatch, *, docker_error=None):
     monkeypatch.setattr(subprocess_supervisor, '_set_parent_death_signal',
                         lambda _expected_parent_pid: 77)
     monkeypatch.setattr(subprocess_supervisor, '_assert_parent_fence',
@@ -351,16 +344,15 @@ def _patch_v1_supervisor(monkeypatch, *, docker_error=None):
                         lambda *_args, **_kwargs: {'graceful': False})
 
 
-def test_fatal_parent_fence_never_reaches_popen(attempt_context, v1_plan,
+def test_fatal_parent_fence_never_reaches_popen(attempt_context, recovery_plan,
                                                 monkeypatch):
     monkeypatch.setattr(
         subprocess_supervisor, '_set_parent_death_signal',
         mock.Mock(side_effect=OSError('cannot install PDEATHSIG')))
     popen = mock.Mock()
     monkeypatch.setattr(subprocess_supervisor.subprocess, 'Popen', popen)
-    assert subprocess_supervisor.supervise('echo service',
-                                           _bound(attempt_context),
-                                           v1_plan) == 1
+    assert subprocess_supervisor.supervise(_bound(attempt_context),
+                                           recovery_plan) == 1
     popen.assert_not_called()
 
 
@@ -375,55 +367,15 @@ def test_parent_change_before_pdeathsig_never_calls_prctl(monkeypatch):
     prctl.assert_not_called()
 
 
-def test_v1_initial_nonfatal_capability_failure_runs_unarmed(
-        attempt_context, v1_plan, monkeypatch):
-    _patch_v1_supervisor(
-        monkeypatch,
-        docker_error=system_oom_recovery.RecoveryError('no local daemon'))
-    command = mock.Mock(pid=888, returncode=0)
-    command.poll.return_value = 0
-    popen = mock.Mock(return_value=command)
-    monkeypatch.setattr(subprocess_supervisor.subprocess, 'Popen', popen)
-    assert subprocess_supervisor.supervise('echo service',
-                                           _bound(attempt_context),
-                                           v1_plan) == 0
-    popen.assert_called_once_with('echo service',
-                                  shell=True,
-                                  start_new_session=True)
-
-
-def test_v1_replacement_never_starts_unarmed(attempt_context, v1_plan,
-                                             monkeypatch):
-    replacement = dict(attempt_context)
-    replacement['attempt_number'] = 1
-    replacement['require_armed_start'] = True
-    replacement['expected_docker_identity'] = _docker_identity().to_dict()
-    _patch_v1_supervisor(
+def test_capability_failure_never_starts_unarmed(attempt_context, recovery_plan,
+                                                 monkeypatch):
+    _patch_supervisor_startup(
         monkeypatch,
         docker_error=system_oom_recovery.RecoveryError('no local daemon'))
     popen = mock.Mock()
     monkeypatch.setattr(subprocess_supervisor.subprocess, 'Popen', popen)
-    assert subprocess_supervisor.supervise('echo service', _bound(replacement),
-                                           v1_plan) == 1
-    popen.assert_not_called()
-
-
-def test_v1_latched_final_fence_never_reaches_popen(attempt_context, v1_plan,
-                                                    monkeypatch):
-    _patch_v1_supervisor(monkeypatch)
-    fence = mock.Mock(side_effect=[
-        None,
-        system_oom_recovery.RecoveryError('termination latch set'),
-    ])
-    monkeypatch.setattr(subprocess_supervisor, '_assert_parent_fence', fence)
-    popen = mock.Mock()
-    monkeypatch.setattr(subprocess_supervisor.subprocess, 'Popen', popen)
-
-    assert subprocess_supervisor.supervise('echo service',
-                                           _bound(attempt_context),
-                                           v1_plan) == 1
-
-    assert fence.call_count == 2
+    assert subprocess_supervisor.supervise(_bound(attempt_context),
+                                           recovery_plan) == 1
     popen.assert_not_called()
 
 
@@ -458,7 +410,8 @@ def test_runtime_validator_rejects_signature_drift(monkeypatch):
     system_oom_recovery.validate_runtime_capability.cache_clear()
 
 
-def test_recovery_log_wrapper_keeps_secret_out_of_argv(attempt_context, v2_plan,
+def test_recovery_log_wrapper_keeps_secret_out_of_argv(attempt_context,
+                                                       recovery_plan,
                                                        monkeypatch, tmp_path):
     supervisor_argv = ['python', '-m', 'supervisor', '--plan-path', '/private']
     build = mock.Mock(return_value=supervisor_argv)
@@ -467,22 +420,21 @@ def test_recovery_log_wrapper_keeps_secret_out_of_argv(attempt_context, v2_plan,
     monkeypatch.setattr(log_lib, 'run_with_log', run)
     result = (log_lib.
               run_bash_command_with_log_and_return_pid_with_system_oom_recovery(
-                  None,
                   str(tmp_path / 'run.log'),
                   attempt_context,
-                  v2_plan,
+                  recovery_plan,
                   env_vars={'TOKEN': 'super-secret-value'},
                   stream_logs=True,
                   with_ray=True))
     assert result['return_code'] == 0
-    bound_plan = build.call_args.args[2]
+    bound_plan = build.call_args.args[1]
     assert dict(bound_plan.execution_envelope.environment)['TOKEN'] == (
         'super-secret-value')
     assert 'super-secret-value' not in ' '.join(supervisor_argv)
 
 
-def test_owned_postlude_returns_original_exit_code(monkeypatch, v2_plan):
-    envelope = v2_plan.execution_envelope
+def test_owned_postlude_returns_original_exit_code(monkeypatch, recovery_plan):
+    envelope = recovery_plan.execution_envelope
     assert envelope is not None
     run = mock.Mock(return_value=SimpleNamespace(returncode=17))
     monkeypatch.setattr(subprocess_supervisor.subprocess, 'run', run)
@@ -490,24 +442,26 @@ def test_owned_postlude_returns_original_exit_code(monkeypatch, v2_plan):
     assert '(exit 17)' in run.call_args.args[0][-1]
 
 
-def test_boltz_v1_v2_execution_envelope_differential(tmp_path, monkeypatch):
+def test_boltz_owned_execution_envelope_matches_ordinary_task(
+        tmp_path, monkeypatch):
     spec = system_oom_recovery.OwnedContainerSpec(
         image='example.invalid/model@sha256:' + 'a' * 64,
         create_options=('--gpus', 'all', '--publish', '8080:8080'),
         argv=('serve', '--port', '8080'),
         inherited_environment_names=('MODEL',))
     environment = {'MODEL': 'boltz'}
-    v2_plan = system_oom_recovery.RecoveryLaunchPlan.owned_container(
-        spec).bind_environment(environment)
-    envelope = v2_plan.execution_envelope
+    recovery_plan = system_oom_recovery.RecoveryLaunchPlan.owned_container(spec)
+    bound_plan = recovery_plan.bind_environment(environment)
+    envelope = bound_plan.execution_envelope
     assert envelope is not None
-    v1_task = task_codegen.TaskCodeGen.build_task_bash_script(
+    ordinary_task = task_codegen.TaskCodeGen.build_task_bash_script(
         spec.render(), env_prefix='unset RAY_RAYLET_PID')
-    v1_script = log_lib.make_task_bash_script(v1_task, env_vars=environment)
-    v2_prelude = envelope.render_private_file_prelude()
+    ordinary_script = log_lib.make_task_bash_script(ordinary_task,
+                                                    env_vars=environment)
+    owned_prelude = envelope.render_private_file_prelude()
 
-    # The exact Boltz closure sees the same setup, environment, working
-    # directory, Ray-variable removal, and byte-identical rclone postlude.
+    # The owned-container closure preserves the ordinary task setup,
+    # environment, working directory, Ray-variable removal, and postlude.
     for line in (
             'source ~/.bashrc',
             'set -a',
@@ -517,26 +471,24 @@ def test_boltz_v1_v2_execution_envelope_differential(tmp_path, monkeypatch):
             "export MODEL=boltz",
             'unset RAY_RAYLET_PID',
     ):
-        assert line in v1_script
-        assert line in v2_prelude
-    assert f'cd {constants.SKY_REMOTE_WORKDIR}' in v1_script
-    assert 'cd "$HOME"/sky_workdir' in v2_prelude
-    assert spec.render() in v1_script
+        assert line in ordinary_script
+        assert line in owned_prelude
+    assert f'cd {constants.SKY_REMOTE_WORKDIR}' in ordinary_script
+    assert 'cd "$HOME"/sky_workdir' in owned_prelude
+    assert spec.render() in ordinary_script
     assert envelope.postlude_script == (
         system_oom_recovery.build_rclone_flush_script())
-    assert v1_script.endswith(envelope.postlude_script + '\n')
+    assert ordinary_script.endswith(envelope.postlude_script + '\n')
 
-    # Both recovery profiles use the same log stream contract; only their
-    # private supervisor command differs.
+    # The final recovery path retains the ordinary log stream contract while
+    # passing its environment through the private launch file.
     monkeypatch.setattr(system_oom_recovery, 'RECOVERY_ROOT',
                         str(tmp_path / 'recovery'))
     monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: 'boot-id')
-    v1_plan = system_oom_recovery.RecoveryLaunchPlan.direct_shell()
-    v1_context = system_oom_recovery.new_attempt_context(7, 0, 0, v1_plan)
-    v2_context = system_oom_recovery.new_attempt_context(8, 0, 0, v2_plan)
-    monkeypatch.setattr(
-        system_oom_recovery, 'build_supervisor_command', lambda _command,
-        _context, plan: ['supervisor', str(plan.profile_version)])
+    context = system_oom_recovery.new_attempt_context(8, 0, 0, recovery_plan)
+    build = mock.Mock(side_effect=lambda _context, plan:
+                      ['supervisor', str(plan.profile_version)])
+    monkeypatch.setattr(system_oom_recovery, 'build_supervisor_command', build)
     run = mock.Mock(return_value=23)
     monkeypatch.setattr(log_lib, 'run_with_log', run)
     common_logging = {
@@ -546,39 +498,22 @@ def test_boltz_v1_v2_execution_envelope_differential(tmp_path, monkeypatch):
     }
     log_path = str(tmp_path / 'run.log')
 
-    v1_result = (
-        log_lib.
-        run_bash_command_with_log_and_return_pid_with_system_oom_recovery(
-            v1_task,
-            log_path,
-            v1_context,
-            v1_plan,
-            env_vars=environment,
-            **common_logging))
-    v2_result = (
-        log_lib.
-        run_bash_command_with_log_and_return_pid_with_system_oom_recovery(
-            None,
-            log_path,
-            v2_context,
-            system_oom_recovery.RecoveryLaunchPlan.owned_container(spec),
-            env_vars=environment,
-            **common_logging))
+    result = (log_lib.
+              run_bash_command_with_log_and_return_pid_with_system_oom_recovery(
+                  log_path,
+                  context,
+                  recovery_plan,
+                  env_vars=environment,
+                  **common_logging))
 
-    assert v1_result['return_code'] == v2_result['return_code'] == 23
-    assert [call.args[1] for call in run.call_args_list] == [log_path, log_path]
-    assert [call.kwargs for call in run.call_args_list] == [
-        {
-            **common_logging, 'shell': False
-        },
-        {
-            **common_logging, 'shell': False
-        },
-    ]
+    assert result['return_code'] == 23
+    assert run.call_args.args[1] == log_path
+    assert run.call_args.kwargs == {**common_logging, 'shell': False}
+    assert build.call_args.args[0]['expected_parent_pid'] == os.getpid()
+    assert build.call_args.args[1] == bound_plan
 
-    # TERM is the graceful signal in both profiles; SIGKILL can never produce
-    # a positive cleanup result. The v2 attached Docker CLI has the same
-    # inherited stdout/stderr stream as v1.
+    # TERM remains the graceful signal; SIGKILL cannot produce a positive
+    # cleanup result. Attached Docker inherits the supervisor log streams.
     docker_environment = {'PATH': '/usr/bin'}
     monkeypatch.setattr(system_oom_recovery, '_docker_environment',
                         lambda: docker_environment)
@@ -604,15 +539,11 @@ def test_boltz_v1_v2_execution_envelope_differential(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess_supervisor, '_descendants', lambda: [])
     identity = _docker_identity()
 
-    v1_cleanup = subprocess_supervisor._cleanup(command, identity, armed=True)
-    v2_cleanup = subprocess_supervisor._cleanup(command,
-                                                identity,
-                                                armed=True,
-                                                owned_container_id='a' * 64)
+    cleanup = subprocess_supervisor._cleanup(command, identity, 'a' * 64)
 
-    assert signals == [signal.SIGTERM, signal.SIGTERM]
-    assert v1_cleanup['graceful'] is v2_cleanup['graceful'] is True
-    assert v1_cleanup['forced'] is v2_cleanup['forced'] is False
+    assert signals == [signal.SIGTERM]
+    assert cleanup['graceful'] is True
+    assert cleanup['forced'] is False
 
 
 def test_owned_start_uses_supported_attached_docker_argv(monkeypatch):
@@ -631,12 +562,12 @@ def test_owned_start_uses_supported_attached_docker_argv(monkeypatch):
                                   env=environment)
 
 
-def test_v2_signal_at_final_gate_suppresses_start_and_removes_exact_id(
-        tmp_path, monkeypatch, v2_plan):
+def test_signal_at_final_gate_suppresses_start_and_removes_exact_id(
+        tmp_path, monkeypatch, recovery_plan):
     monkeypatch.setattr(system_oom_recovery, 'RECOVERY_ROOT',
                         str(tmp_path / 'recovery'))
     monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: 'boot-id')
-    context = system_oom_recovery.new_attempt_context(7, 0, 0, v2_plan)
+    context = system_oom_recovery.new_attempt_context(7, 0, 0, recovery_plan)
     context = _bound(context)
     container_id = 'a' * 64
     identity = _docker_identity()
@@ -673,7 +604,7 @@ def test_v2_signal_at_final_gate_suppresses_start_and_removes_exact_id(
     monkeypatch.setattr(subprocess_supervisor, '_write_capability',
                         write_capability)
 
-    assert subprocess_supervisor.supervise(None, context, v2_plan) == 1
+    assert subprocess_supervisor.supervise(context, recovery_plan) == 1
 
     start.assert_not_called()
     remove.assert_called_once_with(identity, container_id, mock.ANY, force=True)
@@ -683,12 +614,13 @@ def test_v2_signal_at_final_gate_suppresses_start_and_removes_exact_id(
     assert write_capability.call_args.kwargs['armed'] is False
 
 
-def test_v2_positive_capability_is_published_only_after_final_gate_and_start(
-        tmp_path, monkeypatch, v2_plan):
+def test_positive_capability_is_published_only_after_final_gate_and_start(
+        tmp_path, monkeypatch, recovery_plan):
     monkeypatch.setattr(system_oom_recovery, 'RECOVERY_ROOT',
                         str(tmp_path / 'recovery'))
     monkeypatch.setattr(system_oom_recovery, 'read_boot_id', lambda: 'boot-id')
-    context = _bound(system_oom_recovery.new_attempt_context(7, 0, 0, v2_plan))
+    context = _bound(
+        system_oom_recovery.new_attempt_context(7, 0, 0, recovery_plan))
     container_id = 'a' * 64
     identity = _docker_identity()
     events = []
@@ -739,7 +671,7 @@ def test_v2_positive_capability_is_published_only_after_final_gate_and_start(
     monkeypatch.setattr(subprocess_supervisor, '_write_capability',
                         _write_capability)
 
-    assert subprocess_supervisor.supervise(None, context, v2_plan) == 1
+    assert subprocess_supervisor.supervise(context, recovery_plan) == 1
 
     assert len(events) == 4
     assert timeline == ['fence'] * 4 + ['start', 'capability:True']
@@ -747,7 +679,6 @@ def test_v2_positive_capability_is_published_only_after_final_gate_and_start(
     start.assert_called_once_with(container_id)
     cleanup.assert_called_once_with(command,
                                     identity,
-                                    armed=True,
                                     owned_container_id=container_id)
     write_cleanup.assert_called_once()
 
@@ -787,7 +718,7 @@ def _ray_with_session(session_name):
 
 
 def _waiting_memory_session(attempt_context,
-                            v1_plan,
+                            recovery_plan,
                             submitter,
                             *,
                             clock=None,
@@ -799,14 +730,14 @@ def _waiting_memory_session(attempt_context,
     } if clock is not None else {})
     session = system_oom_recovery.RecoverySession(
         7,
-        v1_plan,
+        recovery_plan,
         attempt_context,
         'original-ref',
         submitter,
         expected_ray_session_identity=('ray-session-1'),
         **clock_kwargs)
     session.armed_info = job_lib.JobSystemRecoveryInfo(
-        capability=v1_plan.capability,
+        capability=recovery_plan.capability,
         phase=job_lib.JobSystemRecoveryPhase.ARMED,
         original_attempt_id=attempt_context['attempt_id'],
         replacement_attempt_id=None,
@@ -860,11 +791,12 @@ def test_ray_session_identity_is_exact_and_fail_closed():
 
 
 def test_missing_ray_session_disables_arm_with_bounded_log(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     log = mock.Mock()
     monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
 
-    session = system_oom_recovery.RecoverySession(7, v1_plan, attempt_context,
+    session = system_oom_recovery.RecoverySession(7, recovery_plan,
+                                                  attempt_context,
                                                   'original-ref', mock.Mock())
 
     assert session.arm_state == system_oom_recovery.RecoveryArmState.DISABLED
@@ -875,7 +807,7 @@ def test_missing_ray_session_disables_arm_with_bounded_log(
 
 
 def test_ray_session_change_rejects_replay_without_logging_identity(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     del attempt_context
     log = mock.Mock()
     monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
@@ -890,7 +822,7 @@ def test_ray_session_change_rejects_replay_without_logging_identity(
         mock.sentinel.placement_group,
         'boot-id',
         old_identity,
-        profile_version=v1_plan.profile_version)
+        profile_version=recovery_plan.profile_version)
 
     assert not healthy
     assert reason == 'Ray session identity changed'
@@ -903,7 +835,7 @@ def test_ray_session_change_rejects_replay_without_logging_identity(
 
 
 def test_unchanged_ray_session_and_placement_group_accept_replay(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     del attempt_context
     log = mock.Mock()
     monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
@@ -917,20 +849,21 @@ def test_unchanged_ray_session_and_placement_group_accept_replay(
         placement_group,
         'boot-id',
         'ray-session-1',
-        profile_version=v1_plan.profile_version) == (True, '')
+        profile_version=recovery_plan.profile_version) == (True, '')
     ray_util.placement_group_table.assert_called_once_with(placement_group)
     message = log.call_args.args[0]
     assert 'decision=accepted' in message
     assert 'ray_session=unchanged' in message
 
 
-def test_cgroup_arm_acceptance_emits_one_bounded_log(attempt_context, v1_plan,
+def test_cgroup_arm_acceptance_emits_one_bounded_log(attempt_context,
+                                                     recovery_plan,
                                                      monkeypatch):
     log = mock.Mock()
     monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
     session = system_oom_recovery.RecoverySession(
         7,
-        v1_plan,
+        recovery_plan,
         attempt_context,
         'original-ref',
         mock.Mock(),
@@ -956,10 +889,10 @@ def test_cgroup_arm_acceptance_emits_one_bounded_log(attempt_context, v1_plan,
 
 @pytest.mark.parametrize('wall_jump', [10000.0, -10000.0])
 def test_first_event_visibility_uses_monotonic_remainder_across_wall_jump(
-        attempt_context, v1_plan, monkeypatch, wall_jump):
+        attempt_context, recovery_plan, monkeypatch, wall_jump):
     clock = _FakeClock(attempt_context['created_at'] + 1)
     session = _waiting_memory_session(attempt_context,
-                                      v1_plan,
+                                      recovery_plan,
                                       mock.Mock(),
                                       clock=clock,
                                       visibility_confirmed=False)
@@ -975,10 +908,10 @@ def test_first_event_visibility_uses_monotonic_remainder_across_wall_jump(
 
 
 def test_first_event_visibility_starts_after_waiting_cleanup_is_persisted(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     clock = _FakeClock(attempt_context['created_at'] + 1)
     session = _waiting_memory_session(attempt_context,
-                                      v1_plan,
+                                      recovery_plan,
                                       mock.Mock(),
                                       clock=clock,
                                       visibility_confirmed=False)
@@ -999,10 +932,10 @@ def test_first_event_visibility_starts_after_waiting_cleanup_is_persisted(
 
 
 def test_first_event_visibility_never_extends_local_deadline(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     clock = _FakeClock(attempt_context['created_at'] + 1)
     session = _waiting_memory_session(attempt_context,
-                                      v1_plan,
+                                      recovery_plan,
                                       mock.Mock(),
                                       clock=clock,
                                       visibility_confirmed=False)
@@ -1019,11 +952,11 @@ def test_first_event_visibility_never_extends_local_deadline(
 
 
 def test_first_event_visibility_rechecks_cancellation_after_wait(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     clock = _FakeClock(attempt_context['created_at'] + 1)
     submitter = mock.Mock()
     session = _waiting_memory_session(attempt_context,
-                                      v1_plan,
+                                      recovery_plan,
                                       submitter,
                                       clock=clock,
                                       visibility_confirmed=False)
@@ -1040,10 +973,10 @@ def test_first_event_visibility_rechecks_cancellation_after_wait(
 
 
 def test_replay_quiescence_immediate_memory_waits_from_cleanup_proof(
-        attempt_context, v1_plan):
+        attempt_context, recovery_plan):
     clock = _FakeClock(attempt_context['created_at'] + 1)
     session = _waiting_memory_session(attempt_context,
-                                      v1_plan,
+                                      recovery_plan,
                                       mock.Mock(),
                                       clock=clock)
     session.cleanup_proof_completed_monotonic = None
@@ -1060,7 +993,7 @@ def test_replay_quiescence_immediate_memory_waits_from_cleanup_proof(
 
 
 def test_replay_quiescence_overlaps_memory_and_never_submits_early(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     clock = _FakeClock(attempt_context['created_at'] + 1)
     submitted_at = []
 
@@ -1069,7 +1002,7 @@ def test_replay_quiescence_overlaps_memory_and_never_submits_early(
         return 'replacement-ref'
 
     session = _waiting_memory_session(attempt_context,
-                                      v1_plan,
+                                      recovery_plan,
                                       _submit,
                                       clock=clock)
     session.cleanup_proof_completed_monotonic = None
@@ -1092,11 +1025,11 @@ def test_replay_quiescence_overlaps_memory_and_never_submits_early(
 
 
 def test_replay_quiescence_never_extends_recovery_deadline(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     clock = _FakeClock(attempt_context['created_at'] + 1)
     submitter = mock.Mock()
     session = _waiting_memory_session(attempt_context,
-                                      v1_plan,
+                                      recovery_plan,
                                       submitter,
                                       clock=clock)
     session.cleanup_proof_completed_monotonic = None
@@ -1114,12 +1047,12 @@ def test_replay_quiescence_never_extends_recovery_deadline(
     submitter.assert_not_called()
 
 
-def test_try_arm_requires_exact_existing_record(attempt_context, v1_plan,
+def test_try_arm_requires_exact_existing_record(attempt_context, recovery_plan,
                                                 monkeypatch):
     wall_clock = mock.Mock(return_value=attempt_context['created_at'] + 1)
     session = system_oom_recovery.RecoverySession(
         7,
-        v1_plan,
+        recovery_plan,
         attempt_context,
         'original-ref',
         mock.Mock(),
@@ -1148,17 +1081,13 @@ def test_try_arm_requires_exact_existing_record(attempt_context, v1_plan,
 
 
 def test_arm_gate_is_bounded_one_way_and_rejects_late_marker(
-        attempt_context, v2_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     clock = _FakeClock(attempt_context['created_at'], monotonic_time=20.0)
     arm = mock.Mock(return_value=True)
     session = system_oom_recovery.RecoverySession(
         7,
-        v2_plan,
-        attempt_context | {
-            'profile_version': v2_plan.profile_version,
-            'capability': v2_plan.capability,
-            'schema_version': 2,
-        },
+        recovery_plan,
+        attempt_context,
         'original-ref',
         mock.Mock(),
         arm_started_monotonic=20.0,
@@ -1188,14 +1117,14 @@ def test_arm_gate_is_bounded_one_way_and_rejects_late_marker(
 
 
 def test_arm_gate_checks_cgroup_cap_and_deadline_inside_job_lock(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     clock = _FakeClock(attempt_context['created_at'], monotonic_time=10.0)
     arm = mock.Mock(return_value=True)
     log = mock.Mock()
     monkeypatch.setattr(system_oom_recovery.logger, 'info', log)
     session = system_oom_recovery.RecoverySession(
         7,
-        v1_plan,
+        recovery_plan,
         attempt_context,
         'original-ref',
         mock.Mock(),
@@ -1205,7 +1134,7 @@ def test_arm_gate_checks_cgroup_cap_and_deadline_inside_job_lock(
         monotonic_clock=clock.monotonic_time)
     second = system_oom_recovery.RecoverySession(
         7,
-        v1_plan,
+        recovery_plan,
         attempt_context,
         'original-ref',
         mock.Mock(),
@@ -1238,9 +1167,9 @@ def test_arm_gate_checks_cgroup_cap_and_deadline_inside_job_lock(
 
 
 def test_recovery_session_adopts_exactly_one_replacement(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     submitter = mock.Mock(return_value='replacement-ref')
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     transitions, _ = _patch_session_submission(monkeypatch, [True, True])
     cancel = mock.Mock()
 
@@ -1263,9 +1192,9 @@ def test_recovery_session_adopts_exactly_one_replacement(
 
 
 def test_recovery_session_failed_adoption_cancels_and_retains_identity(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     submitter = mock.Mock(return_value='unadopted-ref')
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     transitions, exhausted = _patch_session_submission(monkeypatch,
                                                        [True, False])
     cancel = mock.Mock()
@@ -1284,9 +1213,9 @@ def test_recovery_session_failed_adoption_cancels_and_retains_identity(
 
 
 def test_recovery_session_resubmitting_failure_never_calls_remote(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     submitter = mock.Mock()
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     _, exhausted = _patch_session_submission(monkeypatch, [False])
 
     assert session.submit_one_retry(
@@ -1297,9 +1226,9 @@ def test_recovery_session_resubmitting_failure_never_calls_remote(
 
 
 def test_recovery_session_locked_transition_exception_cancels_after_unlock(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     submitter = mock.Mock(return_value='unadopted-ref')
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     _patch_session_submission(monkeypatch, [True, RuntimeError('CAS failed')])
     lock_state = {'held': False}
 
@@ -1327,10 +1256,10 @@ def test_recovery_session_locked_transition_exception_cancels_after_unlock(
 
 @pytest.mark.parametrize('submitted', [None, RuntimeError('submit failed')])
 def test_recovery_session_submit_failure_or_missing_ref_never_adopts(
-        attempt_context, v1_plan, monkeypatch, submitted):
+        attempt_context, recovery_plan, monkeypatch, submitted):
     submitter = (mock.Mock(side_effect=submitted) if isinstance(
         submitted, Exception) else mock.Mock(return_value=submitted))
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     transitions, exhausted = _patch_session_submission(monkeypatch, [True])
     cancel = mock.Mock()
 
@@ -1343,9 +1272,9 @@ def test_recovery_session_submit_failure_or_missing_ref_never_adopts(
 
 
 def test_recovery_session_long_submit_error_is_bounded_and_exhausted(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     submitter = mock.Mock(side_effect=RuntimeError('x' * 20000))
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     _, exhausted = _patch_session_submission(monkeypatch, [True])
 
     assert not session.submit_one_retry(SimpleNamespace(cancel=mock.Mock()))
@@ -1358,9 +1287,9 @@ def test_recovery_session_long_submit_error_is_bounded_and_exhausted(
 
 
 def test_recovery_session_post_submit_deadline_cancels_ref(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     submitter = mock.Mock(return_value='late-ref')
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     _patch_session_submission(monkeypatch, [True])
     session.deadline_monotonic = 100.0
     session.cleanup_proof_completed_monotonic = 0.0
@@ -1375,9 +1304,9 @@ def test_recovery_session_post_submit_deadline_cancels_ref(
 
 
 def test_recovery_session_lock_exit_failure_preserves_durable_adoption(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     submitter = mock.Mock(return_value='adopted-ref')
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     _patch_session_submission(monkeypatch, [True, True])
 
     @contextlib.contextmanager
@@ -1397,9 +1326,9 @@ def test_recovery_session_lock_exit_failure_preserves_durable_adoption(
 
 
 def test_recovery_session_lock_entry_failure_before_ref_returns_false(
-        attempt_context, v1_plan, monkeypatch):
+        attempt_context, recovery_plan, monkeypatch):
     submitter = mock.Mock()
-    session = _waiting_memory_session(attempt_context, v1_plan, submitter)
+    session = _waiting_memory_session(attempt_context, recovery_plan, submitter)
     _patch_session_submission(monkeypatch, [])
 
     @contextlib.contextmanager
@@ -1414,8 +1343,8 @@ def test_recovery_session_lock_entry_failure_before_ref_returns_false(
     submitter.assert_not_called()
 
 
-def test_v2_end_to_end_first_and_second_oom_replays_exactly_once(
-        tmp_path, monkeypatch, v2_plan, job_database):
+def test_end_to_end_first_and_second_oom_replays_exactly_once(
+        tmp_path, monkeypatch, recovery_plan, job_database):
     del job_database
     clock = _FakeClock(1000.0)
     arm_started_monotonic = clock.monotonic
@@ -1431,7 +1360,7 @@ def test_v2_end_to_end_first_and_second_oom_replays_exactly_once(
     job_id, _ = job_lib.add_job('service', 'user', 'run-ts', 'CPU:1')
     job_lib.set_job_started(job_id)
     initial_context = system_oom_recovery.new_attempt_context(
-        job_id, 0, 0, v2_plan)
+        job_id, 0, 0, recovery_plan)
     _, cleanup_marker = _publish_markers(initial_context)
     os.unlink(initial_context['cleanup_path'])
     clock.advance(1)
@@ -1502,7 +1431,7 @@ def test_v2_end_to_end_first_and_second_oom_replays_exactly_once(
         submitter,
         initial_context,
         job_id,
-        v2_plan,
+        recovery_plan,
         arm_started_monotonic=arm_started_monotonic,
         expected_ray_session_identity='ray-session-1')
 
@@ -1513,8 +1442,9 @@ def test_v2_end_to_end_first_and_second_oom_replays_exactly_once(
     replacement_context = submitter.call_args.args[1]
     assert replacement_context['job_id'] == job_id
     assert replacement_context['attempt_number'] == 1
-    assert replacement_context['profile_version'] == v2_plan.profile_version
-    assert replacement_context['capability'] == v2_plan.capability
+    assert replacement_context[
+        'profile_version'] == recovery_plan.profile_version
+    assert replacement_context['capability'] == recovery_plan.capability
     assert replacement_context['node_boot_id'] == 'boot-id'
     assert replacement_context['expected_docker_identity'] == (
         _docker_identity().to_dict())
@@ -1561,7 +1491,7 @@ def test_v2_end_to_end_first_and_second_oom_replays_exactly_once(
 
 
 def test_outer_finally_removes_placement_group_on_session_construction_failure(
-        attempt_context, v1_plan):
+        attempt_context, recovery_plan):
     malformed_context = dict(attempt_context, schema_version=True)
     remove = mock.Mock()
     ray_util = SimpleNamespace(remove_placement_group=remove)
@@ -1574,7 +1504,7 @@ def test_outer_finally_removes_placement_group_on_session_construction_failure(
                                                       placement_group,
                                                       mock.Mock(),
                                                       malformed_context, 7,
-                                                      v1_plan)
+                                                      recovery_plan)
 
     remove.assert_called_once_with(placement_group)
 
@@ -1585,15 +1515,19 @@ def test_supervisor_cleanup_never_marks_forced_positive(monkeypatch):
                         lambda _signal, _pid: True)
     monkeypatch.setattr(subprocess_supervisor, '_wait_for_descendants_empty',
                         mock.Mock(side_effect=[False, True]))
-    monkeypatch.setattr(subprocess_supervisor,
-                        '_force_remove_attempt_containers',
-                        lambda _identity: None)
+    remove = mock.Mock(return_value=True)
+    monkeypatch.setattr(subprocess_supervisor, '_remove_owned_container',
+                        remove)
     monkeypatch.setattr(system_oom_recovery, 'docker_identity_matches',
                         lambda _identity: True)
     monkeypatch.setattr(system_oom_recovery, 'docker_container_inventory',
                         lambda: ())
     monkeypatch.setattr(subprocess_supervisor, '_descendants', lambda: [])
-    facts = subprocess_supervisor._cleanup(None, identity, armed=True)
+    facts = subprocess_supervisor._cleanup(None, identity, 'a' * 64)
+    assert remove.call_args_list == [
+        mock.call(identity, 'a' * 64, mock.ANY),
+        mock.call(identity, 'a' * 64, mock.ANY, force=True),
+    ]
     assert facts['forced'] is True
     assert facts['graceful'] is False
     assert facts['timed_out'] is True

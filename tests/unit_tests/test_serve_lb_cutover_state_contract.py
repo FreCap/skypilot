@@ -26,7 +26,7 @@ _EXPECTED_AST_SHA256 = {
     'get_lb_demand_handoff': 'fa130862f4995b2413b977cceb092ba5b3fa3246f570632864162d70ed2f43da',
     'mark_lb_demand_handoff_complete': 'cb984fc2e5c2c3aad8f40707b394877f044b0691ae1650859342db0f660de3c5',
     'clear_lb_demand_handoff': 'c41c6323afe6063aa26f0e165b5acfb098a36df7be90c1e30045da8b58a6cfe8',
-    'lb_cutover_kubernetes_guard': '5c2dde740cfc339006716376a6f1e539bc7da9168b801592459c830f01d85045',
+    'lb_cutover_kubernetes_guard': '218d9795dcb695fe15f034e2f9356e4c5c3a346b8ab5515700fa39335968b490',
     'abort_lb_cutover_preparation': 'f91897f46012883a184514adc61ce542e02116eb4f5ed507d6844e1278ea7599',
 }
 

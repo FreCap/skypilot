@@ -40,6 +40,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
 from sky.adaptors import common as adaptors_common
+from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_file_sync
 from sky.backends import cloud_vm_resource_handle_serialization
@@ -69,6 +70,8 @@ from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
+from sky.serve import reserved_capacity
+from sky.serve import serve_state
 from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.serve import system_oom_recovery_observability
 from sky.server import common as server_common
@@ -797,6 +800,102 @@ class RetryingVmProvisioner:
         if lease is not None:
             lease.take()
 
+    def _validate_reserved_fill_candidate(
+            self, resources: resources_lib.Resources) -> None:
+        """Terminally reject any retry candidate outside a durable fill pin."""
+        try:
+            fence = reserved_capacity.parse_protocol_v2_launch_fence(
+                self._extra_launch_context)
+            if fence is not None:
+                reserved_capacity.validate_protocol_v2_launch_resources(
+                    fence, resources)
+        except ValueError as error:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill retry candidate changed its fenced '
+                'Kubernetes context or accelerator shape.') from error
+
+    def _validate_service_replica_launch_fence(self) -> None:
+        """Fail closed if this Serve request lost durable launch authority."""
+        if self._workload_type not in ('service', 'pool'):
+            return
+        launch_context = self._extra_launch_context
+        if not any(key in launch_context
+                   for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
+            # Preserve compatibility for pre-fence persisted requests.  Once a
+            # service activates the config protocol, every new request carries
+            # the fence and legacy requests are rejected at execution entry.
+            return
+        try:
+            authorized = serve_state.service_replica_launch_fence_holds(
+                launch_context)
+        except Exception as error:  # pylint: disable=broad-except
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Unable to prove durable SkyServe replica launch authority.') \
+                from error
+        if not authorized:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Refusing a SkyServe replica launch after its durable '
+                'service generation changed.')
+
+    @contextlib.contextmanager
+    def _service_replica_launch_provider_guard(self) -> typing.Iterator[None]:
+        """Keep one durable Serve fence valid across an opaque cloud call.
+
+        Built-in provisioners and legacy ``ray up`` can perform their own
+        waits and provider-mutating retries.  A check immediately before the
+        call therefore leaves a check/use race.  Shared authorization guards
+        let parallel replicas proceed while making every fence-invalidating
+        database writer wait until the whole provider operation returns.
+        """
+        if self._workload_type not in ('service', 'pool'):
+            yield
+            return
+        launch_context = self._extra_launch_context
+        if not any(key in launch_context
+                   for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
+            yield
+            return
+        service_name = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        if not isinstance(service_name, str) or not service_name:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'SkyServe replica launch is missing its durable service name.')
+
+        acquired = False
+        provider_completed = False
+        try:
+            with serve_state.service_replica_launch_authority_guard(
+                    service_name) as guard:
+                acquired = True
+                # Lock ordering is guard -> authorization read.  Every writer
+                # takes the exclusive guard before opening its SQL transaction,
+                # so this snapshot cannot become stale during the cloud call.
+                if not serve_state.service_replica_launch_authority_guard_is_valid(
+                        guard):
+                    raise exceptions.ServeReplicaLaunchFenceError(
+                        'SkyServe replica launch authority became indeterminate '
+                        'before the provider operation started.')
+                self._validate_service_replica_launch_fence()
+                yield
+                provider_completed = True
+                if not serve_state.service_replica_launch_authority_guard_is_valid(
+                        guard):
+                    raise exceptions.ServeReplicaLaunchFenceError(
+                        'SkyServe replica launch authority became indeterminate '
+                        'while the provider operation was in progress.')
+                self._validate_service_replica_launch_fence()
+        except exceptions.ServeReplicaLaunchFenceError:
+            raise
+        except Exception as error:
+            if acquired and not provider_completed:
+                # Preserve the provider's own failure classification. Its
+                # normal failover/reconciliation path may be required after a
+                # partial provider-side mutation.
+                raise
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Unable to hold durable SkyServe replica launch authority '
+                'across the provider operation.') from error
+
     def _record_fresh_provision_evidence(
         self,
         provision_record: provision_common.ProvisionRecord,
@@ -1216,6 +1315,9 @@ class RetryingVmProvisioner:
 
             for failover_overrides in to_provision.cloud.yield_cloud_specific_failover_overrides(
                     region=to_provision.region):
+                # Do not create even a local INIT record for a request that
+                # lost authority while placement/config generation ran.
+                self._validate_service_replica_launch_fence()
                 try:
                     config_dict = backend_utils.write_cluster_config(
                         to_provision,
@@ -1318,6 +1420,7 @@ class RetryingVmProvisioner:
                 workload_id, workload_task_id = _get_workload_attribution(
                     task, cluster_name, self._workload_type,
                     self._extra_launch_context)
+                self._validate_service_replica_launch_fence()
                 try:
                     self._active_cluster_hash = (
                         global_user_state.add_or_update_cluster(
@@ -1409,11 +1512,17 @@ class RetryingVmProvisioner:
                             assert self._active_cluster_hash is not None
                             bulk_provision_kwargs['cluster_incarnation'] = (
                                 self._active_cluster_hash)
-                        provision_record = bulk_provision_fn(
-                            to_provision.cloud, region, zones,
-                            resources_utils.ClusterName(
-                                cluster_name, handle.cluster_name_on_cloud),
-                            **bulk_provision_kwargs)
+                        # Recheck at the terminal provider boundary as well as
+                        # at each outer retry iteration. This protects against
+                        # future in-attempt planning changes being inserted
+                        # between those layers.
+                        self._validate_reserved_fill_candidate(to_provision)
+                        with self._service_replica_launch_provider_guard():
+                            provision_record = bulk_provision_fn(
+                                to_provision.cloud, region, zones,
+                                resources_utils.ClusterName(
+                                    cluster_name, handle.cluster_name_on_cloud),
+                                **bulk_provision_kwargs)
                         # NOTE: We will handle the logic of '_ensure_cluster_ray_started'
                         # in 'provision_utils.post_provision_runtime_setup()' in the
                         # caller.
@@ -1483,6 +1592,11 @@ class RetryingVmProvisioner:
                             num_nodes=num_nodes,
                             outcome='succeeded')
                         return config_dict
+                    except reserved_capacity.ReservedFillLaunchFenceError:
+                        # A durable launch fence is terminal. Never reinterpret
+                        # it as provider capacity loss or clean up/fail over
+                        # through a target that may have changed.
+                        raise
                     except provision_common.StopFailoverError:
                         with ux_utils.print_exception_no_traceback():
                             raise
@@ -1493,6 +1607,17 @@ class RetryingVmProvisioner:
                     except exceptions.ExecutionPausedError:
                         # Pausing to wait on an external condition: keep the
                         # resources for resume, do not tear down or fail over.
+                        raise
+                    except (kubernetes_adaptor.
+                            KubernetesPhysicalClusterIdentityError):
+                        # Never fail over, retry, or clean up through a context
+                        # alias whose physical target no longer matches the
+                        # durable reserved-fill request.
+                        raise
+                    except exceptions.RequestCancelled:
+                        # A generation/owner fence is terminal.  In particular,
+                        # do not classify it as capacity, clean up/fail over,
+                        # or retry a provider call under another placement.
                         raise
                     except config_lib.KubernetesError as e:
                         provision_failures.append(e)
@@ -1617,12 +1742,13 @@ class RetryingVmProvisioner:
                     'zone_str': zone_str,
                 }
 
-                status, stdout, stderr, head_internal_ip, head_external_ip = (
-                    self._gang_schedule_ray_up(to_provision.cloud,
-                                               cluster_config_file, handle,
-                                               log_abs_path, stream_logs,
-                                               logging_info,
-                                               to_provision.use_spot))
+                with self._service_replica_launch_provider_guard():
+                    status, stdout, stderr, head_internal_ip, head_external_ip = (
+                        self._gang_schedule_ray_up(to_provision.cloud,
+                                                   cluster_config_file, handle,
+                                                   log_abs_path, stream_logs,
+                                                   logging_info,
+                                                   to_provision.use_spot))
 
                 if status == GangSchedulingStatus.CLUSTER_READY:
                     # We must query the IPs from the cloud provider, when the
@@ -1777,6 +1903,10 @@ class RetryingVmProvisioner:
             # (which may be ok with the semantics of 'sky launch' twice).
             # Tracked in https://github.com/ray-project/ray/issues/20402.
             # Ref: https://github.com/ray-project/ray/blob/releases/2.4.0/python/ray/autoscaler/sdk/sdk.py#L16-L49  # pylint: disable=line-too-long
+            # ``ray up`` has its own retry loop.  Revalidate inside this
+            # function so every provider-mutating retry has a fresh DB fence,
+            # including the final spot upscaling reset call.
+            self._validate_service_replica_launch_fence()
             script_path = write_ray_up_script_with_patched_launch_hash_fn(
                 cluster_config_file, ray_up_kwargs={'no_restart': True})
 
@@ -2052,6 +2182,12 @@ class RetryingVmProvisioner:
         # Retrying launchable resources.
         while True:
             try:
+                # Optimizer failover may replace task.best_resources after a
+                # failed attempt. A protocol-v2 fill request is authorized for
+                # exactly one context and accelerator shape, never a general
+                # cross-cloud/cross-pool retry.
+                self._validate_reserved_fill_candidate(to_provision)
+                self._validate_service_replica_launch_fence()
                 # Recheck cluster name as the 'except:' block below may
                 # change the cloud assignment.
                 common_utils.check_cluster_name_is_valid(cluster_name)
@@ -4913,12 +5049,48 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 if not storage.persistent:
                     storage.delete()
 
+    @staticmethod
+    def _validate_identity_fenced_teardown_handle(
+        handle: CloudVmRayResourceHandle,
+        expected_cluster_record_uuid: str | None,
+        expected_cluster_hash: str | None,
+    ) -> CloudVmRayResourceHandle:
+        """Reload and prove an exact cluster generation without provider IO."""
+        if (expected_cluster_record_uuid is not None and
+                expected_cluster_hash is not None):
+            raise ValueError('Expected cluster-record UUID and legacy cluster '
+                             'hash fences are mutually exclusive.')
+        if expected_cluster_record_uuid is not None:
+            snapshot = global_user_state.get_cluster_record_identity_snapshot(
+                handle.cluster_name, expected_cluster_record_uuid)
+            if snapshot is None:
+                raise global_user_state.ClusterRecordIdentityConflictError(
+                    f'Cluster {handle.cluster_name!r} disappeared before '
+                    'action-fenced provider teardown.')
+            if snapshot.serialized_handle != pickle.dumps(handle):
+                raise global_user_state.ClusterRecordHandleChangedError(
+                    f'Cluster {handle.cluster_name!r} handle changed before '
+                    'action-fenced provider teardown.')
+            return typing.cast(CloudVmRayResourceHandle, snapshot.handle)
+        if expected_cluster_hash is not None:
+            generation_handle = global_user_state.get_handle_from_cluster_name(
+                handle.cluster_name,
+                existing_cluster_hash=expected_cluster_hash)
+            if generation_handle is None:
+                raise global_user_state.ClusterRecordIdentityConflictError(
+                    f'Cluster {handle.cluster_name!r} no longer has expected '
+                    f'generation {expected_cluster_hash!r}.')
+            return typing.cast(CloudVmRayResourceHandle, generation_handle)
+        return handle
+
     def _teardown(self,
                   handle: CloudVmRayResourceHandle,
                   terminate: bool,
                   purge: bool = False,
                   *,
-                  expected_cluster_record_uuid: str | None = None):
+                  expected_cluster_record_uuid: str | None = None,
+                  expected_cluster_hash: str | None = None,
+                  continue_guard: typing.Callable[[], bool] | None = None):
         """Tear down or stop the cluster.
 
         Args:
@@ -4933,17 +5105,27 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 user identity.
             RuntimeError: If the cluster fails to be terminated/stopped.
         """
+        if (expected_cluster_record_uuid is not None and
+                expected_cluster_hash is not None):
+            raise ValueError('Expected cluster-record UUID and legacy cluster '
+                             'hash fences are mutually exclusive.')
+        identity_fenced = (expected_cluster_record_uuid is not None or
+                           expected_cluster_hash is not None)
+        operation_fenced = identity_fenced or continue_guard is not None
         cluster_name = handle.cluster_name
         # Check if the cluster is owned by the current user. Raise
         # exceptions.ClusterOwnerIdentityMismatchError
         yellow = colorama.Fore.YELLOW
         reset = colorama.Style.RESET_ALL
-        is_identity_mismatch_and_purge = False
-        try:
-            backend_utils.check_owner_identity(cluster_name)
-        except (exceptions.ClusterOwnerIdentityMismatchError,
-                exceptions.CloudUserIdentityError) as e:
-            if purge:
+
+        def _check_owner_identity() -> bool:
+            try:
+                backend_utils.check_owner_identity(cluster_name)
+                return False
+            except (exceptions.ClusterOwnerIdentityMismatchError,
+                    exceptions.CloudUserIdentityError) as e:
+                if not purge:
+                    raise
                 logger.error(e)
                 verbed = 'terminated' if terminate else 'stopped'
                 logger.warning(
@@ -4952,9 +5134,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     f'the cluster record from cluster table.{reset}\n{yellow}It'
                     ' is the user\'s responsibility to ensure that this '
                     f'cluster is actually {verbed} on the cloud.{reset}')
-                is_identity_mismatch_and_purge = True
-            else:
-                raise
+                return True
+
+        # A name-only operation preserves historical preemption behavior. An
+        # exact internal cleanup delays even this credential/provider read
+        # until it owns both locks and has re-proved its durable generation.
+        is_identity_mismatch_and_purge = (False if operation_fenced else
+                                          _check_owner_identity())
         lock_id = backend_utils.cluster_status_lock_id(cluster_name)
         lock = locks.get_lock(lock_id, timeout=1)
         resource_lock_id = backend_utils.cluster_resource_operation_lock_id(
@@ -4969,25 +5155,47 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # should be higher priority than the cluster requests, and we should
             # release the lock from other requests.
             exclude_request_to_kill = 'sky.down' if terminate else 'sky.stop'
-            try:
-                # TODO(zhwu): we should get rid of this when it is being called
-                # internally without involving an API server, e.g., when a
-                # controller is trying to terminate a cluster.
-                requests_lib.kill_cluster_requests(handle.cluster_name,
-                                                   exclude_request_to_kill)
-            except Exception as e:  # pylint: disable=broad-except
-                # We allow the failure to kill other launch requests, because
-                # it is not critical to the cluster teardown.
-                logger.warning(
-                    'Failed to kill other launch requests for the '
-                    f'cluster {handle.cluster_name}: '
-                    f'{common_utils.format_exception(e, use_bracket=True)}')
-            # In case other running cluster operations are still holding the
-            # lock.
-            lock.force_unlock()
+            if not operation_fenced:
+                try:
+                    # TODO(zhwu): we should get rid of this when it is being
+                    # called internally without involving an API server, e.g.,
+                    # when a controller is trying to terminate a cluster.
+                    requests_lib.kill_cluster_requests(handle.cluster_name,
+                                                       exclude_request_to_kill)
+                except Exception as e:  # pylint: disable=broad-except
+                    # We allow the failure to kill other launch requests,
+                    # because it is not critical to the cluster teardown.
+                    logger.warning(
+                        'Failed to kill other launch requests for the '
+                        f'cluster {handle.cluster_name}: '
+                        f'{common_utils.format_exception(e, use_bracket=True)}')
+                # Name-only teardown deliberately preempts an older cluster
+                # operation. An identity-fenced cleanup must never break a
+                # successor's lock before proving the expected generation.
+                lock.force_unlock()
             try:
                 with lock:
                     with resource_lock:
+                        if identity_fenced:
+                            handle = (
+                                self._validate_identity_fenced_teardown_handle(
+                                    handle, expected_cluster_record_uuid,
+                                    expected_cluster_hash))
+                        if continue_guard is not None:
+                            try:
+                                continue_allowed = continue_guard()
+                            except Exception as error:
+                                raise RuntimeError(
+                                    'Teardown continuation guard could not be '
+                                    'verified under the cluster locks.') from (
+                                        error)
+                            if not continue_allowed:
+                                raise RuntimeError(
+                                    'Teardown continuation guard rejected the '
+                                    'operation under the cluster locks.')
+                        if operation_fenced:
+                            is_identity_mismatch_and_purge = (
+                                _check_owner_identity())
                         teardown_kwargs: dict[str, Any] = {
                             # When --purge is set and we already see an ID
                             # mismatch error, we skip the refresh codepath. This
@@ -5001,9 +5209,14 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         if expected_cluster_record_uuid is not None:
                             teardown_kwargs['expected_cluster_record_uuid'] = (
                                 expected_cluster_record_uuid)
+                        if expected_cluster_hash is not None:
+                            teardown_kwargs['expected_cluster_hash'] = (
+                                expected_cluster_hash)
+                        if continue_guard is not None:
+                            teardown_kwargs['continue_guard'] = continue_guard
                         self.teardown_no_lock(handle, terminate, purge,
                                               **teardown_kwargs)
-                if terminate:
+                if terminate and not operation_fenced:
                     lock.force_unlock()
                 break
             except locks.LockTimeout as e:
@@ -5083,8 +5296,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     for job_id, proto_status in response.job_statuses.items()
                 }
                 recovery_infos: dict[int, job_lib.JobSystemRecoveryInfo] = {}
+                # Protobuf map absence (including an old status-only response)
+                # is not positive evidence that recovery detail is absent.
                 detail_statuses = {
-                    job_id: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+                    job_id: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
                     for job_id in statuses
                     if isinstance(job_id, int)
                 }
@@ -5726,7 +5941,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             post_teardown_cleanup: bool = True,
             refresh_cluster_status: bool = True,
             remove_from_db: bool = True,
-            expected_cluster_record_uuid: str | None = None) -> None:
+            expected_cluster_record_uuid: str | None = None,
+            expected_cluster_hash: str | None = None,
+            continue_guard: typing.Callable[[], bool] | None = None) -> None:
         """Teardown the cluster without acquiring the cluster status lock.
 
         NOTE: This method should not be called without holding the cluster
@@ -5738,6 +5955,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         Raises:
             RuntimeError: If the cluster fails to be terminated/stopped.
         """
+        # This method owns both cluster locks. Prove an internal cleanup's
+        # exact durable generation before the first name-scoped effect below
+        # (tunnel close, request cancellation, status refresh, or provider IO).
+        handle = self._validate_identity_fenced_teardown_handle(
+            handle, expected_cluster_record_uuid, expected_cluster_hash)
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError('Teardown continuation guard rejected the '
+                               'operation before cluster effects.')
+
         try:
             handle.close_skylet_ssh_tunnel()
         except Exception as e:  # pylint: disable=broad-except
@@ -5753,19 +5979,21 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # the cluster is terminated/stopped. Otherwise, it will be quite
         # confusing to see the cluster restarted immediately after it is
         # terminated/stopped, when there is a pending launch request.
-        try:
-            # TODO(zhwu): we should get rid of this when it is being called
-            # internally without involving an API server, e.g., when a
-            # controller is trying to terminate a cluster.
-            requests_lib.kill_cluster_requests(handle.cluster_name,
-                                               exclude_request_to_kill)
-        except Exception as e:  # pylint: disable=broad-except
-            # We allow the failure to kill other launch requests, because
-            # it is not critical to the cluster teardown.
-            logger.warning(
-                'Failed to kill other launch requests for the '
-                f'cluster {handle.cluster_name}: '
-                f'{common_utils.format_exception(e, use_bracket=True)}')
+        if (expected_cluster_record_uuid is None and
+                expected_cluster_hash is None):
+            try:
+                # TODO(zhwu): we should get rid of this when it is being called
+                # internally without involving an API server, e.g., when a
+                # controller is trying to terminate a cluster.
+                requests_lib.kill_cluster_requests(handle.cluster_name,
+                                                   exclude_request_to_kill)
+            except Exception as e:  # pylint: disable=broad-except
+                # We allow the failure to kill other launch requests, because
+                # it is not critical to the cluster teardown.
+                logger.warning(
+                    'Failed to kill other launch requests for the '
+                    f'cluster {handle.cluster_name}: '
+                    f'{common_utils.format_exception(e, use_bracket=True)}')
         if refresh_cluster_status:
             try:
                 prev_cluster_status, refreshed_handle = (
@@ -5801,7 +6029,22 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             prev_cluster_status = (
                 global_user_state.get_status_from_cluster_name(
                     handle.cluster_name))
+        # Status refresh may update the persisted handle. Re-prove and reload
+        # the same durable generation before interpreting absence or issuing
+        # provider teardown.
+        handle = self._validate_identity_fenced_teardown_handle(
+            handle, expected_cluster_record_uuid, expected_cluster_hash)
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError('Teardown continuation guard rejected the '
+                               'operation before provider effects.')
+
         if prev_cluster_status is None:
+            if (expected_cluster_record_uuid is not None or
+                    expected_cluster_hash is not None):
+                raise global_user_state.ClusterRecordIdentityConflictError(
+                    f'Cluster {handle.cluster_name!r} still has the expected '
+                    'durable generation but status refresh reported it '
+                    'absent during identity-fenced teardown.')
             # When the cluster is not in the cluster table, we guarantee that
             # all related resources / cache / config are cleaned up, i.e. it
             # is safe to skip and return True.
@@ -5810,23 +6053,6 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'Cluster {handle.cluster_name!r} is already terminated. '
                 'Skipped.')
             return
-
-        if expected_cluster_record_uuid is not None:
-            exact_snapshot = (
-                global_user_state.get_cluster_record_identity_snapshot(
-                    handle.cluster_name, expected_cluster_record_uuid))
-            if exact_snapshot is None:
-                logger.warning(
-                    f'Cluster {handle.cluster_name!r} was removed before '
-                    'action-fenced provider teardown. Skipped.')
-                return
-            expected_handle_bytes = pickle.dumps(handle)
-            if exact_snapshot.serialized_handle != expected_handle_bytes:
-                raise global_user_state.ClusterRecordIdentityConflictError(
-                    f'Cluster {handle.cluster_name!r} handle changed before '
-                    'action-fenced provider teardown.')
-            handle = typing.cast(CloudVmRayResourceHandle,
-                                 exact_snapshot.handle)
 
         if handle.cluster_yaml is None:
             logger.warning(f'Cluster {handle.cluster_name!r} has no '
@@ -5838,6 +6064,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     'expected_cluster_record_uuid': expected_cluster_record_uuid,
                     'expected_cluster_handle': handle,
                 })
+            elif expected_cluster_hash is not None:
+                removal_kwargs['existing_cluster_hash'] = expected_cluster_hash
             global_user_state.remove_cluster(handle.cluster_name,
                                              terminate=terminate,
                                              **removal_kwargs)
@@ -5903,6 +6131,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 if expected_cluster_record_uuid is not None:
                     cleanup_kwargs['expected_cluster_record_uuid'] = (
                         expected_cluster_record_uuid)
+                elif expected_cluster_hash is not None:
+                    cleanup_kwargs['expected_cluster_hash'] = (
+                        expected_cluster_hash)
                 self.post_teardown_cleanup(handle, terminate, purge,
                                            remove_from_db, **cleanup_kwargs)
             return
@@ -6001,17 +6232,20 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             if expected_cluster_record_uuid is not None:
                 final_cleanup_kwargs['expected_cluster_record_uuid'] = (
                     expected_cluster_record_uuid)
+            elif expected_cluster_hash is not None:
+                final_cleanup_kwargs['expected_cluster_hash'] = (
+                    expected_cluster_hash)
             self.post_teardown_cleanup(handle, terminate, purge,
                                        **final_cleanup_kwargs)
 
-    def post_teardown_cleanup(
-            self,
-            handle: CloudVmRayResourceHandle,
-            terminate: bool,
-            purge: bool = False,
-            remove_from_db: bool = True,
-            failover: bool = False,
-            expected_cluster_record_uuid: str | None = None) -> None:
+    def post_teardown_cleanup(self,
+                              handle: CloudVmRayResourceHandle,
+                              terminate: bool,
+                              purge: bool = False,
+                              remove_from_db: bool = True,
+                              failover: bool = False,
+                              expected_cluster_record_uuid: str | None = None,
+                              expected_cluster_hash: str | None = None) -> None:
         """Cleanup local configs/caches and delete TPUs after teardown.
 
         This method will handle the following cleanup steps:
@@ -6024,6 +6258,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         * Updating the local state of the cluster;
         * Removing the terminated cluster's scripts and ray yaml files.
         """
+        if (expected_cluster_record_uuid is not None and
+                expected_cluster_hash is not None):
+            raise ValueError('Expected cluster-record UUID and legacy cluster '
+                             'hash fences are mutually exclusive.')
         cluster_name_on_cloud = handle.cluster_name_on_cloud
         cloud = handle.launched_resources.cloud
 
@@ -6214,6 +6452,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     'expected_cluster_record_uuid': expected_cluster_record_uuid,
                     'expected_cluster_handle': handle,
                 })
+            elif expected_cluster_hash is not None:
+                removal_kwargs['existing_cluster_hash'] = expected_cluster_hash
             global_user_state.remove_cluster(handle.cluster_name,
                                              terminate=terminate,
                                              **removal_kwargs)

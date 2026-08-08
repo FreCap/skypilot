@@ -1,0 +1,14 @@
+serve:
+  externalLoadBalancer:
+    enabled: true
+    priorityClassName: skypilot-serve-lb
+    auth:
+      lbSync:
+        existingSecret: serve-lb-sync
+        key: tokens
+      controllerAdmin:
+        existingSecret: serve-controller-admin
+        key: tokens
+      lbDataPlane:
+        existingSecret: serve-lb-data-plane
+        key: tokens

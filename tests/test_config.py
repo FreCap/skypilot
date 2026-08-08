@@ -1,9 +1,11 @@
 """Test skypilot_config"""
 import copy
+import json
 import os
 import pathlib
 import shutil
 import textwrap
+import threading
 from unittest import mock
 
 import pytest
@@ -369,6 +371,152 @@ def test_config_with_env(monkeypatch, tmp_path) -> None:
                                       None) == PROXY_COMMAND
     assert skypilot_config.get_nested(('gcp', 'vpc_name'), None) == VPC_NAME
     assert skypilot_config.get_nested(('gcp', 'use_internal_ips'), None)
+
+
+def test_internal_config_reload_publishes_one_complete_generation(
+        monkeypatch, tmp_path) -> None:
+    """Concurrent readers never observe a cleared or torn config context."""
+    old_config = config_utils.Config.from_dict({
+        'aws': {
+            'vpc_name': 'old-vpc',
+        },
+    })
+    old_path = str(tmp_path / 'old-config.yaml')
+    old_serialized_path = json.dumps([old_path])
+    monkeypatch.setattr(
+        skypilot_config, '_global_config_context',
+        skypilot_config.ConfigContext(config=old_config,
+                                      config_path=old_serialized_path))
+
+    new_path = tmp_path / 'new-config.yaml'
+    new_path.write_text('aws:\n  vpc_name: new-vpc\n', encoding='utf-8')
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, str(new_path))
+    monkeypatch.setattr(skypilot_config, 'get_skypilot_config_lock_path',
+                        lambda: str(tmp_path / 'config.lock'))
+
+    parser_entered = threading.Event()
+    release_parser = threading.Event()
+    original_parser = skypilot_config.parse_and_validate_config_file
+
+    def blocked_parser(config_path: str) -> config_utils.Config:
+        parser_entered.set()
+        if not release_parser.wait(timeout=5):
+            raise TimeoutError('test did not release the config parser')
+        return original_parser(config_path)
+
+    monkeypatch.setattr(skypilot_config, 'parse_and_validate_config_file',
+                        blocked_parser)
+
+    old_generation = ('old-vpc', old_serialized_path)
+    new_generation = ('new-vpc', json.dumps([str(new_path)]))
+    observed: set[tuple[str | None, str | None]] = set()
+    observed_lock = threading.Lock()
+    reader_stop = threading.Event()
+    reader_saw_old = threading.Event()
+    reader_saw_new = threading.Event()
+
+    def read_contexts() -> None:
+        while not reader_stop.wait(0.001):
+            # Capture one generation reference before reading either field.
+            config_context = skypilot_config._get_config_context()
+            generation = (config_context.config.get_nested(
+                ('aws', 'vpc_name'), None), config_context.config_path)
+            with observed_lock:
+                observed.add(generation)
+            if generation == old_generation:
+                reader_saw_old.set()
+            elif generation == new_generation:
+                reader_saw_new.set()
+
+    reload_errors: list[BaseException] = []
+
+    def reload_in_thread() -> None:
+        try:
+            skypilot_config.safe_reload_config()
+        except BaseException as error:  # pylint: disable=broad-except
+            reload_errors.append(error)
+
+    reader = threading.Thread(target=read_contexts)
+    reloader = threading.Thread(target=reload_in_thread)
+    reader.start()
+    assert reader_saw_old.wait(timeout=5)
+    reloader.start()
+    assert parser_entered.wait(timeout=5)
+
+    # Parsing is deliberately blocked. Publication must leave the prior
+    # generation intact until the complete replacement is ready.
+    current_context = skypilot_config._global_config_context
+    assert (current_context.config.get_nested(
+        ('aws', 'vpc_name'),
+        None), current_context.config_path) == old_generation
+
+    release_parser.set()
+    reloader.join(timeout=5)
+    assert not reloader.is_alive()
+    assert not reload_errors
+    assert reader_saw_new.wait(timeout=5)
+    reader_stop.set()
+    reader.join(timeout=5)
+    assert not reader.is_alive()
+
+    with observed_lock:
+        assert observed == {old_generation, new_generation}
+
+
+def test_internal_config_reload_replaces_only_request_context(
+        monkeypatch, tmp_path) -> None:
+    """Atomic publication retains reload_config's request-local isolation."""
+    global_config = config_utils.Config.from_dict(
+        {'aws': {
+            'vpc_name': 'global-vpc'
+        }})
+    global_context = skypilot_config.ConfigContext(
+        config=global_config, config_path='["global-config.yaml"]')
+    monkeypatch.setattr(skypilot_config, '_global_config_context',
+                        global_context)
+
+    request_context = skypilot_config.context.SkyPilotContext()
+    old_request_config = config_utils.Config.from_dict(
+        {'aws': {
+            'vpc_name': 'request-vpc'
+        }})
+    old_request_context = skypilot_config.ConfigContext(
+        config=old_request_config,
+        config_path='["request-config.yaml"]',
+        config_overridden=True)
+    request_context.config_context = old_request_context
+    new_path = tmp_path / 'new-request-config.yaml'
+    new_path.write_text('aws:\n  vpc_name: new-request-vpc\n', encoding='utf-8')
+
+    with mock.patch.object(skypilot_config.context,
+                           'get',
+                           return_value=request_context):
+        skypilot_config._reload_config_from_internal_file(str(new_path))
+        replacement = request_context.config_context
+        assert replacement is not old_request_context
+        assert replacement.config.get_nested(('aws', 'vpc_name'),
+                                             None) == 'new-request-vpc'
+        assert skypilot_config.loaded_config_path() == str(new_path)
+        assert replacement.config_overridden
+
+    assert skypilot_config._global_config_context is global_context
+    assert global_context.config.get_nested(('aws', 'vpc_name'),
+                                            None) == 'global-vpc'
+
+
+def test_pure_config_parse_does_not_mutate_database_environment(monkeypatch):
+    monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI,
+                       'postgresql://current')
+
+    parsed = skypilot_config.parse_and_validate_config_bytes(
+        b'db: postgresql://candidate\nactive_workspace: default\n',
+        'uncommitted candidate',
+        log_config=False,
+        apply_db_env=False)
+
+    assert (os.environ[constants.ENV_VAR_DB_CONNECTION_URI] ==
+            'postgresql://current')
+    assert parsed.get_nested(('db',), None) is None
 
 
 def test_invalid_override_config(monkeypatch, tmp_path) -> None:
@@ -1940,3 +2088,90 @@ class TestRemoveQueueNameFromConfig:
                 ]:
                     assert current.get_nested(
                         keys, 'NOT_SET') is None, (f'Expected None at {keys}')
+
+
+class TestClearedConfigPathIsNotSerializedNull:
+    """Clearing the loaded config path must store None, never the string 'null'.
+
+    `_set_loaded_config_path(None)` fell through its own early branch and
+    re-assigned `json.dumps(None)`, i.e. the four characters 'null'. That value
+    is not None to any consumer, so it survived into a request body as
+    `override_skypilot_config_path` and decoded back to None on the API server,
+    where `override_skypilot_config` concatenated it to a list:
+
+        TypeError: can only concatenate list (not "NoneType") to list
+
+    It raised inside the request executor's context manager, before the
+    request log file was opened, so every affected `sky.launch` failed with an
+    empty log and no server-side frames in the client's traceback. Measured
+    live: 58 consecutive SkyServe replica launches lost this way, while the
+    reserved-fill broker kept granting the capacity they were meant to take.
+    """
+
+    def test_clearing_stores_none(self):
+        skypilot_config._set_loaded_config_path(None)
+        assert skypilot_config.loaded_config_path_serialized() is None
+
+    def test_clearing_never_stores_the_json_null_literal(self):
+        skypilot_config._set_loaded_config_path(None)
+        assert skypilot_config.loaded_config_path_serialized() != 'null'
+
+    @pytest.mark.parametrize('empty', [None, '', []])
+    def test_every_empty_path_clears_to_none(self, empty):
+        skypilot_config._set_loaded_config_path(['/some/real/path.yaml'])
+        skypilot_config._set_loaded_config_path(empty)
+        assert skypilot_config.loaded_config_path_serialized() is None
+
+    def test_a_real_path_still_round_trips(self):
+        skypilot_config._set_loaded_config_path('/a/config.yaml')
+        assert (skypilot_config._get_loaded_config_path() == ['/a/config.yaml'])
+        skypilot_config._set_loaded_config_path(['/a.yaml', '/b.yaml'])
+        assert (skypilot_config._get_loaded_config_path() == [
+            '/a.yaml', '/b.yaml'
+        ])
+
+    def test_replace_in_memory_leaves_no_null_literal(self):
+        """The serve controller clears the path through this helper."""
+        skypilot_config._set_loaded_config_path('/a/config.yaml')
+        observed = []
+        with skypilot_config.replace_skypilot_config_in_memory(
+                config_utils.Config.from_dict({'kubernetes': {}})):
+            observed.append(skypilot_config.loaded_config_path_serialized())
+        assert observed == [None]
+        assert (skypilot_config._get_loaded_config_path() == ['/a/config.yaml'])
+
+
+class TestOverrideAcceptsASerializedNullPath:
+    """The API server must survive a request body that carries 'null'.
+
+    Fixing the writer above stops new occurrences, but request bodies already
+    persisted (and clients on older builds) still carry the literal. Decoding
+    it yields None, and the previous code concatenated that directly.
+    """
+
+    def test_a_null_literal_path_does_not_raise(self, monkeypatch, tmp_path):
+        os.environ.pop(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, None)
+        config_path = tmp_path / 'config.yaml'
+        _create_config_file(config_path)
+        monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH', config_path)
+        skypilot_config.reload_config()
+        with skypilot_config.override_skypilot_config(
+            {'aws': {
+                'vpc_name': 'override-vpc'
+            }}, 'null'):
+            assert skypilot_config.get_nested(('aws', 'vpc_name'),
+                                              None) == 'override-vpc'
+
+    def test_a_real_serialized_path_is_still_appended(self, monkeypatch,
+                                                      tmp_path):
+        os.environ.pop(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, None)
+        config_path = tmp_path / 'config.yaml'
+        _create_config_file(config_path)
+        monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH', config_path)
+        skypilot_config.reload_config()
+        with skypilot_config.override_skypilot_config(
+            {'aws': {
+                'vpc_name': 'override-vpc'
+            }}, json.dumps(['/client/config.yaml'])):
+            assert ('/client/config.yaml'
+                    in skypilot_config._get_loaded_config_path())

@@ -264,9 +264,7 @@ def _encoded_return_value(name: str, request_id: str, return_value: Any) -> Any:
     """Encode a return value.
 
     Durable terminal-transition implementations catch encoder failures and
-    atomically persist FAILED plus the encoding error.  Keeping this helper
-    strict prevents a malformed private-handler result from becoming a
-    successful JSON null.
+    atomically persist FAILED plus the encoding error.
     """
     encoder = encoders.get_encoder(name)
     del request_id
@@ -293,6 +291,63 @@ REQUEST_COLUMNS = [
     COL_IGNORE_RETURN_VALUE,
     COL_RETRYABLE,
 ]
+REQUEST_QUERY_FIELDS = frozenset(REQUEST_COLUMNS) | frozenset({
+    'execution_generation',
+    'execution_quiescence_required',
+    'execution_quiesced_generation',
+    'execution_quiesced_at',
+})
+
+# Scalar projections avoid decoding the durable request payload.  This is an
+# internal persistence interface, not the public status contract below.
+SCALAR_REQUEST_QUERY_FIELDS = (
+    'request_id',
+    'name',
+    'status',
+    'pid',
+    'created_at',
+    COL_CLUSTER_NAME,
+    'schedule_type',
+    COL_USER_ID,
+    COL_STATUS_MSG,
+    COL_SHOULD_RETRY,
+    COL_FINISHED_AT,
+    COL_FILE_MOUNTS_BLOB_ID,
+    'execution_generation',
+    'execution_quiescence_required',
+    'execution_quiesced_generation',
+    'execution_quiesced_at',
+)
+SCALAR_REQUEST_QUERY_FIELD_SET = frozenset(SCALAR_REQUEST_QUERY_FIELDS)
+
+# Public request-status responses are metadata projections.  The default list
+# is deliberately portable across SQLite and PostgreSQL.  PostgreSQL-only
+# execution metadata remains an allowed explicit projection for the internal
+# execution-quiescence protocol.
+#
+# Keep both interfaces explicit: request bodies, callables, return values,
+# errors, free-form status messages, executor PIDs, and file-mount blob IDs can
+# contain private data or internal capabilities.  Full request payloads remain
+# available to their owner through /api/get.
+REQUEST_STATUS_QUERY_FIELDS = (
+    'request_id',
+    'name',
+    'status',
+    'created_at',
+    COL_CLUSTER_NAME,
+    'schedule_type',
+    COL_USER_ID,
+    COL_SHOULD_RETRY,
+    COL_FINISHED_AT,
+)
+REQUEST_STATUS_POSTGRES_QUERY_FIELDS = (
+    'execution_generation',
+    'execution_quiescence_required',
+    'execution_quiesced_generation',
+    'execution_quiesced_at',
+)
+REQUEST_STATUS_QUERY_FIELD_SET = frozenset(
+    (*REQUEST_STATUS_QUERY_FIELDS, *REQUEST_STATUS_POSTGRES_QUERY_FIELDS))
 
 
 class ScheduleType(enum.Enum):
@@ -350,6 +405,9 @@ class Request:
     heartbeat_at: float | None = None
     cancel_requested_at: float | None = None
     cancel_acknowledged_at: float | None = None
+    execution_quiescence_required: bool = False
+    execution_quiesced_generation: int | None = None
+    execution_quiesced_at: float | None = None
     interrupted_reason: str | None = None
     # PostgreSQL-only, server-owned context for actor-aware operational
     # events. It is intentionally absent from the client RequestPayload and
@@ -453,6 +511,11 @@ class Request:
             'heartbeat_at': self.heartbeat_at,
             'cancel_requested_at': self.cancel_requested_at,
             'cancel_acknowledged_at': self.cancel_acknowledged_at,
+            'execution_quiescence_required':
+                (self.execution_quiescence_required),
+            'execution_quiesced_generation':
+                (self.execution_quiesced_generation),
+            'execution_quiesced_at': self.execution_quiesced_at,
             'interrupted_reason': self.interrupted_reason,
             'event_context': self.event_context,
         }
@@ -514,6 +577,13 @@ class Request:
             heartbeat_at=values.get('heartbeat_at'),
             cancel_requested_at=values.get('cancel_requested_at'),
             cancel_acknowledged_at=values.get('cancel_acknowledged_at'),
+            execution_quiescence_required=bool(
+                values.get('execution_quiescence_required', False)),
+            execution_quiesced_generation=(
+                int(values['execution_quiesced_generation'])
+                if values.get('execution_quiesced_generation') is not None else
+                None),
+            execution_quiesced_at=values.get('execution_quiesced_at'),
             interrupted_reason=values.get('interrupted_reason'),
             event_context=values.get('event_context'),
         )
@@ -1257,7 +1327,8 @@ def kill_requests(request_ids: list[str] | None = None,
         expanded_request_ids = []
         for request_id in request_ids:
             request_tasks = get_requests_with_prefix(request_id,
-                                                     fields=['request_id'])
+                                                     fields=['request_id'],
+                                                     user_id=user_id)
             if request_tasks is None or len(request_tasks) == 0:
                 continue
             if len(request_tasks) > 1:
@@ -1408,10 +1479,17 @@ async def _get_request_no_lock_async(request_id: str,
 
 
 @metrics_lib.time_me
-async def get_latest_request_id_async() -> str | None:
-    """Get the latest request ID."""
-    return await request_storage.get_request_backend(
-    ).get_latest_request_id_async()
+async def get_latest_request_id_async(user_id: str | None = None) -> str | None:
+    """Get the latest request ID, optionally for one owner."""
+    backend = request_storage.get_request_backend()
+    if user_id is None:
+        return await backend.get_latest_request_id_async()
+    requests = await backend.query_requests_async(
+        RequestTaskFilter(user_id=user_id,
+                          fields=['request_id'],
+                          sort=True,
+                          limit=1))
+    return requests[0].request_id if requests else None
 
 
 @metrics_lib.time_me
@@ -1433,20 +1511,40 @@ async def get_request_async(request_id: str,
 @metrics_lib.time_me
 def get_requests_with_prefix(
         request_id_prefix: str,
-        fields: list[str] | None = None) -> list[Request] | None:
-    """Get requests with a given request ID prefix."""
-    return request_storage.get_request_backend().get_requests_with_prefix(
-        request_id_prefix, fields)
+        fields: list[str] | None = None,
+        user_id: str | None = None) -> list[Request] | None:
+    """Get requests with a given ID prefix and optional owner."""
+    query_fields = fields
+    if user_id is not None and fields and COL_USER_ID not in fields:
+        query_fields = [*fields, COL_USER_ID]
+    requests = request_storage.get_request_backend().get_requests_with_prefix(
+        request_id_prefix, query_fields)
+    if requests is None or user_id is None:
+        return requests
+    owned_requests = [
+        request for request in requests if request.user_id == user_id
+    ]
+    return owned_requests or None
 
 
 @metrics_lib.time_me_async
 @asyncio_utils.shield
 async def get_requests_async_with_prefix(
         request_id_prefix: str,
-        fields: list[str] | None = None) -> list[Request] | None:
-    """Async version of get_request_with_prefix."""
-    return await request_storage.get_request_backend(
-    ).get_requests_async_with_prefix(request_id_prefix, fields)
+        fields: list[str] | None = None,
+        user_id: str | None = None) -> list[Request] | None:
+    """Async version of get_requests_with_prefix."""
+    query_fields = fields
+    if user_id is not None and fields and COL_USER_ID not in fields:
+        query_fields = [*fields, COL_USER_ID]
+    requests = await request_storage.get_request_backend(
+    ).get_requests_async_with_prefix(request_id_prefix, query_fields)
+    if requests is None or user_id is None:
+        return requests
+    owned_requests = [
+        request for request in requests if request.user_id == user_id
+    ]
+    return owned_requests or None
 
 
 class StatusWithMsg(NamedTuple):
@@ -1539,6 +1637,8 @@ class RequestTaskFilter:
 
     Args:
         status: a list of statuses of the requests to filter on.
+        request_ids: exact request IDs to filter on. Unlike the legacy status
+            endpoint's request-ID matching, these are not prefixes.
         cluster_names: a list of cluster names to filter requests on.
         exclude_request_names: a list of request names to exclude from results.
             Mutually exclusive with include_request_names.
@@ -1557,6 +1657,10 @@ class RequestTaskFilter:
         retention_safe: internal GC guard that excludes correlated requests
             until their exact resource-action attempt is settled. PostgreSQL
             enforces this; SQLite has no central resource-action correlation.
+        execution_quiescence_candidates_only: include active rows plus
+            terminal rows governed by the API008 execution-quiescence
+            contract. Used with ``cluster_names`` for bounded cancellation
+            barriers.
         limit: the number of requests to show. If None, show all requests.
 
     Raises:
@@ -1564,6 +1668,7 @@ class RequestTaskFilter:
             provided.
     """
     status: list[RequestStatus] | None = None
+    request_ids: list[str] | None = None
     cluster_names: list[str] | None = None
     user_id: str | None = None
     exclude_request_names: list[str] | None = None
@@ -1572,6 +1677,7 @@ class RequestTaskFilter:
     include_missing_finished_at: bool = False
     finished_after: float | None = None
     retention_safe: bool = False
+    execution_quiescence_candidates_only: bool = False
     limit: int | None = None
     fields: list[str] | None = None
     sort: bool = False
@@ -1582,6 +1688,15 @@ class RequestTaskFilter:
             raise ValueError(
                 'Only one of exclude_request_names or include_request_names '
                 'can be provided, not both.')
+        if self.fields is not None:
+            invalid_fields = set(self.fields) - REQUEST_QUERY_FIELDS
+            if invalid_fields:
+                raise ValueError('Unsupported request status fields: '
+                                 f'{sorted(invalid_fields)}')
+        if (self.limit is not None and
+            (not isinstance(self.limit, int) or isinstance(self.limit, bool) or
+             self.limit < 0)):
+            raise ValueError('Request status limit must be a non-negative int.')
 
     def build_query(self) -> tuple[str, list[Any]]:
         """Build the SQL query and filter parameters.
@@ -1592,39 +1707,62 @@ class RequestTaskFilter:
         filters = []
         filter_params: list[Any] = []
         if self.status is not None:
-            status_list_str = ','.join(
-                repr(status.value) for status in self.status)
-            filters.append(f'status IN ({status_list_str})')
+            if not self.status:
+                filters.append('1=0')
+            else:
+                placeholders = ','.join('?' for _ in self.status)
+                filters.append(f'status IN ({placeholders})')
+                filter_params.extend(status.value for status in self.status)
+        if self.request_ids is not None:
+            if len(self.request_ids) == 0:
+                # Empty IN () is invalid SQL. An empty list matches nothing.
+                filters.append('1=0')
+            else:
+                placeholders = ','.join('?' for _ in self.request_ids)
+                filters.append(f'request_id IN ({placeholders})')
+                filter_params.extend(self.request_ids)
+        if self.execution_quiescence_candidates_only:
+            active_statuses = RequestStatus.active_statuses()
+            placeholders = ','.join('?' for _ in active_statuses)
+            # SQLite has no API008 durable execution metadata. Its candidate
+            # set therefore contains active rows only.
+            filters.append(f'status IN ({placeholders})')
+            filter_params.extend(status.value for status in active_statuses)
         if self.include_request_names is not None:
-            request_names_str = ','.join(
-                repr(name) for name in self.include_request_names)
-            filters.append(f'name IN ({request_names_str})')
+            if not self.include_request_names:
+                filters.append('1=0')
+            else:
+                placeholders = ','.join('?' for _ in self.include_request_names)
+                filters.append(f'name IN ({placeholders})')
+                filter_params.extend(self.include_request_names)
         if self.exclude_request_names is not None:
-            exclude_request_names_str = ','.join(
-                repr(name) for name in self.exclude_request_names)
-            filters.append(f'name NOT IN ({exclude_request_names_str})')
+            if self.exclude_request_names:
+                placeholders = ','.join('?' for _ in self.exclude_request_names)
+                filters.append(f'name NOT IN ({placeholders})')
+                filter_params.extend(self.exclude_request_names)
         if self.cluster_names is not None:
             if len(self.cluster_names) == 0:
                 # Empty IN () is invalid SQL in PostgreSQL.
                 # An empty list means "match nothing".
                 filters.append('1=0')
             else:
-                cluster_names_str = ','.join(
-                    repr(name) for name in self.cluster_names)
-                filters.append(f'{COL_CLUSTER_NAME} IN ({cluster_names_str})')
+                placeholders = ','.join('?' for _ in self.cluster_names)
+                filters.append(f'{COL_CLUSTER_NAME} IN ({placeholders})')
+                filter_params.extend(self.cluster_names)
         if self.user_id is not None:
             filters.append(f'{COL_USER_ID} = ?')
             filter_params.append(self.user_id)
         if self.finished_before is not None:
             if self.include_missing_finished_at:
-                terminal_statuses = ','.join(
-                    repr(status.value)
-                    for status in RequestStatus.finished_status())
+                terminal_statuses = RequestStatus.finished_status()
+                placeholders = ','.join('?' for _ in terminal_statuses)
                 filters.append(
                     '(finished_at < ? OR (finished_at IS NULL AND '
-                    f'status IN ({terminal_statuses}) AND created_at < ?))')
+                    f'status IN ({placeholders}) AND created_at < ?))')
+                filter_params.append(self.finished_before)
                 filter_params.extend(
-                    [self.finished_before, self.finished_before])
+                    status.value for status in terminal_statuses)
+                filter_params.append(self.finished_before)
             else:
                 filters.append('finished_at < ?')
                 filter_params.append(self.finished_before)
@@ -1711,11 +1849,7 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     """
     serialized_result = None
     result_encoding_failed = False
-    should_encode_result = result is not None
-    if (name is not None and status == RequestStatus.SUCCEEDED and
-            encoders.requires_strict_return_value(name)):
-        should_encode_result = True
-    if should_encode_result:
+    if result is not None:
         assert name is not None, request_id
         serializer = return_value_serializers.get_serializer(name)
         # A serializer failure must not raise: an exception here escapes the
@@ -2360,7 +2494,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                              result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
-        if result is not None or status == RequestStatus.SUCCEEDED:
+        if result is not None:
             # The return-value encoder is looked up by request name; a
             # single-column primary-key read is far cheaper than the full
             # row (which would unpickle entrypoint and request_body).
@@ -2397,7 +2531,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                                          result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
-        if result is not None or status == RequestStatus.SUCCEEDED:
+        if result is not None:
             async with _DB.execute_fetchall_async(
                     f'SELECT name FROM {REQUEST_TABLE} WHERE request_id = ?',
                 (request_id,)) as rows:
@@ -2434,6 +2568,8 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                 if not _should_kill_request(request_id, request_record):
                     continue
                 assert request_record is not None
+                if (user_id is not None and request_record.user_id != user_id):
+                    continue
                 if request_record.pid is not None:
                     logger.debug(
                         f'Killing request process {request_record.pid}')

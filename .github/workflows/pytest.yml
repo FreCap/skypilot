@@ -32,22 +32,22 @@ jobs:
           # TODO(zeping): Move back to the main test group once we fixed the flakiness.
           - test-path: tests/unit_tests
             test-name: "Unit Tests"
-            runner: namespace-profile-ci-4x16
+            runner: namespace-profile-skypilot-ci-4x16
           - test-path: tests/test_cli.py
             test-name: "CLI Tests"
-            runner: namespace-profile-ci-4x8
+            runner: namespace-profile-skypilot-ci-4x8
           - test-path: tests/test_jobs.py tests/test_jobs_and_serve.py tests/test_jobs_state_async_vs_sync.py tests/test_list_accelerators.py tests/test_api.py
             test-name: "Jobs & API Tests"
-            runner: namespace-profile-ci-4x8
+            runner: namespace-profile-skypilot-ci-4x8
           - test-path: tests/test_config.py tests/test_wheels.py tests/test_yaml_parser.py tests/test_global_user_state.py tests/test_storage.py tests/test_api_compatibility.py tests/test_infra_k8s_alias.py
             test-name: "Config, Storage & Compatibility Tests"
-            runner: namespace-profile-ci-4x8
+            runner: namespace-profile-skypilot-ci-4x8
           - test-path: tests/test_no_parellel.py
             test-name: "No Parallel Tests"
-            runner: namespace-profile-ci-4x8
+            runner: namespace-profile-skypilot-ci-4x8
           - test-path: tests/test_ssh_proxy_lag.py
             test-name: "Event Loop Lag Tests"
-            runner: namespace-profile-ci-4x8
+            runner: namespace-profile-skypilot-ci-4x8
           - python-version: "3.14"
             test-path: >-
               tests/unit_tests/test_asyncio_utils.py
@@ -58,7 +58,7 @@ jobs:
               tests/unit_tests/test_serve_load_balancer_sync_spec.py
               tests/unit_tests/test_sky/storage/test_storage_utils.py
             test-name: "Resource Lifetime"
-            runner: namespace-profile-ci-4x8
+            runner: namespace-profile-skypilot-ci-4x8
     runs-on: ${{ matrix.runner }}
     name: "Python Tests - ${{ matrix.test-name }}"
     steps:
@@ -75,7 +75,7 @@ jobs:
   limited-deps-test:
     # Test with limited dependencies to ensure cloud module imports don't break
     # basic functionality (e.g., importing IBM shouldn't break AWS support)
-    runs-on: namespace-profile-ci-2x4
+    runs-on: namespace-profile-skypilot-ci-2x4
     strategy:
       matrix:
         python-version: ["3.14"]
@@ -145,7 +145,7 @@ jobs:
 
   failover-test:
     # Test failover functionality
-    runs-on: namespace-profile-ci-2x4
+    runs-on: namespace-profile-skypilot-ci-2x4
     strategy:
       matrix:
         # Keep failover coverage on the production interpreter.

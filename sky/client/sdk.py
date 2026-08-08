@@ -2553,7 +2553,8 @@ def get(request_id: server_common.RequestId[T]) -> T:
 
     Args:
         request_id: The request ID of the request to get. May be a full request
-            ID or a prefix.
+            ID or a prefix. Authenticated non-admin users can retrieve only
+            requests they own.
 
     Returns:
         The ``Request Returns`` of the specified request. See the documentation
@@ -2612,7 +2613,8 @@ def stream_and_get(
             request ID or a prefix.
             If None, the latest request submitted to the API server is streamed.
             Using None request_id is not recommended in multi-user environments.
-        log_path: The path to the log file to stream.
+        log_path: The path to the log file to stream. On an authenticated
+            multi-user server, arbitrary log paths require an admin role.
         tail: The number of lines to show from the end of the logs.
             If None, show all logs.
         follow: Whether to follow the logs.
@@ -2656,7 +2658,8 @@ def api_cancel(request_ids: server_common.RequestId[T] |
     Args:
         request_ids: The request ID(s) to abort. Can be a single string or a
             list of strings.
-        all_users: Whether to abort all requests from all users.
+        all_users: Whether to abort all requests from all users. This requires
+            an admin role on an authenticated server.
         silent: Whether to suppress the output.
 
     Returns:
@@ -2719,6 +2722,11 @@ def api_status(
     limit: int | None = None,
     fields: list[str] | None = None,
     cluster_name: str | None = None,
+    cluster_names: list[str] | None = None,
+    _include_request_names: list[str] | None = None,
+    _execution_quiescence_candidates_only: bool = False,
+    _exact_request_ids: bool = False,
+    _use_body: bool = False,
 ) -> list[payloads.RequestPayload]:
     """Lists all requests.
 
@@ -2728,9 +2736,20 @@ def api_status(
         all_status: Whether to list all finished requests as well. This argument
             is ignored if request_ids is not None.
         limit: The number of requests to show. If None, show all requests.
-        fields: The fields to get. If None, get all fields.
+        fields: Safe metadata fields to get. Request bodies, callables, return
+            values, errors, status messages, executor PIDs, and file-mount blob
+            IDs are not available from the organization-wide status interface.
         cluster_name: Filter requests by cluster name.
             If None, show all requests.
+        cluster_names: Filter requests by any of these cluster names in one
+            server-side query. Mutually exclusive with ``cluster_name``.
+        _include_request_names: Internal exact request-name allowlist.
+        _execution_quiescence_candidates_only: Internal PostgreSQL filter for
+            active or receipt-required request generations.
+        _exact_request_ids: Treat ``request_ids`` as full primary keys and
+            query them in one server-side batch instead of as prefixes.
+        _use_body: Use the v70 body-backed endpoint for a potentially large
+            filter set.
 
     Returns:
         A list of request payloads.
@@ -2739,11 +2758,23 @@ def api_status(
         logger.info('SkyPilot API server is not running.')
         return []
 
+    if cluster_name is not None and cluster_names is not None:
+        raise ValueError('cluster_name and cluster_names are mutually '
+                         'exclusive.')
+
     # Backward compatibility check for the new flag cluster_name
     version = versions.get_remote_api_version()
     if (cluster_name is not None) and (version is None or version < 38):
         logger.warning(
             'The flag is ignored because the server does not support it yet.')
+    if (cluster_names is not None and version is not None and version
+            < server_constants.MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.APINotSupportedError(
+                'Filtering API requests by multiple cluster names requires '
+                'API server version '
+                f'{server_constants.MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION}'
+                ' or newer. Please upgrade the remote server.')
 
     body = payloads.RequestStatusBody(
         request_ids=request_ids,
@@ -2751,11 +2782,26 @@ def api_status(
         limit=limit,
         fields=fields,
         cluster_name=cluster_name,
+        cluster_names=cluster_names,
+        include_request_names=_include_request_names,
+        execution_quiescence_candidates_only=(
+            _execution_quiescence_candidates_only),
+        exact_request_ids=_exact_request_ids,
     )
+    use_body = (_use_body or cluster_names is not None or
+                _include_request_names is not None or
+                _execution_quiescence_candidates_only or _exact_request_ids)
+    request_kwargs: dict[str, Any]
+    if use_body:
+        request_kwargs = {'json': json.loads(body.model_dump_json())}
+    else:
+        request_kwargs = {
+            'params': server_common.request_body_to_params(body),
+        }
     response = server_common.make_authenticated_request(
-        'GET',
-        '/api/status',
-        params=server_common.request_body_to_params(body),
+        'POST' if use_body else 'GET',
+        '/api/status/query' if use_body else '/api/status',
+        **request_kwargs,
         timeout=(client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS,
                  None))
     server_common.handle_request_error(response)

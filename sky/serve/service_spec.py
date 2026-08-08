@@ -9,8 +9,8 @@ from sky import serve
 from sky import sky_logging
 from sky.serve import constants
 from sky.serve import load_balancing_policies as lb_policies
+from sky.serve import placement_policy
 from sky.serve import serve_utils
-from sky.serve import spot_placer as spot_placer_lib
 from sky.utils import common_utils
 from sky.utils import schemas
 from sky.utils import ux_utils
@@ -18,8 +18,81 @@ from sky.utils import yaml_utils
 
 logger = sky_logging.init_logger(__name__)
 
-REPLICA_UNIT_PHYSICAL_BACKEND = 'physical_backend'
-REPLICA_UNIT_LOGICAL = 'logical'
+_PLACEMENT_CONTRACT_COPY_TOKEN = object()
+_PLACEMENT_DECODE_EVENT = 'skyserve_placement_contract_decode'
+
+
+def _canonical_pool_driver(
+    pool: bool | dict[str, Any] | None,
+    min_replicas: int,
+    max_replicas: int | None,
+) -> bool | dict[str, Any] | None:
+    """Return a rollback-readable persisted pool driver."""
+    if not placement_policy.is_pool_workload(pool):
+        return pool
+    if isinstance(pool, dict) and pool:
+        canonical_pool = dict(pool)
+        # The policy name has its own persisted primitive field.  Keeping a
+        # second, unnormalized copy in _pool lets the two drivers disagree and
+        # causes explicit null to leak back into canonical YAML.
+        canonical_pool.pop('spot_placer', None)
+        if canonical_pool:
+            return canonical_pool
+    if max_replicas is None:
+        return {'workers': min_replicas}
+    return {
+        'min_workers': min_replicas,
+        'max_workers': max_replicas,
+    }
+
+
+def materialize_legacy_placement_contract_state(
+    state: dict[str, Any],
+) -> tuple[placement_policy.PlacementContract, int | None]:
+    """Decode compatibility state and materialize its in-memory contract.
+
+    This is the single raw-state boundary shared by normal unpickling and the
+    operator-only PostgreSQL normalizer.  It deliberately changes only the
+    placement-policy primitives; unrelated compatibility defaults remain the
+    responsibility of ``SkyServiceSpec.__setstate__``.
+    """
+    resolved_contract, contract_version = (
+        placement_policy.decode_contract_state(state))
+    if contract_version == placement_policy.PLACEMENT_CONTRACT_VERSION_V2:
+        return resolved_contract, contract_version
+
+    if contract_version is None:
+        state.setdefault(placement_policy.POLICY_NAME_FIELD, None)
+        state.setdefault(placement_policy.POOL_FIELD, False)
+        legacy_pool = state[placement_policy.POOL_FIELD]
+        if (resolved_contract.workload_kind ==
+                placement_policy.WORKLOAD_KIND_POOL):
+            state[placement_policy.POOL_FIELD] = _canonical_pool_driver(
+                legacy_pool, state.get('_min_replicas', 0),
+                state.get('_max_replicas'))
+        elif isinstance(legacy_pool, dict) and not legacy_pool:
+            # Preserve the preceding reader's explicit meaning for an empty
+            # legacy mapping: it was a service, not a pool.
+            state[placement_policy.POOL_FIELD] = False
+
+    if resolved_contract.is_legacy_physical_per_gpu:
+        # Keep only the transition-only tuple transition-shaped so the
+        # operator can identify and retire it without changing its semantics.
+        if contract_version is None:
+            # pylint: disable=protected-access
+            transition_fields = (
+                resolved_contract._legacy_v1_persisted_fields())
+            # pylint: enable=protected-access
+            state.update(transition_fields)
+            state[placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+        return resolved_contract, contract_version
+
+    # Compatibility decoding changes only this in-memory object.  The
+    # authoritative row remains byte-for-byte untouched until the explicit
+    # PostgreSQL normalizer records and CASes its v2 replacement.
+    state.update(resolved_contract.persisted_fields())
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+    return resolved_contract, contract_version
 
 
 class SkyServiceSpec:
@@ -66,13 +139,18 @@ class SkyServiceSpec:
         upscale_delay_seconds: int | None = None,
         downscale_delay_seconds: int | None = None,
         load_balancing_policy: str | None = None,
-        pool: bool | None = None,
+        pool: bool | dict[str, Any] | None = None,
         queue_length_threshold: int | None = None,
         consecutive_failure_threshold_timeout: int | None = None,
         graceful_drain_seconds: int | None = None,
         graceful_drain_async_occupancy: bool | None = None,
+        _preserved_placement_contract: (placement_policy.PlacementContract |
+                                        None) = None,
+        _placement_contract_copy_token: object | None = None,
     ) -> None:
-        if pool:
+        spot_placer = placement_policy.canonicalize_policy_name(spot_placer)
+        is_pool = placement_policy.is_pool_workload(pool)
+        if is_pool:
             # For pools, max_replicas should never be specified directly by the
             # user. It should only be set via max_workers in the pool config.
             # However, if queue_length_threshold is set, that means max_replicas
@@ -305,11 +383,48 @@ class SkyServiceSpec:
                         'target_concurrency_per_replica must be > 0. '
                         f'Got: {target_concurrency_per_replica}')
 
+        if _preserved_placement_contract is None:
+            if _placement_contract_copy_token is not None:
+                raise ValueError('Placement contract copy token cannot be '
+                                 'used without a preserved contract.')
+            resolved_placement_contract = (
+                placement_policy.resolve_fresh_contract(spot_placer, pool))
+            preserves_legacy_placement_contract = False
+        else:
+            if _placement_contract_copy_token is not (
+                    _PLACEMENT_CONTRACT_COPY_TOKEN):
+                raise ValueError('Preserved placement contracts are internal '
+                                 'to SkyServiceSpec.copy().')
+            # Internal copies of a committed version carry the complete
+            # contract.  Validate it against both public drivers instead of
+            # reconstructing through a different policy name.
+            preserves_legacy_placement_contract = (
+                _preserved_placement_contract.is_legacy_physical_per_gpu)
+            if preserves_legacy_placement_contract:
+                # This compatibility-only object must remain usable in memory
+                # until the operator retires its authoritative row.  Keep its
+                # v1 shape so __getstate__ and every central writer reject it.
+                # pylint: disable=protected-access
+                placement_state = (
+                    _preserved_placement_contract._legacy_v1_persisted_fields())
+                # pylint: enable=protected-access
+                placement_state[
+                    placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+            else:
+                placement_state = (
+                    _preserved_placement_contract.persisted_fields())
+            placement_state.update({
+                placement_policy.POLICY_NAME_FIELD: spot_placer,
+                placement_policy.POOL_FIELD: pool,
+            })
+            resolved_placement_contract, _ = (
+                placement_policy.decode_contract_state(placement_state))
         uses_logical_replicas = (
-            spot_placer == spot_placer_lib.CAPACITY_AWARE_SPOT_PLACER)
+            resolved_placement_contract.uses_logical_replicas)
 
         def _validate_percentage(name: str, value: int | None) -> None:
-            if (value is not None and
+            if (not preserves_legacy_placement_contract and
+                    value is not None and
                 (not isinstance(value, int) or isinstance(value, bool) or
                  value < 1 or value > 100)):
                 with ux_utils.print_exception_no_traceback():
@@ -323,7 +438,8 @@ class SkyServiceSpec:
                              max_scale_up_rate_percentage)
         _validate_percentage('max_scale_down_rate_percentage',
                              max_scale_down_rate_percentage)
-        if (expected_request_duration_seconds is not None and
+        if (not preserves_legacy_placement_contract and
+                expected_request_duration_seconds is not None and
             (not isinstance(expected_request_duration_seconds, (int, float)) or
              isinstance(expected_request_duration_seconds, bool) or
              not math.isfinite(expected_request_duration_seconds) or
@@ -333,13 +449,15 @@ class SkyServiceSpec:
                     'expected_request_duration_seconds must be a finite '
                     'number > 0. Got: '
                     f'{expected_request_duration_seconds!r}')
-        if (adaptive_demand_estimation is not None and
+        if (not preserves_legacy_placement_contract and
+                adaptive_demand_estimation is not None and
                 not isinstance(adaptive_demand_estimation, bool)):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
                     'adaptive_demand_estimation must be a boolean. Got: '
                     f'{adaptive_demand_estimation!r}')
-        if (initial_provision_lead_time_seconds is not None and
+        if (not preserves_legacy_placement_contract and
+                initial_provision_lead_time_seconds is not None and
                 initial_provision_lead_time_seconds
                 != constants.AUTOSCALER_PROVISION_LEAD_AUTO and
             (not isinstance(initial_provision_lead_time_seconds,
@@ -357,8 +475,10 @@ class SkyServiceSpec:
             ('scale_up_rate_min_replicas', scale_up_rate_min_replicas),
             ('scale_up_rate_period_seconds', scale_up_rate_period_seconds),
         ):
-            if (value is not None and (not isinstance(value, int) or
-                                       isinstance(value, bool) or value <= 0)):
+            if (not preserves_legacy_placement_contract and
+                    value is not None and
+                (not isinstance(value, int) or isinstance(value, bool) or
+                 value <= 0)):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(f'{name} must be a positive integer. '
                                      f'Got: {value!r}')
@@ -367,14 +487,16 @@ class SkyServiceSpec:
             scale_up_rate_min_replicas,
             scale_up_rate_period_seconds,
         )
-        if any(value is not None for value in scale_up_rate_fields) and not all(
-                value is not None for value in scale_up_rate_fields):
+        if (not preserves_legacy_placement_contract and
+                any(value is not None for value in scale_up_rate_fields) and
+                not all(value is not None for value in scale_up_rate_fields)):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
                     'max_scale_up_rate_percentage, '
                     'scale_up_rate_min_replicas, and '
                     'scale_up_rate_period_seconds must be set together.')
-        if adaptive_scale_up is not None:
+        if (not preserves_legacy_placement_contract and
+                adaptive_scale_up is not None):
             if not isinstance(adaptive_scale_up, dict):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError('adaptive_scale_up must be an object. '
@@ -429,12 +551,13 @@ class SkyServiceSpec:
             name for name, value in logical_scaling_fields.items()
             if value is not None
         ]
-        if explicitly_set_logical_fields and not uses_logical_replicas:
+        if (explicitly_set_logical_fields and not uses_logical_replicas and
+                not preserves_legacy_placement_contract):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
                     f'{", ".join(explicitly_set_logical_fields)} require '
                     'logical replicas with spot_placer: '
-                    f'{spot_placer_lib.CAPACITY_AWARE_SPOT_PLACER}.')
+                    f'{placement_policy.CAPACITY_AWARE_SPOT_PLACER}.')
         if uses_logical_replicas:
             if (not isinstance(target_concurrency_per_replica, int) or
                     isinstance(target_concurrency_per_replica, bool)):
@@ -468,7 +591,7 @@ class SkyServiceSpec:
         else:
             # Allow different min/max replicas for pools with queue-length
             # autoscaling
-            if (not pool and max_replicas is not None and
+            if (not is_pool and max_replicas is not None and
                     max_replicas != min_replicas):
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(
@@ -700,11 +823,20 @@ class SkyServiceSpec:
         self._adaptive_scale_up: dict[str, Any] | None = adaptive_scale_up
         self._max_scale_down_rate_percentage: int | None = (
             max_scale_down_rate_percentage)
-        # Internal compatibility marker. dynamic_fallback_per_gpu predates
-        # logical replica semantics, so old persisted specs must remain
-        # physical across controller restarts. New specs activate logical
-        # semantics automatically; the marker is deliberately not a YAML field.
-        self._uses_logical_replicas: bool = uses_logical_replicas
+        # Persist primitive placement dimensions, never the runtime dataclass.
+        # The historical tuple remains compatibility-only in memory: its v1
+        # shape makes __getstate__ and the central writers fail closed.  Every
+        # supported fresh/copy path is the sole mirror-free v2 representation.
+        if preserves_legacy_placement_contract:
+            # pylint: disable=protected-access
+            placement_fields = (
+                resolved_placement_contract._legacy_v1_persisted_fields())
+            # pylint: enable=protected-access
+            placement_fields[
+                placement_policy.ROLLBACK_REPLICA_UNIT_FIELD] = False
+        else:
+            placement_fields = resolved_placement_contract.persisted_fields()
+        self.__dict__.update(placement_fields)
         # Opt-in: allow scaling up onto free reserved (zero-cost) capacity.
         # Absent/False means no behavior change. Bool form or object form
         # ({floor_replicas, weight}); object form implies enabled.
@@ -736,7 +868,8 @@ class SkyServiceSpec:
         self._upscale_delay_seconds: int | None = upscale_delay_seconds
         self._downscale_delay_seconds: int | None = downscale_delay_seconds
         self._load_balancing_policy: str | None = load_balancing_policy
-        self._pool: bool | None = pool
+        self._pool: bool | dict[str, Any] | None = _canonical_pool_driver(
+            pool, min_replicas, max_replicas)
         self._queue_length_threshold: int | None = queue_length_threshold
         self._consecutive_failure_threshold_timeout: int | None = (
             consecutive_failure_threshold_timeout)
@@ -749,6 +882,32 @@ class SkyServiceSpec:
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Set state from pickled state, for backward compatibility."""
+        try:
+            resolved_contract, contract_version = (
+                materialize_legacy_placement_contract_state(state))
+        except (TypeError, ValueError):
+            present_fields = sum(
+                field in state for field in placement_policy.CONTRACT_FIELDS)
+            logger.error(
+                f'event={_PLACEMENT_DECODE_EVENT} outcome=rejected '
+                f'contract_fields_present={present_fields} '
+                f'policy_present={placement_policy.POLICY_NAME_FIELD in state} '
+                f'pool_present={placement_policy.POOL_FIELD in state} '
+                f'mirror_present='
+                f'{placement_policy.ROLLBACK_REPLICA_UNIT_FIELD in state}')
+            raise
+        if contract_version in (None,
+                                placement_policy.PLACEMENT_CONTRACT_VERSION_V1):
+            source = 'fieldless' if contract_version is None else 'v1'
+            logger.warning(
+                f'event={_PLACEMENT_DECODE_EVENT} '
+                'outcome=legacy_materialized '
+                f'source={source} '
+                f'historical='
+                f'{str(resolved_contract.is_legacy_physical_per_gpu).lower()} '
+                f'replica_unit={resolved_contract.replica_unit} '
+                f'workload_kind={resolved_contract.workload_kind}')
+            # The authoritative persisted version bytes remain untouched.
         # These fields were added after earlier releases had already persisted
         # SkyServiceSpec objects in the serve DB.
         state.setdefault('_endpoint_probe_interval_seconds',
@@ -762,6 +921,7 @@ class SkyServiceSpec:
         state.setdefault('_lb_high_availability', False)
         state.setdefault('_lb_high_availability_specified', False)
         state.setdefault('_consecutive_failure_threshold_timeout', None)
+        state.setdefault('_pool', False)
         # Added with the concurrency autoscaler; old DB rows predate it.
         state.setdefault('_target_concurrency_per_replica', None)
         state.setdefault('_min_replicas_by_accelerator', {})
@@ -778,10 +938,6 @@ class SkyServiceSpec:
         # an API-server restart. Newly parsed specs default to 50 via the
         # property below.
         state.setdefault('_max_scale_down_rate_percentage', 100)
-        # dynamic_fallback_per_gpu existed before logical replica semantics.
-        # Missing means this service version still counts physical backends
-        # until an explicit update creates a newly marked version.
-        state.setdefault('_uses_logical_replicas', False)
         # Added with reserved-capacity fill; old DB rows predate it. M5 made
         # utilization gating the default for newly parsed enabled specs, but
         # old persisted bool/object forms did not make that choice. Normalize
@@ -804,6 +960,16 @@ class SkyServiceSpec:
         state.setdefault('_graceful_drain_seconds', None)
         state.setdefault('_graceful_drain_async_occupancy', None)
         self.__dict__.update(state)
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize only the sole current, mirror-free v2 representation."""
+        state = dict(self.__dict__)
+        _, contract_version = placement_policy.decode_contract_state(state)
+        if (contract_version != placement_policy.PLACEMENT_CONTRACT_VERSION_V2
+                or placement_policy.ROLLBACK_REPLICA_UNIT_FIELD in state):
+            raise ValueError('SkyServiceSpec serialization requires an '
+                             'explicit mirror-free v2 placement contract.')
+        return state
 
     @staticmethod
     def from_yaml_config(config: dict[str, Any]) -> 'SkyServiceSpec':
@@ -921,7 +1087,7 @@ class SkyServiceSpec:
             service_config['pool'] = pool_config
 
         policy_section = config.get('replica_policy', None)
-        if policy_section is not None and pool_config:
+        if policy_section is not None and pool_config is not None:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError('Cannot specify `replica_policy` for cluster '
                                  'pool. Only `workers: <num>` or `min_workers: '
@@ -934,7 +1100,7 @@ class SkyServiceSpec:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError('Cannot specify both `replicas` and `workers`.'
                                  ' Please use one of them.')
-        if simplified_policy_section is not None and pool_config:
+        if (simplified_policy_section is not None and pool_config is not None):
             with ux_utils.print_exception_no_traceback():
                 raise ValueError('Cannot specify `replicas` for pool. '
                                  'Please use `workers` instead.')
@@ -1187,7 +1353,11 @@ class SkyServiceSpec:
                         config[section] = dict()
                     config[section][key] = value
 
-        add_if_not_none('pool', None, self._pool)
+        # Rendering must not mutate the persisted rollback driver when nested
+        # fields are added below.
+        rendered_pool = (dict(self._pool)
+                         if isinstance(self._pool, dict) else self._pool)
+        add_if_not_none('pool', None, rendered_pool)
         # Emitted before the pool early-return: the field is service-level
         # and must survive serialization for pools too (their retirement
         # uses the same bounded drain, just without the in-flight gauge).
@@ -1255,15 +1425,25 @@ class SkyServiceSpec:
                         self.target_qps_per_replica)
         add_if_not_none('replica_policy', 'target_concurrency_per_replica',
                         self.target_concurrency_per_replica)
-        for field in ('target_utilization_percentage',
-                      'expected_request_duration_seconds',
-                      'initial_provision_lead_time_seconds',
-                      'adaptive_demand_estimation',
-                      'max_scale_up_rate_percentage',
-                      'scale_up_rate_min_replicas',
-                      'scale_up_rate_period_seconds', 'adaptive_scale_up',
-                      'max_scale_down_rate_percentage'):
-            add_if_not_none('replica_policy', field, getattr(self, f'_{field}'))
+        replica_policy_values = (
+            ('target_utilization_percentage',
+             self._target_utilization_percentage),
+            ('expected_request_duration_seconds',
+             self._expected_request_duration_seconds),
+            ('initial_provision_lead_time_seconds',
+             self._initial_provision_lead_time_seconds),
+            ('adaptive_demand_estimation', self._adaptive_demand_estimation),
+            ('max_scale_up_rate_percentage',
+             self._max_scale_up_rate_percentage),
+            ('scale_up_rate_min_replicas', self._scale_up_rate_min_replicas),
+            ('scale_up_rate_period_seconds',
+             self._scale_up_rate_period_seconds),
+            ('adaptive_scale_up', self._adaptive_scale_up),
+            ('max_scale_down_rate_percentage',
+             self._max_scale_down_rate_percentage),
+        )
+        for field, value in replica_policy_values:
+            add_if_not_none('replica_policy', field, value)
         # no_empty omits the disabled None/False forms. Enabled fill always
         # serializes as an object so its utilization policy is unambiguous
         # across server versions.
@@ -1318,7 +1498,7 @@ class SkyServiceSpec:
         if (self.dynamic_ondemand_fallback is not None and
                 self.dynamic_ondemand_fallback):
             if self.spot_placer is not None:
-                if self.spot_placer == spot_placer_lib.SPOT_HEDGE_PLACER:
+                if self.spot_placer == placement_policy.SPOT_HEDGE_PLACER:
                     return 'SpotHedge'
             policy_strs.append('Dynamic on-demand fallback')
             if self.base_ondemand_fallback_replicas is not None:
@@ -1484,61 +1664,69 @@ class SkyServiceSpec:
 
     @property
     def target_concurrency_per_replica(self) -> float | None:
-        # Per GPU: replica capacity = knob * gpu_count. Guarded with getattr
-        # semantics via __setstate__ for specs unpickled from old DB rows.
+        # Per GPU: replica capacity = knob * gpu_count. __setstate__
+        # materializes the field for specs unpickled from old DB rows.
         return self._target_concurrency_per_replica
 
     @property
     def target_utilization_percentage(self) -> int:
-        value = getattr(self, '_target_utilization_percentage', None)
+        value = self._target_utilization_percentage
         return 100 if value is None else value
 
     @property
     def expected_request_duration_seconds(self) -> float | None:
-        return getattr(self, '_expected_request_duration_seconds', None)
+        return self._expected_request_duration_seconds
 
     @property
     def initial_provision_lead_time_seconds(self) -> float | str | None:
         """Configured seed: a number, the 'auto' sentinel, or unset."""
-        return getattr(self, '_initial_provision_lead_time_seconds', None)
+        return self._initial_provision_lead_time_seconds
 
     @property
     def adaptive_demand_estimation(self) -> bool:
         # Default-on: measuring the workload is the correct behavior, and an
         # explicit false is the only way to keep static configured estimates.
-        return getattr(self, '_adaptive_demand_estimation', None) is not False
+        return self._adaptive_demand_estimation is not False
 
     @property
     def max_scale_up_rate_percentage(self) -> int | None:
-        return getattr(self, '_max_scale_up_rate_percentage', None)
+        return self._max_scale_up_rate_percentage
 
     @property
     def scale_up_rate_min_replicas(self) -> int | None:
-        return getattr(self, '_scale_up_rate_min_replicas', None)
+        return self._scale_up_rate_min_replicas
 
     @property
     def scale_up_rate_period_seconds(self) -> int | None:
-        return getattr(self, '_scale_up_rate_period_seconds', None)
+        return self._scale_up_rate_period_seconds
 
     @property
     def adaptive_scale_up(self) -> dict[str, Any] | None:
-        value = getattr(self, '_adaptive_scale_up', None)
+        value = self._adaptive_scale_up
         return dict(value) if value is not None else None
 
     @property
     def max_scale_down_rate_percentage(self) -> int:
-        value = getattr(self, '_max_scale_down_rate_percentage', None)
+        value = self._max_scale_down_rate_percentage
         return 50 if value is None else value
 
     @property
     def replica_unit(self) -> str:
-        if self.uses_logical_replicas:
-            return REPLICA_UNIT_LOGICAL
-        return REPLICA_UNIT_PHYSICAL_BACKEND
+        return self.placement_contract.replica_unit
+
+    @property
+    def placement_contract(self) -> placement_policy.PlacementContract:
+        contract, version = placement_policy.decode_contract_state(
+            self.__dict__)
+        if version is None:
+            raise ValueError(
+                'Runtime SkyServiceSpec is missing its materialized '
+                'placement contract.')
+        return contract
 
     @property
     def uses_logical_replicas(self) -> bool:
-        return getattr(self, '_uses_logical_replicas', False)
+        return self.placement_contract.uses_logical_replicas
 
     @property
     def reserved_capacity_fill(self) -> bool:
@@ -1580,7 +1768,7 @@ class SkyServiceSpec:
 
     @property
     def cost_rebalance(self) -> bool:
-        return (not self._pool and self._spot_placer is not None and
+        return (not self.pool and self.placement_contract.enabled and
                 self._cost_rebalance is not False)
 
     @property
@@ -1648,10 +1836,7 @@ class SkyServiceSpec:
 
     @property
     def pool(self) -> bool:
-        # This can happen for backward compatibility.
-        if not hasattr(self, '_pool'):
-            return False
-        return bool(self._pool)
+        return placement_policy.is_pool_workload(self._pool)
 
     @property
     def queue_length_threshold(self) -> int | None:
@@ -1662,45 +1847,12 @@ class SkyServiceSpec:
         return self._consecutive_failure_threshold_timeout
 
     def copy(self, **override) -> 'SkyServiceSpec':
-        spot_placer_overridden = 'spot_placer' in override
+        placement_driver_overridden = ('spot_placer' in override or
+                                       'pool' in override)
         copied_spot_placer = override.pop('spot_placer', self._spot_placer)
-        preserve_legacy_semantics = (
-            not spot_placer_overridden and
-            copied_spot_placer == spot_placer_lib.CAPACITY_AWARE_SPOT_PLACER and
-            not self.uses_logical_replicas)
-        # Legacy pickles can carry the per-GPU placer while retaining the old
-        # physical-backend contract.  Reconstruct through the other physical
-        # placer so all ordinary field validation still runs, then restore the
-        # authoritative legacy placer and hidden semantic marker below.
-        constructor_spot_placer = (spot_placer_lib.SPOT_HEDGE_PLACER
-                                   if preserve_legacy_semantics else
-                                   copied_spot_placer)
-        logical_scaling_values = {
-            'target_utilization_percentage': override.pop(
-                'target_utilization_percentage',
-                self._target_utilization_percentage),
-            'expected_request_duration_seconds': override.pop(
-                'expected_request_duration_seconds',
-                self._expected_request_duration_seconds),
-            'initial_provision_lead_time_seconds': override.pop(
-                'initial_provision_lead_time_seconds',
-                self._initial_provision_lead_time_seconds),
-            'adaptive_demand_estimation': override.pop(
-                'adaptive_demand_estimation', self._adaptive_demand_estimation),
-            'max_scale_up_rate_percentage': override.pop(
-                'max_scale_up_rate_percentage',
-                self._max_scale_up_rate_percentage),
-            'scale_up_rate_min_replicas': override.pop(
-                'scale_up_rate_min_replicas', self._scale_up_rate_min_replicas),
-            'scale_up_rate_period_seconds': override.pop(
-                'scale_up_rate_period_seconds',
-                self._scale_up_rate_period_seconds),
-            'adaptive_scale_up': override.pop('adaptive_scale_up',
-                                              self._adaptive_scale_up),
-            'max_scale_down_rate_percentage': override.pop(
-                'max_scale_down_rate_percentage',
-                self._max_scale_down_rate_percentage),
-        }
+        copied_pool = override.pop('pool', self._pool)
+        copied_placement_contract = (None if placement_driver_overridden else
+                                     self.placement_contract)
         copied = SkyServiceSpec(
             readiness_path=override.pop('readiness_path', self._readiness_path),
             initial_delay_seconds=override.pop('initial_delay_seconds',
@@ -1740,32 +1892,30 @@ class SkyServiceSpec:
             target_concurrency_per_replica=override.pop(
                 'target_concurrency_per_replica',
                 self._target_concurrency_per_replica),
-            target_utilization_percentage=(
-                None if preserve_legacy_semantics else
-                logical_scaling_values['target_utilization_percentage']),
-            expected_request_duration_seconds=(
-                None if preserve_legacy_semantics else
-                logical_scaling_values['expected_request_duration_seconds']),
-            initial_provision_lead_time_seconds=(
-                None if preserve_legacy_semantics else
-                logical_scaling_values['initial_provision_lead_time_seconds']),
-            adaptive_demand_estimation=(
-                None if preserve_legacy_semantics else
-                logical_scaling_values['adaptive_demand_estimation']),
-            max_scale_up_rate_percentage=(
-                None if preserve_legacy_semantics else
-                logical_scaling_values['max_scale_up_rate_percentage']),
-            scale_up_rate_min_replicas=(
-                None if preserve_legacy_semantics else
-                logical_scaling_values['scale_up_rate_min_replicas']),
-            scale_up_rate_period_seconds=(
-                None if preserve_legacy_semantics else
-                logical_scaling_values['scale_up_rate_period_seconds']),
-            adaptive_scale_up=(None if preserve_legacy_semantics else
-                               logical_scaling_values['adaptive_scale_up']),
-            max_scale_down_rate_percentage=(
-                None if preserve_legacy_semantics else
-                logical_scaling_values['max_scale_down_rate_percentage']),
+            target_utilization_percentage=override.pop(
+                'target_utilization_percentage',
+                self._target_utilization_percentage),
+            expected_request_duration_seconds=override.pop(
+                'expected_request_duration_seconds',
+                self._expected_request_duration_seconds),
+            initial_provision_lead_time_seconds=override.pop(
+                'initial_provision_lead_time_seconds',
+                self._initial_provision_lead_time_seconds),
+            adaptive_demand_estimation=override.pop(
+                'adaptive_demand_estimation', self._adaptive_demand_estimation),
+            max_scale_up_rate_percentage=override.pop(
+                'max_scale_up_rate_percentage',
+                self._max_scale_up_rate_percentage),
+            scale_up_rate_min_replicas=override.pop(
+                'scale_up_rate_min_replicas', self._scale_up_rate_min_replicas),
+            scale_up_rate_period_seconds=override.pop(
+                'scale_up_rate_period_seconds',
+                self._scale_up_rate_period_seconds),
+            adaptive_scale_up=override.pop('adaptive_scale_up',
+                                           self._adaptive_scale_up),
+            max_scale_down_rate_percentage=override.pop(
+                'max_scale_down_rate_percentage',
+                self._max_scale_down_rate_percentage),
             reserved_capacity_fill=override.pop('reserved_capacity_fill',
                                                 self._reserved_capacity_fill),
             cost_rebalance=override.pop('cost_rebalance', self._cost_rebalance),
@@ -1778,28 +1928,24 @@ class SkyServiceSpec:
             base_ondemand_fallback_replicas=override.pop(
                 'base_ondemand_fallback_replicas',
                 self._base_ondemand_fallback_replicas),
-            spot_placer=constructor_spot_placer,
+            spot_placer=copied_spot_placer,
             upscale_delay_seconds=override.pop('upscale_delay_seconds',
                                                self._upscale_delay_seconds),
             downscale_delay_seconds=override.pop('downscale_delay_seconds',
                                                  self._downscale_delay_seconds),
             load_balancing_policy=override.pop('load_balancing_policy',
                                                self._load_balancing_policy),
-            pool=override.pop('pool', self._pool),
+            pool=copied_pool,
             queue_length_threshold=override.pop('queue_length_threshold',
                                                 self._queue_length_threshold),
             consecutive_failure_threshold_timeout=override.pop(
                 'consecutive_failure_threshold_timeout',
                 self._consecutive_failure_threshold_timeout),
+            _preserved_placement_contract=copied_placement_contract,
+            _placement_contract_copy_token=(None if copied_placement_contract
+                                            is None else
+                                            _PLACEMENT_CONTRACT_COPY_TOKEN),
         )
-        if preserve_legacy_semantics:
-            # Preserve a legacy per-GPU version's pre-activation semantics
-            # through internal copies.  An explicit placer override is a new
-            # policy choice and keeps the constructor-derived semantics.
-            copied._spot_placer = copied_spot_placer  # pylint: disable=protected-access
-            copied._uses_logical_replicas = False  # pylint: disable=protected-access
-            for field, value in logical_scaling_values.items():
-                setattr(copied, f'_{field}', value)
         copied._lb_high_availability_specified = (  # pylint: disable=protected-access
             self._lb_high_availability_specified)
         return copied

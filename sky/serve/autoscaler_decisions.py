@@ -30,6 +30,12 @@ class LogicalScaleTarget:
     launch_budget: int | None = None
     launch_priority: int = constants.LB_REQUEST_PRIORITY_MIN
     launch_priority_by_accelerator: tuple[tuple[str, int], ...] = ()
+    # None is the legacy call shape, where the exact-card target itself is
+    # interpreted as launch authority.  New compatibility-aware decisions
+    # always carry an explicit map, including an empty tuple when no paid
+    # cold launch is authorized for this reconciliation generation.
+    cold_launch_authority_by_accelerator: (tuple[tuple[str, int], ...] |
+                                           None) = None
 
 
 @dataclasses.dataclass(frozen=True)

@@ -23,7 +23,12 @@ class ExecutionClass(enum.Enum):
 
 
 class HandlerClaimScope(enum.Enum):
-    """Closed worker population allowed to claim a handler."""
+    """Deprecated compatibility surface for released request plugins.
+
+    The dedicated authority claimant is retired.  ``GENERAL`` remains so
+    plugins written against released SkyPilot versions continue to register;
+    every other scope is rejected by :func:`register_handler`.
+    """
 
     GENERAL = 'general'
     RESOURCE_ACTION_AUTHORITY = 'resource_action_authority'
@@ -56,15 +61,6 @@ class HandlerRegistration:
     claim_scope: HandlerClaimScope = HandlerClaimScope.GENERAL
     aliases: tuple[str, ...] = ()
 
-
-RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST = (
-    'serve_shadow_candidate_launch',
-    'serve_shadow_candidate_down',
-    'serve_resource_action_launch',
-    'serve_resource_action_down',
-)
-_RESOURCE_ACTION_AUTHORITY_HANDLER_NAMES = frozenset(
-    RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST)
 
 _BUILTIN_HANDLER_MODULES = (
     'sky.catalog',
@@ -161,25 +157,9 @@ def register_handler(
         aliases: tuple[str, ...] = (),
 ) -> HandlerRegistration:
     """Register one durable handler and reject conflicting identities."""
+    if claim_scope is not HandlerClaimScope.GENERAL:
+        raise ValueError('Non-general handler claim scopes have been retired.')
     stable_name = name or _handler_name(func)
-    private_names = _RESOURCE_ACTION_AUTHORITY_HANDLER_NAMES
-    if stable_name in private_names:
-        if claim_scope is not HandlerClaimScope.RESOURCE_ACTION_AUTHORITY:
-            raise ValueError(
-                f'Private handler {stable_name!r} requires the resource-action '
-                'authority claim scope.')
-    elif claim_scope is HandlerClaimScope.RESOURCE_ACTION_AUTHORITY:
-        raise ValueError(
-            f'Authority claim scope is closed to {sorted(private_names)}.')
-    if private_names.intersection(aliases):
-        raise ValueError('Private handler names cannot be aliases.')
-    if claim_scope is HandlerClaimScope.RESOURCE_ACTION_AUTHORITY:
-        if (execution_class is not ExecutionClass.NORMAL or
-                replay_policy is not ReplayPolicy.NEVER or
-                cancellation_policy is not CancellationPolicy.FENCED_PROCESS or
-                aliases):
-            raise ValueError('Private authority handlers require NORMAL, '
-                             'NEVER, FENCED_PROCESS, and no aliases.')
     registration = HandlerRegistration(
         name=stable_name,
         func=func,
@@ -237,27 +217,11 @@ def register_builtin_handlers() -> None:
         try:
             for module_name in _BUILTIN_HANDLER_MODULES:
                 _register_module_handlers(module_name)
-            _register_resource_action_authority_handlers()
             _register_daemon_handlers()
             _register_payload_types()
             _BUILTINS_REGISTERED = True
         finally:
             _BUILTINS_REGISTRATION_IN_PROGRESS = False
-
-
-def _register_resource_action_authority_handlers() -> None:
-    """Register the closed private inventory outside the public scanner."""
-    module = importlib.import_module('sky.serve.resource_action_handlers')
-    for handler_name in RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST:
-        handler = getattr(module, handler_name)
-        register_handler(
-            handler,
-            name=handler_name,
-            execution_class=ExecutionClass.NORMAL,
-            replay_policy=ReplayPolicy.NEVER,
-            cancellation_policy=CancellationPolicy.FENCED_PROCESS,
-            claim_scope=HandlerClaimScope.RESOURCE_ACTION_AUTHORITY,
-        )
 
 
 def _register_daemon_handlers() -> None:
