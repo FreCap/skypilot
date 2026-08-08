@@ -552,7 +552,9 @@ recovered failures at most 15 seconds, no role/controller/phase observation in
 the eight-second bucket, and every safety, health, schema, state, event, and log
 gate passing.
 
-PR #1362 implemented that contract and merged as
+PR #1362 implemented the overlap and under-lock revalidation portions of that
+contract, while retaining the historical two-read Deployment owner helper. It
+merged as
 `0d6bd802bb32e2c35a3af7469e8968f4d39ea4b0`. Release `1.1.1171` and source
 image digest
 `sha256:830a2e317fcb9a9b80d39bc74046ca00b79925169dbf611db173999db8390343`
@@ -645,6 +647,18 @@ different fence or state is never shared, that cancelling one waiter does not
 poison its peer, that shared errors retain their deterministic fail-closed
 outcome, and that non-STABLE behavior is unchanged. The same immutable staging
 and fresh production readiness/+10/+30/+60 gates remain mandatory.
+
+PR #1369 completes the remaining read-only Kubernetes owner collapse. For HA
+Pod authority, the already-read Service supplies the exact API Deployment
+ownerReference. The helper validates its kind, name, non-empty UID, service
+incarnation label, and resource version, then performs one live Deployment UID
+read after the Service and requires equality. This retains the prior final
+replacement linearization point while removing the redundant pre-read.
+Mutation helpers keep both reads because they must construct a new desired
+ownerReference. Focused tests require exactly one live Deployment read on the
+HA authority path and fail-closed behavior when the Deployment is replaced.
+The immutable rollout artifact must include #1369 together with #1367, #1368,
+and the full controller-owner attestation correction above.
 
 ### Final-removal artifact evidence (2026-08-08)
 
