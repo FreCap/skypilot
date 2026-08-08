@@ -45,6 +45,7 @@ jobs:
           src/components/job-detail-logs.test.jsx \
           src/components/job-log-actions.test.jsx \
           src/components/jobs.test.jsx \
+          src/components/cluster-operational-events.test.jsx \
           src/components/pools-table.test.jsx \
           src/components/users.test.jsx \
           src/components/workspace-editor.test.jsx \

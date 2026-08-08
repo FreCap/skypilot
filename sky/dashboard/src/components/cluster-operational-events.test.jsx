@@ -129,6 +129,51 @@ describe('ClusterOperationalEvents', () => {
     });
   });
 
+  it('keeps the current page visible and retryable when load-more fails', async () => {
+    getOperationalEvents
+      .mockResolvedValueOnce({
+        items: [event('newer')],
+        next_cursor: 'older-cursor',
+      })
+      .mockRejectedValueOnce(new Error('append failed'))
+      .mockResolvedValueOnce({
+        items: [event('older', { kind: 'cluster.launch' })],
+        next_cursor: null,
+      });
+
+    render(
+      <ClusterOperationalEvents
+        clusterHash="hash-1"
+        clusterName="trainer"
+        workspace="research"
+      />
+    );
+    await screen.findByText('request-newer');
+
+    const loadMoreButton = screen.getByRole('button', { name: 'Load more' });
+    fireEvent.click(loadMoreButton);
+
+    expect(await screen.findByText('request-newer')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'Operational history refresh failed. Showing the last available page.'
+      )
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeEnabled();
+    expect(getOperationalEvents).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+
+    expect(await screen.findByText('request-older')).toBeInTheDocument();
+    expect(screen.getByText('request-newer')).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        'Operational history refresh failed. Showing the last available page.'
+      )
+    ).not.toBeInTheDocument();
+    expect(getOperationalEvents).toHaveBeenCalledTimes(3);
+  });
+
   it('ignores a stale response after cluster navigation', async () => {
     let resolveFirst;
     const first = new Promise((resolve) => {
