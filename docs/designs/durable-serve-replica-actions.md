@@ -26,6 +26,14 @@ effect ran through the proposed path. Source cleanup is not operationally
 complete until the exact merged compatibility artifact and this final-removal
 artifact are each deployed and pass their monitoring gates below.
 
+The combined HA latency fix through PRs #1367, #1369, and #1370 shipped as
+release `1.1.1176` and passed the exact `boltz-test` readiness/+10/+30 window.
+Its production +10 gate failed with one client timeout on each
+`boltz-l4-fleet` slot while the service controller was under provisioning
+pressure. Safety held, but completion is now blocked on the executor-isolation
+correction and a fresh exact-artifact production readiness/+10/+30/+60 window
+defined below.
+
 The review found one smaller, independent correctness gap in the existing
 Serve controller: an ordinary replica launch records its exact API request ID
 only in process memory. A controller restart can therefore lose the association
@@ -677,6 +685,86 @@ ownerReference. Focused tests require exactly one live Deployment read on the
 HA authority path and fail-closed behavior when the Deployment is replaced.
 The immutable rollout artifact must include #1369 together with #1367, #1368,
 and the full controller-owner attestation correction above.
+
+### HA role executor-isolation correction (2026-08-08)
+
+Release `1.1.1176` points exactly to merge
+`54184f7c7046d1113077f61232045d5e8fe4d6d7`. Its source image digest is
+`sha256:68b9869f4fcc7ae8fa752443b98ed779d827c5a6d1e734bc849b58bd49617cbc`;
+its chart digest is
+`sha256:04288f5d76edaf4658a6d0204667f27cba6f6ba61c3b6a0ef9f526d62600259b`.
+Direct-Helm `boltz-test` revision 104 passed readiness, +10, and +30 with the
+same six Pod UIDs, zero restarts, no new Warning or high-signal log event,
+healthy exact-version endpoints, empty retired state, and Spot-only placement.
+
+Production direct-Helm revision 373 deployed the same exact chart and image on
+the unchanged three fixed `m6i.8xlarge` nodes. A concurrent operator then
+created revision 374 with the same chart, image, values, and capacity; no API
+or LB Pod UID changed and no Pod restarted. The qualification clock was
+therefore restarted from a clean revision-374 T0 at 11:57:52 UTC.
+
+The production +10 checkpoint at 12:08:06 UTC failed the exact behavior gate.
+Each `boltz-l4-fleet` slot added one `client_timeout` outcome. The clients
+timed out at 12:06:15/12:06:16 UTC and recovered in 4.974/4.738 seconds. The
+controller returned those requests with HTTP 200 only at
+12:06:20.746/12:06:20.818 UTC, after the previous pair had completed at
+12:06:05.350/12:06:05.411 UTC. Other services' role requests continued to
+complete throughout that interval. All 17 exact-digest API/LB Pods remained
+Ready with zero restarts, all eight pairs retained the correct ACTIVE/STANDBY
+roles and complete owner/cutover state, the schema and retired-state gates
+remained clean, no Warning event was added, and fixed capacity was unchanged.
+This is another fix-forward latency failure, not a rollback trigger.
+
+The failing Kubernetes selector names one service incarnation and returned
+exactly its two LB Pods, so neither an unbounded Pod payload nor cross-service
+API-server failure explains this service-local stall. The live controller log
+shows fleet-wide sync and readiness-probe rounds over roughly 89 backends in
+the same process around the failure. Unrelated service controllers remained
+responsive. The role path currently submits both PostgreSQL authority reads
+and the shared Kubernetes snapshot to the controller event loop's default
+executor; fleet sync uses that same executor, while readiness probes use a
+separate high-fan-out pool in the same process. The cancelled requests did not
+publish their phase traces, so this evidence does not distinguish default-pool
+queue wait from PostgreSQL, Kubernetes, or process-wide scheduling delay. It
+does prove that the safety-critical role path retains an avoidable shared
+executor dependency and needs queue-delay telemetry. It does not justify
+weakening an owner fence, increasing the eight-second deadline, or reusing a
+completed authority snapshot.
+
+The bounded correction is:
+
+- Every HA controller owns one two-worker role executor. All blocking work
+  entered by `_handle_load_balancer_role`, including the pre-lock and
+  under-lock PostgreSQL reads, the shared STABLE Kubernetes snapshot, and
+  serialized transition operations, runs on this executor. Ordinary
+  provisioning, autoscaling, sync, and unrelated controller work remain on the
+  default executor and cannot occupy or queue ahead on the role executor. This
+  does not claim to isolate PostgreSQL capacity, Kubernetes latency, the GIL,
+  or the readiness-probe pool; the exact rollout gate remains authoritative.
+- The executor changes only scheduling isolation. The complete owner/fence and
+  cutover record is still read before the Kubernetes snapshot and compared
+  byte-for-byte with a second read under the role lock. The exact Service then
+  live-Deployment owner ordering, in-flight-only snapshot sharing, session
+  ledger, state machine, demand lock, and every mutation fence remain
+  unchanged. There is no TTL, completed-result cache, fallback authority, or
+  added capacity.
+- Two workers are sufficient for the two independently arriving slot
+  pre-reads while the identical STABLE provider snapshot remains coalesced.
+  The pool is fixed-size, created only for HA controllers, and shut down by the
+  controller lifespan. Executor queue delay is exposed separately from the
+  blocking operation's total latency so a future scheduling regression is
+  attributable.
+
+Focused tests must saturate a one-worker default executor, prove it is still
+blocked, and require a real HA role request to return the exact intended role
+through the dedicated executor. Existing exact-key sharing, cancellation,
+owner replacement, complete-row mismatch, non-STABLE transition, and all
+external-load-balancer suites remain mandatory. Completion requires a new
+immutable exact-merge artifact, direct-Helm staging readiness/+10/+30, and a
+fresh direct-Helm production readiness/+10/+30/+60 window with zero incremental
+`client_timeout`, no role/controller/phase observation in the eight-second
+bucket, recovery at most 15 seconds, unchanged fixed capacity, and every
+safety, state, schema, event, log, health, and restart gate passing.
 
 ### Final-removal artifact evidence (2026-08-08)
 
