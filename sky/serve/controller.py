@@ -1746,6 +1746,15 @@ class SkyServeController:
         if (owner is None or not owner.get('lb_ha_enabled') or
                 not owner.get('hash') or owner.get('lifecycle_epoch') is None):
             return None
+        try:
+            live_owner_fingerprint = (
+                serve_utils.make_controller_owner_fingerprint(
+                    owner.get('hash'), owner.get('controller_pid'),
+                    owner.get('controller_ip'), owner.get('controller_port')))
+        except serve_utils.ControllerOwnerError:
+            return None
+        if live_owner_fingerprint != self._controller_owner_fingerprint:
+            return None
         expected_owner = self._controller_owner
         actual_owner = (owner.get('controller_pid'), owner.get('controller_ip'))
         if expected_owner is None or actual_owner != expected_owner:
