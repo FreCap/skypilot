@@ -30,7 +30,14 @@ from sky.serve import serve_state
 
 _SERVICE_NAME = 'svc-production-shaped-retirement'
 _RESOURCE_SCOPE = 'service-incarnation-a'
-_VERSION_COUNT = 49
+_VERSION_IDS = (1, 2, 4, 5, 6, 7, 8, 9, *range(11, 52))
+_VERSION_COUNT = len(_VERSION_IDS)
+_CURRENT_VERSION = max(_VERSION_IDS)
+_HISTORICAL_VERSION = 2
+_LEGACY_NULL_VERSION_IDS = frozenset({1, 2, 4, 5, 6, 7})
+_LEGACY_NULL_VERSION_COUNT = len(_LEGACY_NULL_VERSION_IDS)
+_TIMESTAMP_BOUNDARY_VERSION = 8
+_TIMESTAMP_BOUNDARY_CREATED_AT = 100.0 + _TIMESTAMP_BOUNDARY_VERSION
 _ROW_BOUND = 100
 _PREDECESSOR_COMMIT = 'b' * 40
 _PRODUCTION_SNAPSHOT_PATH = pathlib.Path(__file__).with_name(
@@ -71,6 +78,33 @@ service: {{}}
 def _zero_evidence() -> placement_contract_normalization._ExternalEvidence:
     return placement_contract_normalization._ExternalEvidence(count=0,
                                                               digest='0' * 64)
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+
+
+def _expected_timestamp_inventory() -> list[list[Any]]:
+    service_name_sha256 = hashlib.sha256(_SERVICE_NAME.encode()).hexdigest()
+    inventory = []
+    for version in _VERSION_IDS:
+        legacy_null = version in _LEGACY_NULL_VERSION_IDS
+        intent_key_sha256 = _canonical_json_sha256(
+            [_SERVICE_NAME, _RESOURCE_SCOPE, f'generation-{version:02d}'])
+        inventory.append([
+            service_name_sha256,
+            version,
+            'committed',
+            'legacy_prefix_null' if legacy_null else 'finite',
+            None if legacy_null else 100.0 + version,
+            _TIMESTAMP_BOUNDARY_VERSION if legacy_null else None,
+            _TIMESTAMP_BOUNDARY_CREATED_AT if legacy_null else None,
+            intent_key_sha256,
+            float(version),
+        ])
+    return inventory
 
 
 def _no_resource_actions(
@@ -187,8 +221,14 @@ def _read_normalization_inventory(
 def _seed_retirement_fixture(
     engine: sqlalchemy.engine.Engine,
     monkeypatch: pytest.MonkeyPatch,
+    timestamp_case: str = 'production',
 ) -> _RetirementFixture:
     """Create a production-shaped inventory and completed protocol-1 proof."""
+    if timestamp_case not in {
+            'production', 'null_after_boundary', 'no_finite_boundary',
+            'legacy_intent_after_boundary', 'finite_intent_after_version'
+    }:
+        raise ValueError(f'Unknown timestamp case: {timestamp_case}')
     serve_state.Base.metadata.create_all(engine)
     monkeypatch.setattr(sky, '__commit__', 'a' * 40)
     historical_payload = zlib.decompress(
@@ -196,14 +236,28 @@ def _seed_retirement_fixture(
     successor_payload = _explicit_v2_payload()
     version_rows = []
     intent_rows = []
-    for version in range(1, _VERSION_COUNT + 1):
+    for version in _VERSION_IDS:
         yaml_content = _cleanup_yaml(version)
+        version_created_at = (None if version in _LEGACY_NULL_VERSION_IDS else
+                              100.0 + version)
+        intent_created_at = float(version)
+        if timestamp_case == 'null_after_boundary' and version == 9:
+            version_created_at = None
+        elif timestamp_case == 'no_finite_boundary':
+            version_created_at = None
+        elif (timestamp_case == 'legacy_intent_after_boundary' and
+              version == 1):
+            intent_created_at = _TIMESTAMP_BOUNDARY_CREATED_AT + 1.0
+        elif (timestamp_case == 'finite_intent_after_version' and version == 9):
+            assert version_created_at is not None
+            intent_created_at = version_created_at + 1.0
         version_rows.append({
             'service_name': _SERVICE_NAME,
             'version': version,
-            'spec': historical_payload if version == 1 else successor_payload,
+            'spec': (historical_payload
+                     if version == _HISTORICAL_VERSION else successor_payload),
             'yaml_content': yaml_content,
-            'created_at': 10.0 + version,
+            'created_at': version_created_at,
             'created_by': 'test',
         })
         intent_rows.append({
@@ -214,7 +268,7 @@ def _seed_retirement_fixture(
             'pool': 0,
             'lifecycle_epoch': 7,
             'provisional': 1,
-            'created_at': float(version),
+            'created_at': intent_created_at,
         })
 
     with engine.begin() as connection:
@@ -222,8 +276,8 @@ def _seed_retirement_fixture(
             name=_SERVICE_NAME,
             workspace='workspace',
             status=serve_state.ServiceStatus.READY.value,
-            current_version=_VERSION_COUNT,
-            active_versions=f'[{_VERSION_COUNT}]',
+            current_version=_CURRENT_VERSION,
+            active_versions=f'[{_CURRENT_VERSION}]',
             pool=0,
             controller_pid=123,
             controller_ip='10.0.0.1',
@@ -280,10 +334,11 @@ def _seed_retirement_fixture(
                     predecessor_run_id)).scalar_one()
     assert manifest_identity == f'1:{"a" * 40}'
     return _RetirementFixture(predecessor_run_id, historical_payload,
-                              _cleanup_yaml(1), _read_intents(engine))
+                              _cleanup_yaml(_HISTORICAL_VERSION),
+                              _read_intents(engine))
 
 
-def test_protocol_v2_reader_accepts_exact_production_protocol_v1_snapshot():
+def test_current_reader_accepts_exact_production_protocol_v1_snapshot():
     """The current reader validates the complete secret-free production run."""
     compressed = base64.b64decode(_PRODUCTION_SNAPSHOT_PATH.read_text())
     raw_snapshot = zlib.decompress(compressed)
@@ -463,7 +518,7 @@ def _assert_database_unchanged_after_failed_retirement(
         candidate = connection.execute(
             sqlalchemy.select(versions).where(
                 versions.c.service_name == _SERVICE_NAME,
-                versions.c.version == 1)).mappings().one()
+                versions.c.version == _HISTORICAL_VERSION)).mappings().one()
         manifest_ids = connection.execute(
             sqlalchemy.select(runs.c.run_id).order_by(
                 runs.c.started_at)).scalars().all()
@@ -484,7 +539,7 @@ def _assert_database_unchanged_after_failed_retirement(
                               fixture.predecessor_run_id, _PREDECESSOR_COMMIT)
 
 
-def test_postgres_protocol_v2_retires_production_shaped_cleanup_inventory(
+def test_postgres_protocol_v3_retires_production_shaped_cleanup_inventory(
         empty_postgres, monkeypatch):
     engine = empty_postgres
     fixture = _seed_retirement_fixture(engine, monkeypatch)
@@ -515,8 +570,8 @@ def test_postgres_protocol_v2_retires_production_shaped_cleanup_inventory(
         candidate = dict(
             connection.execute(
                 sqlalchemy.select(versions).where(
-                    versions.c.service_name == _SERVICE_NAME,
-                    versions.c.version == 1)).mappings().one())
+                    versions.c.service_name == _SERVICE_NAME, versions.c.version
+                    == _HISTORICAL_VERSION)).mappings().one())
         manifest = dict(
             connection.execute(
                 sqlalchemy.select(runs).where(
@@ -533,11 +588,12 @@ def test_postgres_protocol_v2_retires_production_shaped_cleanup_inventory(
     assert candidate['retired_yaml_content'] == fixture.historical_yaml
     assert candidate['retired_at'] == 201.0
     assert candidate['retirement_run_id'] == run_id
-    assert manifest['normalizer_version'] == f'2:{"a" * 40}'
+    assert manifest['normalizer_version'] == f'3:{"a" * 40}'
     assert not placement_contract_normalization._ledger_manifest_mismatches(
         manifest, entries)
-    candidate_ledger = next(entry for entry in entries if entry['version'] == 1)
-    assert placement_contract_normalization._retirement_ledger_v2_facts_are_complete(
+    candidate_ledger = next(
+        entry for entry in entries if entry['version'] == _HISTORICAL_VERSION)
+    assert placement_contract_normalization._retirement_ledger_v3_facts_are_complete(
         candidate_ledger)
     facts = candidate_ledger['dependency_facts']
     assert facts['cleanup_intent_inventory_count'] == _VERSION_COUNT
@@ -546,8 +602,63 @@ def test_postgres_protocol_v2_retires_production_shaped_cleanup_inventory(
     assert facts['cleanup_candidate_match_count'] == 1
     assert facts['cleanup_candidate_deletion_target_count'] == 0
     assert facts['cleanup_intent_deletion_target_count'] == 0
+    assert facts['cleanup_version_timestamp_service_count'] == 1
+    assert facts['cleanup_version_timestamp_inventory_count'] == _VERSION_COUNT
+    assert facts['cleanup_version_timestamp_matched_intent_count'] == (
+        _VERSION_COUNT)
+    assert facts['cleanup_legacy_null_version_timestamp_count'] == (
+        _LEGACY_NULL_VERSION_COUNT)
+    assert facts['cleanup_timestamp_boundary_count'] == 1
+    timestamp_inventory_sha256 = facts[
+        'cleanup_version_timestamp_inventory_sha256']
+    expected_timestamp_inventory_sha256 = _canonical_json_sha256(
+        _expected_timestamp_inventory())
+    assert timestamp_inventory_sha256 == expected_timestamp_inventory_sha256
+    assert facts['cleanup_candidate_version_created_at_mode'] == (
+        'legacy_prefix_null')
+    assert facts['cleanup_candidate_legacy_timestamp_boundary_version'] == (
+        _TIMESTAMP_BOUNDARY_VERSION)
+    timestamp_proof_sha256 = facts['cleanup_timestamp_proof_sha256']
+    assert timestamp_proof_sha256 == _canonical_json_sha256({
+        'cleanup_contract_schema': 'skyserve-ephemeral-storage-retirement-v3',
+        'cleanup_version_timestamp_service_count': 1,
+        'cleanup_version_timestamp_inventory_count': _VERSION_COUNT,
+        'cleanup_version_timestamp_matched_intent_count': _VERSION_COUNT,
+        'cleanup_legacy_null_version_timestamp_count': _LEGACY_NULL_VERSION_COUNT,
+        'cleanup_timestamp_boundary_count': 1,
+        'cleanup_version_timestamp_inventory_sha256': expected_timestamp_inventory_sha256,
+        'cleanup_candidate_service_name_sha256': hashlib.sha256(
+            _SERVICE_NAME.encode()).hexdigest(),
+        'cleanup_candidate_version': _HISTORICAL_VERSION,
+        'cleanup_candidate_version_created_at_mode': 'legacy_prefix_null',
+        'cleanup_candidate_legacy_timestamp_boundary_version': _TIMESTAMP_BOUNDARY_VERSION,
+        'cleanup_intent_key_sha256': _canonical_json_sha256(
+            [_SERVICE_NAME, _RESOURCE_SCOPE, 'generation-02']),
+    })
+    assert timestamp_proof_sha256 != timestamp_inventory_sha256
     assert facts['predecessor_receipt_inventory_count'] == 1
     assert facts['approved_loaded_image_commit_count'] == 1
+
+
+@pytest.mark.parametrize('timestamp_case', [
+    'null_after_boundary',
+    'no_finite_boundary',
+    'legacy_intent_after_boundary',
+    'finite_intent_after_version',
+])
+def test_postgres_protocol_v3_rejects_invalid_cleanup_timestamp_topology(
+        empty_postgres, monkeypatch, timestamp_case):
+    engine = empty_postgres
+    fixture = _seed_retirement_fixture(engine,
+                                       monkeypatch,
+                                       timestamp_case=timestamp_case)
+
+    timestamps = iter((200.0, 201.0, 202.0))
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker):
+        placement_contract_normalization.run_operator(
+            **_retirement_kwargs(engine), now=lambda: next(timestamps))
+
+    _assert_database_unchanged_after_failed_retirement(engine, fixture)
 
 
 @pytest.mark.parametrize('failure_point', ['cas', 'postimage'])

@@ -253,7 +253,7 @@ def _build_test_cleanup_plan(
 ) -> placement_contract_normalization._CleanupIntentPlan:
     intents = _attach_cleanup_intent_inputs(rows, service_rows)
     return placement_contract_normalization._build_cleanup_intent_plan(
-        intents, rows, service_rows, row_bound=max(1, len(intents)))
+        intents, rows, service_rows, row_bound=max(1, len(intents), len(rows)))
 
 
 def _test_predecessor_receipt_evidence(
@@ -1152,7 +1152,7 @@ def test_cleanup_plan_rejects_scope_under_wrong_metadata_key():
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match='wrong Task metadata field'):
         placement_contract_normalization._build_cleanup_intent_plan(
-            intents, rows, service_rows, row_bound=1)
+            intents, rows, service_rows, row_bound=2)
 
 
 @pytest.mark.parametrize(('field', 'value', 'match'), [
@@ -1167,7 +1167,7 @@ def test_cleanup_plan_rejects_false_lookalike_integer_fields(
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match=match):
         placement_contract_normalization._build_cleanup_intent_plan(
-            intents, rows, service_rows, row_bound=1)
+            intents, rows, service_rows, row_bound=2)
 
 
 def test_cleanup_plan_rejects_yaml_scope_mismatch():
@@ -1178,7 +1178,7 @@ def test_cleanup_plan_rejects_yaml_scope_mismatch():
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match='YAML scope disagrees'):
         placement_contract_normalization._build_cleanup_intent_plan(
-            intents, rows, service_rows, row_bound=1)
+            intents, rows, service_rows, row_bound=2)
 
 
 def test_cleanup_plan_rejects_duplicate_yaml_version_mapping():
@@ -1190,7 +1190,7 @@ def test_cleanup_plan_rejects_duplicate_yaml_version_mapping():
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match='generation is reused'):
         placement_contract_normalization._build_cleanup_intent_plan(
-            intents, rows, service_rows, row_bound=1)
+            intents, rows, service_rows, row_bound=2)
 
 
 def test_cleanup_plan_rejects_generation_reused_by_different_version_yaml():
@@ -1203,7 +1203,7 @@ def test_cleanup_plan_rejects_generation_reused_by_different_version_yaml():
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match='generation|multiple live'):
         placement_contract_normalization._build_cleanup_intent_plan(
-            intents, rows, service_rows, row_bound=1)
+            intents, rows, service_rows, row_bound=2)
 
 
 def test_cleanup_plan_rejects_future_lifecycle_epoch():
@@ -1213,7 +1213,7 @@ def test_cleanup_plan_rejects_future_lifecycle_epoch():
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match='future lifecycle epoch'):
         placement_contract_normalization._build_cleanup_intent_plan(
-            intents, rows, service_rows, row_bound=1)
+            intents, rows, service_rows, row_bound=2)
 
 
 def test_cleanup_plan_rejects_nonzero_deletion_target():
@@ -1223,7 +1223,65 @@ def test_cleanup_plan_rejects_nonzero_deletion_target():
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match='nonzero deletion target'):
         placement_contract_normalization._build_cleanup_intent_plan(
-            intents, rows, service_rows, row_bound=1)
+            intents, rows, service_rows, row_bound=2)
+
+
+def test_cleanup_plan_rejects_null_timestamp_after_finite_boundary():
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    rows[1].original['created_at'] = None
+    rows[1].result['created_at'] = None
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='NULL.*after.*finite|strict.*NULL.*prefix'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=2)
+
+
+def test_cleanup_plan_rejects_all_null_version_timestamps():
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    for row in rows:
+        row.original['created_at'] = None
+        row.result['created_at'] = None
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='finite.*boundary|all.*NULL'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=2)
+
+
+@pytest.mark.parametrize(
+    'created_at', [True, '1.0', -1.0,
+                   float('inf'), float('nan')],
+    ids=['bool', 'string', 'negative', 'infinity', 'nan'])
+def test_cleanup_plan_rejects_malformed_version_timestamp(created_at):
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    rows[0].original['created_at'] = created_at
+    rows[0].result['created_at'] = created_at
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='invalid.*timestamp'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=2)
+
+
+@pytest.mark.parametrize(('candidate_created_at', 'successor_created_at'), [
+    (1.0, 2.0),
+    (None, 2.0),
+],
+                         ids=['finite-version', 'legacy-null-prefix'])
+def test_cleanup_plan_rejects_intent_after_timestamp_bound(
+        candidate_created_at, successor_created_at):
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    rows[0].original['created_at'] = candidate_created_at
+    rows[0].result['created_at'] = candidate_created_at
+    rows[1].original['created_at'] = successor_created_at
+    rows[1].result['created_at'] = successor_created_at
+    intents[0]['created_at'] = 3.0
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='created after|newer than'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=2)
 
 
 def test_multirow_retirement_proves_a_surviving_successor():
@@ -1232,6 +1290,11 @@ def test_multirow_retirement_proves_a_surviving_successor():
     historical_one = _normalizer_work(historical_payload, 1)
     historical_two = _normalizer_work(historical_payload, 2)
     successor = _normalizer_work(_explicit_v2_payload(), 3)
+    for historical in (historical_one, historical_two):
+        historical.original['created_at'] = None
+        historical.result['created_at'] = None
+    successor.original['created_at'] = 2.0
+    successor.result['created_at'] = 2.0
     rows = [historical_one, historical_two, successor]
     service_rows = {'svc': _retirement_service_row(current_version=3)}
     cleanup_plan = _build_test_cleanup_plan(rows, service_rows)
@@ -1271,13 +1334,94 @@ def test_multirow_retirement_proves_a_surviving_successor():
     assert historical_one.dependency_facts['parent_non_pool_proved'] is True
     assert historical_one.dependency_facts[
         'resource_action_mode_legacy_inert'] is True
+    timestamp_global_facts = {
+        'cleanup_version_timestamp_service_count': 1,
+        'cleanup_version_timestamp_inventory_count': 3,
+        'cleanup_version_timestamp_matched_intent_count': 2,
+        'cleanup_legacy_null_version_timestamp_count': 2,
+        'cleanup_timestamp_boundary_count': 1,
+    }
+    for field, expected in timestamp_global_facts.items():
+        assert historical_one.dependency_facts[field] == expected
+        assert historical_two.dependency_facts[field] == expected
+    assert placement_contract_normalization._is_sha256(
+        historical_one.
+        dependency_facts['cleanup_version_timestamp_inventory_sha256'])
+    assert historical_one.dependency_facts[
+        'cleanup_candidate_version_created_at_mode'] == 'legacy_prefix_null'
+    assert historical_one.dependency_facts[
+        'cleanup_candidate_legacy_timestamp_boundary_version'] == 3
+    assert placement_contract_normalization._is_sha256(
+        historical_one.dependency_facts['cleanup_timestamp_proof_sha256'])
     ledger_entry = {
+        'service_name': 'svc',
         'version': 1,
+        'original_column_sha256s': {
+            'created_at': placement_contract_normalization._value_sha256(None),
+        },
         'dependency_facts': historical_one.dependency_facts,
     }
     assert (
         placement_contract_normalization._retirement_ledger_facts_are_complete(
+            ledger_entry, protocol=3))
+
+    protocol_2_facts = {
+        field: value
+        for field, value in historical_one.dependency_facts.items()
+        if field not in
+        placement_contract_normalization._CLEANUP_PROTOCOL_V3_ONLY_FIELDS
+    }
+    protocol_2_facts['cleanup_contract_schema'] = (
+        placement_contract_normalization._CLEANUP_PROOF_SCHEMA_V2)
+    assert (
+        placement_contract_normalization._retirement_ledger_facts_are_complete(
+            {
+                'service_name': 'svc',
+                'version': 1,
+                'original_column_sha256s': {
+                    'created_at':
+                        placement_contract_normalization._value_sha256(1.0),
+                },
+                'dependency_facts': protocol_2_facts,
+            },
+            protocol=2))
+    assert not (
+        placement_contract_normalization._retirement_ledger_facts_are_complete(
             ledger_entry, protocol=2))
+    assert not (
+        placement_contract_normalization._retirement_ledger_facts_are_complete(
+            {
+                **ledger_entry,
+                'dependency_facts': protocol_2_facts,
+            }, protocol=2))
+
+    for field in placement_contract_normalization._CLEANUP_PROTOCOL_V3_ONLY_FIELDS:
+        missing_facts = dict(historical_one.dependency_facts)
+        missing_facts.pop(field)
+        assert not (placement_contract_normalization.
+                    _retirement_ledger_facts_are_complete(
+                        {
+                            **ledger_entry,
+                            'dependency_facts': missing_facts,
+                        },
+                        protocol=3)), field
+
+    for field, valid_looking_value in (
+        ('cleanup_version_timestamp_inventory_sha256', 'd' * 64),
+        ('cleanup_version_timestamp_inventory_count', 4),
+        ('cleanup_candidate_version_created_at_mode', 'finite'),
+        ('cleanup_candidate_legacy_timestamp_boundary_version', 2),
+        ('cleanup_timestamp_proof_sha256', 'd' * 64),
+    ):
+        tampered_facts = dict(historical_one.dependency_facts)
+        tampered_facts[field] = valid_looking_value
+        assert not (placement_contract_normalization.
+                    _retirement_ledger_facts_are_complete(
+                        {
+                            **ledger_entry,
+                            'dependency_facts': tampered_facts,
+                        },
+                        protocol=3)), field
     for field, contradictory_value in (
         ('service_pool', 1),
         ('service_resource_action_mode', 'shadow'),
@@ -1288,10 +1432,10 @@ def test_multirow_retirement_proves_a_surviving_successor():
         assert not (placement_contract_normalization.
                     _retirement_ledger_facts_are_complete(
                         {
-                            'version': 1,
+                            **ledger_entry,
                             'dependency_facts': tampered_facts,
                         },
-                        protocol=2))
+                        protocol=3))
     for field, false_lookalike in (
         ('replica_count', False),
         ('cleanup_candidate_deletion_target_count', False),
@@ -1309,10 +1453,10 @@ def test_multirow_retirement_proves_a_surviving_successor():
         assert not (placement_contract_normalization.
                     _retirement_ledger_facts_are_complete(
                         {
-                            'version': 1,
+                            **ledger_entry,
                             'dependency_facts': tampered_facts,
                         },
-                        protocol=2)), field
+                        protocol=3)), field
     assert historical_one.result['yaml_content'] is None
     assert historical_two.result['yaml_content'] is None
     assert successor.result['yaml_content'] == 'service: {}'

@@ -11,6 +11,7 @@ from sky.serve import serve_state
 @pytest.mark.parametrize('protocol', [
     placement_normalization_identity.PROTOCOL_V1,
     placement_normalization_identity.PROTOCOL_V2,
+    placement_normalization_identity.PROTOCOL_V3,
 ])
 def test_parse_normalizer_identity_accepts_exact_supported_protocols(protocol):
     commit = '0123456789abcdef' * 2 + '01234567'
@@ -31,7 +32,7 @@ def test_parse_normalizer_identity_accepts_exact_supported_protocols(protocol):
     '2',
     '2:',
     f'0:{"a" * 40}',
-    f'3:{"a" * 40}',
+    f'4:{"a" * 40}',
     f'02:{"a" * 40}',
     f'2:{"a" * 39}',
     f'2:{"a" * 41}',
@@ -52,7 +53,7 @@ def test_format_normalizer_identity_emits_only_current_protocol():
 
     value = placement_normalization_identity.format_normalizer_identity(commit)
 
-    assert value == f'2:{commit}'
+    assert value == f'3:{commit}'
     assert placement_normalization_identity.parse_normalizer_identity(
         value).protocol == placement_normalization_identity.CURRENT_PROTOCOL
 
@@ -94,7 +95,7 @@ def test_parse_manifest_mode_rejects_aliases_and_coercions(mode):
         placement_normalization_identity.parse_manifest_mode(mode)
 
 
-@pytest.mark.parametrize('protocol', [1, 2])
+@pytest.mark.parametrize('protocol', [1, 2, 3])
 def test_manifest_outcome_dispatch_is_mode_bound(protocol):
     identity = placement_normalization_identity.parse_normalizer_identity(
         f'{protocol}:{"c" * 40}')
@@ -138,7 +139,7 @@ def _manifest_row(normalizer_version):
     }
 
 
-@pytest.mark.parametrize('protocol', [1, 2])
+@pytest.mark.parametrize('protocol', [1, 2, 3])
 def test_serve_state_manifest_accepts_each_supported_identity(protocol):
     row = _manifest_row(f'{protocol}:{"b" * 40}')
 
@@ -150,7 +151,7 @@ def test_serve_state_manifest_accepts_each_supported_identity(protocol):
 
 @pytest.mark.parametrize('normalizer_version', [
     '1:test',
-    f'3:{"b" * 40}',
+    f'4:{"b" * 40}',
     f'2:{"B" * 40}',
     f'2:{"b" * 40}-dirty',
 ])
