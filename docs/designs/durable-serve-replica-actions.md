@@ -27,9 +27,11 @@ compatibility shim; its retired authority value is rejected and does not affect
 queue selection.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
-cleanup is not operationally complete until the exact merged compatibility
-artifact and this final-removal artifact are each deployed and pass their
-monitoring gates below.
+cleanup is merged and deployed, but operational closeout remains open: the
+final-removal artifact preserved every safety and retired-state invariant while
+failing its exact +60 heartbeat-latency comparator. PR #1355 merged the bounded
+fix as `606b4b29703dd2a6e69f57e49db685e85a3c6468`; its immutable artifact must
+still be deployed and pass the fresh production qualification below.
 
 The combined HA latency fix through PRs #1367, #1369, and #1370 shipped as
 release `1.1.1176` and passed the exact `boltz-test` readiness/+10/+30 window.
@@ -1014,8 +1016,9 @@ heads remain API008, Serve039, state028, and capacity001. Every private-handler
 request, gated relation, and gated nullable value remains empty or null. All
 eight HA services are `STABLE` with no pending or draining transition, and each
 Service selector and generation matches the durable slot state. The +10-,
-+30-, and issue-#1349-aware +60-minute production monitoring gates remain
-required below.
++30-, and issue-#1349-aware +60-minute production monitoring results are
+recorded below. The original +60 comparison failed, so a fresh window on the
+bounded fix remains required.
 
 The readiness window was not timeout-free. Counters retained from rollout show
 two and three recovered `client_timeout` outcomes on the `boltz-l4-fleet`
@@ -1074,6 +1077,40 @@ limit. Revision 369 therefore cannot close R0 even though its safety and
 retired-state invariants remain intact. The bounded #1349 fix must pass a fresh
 window before the retirement can be declared production-complete.
 
+The exact +60 window ended at 05:40:17 UTC and confirmed that failure without
+finding a safety regression. Exact-line-deduplicated current-incarnation logs
+contained 1,843 role completions, all HTTP 200, but 64 adjacent completion gaps
+of at least eight seconds (64/hour, versus the at-most-24 limit). The maximum
+gap was 44.946 seconds and the head/tail coverage gaps were 0.566/0.500 seconds.
+Controller sync passed at three 503s in 186 attempts (1.6129%, versus the 3.44%
+limit); the failures at 04:59:07.635, 05:14:00.478, and 05:31:15.174 UTC each
+had a same-cycle LB error and traceback and then recovered. There was no
+proxy-only 503.
+
+Both exact `boltz-l4-fleet` slots ended successfully in generation 160, synced
+and non-draining, with no active failure streak. ACTIVE/STANDBY role p99 was
+8.9988/8.9982 seconds, controller p99 7.8955/8.5815, lock-wait maximum
+6.5713/7.6686, lock-hold p99 7.7653/8.2385, pod-authority maximum
+7.7317/6.7360, and routing-read maximum 7.3040/8.1605. Maximum recovered
+failure duration was 40.372/39.773 seconds: below this cleanup comparison's
+60-second safety ceiling, but above issue #1349's 15-second qualification.
+The exact window contained 105 pre-classified recovered heartbeat warnings
+(53 retaining ACTIVE and 52 retaining STANDBY), the six lines belonging to the
+three correlated sync failures, no unexpected application severity, and no
+Kubernetes Warning event.
+
+The final safety audit kept all 17 workloads Ready and available on the exact
+digest with zero restarts. Health and version, the four schema heads, empty
+private and gated state, nullable retirement fields, all eight `STABLE` HA
+rows, Service selectors/generations, fresh-heartbeat rows, authority-object
+absence, and the fixed three-node capacity bound remained correct. Local
+observer access was interrupted from 05:20:38-05:26:42 UTC by expired SSO and
+from 05:34:32.011-05:36:59 UTC by an SSM/WebSocket loss. Persisted controller
+logs, retained Kubernetes logs/events, unchanged Pod UIDs, and zero restarts
+backfilled both intervals; neither interruption is attributed to production.
+The evidence manifest SHA-256 is
+`f9e9bcd638000aed2deb5c170605f259d0909cd7e63239bee5409fdea680f162`.
+
 PR #1355 owns that bounded fix. It replaces the duplicated steady-role Pod and
 Service authority reads with one fail-closed snapshot under the existing role
 lock. The snapshot keeps the PostgreSQL owner/hash/lifecycle/state fence,
@@ -1081,8 +1118,10 @@ incarnation-scoped Pod UIDs and slots, exact Service ownership and
 resourceVersion, runtime revision, and both live API Deployment UID reads. It
 reduces the successful steady heartbeat from seven sequential Kubernetes
 requests to four without caching authority or adding another execution path.
-Its exact-head CI, merge, immutable-artifact rollout, and fresh 60-minute
-production comparison remain open.
+Its 203 focused tests and exact-head CI passed, and PR #1355 merged as
+`606b4b29703dd2a6e69f57e49db685e85a3c6468`. Immutable-artifact publication,
+the zero-incremental-capacity rollout, and a fresh 60-minute production
+qualification remain open.
 
 ### R0 manual test plan
 
@@ -1194,15 +1233,15 @@ approved canary:
   passed, and physical capacity returned to the 10-node / 80-vCPU baseline.
 - [ ] Merge this canonical follow-up after it records the complete production
   monitor and the third deployment-sequencing departure.
-- [ ] Merge PR #1355 after exact-head CI, deploy its immutable artifact with
-  zero incremental provider capacity, and pass a fresh readiness, +10, +30,
-  and exact 60-minute production window before closing the failed comparator.
-- [ ] Complete PR #1346's production monitoring. Revision 369 deployed the
-  exact artifact, all 17 workloads converged at 04:40:17 UTC, and the readiness
-  and +10-minute audits passed. The +30 safety/state audit passed, but the
-  issue-#1349-aware comparison irreversibly failed at 25 gaps before +60; a
-  bounded fix and fresh passing production window are required before closing
-  R0.
+- [ ] Publish and deploy PR #1355's merged immutable artifact with zero
+  incremental provider capacity, then pass a fresh readiness, +10, +30, and
+  exact 60-minute production window before closing the failed comparator. The
+  PR passed 30/30 checks and merged as `606b4b29703dd2a6e69f57e49db685e85a3c6468`.
+- [x] Complete PR #1346's production monitoring. Revision 369 deployed the
+  exact artifact and passed its readiness, +10, +30 safety/state, sync-rate,
+  and 60-second recovery-safety gates. Its exact +60 comparison failed at 64
+  role gaps versus the allowed 24, so the completed result holds R0 open and
+  requires PR #1355's fresh passing window.
 - [x] Record R1 ownership and its telemetry-first disposition: issue #1352 owns
   an existing-executor durable binding; it is independent of R0 and must not
   revive the authority stack.
