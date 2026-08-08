@@ -446,10 +446,12 @@ class SkyServeController:
         self._lb_ha_enabled = (durable_lb_state.enabled
                                if durable_lb_state is not None else
                                service_spec.lb_high_availability is True)
-        self._lb_role_executor: concurrent.futures.ThreadPoolExecutor | None = (
+        # Threads are created lazily.  Establish this interface for every
+        # controller so an in-place legacy-to-HA transition cannot silently
+        # submit role authority reads to asyncio's shared default executor.
+        self._lb_role_executor: concurrent.futures.ThreadPoolExecutor = (
             concurrent.futures.ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix='skyserve-ha-role')
-            if self._lb_ha_enabled else None)
+                max_workers=2, thread_name_prefix='skyserve-ha-role'))
         self._lb_session_ledger = (lb_ha.LbSessionLedger(
             serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
@@ -583,9 +585,7 @@ class SkyServeController:
         try:
             yield
         finally:
-            executor = self._lb_role_executor
-            if executor is not None:
-                executor.shutdown(wait=False, cancel_futures=True)
+            self._lb_role_executor.shutdown(wait=False, cancel_futures=True)
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:

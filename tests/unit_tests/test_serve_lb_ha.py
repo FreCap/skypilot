@@ -613,7 +613,8 @@ def _role_controller() -> controller.SkyServeController:
     ctrl._service_name = 'service'
     ctrl._resource_scope = None
     ctrl._lb_ha_enabled = True
-    ctrl._lb_role_executor = None
+    ctrl._lb_role_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix='test-skyserve-ha-role')
     ctrl._lb_role_lock = None
     ctrl._lb_role_snapshot_task = None
     ctrl._lb_role_snapshot_key = None

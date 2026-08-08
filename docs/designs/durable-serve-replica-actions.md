@@ -934,15 +934,16 @@ phase trace, that earlier sample could not distinguish default-executor queue
 delay from a PostgreSQL, Kubernetes, GIL, or process-scheduling stall.
 
 PR #1373 therefore made the independently justified scheduling correction. It
-gives every HA controller a fixed two-worker role executor for all blocking
-work in `_handle_load_balancer_role`, including both PostgreSQL reads, the
-shared STABLE snapshot, and serialized transition work. Ordinary provisioning,
-autoscaling, sync, and unrelated controller work remain on the default
-executor. The pool is created only for HA controllers, is shut down by the
-controller lifespan, and exposes queue delay separately from blocking-operation
-latency. A focused test saturates the default executor and still requires a
-real role request to return the intended role. PR #1373's exact head passed all
-CI checks and 494 selected tests, and merged as
+gave every initially HA-enabled controller a fixed two-worker role executor for
+all blocking work in `_handle_load_balancer_role`, including both PostgreSQL
+reads, the shared STABLE snapshot, and serialized transition work. Ordinary
+provisioning, autoscaling, sync, and unrelated controller work remain on the
+default executor. In that merged implementation the pool was created only when
+HA was enabled during construction, was shut down by the controller lifespan,
+and exposed queue delay separately from blocking-operation latency. A focused
+test saturates the default executor and still requires a real role request to
+return the intended role. PR #1373's exact head passed all CI checks and 494
+selected tests, and merged as
 `5c399d5dfa65b711d5c24010111eeef9054d3a3e`.
 
 Executor isolation is complementary to, not a replacement for, the provider
@@ -976,16 +977,18 @@ The stacked bounded correction retains #1373 and adds these invariants:
   state-machine, demand-lock, transition, and mutation fences are unchanged.
   There is no TTL, completed-result cache, fallback authority, stale result, or
   capacity change.
-- The dedicated role executor is a constructor-established typed field. Role
-  handling and shared snapshot submission access that field directly; there is
-  no missing-attribute compatibility fallback that can silently select a
-  different executor contract.
+- The dedicated role executor is a constructor-established typed field on
+  every controller; its threads remain lazy while HA is disabled. An in-place
+  legacy-to-HA transition retains that exact executor. Role handling and shared
+  snapshot submission access the field directly, so no missing/optional
+  fallback can silently select asyncio's shared default executor.
 
-Focused tests must jointly prove default-executor isolation, fixed shared-task
-expiry for both slots, a late waiter's inability to extend the deadline, fresh
-retry while the expired synchronous read is still blocked, late-result
-isolation, all three STABLE transport timeouts, cancellation isolation, and no
-timeout keyword on non-STABLE reads. The complete external-load-balancer,
+Focused tests must jointly prove default-executor isolation both at startup and
+after an in-place legacy-to-HA transition, fixed shared-task expiry for both
+slots, a late waiter's inability to extend the deadline, fresh retry while the
+expired synchronous read is still blocked, late-result isolation, all three
+STABLE transport timeouts, cancellation isolation, and no timeout keyword on
+non-STABLE reads. The complete external-load-balancer,
 owner-replacement, exact-key, complete-row mismatch, and transition suites
 remain mandatory. Completion requires one immutable merge containing both
 corrections, direct-Helm staging readiness/+10/+30, and a fresh direct-Helm
@@ -993,12 +996,31 @@ production readiness/+10/+30/+60 window with zero incremental
 `client_timeout`, no role/controller/phase observation in the eight-second
 bucket, recovery at most 15 seconds, unchanged fixed capacity, and every
 safety, state, schema, event, log, health, and restart gate passing. The
-combined local verification passed: eight focused executor/deadline/transport
-cases and the complete 21-file controller/external-load-balancer selection
-passed with 912 tests, the configured mypy run passed 887 source files, Pylint
-rated the changed Python files 10.00/10, dashboard lint/format passed, and
-`git diff --check` passed. Exact-head CI and both deployment windows remain open
-gates.
+qualification release combines placement PR #1380 with both HA corrections
+#1373 and #1374, including PostgreSQL Serve revision 040. Its reader-first
+upgrade must start from the exact live Serve039 head with
+`serve.controllerHold=false`, leave revision 040 open and terminal retirement
+state empty, and validate every prior protocol-1/2/3 manifest. Staging must
+validate and converge its exact complete local receipt inventory; production
+must preserve all eight requested/loaded receipts unchanged. Bounded
+default-mode (`mode=None`) placement inventory/ledger dry-runs are required and
+permitted during qualification because they have `run_id=None` and create no
+protocol-4 identity. Enabling the hold, approving writer freeze evidence,
+invoking an apply-supported or terminal writer, and requesting a protocol-4
+receipt remain forbidden during both HA windows. Only a passing production +60
+sample authorizes a separate hold revision on the identical immutable pin tuple
+(combined merge SHA, image digest, chart version, and chart digest), followed by
+the placement design's final held preflight, full snapshot/restore drill, and
+writer gates. After terminal apply, the combined artifact—not standalone
+v1.1.1182—is the production-qualified operational rollback floor for the live
+database. Final combined local verification passed after closing the in-place
+migration gap: the new legacy-to-HA/default-executor regression passed, the
+complete three-file controller/HA/Kubernetes selection passed all 430 tests,
+and the exact 21-file controller/external-load-balancer selection passed all
+924 tests.
+The configured mypy run passed 887 source files, Pylint rated the changed Python
+files 10.00/10, dashboard lint/format passed, and `git diff --check` passed.
+Exact-head CI and both deployment windows remain open gates.
 
 ### Final-removal artifact evidence (2026-08-08)
 
@@ -1417,8 +1439,9 @@ approved canary:
   `1.1.1176` artifact on `boltz-test`; and deploy it to production on unchanged
   capacity. Revision 374 passed readiness/+10 but failed +30 with five new
   timeouts per slot and a 32.90-second shared owner-validation read.
-- [ ] Pass exact-head CI and merge the bounded shared-snapshot deadline fix.
-  Qualify its immutable artifact on `boltz-test` through fresh
+- [ ] Pass exact-head CI and merge the bounded shared-snapshot deadline fix on
+  top of merged #1380 and #1373. Qualify the resulting exact
+  #1380+#1373+#1374 immutable pin tuple on `boltz-test` through fresh
   readiness/+10/+30 without On-Demand capacity, then deploy the same artifact
   to production with `--reuse-values` on the fixed three-node capacity and pass
   fresh readiness/+10/+30/+60 gates, including zero `client_timeout` delta,

@@ -129,8 +129,7 @@ def _latency_stat() -> _RunningStat:
 class RoleRequestTrace:
     """Per-request controller trace with executor and lock timing."""
 
-    def __init__(self,
-                 executor: concurrent.futures.Executor | None = None) -> None:
+    def __init__(self, executor: concurrent.futures.Executor) -> None:
         self._started_at = time.monotonic()
         self._executor = executor
         self._phases: collections.defaultdict[str, float] = (
