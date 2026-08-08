@@ -86,11 +86,16 @@ class ServiceHashObservation:
             if self.value is not None:
                 raise ValueError('An absent parent cannot carry a hash value.')
             return None
-        if (type(self.value) is not str or not self.value or
-                any(character.isspace() for character in self.value)):
+        value = self.value
+        if type(value) is not str:
             raise ValueError(
                 'A present parent must carry a nonempty opaque hash.')
-        return self.value
+        value_str = str(value)
+        if (not value_str or
+                any(character.isspace() for character in value_str)):
+            raise ValueError(
+                'A present parent must carry a nonempty opaque hash.')
+        return value_str
 
 
 _SCHEMA_REVISION = '037'
@@ -1416,8 +1421,8 @@ def current_inventory_mismatches(
             add('missing_current_row_classification', service_name, version)
     unexpected_observations = set(current_service_hashes) - candidate_services
     for service_name in sorted(unexpected_observations,
-                               key=lambda value: (type(value).__name__,
-                                                  repr(value))):
+                               key=lambda value:
+                               (type(value).__name__, repr(value))):
         add('unexpected_current_parent_hash_observation', service_name)
     normalized_hashes: dict[str, str | None] = {}
     invalid_hash_services: set[str] = set()
@@ -1503,8 +1508,7 @@ def current_inventory_mismatches(
                 terminal_hash is not None and
                 normalized_hashes.get(service_name) == terminal_hash and
             (service_name, current_version) not in current_by_identity):
-            add('manifested_current_row_missing', service_name,
-                current_version)
+            add('manifested_current_row_missing', service_name, current_version)
 
     for identity, row in current_by_identity.items():
         service_name, version = identity

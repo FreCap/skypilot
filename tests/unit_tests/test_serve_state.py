@@ -5426,9 +5426,8 @@ class TestRecoveryVersionSelection:
                         hash=None))
             session.commit()
 
-        with pytest.raises(
-                RuntimeError,
-                match='invalid_current_parent_hash_observation'):
+        with pytest.raises(RuntimeError,
+                           match='invalid_current_parent_hash_observation'):
             _validate_placement_normalization_manifest_directly(
                 _mock_serve_db, run_id)
 

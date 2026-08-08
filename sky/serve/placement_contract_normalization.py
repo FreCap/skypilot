@@ -3504,21 +3504,25 @@ def _acquire_writer_session_lock(
             authority = (placement_normalization_authority.
                          assert_writer_database_authority(
                              connection, _ADVISORY_LOCK_NAME))
-    except BaseException as exc:
+    except NormalizationBlocker:
         if not busy and not connection.closed:
             # The acquisition query or the active exact-session probe may
             # have changed a backend-level lock before the client observed
             # its result. Invalidating is the only safe pool cleanup for an
             # uncertain session-level side effect.
             connection.invalidate()
-        if isinstance(exc, NormalizationBlocker):
-            raise
-        if isinstance(exc, (placement_normalization_authority.
-                            PlacementNormalizationAuthorityError,
-                            sqlalchemy.exc.SQLAlchemyError)):
-            raise NormalizationBlocker(
-                'Placement-normalization database write authority is absent '
-                'or invalid.') from exc
+        raise
+    except (placement_normalization_authority.
+            PlacementNormalizationAuthorityError,
+            sqlalchemy.exc.SQLAlchemyError) as exc:
+        if not connection.closed:
+            connection.invalidate()
+        raise NormalizationBlocker(
+            'Placement-normalization database write authority is absent '
+            'or invalid.') from exc
+    except BaseException:
+        if not connection.closed:
+            connection.invalidate()
         raise
     return authority
 
