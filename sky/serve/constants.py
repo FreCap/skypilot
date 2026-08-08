@@ -411,6 +411,8 @@ LB_CONTROLLER_HISTORY_SYNC_PATH = (
 LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH = (
     '/controller/system_recovery_route_lease')
 LB_ROLE_PROXY_OBSERVABILITY_HEADER = ('X-SkyServe-LB-Role-Proxy-Observability')
+LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER = (
+    'X-SkyServe-LB-Role-Controller-Owner-Verified')
 
 # A recovery-capable backend can bind the same route after Ray has killed its
 # first process.  The heavyweight 20-second controller sync deliberately keeps

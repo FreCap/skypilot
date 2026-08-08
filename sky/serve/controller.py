@@ -38,6 +38,7 @@ from sky import task as task_lib
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
+from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
@@ -62,6 +63,14 @@ from sky.utils.db import db_utils
 logger = sky_logging.init_logger(__name__)
 # Keep the historical controller-module patch surface for tests and plugins.
 serve_history = controller_history.serve_history
+
+
+class _LbRoleDatabaseSnapshot(NamedTuple):
+    """One exact controller-owner and durable-cutover row observation."""
+
+    fence: tuple[str, tuple[int | None, str | None], int]
+    state: lb_ha.LbCutoverState
+    owner: dict[str, Any]
 
 
 def _catalog_missing_task_contexts(
@@ -1714,6 +1723,22 @@ class SkyServeController:
             return None
         return (str(owner['hash']), actual_owner, int(owner['lifecycle_epoch']))
 
+    def _lb_role_database_snapshot(self) -> _LbRoleDatabaseSnapshot | None:
+        """Read the complete role owner/fence/cutover record once."""
+        owner = serve_state.get_service_controller_owner(self._service_name,
+                                                         include_lb_state=True)
+        if (owner is None or not owner.get('lb_ha_enabled') or
+                not owner.get('hash') or owner.get('lifecycle_epoch') is None):
+            return None
+        expected_owner = self._controller_owner
+        actual_owner = (owner.get('controller_pid'), owner.get('controller_ip'))
+        if expected_owner is None or actual_owner != expected_owner:
+            return None
+        fence = (str(owner['hash']), actual_owner,
+                 int(owner['lifecycle_epoch']))
+        state = lb_cutover_state.parse_lb_cutover_state_record(owner)
+        return _LbRoleDatabaseSnapshot(fence, state, owner)
+
     def _lb_promotion_report_is_current(self, request_data: dict[str,
                                                                  Any]) -> bool:
         if not self._lb_occupancy_contract_known:
@@ -2016,6 +2041,7 @@ class SkyServeController:
             self, request_data: dict[str, Any]) -> fastapi.Response:
         """Ingest a fast HA report and advance the recoverable cutover saga."""
         trace = lb_ha_obs.RoleRequestTrace()
+        verified_owner_fingerprint: str | None = None
 
         def role_response(
                 outcome: lb_ha_obs.LbRoleOutcome,
@@ -2025,8 +2051,14 @@ class SkyServeController:
             response_content = dict(content or {})
             response_content['outcome'] = outcome.value
             response_content['observability'] = trace.snapshot()
+            response_headers = {}
+            if verified_owner_fingerprint is not None:
+                response_headers[serve_constants.
+                                 LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER] = (
+                                     verified_owner_fingerprint)
             return responses.JSONResponse(content=response_content,
-                                          status_code=status_code)
+                                          status_code=status_code,
+                                          headers=response_headers)
 
         if not self._lb_ha_enabled:
             return role_response(
@@ -2106,17 +2138,17 @@ class SkyServeController:
         # validated STABLE snapshot.  The exact controller fence and frozen
         # cutover state are re-read under the lock before this snapshot can
         # influence the session ledger, role decision, or a planned cutover.
-        prefetched_fence = await trace.run_in_executor(loop,
-                                                       'postgresql_fence_read',
-                                                       self._lb_cutover_fence)
+        prefetched_database_snapshot = await trace.run_in_executor(
+            loop, 'postgresql_role_state_read', self._lb_role_database_snapshot)
+        prefetched_fence = (prefetched_database_snapshot.fence if
+                            prefetched_database_snapshot is not None else None)
         prefetched_state: lb_ha.LbCutoverState | None = None
         prefetched_snapshot: lb_k8s.LbRoleSnapshot | None = None
-        if prefetched_fence is not None:
-            prefetched_state = await trace.run_in_executor(
-                loop, 'postgresql_cutover_state_read',
-                serve_state.get_lb_cutover_state, self._service_name)
+        if prefetched_database_snapshot is not None:
+            prefetched_state = prefetched_database_snapshot.state
         if (prefetched_state is not None and prefetched_state.enabled and
                 prefetched_state.active_slot is not None and
+                prefetched_fence is not None and
                 prefetched_state.lifecycle_epoch == prefetched_fence[2] and
                 prefetched_state.phase is lb_ha.LbCutoverPhase.STABLE):
             prefetched_timings: dict[str, float] = {}
@@ -2124,7 +2156,8 @@ class SkyServeController:
                 prefetched_snapshot = await trace.run_in_executor(
                     loop, 'kubernetes_role_snapshot',
                     lb_k8s.get_lb_role_snapshot, self._service_name,
-                    prefetched_fence, prefetched_state, prefetched_timings)
+                    prefetched_fence, prefetched_state,
+                    prefetched_database_snapshot.owner, prefetched_timings)
             except lb_k8s.LbRoleSnapshotStateMismatchError:
                 trace.add_phases(prefetched_timings)
                 return role_response(
@@ -2141,21 +2174,22 @@ class SkyServeController:
         lock_wait_started_at = time.monotonic()
         async with role_lock:
             trace.lock_acquired(lock_wait_started_at)
-            fence = await trace.run_in_executor(loop, 'postgresql_fence_read',
-                                                self._lb_cutover_fence)
-            if fence is None:
+            database_snapshot = await trace.run_in_executor(
+                loop, 'postgresql_role_state_read',
+                self._lb_role_database_snapshot)
+            if database_snapshot is None:
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.CONTROLLER_NOT_OWNER, 503)
-            state = await trace.run_in_executor(
-                loop, 'postgresql_cutover_state_read',
-                serve_state.get_lb_cutover_state, self._service_name)
+            verified_owner_fingerprint = self._controller_owner_fingerprint
+            fence = database_snapshot.fence
+            state = database_snapshot.state
             if (state is None or not state.enabled or
                     state.active_slot is None or
                     state.lifecycle_epoch != fence[2]):
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
             if prefetched_snapshot is not None:
-                if (fence != prefetched_fence or state != prefetched_state or
+                if (database_snapshot != prefetched_database_snapshot or
                         state.phase is not lb_ha.LbCutoverPhase.STABLE):
                     return role_response(
                         lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
@@ -2166,7 +2200,7 @@ class SkyServeController:
                     snapshot = await trace.run_in_executor(
                         loop, 'kubernetes_role_snapshot',
                         lb_k8s.get_lb_role_snapshot, self._service_name, fence,
-                        state, snapshot_timings)
+                        state, database_snapshot.owner, snapshot_timings)
                 except lb_k8s.LbRoleSnapshotStateMismatchError:
                     trace.add_phases(snapshot_timings)
                     return role_response(

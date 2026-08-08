@@ -2031,6 +2031,7 @@ def get_service_controller_owner(
             services_table.c.lb_cutover_generation,
             services_table.c.lb_pending_slot,
             services_table.c.lb_cutover_phase,
+            services_table.c.lb_drain_started_at,
         ).where(services_table.c.name == service_name)
         if require_version:
             query = query.where(sqlalchemy.exists().where(
@@ -2047,6 +2048,7 @@ def get_service_controller_owner(
             'lb_cutover_generation': mapping['lb_cutover_generation'],
             'lb_pending_slot': mapping['lb_pending_slot'],
             'lb_cutover_phase': mapping['lb_cutover_phase'],
+            'lb_drain_started_at': mapping['lb_drain_started_at'],
         })
     return record
 

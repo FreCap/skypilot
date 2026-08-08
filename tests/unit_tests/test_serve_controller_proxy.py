@@ -62,10 +62,13 @@ class _FakeControllerResponse:
     def __init__(self,
                  body: bytes = b'{"replica_info": {}}',
                  status: int = 200,
-                 content_type: str = 'application/json'):
+                 content_type: str = 'application/json',
+                 headers: Optional[dict] = None):
         self._body = body
         self.status = status
         self.headers = {'Content-Type': content_type}
+        if headers is not None:
+            self.headers.update(headers)
 
     async def __aenter__(self):
         return self
@@ -218,6 +221,67 @@ def test_proxy_forwards_role_heartbeat_to_distinct_controller_path(monkeypatch):
     assert calls[0]['url'] == (
         'http://10.2.3.4:20001/controller/load_balancer_role')
     assert calls[0]['data'] == b'{"lb_slot":"a"}'
+    assert 'owner_after' in response.headers[
+        constants.LB_ROLE_PROXY_OBSERVABILITY_HEADER]
+
+
+def test_role_owner_attestation_replaces_proxy_owner_after_read(monkeypatch):
+    owner = _owner()
+    fingerprint = serve_utils.make_controller_owner_fingerprint(*owner)
+    _patch_owner_reads(monkeypatch, [owner])
+    calls = []
+    upstream = _FakeControllerResponse(headers={
+        constants.LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER: fingerprint,
+    })
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls, response=upstream))
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_role(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_role')))
+
+    assert response.status_code == 200
+    observation = response.headers[constants.LB_ROLE_PROXY_OBSERVABILITY_HEADER]
+    assert 'owner_after' not in observation
+
+
+def test_role_owner_attestation_mismatch_fails_closed(monkeypatch):
+    _patch_owner_reads(monkeypatch, [_owner()])
+    calls = []
+    upstream = _FakeControllerResponse(headers={
+        constants.LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER: 'wrong-owner',
+    })
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls, response=upstream))
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_role(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_role')))
+
+    assert response.status_code == 503
+    assert b'attestation changed' in response.body
+
+
+def test_nonrole_route_ignores_owner_attestation_and_keeps_after_read(
+        monkeypatch):
+    owner = _owner()
+    fingerprint = serve_utils.make_controller_owner_fingerprint(*owner)
+    _patch_owner_reads(monkeypatch, [owner, owner])
+    calls = []
+    upstream = _FakeControllerResponse(headers={
+        constants.LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER: fingerprint,
+    })
+    monkeypatch.setattr(controller_proxy.aiohttp, 'ClientSession',
+                        lambda: _FakeClientSession(calls, response=upstream))
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync')))
+
+    assert response.status_code == 200
 
 
 def test_proxy_rejects_response_if_owner_changes(monkeypatch):
@@ -538,7 +602,7 @@ def test_system_recovery_lease_route_uses_internal_sync_auth(monkeypatch):
 
     assert rejected.status_code == 401
     assert rejected_reads == [True]
-    assert rejected_users == []
+    assert not rejected_users
     assert accepted.status_code == 204
     assert accepted_reads == [True]
     assert accepted_users[0].user_type == 'system'

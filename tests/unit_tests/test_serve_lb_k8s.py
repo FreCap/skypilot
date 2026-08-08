@@ -1848,7 +1848,7 @@ def test_role_snapshot_reuses_owner_pods_and_service(monkeypatch):
     state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
                                  lb_ha.LbCutoverPhase.STABLE, 7)
 
-    snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state, timings)
+    snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state, owner, timings)
 
     assert snapshot is not None
     assert snapshot.routing == lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 3,
@@ -1858,14 +1858,13 @@ def test_role_snapshot_reuses_owner_pods_and_service(monkeypatch):
         'slot-a': lb_ha.LbSlot.A,
         'slot-b': lb_ha.LbSlot.B,
     }
-    owner_read.assert_called_once_with('svc', include_lb_state=True)
+    owner_read.assert_not_called()
     core.list_namespaced_pod.assert_called_once()
     core.read_namespaced_service.assert_called_once()
     # The Service supplies the expected owner identity.  One subsequent live
     # Deployment read proves that exact UID without an earlier duplicate GET.
     assert apps.read_namespaced_deployment.call_count == 1
     assert set(timings) == {
-        'snapshot_postgresql_owner_read',
         'snapshot_pod_list',
         'snapshot_service_read',
         'snapshot_ownership_validation',
@@ -1948,7 +1947,7 @@ def test_role_snapshot_joins_independent_kubernetes_reads(monkeypatch):
                                  lb_ha.LbCutoverPhase.STABLE, 7)
 
     try:
-        snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state)
+        snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state, owner)
     finally:
         caller_context.reset(caller_context_token)
 
@@ -1989,7 +1988,7 @@ def test_role_snapshot_fails_closed_on_malformed_shared_service(monkeypatch):
     state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
                                  lb_ha.LbCutoverPhase.STABLE, 7)
     with pytest.raises(lb_k8s.LbRoleSnapshotRoutingError):
-        lb_k8s.get_lb_role_snapshot('svc', fence, state)
+        lb_k8s.get_lb_role_snapshot('svc', fence, state, owner)
 
 
 def test_role_snapshot_rejects_owner_row_state_mismatch_before_kubernetes(
@@ -2014,7 +2013,7 @@ def test_role_snapshot_rejects_owner_row_state_mismatch_before_kubernetes(
                                        lb_ha.LbCutoverPhase.STABLE, 7)
 
     with pytest.raises(lb_k8s.LbRoleSnapshotStateMismatchError):
-        lb_k8s.get_lb_role_snapshot('svc', fence, stale_state)
+        lb_k8s.get_lb_role_snapshot('svc', fence, stale_state, owner)
 
     core.list_namespaced_pod.assert_not_called()
     core.read_namespaced_service.assert_not_called()
@@ -2065,7 +2064,7 @@ def test_role_snapshot_fails_closed_when_owner_deployment_is_replaced(
                                  lb_ha.LbCutoverPhase.STABLE, 7)
 
     with pytest.raises(lb_k8s.LbRoleSnapshotRoutingError):
-        lb_k8s.get_lb_role_snapshot('svc', fence, state)
+        lb_k8s.get_lb_role_snapshot('svc', fence, state, owner)
 
 
 @pytest.mark.parametrize('owner_references', [
@@ -2144,7 +2143,7 @@ def test_role_snapshot_transition_routing_matches_existing_contract(
     fence = ('incarnation', (123, '10.0.0.1'), 7)
     state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None, phase, 7)
 
-    snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state)
+    snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state, owner)
 
     assert snapshot is not None
     assert snapshot.routing == lb_k8s.LbServiceTransitionRouting(

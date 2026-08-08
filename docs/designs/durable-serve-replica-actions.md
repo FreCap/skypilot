@@ -552,6 +552,63 @@ recovered failures at most 15 seconds, no role/controller/phase observation in
 the eight-second bucket, and every safety, health, schema, state, event, and log
 gate passing.
 
+PR #1362 implemented that contract and merged as
+`0d6bd802bb32e2c35a3af7469e8968f4d39ea4b0`. Release `1.1.1171` and source
+image digest
+`sha256:830a2e317fcb9a9b80d39bc74046ca00b79925169dbf611db173999db8390343`
+point exactly to the merge. Its fresh `boltz-test` readiness/+10/+30 window
+passed with six exact Ready workloads, zero restarts, and no On-Demand node.
+Production direct-Helm revision 372 reached a clean exact readiness baseline at
+09:09:50 UTC with all 17 workloads Ready, zero restarts, all eight pairs
+`STABLE` and converged, and the same three fixed `m6i.8xlarge` nodes.
+
+The production +10 exact-behavior gate nevertheless failed. Each
+`boltz-l4-fleet` slot added 21 `client_timeout` outcomes and ended with an
+active failure streak; each `boltz-l4-fleet-test` slot added one recovered
+timeout. The change did remove the targeted cross-slot contention: large-fleet
+role-lock wait p99 fell to 0.39/0.58 seconds and lock-hold p99 to 0.45/1.40
+seconds. The remaining path is one slow individual Kubernetes snapshot plus
+duplicated SQL and proxy fences. Kubernetes snapshot p99 remained 6.43/6.44
+seconds, controller p99 7.51/7.71 seconds, and end-to-end role p99 entered the
+8.998-second bucket. Safety, state, health, fixed capacity, and zero-restart
+invariants stayed intact, so this is a fix-forward latency failure rather than
+a rollback trigger.
+
+The bounded follow-up removes those duplicated reads without changing the
+eight-second client budget or six-second independent report-freshness gate:
+
+- One PostgreSQL query returns the exact controller owner/incarnation tuple and
+  the complete durable cutover state, including drain start. The pre-lock read
+  supplies the fence, frozen state, and resource scope used by the Kubernetes
+  snapshot, replacing the prior fence query, cutover-state query, and snapshot
+  owner query. No authority value is cached.
+- Under the existing role lock, repeat that same complete query and require the
+  entire owner/fence/state record to equal the pre-lock record before the
+  Kubernetes result may affect the session ledger or role decision. Non-STABLE
+  and mutation paths use the record read under the lock and retain all existing
+  transition serialization.
+- After that exact under-lock owner proof, the controller may attach its
+  existing owner fingerprint to the role response. The stable API proxy accepts
+  the attestation only when it exactly equals the owner fingerprint read before
+  routing the request; it then omits its redundant post-response owner query.
+  A missing attestation, as during a mixed-version rollout, retains the current
+  post-response owner read. A mismatched attestation fails closed. Every
+  non-role controller route retains both proxy owner reads.
+- The attestation moves the successful role response's last owner
+  linearization point from the proxy to the controller's immediately preceding
+  complete under-lock row read. It does not extend a TTL, trust a client value,
+  weaken controller-request authentication, accept a stale cutover state, or
+  permit a transition outside the lock.
+
+Focused tests must prove one SQL read before and one after the Kubernetes
+snapshot, byte-for-byte owner/state mismatch rejection, no snapshot-side SQL
+owner read, exact controller attestation, mixed-version proxy fallback,
+mismatched-attestation rejection, and unchanged two-read behavior for every
+other proxy route. The 143-backend overlap, owner-replacement, transition, and
+full external-load-balancer suites remain mandatory. The immutable follow-up
+must repeat the same direct-Helm staging and production qualification; revision
+372 does not satisfy completion.
+
 ### Final-removal artifact evidence (2026-08-08)
 
 PR #1346's exact code head
