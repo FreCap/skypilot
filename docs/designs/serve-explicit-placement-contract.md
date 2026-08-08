@@ -428,6 +428,14 @@ records it.  Spec-drift comparison uses the latest result for the exact
 `(service_name, version, service_hash, lifecycle_epoch)` owner generation and
 does not compare unrelated mutable status columns.
 
+A successful protocol-4 retirement manifest containing any
+`stale_placeholder` entry is the terminal writer generation.  Every later
+`--apply-supported` or `--retire-terminal-historical` invocation must fail
+before external evidence collection or DML instead of emitting a newer
+manifest that could downgrade the durable stale classification to an ordinary
+fillable placeholder.  Read-only dry-runs remain available for verification;
+the staged cleanup removes the transitional writer after its rollout gates.
+
 The cleanup-contract and receipt additions introduced normalizer protocol 2.
 The NULL-timestamp proof below introduced protocol 3.  The explicit stale
 placeholder proof introduces protocol 4.  Ledger verification
@@ -591,7 +599,13 @@ service-version demands in `WARMING`, `READY`, or `FAILED` across every
 incarnation hash and target-scoped derivative; that cross-database
 snapshot is taken before and after the locked Serve transaction while requests
 are frozen.  Missing, hash-mismatched, and terminal services do not bypass
-those checks.  The same bounded pre/locked/post protocol requires zero exact
+those checks.  Historical service hashes are opaque nonempty strings and may
+contain `:`.  Any-incarnation owner parsing therefore anchors the exact
+`:v<version>` suffix from the right and conservatively accepts every nonempty
+hash prefix; it must not use a `[^:]+` hash regex that can silently discard a
+valid legacy owner.  An ambiguous or malformed possibly matching owner blocks
+instead of producing zero-demand evidence.  The same bounded pre/locked/post
+protocol requires zero exact
 `ProviderLaunchContentSourceV1` roots for the candidate `(service_name,
 version)` in either `api_resource_actions.immutable_spec` or
 `serve_resource_action_shadow_samples.immutable_spec`.  Both complete bounded
