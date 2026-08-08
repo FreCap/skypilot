@@ -719,16 +719,16 @@ export function ManagedJobsTable({
           }
         }
 
-        // Check controller status from clusters — only needed when the
-        // queue response indicated the controller wasn't reachable. The
-        // queue endpoint catches ClusterNotUpError and returns
-        // controllerStopped=true for both STOPPED and INIT-without-head_ip
-        // (i.e. LAUNCHING). We then call /status to disambiguate so the
-        // right banner is shown. When the controller is reachable
-        // (controllerStopped === false) there is no banner to show, so we
-        // skip /status entirely — saving ~hundreds of ms on every page
-        // load and on every 5-second periodic refresh.
-        if (includeStatus && response.controllerStopped) {
+        // Check controller status from clusters only when the queue response
+        // indicates the controller is unreachable and the banner state is not
+        // already known for this outage. The queue endpoint collapses STOPPED
+        // and LAUNCHING into controllerStopped=true, so the first no-status
+        // refresh that hits an outage must still resolve the banner once.
+        // Healthy refreshes remain on the fast path with no /status lookup.
+        const shouldResolveControllerStatus =
+          response.controllerStopped &&
+          (includeStatus || !hookControllerStopped);
+        if (shouldResolveControllerStatus) {
           try {
             const clustersData = await dashboardCache.get(getClusters);
 
@@ -783,6 +783,7 @@ export function ManagedJobsTable({
       computedStatuses,
       sortBy,
       sortOrder,
+      hookControllerStopped,
       userScope,
       currentUser,
     ]

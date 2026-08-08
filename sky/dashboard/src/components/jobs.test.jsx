@@ -26,6 +26,7 @@ import cachePreloader from '@/lib/cache-preloader';
 import jobsCacheManager from '@/lib/jobs-cache-manager';
 import { getPoolStatus } from '@/data/connectors/jobs';
 import { getCurrentUserInfo } from '@/data/connectors/client';
+import { getClusters } from '@/data/connectors/clusters';
 import { getUsers } from '@/data/connectors/users';
 import { getWorkspaces } from '@/data/connectors/workspaces';
 
@@ -1008,6 +1009,114 @@ describe('managed jobs automatic refresh', () => {
       jest.advanceTimersByTime(5000);
     });
     expect(jobsCacheManager.getPaginatedJobs).toHaveBeenCalledTimes(3);
+  });
+
+  it('resolves the controller banner once for a no-status outage transition and re-arms after recovery', async () => {
+    getCurrentUserInfo.mockResolvedValue({ id: 'alice-id', name: 'alice' });
+    const runningResponse = {
+      jobs: [
+        {
+          id: 1,
+          task_id: 0,
+          task_job_id: '1-0',
+          name: 'running-job',
+          user: 'alice',
+          user_hash: 'alice-id',
+          status: 'RUNNING',
+          batch_total_batches: 10,
+          batch_completed_batches: 1,
+        },
+      ],
+      total: 1,
+      totalNoFilter: 1,
+      statusCounts: { RUNNING: 1 },
+      controllerStopped: false,
+      hasNext: false,
+    };
+    const stoppedResponse = {
+      jobs: [],
+      total: 0,
+      totalNoFilter: 0,
+      statusCounts: {},
+      controllerStopped: true,
+      hasNext: false,
+    };
+    const recoveredResponse = {
+      jobs: [],
+      total: 0,
+      totalNoFilter: 0,
+      statusCounts: {},
+      controllerStopped: false,
+      hasNext: false,
+    };
+    jobsCacheManager.getPaginatedJobs.mockResolvedValueOnce(runningResponse);
+    dashboardCache.get.mockImplementation((fetcher) => {
+      if (fetcher === getPoolStatus) {
+        return Promise.resolve({ pools: [] });
+      }
+      if (fetcher === getClusters) {
+        return Promise.resolve([
+          {
+            cluster: 'sky-jobs-controller-main',
+            status: 'STOPPED',
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    const refreshDataRef = { current: null };
+
+    render(
+      <ManagedJobsTable
+        refreshInterval={5000}
+        setLoading={jest.fn()}
+        refreshDataRef={refreshDataRef}
+        filters={[]}
+        onUserFilter={jest.fn()}
+        onRefresh={jest.fn()}
+        poolsData={[]}
+        poolsLoading={false}
+        setValueList={jest.fn()}
+        preloadingComplete={true}
+        lastFetchedTime={null}
+      />
+    );
+
+    await screen.findByText('running-job');
+
+    jobsCacheManager.getPaginatedJobs.mockReset();
+    jobsCacheManager.getPaginatedJobs.mockResolvedValueOnce(stoppedResponse);
+    await act(async () => {
+      await refreshDataRef.current({ includeStatus: false });
+    });
+    await screen.findByText(/managed job controller has been stopped/i);
+    expect(countCacheReads(getClusters)).toBe(1);
+
+    jobsCacheManager.getPaginatedJobs.mockReset();
+    jobsCacheManager.getPaginatedJobs.mockResolvedValueOnce(stoppedResponse);
+    await act(async () => {
+      await refreshDataRef.current({ includeStatus: false });
+    });
+    expect(countCacheReads(getClusters)).toBe(1);
+
+    jobsCacheManager.getPaginatedJobs.mockReset();
+    jobsCacheManager.getPaginatedJobs.mockResolvedValueOnce(recoveredResponse);
+    await act(async () => {
+      await refreshDataRef.current({ includeStatus: false });
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByText(/managed job controller has been stopped/i)
+      ).not.toBeInTheDocument()
+    );
+
+    jobsCacheManager.getPaginatedJobs.mockReset();
+    jobsCacheManager.getPaginatedJobs.mockResolvedValueOnce(stoppedResponse);
+    await act(async () => {
+      await refreshDataRef.current({ includeStatus: false });
+    });
+    await screen.findByText(/managed job controller has been stopped/i);
+    expect(countCacheReads(getClusters)).toBe(2);
   });
 
   it('refreshes jobs immediately when the page becomes visible again', async () => {
