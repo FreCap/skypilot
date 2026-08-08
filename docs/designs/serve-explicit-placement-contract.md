@@ -421,10 +421,17 @@ writer, changed preimage, missing row-inventory entry, incomplete manifest,
 ledger collision, or timeout aborts the whole transaction.  Rerunning after
 success must report zero pending fieldless/v1 changes and verify the completed
 manifest, every surviving v2 result digest, every intentional retirement, and
-all new rows.  The latest completed full-run manifest must cover the exact
-current `(service_name, version)` identity set; a later v2 or placeholder row
-is an explicit `untracked_current_row` mismatch until a new zero-change apply
-records it.  Spec-drift comparison uses the latest result for the exact
+all new rows.  Before the terminal protocol-4 retirement, the latest completed
+full-run manifest must cover the exact current `(service_name, version)`
+identity set; a later v2 or placeholder row is an explicit
+`untracked_current_row` mismatch until a new zero-change apply records it.
+After the terminal manifest, an untracked row is accepted without a newer
+writer generation only when its version is above the terminal proved current
+version for that service and it is either an ordinary explicit-v2 commit with
+finite `created_at > completed_at` or an exact fillable canonical placeholder
+with SQL-NULL `created_at`.  An older, stale-version, retired, historical, or
+blocker row remains a mismatch.  Spec-drift comparison uses the terminal result
+for the exact
 `(service_name, version, service_hash, lifecycle_epoch)` owner generation and
 does not compare unrelated mutable status columns.
 
@@ -435,6 +442,9 @@ before external evidence collection or DML instead of emitting a newer
 manifest that could downgrade the durable stale classification to an ordinary
 fillable placeholder.  Read-only dry-runs remain available for verification;
 the staged cleanup removes the transitional writer after its rollout gates.
+The terminal fence is checked against the latest fully validated manifest once
+before any external getter and again after acquiring the unchanged advisory and
+table locks; two concurrent first-retirement attempts cannot both pass it.
 
 The cleanup-contract and receipt additions introduced normalizer protocol 2.
 The NULL-timestamp proof below introduced protocol 3.  The explicit stale
@@ -475,11 +485,18 @@ inventory and validates it before returning a pending request, accepting a
 completed receipt, or acknowledging and CASing a load; validating only the
 selected current and recovery entries is insufficient for protocol 4.  For a
 protocol-4 retirement run it also reads the current bounded `version_specs`
-rows for every retired candidate service and requires the exact canonical,
-unretired pickled-`None` row identities and full row/column hashes to equal the
-manifest's `stale_placeholder` inventory.  This live snapshot binding prevents
-a coherently rewritten ledger from omitting or relabeling an unchanged stale
-placeholder and is repeated inside the acknowledgement transaction.
+rows for every retired candidate service and requires every manifested stale
+identity to remain the exact canonical, unretired pickled-`None` full
+row/column postimage.  Every additional canonical placeholder whose version is
+at or below the proved current version is an omitted stale row and blocks.  A
+later ordinary placeholder is permitted only when its version is above the
+proved current version and its `created_at` remains SQL NULL, matching the
+central reservation writer; it remains `placeholder/unchanged` and fillable.
+This
+live snapshot binding prevents a coherently rewritten ledger from omitting or
+relabeling an unchanged stale placeholder without making later reservations
+part of the terminal proof, and is repeated inside the acknowledgement
+transaction.
 The protocol-1 through protocol-3 validators retain the historical
 `same_service_placeholder_dependency_absent=true` fact exactly.  Protocol 4
 must neither emit nor accept that fact: its complete stale-placeholder
@@ -552,7 +569,9 @@ compact JSON of
 envelope from all same-service `stale_placeholder` entries, proves each
 entry's original and result row/column hashes are identical, proves every
 listed side-column hash equals the canonical SQL-NULL hash, and proves the
-surviving current entry is committed explicit v2.  A missing, extra,
+placeholder's `contract_projection` is exactly NULL.  The surviving current
+entry must be committed explicit v2 and its service hash/lifecycle epoch must
+equal both the retired candidate and every stale entry.  A missing, extra,
 duplicated, fillable, active, stateful, evidence-bearing, or substituted
 placeholder invalidates the entire run.  The empty list uses the same envelope
 and is valid.  Older-protocol all-row validation rejects either v4-only
@@ -1209,9 +1228,14 @@ The blocked cleanup may merge only when all are true:
   qualified class reference.  A retained snapshot/backup containing such state
   is classified as non-directly-recoverable and must be covered by the tested
   hold-and-normalize-before-resume restore runbook below.
-- The PostgreSQL run manifest and row inventory cover the exact current row
-  identity set and the point-in-time canonical fleet digest; every current spec
-  matches the latest result-spec digest for its exact owner generation.  Every
+- The terminal PostgreSQL run manifest and row inventory cover its exact
+  point-in-time row identity set and canonical fleet digest; every manifested
+  current spec matches the terminal result-spec digest for its exact owner
+  generation.  Every later unmanifested row satisfies the strict
+  higher-version and explicit-v2-with-post-completion-timestamp or
+  fillable-placeholder-with-NULL-timestamp contract above; it cannot replace
+  or mutate a manifested row.
+  Every
   terminal retirement includes the locked dependency proof and retired-row
   digests; requested/loaded controller receipts converge; and a post-reload
   dry-run reports zero pending changes, zero blockers, and zero ledger
