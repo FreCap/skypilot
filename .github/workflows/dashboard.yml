@@ -66,6 +66,7 @@ jobs:
           src/data/connectors/volumes.test.js \
           src/tests/managed-job-details.test.jsx \
           src/tests/task-details-route.test.jsx \
+          src/tests/cluster-job-details.test.jsx \
           src/tests/service-details.test.jsx \
           src/tests/cluster-details-route.test.jsx \
           src/tests/cluster-history-details.test.jsx \
