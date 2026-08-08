@@ -140,13 +140,6 @@ Set `release_name` to choose that name; `extra_helm_values.fullnameOverride` is
 rejected so the rendered service account and Deployments cannot diverge from
 the identities and post-seed reconciliation targets managed by Terraform.
 
-Existing state created before this split has an image-coupled
-`config_generation`. If the API server has already rolled to the desired image,
-set `suppress_api_server_reconcile_for_migration = true` for exactly one apply,
-then remove it. The apply advances the Terraform trigger without restarting the
-already-current API server. Never suppress reconciliation while changing the
-desired DB-backed config.
-
 ## Security and lifecycle notes
 
 - The API role can describe EKS clusters and EC2 resources. Broader authority is
@@ -260,7 +253,6 @@ No modules.
 | <a name="input_rbac_default_role"></a> [rbac\_default\_role](#input\_rbac\_default\_role) | Default role for newly auto-provisioned SSO users. SkyPilot ships this as<br/>`admin` to ease setup; we default to `user` for least privilege. NOTE: verify<br/>it actually takes effect on your chart version (see skypilot issue #9271). | `string` | `"user"` | no |
 | <a name="input_release_name"></a> [release\_name](#input\_release\_name) | Helm release name. The chart derives the API service account as <release\_name>-api-sa. | `string` | `"skypilot"` | no |
 | <a name="input_request_store"></a> [request\_store](#input\_request\_store) | API request-envelope persistence settings rendered as the chart's<br/>requestStore values. The SQLite defaults preserve the chart's compatibility<br/>behavior; select PostgreSQL explicitly only after completing the chart's<br/>one-way request-store cutover procedure. Enabling built-in execution<br/>quiescence enforcement requires the PostgreSQL backend. | <pre>object({<br/>    backend                                        = optional(string, "sqlite")<br/>    enforce_builtin_execution_quiescence_backends = optional(bool, false)<br/>    cutover_gate_path                              = optional(string, "/root/.sky/api-request-cutover.json")<br/>  })</pre> | `{}` | no |
-| <a name="input_suppress_api_server_reconcile_for_migration"></a> [suppress\_api\_server\_reconcile\_for\_migration](#input\_suppress\_api\_server\_reconcile\_for\_migration) | Temporary one-apply migration switch for callers whose existing<br/>config\_generation included the helper image. Set true only when the running<br/>API server has already rolled to the desired image: the seed Job still runs<br/>and Terraform advances to the image-independent generation, but the<br/>post-seed API restart is suppressed. Remove the override immediately after<br/>that apply; while true, real config changes are not loaded into API-server<br/>memory. Deprecated and scheduled for removal after migration. | `bool` | `false` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to AWS resources created by this module. | `map(string)` | `{}` | no |
 | <a name="input_workspace_email_domain"></a> [workspace\_email\_domain](#input\_workspace\_email\_domain) | Restrict logins to this email domain (auth.oauth.email-domain). Null relies on the OIDC client's audience restriction. | `string` | `null` | no |
 

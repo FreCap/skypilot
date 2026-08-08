@@ -466,23 +466,11 @@ class ControlPlaneModuleSourceTest(unittest.TestCase):
             self.config_seed_hcl,
         )
 
-    def test_reconcile_migration_suppression_is_explicit_and_deprecated(
-            self) -> None:
-        variable = re.search(
-            r'variable "suppress_api_server_reconcile_for_migration" '
-            r'\{(?P<body>.*?)\n\}',
-            self.variables_hcl,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(variable)
-        assert variable is not None
-        self.assertRegex(variable.group('body'),
-                         r'(?m)^\s*default\s*=\s*false$')
-        self.assertIn('Deprecated and scheduled for removal',
-                      variable.group('body'))
-        self.assertIn(
-            'SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION = '
-            'tostring(var.suppress_api_server_reconcile_for_migration)',
+    def test_config_reconcile_has_no_migration_suppression(self) -> None:
+        self.assertNotIn('suppress_api_server_reconcile_for_migration',
+                         self.variables_hcl)
+        self.assertNotIn(
+            'SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION',
             self.config_seed_hcl,
         )
 
@@ -512,7 +500,7 @@ class ControlPlaneModuleSourceTest(unittest.TestCase):
             self.module_hcl,
         )
         self.assertIn(
-            'SKYPILOT_HIGH_AVAILABILITY_ENABLED                   = '
+            'SKYPILOT_HIGH_AVAILABILITY_ENABLED = '
             'tostring(local.split_role_high_availability_enabled)',
             self.config_seed_hcl,
         )

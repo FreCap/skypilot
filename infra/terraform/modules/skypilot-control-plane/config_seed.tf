@@ -137,15 +137,10 @@ resource "terraform_data" "reconcile_api_server" {
   provisioner "local-exec" {
     interpreter = ["bash", "-c"]
     environment = merge(local.provider_exec_env, {
-      SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION = tostring(var.suppress_api_server_reconcile_for_migration)
-      SKYPILOT_HIGH_AVAILABILITY_ENABLED                   = tostring(local.split_role_high_availability_enabled)
+      SKYPILOT_HIGH_AVAILABILITY_ENABLED = tostring(local.split_role_high_availability_enabled)
     })
     command = <<-EOT
       set -euo pipefail
-      if [[ "$${SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION:-false}" == "true" ]]; then
-        echo "SkyPilot API-server reconcile suppressed for config-generation state migration"
-        exit 0
-      fi
       KUBECONFIG_TMP="$(mktemp)"
       trap 'rm -f "$KUBECONFIG_TMP"' EXIT
       proxy_args=()
