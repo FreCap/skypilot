@@ -511,15 +511,31 @@ inventory and validates it before returning a pending request, accepting a
 completed receipt, or acknowledging and CASing a load; validating only the
 selected current and recovery entries is insufficient for protocol 4.  For a
 protocol-4 retirement run it also reads the current bounded `version_specs`
-rows and parent service hash for every retired candidate service.  While that
+rows and parent service hash for every retired candidate service.  This live
+query and its required parent-hash observation are scoped exactly to those
+candidate names; unrelated services that merely appear in the full fleet
+manifest are not live-proof inputs.  The query projects exactly the frozen
+protocol-4 revision-038 columns listed below, so a later live-schema addition
+cannot retroactively invalidate an old receipt.  While that
 same service incarnation exists, every manifested stale identity must remain
 the exact canonical, unretired pickled-`None` full row/column postimage, and
 every additional canonical placeholder whose version is at or below the
-proved current version is an omitted stale row and blocks.  If the old parent
-is absent, missing stale rows are permitted because the immutable audit remains
-in the manifest.  If the name belongs to a different incarnation, every old
-manifested stale identity must be absent; a surviving same-name row would be
-implicitly reassociated with the new parent and blocks.  A
+proved current version is an omitted stale row and blocks.  The manifested
+retired candidate must also remain present while that same-hash parent exists
+and must retain the exact terminal `spec`, `yaml_content`,
+`retired_yaml_content`, `retired_at`, `retirement_reason`, and
+`retirement_run_id` postimage; changing or deleting the tombstone blocks even
+though its `spec` is canonical pickled `None`.  If the old parent is absent,
+missing stale and retired rows are permitted because the immutable audit
+remains in the manifest.  If the name belongs to a different incarnation, an
+unchanged old stale postimage at the same name/version would be implicitly
+reassociated and blocks.  Reuse of an old version number is nevertheless
+unambiguous and allowed when that row is instead a committed explicit-v2
+postimage with a finite `created_at` strictly after manifest completion; the
+different parent hash and later commit boundary prove that the old row was
+removed and the new incarnation created a new one.  A new-incarnation
+placeholder, including one at an old version number, remains ambiguous and
+blocks.  A
 later ordinary placeholder is permitted only when its version is above both
 the proved current version and the terminal same-incarnation manifested
 high-water mark, and its `created_at` remains SQL NULL, matching the central
