@@ -585,6 +585,8 @@ def _role_controller() -> controller.SkyServeController:
     ctrl._resource_scope = None
     ctrl._lb_ha_enabled = True
     ctrl._lb_role_lock = None
+    ctrl._lb_role_snapshot_task = None
+    ctrl._lb_role_snapshot_key = None
     ctrl._lb_demand_lock = None
     ctrl._lb_session_ledger = lb_ha.LbSessionLedger(10, 10)
     ctrl._lb_expected_occupancy_urls = set()
@@ -840,7 +842,8 @@ def test_concurrent_slot_heartbeats_keep_shared_snapshot_fencing():
     snapshot = lb_k8s.LbRoleSnapshot(
         authority, lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
     observed_fences = []
-    snapshot_barrier = threading.Barrier(2)
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
     backend_urls = [f'http://replica-{index}' for index in range(143)]
     large_report = _report({url: 1 for url in backend_urls},
                            {url: 1 for url in backend_urls},
@@ -849,10 +852,8 @@ def test_concurrent_slot_heartbeats_keep_shared_snapshot_fencing():
 
     def read_snapshot(unused_name, fence, state, unused_timings):
         observed_fences.append((fence, state))
-        # Both STABLE reads must start before either role handler enters its
-        # serialized decision tail.  This times out under the old read-under-
-        # lock implementation.
-        snapshot_barrier.wait(timeout=2)
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2)
         return snapshot
 
     async def run_both_slots():
@@ -860,9 +861,17 @@ def test_concurrent_slot_heartbeats_keep_shared_snapshot_fencing():
         standby_request = _role_request('standby', lb_ha.LbSlot.B)
         active_request.update(large_report)
         standby_request.update(large_report)
-        return await asyncio.gather(
-            ctrl._handle_load_balancer_role(active_request),
+        active_task = asyncio.create_task(
+            ctrl._handle_load_balancer_role(active_request))
+        while not snapshot_started.is_set():
+            await asyncio.sleep(0.001)
+        standby_task = asyncio.create_task(
             ctrl._handle_load_balancer_role(standby_request))
+        while ctrl._lb_cutover_fence.call_count < 2:
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.01)
+        release_snapshot.set()
+        return await asyncio.gather(active_task, standby_task)
 
     with mock.patch.object(
             controller.lb_k8s, 'get_lb_role_snapshot',
@@ -870,16 +879,230 @@ def test_concurrent_slot_heartbeats_keep_shared_snapshot_fencing():
                 controller.serve_state,
                 'get_lb_cutover_state',
                 return_value=stable):
-        active_response, standby_response = asyncio.run(run_both_slots())
+        try:
+            active_response, standby_response = asyncio.run(run_both_slots())
+        finally:
+            release_snapshot.set()
 
     assert json.loads(active_response.body)['role'] == 'ACTIVE'
     assert json.loads(standby_response.body)['role'] == 'STANDBY'
-    assert snapshot_read.call_count == 2
+    assert snapshot_read.call_count == 1
     assert observed_fences == [
-        (('incarnation', (123, '10.0.0.1'), 7), stable),
         (('incarnation', (123, '10.0.0.1'), 7), stable),
     ]
     assert ctrl._lb_cutover_fence.call_count == 4
+
+
+@pytest.mark.parametrize('changed_key', ['fence', 'state'])
+def test_concurrent_stable_snapshots_with_different_keys_never_share(
+        changed_key):
+    ctrl = _role_controller()
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    changed_fence = ('other-incarnation', (123, '10.0.0.1'), 7)
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    changed_state = _state(lb_ha.LbCutoverPhase.STABLE, generation=2)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    snapshot_barrier = threading.Barrier(2)
+
+    def read_snapshot(*_args):
+        snapshot_barrier.wait(timeout=2)
+        return snapshot
+
+    async def run_different_keys():
+        loop = asyncio.get_running_loop()
+        first = asyncio.create_task(
+            ctrl._get_shared_stable_lb_role_snapshot(loop, fence, stable))
+        if changed_key == 'fence':
+            second_key = (changed_fence, stable)
+        else:
+            second_key = (fence, changed_state)
+        second = asyncio.create_task(
+            ctrl._get_shared_stable_lb_role_snapshot(loop, *second_key))
+        return await asyncio.gather(first, second)
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           side_effect=read_snapshot) as snapshot_read:
+        reads = asyncio.run(run_different_keys())
+
+    assert [read.snapshot for read in reads] == [snapshot, snapshot]
+    assert snapshot_read.call_count == 2
+    assert ctrl._lb_role_snapshot_task is None
+    assert ctrl._lb_role_snapshot_key is None
+
+
+def test_completed_stable_snapshot_is_never_reused():
+    ctrl = _role_controller()
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+
+    async def read_twice():
+        loop = asyncio.get_running_loop()
+        first = await ctrl._get_shared_stable_lb_role_snapshot(
+            loop, fence, stable)
+        second = await ctrl._get_shared_stable_lb_role_snapshot(
+            loop, fence, stable)
+        return first, second
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           return_value=snapshot) as snapshot_read:
+        reads = asyncio.run(read_twice())
+
+    assert [read.snapshot for read in reads] == [snapshot, snapshot]
+    assert snapshot_read.call_count == 2
+
+
+def test_old_snapshot_completion_cannot_clear_new_key_task():
+    ctrl = _role_controller()
+    first_fence = ('incarnation', (123, '10.0.0.1'), 7)
+    second_fence = ('other-incarnation', (123, '10.0.0.1'), 7)
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+
+    def read_snapshot(unused_name, fence, *_args):
+        if fence == first_fence:
+            first_started.set()
+            assert release_first.wait(timeout=2)
+        else:
+            assert fence == second_fence
+            second_started.set()
+            assert release_second.wait(timeout=2)
+        return snapshot
+
+    async def complete_in_order():
+        loop = asyncio.get_running_loop()
+        first = asyncio.create_task(
+            ctrl._get_shared_stable_lb_role_snapshot(loop, first_fence, stable))
+        while not first_started.is_set():
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(
+            ctrl._get_shared_stable_lb_role_snapshot(loop, second_fence,
+                                                     stable))
+        while not second_started.is_set():
+            await asyncio.sleep(0.001)
+        release_first.set()
+        await first
+        await asyncio.sleep(0)
+        assert ctrl._lb_role_snapshot_key == (second_fence, stable)
+        assert ctrl._lb_role_snapshot_task is not None
+        assert not ctrl._lb_role_snapshot_task.done()
+        release_second.set()
+        await second
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           side_effect=read_snapshot):
+        try:
+            asyncio.run(complete_in_order())
+        finally:
+            release_first.set()
+            release_second.set()
+
+    assert ctrl._lb_role_snapshot_task is None
+    assert ctrl._lb_role_snapshot_key is None
+
+
+def test_cancelled_stable_snapshot_waiter_does_not_poison_peer():
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    def read_snapshot(*_args):
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2)
+        return snapshot
+
+    async def cancel_then_join():
+        first = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        while not snapshot_started.is_set():
+            await asyncio.sleep(0.001)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        peer = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        while ctrl._lb_cutover_fence.call_count < 2:
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.01)
+        release_snapshot.set()
+        return await peer
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_role_snapshot',
+            side_effect=read_snapshot) as snapshot_read, mock.patch.object(
+                controller.serve_state,
+                'get_lb_cutover_state',
+                return_value=stable):
+        try:
+            response = asyncio.run(cancel_then_join())
+        finally:
+            release_snapshot.set()
+
+    assert response.status_code == 200
+    assert snapshot_read.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ('error', 'outcome'),
+    [(lb_k8s.LbRoleSnapshotStateMismatchError('owner changed'),
+      'cutover_state_unavailable'),
+     (lb_k8s.LbRoleSnapshotRoutingError('Service malformed'),
+      'routing_unavailable')])
+def test_concurrent_stable_snapshot_errors_are_shared(error, outcome):
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    def read_snapshot(*_args):
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2)
+        raise error
+
+    async def run_both_slots():
+        first = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        while not snapshot_started.is_set():
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('standby', lb_ha.LbSlot.B)))
+        while ctrl._lb_cutover_fence.call_count < 2:
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.01)
+        release_snapshot.set()
+        return await asyncio.gather(first, second)
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_role_snapshot',
+            side_effect=read_snapshot) as snapshot_read, mock.patch.object(
+                controller.serve_state,
+                'get_lb_cutover_state',
+                return_value=stable):
+        try:
+            responses = asyncio.run(run_both_slots())
+        finally:
+            release_snapshot.set()
+
+    assert [json.loads(response.body)['outcome'] for response in responses
+           ] == [outcome, outcome]
+    assert snapshot_read.call_count == 1
 
 
 @pytest.mark.parametrize('changed_authority', ['fence', 'state'])
