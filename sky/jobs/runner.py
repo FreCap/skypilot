@@ -1,11 +1,10 @@
 """Managed job runner: abstraction + registry.
 
 A ``ManagedJobRunner`` is the strategy object that the server's managed-job
-entry points (queue, cancel, tail_logs) delegate to. The registered runner
-decides *how* the operation executes — the default runner generates Python
-code and runs it on the controller via subprocess, while a plugin-provided
-runner might call the managed jobs DB directly when the controller is
-in-process.
+entry points (queue, cancel, tail_logs) delegate to. The registered runner decides
+*how* the operation executes — the default runner generates Python code and
+runs it on the controller via subprocess, while a plugin-provided runner
+might call the managed jobs DB directly when the controller is in-process.
 
 At most one runner is registered at a time. If nothing has registered,
 ``current()`` lazily constructs ``_DefaultManagedJobRunner`` from

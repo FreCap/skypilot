@@ -25,6 +25,45 @@ else:
 # behind sky.jobs.server.core.cancel.
 logger = sky_logging.init_logger('sky.jobs.server.core')
 
+_CANCEL_TRANSPORT_UPGRADE_HINT = (
+    'Graceful managed job cancellation requires a jobs controller with the gRPC '
+    '`cancel_managed_jobs` endpoint. Please upgrade the jobs controller and '
+    'retry.')
+
+
+def _requires_modern_cancel_transport(graceful: bool,
+                                      graceful_timeout: int | None) -> bool:
+    return graceful or graceful_timeout is not None
+
+
+def _build_cancel_request(
+    *,
+    current_workspace: str | None,
+    all_users: bool,
+    all: bool,  # pylint: disable=redefined-builtin
+    job_ids: list[int] | None,
+    name: str | None,
+    pool: str | None,
+    graceful: bool,
+    graceful_timeout: int | None,
+) -> 'managed_jobsv1_pb2.CancelJobsRequest':
+    request = managed_jobsv1_pb2.CancelJobsRequest(
+        current_workspace=current_workspace,
+        graceful=graceful,
+        graceful_timeout=graceful_timeout)
+    if all_users or all or job_ids:
+        request.all_users = all_users
+        if all:
+            request.user_hash = common_utils.get_user_hash()
+        if job_ids is not None:
+            request.job_ids.CopyFrom(managed_jobsv1_pb2.JobIds(ids=job_ids))
+    elif name is not None:
+        request.job_name = name
+    else:
+        assert pool is not None, (job_ids, name, pool, all)
+        request.pool_name = pool
+    return request
+
 
 @usage_lib.entrypoint
 # pylint: disable=redefined-builtin
@@ -69,38 +108,34 @@ def cancel(name: str | None = None,
 
         job_ids = None if (all_users or all) else job_ids
 
+        requires_modern_transport = _requires_modern_cancel_transport(
+            graceful, graceful_timeout)
+        if requires_modern_transport and not handle.is_grpc_enabled_with_flag:
+            raise exceptions.NotSupportedError(_CANCEL_TRANSPORT_UPGRADE_HINT)
+
         backend = backend_utils.get_backend_from_handle(handle)
         assert isinstance(backend, backends.CloudVmRayBackend)
-
         use_legacy = not handle.is_grpc_enabled_with_flag
         stdout = None
-
         if not use_legacy:
-            current_workspace = skypilot_config.get_active_workspace()
+            request = _build_cancel_request(
+                current_workspace=skypilot_config.get_active_workspace(),
+                all_users=all_users,
+                all=all,
+                job_ids=job_ids,
+                name=name,
+                pool=pool,
+                graceful=graceful,
+                graceful_timeout=graceful_timeout)
             try:
-                request = managed_jobsv1_pb2.CancelJobsRequest(
-                    current_workspace=current_workspace,
-                    graceful=graceful,
-                    graceful_timeout=graceful_timeout)
-
-                if all_users or all or job_ids:
-                    request.all_users = all_users
-                    if all:
-                        request.user_hash = common_utils.get_user_hash()
-                    if job_ids is not None:
-                        request.job_ids.CopyFrom(
-                            managed_jobsv1_pb2.JobIds(ids=job_ids))
-                elif name is not None:
-                    request.job_name = name
-                else:
-                    assert pool is not None, (job_ids, name, pool, all)
-                    request.pool_name = pool
-
                 response = backend_utils.invoke_skylet_with_retries(
                     lambda: cloud_vm_ray_backend.SkyletClient(
                         handle.get_grpc_channel()).cancel_managed_jobs(request))
                 stdout = response.message
-            except exceptions.SkyletMethodNotImplementedError:
+            except exceptions.SkyletMethodNotImplementedError as e:
+                if requires_modern_transport:
+                    raise exceptions.NotSupportedError(
+                        _CANCEL_TRANSPORT_UPGRADE_HINT) from e
                 use_legacy = True
 
         if use_legacy:

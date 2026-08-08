@@ -306,8 +306,6 @@ class _DefaultManagedJobRunner:
         graceful: bool,
         graceful_timeout: int | None,
     ) -> str:
-        # Single codegen that embeds the dispatcher (``cancel_managed_jobs``)
-        # via ``inspect.getsource`` — keeps the variant selection in one place.
         code = managed_job_utils.ManagedJobCodeGen.cancel_managed_jobs(
             name=name,
             job_ids=job_ids,
@@ -317,7 +315,6 @@ class _DefaultManagedJobRunner:
             graceful=graceful,
             graceful_timeout=graceful_timeout,
         )
-        # The stderr is redirected to stdout.
         returncode, stdout, stderr = backend.run_on_head(handle,
                                                          code,
                                                          require_outputs=True,

@@ -68,12 +68,12 @@ _CODEGEN_CASES = [
         'all_users': True,
         'graceful': True,
         'graceful_timeout': 30,
-    }, '6cbd7e33cf7123182588a5408b56e3e4a1f1bbbef0fe4e2007fce8b89b94857c'),
+    }, '8cfb362c5db217363fbd71e9a1f211d99bf1d7ca4ad21f427f0cee3bf68d2afc'),
     ('cancel_managed_jobs', (), {
         'name': 'job name',
         'graceful': True,
         'graceful_timeout': 12,
-    }, '129a0378a55745d0802e83ae27dd1a2d5943b4aec5979640d13c92332caf182e'),
+    }, 'da6f0d0b3d25cd407448dc9ec0cfd5050bee084cbfffe141b9e8a2c44b8d2743'),
     ('cancel_managed_jobs', (), {
         'pool': 'pool A',
     }, 'ec34494a27b122a5b7b25e41afa9d804792eebc50b2ab22348f98c15b46d2cce'),
@@ -127,6 +127,17 @@ def test_set_pending_codegen_output_is_stable() -> None:
     assert hashlib.sha256(command.encode()).hexdigest() == (
         '260a0d7364197543a454015ce59ae3ba3b18a1914b1f8b9165a02fed8b0e1c20')
     compile(_extract_generated_python(command), '<managed-job-code>', 'exec')
+
+
+def test_cancel_codegen_legacy_graceful_guard_is_embedded() -> None:
+    command = managed_job_utils.ManagedJobCodeGen.cancel_managed_jobs(
+        name='job name', graceful=True, graceful_timeout=12)
+    code = _extract_generated_python(command)
+
+    assert 'if managed_job_version < 19:' in code
+    assert 'raise RuntimeError(' in code
+    assert '`cancel_managed_jobs` endpoint.' in code
+    assert 'Please upgrade the jobs controller and retry.' in code
 
 
 def test_managed_job_codegen_facade_contract() -> None:

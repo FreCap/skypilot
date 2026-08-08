@@ -115,25 +115,18 @@ def test_cancel_grpc_projects_selector(cancellation_gateway, kwargs, field,
     assert getattr(request, field) == expected
 
 
-def test_cancel_falls_back_to_legacy_runner(cancellation_gateway):
+def test_cancel_rejects_stale_controller_graceful_without_legacy_runner(
+        cancellation_gateway):
     gateway = cancellation_gateway
     gateway.client.cancel_managed_jobs.side_effect = (
         exceptions.SkyletMethodNotImplementedError())
-    gateway.runner.cancel_managed_jobs.return_value = 'Legacy cancelled.'
 
-    jobs_core.cancel(name='train', graceful=True, graceful_timeout=17)
+    with pytest.raises(exceptions.NotSupportedError,
+                       match='Please upgrade the jobs controller'):
+        jobs_core.cancel(name='train', graceful=True, graceful_timeout=17)
 
-    gateway.runner.cancel_managed_jobs.assert_called_once_with(
-        handle=gateway.handle,
-        backend=gateway.backend,
-        all_users=False,
-        all=False,
-        job_ids=[],
-        name='train',
-        pool=None,
-        graceful=True,
-        graceful_timeout=17,
-    )
+    gateway.client.cancel_managed_jobs.assert_called_once()
+    gateway.current_runner.assert_not_called()
 
 
 def test_cancel_rejects_missing_selector(cancellation_gateway):
@@ -142,6 +135,52 @@ def test_cancel_rejects_missing_selector(cancellation_gateway):
 
     cancellation_gateway.get_backend.assert_not_called()
     cancellation_gateway.invoke.assert_not_called()
+
+
+def test_cancel_non_graceful_falls_back_to_legacy_runner_when_grpc_missing(
+        cancellation_gateway):
+    gateway = cancellation_gateway
+    gateway.client.cancel_managed_jobs.side_effect = (
+        exceptions.SkyletMethodNotImplementedError())
+    gateway.runner.cancel_managed_jobs.return_value = 'Legacy cancelled.'
+
+    jobs_core.cancel(name='train')
+
+    gateway.client.cancel_managed_jobs.assert_called_once()
+    gateway.runner.cancel_managed_jobs.assert_called_once_with(
+        handle=gateway.handle,
+        backend=gateway.backend,
+        all_users=False,
+        all=False,
+        job_ids=[],
+        name='train',
+        pool=None,
+        graceful=False,
+        graceful_timeout=None,
+    )
+
+
+def test_cancel_rejects_non_grpc_graceful_before_backend_lookup(
+        cancellation_gateway):
+    gateway = cancellation_gateway
+    gateway.handle.is_grpc_enabled_with_flag = False
+
+    with pytest.raises(exceptions.NotSupportedError,
+                       match='Please upgrade the jobs controller'):
+        jobs_core.cancel(name='train', graceful=True, graceful_timeout=17)
+
+    gateway.get_backend.assert_not_called()
+    gateway.invoke.assert_not_called()
+    gateway.current_runner.assert_not_called()
+
+
+def test_cancel_rejects_missing_grpc_output(cancellation_gateway):
+    gateway = cancellation_gateway
+    gateway.client.cancel_managed_jobs.return_value = SimpleNamespace(
+        message=None)
+
+    with pytest.raises(RuntimeError, match='produced no output'):
+        jobs_core.cancel(name='train')
 
 
 @pytest.mark.parametrize(('output', 'message'), [
