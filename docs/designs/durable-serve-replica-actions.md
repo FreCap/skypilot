@@ -766,6 +766,16 @@ fresh direct-Helm production readiness/+10/+30/+60 window with zero incremental
 bucket, recovery at most 15 seconds, unchanged fixed capacity, and every
 safety, state, schema, event, log, health, and restart gate passing.
 
+Local pre-PR verification passed on 2026-08-08. The selected 21-file HA,
+external-load-balancer, controller-proxy, controller-event-loop, and controller
+hard-exit suite passed with exit code zero (493 tests before the final
+lifecycle test was added). A focused rerun then passed both the default-pool
+saturation behavior test and the executor-lifespan shutdown test, bringing the
+distinct selected coverage to 494 tests. The repository's configured mypy set
+passed for 884 source files, Pylint rated all three changed Python files
+10.00/10, and `git diff --check` passed. CI and both exact-artifact deployment
+windows remain open gates.
+
 ### Final-removal artifact evidence (2026-08-08)
 
 PR #1346's exact code head

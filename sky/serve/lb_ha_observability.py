@@ -8,6 +8,7 @@ It deliberately stores no service, Pod, replica URL, or request identifiers.
 
 import collections
 from collections.abc import Callable
+import concurrent.futures
 import dataclasses
 import enum
 import math
@@ -128,8 +129,10 @@ def _latency_stat() -> _RunningStat:
 class RoleRequestTrace:
     """Per-request controller trace with executor and lock timing."""
 
-    def __init__(self) -> None:
+    def __init__(self,
+                 executor: concurrent.futures.Executor | None = None) -> None:
         self._started_at = time.monotonic()
+        self._executor = executor
         self._phases: collections.defaultdict[str, float] = (
             collections.defaultdict(float))
         self._lock_wait_seconds = 0.0
@@ -138,11 +141,21 @@ class RoleRequestTrace:
     async def run_in_executor(self, loop: Any, phase: str, function: Callable,
                               *args: Any) -> Any:
         """Run one blocking authority read and attribute its elapsed time."""
-        started_at = time.monotonic()
+        submitted_at = time.monotonic()
+        worker_started_at: float | None = None
+
+        def invoke() -> Any:
+            nonlocal worker_started_at
+            worker_started_at = time.monotonic()
+            return function(*args)
+
         try:
-            return await loop.run_in_executor(None, function, *args)
+            return await loop.run_in_executor(self._executor, invoke)
         finally:
-            self._phases[phase] += time.monotonic() - started_at
+            self._phases[phase] += time.monotonic() - submitted_at
+            if worker_started_at is not None:
+                self._phases[f'{phase}_executor_queue'] += max(
+                    0.0, worker_started_at - submitted_at)
 
     def lock_acquired(self, wait_started_at: float) -> None:
         now = time.monotonic()

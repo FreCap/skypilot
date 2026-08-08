@@ -4,6 +4,7 @@ Responsible for autoscaling and replica management.
 """
 import asyncio
 from collections.abc import Callable
+import concurrent.futures
 import contextlib
 import contextvars
 import functools
@@ -445,6 +446,10 @@ class SkyServeController:
         self._lb_ha_enabled = (durable_lb_state.enabled
                                if durable_lb_state is not None else
                                service_spec.lb_high_availability is True)
+        self._lb_role_executor: concurrent.futures.ThreadPoolExecutor | None = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix='skyserve-ha-role')
+            if self._lb_ha_enabled else None)
         self._lb_session_ledger = (lb_ha.LbSessionLedger(
             serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
@@ -575,7 +580,12 @@ class SkyServeController:
         for handler in uvicorn_access_logger.handlers:
             handler.setFormatter(sky_logging.FORMATTER)
             handler.addFilter(AutoscalerInfoFilter())
-        yield
+        try:
+            yield
+        finally:
+            executor = self._lb_role_executor
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:
@@ -2075,10 +2085,19 @@ class SkyServeController:
 
             async def read_snapshot() -> _StableLbRoleSnapshotRead:
                 timings: dict[str, float] = {}
+                submitted_at = time.monotonic()
+
+                def get_snapshot() -> lb_k8s.LbRoleSnapshot | None:
+                    timings['kubernetes_role_snapshot_executor_queue'] = max(
+                        0.0,
+                        time.monotonic() - submitted_at)
+                    return lb_k8s.get_lb_role_snapshot(self._service_name,
+                                                       fence, state, owner,
+                                                       timings)
+
                 try:
                     snapshot = await loop.run_in_executor(
-                        None, lb_k8s.get_lb_role_snapshot, self._service_name,
-                        fence, state, owner, timings)
+                        getattr(self, '_lb_role_executor', None), get_snapshot)
                     return _StableLbRoleSnapshotRead(snapshot, timings, None)
                 except Exception as e:  # pylint: disable=broad-except
                     # Return failures as task data so an individually cancelled
@@ -2106,7 +2125,8 @@ class SkyServeController:
     async def _handle_load_balancer_role(
             self, request_data: dict[str, Any]) -> fastapi.Response:
         """Ingest a fast HA report and advance the recoverable cutover saga."""
-        trace = lb_ha_obs.RoleRequestTrace()
+        trace = lb_ha_obs.RoleRequestTrace(
+            getattr(self, '_lb_role_executor', None))
         verified_owner_fingerprint: str | None = None
 
         def role_response(
