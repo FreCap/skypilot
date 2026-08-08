@@ -29,9 +29,12 @@ No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
 cleanup is merged and deployed, but operational closeout remains open: the
 final-removal artifact preserved every safety and retired-state invariant while
-failing its exact +60 heartbeat-latency comparator. PR #1355 merged the bounded
-fix as `606b4b29703dd2a6e69f57e49db685e85a3c6468`; its immutable artifact must
-still be deployed and pass the fresh production qualification below.
+failing its exact +60 heartbeat-latency comparator. PRs #1355 and #1360 merged
+two bounded snapshot-latency corrections, but production revisions 370 and 371
+both failed the stricter zero-new-timeout qualification without a safety or
+state regression. Parent PR #1362 owns the narrower remaining per-service
+role-lock serialization fix. Its immutable artifact must pass the fresh test and
+production qualification below before this cleanup record can merge.
 
 The combined HA latency fix through PRs #1367, #1369, and #1370 shipped as
 release `1.1.1176` and passed the exact `boltz-test` readiness/+10/+30 window.
@@ -1141,23 +1144,63 @@ recorded no Warning event after readiness.  The zero-timeout gate is
 monotonic, so revision 370 cannot qualify and its +60 timer was stopped rather
 than misrepresented as recoverable evidence.
 
-The new phase telemetry narrows the remaining serialized work.  On the first
-post-readiness sample, the ACTIVE/STANDBY `kubernetes_role_snapshot` recent
-p99 was 5.065/3.475 seconds.  Its Pod LIST reached 4.111/2.067 seconds, the
-first live Deployment-identity read reached 3.572/1.133 seconds, and the
-second live Deployment-ownership validation reached 1.177/1.862 seconds.
-Those independent Pod, Service, and first Deployment reads still execute
-sequentially under the per-service role lock; the opposite slot then waits for
-their sum and performs the same sequence.  The next bounded correction will
-issue only those first three independent reads concurrently, join all three
-before parsing or making a role decision, and retain the second live
-Deployment UID read after the join.  Thus the critical path becomes the
-maximum of the independent reads rather than their sum while the existing
-lock, fail-closed error mapping, exact Pod/Service/incarnation checks, and
-two-read Deployment replacement fence remain unchanged.  It adds no cache,
-TTL, stale authority, new mutation path, or provider capacity.  A fresh exact
-readiness/+10/+30/+60 production qualification on the subsequently merged
-artifact remains mandatory.
+The new phase telemetry first narrowed the remaining work inside each shared
+snapshot. On revision 370's first post-readiness sample, the ACTIVE/STANDBY
+`kubernetes_role_snapshot` recent p99 was 5.065/3.475 seconds. Its Pod LIST
+reached 4.111/2.067 seconds, the first live Deployment-identity read reached
+3.572/1.133 seconds, and the second live Deployment-ownership validation
+reached 1.177/1.862 seconds. PR #1360 therefore issued only the independent
+Pod LIST, Service GET, and first Deployment GET concurrently, joined all
+three before parsing or making a role decision, and retained the second live
+Deployment UID read after the join. It changed no cache, TTL, authority
+contract, mutation path, or provider capacity. Its 204 focused tests and exact
+30/30 CI passed, and it merged as
+`701ae52216254b5f25e485f42adf8d307062e37a`. Release `1.1.1168` points exactly
+to that merge; its source image digest is
+`sha256:1f25b3b44e01c6420284cd79862245ed717e11dbbfe7a6f54ce0b2ece5b1d2df`
+and chart digest is
+`sha256:20283f5c4fe469f2c8ac2b2424062e426f05ee6d930318e42a0ee524443e6fee`.
+
+Test Helm revision 98 deployed that exact artifact on the bounded CPU-only
+Spot cluster. A first observation window was invalidated, rather than counted,
+when Karpenter terminated an older Spot node at its first +10 sample. The
+subsequent fresh window passed at T0 07:07:09, +10 07:17:58, and +30 07:37:43
+UTC: all six exact workloads remained Ready with zero restarts, both slots
+remained correctly routed, stable, synced, and non-draining, schema and retired
+state stayed exact and empty, the 10-claim baseline did not grow, and no
+On-Demand node appeared.
+
+Production Helm revision 371 then deployed the same exact chart and image with
+the complete preserved values and no incremental provider capacity. The
+migration succeeded once, all 17 workloads converged to the exact digest with
+zero restarts, all eight pairs were stable, correctly routed, synced,
+non-draining, and converged, and the fixed three-node Auto Scaling group and
+all cleanup-state gates remained unchanged. That artifact nevertheless failed
+the monotonic zero-new-timeout gate immediately. At T0 07:51:29 UTC the
+`boltz-l4-fleet` ACTIVE/STANDBY counters were 24/20 `client_timeout` and 85/62
+success; by 07:51:55 they were 25/22 timeouts. The +60 timer was stopped.
+Successful owner reads remained below 0.3 seconds, while the serialized
+controller-forward path reached roughly 8.1--8.65 seconds and controller
+role-lock wait reached 7.38 seconds. The evidence proves that concurrent reads
+inside one snapshot are insufficient while the two slot snapshots themselves
+remain serialized across the per-service role lock.
+
+PR #1362 is the parent correction. Only an already validated `STABLE`,
+read-only Kubernetes role snapshot may execute before the transition lock, so
+the two warm slots may overlap their slow provider reads. The handler then
+acquires the lock and exactly revalidates the PostgreSQL owner fence and the
+complete frozen durable state before the snapshot can affect the session
+ledger or a role response. Any mismatch fails closed. Every non-STABLE
+snapshot, planned promotion, selector/database mutation, ledger update, and
+drain publication retains the existing serialized path. The read-only snapshot
+uses the Service ownerReference as its expected API Deployment identity and
+retains a final live Deployment UID validation after the Service read; mutation
+callers retain their two-read owner fence. There is still no authority cache,
+TTL, stale-role acceptance, new execution path, or provider-capacity
+dependency. The 216 focused HA/Kubernetes/qualification tests and complete
+462-test external-load-balancer unit surface pass locally. Exact-head CI and a
+fresh exact readiness/+10/+30 test qualification followed by
+readiness/+10/+30/+60 production qualification remain mandatory.
 
 ### R0 manual test plan
 
@@ -1269,11 +1312,19 @@ approved canary:
   passed, and physical capacity returned to the 10-node / 80-vCPU baseline.
 - [ ] Merge this canonical follow-up after it records the complete production
   monitor and the third deployment-sequencing departure.
-- [ ] Deploy PR #1355's published immutable artifact with zero incremental
-  provider capacity, then pass a fresh readiness, +10, +30, and exact
-  60-minute production window before closing the failed comparator. The PR
-  passed 30/30 checks and release `1.1.1166` points exactly to merge
-  `606b4b29703dd2a6e69f57e49db685e85a3c6468`.
+- [x] Deploy PR #1355's published immutable artifact with zero incremental
+  provider capacity. Production revision 370 preserved every safety and state
+  invariant but failed the monotonic zero-new-timeout gate immediately.
+- [x] Merge PR #1360, qualify its exact immutable artifact on `boltz-test`, and
+  deploy it to production with zero incremental provider capacity. Test
+  revision 98 passed its fresh readiness/+10/+30 window; production revision
+  371 preserved every safety and state invariant but failed the monotonic
+  zero-new-timeout gate by its first post-T0 sample.
+- [ ] Pass PR #1362 exact-head CI, merge it, and qualify its exact immutable
+  artifact on `boltz-test` through fresh readiness/+10/+30 without On-Demand
+  capacity. Then deploy the same artifact to production with `--reuse-values`
+  on the fixed three-node capacity and pass fresh readiness/+10/+30/+60 gates,
+  including zero `client_timeout` delta and the exact issue-#1349 comparator.
 - [x] Complete PR #1346's production monitoring. Revision 369 deployed the
   exact artifact and passed its readiness, +10, +30 safety/state, sync-rate,
   and 60-second recovery-safety gates. Its exact +60 comparison failed at 64
@@ -1287,7 +1338,7 @@ approved canary:
 - [ ] R2 only: obtain named capacity approval before any positive launch/down
   crash canary or any rollout that invalidates the zero-capacity bound.
 
-Until the production monitor and canonical follow-up merge, the dedicated
-authority-stack retirement is not production-complete. The bounded
+Until PR #1362's production monitor and this stacked canonical follow-up merge,
+the dedicated authority-stack retirement is not production-complete. The bounded
 request-binding follow-up remains independently incomplete until issue #1352
 satisfies the R1/R2 evidence above.
