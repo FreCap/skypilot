@@ -3230,6 +3230,23 @@ class TestGetServiceControllerOwner:
     def test_missing_row_returns_none(self, _mock_serve_db):
         assert serve_state.get_service_controller_owner('missing') is None
 
+    def test_lb_state_extension_includes_complete_cutover_row_in_one_query(
+            self, _mock_serve_db):
+        _add_minimal_service('svc-role-state', controller_ip='10.4.10.8')
+
+        with _count_sql_statements(_mock_serve_db) as counts:
+            record = serve_state.get_service_controller_owner(
+                'svc-role-state', include_lb_state=True)
+
+        assert record is not None
+        assert record['lb_ha_enabled'] is False
+        assert record['lb_active_slot'] is None
+        assert record['lb_cutover_generation'] == 0
+        assert record['lb_pending_slot'] is None
+        assert record['lb_cutover_phase'] == 'STABLE'
+        assert record['lb_drain_started_at'] is None
+        assert counts['n'] == 1
+
     def test_require_version_rejects_orphan_service_row(self, _mock_serve_db):
         _insert_orphan_service_row(_mock_serve_db, 'svc-orphan')
 

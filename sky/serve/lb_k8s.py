@@ -24,6 +24,7 @@ starting a real service calls :func:`require_external_lb_runtime` and fails
 closed instead of falling back to an in-pod LB.
 """
 from collections.abc import Callable
+from collections.abc import Mapping
 import concurrent.futures
 import contextvars
 import copy
@@ -2848,14 +2849,16 @@ def get_lb_role_snapshot(
         service_name: str,
         expected_fence: tuple[str, tuple[int | None, str | None], int],
         expected_state: lb_ha.LbCutoverState,
+        owner: Mapping[str, Any],
         timings: dict[str, float] | None = None) -> LbRoleSnapshot | None:
     """Read one fail-closed Pod and Service authority snapshot for a role.
 
-    The common heartbeat path shares one owner-row read, one Pod list, one
-    Service read, and one live Deployment UID validation after the Service
-    read.  The independent Pod and Service reads are fully joined before any
-    decision.  The existing Service supplies the expected owner identity, so
-    no earlier Deployment read is needed to construct that same identity.
+    The caller supplies the owner and complete cutover state from one database
+    row read.  This function performs one Pod list, one Service read, and one
+    live Deployment UID validation after the Service read.  The independent
+    Pod and Service reads are fully joined before any decision.  The existing
+    Service supplies the expected owner identity, so no earlier Deployment
+    read is needed to construct that same identity.
     """
     if not _lb_mode_active():
         return None
@@ -2870,10 +2873,6 @@ def get_lb_role_snapshot(
                                   started_at)
 
     try:
-        owner = timed('snapshot_postgresql_owner_read',
-                      serve_state.get_service_controller_owner,
-                      service_name,
-                      include_lb_state=True)
         expected_hash, expected_owner, expected_epoch = expected_fence
         owner_active_slot = (lb_ha.parse_slot(owner.get('lb_active_slot'))
                              if owner is not None else None)

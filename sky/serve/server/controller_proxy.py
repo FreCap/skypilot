@@ -192,13 +192,15 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
 
     body = await request.body()
     request_bytes = len(body)
+    expected_owner_fingerprint = serve_utils.make_controller_owner_fingerprint(
+        *owner_before)
     forwarded_headers = {
         'Authorization': authorization,
         'Content-Type': request.headers.get('content-type', 'application/json'),
-        constants.CONTROLLER_OWNER_HEADER:
-            serve_utils.make_controller_owner_fingerprint(*owner_before),
+        constants.CONTROLLER_OWNER_HEADER: expected_owner_fingerprint,
     }
     forward_started_at = time.monotonic()
+    controller_owner_attestation: str | None = None
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -217,6 +219,8 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
                 response_status = controller_response.status
                 response_content_type = controller_response.headers.get(
                     'Content-Type')
+                controller_owner_attestation = controller_response.headers.get(
+                    constants.LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         phases['controller_forward'] = time.monotonic() - forward_started_at
         logger.warning('Failed to connect to the SkyServe controller for '
@@ -226,20 +230,34 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
             lb_ha_obs.LbRoleOutcome.PROXY_CONTROLLER_CONNECTION_FAILED)
     phases['controller_forward'] = time.monotonic() - forward_started_at
 
-    owner_verify_started_at = time.monotonic()
-    try:
-        owner_after = await _read_controller_owner(service_name)
-    except Exception as e:  # pylint: disable=broad-except
+    if is_role_request and controller_owner_attestation is not None:
+        # The controller emits this only after its complete owner/cutover row
+        # has been re-read under the role lock. Matching the exact fingerprint
+        # read before routing moves the final owner linearization point into the
+        # controller and avoids a redundant proxy SQL query. An explicit bad
+        # attestation is never treated as an old-version fallback.
+        if controller_owner_attestation != expected_owner_fingerprint:
+            return unavailable(
+                'Controller ownership attestation changed during the request.',
+                lb_ha_obs.LbRoleOutcome.PROXY_OWNER_CHANGED)
+    else:
+        # Mixed-version role responses carry no attestation and every non-role
+        # route retains the historical before/after owner fence.
+        owner_verify_started_at = time.monotonic()
+        try:
+            owner_after = await _read_controller_owner(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            phases['owner_after'] = time.monotonic() - owner_verify_started_at
+            logger.warning('Failed to verify the SkyServe controller owner for '
+                           f'{service_name!r}: {e}')
+            return unavailable(
+                'Controller ownership could not be verified.',
+                lb_ha_obs.LbRoleOutcome.PROXY_OWNER_VERIFICATION_FAILED)
         phases['owner_after'] = time.monotonic() - owner_verify_started_at
-        logger.warning('Failed to verify the SkyServe controller owner for '
-                       f'{service_name!r}: {e}')
-        return unavailable(
-            'Controller ownership could not be verified.',
-            lb_ha_obs.LbRoleOutcome.PROXY_OWNER_VERIFICATION_FAILED)
-    phases['owner_after'] = time.monotonic() - owner_verify_started_at
-    if owner_after != owner_before:
-        return unavailable('Controller ownership changed during the request.',
-                           lb_ha_obs.LbRoleOutcome.PROXY_OWNER_CHANGED)
+        if owner_after != owner_before:
+            return unavailable(
+                'Controller ownership changed during the request.',
+                lb_ha_obs.LbRoleOutcome.PROXY_OWNER_CHANGED)
 
     response_headers = {}
     if response_content_type is not None:
