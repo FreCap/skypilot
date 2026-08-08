@@ -459,6 +459,13 @@ validation, and the global predecessor-receipt scan; an unknown protocol, a
 malformed suffix, a relabeled v3/v4 proof, or any protocol/fact mismatch is a
 blocker.  Tests include a secret-free exact manifest/row snapshot of production
 run `3bacd32f-888e-4a1f-af87-8f17dd82f168`, not only a synthetic v1 ledger.
+The dependency-light `placement_normalization_manifest` module owns this pure
+persisted-manifest contract and imports no operator or database state module.
+Both operator-side validation and the controller receipt reader call that same
+validator.  The receipt reader loads the requested run's complete bounded row
+inventory and validates it before returning a pending request, accepting a
+completed receipt, or acknowledging and CASing a load; validating only the
+selected current and recovery entries is insufficient for protocol 4.
 The protocol-1 through protocol-3 validators retain the historical
 `same_service_placeholder_dependency_absent=true` fact exactly.  Protocol 4
 must neither emit nor accept that fact: its complete stale-placeholder
@@ -467,8 +474,16 @@ contradictory rather than additional evidence.
 The persisted `schema_revision="037"` is the immutable placement-normalization
 ledger schema identifier for protocols 1-4, not the central database migration
 number.  Protocol 4 nevertheless requires the current full column-hash maps to
-contain both revision-038 action-identity columns and prove them SQL NULL for
-every stale placeholder.
+contain exactly the frozen revision-038 `version_specs` columns
+`service_name`, `version`, `spec`, `yaml_content`, `submitted_yaml_content`,
+`created_at`, `created_by`, `quarantined_at`, `quarantine_reason`,
+`retired_yaml_content`, `retired_at`, `retirement_reason`,
+`retirement_run_id`, `placement_catalog`, `controller_config`,
+`controller_config_digest`, `controller_config_snapshot_id`,
+`controller_applied_at`, `resource_action_spec_identity`, and
+`resource_action_spec_identity_sha256`.  The action-identity columns must hash
+as SQL NULL for every stale placeholder.  Later live-schema additions do not
+retroactively change this protocol-4 column contract.
 
 For each historical candidate service, protocol 4 selects every exact
 `PLACEHOLDER` row from the already bounded locked version inventory.  Each
