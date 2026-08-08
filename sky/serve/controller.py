@@ -446,10 +446,12 @@ class SkyServeController:
         self._lb_ha_enabled = (durable_lb_state.enabled
                                if durable_lb_state is not None else
                                service_spec.lb_high_availability is True)
-        self._lb_role_executor: concurrent.futures.ThreadPoolExecutor | None = (
+        # Threads are created lazily.  Establish this interface for every
+        # controller so an in-place legacy-to-HA transition cannot silently
+        # submit role authority reads to asyncio's shared default executor.
+        self._lb_role_executor: concurrent.futures.ThreadPoolExecutor = (
             concurrent.futures.ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix='skyserve-ha-role')
-            if self._lb_ha_enabled else None)
+                max_workers=2, thread_name_prefix='skyserve-ha-role'))
         self._lb_session_ledger = (lb_ha.LbSessionLedger(
             serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
@@ -583,9 +585,7 @@ class SkyServeController:
         try:
             yield
         finally:
-            executor = self._lb_role_executor
-            if executor is not None:
-                executor.shutdown(wait=False, cancel_futures=True)
+            self._lb_role_executor.shutdown(wait=False, cancel_futures=True)
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:
@@ -2096,9 +2096,23 @@ class SkyServeController:
                                                        timings)
 
                 try:
-                    snapshot = await loop.run_in_executor(
-                        getattr(self, '_lb_role_executor', None), get_snapshot)
+                    snapshot = await asyncio.wait_for(
+                        loop.run_in_executor(self._lb_role_executor,
+                                             get_snapshot),
+                        timeout=serve_constants.LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS
+                    )
                     return _StableLbRoleSnapshotRead(snapshot, timings, None)
+                except asyncio.TimeoutError:
+                    # wait_for() cannot stop a sync function that is already
+                    # running in an executor.  Return an immutable timing copy
+                    # and let this task complete so the identity-checked
+                    # callback makes the next heartbeat start a fresh read.
+                    # The late read is side-effect-free and its eventual result
+                    # is intentionally ignored.
+                    error = lb_k8s.LbRoleSnapshotRoutingError(
+                        'HA role Kubernetes snapshot exceeded its bounded '
+                        'provider deadline.')
+                    return _StableLbRoleSnapshotRead(None, dict(timings), error)
                 except Exception as e:  # pylint: disable=broad-except
                     # Return failures as task data so an individually cancelled
                     # waiter cannot leave an unobserved task exception behind.
@@ -2125,8 +2139,7 @@ class SkyServeController:
     async def _handle_load_balancer_role(
             self, request_data: dict[str, Any]) -> fastapi.Response:
         """Ingest a fast HA report and advance the recoverable cutover saga."""
-        trace = lb_ha_obs.RoleRequestTrace(
-            getattr(self, '_lb_role_executor', None))
+        trace = lb_ha_obs.RoleRequestTrace(self._lb_role_executor)
         verified_owner_fingerprint: str | None = None
 
         def role_response(

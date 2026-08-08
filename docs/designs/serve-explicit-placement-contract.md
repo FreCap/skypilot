@@ -38,7 +38,14 @@ YAML, staged controller configuration, replica, catalog, action identity, or
 typed resource-action root.  The protocol-4 follow-up below replaces the
 blanket same-service-placeholder rejection with a complete locked proof of
 that non-executable state; an unproved or concurrently owned reservation still
-blocks the transaction.  Created 2026-08-07; last updated 2026-08-08._
+blocks the transaction.  Protocol-4 PR #1380 merged as
+`c4f5b417b538d4876a1279200592457854fdf913` and released as v1.1.1182, but that
+artifact is not a production qualification candidate because it does not
+contain the still-required bounded HA snapshot correction.  The next immutable
+release containing #1380 plus both HA corrections #1373 and #1374 is the
+reader-first and HA qualification unit defined below; standalone v1.1.1182 is
+not selected or qualified for this rollout.  Created 2026-08-07; last updated
+2026-08-08._
 
 ## Decision summary
 
@@ -1337,7 +1344,11 @@ placement pickle during startup.  Reader-first rollout
 must prove the trigger definitions are installed before the held operator
 transaction; after the terminal row commits, rollback to any image that does
 not understand protocol 4 and downgrade of revision 040 are forbidden
-independently of the application-level writer fence.
+independently of the application-level writer fence.  The schema/format
+compatibility floor is v1.1.1182, but the production-qualified operational
+floor is the combined #1380+#1373+#1374 artifact (or a separately qualified
+newer fix); v1.1.1182 must not be selected as an ordinary post-protocol-4
+production rollback merely because it can parse the database.
 
 Production baseline inventory found 155 valid fieldless public contracts,
 seven pickled-`None` placeholders, and one fieldless transition-only
@@ -1420,20 +1431,38 @@ evidence is attached.
    image with `serve.controllerHold=false`; all eight controller health probes
    and all 16 load-balancer deployments recovered.  For protocol 4, first
    deploy the exact corrected image directly with Helm `--reuse-values` while
-   `serve.controllerHold=false`.  Let the Recreate pod recover controllers and
-   require every existing protocol-1/protocol-2/protocol-3 receipt and manifest
-   to pass its frozen validator, all eight requested receipts to remain converged, all
-   controller ports and health probes to recover, all endpoint/LB identities
-   and 16 LB deployments to remain healthy, and
+   `serve.controllerHold=false`.  The first qualified protocol-4 reader also
+   contains #1380 plus both HA corrections #1373 and #1374.  Keep the hold
+   false, create no protocol-4 run manifest or requested receipt, and perform
+   no retirement apply throughout its staging readiness/+10/+30 and production
+   readiness/+10/+30/+60 HA windows.  Bounded default-mode (`mode=None`)
+   inventory/ledger dry-runs are required and permitted during those windows:
+   they have `run_id=None` and create no protocol-4 identity or database write.
+   Enabling the hold, approving writer freeze evidence, invoking either
+   apply-supported or terminal writer mode, and requesting a protocol-4 receipt
+   remain forbidden until the production +60 gate passes.  Let the Recreate pod
+   recover controllers and require every existing
+   protocol-1/protocol-2/protocol-3 manifest to pass its frozen validator.  In
+   staging require the exact complete local receipt inventory to validate and
+   converge; in production require all eight requested/loaded receipts to
+   remain converged and unchanged.  Require all controller ports and health
+   probes to recover, all endpoint/LB identities and 16 LB deployments to
+   remain healthy, and
    committed/elected/applied versions, replica inventory, and paid-capacity
    authority to remain unchanged.  Only after attaching that reader-first
-   evidence may a separate Helm revision set the hold to true.  Its final
+   evidence may a separate Helm revision set the hold to true.  The reader and
+   held revisions must use one exact immutable pin tuple: combined merge SHA,
+   image digest, chart version, and chart digest.  Its final
    preflight must reproduce all 164 rows and the exact preimage digest, classify
    exactly 156 explicit-v2, one historical, and seven placeholders, prove
    `{3, 10}` is the complete same-service placeholder set below committed/current
    version 51, and prove every required side column, replica count, image demand,
-   and action root is zero/NULL before applying protocol-4 retirement.  The hold
-   revision must retain the exact protocol-4 image and chart pins.  Post-apply,
+   and action root is zero/NULL.  Before applying protocol-4 retirement, take a
+   fresh full production database snapshot, wait until it is available, capture
+   the exact networking, encryption, and secret-switch inputs needed to restore
+   it, and complete the documented restore drill under the hold.  The terminal
+   writer is NO-GO until that backup/restore gate closes.  The hold revision
+   must retain the exact combined pin tuple.  Post-apply,
    require both placeholder rows to retain identical full row/column hashes;
    among preexisting version and cleanup rows, only historical version 2 and
    the 49 exact `provisional: 1 -> 0` bits may change.  Recompute the complete
@@ -1452,30 +1481,42 @@ evidence is attached.
 7. Migrate eligible physical GPU services only through an explicit rolling
    update.  Require every old replica to drain and the logical bridge to
    converge before counting a service as migrated.
-8. The normalization release is the minimum post-supported-apply server-image
-   rollback floor.  Its placement-contract-v2 serializer and central write
-   guards prevent reintroduction.
-   v1.1.1135 remains an offline read fixture only and must not be deployed
-   against the post-apply database because it can write v1 and has no
-   controller hold.  Before apply, the ordinary Helm rollback to v1.1.1135 is
-   still available.  After apply, roll back chart/config changes while pinning
-   the normalization-or-newer image, or restore the pre-apply database backup
-   before deploying v1.1.1135.  Normalized rows are mirror-free v2.
-   Once any protocol-4 run manifest or requested receipt exists, the exact
-   protocol-4-capable release becomes the stricter live-database rollback
-   floor: v1.1.1155 and every older image reject the `4:<commit>` identity and
-   must not be started against that database.  Rolling back chart or config
-   after that point must retain the protocol-4-capable image.  Deploying an
-   older image requires first restoring a verified pre-protocol-4 database
-   backup under the controller hold.  Historical retirement is intentionally
-   irreversible in the live database:
-   the retained history row and strictly newer committed row preserve the
-   version high-water mark, while NULL committed YAML makes the retired row
-   invisible to old and new election/recovery readers and stale commit retries
-   fail against that successor.  Restore from a pre-apply backup is permitted
-   only through a runbook that deploys the normalization reader/writer with the
-   controller hold active and normalizes before controllers resume.  No older
-   binary may perform partial-restore orphan cleanup against a retired row.
+8. Rollback follows three explicit database states.  The prior supported
+   normalization remains in force throughout: v1.1.1143 is the minimum image
+   for the already-normalized mirror-free-v2 database, and v1.1.1135 remains an
+   offline read fixture rather than a deployable v1 writer.
+
+   1. **Revision 040 open; no protocol-4 identity.** Installing revision 040
+      alone does not raise the application floor because it installs authority
+      objects without rewriting placement state.  After proving there is no
+      protocol-4 run manifest, requested receipt, or terminal row, a documented
+      safety or availability failure may roll the application back to the
+      freshly captured pre-upgrade release while retaining revision 040.
+      Latency-only qualification failures remain fix-forward.  Production
+      policy does not depend on exercising the mechanically available open-gate
+      schema downgrade.
+   2. **Any protocol-4 manifest or requested receipt.** This threshold includes
+      a zero-change apply-supported writer run and applies before terminal
+      retirement.  The technical schema/format floor becomes v1.1.1182; the
+      production operational floor becomes the exact qualified combined
+      #1380+#1373+#1374 artifact (or a separately qualified newer fix).  Retain
+      revision 040.  Although the migration's downgrade function can
+      mechanically remove an open preterminal gate, doing so after protocol-4
+      identity exists is operationally forbidden: protocol-4 applications
+      require revision 040, while protocol-1/2/3 applications reject the
+      `4:<commit>` identity and would strand the database.
+   3. **Terminal historical row committed.** Revision-040 downgrade hard-fails,
+      later run inserts fail closed, and live rollback is limited to chart or
+      configuration changes that retain the exact qualified combined image (or
+      a qualified newer image).  Historical retirement is intentionally
+      irreversible in the live database: the retained history row and strictly
+      newer committed row preserve the version high-water mark, while NULL
+      committed YAML makes the retired row invisible to election/recovery
+      readers and stale commits fail against the successor.  Starting an older
+      binary requires a full verified pre-protocol-4 database restore under the
+      controller hold, using the protocol-4-capable normalization release and
+      revalidating/normalizing before any controller resumes.  Partial repair,
+      row deletion, and old-binary orphan cleanup are forbidden.
 9. Cross-release proof uses the exact v1.1.1135 and normalization artifacts:
    v1 writes -> normalization reads and normalizes; normalization v2 writes ->
    offline v1.1.1135 read only; and v2 writer copy/reserialize -> v2 reread.
@@ -1758,13 +1799,20 @@ zero-cost reserved-capacity tests remain fail closed.
   placement-contract, cheapest-first, hybrid, reserved-capacity, measured-
   availability, and zero-cost-refill suites; repository formatting, mypy,
   pylint, and dashboard lint/format checks; and an adversarial authority audit
-  with an unconditional GO.  A fresh integration audit found no path,
-  semantic, or merge-tree overlap with the two newer `origin/improvements`
-  commits, which touch only the Managed Jobs dashboard banner.
-- Adversarial review of this exact design and code-level implementation review
-  both returned GO for the transition.  A separate final cleanup audit returned
-  GO for committing and submitting the blocked cleanup, and NO-GO for merging
-  or deploying it before every removal gate above is satisfied.
+  with an unconditional GO.  PR #1380 passed its exact-head CI and merged as
+  `c4f5b417b538d4876a1279200592457854fdf913`; its deterministic v1.1.1182
+  release published successfully.  The HA correction branch was then rebased
+  without conflict onto that exact merge.  A fresh fetch and remote-head audit
+  found `origin/improvements` still at `c4f5b417...`; the combined artifact,
+  rather than standalone v1.1.1182, is now the required deployment unit.
+- Earlier protocol-4 implementation review returned GO before the combined HA
+  rollout and rollback contract was added.  Final adversarial review of the
+  exact integrated six-file tree returned GO after the 924-test regression and
+  post-format static evidence closed the legacy-to-HA executor gap; that GO
+  authorizes commit, push, and fresh exact-head CI, not Helm deployment.  A
+  separate final cleanup audit returned GO for maintaining the blocked cleanup
+  change and NO-GO for merging or deploying it before every removal gate above
+  is satisfied.
 - Transition PR #1318 passed 30/30 pre-merge checks and merged as
   `95e0b41b15ad56598e06ef9cb08297815a65f662`.  The exact release workflows
   published v1.1.1135 image digest
@@ -2012,8 +2060,10 @@ zero-cost reserved-capacity tests remain fail closed.
   the hold without changing the v1.1.1155 pins; the replacement pod and both
   init containers have zero restarts, all eight controller health probes
   return 200, and all 16 load-balancer deployments are Ready and Available.
-  Protocol 4 implementation, review, immutable release, reader-first rollout,
-  and a fresh held apply remain open.
+  Protocol-4 implementation merged in #1380 and its standalone v1.1.1182
+  release published successfully.  Exact-head CI, merge, and immutable
+  publication of the integrated #1380+#1373+#1374 release; its reader-first HA
+  qualification windows; and a later separately held apply remain open.
 
 Credentialed provider catalog coverage and zero-cost production smoke evidence
 remain open gates.  This is only the first transition production release, and
@@ -2055,35 +2105,37 @@ removal gate are not yet attached.
 
 - Draft cleanup PR #1319 is authored in stack #1320.  Its first production
   rollout check passed, but the remaining removal gates are unmet, so it is not
-  approved to merge or deploy.  After protocol 4 merges, rebase and refresh it
-  to retain or extract the shared protocol-1/2/3/4 identity and receipt reader,
-  a read-only full-ledger/bootstrap guard, the production-shaped protocol-4
-  fixture, the stale-placeholder zero-materialization gate, and the new rollback
-  floor.  The transition decoder/writer may be deleted only after those final
-  readers and the documented 30-day gate pass.
+  approved to merge or deploy.  Now that protocol 4 has merged in #1380, rebase
+  and refresh it to retain or extract the shared protocol-1/2/3/4 identity and
+  receipt reader, a read-only full-ledger/bootstrap guard, the production-shaped
+  protocol-4 fixture, the stale-placeholder zero-materialization gate, and the
+  new rollback floor.  The transition decoder/writer may be deleted only after
+  those final readers and the documented 30-day gate pass.
 - Transition and cleanup GitHub CI, including the mandatory real-PostgreSQL
   lane, completed successfully.  Credentialed AWS catalog coverage remains
   open because it has not been rerun after the operator refreshed SSO for this
   deployment.
-- Production control-plane v1.1.1155 is deployed directly through Helm at
-  revision 366 with the controller hold disabled; closed Platform PR #8090 is
-  not part of the release path.  The sole Recreate API pod is healthy on the
-  exact PR #1341 image with both init containers and both app containers Ready
-  and zero restarts.  Protocol-2 and protocol-3 retirement attempts made no
-  mutation.  Protocol 4 must pass design/code review, merge, release, and
-  complete a reader-first Helm rollout before a separate hold revision and
-  retirement attempt.  Normalization apply has committed, so the current
-  rollback floor is v1.1.1143; after any protocol-4 manifest or request exists,
-  the protocol-4-capable release becomes the floor and older rollback requires
-  a pre-protocol-4 database restore.  That restore path still needs a drill.
+- v1.1.1155 at Helm revision 366 is the last placement-specific reader/hold
+  baseline, not an assertion of current production state.  The HA design later
+  records at least revision 374/v1.1.1176 and cached evidence may itself be
+  stale.  Fresh live Helm values, revision, image, schema head, controller hold,
+  receipt inventory, workloads, and capacity are mandatory before rollout;
+  closed Platform PR #8090 is not part of the release path.  Protocol-2 and
+  protocol-3 retirement attempts made no mutation.  #1380/v1.1.1182 completed
+  protocol-4 implementation and standalone publication; the integrated
+  #1380+#1373+#1374 release still requires exact-head CI, merge/publication, and
+  reader-first HA qualification before a separate hold.  The full backup and
+  restore drill above remains a hard blocker for terminal apply.
 - A second consecutive production release, the retained 45-day log sink, exact
   zero-event query, and 30 continuous qualifying days remain required.
 - The Boltz fleet's canonical service YAML currently keeps warm capacity; its
   separate scale-to-zero policy must be reviewed, deployed/applied, converged,
   and drained before any service update can claim scale-to-zero compliance.
-- Service version 58 is authoritative mirror-free placement-contract v2.  Its
-  requested load receipt and the seven other requested receipts converged
-  under v1.1.1146 and remain healthy through v1.1.1155.  The one historical
-  test-service tuple requires the protocol-4 stale-placeholder proof to pass
-  review, merge, deploy reader-first, and run its locked terminal-retirement
-  proof before the zero-event window can start.
+- Service version 58 was the authoritative mirror-free placement-contract-v2
+  production baseline, and its requested load receipt plus seven peers
+  converged under v1.1.1146 through the last placement-specific v1.1.1155
+  observation.  Fresh production preflight must prove the current eight-receipt
+  inventory and version authority; it must not infer them from that historical
+  sample.  The one historical test-service tuple still requires the integrated
+  reader-first windows, locked protocol-4 stale-placeholder proof, terminal
+  retirement, and postflight before the zero-event window can start.

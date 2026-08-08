@@ -392,6 +392,13 @@ TERMINATE_REPLICA_TIMEOUT_SECONDS = 600
 # interval.
 LB_CONTROLLER_SYNC_INTERVAL_SECONDS = 20
 LB_ROLE_HEARTBEAT_INTERVAL_SECONDS = 2
+# A STABLE role snapshot is read-only but may be shared by both LB slots. Bound
+# the shared provider task from its creation time so a hung Kubernetes call
+# cannot make every later heartbeat join the same stale in-flight work. This is
+# also the transport deadline for each Kubernetes read in that snapshot. Three
+# seconds leaves retry and proxy/DB headroom inside both report freshness (6s)
+# and the external LB client timeout (8s).
+LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS = 3
 # The stable API proxy performs owner reads before and after the controller
 # request. Production p99 is about 5.6s even when the controller is healthy,
 # so a 5s client budget creates false heartbeat failures. Keep 2s of measured

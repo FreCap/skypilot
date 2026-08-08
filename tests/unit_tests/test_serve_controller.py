@@ -8,6 +8,7 @@ pruned when a replica leaves the ready set.
 """
 # pylint: disable=missing-class-docstring,protected-access
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -309,6 +310,11 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._autoscaler = None  # pylint: disable=protected-access
     ctrl._lb_sync_lock = None  # pylint: disable=protected-access
     ctrl._lb_role_lock = None  # pylint: disable=protected-access
+    ctrl._lb_role_snapshot_task = None  # pylint: disable=protected-access
+    ctrl._lb_role_snapshot_key = None  # pylint: disable=protected-access
+    ctrl._lb_role_executor = concurrent.futures.ThreadPoolExecutor(  # pylint: disable=protected-access
+        max_workers=2,
+        thread_name_prefix='test-skyserve-ha-role')
     ctrl._lb_demand_lock = None  # pylint: disable=protected-access
     ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
     ctrl._lb_session_ledger = None  # pylint: disable=protected-access
@@ -1720,6 +1726,102 @@ class TestServiceUpdateReconciler:
             expected_service_hash='incarnation-a',
             expected_lifecycle_epoch=7)
 
+    def test_legacy_to_ha_transition_keeps_dedicated_role_executor(self):
+        ctrl = _make_update_controller()
+        ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
+        ctrl._owns_current_service = mock.Mock(  # pylint: disable=protected-access
+            return_value=True)
+        target_spec = types.SimpleNamespace(lb_stream_timeout_seconds=30,
+                                            graceful_drain_seconds=60)
+        disabled = controller.lb_ha.LbCutoverState(
+            enabled=False,
+            active_slot=None,
+            generation=0,
+            pending_slot=None,
+            phase=controller.lb_ha.LbCutoverPhase.STABLE,
+            lifecycle_epoch=7)
+        stable = controller.lb_ha.LbCutoverState(
+            enabled=True,
+            active_slot=controller.lb_ha.LbSlot.A,
+            generation=1,
+            pending_slot=None,
+            phase=controller.lb_ha.LbCutoverPhase.STABLE,
+            lifecycle_epoch=7)
+        owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'lifecycle_epoch': 7,
+        }
+        role_executor = ctrl._lb_role_executor  # pylint: disable=protected-access
+        try:
+            with mock.patch.object(controller.serve_state,
+                                   'get_lb_cutover_state',
+                                   side_effect=[disabled, stable]), \
+                 mock.patch.object(controller.serve_state,
+                                   'get_service_controller_owner',
+                                   return_value=owner), \
+                 mock.patch.object(controller.serve_state,
+                                   'begin_lb_ha_migration',
+                                   return_value=True), \
+                 mock.patch.object(controller.lb_k8s,
+                                   'require_lb_ha_runtime'), \
+                 mock.patch.object(
+                     controller.lb_k8s,
+                     'lb_termination_grace_period_seconds',
+                     return_value=90), \
+                 mock.patch.object(controller.lb_k8s,
+                                   'prepare_lb_mode_transition'):
+                ctrl._transition_load_balancer_mode(  # pylint: disable=protected-access
+                    True,
+                    target_spec,
+                    expected_service_hash='incarnation-a',
+                    expected_lifecycle_epoch=7)
+
+            assert ctrl._lb_ha_enabled is True  # pylint: disable=protected-access
+            assert ctrl._lb_role_executor is role_executor  # pylint: disable=protected-access
+
+            release_default = threading.Event()
+            default_started = threading.Event()
+
+            def block_default_executor():
+                default_started.set()
+                assert release_default.wait(timeout=5)
+
+            def snapshot_thread_name(*_args):
+                return threading.current_thread().name
+
+            async def read_snapshot():
+                loop = asyncio.get_running_loop()
+                default_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix='blocked-default')
+                loop.set_default_executor(default_executor)
+                blocker = loop.run_in_executor(None, block_default_executor)
+                while not default_started.is_set():
+                    await asyncio.sleep(0)
+                try:
+                    result = await asyncio.wait_for(
+                        ctrl._get_shared_stable_lb_role_snapshot(  # pylint: disable=protected-access
+                            loop, ('incarnation-a', (123, '10.0.0.1'), 7),
+                            stable, owner),
+                        timeout=1)
+                    assert not blocker.done()
+                    return result
+                finally:
+                    release_default.set()
+                    await blocker
+                    default_executor.shutdown(wait=True, cancel_futures=True)
+
+            with mock.patch.object(controller.lb_k8s,
+                                   'get_lb_role_snapshot',
+                                   side_effect=snapshot_thread_name):
+                snapshot = asyncio.run(read_snapshot())
+
+            assert snapshot.error is None
+            assert snapshot.snapshot.startswith('test-skyserve-ha-role')
+        finally:
+            role_executor.shutdown(wait=True, cancel_futures=True)
+
     def test_lb_mode_retry_resumes_interrupted_migration(self):
         ctrl = _make_update_controller()
         ctrl._lb_ha_enabled = True  # pylint: disable=protected-access
@@ -1812,6 +1914,7 @@ class TestServiceUpdateReconciler:
 
     def test_lb_mode_retry_resumes_interrupted_rollback(self):
         ctrl = _make_update_controller()
+        role_executor = ctrl._lb_role_executor  # pylint: disable=protected-access
         ctrl._lb_ha_enabled = True  # pylint: disable=protected-access
         ctrl._lb_session_ledger = mock.Mock()  # pylint: disable=protected-access
         ctrl._lb_last_demand_snapshot = mock.Mock()  # pylint: disable=protected-access
@@ -1864,6 +1967,7 @@ class TestServiceUpdateReconciler:
         prepare.assert_called_once()
         assert ctrl._lb_ha_enabled is False  # pylint: disable=protected-access
         assert ctrl._lb_session_ledger is None  # pylint: disable=protected-access
+        assert ctrl._lb_role_executor is role_executor  # pylint: disable=protected-access
 
     def test_per_gpu_service_rejects_update_to_physical_semantics(self):
         ctrl = _make_update_controller()

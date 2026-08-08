@@ -200,6 +200,10 @@ def test_session_ledger_requires_applied_drain_role_and_generation():
 def test_role_timeout_headroom_does_not_weaken_report_freshness():
     assert serve_constants.LB_ROLE_HEARTBEAT_TIMEOUT_SECONDS == 8
     assert serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS == 6
+    assert serve_constants.LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS == 3
+    assert (serve_constants.LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS <
+            serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS <
+            serve_constants.LB_ROLE_HEARTBEAT_TIMEOUT_SECONDS)
     ledger = lb_ha.LbSessionLedger(
         max_session_age_seconds=serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
         max_occupancy_age_seconds=10)
@@ -609,7 +613,8 @@ def _role_controller() -> controller.SkyServeController:
     ctrl._service_name = 'service'
     ctrl._resource_scope = None
     ctrl._lb_ha_enabled = True
-    ctrl._lb_role_executor = None
+    ctrl._lb_role_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix='test-skyserve-ha-role')
     ctrl._lb_role_lock = None
     ctrl._lb_role_snapshot_task = None
     ctrl._lb_role_snapshot_key = None
@@ -1182,6 +1187,82 @@ def test_cancelled_stable_snapshot_waiter_does_not_poison_peer():
 
     assert response.status_code == 200
     assert snapshot_read.call_count == 1
+
+
+def test_shared_stable_snapshot_deadline_is_fixed_and_late_result_is_ignored(
+        monkeypatch):
+    ctrl = _role_controller()
+    role_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    ctrl._lb_role_executor = role_executor
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def read_snapshot(*_args):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            first_started.set()
+            assert release_first.wait(timeout=2)
+        return snapshot
+
+    async def expire_shared_then_retry():
+        first = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        while not first_started.is_set():
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.1)
+        assert ctrl._lb_role_snapshot_task is not None
+        assert not ctrl._lb_role_snapshot_task.done()
+        late_join_started = asyncio.get_running_loop().time()
+        second = asyncio.create_task(
+            ctrl._handle_load_balancer_role(
+                _role_request('standby', lb_ha.LbSlot.B)))
+        failed = await asyncio.gather(first, second)
+        late_join_elapsed = (asyncio.get_running_loop().time() -
+                             late_join_started)
+        assert late_join_elapsed < 0.45
+        assert ctrl._lb_role_snapshot_task is None
+        assert ctrl._lb_role_snapshot_key is None
+
+        # The expired synchronous read is still blocked in its executor. A new
+        # heartbeat must start a fresh fenced snapshot instead of rejoining it.
+        recovered = await ctrl._handle_load_balancer_role(
+            _role_request('active', lb_ha.LbSlot.A))
+        release_first.set()
+        await asyncio.sleep(0)
+        return failed, recovered
+
+    monkeypatch.setattr(serve_constants, 'LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS',
+                        0.5)
+    try:
+        with mock.patch.object(
+                controller.lb_k8s,
+                'get_lb_role_snapshot',
+                side_effect=read_snapshot) as snapshot_read, mock.patch.object(
+                    controller.serve_state,
+                    'get_lb_cutover_state',
+                    return_value=stable):
+            failed, recovered = asyncio.run(expire_shared_then_retry())
+    finally:
+        release_first.set()
+        role_executor.shutdown(wait=True, cancel_futures=True)
+
+    assert [response.status_code for response in failed] == [503, 503]
+    assert [json.loads(response.body)['outcome'] for response in failed
+           ] == ['routing_unavailable', 'routing_unavailable']
+    assert recovered.status_code == 200
+    assert json.loads(recovered.body)['role'] == 'ACTIVE'
+    assert snapshot_read.call_count == 2
+    assert ctrl._lb_role_snapshot_task is None
+    assert ctrl._lb_role_snapshot_key is None
 
 
 @pytest.mark.parametrize(
