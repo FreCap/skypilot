@@ -770,6 +770,64 @@ def _require_existing_lb_object_ownership(context: str, namespace: str,
     return str(resource_version)
 
 
+def _require_existing_lb_object_live_ownership(context: str, namespace: str,
+                                               object_name: str, existing,
+                                               service_hash: str) -> str:
+    """Validate a read-only LB snapshot at one live owner linearization point.
+
+    Unlike mutation callers, a role snapshot does not need to construct a new
+    ownerReference.  Its Service already carries the exact owner identity, so
+    reading the API Deployment before validating that identity is redundant.
+    Read the live Deployment once *after* the Service and require its UID to
+    equal the Service ownerReference.  Replacement before that read fails
+    closed; replacement after it has the same boundary as the second read in
+    ``_require_existing_lb_object_ownership``.
+    """
+    expected_owner_name = _api_deployment_name()
+    owner_references = _metadata_value(existing, 'ownerReferences',
+                                       'owner_references') or []
+    owner_identities = [
+        _owner_reference_identity(reference) for reference in owner_references
+    ]
+    if len(owner_identities) != 1:
+        raise RuntimeError(
+            f'Refusing to read external load balancer object '
+            f'{namespace}/{object_name}: it does not have exactly one API '
+            'Deployment owner identity.')
+    owner_identity = owner_identities[0]
+    expected_prefix = (_OWNER_API_VERSION, _OWNER_KIND, expected_owner_name)
+    if owner_identity[:3] != expected_prefix or not owner_identity[3]:
+        raise RuntimeError(
+            f'Refusing to read external load balancer object '
+            f'{namespace}/{object_name}: owner identity '
+            f'{owner_identity!r} is not the expected API Deployment.')
+
+    labels = _metadata_value(existing, 'labels', 'labels') or {}
+    actual_service_hash = labels.get(SERVICE_HASH_LABEL_KEY)
+    if actual_service_hash != service_hash:
+        raise RuntimeError(
+            f'Refusing to read external load balancer object '
+            f'{namespace}/{object_name}: service incarnation label is '
+            f'{actual_service_hash!r}, expected {service_hash!r}.')
+
+    resource_version = _metadata_value(existing, 'resourceVersion',
+                                       'resource_version')
+    if not resource_version:
+        raise RuntimeError(f'Refusing to read external load balancer object '
+                           f'{namespace}/{object_name}: Kubernetes returned no '
+                           'resourceVersion for the existing object.')
+
+    live_owner_uid = _live_deployment_owner_uid(context, namespace,
+                                                expected_owner_name)
+    if live_owner_uid != owner_identity[3]:
+        raise RuntimeError(
+            f'Refusing to read external load balancer object '
+            f'{namespace}/{object_name}: owner Deployment '
+            f'{namespace}/{expected_owner_name} changed from UID '
+            f'{owner_identity[3]} to {live_owner_uid!r}.')
+    return str(resource_version)
+
+
 def _find_named(items, name: str):
     for item in items or []:
         item_name = item.get('name') if isinstance(item, dict) else getattr(
@@ -2794,11 +2852,10 @@ def get_lb_role_snapshot(
     """Read one fail-closed Pod and Service authority snapshot for a role.
 
     The common heartbeat path shares one owner-row read, one Pod list, one
-    Service read, and one exact ownership validation.  The independent Pod,
-    Service, and first Deployment reads are fully joined before any decision;
-    ownership validation deliberately retains the second Deployment UID read
-    so replacement between identity resolution and validation still fails
-    closed.
+    Service read, and one live Deployment UID validation after the Service
+    read.  The independent Pod and Service reads are fully joined before any
+    decision.  The existing Service supplies the expected owner identity, so
+    no earlier Deployment read is needed to construct that same identity.
     """
     if not _lb_mode_active():
         return None
@@ -2853,7 +2910,7 @@ def get_lb_role_snapshot(
         # window.  Resolve futures in the historical fail-closed order so a
         # concurrent multi-failure retains deterministic outcome mapping.
         parent_context = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             pods_future = executor.submit(parent_context.copy().run,
                                           timed,
                                           'snapshot_pod_list',
@@ -2864,21 +2921,16 @@ def get_lb_role_snapshot(
                                              'snapshot_service_read',
                                              core_api.read_namespaced_service,
                                              name, namespace)
-            owner_reference_future = executor.submit(
-                parent_context.copy().run, timed,
-                'snapshot_owner_identity_read', _api_deployment_owner_reference,
-                context, namespace)
             pods = pods_future.result()
             try:
                 service = service_future.result()
-                owner_reference = owner_reference_future.result()
             except Exception as e:  # pylint: disable=broad-except
                 raise LbRoleSnapshotRoutingError(str(e)) from e
         try:
-            resource_version = timed('snapshot_ownership_validation',
-                                     _require_existing_lb_object_ownership,
-                                     context, namespace, name, service,
-                                     owner_reference, service_hash)
+            resource_version = timed(
+                'snapshot_ownership_validation',
+                _require_existing_lb_object_live_ownership, context, namespace,
+                name, service, service_hash)
             if expected_state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
                                         lb_ha.LbCutoverPhase.ROLLING_BACK):
                 routing: (LbServiceRouting |
