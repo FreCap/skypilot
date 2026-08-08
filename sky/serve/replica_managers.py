@@ -3769,25 +3769,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         # `sky.launch` against its live serving cluster. Advance the allocator
         # past every persisted id so new replicas always get a fresh id. On a
         # first run there are no replicas, so this stays at 1 (no-op).
-        # A rollback to the last compatible v12 writer can erase the complete
-        # recovery bundle while retaining the v13 replica version label.  The
-        # v13 reader accepts only that exact all-fields-absent shape, and the
-        # first rewritten controller that owns the service must immediately
-        # canonicalize it again.  Do this before any recovery decisions so a
-        # later generic whole-row write cannot perpetuate the temporary shape.
-        recovery_fence = self._system_recovery_mutation_fence()
-        if (recovery_fence is not None and not self._is_pool and
-                self._resource_action_mode == 'legacy' and
-                self._enforce_launch_fence and
-                serve_state.system_recovery_persistence_available()):
-            rewritten = (
-                serve_state.rewrite_rollback_replica_system_recovery_state(
-                    self._service_name, **recovery_fence))
-            if rewritten:
-                logger.info(
-                    f'Rewrote {rewritten} rollback-shaped system-recovery '
-                    'replica row(s) into the complete v13 representation.')
-
         all_replica_infos = serve_state.get_replica_infos(self._service_name)
         all_replica_infos = self._initialize_system_recovery_process_guards(
             all_replica_infos)
@@ -4378,7 +4359,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         prior_created_at: original durable row creation timestamp retained by
         a recovery re-drive. It is also an input to the deterministic identity
-        used by v12/rollback-shaped transition rows.
+        used by v12 transition rows.
 
         recovering_existing_replica: the replica already has a durable row
         and cluster identity. Reuse an exact persisted placement instead of
@@ -9778,8 +9759,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'Replica {fresh.replica_id} returned malformed '
                         f'recovery detail for exact job {exact_job_id}: '
                         f'{common_utils.format_exception(e)}')
-                if observation is not None and observation.profile_version == 1:
-                    outcome['events'].add('runtime_capability_v1_observed')
                 if (observation is None or observation.capability
                         != intent.expected_runtime_capability or
                         observation.profile_version
@@ -9791,16 +9770,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     outcome['valid_present'] = True
             elif (detail is not None or detail_status
                   not in (job_lib.JobSystemRecoveryDetailStatus.ABSENT,
-                          job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED,
                           job_lib.JobSystemRecoveryDetailStatus.MALFORMED)):
                 outcome['teardown'] = True
                 outcome['events'].add('evidence_lost')
-            if (detail_status ==
-                    job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED):
-                outcome['events'].add('status_only_read')
-                outcome['events'].add('evidence_lost')
-            elif (detail_status ==
-                  job_lib.JobSystemRecoveryDetailStatus.MALFORMED):
+            if (detail_status == job_lib.JobSystemRecoveryDetailStatus.MALFORMED
+               ):
                 outcome['events'].add('evidence_lost')
 
             previous_recovery = fresh.system_recovery
@@ -10345,7 +10319,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     recovery_detail = recovery_infos.get(service_job_id)
                     recovery_detail_status = recovery_detail_statuses.get(
                         service_job_id,
-                        job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED)
+                        job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
                 with self.lock:
                     if self._update_recovery_required:
                         return
@@ -11360,8 +11334,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     job_status = statuses.get(job_id)
                     detail = recovery_infos.get(job_id)
                     detail_status = detail_statuses.get(
-                        job_id,
-                        job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED)
+                        job_id, job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
                 else:
                     job_status = None
                     detail = None

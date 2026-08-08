@@ -1074,8 +1074,8 @@ async def test_partial_system_recovery_context_is_rejected_before_binding():
 
 
 @pytest.mark.asyncio
-async def test_exact_legacy_recovery_context_remains_retryable():
-    """The deprecated contract-1 tuple bypasses the v3 nonce protocol."""
+async def test_exact_legacy_recovery_context_is_rejected():
+    """Historical recovery fields cannot bypass closed v3 validation."""
     from sky.serve import constants as serve_constants
     from sky.server.requests import payloads
 
@@ -1092,18 +1092,20 @@ async def test_exact_legacy_recovery_context_remains_retryable():
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
             serve_constants.SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY: 1,
             serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY: 'boltz-l4-v1',
-            serve_constants.SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY: 1,
+            'sky_serve_system_oom_recovery_profile_version': 1,
         })
 
     with mock.patch.object(
             server.serve_state,
             'bind_replica_system_recovery_launch_request') as mock_bind, \
          mock.patch('sky.server.server.executor.schedule_request_async',
-                    new_callable=mock.AsyncMock) as mock_schedule:
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException, match='launch intent') as exc:
         await server.launch(launch_body, request)
 
+    assert exc.value.status_code == 409
     mock_bind.assert_not_called()
-    assert mock_schedule.await_args.kwargs['retryable'] is True
+    mock_schedule.assert_not_awaited()
 
 
 @pytest.mark.asyncio

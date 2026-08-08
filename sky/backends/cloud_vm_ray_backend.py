@@ -5296,8 +5296,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                     for job_id, proto_status in response.job_statuses.items()
                 }
                 recovery_infos: dict[int, job_lib.JobSystemRecoveryInfo] = {}
+                # Protobuf map absence (including an old status-only response)
+                # is not positive evidence that recovery detail is absent.
                 detail_statuses = {
-                    job_id: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+                    job_id: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
                     for job_id in statuses
                     if isinstance(job_id, int)
                 }

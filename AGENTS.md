@@ -24,6 +24,20 @@ Do not add, fetch, consult, compare, or cherry-pick from
 user explicitly requests that upstream repository. Pin cross-repository modules
 and artifacts to an immutable commit or tag from `boltz-bio/skypilot`.
 
+## Boltz Production Deployment Authority
+
+Deploy and update the Boltz SkyPilot control plane directly with the reviewed
+Helm deployment workflow (`helm upgrade --install`, preserving the live release
+values on upgrades). A SkyPilot deployment does not require a corresponding
+`boltz-bio/boltz-platform` change or pull request. Do not treat a platform
+repository pin, Terraform/Terragrunt state, or an open platform PR as the
+deployment authority or as a prerequisite for deploying, validating, or
+finishing a SkyPilot change.
+
+Ground deployment claims in the live Helm release, its immutable image/chart
+version, rollout state, and post-deploy verification. Repository tags or open
+pull requests alone do not prove what is deployed.
+
 ## Repository Structure
 
 ```

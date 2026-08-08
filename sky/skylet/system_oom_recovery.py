@@ -40,22 +40,14 @@ else:
 
 logger = sky_logging.init_logger(__name__)
 
-PROFILE_VERSION_DIRECT_SHELL = 1
 PROFILE_VERSION_OWNED_CONTAINER = 2
-CAPABILITY_V1 = 'subreaper-v1+local-docker-empty-inventory-v1'
 CAPABILITY_V2 = 'subreaper-v2+owned-local-docker-v1'
 CAPABILITY_BY_PROFILE_VERSION = {
-    PROFILE_VERSION_DIRECT_SHELL: CAPABILITY_V1,
     PROFILE_VERSION_OWNED_CONTAINER: CAPABILITY_V2,
 }
 MARKER_SCHEMA_BY_PROFILE_VERSION = {
-    PROFILE_VERSION_DIRECT_SHELL: 1,
     PROFILE_VERSION_OWNED_CONTAINER: 2,
 }
-# Deprecated transition aliases. Profile/marker v1 is removed by stacked PR 3
-# only after every numbered removal gate in the canonical design has passed.
-CAPABILITY = CAPABILITY_V1
-MARKER_SCHEMA_VERSION = 1
 RECOVERY_ROOT = '~/.sky/system_oom_recovery'
 MARKER_RETENTION_SECONDS = 24 * 60 * 60
 BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
@@ -507,31 +499,22 @@ class RecoveryLaunchPlan:
     def __post_init__(self) -> None:
         if type(self.profile_version) is not int:  # pylint: disable=unidiomatic-typecheck
             raise ValueError('profile_version must be an integer')
-        if self.profile_version == PROFILE_VERSION_DIRECT_SHELL:
-            if (self.owned_container_spec is not None or
-                    self.execution_envelope is not None):
-                raise ValueError('v1 plan must use the direct-shell path')
-        elif self.profile_version == PROFILE_VERSION_OWNED_CONTAINER:
-            if (not isinstance(self.owned_container_spec, OwnedContainerSpec) or
-                    not isinstance(self.execution_envelope,
-                                   RecoveryExecutionEnvelope)):
-                raise ValueError('v2 plan requires an owned spec and envelope')
-            unbound_envelope = dataclasses.replace(self.execution_envelope,
-                                                   environment=())
-            if unbound_envelope != RecoveryExecutionEnvelope.standard():
-                raise ValueError(
-                    'v2 plan must use the exact code-owned envelope')
-        else:
+        if self.profile_version != PROFILE_VERSION_OWNED_CONTAINER:
             raise ValueError('unsupported recovery profile version')
+        if (not isinstance(self.owned_container_spec, OwnedContainerSpec) or
+                not isinstance(self.execution_envelope,
+                               RecoveryExecutionEnvelope)):
+            raise ValueError(
+                'recovery plan requires an owned spec and envelope')
+        unbound_envelope = dataclasses.replace(self.execution_envelope,
+                                               environment=())
+        if unbound_envelope != RecoveryExecutionEnvelope.standard():
+            raise ValueError('recovery plan must use the exact code-owned '
+                             'execution envelope')
 
     @property
     def capability(self) -> str:
         return CAPABILITY_BY_PROFILE_VERSION[self.profile_version]
-
-    @classmethod
-    def direct_shell(cls) -> 'RecoveryLaunchPlan':
-        """Create the deprecated, transitional profile-v1 plan."""
-        return cls(profile_version=PROFILE_VERSION_DIRECT_SHELL)
 
     @classmethod
     def owned_container(cls, spec: OwnedContainerSpec) -> 'RecoveryLaunchPlan':
@@ -541,8 +524,6 @@ class RecoveryLaunchPlan:
 
     def bind_environment(
             self, environment: dict[str, str] | None) -> 'RecoveryLaunchPlan':
-        if self.profile_version == PROFILE_VERSION_DIRECT_SHELL:
-            return self
         assert self.execution_envelope is not None
         return dataclasses.replace(
             self,
@@ -691,7 +672,7 @@ def _validate_attempt_context(context: object) -> dict[str, Any]:
         raise RecoveryError(f'Attempt context is missing {sorted(missing)!r}.')
     profile_version = context['profile_version']
     if (type(profile_version) is not int or  # pylint: disable=unidiomatic-typecheck
-            profile_version not in CAPABILITY_BY_PROFILE_VERSION):
+            profile_version != PROFILE_VERSION_OWNED_CONTAINER):
         raise RecoveryError('Attempt profile version is unsupported.')
     if (type(context['schema_version']) is not int or  # pylint: disable=unidiomatic-typecheck
             context['schema_version']
@@ -712,13 +693,12 @@ def _validate_attempt_context(context: object) -> dict[str, Any]:
     if (not isinstance(context['node_boot_id'], str) or
             not context['node_boot_id']):
         raise RecoveryError('Node boot ID is invalid.')
-    if not isinstance(context['require_armed_start'], bool):
-        raise RecoveryError('Attempt armed-start requirement is invalid.')
+    if context['require_armed_start'] is not True:
+        raise RecoveryError('Attempt must require an armed start.')
     expected_docker = context['expected_docker_identity']
     if expected_docker is not None:
         DockerIdentity.from_dict(expected_docker)
-    if (context['attempt_number'] > 0 and
-        (not context['require_armed_start'] or expected_docker is None)):
+    if context['attempt_number'] > 0 and expected_docker is None:
         raise RecoveryError(
             'Replacement attempt lacks mandatory Docker continuity.')
     expected_parent_pid = context['expected_parent_pid']
@@ -851,9 +831,7 @@ def new_attempt_context(
         'cleanup_path': str(marker_dir / 'cleanup.json'),
         'profile_version': recovery_plan.profile_version,
         'capability': recovery_plan.capability,
-        'require_armed_start':
-            (attempt_number > 0 or
-             recovery_plan.profile_version == PROFILE_VERSION_OWNED_CONTAINER),
+        'require_armed_start': True,
         'expected_docker_identity': (None if expected_docker_identity is None
                                      else expected_docker_identity.to_dict()),
         'expected_parent_pid': None,
@@ -942,7 +920,7 @@ def _read_marker(path: str) -> dict[str, object] | None:
     return payload
 
 
-def build_supervisor_command(inner_command: str | None, context: dict[str, Any],
+def build_supervisor_command(context: dict[str, Any],
                              recovery_plan: RecoveryLaunchPlan) -> list[str]:
     """Build the argv that makes the supervisor the command's real parent."""
     context = _validate_attempt_context(context)
@@ -952,11 +930,6 @@ def build_supervisor_command(inner_command: str | None, context: dict[str, Any],
         raise TypeError('recovery_plan must be a RecoveryLaunchPlan')
     if recovery_plan.profile_version != context['profile_version']:
         raise ValueError('recovery plan does not match attempt context')
-    if recovery_plan.profile_version == PROFILE_VERSION_DIRECT_SHELL:
-        if not isinstance(inner_command, str) or not inner_command:
-            raise ValueError('v1 inner_command must be a nonempty string.')
-    elif inner_command is not None:
-        raise ValueError('v2 does not accept a shell command')
     plan_path = pathlib.Path(str(context['marker_dir'])) / 'plan.json'
     atomic_write_marker(str(plan_path), recovery_plan.to_dict())
     supervisor_command = [
@@ -965,11 +938,6 @@ def build_supervisor_command(inner_command: str | None, context: dict[str, Any],
         json.dumps(context, separators=(',', ':')), '--plan-path',
         str(plan_path)
     ]
-    if inner_command is not None:
-        supervisor_command.extend(('--command', inner_command))
-    if recovery_plan.profile_version == PROFILE_VERSION_DIRECT_SHELL:
-        return supervisor_command
-
     assert recovery_plan.execution_envelope is not None
     launch_path = pathlib.Path(str(context['marker_dir'])) / 'launch.sh'
     launch_script = (
@@ -1161,17 +1129,14 @@ def read_capability_marker(context: dict[str, Any]) -> dict[str, object] | None:
     if not isinstance(armed, bool):
         raise RecoveryError('Capability marker armed state is invalid.')
     owned_container_id = marker.get('owned_container_id')
-    if context['profile_version'] == PROFILE_VERSION_OWNED_CONTAINER:
-        if (armed and
-            (not isinstance(owned_container_id, str) or
-             _CONTAINER_ID_PATTERN.fullmatch(owned_container_id) is None)):
-            raise RecoveryError('Capability owned container ID is invalid.')
-        if (not armed and owned_container_id is not None and
-            (not isinstance(owned_container_id, str) or
-             _CONTAINER_ID_PATTERN.fullmatch(owned_container_id) is None)):
-            raise RecoveryError('Capability owned container ID is invalid.')
-    elif owned_container_id is not None:
-        raise RecoveryError('Direct-shell capability names an owned container.')
+    if (armed and
+        (not isinstance(owned_container_id, str) or
+         _CONTAINER_ID_PATTERN.fullmatch(owned_container_id) is None)):
+        raise RecoveryError('Capability owned container ID is invalid.')
+    if (not armed and owned_container_id is not None and
+        (not isinstance(owned_container_id, str) or
+         _CONTAINER_ID_PATTERN.fullmatch(owned_container_id) is None)):
+        raise RecoveryError('Capability owned container ID is invalid.')
     if armed:
         DockerIdentity.from_dict(marker.get('docker_identity'))
         _validate_supervisor_identity(marker.get('supervisor'))
@@ -1208,15 +1173,12 @@ def validate_cleanup_marker(  # pylint: disable=too-many-return-statements
             return False, 'cleanup supervisor identity does not match'
         if cleanup.get('docker_identity') != capability.get('docker_identity'):
             return False, 'cleanup Docker identity does not match'
-        if context['profile_version'] == PROFILE_VERSION_OWNED_CONTAINER:
-            cleanup_container_id = cleanup.get('owned_container_id')
-            capability_container_id = capability.get('owned_container_id')
-            if (not isinstance(cleanup_container_id, str) or
-                    _CONTAINER_ID_PATTERN.fullmatch(cleanup_container_id)
-                    is None or cleanup_container_id != capability_container_id):
-                return False, 'cleanup owned container ID does not match'
-        elif cleanup.get('owned_container_id') is not None:
-            return False, 'direct-shell cleanup names an owned container'
+        cleanup_container_id = cleanup.get('owned_container_id')
+        capability_container_id = capability.get('owned_container_id')
+        if (not isinstance(cleanup_container_id, str) or
+                _CONTAINER_ID_PATTERN.fullmatch(cleanup_container_id) is None or
+                cleanup_container_id != capability_container_id):
+            return False, 'cleanup owned container ID does not match'
         incomplete_cleanup = (
             cleanup.get('forced') is not False,
             cleanup.get('timed_out') is not False,

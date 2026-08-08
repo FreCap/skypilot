@@ -660,16 +660,14 @@ class RayCodeGen(TaskCodeGen):
                      f'{options_str}')
         unset_ray_env_vars = ' && '.join(
             [f'unset {var}' for var in UNSET_RAY_ENV_VARS])
-        if (self._system_oom_recovery_plan is not None and
-                self._system_oom_recovery_plan.profile_version
-                == system_oom_recovery.PROFILE_VERSION_OWNED_CONTAINER):
+        if self._system_oom_recovery_plan is not None:
             spec = self._system_oom_recovery_plan.owned_container_spec
             assert spec is not None
             if bash_script != spec.render():
                 raise ValueError(
-                    'v2 system-OOM task.run is not the canonical owned spec')
-            # The v2 supervisor applies the typed prelude and postlude. It must
-            # never receive or execute an inferred shell representation.
+                    'system-OOM task.run is not the canonical owned spec')
+            # The supervisor applies the typed prelude and postlude. It never
+            # receives or executes an inferred shell representation.
             task_bash_script = None
         else:
             task_bash_script = (self.build_task_bash_script(
@@ -685,7 +683,6 @@ class RayCodeGen(TaskCodeGen):
                     if attempt_number == 0:
                         arm_started_monotonics.append(time.monotonic())
                     future = remote_task.remote(
-                            script,
                             log_path,
                             env_vars=sky_env_vars_dict,
                             stream_logs=True,
@@ -717,11 +714,8 @@ class RayCodeGen(TaskCodeGen):
                             stream_logs=True,
                             with_ray=True,
                         ))"""), ' ' * 12)
-        script_guard = 'script is not None'
-        if self._system_oom_recovery_plan is not None:
-            script_guard += (
-                ' or system_oom_recovery_plan.profile_version == '
-                'system_oom_recovery.PROFILE_VERSION_OWNED_CONTAINER')
+        script_guard = ('True' if self._system_oom_recovery_plan is not None
+                        else 'script is not None')
         self._code += [
             sky_env_vars_dict_str,
             textwrap.dedent(f"""\

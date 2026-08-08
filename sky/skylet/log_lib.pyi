@@ -145,7 +145,6 @@ def run_bash_command_with_log_and_return_pid(
 
 
 def run_bash_command_with_log_and_return_pid_with_system_oom_recovery(
-        bash_command: str | None,
         log_path: str,
         recovery_context: dict[str, object],
         recovery_plan: system_oom_recovery.RecoveryLaunchPlan,

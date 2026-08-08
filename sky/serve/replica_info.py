@@ -46,13 +46,13 @@ SYSTEM_RECOVERY_STORAGE_FIELDS = (
     'system_recovery',
     'system_recovery_quarantine',
 )
-# Exact set added by v13. A row missing all ten keys is the one supported
-# rollback shape; any nonempty proper subset is quarantined.
+# Exact set added by v13. Every v13 row must contain all ten keys; any missing
+# key, including a completely absent bundle, is quarantined.
 V13_ADDITIVE_STORAGE_FIELDS = ('replica_record_id',
                                *SYSTEM_RECOVERY_STORAGE_FIELDS)
 _REPLICA_INFO_VERSION = 14
 
-# A fixed namespace makes the one supported v12/rollback transition identity
+# A fixed namespace makes the v12 transition identity
 # reproducible across processes and across JSON/pickle readers.  New v13 rows
 # never use this namespace: they receive an independent random UUID4.
 _REPLICA_RECORD_ID_TRANSITION_NAMESPACE = uuid.UUID(
@@ -832,17 +832,14 @@ class ReplicaInfo:
                                          owner=f'ReplicaInfo v{record_version}')
 
         # Pre-v13 pickles have no recovery fields and are ordinary by
-        # contract. The only missing v13 shape accepted is the exact rollback
-        # bundle in which all additive recovery fields are absent. Current
-        # v14 objects were checked above and can never enter either path.
+        # contract. Every v13 recovery bundle must be complete; a partial or
+        # completely absent bundle is quarantined. Current v14 objects were
+        # checked above and can never enter either path.
         present_recovery_fields = {
             field for field in V13_ADDITIVE_STORAGE_FIELDS
             if field in vars(self)
         }
         if record_version < 13:
-            _set_ordinary_system_recovery_defaults(self)
-            _set_transition_replica_record_id(self)
-        elif (not present_recovery_fields and record_version == 13):
             _set_ordinary_system_recovery_defaults(self)
             _set_transition_replica_record_id(self)
         elif present_recovery_fields != set(V13_ADDITIVE_STORAGE_FIELDS):
@@ -1029,11 +1026,6 @@ class ReplicaInfo:
             _quarantine_system_recovery(
                 replica, system_recovery_state.RecoveryQuarantineReason.
                 INCONSISTENT_V13_BUNDLE)
-        elif not present_recovery_keys:
-            # Exact rollback compatibility: a v12 writer can retain the v13
-            # version label while erasing the *entire* additive bundle.
-            _set_ordinary_system_recovery_defaults(replica)
-            _set_transition_replica_record_id(replica)
         elif present_recovery_keys != recovery_keys:
             _quarantine_system_recovery(
                 replica, system_recovery_state.RecoveryQuarantineReason.
@@ -1634,9 +1626,6 @@ class ReplicaInfo:
             _quarantine_system_recovery(
                 self, system_recovery_state.RecoveryQuarantineReason.
                 INCONSISTENT_V13_BUNDLE)
-        elif version == 13 and not present_recovery_fields:
-            _set_ordinary_system_recovery_defaults(self)
-            _set_transition_replica_record_id(self)
         elif present_recovery_fields != recovery_fields:
             _quarantine_system_recovery(
                 self, system_recovery_state.RecoveryQuarantineReason.

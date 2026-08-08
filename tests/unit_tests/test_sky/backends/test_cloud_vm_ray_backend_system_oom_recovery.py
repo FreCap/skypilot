@@ -184,7 +184,7 @@ def _evidence(**overrides) -> backend_recovery.FreshProvisionEvidence:
 
 def _recovery_info() -> job_lib.JobSystemRecoveryInfo:
     return job_lib.JobSystemRecoveryInfo(
-        capability=runtime_recovery.CAPABILITY_V1,
+        capability=runtime_recovery.CAPABILITY_V2,
         phase=job_lib.JobSystemRecoveryPhase.RETRY_SUBMITTED,
         original_attempt_id='attempt-original',
         replacement_attempt_id='attempt-replacement',
@@ -650,7 +650,7 @@ def test_structured_job_status_round_trips_over_grpc():
     assert detail_statuses == {7: job_lib.JobSystemRecoveryDetailStatus.PRESENT}
 
 
-def test_old_grpc_response_has_status_and_empty_recovery_detail():
+def test_old_grpc_response_preserves_status_and_is_malformed():
     backend = cloud_vm_ray_backend.CloudVmRayBackend()
     handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
     client = mock.MagicMock()
@@ -670,7 +670,7 @@ def test_old_grpc_response_has_status_and_empty_recovery_detail():
     assert statuses == {7: job_lib.JobStatus.RUNNING}
     assert not infos
     assert detail_statuses == {
-        7: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+        7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
     }
 
 
@@ -699,13 +699,17 @@ def test_new_grpc_response_reports_positive_absence():
     assert detail_statuses == {7: job_lib.JobSystemRecoveryDetailStatus.ABSENT}
 
 
-def test_unknown_grpc_detail_status_is_malformed():
+@pytest.mark.parametrize('detail_status', [
+    jobsv1_pb2.JOB_SYSTEM_RECOVERY_DETAIL_STATUS_UNSPECIFIED,
+    99,
+])
+def test_zero_or_unknown_grpc_detail_status_is_malformed(detail_status):
     backend = cloud_vm_ray_backend.CloudVmRayBackend()
     handle = mock.MagicMock(is_grpc_enabled_with_flag=True)
     client = mock.MagicMock()
     client.get_job_status.return_value = jobsv1_pb2.GetJobStatusResponse(
         job_statuses={7: jobsv1_pb2.JOB_STATUS_RUNNING},
-        system_recovery_detail_statuses={7: 99})
+        system_recovery_detail_statuses={7: detail_status})
 
     with mock.patch.object(cloud_vm_ray_backend,
                            'SkyletClient',
@@ -735,7 +739,7 @@ def test_malformed_grpc_detail_does_not_hide_ordinary_status():
         },
         system_recovery_infos={
             7: jobsv1_pb2.JobSystemRecoveryInfo(
-                capability=runtime_recovery.CAPABILITY_V1,
+                capability=runtime_recovery.CAPABILITY_V2,
                 phase=jobsv1_pb2.JOB_SYSTEM_RECOVERY_PHASE_UNSPECIFIED,
                 original_attempt_id='attempt-original',
                 node_boot_id='boot-id',
@@ -769,7 +773,7 @@ def test_structured_job_status_round_trips_over_ssh(legacy_payload):
         payload = message_utils.encode_payload({7: 'RUNNING'})
         expected_infos = {}
         expected_detail_statuses = {
-            7: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+            7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
         }
     else:
         payload = message_utils.encode_payload({
@@ -821,7 +825,7 @@ def test_structured_grpc_failure_falls_back_to_status_only_ssh():
     assert statuses == {7: job_lib.JobStatus.RUNNING}
     assert not infos
     assert detail_statuses == {
-        7: job_lib.JobSystemRecoveryDetailStatus.UNSPECIFIED
+        7: job_lib.JobSystemRecoveryDetailStatus.MALFORMED
     }
 
 

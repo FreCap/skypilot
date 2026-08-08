@@ -82,16 +82,12 @@ RESERVED_FILL_LAUNCH_FENCE_KEYS = (
 SYSTEM_OOM_RECOVERY_PROFILES_ENV_VAR = (
     'SKYPILOT_INTERNAL_SERVE_SYSTEM_OOM_RECOVERY_PROFILES')
 # Recovery-capable code generation requires one exact controller-owned
-# contract tuple.  Contract 1 remains a deprecated transition reader until the
-# stacked cleanup PR.  New candidates use contract 2 and a closed context that
-# is atomically bound to the API server's own ordinary request ID.
+# contract tuple. Candidates use contract 2 and a closed context that is
+# atomically bound to the API server's own ordinary request ID.
 SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION_KEY = (
     'sky_serve_system_oom_recovery_controller_contract_version')
-SYSTEM_OOM_RECOVERY_LEGACY_CONTROLLER_CONTRACT_VERSION = 1
 SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION = 2
 SYSTEM_OOM_RECOVERY_PROFILE_ID_KEY = 'sky_serve_system_oom_recovery_profile_id'
-SYSTEM_OOM_RECOVERY_PROFILE_VERSION_KEY = (
-    'sky_serve_system_oom_recovery_profile_version')
 SYSTEM_OOM_RECOVERY_AUTHORIZATION_VERSION_KEY = (
     'sky_serve_system_oom_recovery_authorization_version')
 SYSTEM_OOM_RECOVERY_AUTHORIZATION_SHA256_KEY = (
