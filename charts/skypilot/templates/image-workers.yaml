@@ -1,5 +1,7 @@
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
+{{- $authorityV1RetirementPhase := .Values.databaseMigration.authorityV1RetirementPhase | default "none" -}}
+{{- $authorityV1RetirementActive := ne $authorityV1RetirementPhase "none" -}}
 {{- $copyTerminationGracePeriodSeconds := 30 -}}
 {{- if and (hasKey .Values.imageCopyWorker "terminationGracePeriodSeconds") (not (kindIs "invalid" .Values.imageCopyWorker.terminationGracePeriodSeconds)) -}}
 {{- $copyTerminationGracePeriodSeconds = .Values.imageCopyWorker.terminationGracePeriodSeconds -}}
@@ -49,7 +51,7 @@
 {{- end -}}
 {{- $_ := set $sourceCredentialIdentities $identity true -}}
 {{- end -}}
-{{- $workerReservedEnvNames := list "IS_SKYPILOT_SERVER" "KUBECONFIG" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_GLOBAL_CONFIG" "SKYPILOT_IMAGE_HEALTH_PORT" "SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS" "SKYPILOT_IMAGE_MAX_IN_FLIGHT" "SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR" "SKYPILOT_IMAGE_RETENTION_SECONDS" "SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST" "SKYPILOT_IMAGE_WORKER_ID" "SKYPILOT_IMAGE_WORKER_VERSION" "SKYPILOT_RELEASE_NAME" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
+{{- $workerReservedEnvNames := list "IS_SKYPILOT_SERVER" "KUBECONFIG" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_GLOBAL_CONFIG" "SKYPILOT_IMAGE_HEALTH_PORT" "SKYPILOT_IMAGE_LIVENESS_DEADLINE_SECONDS" "SKYPILOT_IMAGE_MAX_IN_FLIGHT" "SKYPILOT_IMAGE_QUALIFICATION_MANIFEST_DIR" "SKYPILOT_IMAGE_RETENTION_SECONDS" "SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST" "SKYPILOT_IMAGE_WORKER_ID" "SKYPILOT_IMAGE_WORKER_VERSION" "SKYPILOT_RELEASE_NAME" "SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
 
 {{- if and .Values.imageCopyWorker.enabled .Values.imageCopyWorker.serviceAccount.create }}
 apiVersion: v1
@@ -181,6 +183,10 @@ spec:
           value: {{ .Values.imageCopyWorker.livenessDeadlineSeconds | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
+        {{- if $authorityV1RetirementActive }}
+        - name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+          value: "037"
+        {{- end }}
         - name: SKYPILOT_IMAGE_SOURCE_SECRET_ALLOWLIST
           value: {{ toJson .Values.imageCopyWorker.sourceCredentialSecrets | quote }}
         {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
@@ -367,6 +373,10 @@ spec:
           value: {{ .Values.imageLifecycleWorker.retentionSeconds | int64 | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
+        {{- if $authorityV1RetirementActive }}
+        - name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+          value: "037"
+        {{- end }}
         {{- if .Values.apiService.dbConnectionSecretName }}
         - name: SKYPILOT_DB_CONNECTION_URI
           valueFrom:
@@ -532,6 +542,10 @@ spec:
           value: {{ .Values.imageCanaryWorker.livenessDeadlineSeconds | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: {{ ternary "verify" "auto" .Values.databaseMigration.enabled | quote }}
+        {{- if $authorityV1RetirementActive }}
+        - name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+          value: "037"
+        {{- end }}
         {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
         - name: KUBECONFIG
           value: /var/skypilot/kubeconfig/config

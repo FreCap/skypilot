@@ -17,6 +17,7 @@ import urllib3.util
 from sky.adaptors import common as adaptors_common
 from sky.serve import auth_tokens
 from sky.serve import constants
+from sky.serve import resource_action_preflight_v2
 from sky.serve import resource_actions
 from sky.server import authority_preflight
 from sky.server.requests import resource_actions as kernel_actions
@@ -289,40 +290,33 @@ def _decode_json(body: bytes) -> Any:
     return value
 
 
-def _validate_error_response(response: requests.Response, body: bytes) -> None:
+def _validate_error_response(response: requests.Response, body: bytes,
+                             protocol_version: int) -> None:
     code = _ERROR_CODES.get(response.status_code)
     if code is None:
         raise ValueError('authority preflight status is outside the protocol')
     expected = resource_actions.canonical_json_bytes({
-        'version': 1,
+        'version': protocol_version,
         'code': code,
     })
     if body != expected:
         raise ValueError('authority preflight error body is invalid')
 
 
-def request_provider_authority_preflight_v1(
-    request: resource_actions.ProviderAuthorityPreflightRequestV1,
+def _request_provider_authority_preflight(
+    request: Any,
     *,
-    service_dns: str | None = None,
-    port: int = constants.RESOURCE_ACTION_PREFLIGHT_PORT,
-    ca_file: str = f'{constants.RESOURCE_ACTION_PREFLIGHT_TLS_DIRECTORY}/ca.crt',
-) -> resource_actions.ProviderAuthorityPreflightResponseV1:
-    """Perform the exact bounded call, retrying only the closed transient set."""
+    path: str,
+    protocol_version: int,
+    response_parser: typing.Callable[[Any], Any],
+    service_dns: str,
+    port: int,
+    ca_file: str,
+) -> Any:
+    """Execute the common trust edge after version-specific type selection."""
 
-    if type(request
-           ) is not resource_actions.ProviderAuthorityPreflightRequestV1:
-        raise TypeError('authority preflight request has an invalid type.')
-    if service_dns is None:
-        service_dns = authority_preflight.authority_preflight_service_dns()
-    if type(service_dns) is not str or not service_dns:
-        raise ValueError('authority preflight Service DNS is invalid.')
-    if type(port) is not int or isinstance(port,
-                                           bool) or not 1 <= port <= 65_535:
-        raise ValueError('authority preflight port is invalid.')
     body = request.canonical_bytes
-    url = (f'https://{service_dns}:{port}'
-           f'{constants.RESOURCE_ACTION_PREFLIGHT_PATH}')
+    url = f'https://{service_dns}:{port}{path}'
     deadline = time.monotonic() + _TOTAL_TIMEOUT_SECONDS
 
     for attempt in range(2):
@@ -353,9 +347,8 @@ def request_provider_authority_preflight_v1(
                 headers=headers,
                 allow_redirects=False,
                 stream=True,
-                # requests accepts urllib3's richer total
-                # timeout object at runtime, while its
-                # public type stub exposes only scalar or
+                # requests accepts urllib3's richer total timeout object at
+                # runtime, while its public type stub exposes only scalar or
                 # connect/read tuple forms.
                 timeout=typing.cast(Any, _request_timeout(remaining_seconds)))
             _validate_peer(response, service_dns)
@@ -370,22 +363,21 @@ def request_provider_authority_preflight_v1(
                 response_body = _read_exact_body(response, expected_length,
                                                  deadline)
                 if response.status_code == 503:
-                    _validate_error_response(response, response_body)
+                    _validate_error_response(response, response_body,
+                                             protocol_version)
                     if attempt == 0:
                         retry = True
                     else:
                         raise ProviderAuthorityPreflightTransportError(
                             request.action_kind)
                 elif response.status_code != 200:
-                    _validate_error_response(response, response_body)
+                    _validate_error_response(response, response_body,
+                                             protocol_version)
                     raise ProviderAuthorityPreflightTransportError(
                         request.action_kind)
                 else:
                     value = _decode_json(response_body)
-                    parsed = (
-                        resource_actions.
-                        provider_authority_preflight_response_from_value_v1(
-                            value))
+                    parsed = response_parser(value)
                     if parsed.canonical_bytes != response_body:
                         raise ValueError(
                             'authority response bytes changed on decode')
@@ -422,10 +414,76 @@ def request_provider_authority_preflight_v1(
     raise AssertionError('authority preflight retry loop did not terminate')
 
 
+def request_provider_authority_preflight_v1(
+    request: resource_actions.ProviderAuthorityPreflightRequestV1,
+    *,
+    service_dns: str | None = None,
+    port: int = constants.RESOURCE_ACTION_PREFLIGHT_PORT,
+    ca_file: str = f'{constants.RESOURCE_ACTION_PREFLIGHT_TLS_DIRECTORY}/ca.crt',
+) -> resource_actions.ProviderAuthorityPreflightResponseV1:
+    """Perform the exact bounded call, retrying only the closed transient set."""
+
+    if type(request
+           ) is not resource_actions.ProviderAuthorityPreflightRequestV1:
+        raise TypeError('authority preflight request has an invalid type.')
+    if service_dns is None:
+        service_dns = authority_preflight.authority_preflight_service_dns()
+    if type(service_dns) is not str or not service_dns:
+        raise ValueError('authority preflight Service DNS is invalid.')
+    if type(port) is not int or isinstance(port,
+                                           bool) or not 1 <= port <= 65_535:
+        raise ValueError('authority preflight port is invalid.')
+    return typing.cast(
+        resource_actions.ProviderAuthorityPreflightResponseV1,
+        _request_provider_authority_preflight(
+            request,
+            path=constants.RESOURCE_ACTION_PREFLIGHT_PATH_V1,
+            protocol_version=1,
+            response_parser=resource_actions.
+            provider_authority_preflight_response_from_value_v1,
+            service_dns=service_dns,
+            port=port,
+            ca_file=ca_file))
+
+
+def request_provider_authority_preflight_v2(
+    request: resource_action_preflight_v2.ProviderAuthorityPreflightRequestV2,
+    *,
+    service_dns: str | None = None,
+    port: int = constants.RESOURCE_ACTION_PREFLIGHT_PORT,
+    ca_file: str = f'{constants.RESOURCE_ACTION_PREFLIGHT_TLS_DIRECTORY}/ca.crt',
+) -> resource_action_preflight_v2.ProviderAuthorityPreflightResponseV2:
+    """Perform one typed V2 call without accepting a V1 wire value."""
+
+    if type(request) is not (
+            resource_action_preflight_v2.ProviderAuthorityPreflightRequestV2):
+        raise TypeError('authority preflight V2 request has an invalid type.')
+    if service_dns is None:
+        service_dns = authority_preflight.authority_preflight_service_dns()
+    if type(service_dns) is not str or not service_dns:
+        raise ValueError('authority preflight Service DNS is invalid.')
+    if type(port) is not int or isinstance(port,
+                                           bool) or not 1 <= port <= 65_535:
+        raise ValueError('authority preflight port is invalid.')
+    return typing.cast(
+        resource_action_preflight_v2.ProviderAuthorityPreflightResponseV2,
+        _request_provider_authority_preflight(
+            request,
+            path=constants.RESOURCE_ACTION_PREFLIGHT_PATH_V2,
+            protocol_version=2,
+            response_parser=(
+                resource_action_preflight_v2.
+                provider_authority_preflight_response_from_value_v2),
+            service_dns=service_dns,
+            port=port,
+            ca_file=ca_file))
+
+
 # Concise public spelling for the controller integration.
 preflight = request_provider_authority_preflight_v1
 
 __all__ = [
     'ProviderAuthorityPreflightTransportError', 'preflight',
-    'request_provider_authority_preflight_v1'
+    'request_provider_authority_preflight_v1',
+    'request_provider_authority_preflight_v2'
 ]

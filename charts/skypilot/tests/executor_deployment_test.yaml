@@ -194,6 +194,21 @@ tests:
       - failedTemplate:
           errorMessage: executorService.healthPort must differ from apiService.metrics.port when metrics are enabled
 
+  - it: should hold executors at Serve037 during V1 retirement
+    release:
+      upgrade: true
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: deselect
+      resourceActions.authorityWorker.activeCohort: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+            value: "037"
+
   - it: should allow an explicit executor topology-spread opt-out
     set:
       apiService.highAvailability.enabled: true

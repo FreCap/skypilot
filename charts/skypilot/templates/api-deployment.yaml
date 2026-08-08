@@ -18,8 +18,19 @@
 {{- $controllerService := .Values.controllerService | default (dict) -}}
 {{- $controllerReplicas := dig "replicas" 2 $controllerService -}}
 {{- $resourceActions := .Values.resourceActions | default (dict) -}}
+{{- $qualificationPolicy := include "skypilot.resourceActionQualificationPolicy" . | fromJson -}}
+{{- $qualificationPolicyConfigured := get $qualificationPolicy "configured" | default false -}}
+{{- $apiAnnotations := .Values.apiService.annotations | default (dict) -}}
+{{- range $annotation := list "skypilot.co/resource-action-qualification-policy-config-map" "skypilot.co/resource-action-qualification-policy-byte-size" "skypilot.co/resource-action-qualification-policy-sha256" -}}
+{{- if hasKey $apiAnnotations $annotation -}}
+{{- fail (printf "API Pod annotation %q is reserved by the resource-action qualification policy projection" $annotation) -}}
+{{- end -}}
+{{- end -}}
 {{- $authorityWorker := get $resourceActions "authorityWorker" | default (dict) -}}
 {{- $authorityWorkerEnabled := get $authorityWorker "enabled" | default false -}}
+{{- $authorityV1RetirementPhase := .Values.databaseMigration.authorityV1RetirementPhase | default "none" -}}
+{{- $authorityV1RetirementActive := ne $authorityV1RetirementPhase "none" -}}
+{{- $authorityPrivateEnabled := and $authorityWorkerEnabled (not $authorityV1RetirementActive) -}}
 {{- $authorityInstallationId := get $authorityWorker "installationId" | default "" -}}
 {{- $authorityCohortSuffixes := list -}}
 {{- $authorityRetirementTombstones := list -}}
@@ -78,7 +89,7 @@
       only when the chart will actually emit them. The authority activation
       marker has no compatibility meaning and remains chart-owned in every
       mode. */ -}}
-{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
+{{- $apiReservedEnvNames := list "ENABLE_SERVICE_ACCOUNTS" "KUBECONFIG" "SKYPILOT_APISERVER_UUID" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL" "SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED" "SKYPILOT_AUTH_USER_HEADER" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_INGRESS_BASIC_AUTH_ENABLED" "SKYPILOT_INGRESS_HOST" "SKYPILOT_INITIAL_BASIC_AUTH" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_VERIFIER_ENABLED" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKY_API_SERVER_METRICS_ENABLED" -}}
 {{- if $authorityWorkerEnabled -}}
 {{- $apiReservedEnvNames = concat $apiReservedEnvNames (list "SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON") -}}
 {{- end -}}
@@ -104,7 +115,7 @@
 {{- $apiReservedEnvNames = append $apiReservedEnvNames "VAST_API_KEY" -}}
 {{- end -}}
 
-{{- $apiReservedVolumeNames := list "sky-ephemeral" "skypilot-config" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- $apiReservedVolumeNames := list "sky-ephemeral" "skypilot-config" "skypilot-resource-action-qualification-policy" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedVolumeNames = concat $apiReservedVolumeNames (list "aws-config" "aws-config-files") -}}
 {{- end -}}
@@ -139,7 +150,7 @@
 {{- $apiReservedVolumeNames = append $apiReservedVolumeNames "vast-config" -}}
 {{- end -}}
 
-{{- $apiReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.sky/api_server/clients" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
+{{- $apiReservedMountPaths := list "/etc/skypilot/resource-actions/qualification-policy.json" "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.sky/api_server/clients" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.aws" -}}
 {{- end -}}
@@ -175,6 +186,16 @@
 {{- end -}}
 {{- if .Values.vastCredentials.enabled -}}
 {{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.config/vastai" -}}
+{{- end -}}
+{{- $qualificationPolicyMountPath := "/etc/skypilot/resource-actions/qualification-policy.json" -}}
+{{- range $mountList := list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts -}}
+{{- range (default (list) $mountList) -}}
+{{- $mountPath := default "" .mountPath -}}
+{{- $normalizedMountPath := clean $mountPath -}}
+{{- if and (ne $mountPath "") (ne $mountPath $qualificationPolicyMountPath) (or (eq $normalizedMountPath $qualificationPolicyMountPath) (eq $normalizedMountPath "/") (hasPrefix (printf "%s/" $normalizedMountPath) $qualificationPolicyMountPath) (hasPrefix (printf "%s/" $qualificationPolicyMountPath) $normalizedMountPath)) -}}
+{{- fail (printf "volume mount path %q overlaps the reserved resource-action qualification policy path" $mountPath) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if eq .Values.requestStore.backend "postgres" -}}
 {{- if and (not .Values.apiService.dbConnectionSecretName) (not .Values.apiService.dbConnectionString) -}}
@@ -306,6 +327,11 @@ spec:
         {{- if .Values.apiService.annotations }}
         {{- toYaml .Values.apiService.annotations | nindent 8 }}
         {{- end }}
+        {{- if $qualificationPolicyConfigured }}
+        skypilot.co/resource-action-qualification-policy-config-map: {{ get $qualificationPolicy "configMapName" | quote }}
+        skypilot.co/resource-action-qualification-policy-byte-size: {{ get $qualificationPolicy "byteSize" | quote }}
+        skypilot.co/resource-action-qualification-policy-sha256: {{ get $qualificationPolicy "sha256" | quote }}
+        {{- end }}
       labels:
         app: {{ $fullName }}-api
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -381,9 +407,15 @@ spec:
           value: {{ .Values.apiService.skypilotDev | quote }}
         - name: SKYPILOT_RELEASE_NAME
           value: {{ $fullName | quote }}
-        {{- if $authorityWorkerEnabled }}
+        {{- if $authorityPrivateEnabled }}
         - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
           value: "true"
+        {{- end }}
+        {{- if $authorityWorkerEnabled }}
+        {{- if $authorityV1RetirementActive }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_VERIFIER_ENABLED
+          value: "true"
+        {{- end }}
         - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
           value: {{ $authorityInstallationId | quote }}
         - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
@@ -458,6 +490,10 @@ spec:
         {{- if and (or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString) .Values.databaseMigration.enabled }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: verify
+        {{- end }}
+        {{- if $authorityV1RetirementActive }}
+        - name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+          value: "037"
         {{- end }}
         {{- if .Values.apiService.authUserHeaderName }}
         - name: SKYPILOT_AUTH_USER_HEADER
@@ -756,6 +792,12 @@ spec:
         {{- end }}
         - name: skypilot-config
           mountPath: /var/skypilot/config
+        {{- if $qualificationPolicyConfigured }}
+        - name: skypilot-resource-action-qualification-policy
+          mountPath: /etc/skypilot/resource-actions/qualification-policy.json
+          subPath: qualification-policy.json
+          readOnly: true
+        {{- end }}
         {{- if or .Values.auth.externalProxy.enabled (eq (include "skypilot.ingressOAuthEnabled" .) "true") }}
         - name: skypilot-server-config
           mountPath: /root/.sky/.server.yaml
@@ -1281,6 +1323,15 @@ spec:
       - name: skypilot-config
         configMap:
           name: {{ $fullName }}-config
+      {{- if $qualificationPolicyConfigured }}
+      - name: skypilot-resource-action-qualification-policy
+        configMap:
+          name: {{ get $qualificationPolicy "configMapName" | quote }}
+          defaultMode: 0444
+          items:
+          - key: qualification-policy.json
+            path: qualification-policy.json
+      {{- end }}
       {{- if or .Values.auth.externalProxy.enabled (eq (include "skypilot.ingressOAuthEnabled" .) "true") }}
       - name: skypilot-server-config
         configMap:

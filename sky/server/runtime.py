@@ -13,7 +13,9 @@ import shutil
 import signal
 import threading
 import time
+import typing
 from typing import Any
+import uuid
 
 import uvloop
 
@@ -56,8 +58,18 @@ from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
 
+if typing.TYPE_CHECKING:
+    from sky.serve import resource_action_preflight_v2
+    from sky.serve import resource_action_provider_preflight_v2
+
 _SERVER_USER_HASH_KEY = 'server_user_hash'
 _ROLE_CHOICES = ('all', 'api', 'executor', 'controller', 'authority-worker')
+# One shared central-state connection serves authority bootstrap, one
+# ``api-requests-control`` connection serves the API-instance heartbeat, and
+# one isolated connection serves the zero-queue V2 trust evaluator.  This is
+# the persistent per-authority-Pod physical ceiling; transient advisory-lock
+# NullPool connections are closed when their startup/migration lock ends.
+_AUTHORITY_WORKER_SYNC_POSTGRES_CONNECTION_BUDGET = 3
 _SINGLETON_PREFIX = 'skypilot:api-server-runtime:v1'
 _CONTROLLER_LEADERSHIP_POLL_SECONDS = 2
 _CONTROLLER_LEADERSHIP_PROBE_SECONDS = 2
@@ -156,6 +168,10 @@ def initialize_common_runtime(role: str, deploy: bool) -> RuntimeState:
     usage_lib.maybe_show_privacy_policy()
 
     db_utils.set_max_connections(1)
+    if role == 'authority-worker':
+        logger.info(
+            'Authority-worker synchronous PostgreSQL connection budget: '
+            f'{_AUTHORITY_WORKER_SYNC_POSTGRES_CONNECTION_BUDGET}')
     logger.info('Initializing database engines')
     database_migrations.initialize_central_databases()
     _guard_active_reserved_fill_protocol(role)
@@ -445,7 +461,8 @@ def _start_metrics_background_loop(role: str, host: str,
 def _start_background_loop(role: str) -> _BackgroundLoop:
     background = _BackgroundLoop()
     if (role in ('all', 'api') and
-            auth_tokens.is_resource_action_authority_enabled()):
+        (auth_tokens.is_resource_action_authority_enabled() or
+         authority_worker_retirement.is_retirement_verifier_enabled())):
         if not _uses_postgres_requests():
             raise RuntimeError(
                 'Resource-action authority retirement requires the '
@@ -877,15 +894,71 @@ def _load_authority_static_manifest() -> Any:
     # pylint: disable=import-outside-toplevel
     from sky.serve import resource_action_provider_preflight
     return (resource_action_provider_preflight.
-            load_provider_authority_worker_static_evidence_v1())
+            load_provider_authority_worker_static_evidence())
+
+
+def _build_authority_preflight_evaluator_v2(
+    worker_instance_id: str,
+) -> resource_action_provider_preflight_v2.InitialProviderPreflightEvaluatorV2:
+    """Build the dark V2 evaluator over the PostgreSQL trust transaction."""
+
+    # Imported only by the dedicated preflight-only role.  This bridge does
+    # not construct a claimant, renderer, provider client, or Kubernetes
+    # client; successful trust still returns only typed not-representable.
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import resource_action_authority_state
+    from sky.serve import resource_action_preflight_v2
+    from sky.serve import resource_action_provider_preflight_v2
+    from sky.serve import resource_actions
+    from sky.serve import serve_state_schema
+
+    store = resource_action_authority_state.ServeResourceActionAuthorityStore(
+        serve_state_schema.get_authority_preflight_database_engine())
+
+    def validate_trust(
+        request: resource_action_preflight_v2.
+        ProviderAuthorityPreflightRequestV2,
+        worker_id: uuid.UUID,
+    ) -> bool:
+        launch_identity_context: (
+            resource_actions.ProviderLaunchIdentityCanonicalizationContextV1 |
+            None) = None
+        if type(request.seed) is (
+                resource_action_preflight_v2.ProviderLaunchPreflightSeedV2):
+            launch_identity_context = (
+                request.seed.source.identity_canonicalization.context)
+        try:
+            store.validate_preparing_reference_for_preflight(
+                worker_instance_id=worker_id,
+                expected_manifest=request.expected_cohort_manifest,
+                resource_identity=request.seed.resource_identity,
+                action_kind=request.action_kind,
+                launch_identity_context=launch_identity_context)
+        except resource_action_authority_state.AuthorityStateError:
+            return False
+        return True
+
+    return (resource_action_provider_preflight_v2.
+            InitialProviderPreflightEvaluatorV2(validate_trust,
+                                                worker_instance_id))
 
 
 def _build_authority_bootstrap_coordinator(manifest: Any,
                                            pod_identity: Any) -> Any:
     # pylint: disable=import-outside-toplevel
+    from sky.serve import resource_action_authority
+    from sky.serve import resource_actions
     from sky.server.requests import authority_worker_bootstrap
-    return authority_worker_bootstrap.build_default_coordinator(
-        manifest, pod_identity)
+    if type(manifest
+           ) is resource_actions.ProviderAuthorityWorkerCohortManifestV1:
+        return authority_worker_bootstrap.build_default_coordinator(
+            manifest, pod_identity)
+    if type(manifest) is (
+            resource_action_authority.ProviderAuthorityWorkerCohortManifestV2):
+        from sky.server.requests import authority_worker_bootstrap_v2
+        return authority_worker_bootstrap_v2.build_default_coordinator_v2(
+            manifest, pod_identity)
+    raise TypeError('Authority manifest has no exact runtime contract.')
 
 
 def _run_authority_preflight_role(state: RuntimeState,
@@ -896,6 +969,7 @@ def _run_authority_preflight_role(state: RuntimeState,
             'The authority-worker role requires PostgreSQL instance leases.')
     # pylint: disable=import-outside-toplevel
     from sky.serve import resource_action_provider_preflight
+    from sky.serve import resource_actions
     from sky.server import authority_preflight
     from sky.server.requests import authority_worker_bootstrap
 
@@ -906,9 +980,18 @@ def _run_authority_preflight_role(state: RuntimeState,
             'Authority-worker instance lease differs from the Pod UID.')
     coordinator_holder: list[Any | None] = [None]
 
-    def accepted_manifest() -> Any | None:
+    def accepted_v1_manifest() -> Any | None:
+        # The V1 evaluator remains attached only to the byte-frozen Serve034
+        # retirement/deselect coordinator.  Normal Serve035 V2 membership is
+        # not a preflight evaluator and cannot be reinterpreted as V1.
         coordinator = coordinator_holder[0]
-        return None if coordinator is None else coordinator.accepted_manifest()
+        if coordinator is None:
+            return None
+        accepted = coordinator.accepted_manifest()
+        if type(accepted) is (
+                resource_actions.ProviderAuthorityWorkerCohortManifestV1):
+            return accepted
+        return None
 
     def clear_acceptance() -> None:
         coordinator = coordinator_holder[0]
@@ -916,13 +999,18 @@ def _run_authority_preflight_role(state: RuntimeState,
             coordinator.clear_acceptance()
 
     evaluator = (resource_action_provider_preflight.
-                 InitialProviderPreflightEvaluator(accepted_manifest))
+                 InitialProviderPreflightEvaluator(accepted_v1_manifest))
+    evaluator_v2 = _build_authority_preflight_evaluator_v2(pod_identity.uid)
     preflight_server = authority_preflight.AuthorityPreflightServer(
         args.host,
         args.authority_preflight_port,
         authority_preflight.authority_preflight_service_dns(),
         evaluator,
-        on_transport_invalid=clear_acceptance)
+        on_transport_invalid=clear_acceptance,
+        # This dark evaluator can only validate the complete PostgreSQL trust
+        # fence and return typed unavailable.  It creates no capsule or action
+        # authority and cannot reach claims or provider effects.
+        evaluator_v2=evaluator_v2)
     listeners_ready = threading.Event()
     static_evidence_ready = threading.Event()
     health_server = _RoleHealthServer(

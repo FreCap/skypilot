@@ -1,5 +1,7 @@
 """Fail-closed tests for API-owned authority-worker retirement."""
+# pylint: disable=protected-access
 
+import copy
 import dataclasses
 import datetime
 import hashlib
@@ -9,6 +11,7 @@ from unittest import mock
 import pytest
 import serve_resource_action_test_fixtures as authority_fixtures
 
+from sky.serve import resource_action_authority as authority
 from sky.serve import resource_action_state
 from sky.serve import resource_actions as actions
 from sky.server.requests import authority_worker_retirement as retirement
@@ -122,6 +125,103 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(',', ':'))
 
 
+def _cleanup_environment() -> dict[str, str]:
+    return {
+        retirement.ACCEPTED_V1_CLEANUP_MODE_ENV_VAR: 'true',
+        retirement.ACCEPTED_V1_CLEANUP_DESELECTED_SUFFIXES_ENV_VAR:
+            _canonical_json([authority_fixtures.COHORT_SUFFIX]),
+        retirement.INSTALLATION_ID_ENV_VAR: authority_fixtures.INSTALLATION_ID,
+        retirement.COHORT_SUFFIXES_ENV_VAR: _canonical_json(
+            [authority_fixtures.COHORT_SUFFIX]),
+        retirement.RETIREMENT_TOMBSTONES_ENV_VAR: _canonical_json([]),
+        'SKYPILOT_POD_NAMESPACE': authority_fixtures.NAMESPACE,
+        'SKYPILOT_RELEASE_NAME': authority_fixtures.HELM_FULL_NAME,
+        'SKYPILOT_API_SERVER_ROLE': 'api',
+        'SKYPILOT_API_REQUEST_BACKEND': 'postgres',
+        'SKYPILOT_STATE_DB_MIGRATION_MODE': 'verify',
+        'IS_SKYPILOT_SERVER': 'true',
+    }
+
+
+def test_accepted_v1_cleanup_environment_is_inert_and_exact() -> None:
+    scope = retirement.AuthorityWorkerAcceptedV1CleanupScope.from_environment(
+        _cleanup_environment())
+
+    assert scope.retirement_scope == _scope()
+    assert scope.deselected_cohort_suffixes == (
+        authority_fixtures.COHORT_SUFFIX,)
+
+
+@pytest.mark.parametrize(('name', 'value', 'match'), [
+    ('SKYPILOT_API_SERVER_ROLE', 'all', 'SERVER_ROLE'),
+    ('SKYPILOT_STATE_DB_MIGRATION_MODE', 'upgrade', 'MIGRATION_MODE'),
+    ('SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED', 'true',
+     'forbids private authority'),
+    ('SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACTIVE_COHORT', 'v1',
+     'forbids an active cohort'),
+])
+def test_accepted_v1_cleanup_environment_rejects_runtime_authority(
+        name: str, value: str, match: str) -> None:
+    environ = _cleanup_environment()
+    environ[name] = value
+
+    with pytest.raises(ValueError, match=match):
+        retirement.AuthorityWorkerAcceptedV1CleanupScope.from_environment(
+            environ)
+
+
+def test_accepted_v1_cleanup_environment_requires_complete_deselection(
+) -> None:
+    environ = _cleanup_environment()
+    environ[retirement.ACCEPTED_V1_CLEANUP_DESELECTED_SUFFIXES_ENV_VAR] = '[]'
+
+    with pytest.raises(ValueError, match='nonempty'):
+        retirement.AuthorityWorkerAcceptedV1CleanupScope.from_environment(
+            environ)
+
+
+def test_accepted_v1_cleanup_advances_exact_deselected_record() -> None:
+    initial = _record(actions.WorkerCohortLifecycleState.ACCEPTING, revision=7)
+    authorized = dataclasses.replace(
+        initial,
+        lifecycle_state=actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED,
+        revision=9)
+    store = _store(initial)
+    store.authorize_accepted_v1_worker_cohort_removal.return_value = (
+        resource_action_state.WorkerCohortTransition(authorized))
+    scope = retirement.AuthorityWorkerAcceptedV1CleanupScope(
+        retirement_scope=_scope(),
+        deselected_cohort_suffixes=(authority_fixtures.COHORT_SUFFIX,))
+
+    result = retirement.AuthorityWorkerAcceptedV1Cleanup(scope,
+                                                         store).run_once()
+
+    assert result == retirement.AuthorityWorkerAcceptedV1CleanupPass(
+        scanned=1, authorized=1)
+    store.list_worker_cohorts_for_installation.assert_called_once_with(
+        authority_fixtures.INSTALLATION_ID,
+        (actions.WorkerCohortLifecycleState.ACCEPTING,
+         actions.WorkerCohortLifecycleState.DRAINING),
+        limit=256)
+    store.authorize_accepted_v1_worker_cohort_removal.assert_called_once_with(
+        initial.cohort_identity, initial.revision, initial.lifecycle_state,
+        initial.registration_attestations)
+
+
+def test_accepted_v1_cleanup_fails_closed_for_tombstoned_nonterminal_record(
+) -> None:
+    initial = _record(actions.WorkerCohortLifecycleState.DRAINING)
+    store = _store(initial)
+    scope = retirement.AuthorityWorkerAcceptedV1CleanupScope(
+        retirement_scope=_scope(live=('other-v1',),
+                                tombstones=(authority_fixtures.COHORT_SUFFIX,)),
+        deselected_cohort_suffixes=('other-v1',))
+
+    with pytest.raises(retirement.AuthorityWorkerRetirementInvariantViolation,
+                       match='without an exact live deselection fence'):
+        retirement.AuthorityWorkerAcceptedV1Cleanup(scope, store).run_once()
+
+
 def test_release_preflight_reads_exact_manifest_and_calls_durable_fence(
         tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = str(tmp_path / 'release-preflight')
@@ -136,12 +236,65 @@ def test_release_preflight_reads_exact_manifest_and_calls_durable_fence(
     store = mock.Mock()
     record = mock.sentinel.release_record
     store.preflight_authority_release.return_value = record
+    read_manifest = mock.Mock(wraps=retirement._read_release_manifest)
+    monkeypatch.setattr(retirement, '_read_release_manifest', read_manifest)
 
     assert retirement.validate_release_preflight(preflight, store) is record
+    read_manifest.assert_called_once_with(str(path / 'manifest.json'))
     store.preflight_authority_release.assert_called_once_with(
         authority_fixtures.NAMESPACE, 'stable-release',
         authority_fixtures.HELM_FULL_NAME, authority_fixtures.INSTALLATION_ID,
         True, (manifest,), ())
+
+
+def test_release_preflight_dispatches_exact_numeric_v2_to_additive_store(
+        tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = str(tmp_path / 'release-preflight')
+    monkeypatch.setattr(retirement, '_RELEASE_PREFLIGHT_MANIFEST_ROOT', root)
+    value = copy.deepcopy(authority_fixtures.authority_manifest_value())
+    value['version'] = 2
+    value['claim_contract'] = 'frozen_action_cohort_join_v2'
+    manifest = authority.ProviderAuthorityWorkerCohortManifestV2.from_value(
+        value)
+    path = tmp_path / 'release-preflight' / authority_fixtures.COHORT_SUFFIX
+    path.mkdir(parents=True)
+    (path / 'manifest.json').write_bytes(manifest.canonical_bytes)
+    preflight = retirement.AuthorityWorkerReleasePreflight.from_json(
+        _canonical_json(_release_preflight_value(root)))
+    store_v1 = mock.Mock()
+    store_v2 = mock.Mock()
+    record = mock.sentinel.release_record_v2
+    store_v2.preflight_authority_release_v2.return_value = record
+    read_manifest = mock.Mock(wraps=retirement._read_release_manifest)
+    monkeypatch.setattr(retirement, '_read_release_manifest', read_manifest)
+
+    assert retirement.validate_release_preflight(preflight, store_v1,
+                                                 store_v2) is record
+    read_manifest.assert_called_once_with(str(path / 'manifest.json'))
+    store_v1.preflight_authority_release.assert_not_called()
+    store_v2.preflight_authority_release_v2.assert_called_once_with(
+        authority_fixtures.NAMESPACE, 'stable-release',
+        authority_fixtures.HELM_FULL_NAME, authority_fixtures.INSTALLATION_ID,
+        True, (manifest,), ())
+
+
+@pytest.mark.parametrize('version', (True, 2.0, '2', 3))
+def test_release_preflight_dispatch_rejects_nonexact_manifest_version(
+        tmp_path, monkeypatch: pytest.MonkeyPatch, version: object) -> None:
+    root = str(tmp_path / 'release-preflight')
+    monkeypatch.setattr(retirement, '_RELEASE_PREFLIGHT_MANIFEST_ROOT', root)
+    value = copy.deepcopy(authority_fixtures.authority_manifest_value())
+    value['version'] = version
+    path = tmp_path / 'release-preflight' / authority_fixtures.COHORT_SUFFIX
+    path.mkdir(parents=True)
+    (path / 'manifest.json').write_bytes(
+        json.dumps(value, sort_keys=True, separators=(',', ':')).encode())
+    preflight = retirement.AuthorityWorkerReleasePreflight.from_json(
+        _canonical_json(_release_preflight_value(root)))
+
+    with pytest.raises(ValueError, match='integer 1 or 2'):
+        retirement.validate_release_preflight(preflight, mock.Mock(),
+                                              mock.Mock())
 
 
 @pytest.mark.parametrize(('field', 'value', 'match'), [

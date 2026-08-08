@@ -43,9 +43,11 @@
 {{- $resourceActions := .Values.resourceActions | default (dict) -}}
 {{- $authorityWorker := get $resourceActions "authorityWorker" | default (dict) -}}
 {{- $authorityWorkerEnabled := get $authorityWorker "enabled" | default false -}}
+{{- $authorityV1RetirementPhase := .Values.databaseMigration.authorityV1RetirementPhase | default "none" -}}
+{{- $authorityV1RetirementActive := ne $authorityV1RetirementPhase "none" -}}
 {{- $authorityActiveCohort := get $authorityWorker "activeCohort" | default "" -}}
 {{- $authorityCohorts := get $authorityWorker "cohorts" | default (list) -}}
-{{- $authorityPreflightEnabled := and $authorityWorkerEnabled (gt (len $authorityCohorts) 0) -}}
+{{- $authorityPreflightEnabled := and $authorityWorkerEnabled (gt (len $authorityCohorts) 0) (not $authorityV1RetirementActive) -}}
 {{- $authorityAuth := get $authorityWorker "auth" | default (dict) -}}
 {{- $authorityTLS := get $authorityWorker "tls" | default (dict) -}}
 {{- $authorityAuthSecret := get $authorityAuth "existingSecret" | default "" -}}
@@ -55,7 +57,7 @@
 {{- $authorityManifestConfigMap := printf "%s-authority-%s-manifest" $fullName $authorityActiveCohort -}}
 {{- /* The activation marker has no user-owned compatibility meaning. Keep it
       reserved even when this role has no live authority preflight wiring. */ -}}
-{{- $controllerReservedEnvNames := list "KUBECONFIG" "POD_IP" "PROMETHEUS_MULTIPROC_DIR" "SKY_API_SERVER_METRICS_ENABLED" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_ENDPOINT" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
+{{- $controllerReservedEnvNames := list "KUBECONFIG" "POD_IP" "PROMETHEUS_MULTIPROC_DIR" "SKY_API_SERVER_METRICS_ENABLED" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_ENDPOINT" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
 {{- if $authorityPreflightEnabled -}}
 {{- $controllerReservedEnvNames = append $controllerReservedEnvNames "SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE" -}}
 {{- end -}}
@@ -303,6 +305,10 @@ spec:
         {{- end }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: verify
+        {{- if $authorityV1RetirementActive }}
+        - name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+          value: "037"
+        {{- end }}
         - name: SKYPILOT_POD_CPU_CORE_LIMIT
           valueFrom:
             resourceFieldRef:

@@ -192,6 +192,45 @@ tests:
               secretName: db-ca
         documentIndex: 2
 
+  - it: should hold every image worker at Serve037 during V1 retirement
+    release:
+      upgrade: true
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: deselect
+      resourceActions.authorityWorker.activeCohort: ""
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+      imageLifecycleWorker.enabled: true
+      imageLifecycleWorker.serviceAccount.create: false
+      imageLifecycleWorker.serviceAccount.name: lifecycle-worker
+      imageCanaryWorker.enabled: true
+      imageCanaryWorker.serviceAccount.create: false
+      imageCanaryWorker.serviceAccount.name: canary-worker
+    asserts:
+      - hasDocuments:
+          count: 3
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+            value: "037"
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+            value: "037"
+        documentIndex: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+            value: "037"
+        documentIndex: 2
+
   - it: should default missing legacy worker grace values during reuse upgrades
     set:
       apiService.dbConnectionSecretName: external-db

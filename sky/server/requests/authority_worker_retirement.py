@@ -16,23 +16,39 @@ import json
 import os
 import re
 import stat
-from typing import Any, Protocol
+from typing import Any, cast, Protocol
 import uuid
 
 from sky import sky_logging
+from sky.serve import resource_action_authority as authority
+from sky.serve import resource_action_authority_state as authority_state
 from sky.serve import resource_action_state
 from sky.serve import resource_actions as actions
+from sky.serve import serve_state_schema
 from sky.server.requests import resource_actions as kernel_actions
+from sky.utils.db import db_utils
 
 INSTALLATION_ID_ENV_VAR = ('SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID')
 COHORT_SUFFIXES_ENV_VAR = (
     'SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON')
 RETIREMENT_TOMBSTONES_ENV_VAR = (
     'SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON')
+RETIREMENT_VERIFIER_ENABLED_ENV_VAR = (
+    'SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_VERIFIER_ENABLED')
 RELEASE_PREFLIGHT_ENV_VAR = (
     'SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON')
+ACCEPTED_V1_CLEANUP_MODE_ENV_VAR = (
+    'SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACCEPTED_V1_CLEANUP_ONLY')
+ACCEPTED_V1_CLEANUP_DESELECTED_SUFFIXES_ENV_VAR = (
+    'SKYPILOT_RESOURCE_ACTION_AUTHORITY_DESELECTED_SUFFIXES_JSON')
 _POD_NAMESPACE_ENV_VAR = 'SKYPILOT_POD_NAMESPACE'
 _RELEASE_NAME_ENV_VAR = 'SKYPILOT_RELEASE_NAME'
+_SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
+_REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
+_MIGRATION_MODE_ENV_VAR = 'SKYPILOT_STATE_DB_MIGRATION_MODE'
+_IS_SERVER_ENV_VAR = 'IS_SKYPILOT_SERVER'
+_AUTHORITY_ENABLED_ENV_VAR = 'SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED'
+_ACTIVE_COHORT_ENV_VAR = 'SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACTIVE_COHORT'
 _RELEASE_PREFLIGHT_MANIFEST_ROOT = (
     '/etc/skypilot/resource-action-authority/release-preflight')
 _DNS_LABEL_RE = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
@@ -41,9 +57,27 @@ _SCAN_STATES = (
     actions.WorkerCohortLifecycleState.REGISTERING,
     actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED,
 )
+_ACCEPTED_V1_CLEANUP_SCAN_STATES = (
+    actions.WorkerCohortLifecycleState.ACCEPTING,
+    actions.WorkerCohortLifecycleState.DRAINING,
+)
 _MAINTENANCE_INTERVAL_SECONDS = 30.0
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _suffix_inventory(raw: Any, *, name: str) -> tuple[str, ...]:
+    """Parse one canonical chart-projected suffix inventory."""
+    if type(raw) is not str:
+        raise ValueError(f'{name} environment value is absent.')
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f'{name} is not JSON.') from e
+    if type(value) is not list or json.dumps(
+            value, sort_keys=True, separators=(',', ':')) != raw:
+        raise ValueError(f'{name} is not a canonical JSON array.')
+    return tuple(value)
 
 
 class AuthorityWorkerRetirementInvariantViolation(RuntimeError):
@@ -94,19 +128,6 @@ class AuthorityWorkerRetirementScope:
         return (f'resource-action-authority-retirement:'
                 f'{self.installation_id}:{release_scope}')
 
-    @staticmethod
-    def _suffix_inventory(raw: Any, *, name: str) -> tuple[str, ...]:
-        if type(raw) is not str:
-            raise ValueError(f'{name} environment value is absent.')
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ValueError(f'{name} is not JSON.') from e
-        if type(value) is not list or json.dumps(
-                value, sort_keys=True, separators=(',', ':')) != raw:
-            raise ValueError(f'{name} is not a canonical JSON array.')
-        return tuple(value)
-
     @classmethod
     def from_environment(
         cls,
@@ -127,12 +148,64 @@ class AuthorityWorkerRetirementScope:
         return cls(installation_id=installation_id,
                    namespace=namespace,
                    helm_full_name=helm_full_name,
-                   cohort_suffixes=cls._suffix_inventory(
+                   cohort_suffixes=_suffix_inventory(
                        source.get(COHORT_SUFFIXES_ENV_VAR),
                        name=COHORT_SUFFIXES_ENV_VAR),
-                   retirement_tombstones=cls._suffix_inventory(
+                   retirement_tombstones=_suffix_inventory(
                        source.get(RETIREMENT_TOMBSTONES_ENV_VAR),
                        name=RETIREMENT_TOMBSTONES_ENV_VAR))
+
+
+@dataclasses.dataclass(frozen=True)
+class AuthorityWorkerAcceptedV1CleanupScope:
+    """Chart-fixed deselection proof for the no-DDL exact-034 bridge."""
+
+    retirement_scope: AuthorityWorkerRetirementScope
+    deselected_cohort_suffixes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.retirement_scope) is not AuthorityWorkerRetirementScope:
+            raise TypeError('Accepted-V1 cleanup retirement scope is invalid.')
+        suffixes = self.deselected_cohort_suffixes
+        if (type(suffixes) is not tuple or not suffixes or any(
+                type(value) is not str or
+                _DNS_LABEL_RE.fullmatch(value) is None or len(value) > 42
+                for value in suffixes) or
+                suffixes != tuple(sorted(set(suffixes)))):
+            raise ValueError('Accepted-V1 cleanup deselection inventory is '
+                             'not a nonempty sorted unique DNS-label tuple.')
+        if suffixes != self.retirement_scope.cohort_suffixes:
+            raise ValueError('Accepted-V1 cleanup must deselect the complete '
+                             'live cohort inventory.')
+
+    @classmethod
+    def from_environment(
+        cls,
+        environ: Mapping[str, str] | None = None,
+    ) -> AuthorityWorkerAcceptedV1CleanupScope:
+        """Require an inert, verify-only process and rendered deselection."""
+        source = os.environ if environ is None else environ
+        required = {
+            ACCEPTED_V1_CLEANUP_MODE_ENV_VAR: 'true',
+            _IS_SERVER_ENV_VAR: 'true',
+            _SERVER_ROLE_ENV_VAR: 'api',
+            _REQUEST_BACKEND_ENV_VAR: 'postgres',
+            _MIGRATION_MODE_ENV_VAR: 'verify',
+        }
+        for name, expected in required.items():
+            if source.get(name) != expected:
+                raise ValueError(f'Accepted-V1 cleanup requires {name}='
+                                 f'{expected!r}.')
+        if _AUTHORITY_ENABLED_ENV_VAR in source:
+            raise ValueError('Accepted-V1 cleanup forbids private authority.')
+        if _ACTIVE_COHORT_ENV_VAR in source:
+            raise ValueError('Accepted-V1 cleanup forbids an active cohort.')
+        scope = AuthorityWorkerRetirementScope.from_environment(source)
+        deselected = _suffix_inventory(
+            source.get(ACCEPTED_V1_CLEANUP_DESELECTED_SUFFIXES_ENV_VAR),
+            name=ACCEPTED_V1_CLEANUP_DESELECTED_SUFFIXES_ENV_VAR)
+        return cls(retirement_scope=scope,
+                   deselected_cohort_suffixes=deselected)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -310,6 +383,73 @@ class AuthorityWorkerReleasePreflight:
             manifests.append(manifest)
         return tuple(manifests)
 
+    def load_versioned_live_manifests(
+        self,
+    ) -> tuple[int,
+               tuple[actions.ProviderAuthorityWorkerCohortManifestV1 |
+                     authority.ProviderAuthorityWorkerCohortManifestV2, ...]]:
+        """Read, dispatch, and exactly decode every live manifest once.
+
+        Empty inventory retains the frozen V1 disable path.  A nonempty
+        inventory is descriptor-read once, parsed once, required to carry one
+        uniform exact numeric version, and decoded under only that contract.
+        This makes version selection and the bytes sent to the durable fence
+        one operation rather than two individually safe reads with a TOCTOU
+        gap between them.
+        """
+
+        if not self.live_manifest_files:
+            return 1, ()
+        loaded = []
+        versions = []
+        for manifest_file in self.live_manifest_files:
+            contents = _read_release_manifest(manifest_file.path)
+            try:
+                value = json.loads(contents)
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise ValueError(
+                    'Authority release manifest is invalid JSON.') from e
+            if type(value) is not dict:
+                raise ValueError(
+                    'Authority release manifest must be an exact object.')
+            version = value.get('version')
+            if type(version) is not int or version not in (1, 2):
+                raise ValueError(
+                    'Authority release manifest version must be integer 1 or 2.'
+                )
+            versions.append(version)
+            loaded.append((manifest_file, contents, value))
+        if len(set(versions)) != 1:
+            raise ValueError(
+                'Authority release live inventory mixes manifest versions.')
+        manifest_version = versions[0]
+        manifests: list[actions.ProviderAuthorityWorkerCohortManifestV1 |
+                        authority.ProviderAuthorityWorkerCohortManifestV2] = []
+        for manifest_file, contents, value in loaded:
+            try:
+                manifest: (actions.ProviderAuthorityWorkerCohortManifestV1 |
+                           authority.ProviderAuthorityWorkerCohortManifestV2)
+                if manifest_version == 1:
+                    manifest = (actions.ProviderAuthorityWorkerCohortManifestV1.
+                                from_value(value))
+                else:
+                    manifest = (
+                        authority.ProviderAuthorityWorkerCohortManifestV2.
+                        from_value(value))
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    'Authority release manifest is invalid JSON.') from e
+            release_inputs = manifest.pod_template_binding.release_inputs
+            if (manifest.canonical_bytes != contents or
+                    manifest.namespace != self.namespace or
+                    release_inputs.helm_full_name != self.helm_full_name or
+                    release_inputs.cohort_suffix
+                    != manifest_file.cohort_suffix):
+                raise ValueError(
+                    'Authority release manifest differs from its Helm fence.')
+            manifests.append(manifest)
+        return manifest_version, tuple(manifests)
+
     @classmethod
     def from_environment(
         cls,
@@ -325,6 +465,19 @@ class AuthorityWorkerReleasePreflight:
 def is_configured(environ: Mapping[str, str] | None = None) -> bool:
     source = os.environ if environ is None else environ
     return INSTALLATION_ID_ENV_VAR in source
+
+
+def is_retirement_verifier_enabled(
+        environ: Mapping[str, str] | None = None) -> bool:
+    """Return the chart-owned retirement-only verifier activation state."""
+    source = os.environ if environ is None else environ
+    configured = source.get(RETIREMENT_VERIFIER_ENABLED_ENV_VAR)
+    if configured is None:
+        return False
+    if type(configured) is str and configured == 'true':
+        return True
+    raise ValueError(f'{RETIREMENT_VERIFIER_ENABLED_ENV_VAR} must be exactly '
+                     '"true" when present.')
 
 
 class AuthorityWorkerRetirementStore(Protocol):
@@ -361,6 +514,16 @@ class AuthorityWorkerRetirementStore(Protocol):
     ) -> resource_action_state.WorkerCohortTransition:
         ...
 
+    def authorize_accepted_v1_worker_cohort_removal(
+        self,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_state: actions.WorkerCohortLifecycleState,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+    ) -> resource_action_state.WorkerCohortTransition:
+        ...
+
     def retire_worker_cohort(
         self,
         cohort_identity: actions.WorkerCohortIdentityV1,
@@ -374,10 +537,57 @@ class AuthorityWorkerRetirementStore(Protocol):
         ...
 
 
+class AuthorityWorkerReleaseStoreV2(Protocol):
+    """Additive Serve035 release-ledger surface for exact V2 manifests."""
+
+    def preflight_authority_release_v2(
+        self,
+        namespace: str,
+        helm_release_name: str,
+        helm_full_name: str,
+        installation_id: str,
+        enabled: bool,
+        live_manifests: tuple[authority.ProviderAuthorityWorkerCohortManifestV2,
+                              ...],
+        tombstone_suffixes: tuple[str, ...],
+    ) -> authority_state.AuthorityReleaseLedgerRecord:
+        ...
+
+
 def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _require_record_scope(
+    scope: AuthorityWorkerRetirementScope,
+    record: resource_action_state.WorkerCohortRecord,
+) -> tuple[str, str]:
+    """Return one exact chart inventory class and cohort suffix."""
+    manifest = record.cohort_identity.manifest
+    release_inputs = manifest.pod_template_binding.release_inputs
+    parts = record.cohort_id.split(':')
+    if len(parts) != 4:
+        raise AuthorityWorkerRetirementInvariantViolation(
+            'Central cohort row has a malformed full identity.')
+    prefix, installation_id, scope_digest, suffix = parts
+    expected_digest = hashlib.sha256(
+        f'{scope.namespace}\n{scope.helm_full_name}\n{suffix}'.encode(
+        )).hexdigest()
+    if (prefix != 'ra' or installation_id != scope.installation_id or
+            scope_digest != expected_digest or
+            manifest.namespace != scope.namespace or
+            release_inputs.helm_full_name != scope.helm_full_name or
+            release_inputs.cohort_suffix != suffix):
+        raise AuthorityWorkerRetirementInvariantViolation(
+            'Central cohort row is outside the API release scope.')
+    if suffix in scope.cohort_suffixes:
+        return 'live', suffix
+    if suffix in scope.retirement_tombstones:
+        return 'tombstone', suffix
+    raise AuthorityWorkerRetirementInvariantViolation(
+        'Central cohort row is absent from the chart-fixed inventory.')
 
 
 class ExactAuthorityWorkerTombstoneObserver:
@@ -437,6 +647,52 @@ class AuthorityWorkerRetirementPass:
     retired: int
 
 
+@dataclasses.dataclass(frozen=True)
+class AuthorityWorkerAcceptedV1CleanupPass:
+    """One bounded accepted-V1 no-DDL cleanup result."""
+
+    scanned: int
+    authorized: int
+
+
+class AuthorityWorkerAcceptedV1Cleanup:
+    """Consume every chart-deselected accepted V1 cohort at exact Serve034."""
+
+    def __init__(self, scope: AuthorityWorkerAcceptedV1CleanupScope,
+                 store: AuthorityWorkerRetirementStore) -> None:
+        if type(scope) is not AuthorityWorkerAcceptedV1CleanupScope:
+            raise TypeError('Accepted-V1 cleanup scope is invalid.')
+        self._scope = scope
+        self._store = store
+
+    def run_once(self) -> AuthorityWorkerAcceptedV1CleanupPass:
+        release_scope = self._scope.retirement_scope
+        records = self._store.list_worker_cohorts_for_installation(
+            release_scope.installation_id,
+            _ACCEPTED_V1_CLEANUP_SCAN_STATES,
+            limit=256)
+        authorized = 0
+        for record in records:
+            inventory, suffix = _require_record_scope(release_scope, record)
+            if (inventory != 'live' or
+                    suffix not in self._scope.deselected_cohort_suffixes):
+                raise AuthorityWorkerRetirementInvariantViolation(
+                    'Accepted-V1 cleanup found a nonterminal cohort without '
+                    'an exact live deselection fence.')
+            transition = (
+                self._store.authorize_accepted_v1_worker_cohort_removal(
+                    record.cohort_identity, record.revision,
+                    record.lifecycle_state, record.registration_attestations))
+            if transition.record.lifecycle_state is not (
+                    actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED):
+                raise AuthorityWorkerRetirementInvariantViolation(
+                    'Accepted-V1 cleanup returned an unexpected lifecycle '
+                    'state.')
+            authorized += int(not transition.adopted)
+        return AuthorityWorkerAcceptedV1CleanupPass(scanned=len(records),
+                                                    authorized=authorized)
+
+
 class AuthorityWorkerRetirementVerifier:
     """Apply the two fenced retirement stages for one exact installation."""
 
@@ -451,29 +707,8 @@ class AuthorityWorkerRetirementVerifier:
         self,
         record: resource_action_state.WorkerCohortRecord,
     ) -> str:
-        manifest = record.cohort_identity.manifest
-        release_inputs = manifest.pod_template_binding.release_inputs
-        parts = record.cohort_id.split(':')
-        if len(parts) != 4:
-            raise AuthorityWorkerRetirementInvariantViolation(
-                'Central cohort row has a malformed full identity.')
-        prefix, installation_id, scope_digest, suffix = parts
-        expected_digest = hashlib.sha256(
-            f'{self._scope.namespace}\n{self._scope.helm_full_name}\n{suffix}'.
-            encode()).hexdigest()
-        if (prefix != 'ra' or installation_id != self._scope.installation_id or
-                scope_digest != expected_digest or
-                manifest.namespace != self._scope.namespace or
-                release_inputs.helm_full_name != self._scope.helm_full_name or
-                release_inputs.cohort_suffix != suffix):
-            raise AuthorityWorkerRetirementInvariantViolation(
-                'Central cohort row is outside the API release scope.')
-        if suffix in self._scope.cohort_suffixes:
-            return 'live'
-        if suffix in self._scope.retirement_tombstones:
-            return 'tombstone'
-        raise AuthorityWorkerRetirementInvariantViolation(
-            'Central cohort row is absent from the chart-fixed inventory.')
+        inventory, _ = _require_record_scope(self._scope, record)
+        return inventory
 
     def run_once(self) -> AuthorityWorkerRetirementPass:
         records = self._store.list_worker_cohorts_for_installation(
@@ -547,16 +782,34 @@ class AuthorityWorkerRetirementVerifier:
 def validate_release_preflight(
     preflight: AuthorityWorkerReleasePreflight,
     store: AuthorityWorkerRetirementStore | None = None,
-) -> resource_action_state.AuthorityReleaseRecord | None:
+    store_v2: AuthorityWorkerReleaseStoreV2 | None = None,
+) -> (resource_action_state.AuthorityReleaseRecord |
+      authority_state.AuthorityReleaseLedgerRecord | None):
     """Reject an unsafe Helm inventory before its objects can be applied."""
     if type(preflight) is not AuthorityWorkerReleasePreflight:
         raise TypeError('preflight has an invalid type.')
+    manifest_version, live_manifests = (
+        preflight.load_versioned_live_manifests())
+    if manifest_version == 2:
+        if store_v2 is None:
+            store_v2 = authority_state.ServeResourceActionAuthorityStore(
+                serve_state_schema.get_database_engine())
+        live_manifests_v2 = cast(
+            tuple[authority.ProviderAuthorityWorkerCohortManifestV2, ...],
+            live_manifests)
+        return store_v2.preflight_authority_release_v2(
+            preflight.namespace, preflight.helm_release_name,
+            preflight.helm_full_name, preflight.installation_id,
+            preflight.enabled, live_manifests_v2, preflight.tombstone_suffixes)
     if store is None:
         store = resource_action_state.PostgresServeResourceActionStateStore()
+    live_manifests_v1 = cast(
+        tuple[actions.ProviderAuthorityWorkerCohortManifestV1, ...],
+        live_manifests)
     return store.preflight_authority_release(
         preflight.namespace, preflight.helm_release_name,
         preflight.helm_full_name, preflight.installation_id, preflight.enabled,
-        preflight.load_live_manifests(), preflight.tombstone_suffixes)
+        live_manifests_v1, preflight.tombstone_suffixes)
 
 
 def build_default_verifier(
@@ -574,6 +827,30 @@ def build_default_verifier(
     return AuthorityWorkerRetirementVerifier(
         scope, resource_action_state.PostgresServeResourceActionStateStore(),
         observer)
+
+
+def run_accepted_v1_cleanup_from_environment(
+    environ: Mapping[str, str] | None = None,
+    store: AuthorityWorkerRetirementStore | None = None,
+) -> AuthorityWorkerAcceptedV1CleanupPass:
+    """Run the isolated pre-035 bridge without starting any server runtime."""
+    scope = AuthorityWorkerAcceptedV1CleanupScope.from_environment(environ)
+    if store is None:
+        # Do not initialize the normal Serve DatabaseManager here: in the M4
+        # image its target is already 035, while this one-shot bridge must run
+        # against actual 034 without executing or requiring any DDL.
+        engine = db_utils.get_engine('serve/accepted-v1-cleanup',
+                                     engine_namespace='other')
+        store = resource_action_state.PostgresServeResourceActionStateStore(
+            engine)
+    return AuthorityWorkerAcceptedV1Cleanup(scope, store).run_once()
+
+
+def accepted_v1_cleanup_main() -> None:
+    """Strict ``python -m`` entrypoint for the chart's blocking cleanup hook."""
+    result = run_accepted_v1_cleanup_from_environment()
+    logger.info('Accepted-V1 cleanup pass committed '
+                f'scanned={result.scanned} authorized={result.authorized}.')
 
 
 async def retirement_verifier_daemon() -> None:
@@ -596,6 +873,11 @@ async def retirement_verifier_daemon() -> None:
 
 
 __all__ = [
+    'ACCEPTED_V1_CLEANUP_DESELECTED_SUFFIXES_ENV_VAR',
+    'ACCEPTED_V1_CLEANUP_MODE_ENV_VAR',
+    'AuthorityWorkerAcceptedV1Cleanup',
+    'AuthorityWorkerAcceptedV1CleanupPass',
+    'AuthorityWorkerAcceptedV1CleanupScope',
     'AuthorityWorkerRetirementInvariantViolation',
     'AuthorityWorkerRetirementPass',
     'AuthorityWorkerReleasePreflight',
@@ -606,9 +888,15 @@ __all__ = [
     'ExactAuthorityWorkerTombstoneObserver',
     'INSTALLATION_ID_ENV_VAR',
     'RETIREMENT_TOMBSTONES_ENV_VAR',
+    'RETIREMENT_VERIFIER_ENABLED_ENV_VAR',
     'RELEASE_PREFLIGHT_ENV_VAR',
     'build_default_verifier',
     'is_configured',
+    'is_retirement_verifier_enabled',
+    'run_accepted_v1_cleanup_from_environment',
     'retirement_verifier_daemon',
     'validate_release_preflight',
 ]
+
+if __name__ == '__main__':
+    accepted_v1_cleanup_main()

@@ -111,9 +111,130 @@ tests:
       - failedTemplate:
           errorMessage: resourceActions.authorityWorker.auth and serve.externalLoadBalancer.auth.lbDataPlane must reference different Secret keys
 
-  - it: should require the exact qualification bytes to be chart-packaged
+  - it: should reject reused old V1 cohort values outside explicit deselect
     values:
       - fixtures/resource-action-authority-values.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: manifestContract
+
+  - it: should reject a null V2 manifest contract
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.cohorts:
+        - &complete_cohort
+          id: p2a-v1
+          manifestContract: null
+          replicas: 2
+          image: registry.example/authority@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          imagePullPolicy: Always
+          ociConfigDigest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+          qualificationArtifact:
+            repoPath: charts/skypilot/files/resource-action-qualifications/not-packaged.json
+            byteSize: 1
+            sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          podTemplateContract:
+            repoPath: sky/serve/resource_action_provider_preflight.py
+            byteSize: 1
+            sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          artifactInventory:
+            repoPath: sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json
+            byteSize: 1
+            sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          callableInventory:
+            repoPath: sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json
+            byteSize: 1
+            sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    asserts:
+      - failedTemplate:
+          errorPattern: manifestContract
+
+  - it: should reject numeric one as a manifest contract
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.cohorts:
+        - <<: *complete_cohort
+          manifestContract: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: manifestContract
+
+  - it: should reject numeric two as a manifest contract
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.cohorts:
+        - <<: *complete_cohort
+          manifestContract: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: manifestContract
+
+  - it: should reject numeric two point zero as a manifest contract
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.cohorts:
+        - <<: *complete_cohort
+          manifestContract: 2.0
+    asserts:
+      - failedTemplate:
+          errorPattern: manifestContract
+
+  - it: should reject string two as a manifest contract
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.cohorts:
+        - <<: *complete_cohort
+          manifestContract: "2"
+    asserts:
+      - failedTemplate:
+          errorPattern: manifestContract
+
+  - it: should reject an arbitrary manifest contract
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.cohorts:
+        - <<: *complete_cohort
+          manifestContract: arbitrary
+    asserts:
+      - failedTemplate:
+          errorPattern: manifestContract
+
+  - it: should preserve the old absent contract shape during explicit deselect
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: deselect
+      resourceActions.authorityWorker.activeCohort: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: 'resourceActions.authorityWorker cohort "p2a-v1" qualification artifact is not packaged by this chart'
+
+  - it: should reject every manifest contract during V1 deselect
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: deselect
+      resourceActions.authorityWorker.activeCohort: ""
+      resourceActions.authorityWorker.cohorts:
+        - <<: *complete_cohort
+          manifestContract: provider_authority_worker_cohort_v2
+    asserts:
+      - failedTemplate:
+          errorMessage: 'resourceActions.authorityWorker cohort "p2a-v1" manifestContract must be absent during authority V1 deselect'
+
+  - it: should require exact qualification bytes for a V2 cohort
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      resourceActions.authorityWorker.cohorts:
+        - <<: *complete_cohort
+          manifestContract: provider_authority_worker_cohort_v2
     asserts:
       - failedTemplate:
           errorMessage: 'resourceActions.authorityWorker cohort "p2a-v1" qualification artifact is not packaged by this chart'

@@ -47,6 +47,11 @@ _MAX_WORKER_REGISTRATION_AGE = datetime.timedelta(minutes=5)
 _MAX_PROMOTION_INVENTORY_DECISIONS = 10_000
 _MAX_PROMOTION_INVENTORY_ATTEMPTS_AND_LINKS = 100_000
 _MAX_AUTHORITY_RELEASE_COHORTS = 256
+_ACCEPTED_V1_CLEANUP_SCHEMA_HEADS = (
+    ('api_requests_db', 'alembic_version_api_requests_db', '008'),
+    ('serve_db', 'alembic_version_serve_state_db', '037'),
+    ('state_db', 'alembic_version_state_db', '028'),
+)
 
 
 def _profile_is_authoritative(
@@ -439,9 +444,9 @@ class ActivationGateEvidenceV1:
         if self.api_schema_revision not in ('005', '007', '008'):
             raise ValueError('activation requires API schema revision 005 or '
                              'a 007-compatible revision (007 or 008).')
-        if self.serve_schema_revision not in ('035', '036', '037'):
-            raise ValueError(
-                'activation requires Serve schema revision 035, 036, or 037.')
+        if self.serve_schema_revision not in ('035', '036', '037', '038'):
+            raise ValueError('activation requires Serve schema revision 035, '
+                             '036, 037, or 038.')
         if self.global_user_state_schema_revision != '028':
             raise ValueError('activation requires global-user-state schema '
                              'revision 028.')
@@ -2174,10 +2179,19 @@ class PostgresServeResourceActionStateStore:
             'lifecycle_state': target_state.value,
             'revision': current.revision + 1,
         }
+        operation_time: datetime.datetime | None = None
+        if change_lifecycle_timestamp or retire:
+            operation_time = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.greatest(
+                        sqlalchemy.func.clock_timestamp(),
+                        current.state_changed_at))).scalar_one()
         if change_lifecycle_timestamp:
-            values['state_changed_at'] = sqlalchemy.func.clock_timestamp()
+            assert operation_time is not None
+            values['state_changed_at'] = operation_time
         if retire:
-            values['retired_at'] = sqlalchemy.func.clock_timestamp()
+            assert operation_time is not None
+            values['retired_at'] = operation_time
         table = state_schema.WORKER_COHORTS
         updated = session.execute(
             sqlalchemy.update(table).where(
@@ -2453,10 +2467,39 @@ class PostgresServeResourceActionStateStore:
     def _scan_has_row(session: orm.Session, statement: Any) -> bool:
         return session.execute(statement.limit(1)).first() is not None
 
+    @staticmethod
+    def _require_accepted_v1_cleanup_schema_heads(session: orm.Session) -> None:
+        """Fence migrations and prove the exact no-DDL cleanup baseline."""
+        for section, _, _ in _ACCEPTED_V1_CLEANUP_SCHEMA_HEADS:
+            session.execute(
+                sqlalchemy.text(
+                    'SELECT pg_advisory_xact_lock(hashtext(:lock_name))'),
+                {'lock_name': f'skypilot:alembic:{section}'})
+        for section, version_table, required_revision in (
+                _ACCEPTED_V1_CLEANUP_SCHEMA_HEADS):
+            try:
+                revisions = tuple(
+                    session.execute(
+                        sqlalchemy.text(
+                            f'SELECT version_num FROM {version_table} '
+                            'ORDER BY version_num')).scalars().all())
+            except sqlalchemy.exc.SQLAlchemyError as e:
+                raise kernel_actions.InvariantViolation(
+                    'Accepted-V1 cleanup cannot prove the exact '
+                    f'{section} schema head.') from e
+            if revisions != (required_revision,):
+                observed = ','.join(
+                    str(value) for value in revisions) or 'uninitialized'
+                raise kernel_actions.InvariantViolation(
+                    'Accepted-V1 cleanup requires exact schema head '
+                    f'{section}={required_revision}; observed {observed}.')
+
     def _worker_cohort_dependency_names_in_session(
         self,
         session: orm.Session,
         cohort: WorkerCohortRecord,
+        *,
+        lock_references: bool = False,
     ) -> tuple[str, ...]:
         """Read every possible carrier before aborting REGISTERING.
 
@@ -2477,9 +2520,12 @@ class PostgresServeResourceActionStateStore:
         queue = request_postgres.QUEUE
         action_table = request_postgres.RESOURCE_ACTIONS
         action_attempts = request_postgres.RESOURCE_ACTION_ATTEMPTS
+        reference_scan = sqlalchemy.select(refs.c.decision_id).where(
+            refs.c.cohort_id == cohort_id).order_by(refs.c.decision_id)
+        if lock_references:
+            reference_scan = reference_scan.with_for_update()
         scans = (
-            ('cohort references', sqlalchemy.select(
-                refs.c.decision_id).where(refs.c.cohort_id == cohort_id)),
+            ('cohort references', reference_scan),
             ('shadow coverage',
              sqlalchemy.select(coverage.c.decision_id).select_from(
                  coverage.join(
@@ -2531,6 +2577,109 @@ class PostgresServeResourceActionStateStore:
         )
         return tuple(name for name, statement in scans
                      if self._scan_has_row(session, statement))
+
+    def authorize_accepted_v1_worker_cohort_removal_in_session(
+        self,
+        session: orm.Session,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_state: actions.WorkerCohortLifecycleState,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+    ) -> WorkerCohortTransition:
+        """Retire a deselected accepted V1 cohort on the exact 034 baseline.
+
+        The cleanup-only caller supplies the chart's deselection fence.  This
+        transaction independently fences all three old schema heads, locks the
+        cohort before its references, proves the exhaustive carrier inventory
+        empty, and commits the two missing old-schema lifecycle edges.  It
+        intentionally neither changes the frozen V1 registration bytes nor
+        performs Kubernetes deletion; the existing tombstone verifier owns the
+        later exact-NotFound ``RETIRED`` edge.
+        """
+        self._require_session(session)
+        if type(cohort_identity) is not actions.WorkerCohortIdentityV1:
+            raise TypeError('cohort_identity has an invalid type.')
+        expected_revision = _positive_integer(expected_revision,
+                                              name='expected_revision')
+        state = (expected_state
+                 if type(expected_state) is actions.WorkerCohortLifecycleState
+                 else actions.WorkerCohortLifecycleState(expected_state))
+        if state not in (actions.WorkerCohortLifecycleState.ACCEPTING,
+                         actions.WorkerCohortLifecycleState.DRAINING):
+            raise ValueError('Accepted-V1 cleanup requires ACCEPTING or '
+                             'DRAINING input.')
+        if (type(expected_registration_attestations)
+                is not actions.WorkerCohortRegistrationSetV1):
+            raise TypeError('expected registrations have an invalid type.')
+        expected_registration_attestations.validate_for_cohort(cohort_identity,
+                                                               require_two=True)
+
+        self._require_accepted_v1_cleanup_schema_heads(session)
+        row = self._locked_worker_cohort(session, cohort_identity.cohort_id)
+        if row is None:
+            raise kernel_actions.InvariantViolation(
+                f'Unknown worker cohort {cohort_identity.cohort_id!r}.')
+        current = _worker_cohort_record(row)
+        exact_identity = (current.cohort_identity.canonical_bytes ==
+                          cohort_identity.canonical_bytes)
+        exact_registration = (
+            current.registration_attestations.canonical_bytes ==
+            expected_registration_attestations.canonical_bytes)
+        edge_count = (2 if state is actions.WorkerCohortLifecycleState.ACCEPTING
+                      else 1)
+        if (current.lifecycle_state
+                is actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED and
+                current.revision == expected_revision + edge_count and
+                exact_identity and exact_registration):
+            return WorkerCohortTransition(current, adopted=True)
+
+        lost_first_edge = (state is actions.WorkerCohortLifecycleState.ACCEPTING
+                           and current.lifecycle_state
+                           is actions.WorkerCohortLifecycleState.DRAINING and
+                           current.revision == expected_revision + 1 and
+                           exact_identity and exact_registration)
+        exact_predecessor = (current.lifecycle_state is state and
+                             current.revision == expected_revision and
+                             exact_identity and exact_registration)
+        if not exact_predecessor and not lost_first_edge:
+            raise kernel_actions.StaleRevision(
+                'Accepted-V1 cleanup predecessor changed.')
+
+        dependencies = self._worker_cohort_dependency_names_in_session(
+            session, current, lock_references=True)
+        if dependencies:
+            raise kernel_actions.ActionConflict(
+                'Accepted-V1 cleanup is retained by: ' +
+                ', '.join(dependencies) + '.')
+        if current.lifecycle_state is (
+                actions.WorkerCohortLifecycleState.ACCEPTING):
+            current = self._write_worker_cohort_registration_state(
+                session,
+                current,
+                current.registration_attestations,
+                actions.WorkerCohortLifecycleState.DRAINING,
+                change_lifecycle_timestamp=True)
+        record = self._write_worker_cohort_registration_state(
+            session,
+            current,
+            current.registration_attestations,
+            actions.WorkerCohortLifecycleState.REMOVAL_AUTHORIZED,
+            change_lifecycle_timestamp=True)
+        return WorkerCohortTransition(record)
+
+    def authorize_accepted_v1_worker_cohort_removal(
+        self,
+        cohort_identity: actions.WorkerCohortIdentityV1,
+        expected_revision: int,
+        expected_state: actions.WorkerCohortLifecycleState,
+        expected_registration_attestations: actions.
+        WorkerCohortRegistrationSetV1,
+    ) -> WorkerCohortTransition:
+        with orm.Session(self._database()) as session, session.begin():
+            return self.authorize_accepted_v1_worker_cohort_removal_in_session(
+                session, cohort_identity, expected_revision, expected_state,
+                expected_registration_attestations)
 
     def authorize_stale_worker_cohort_removal_in_session(
         self,

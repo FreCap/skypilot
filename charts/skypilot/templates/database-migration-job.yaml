@@ -1,4 +1,16 @@
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
+{{- $authorityV1RetirementPhase := .Values.databaseMigration.authorityV1RetirementPhase | default "none" -}}
+{{- if not (has $authorityV1RetirementPhase (list "none" "deselect" "tombstone")) -}}
+{{- fail "databaseMigration.authorityV1RetirementPhase must be one of none, deselect, or tombstone" -}}
+{{- end -}}
+{{- if ne $authorityV1RetirementPhase "none" -}}
+{{- if not .Values.databaseMigration.enabled -}}
+{{- fail "authority V1 retirement phases require databaseMigration.enabled=true" -}}
+{{- end -}}
+{{- if not $databaseConfigured -}}
+{{- fail "authority V1 retirement phases require a configured external PostgreSQL database" -}}
+{{- end -}}
+{{- end -}}
 {{- if and $databaseConfigured .Values.databaseMigration.enabled }}
 {{- $haEnabled := .Values.apiService.highAvailability.enabled -}}
 {{- $guardedPostgresHook := and (eq .Values.requestStore.backend "postgres") (not (empty .Values.apiService.dbConnectionSecretName)) -}}
@@ -16,9 +28,12 @@
 {{- end -}}
 {{- end -}}
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $authorityV1Deselect := eq $authorityV1RetirementPhase "deselect" -}}
+{{- $authorityV1Tombstone := eq $authorityV1RetirementPhase "tombstone" -}}
 {{- $authorityWorker := get (.Values.resourceActions | default (dict)) "authorityWorker" | default (dict) -}}
 {{- $authorityEnabled := get $authorityWorker "enabled" | default false -}}
 {{- $authorityInstallationId := get $authorityWorker "installationId" | default "" -}}
+{{- $authorityActiveCohort := get $authorityWorker "activeCohort" | default "" -}}
 {{- $authorityCohorts := get $authorityWorker "cohorts" | default (list) -}}
 {{- $authorityTombstones := get $authorityWorker "retirementTombstones" | default (list) -}}
 {{- $authorityCohortSuffixes := list -}}
@@ -35,6 +50,32 @@
 {{- $authorityLiveManifestFiles = append $authorityLiveManifestFiles (dict "cohort_suffix" $cohortSuffix "path" $manifestPath) -}}
 {{- end -}}
 {{- end -}}
+{{- if or $authorityV1Deselect $authorityV1Tombstone -}}
+{{- if not .Release.IsUpgrade -}}
+{{- fail "authority V1 retirement phases are valid only during Helm upgrade" -}}
+{{- end -}}
+{{- if not $guardedPostgresHook -}}
+{{- fail "authority V1 retirement phases require PostgreSQL and a pre-existing apiService.dbConnectionSecretName" -}}
+{{- end -}}
+{{- if .Values.databaseMigration.bootstrapFreshSchema -}}
+{{- fail "authority V1 retirement phases forbid databaseMigration.bootstrapFreshSchema" -}}
+{{- end -}}
+{{- if not $authorityEnabled -}}
+{{- fail "authority V1 retirement phases require resourceActions.authorityWorker.enabled=true" -}}
+{{- end -}}
+{{- if not (empty $authorityActiveCohort) -}}
+{{- fail "authority V1 retirement phases require resourceActions.authorityWorker.activeCohort to be empty" -}}
+{{- end -}}
+{{- if and $authorityV1Deselect (eq (len $authorityCohortSuffixes) 0) -}}
+{{- fail "authority V1 deselect requires at least one live authority cohort" -}}
+{{- end -}}
+{{- if and $authorityV1Tombstone (gt (len $authorityCohortSuffixes) 0) -}}
+{{- fail "authority V1 tombstone requires the live cohort inventory to be empty" -}}
+{{- end -}}
+{{- if and $authorityV1Tombstone (eq (len $authorityTombstoneSuffixes) 0) -}}
+{{- fail "authority V1 tombstone requires at least one retirement tombstone" -}}
+{{- end -}}
+{{- end -}}
 {{- $proposedInstallationId := ternary $authorityInstallationId "" $authorityEnabled -}}
 {{- $authorityReleasePreflight := dict "enabled" $authorityEnabled "helm_full_name" $fullName "helm_release_name" .Release.Name "installation_id" $proposedInstallationId "live_manifest_files" $authorityLiveManifestFiles "namespace" .Release.Namespace "tombstone_suffixes" $authorityTombstoneSuffixes "version" 1 -}}
 {{- $reservedVolumeNames := list -}}
@@ -43,7 +84,7 @@
 {{- $reservedVolumeNames = append $reservedVolumeNames (printf "authority-preflight-%d" $index) -}}
 {{- $reservedMountPaths = append $reservedMountPaths (get $manifestFile "path") -}}
 {{- end -}}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "IS_SKYPILOT_SERVER" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedVolumeNames" $reservedVolumeNames "reservedMountPaths" $reservedMountPaths) }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "IS_SKYPILOT_SERVER" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_RELEASE_NAME" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACCEPTED_V1_CLEANUP_ONLY" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_DESELECTED_SUFFIXES_JSON" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedVolumeNames" $reservedVolumeNames "reservedMountPaths" $reservedMountPaths) }}
 {{- $migrationSuffix := printf "-db-migration-%d" .Release.Revision -}}
 {{- $migrationBaseLength := sub 63 (len $migrationSuffix) | int -}}
 {{- $migrationName := printf "%s%s" ($fullName | trunc $migrationBaseLength | trimSuffix "-") $migrationSuffix -}}
@@ -62,7 +103,11 @@ metadata:
     {{- with .Values.databaseMigration.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-    {{- if $guardedPostgresHook }}
+    {{- if $authorityV1Deselect }}
+    helm.sh/hook: post-upgrade
+    helm.sh/hook-weight: "10"
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- else if $guardedPostgresHook }}
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
     helm.sh/hook-delete-policy: before-hook-creation
@@ -99,7 +144,11 @@ spec:
         securityContext:
           {{- toYaml . | nindent 10 }}
         {{- end }}
+        {{- if $authorityV1Deselect }}
+        command: ["python", "-m", "sky.server.requests.authority_worker_retirement"]
+        {{- else }}
         command: ["python", "-m", "sky.server.database_migrations"]
+        {{- end }}
         resources:
           {{- toYaml .Values.databaseMigration.resources | nindent 10 }}
         env:
@@ -114,8 +163,29 @@ spec:
         - name: SKYPILOT_API_REQUEST_BACKEND
           value: {{ .Values.requestStore.backend | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
-          value: {{ ternary "bootstrap" "upgrade" .Values.databaseMigration.bootstrapFreshSchema }}
-        {{- if $guardedPostgresHook }}
+          value: {{ ternary "verify" (ternary "bootstrap" "upgrade" .Values.databaseMigration.bootstrapFreshSchema) $authorityV1Deselect | quote }}
+        {{- if or $authorityV1Deselect $authorityV1Tombstone }}
+        - name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+          value: "037"
+        {{- end }}
+        {{- if $authorityV1Deselect }}
+        - name: SKYPILOT_API_SERVER_ROLE
+          value: "api"
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACCEPTED_V1_CLEANUP_ONLY
+          value: "true"
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
+          value: {{ $authorityInstallationId | quote }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+          value: {{ toRawJson $authorityCohortSuffixes | quote }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_DESELECTED_SUFFIXES_JSON
+          value: {{ toRawJson $authorityCohortSuffixes | quote }}
+        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
+          value: {{ toRawJson $authorityTombstoneSuffixes | quote }}
+        - name: SKYPILOT_POD_NAMESPACE
+          value: {{ .Release.Namespace | quote }}
+        - name: SKYPILOT_RELEASE_NAME
+          value: {{ $fullName | quote }}
+        {{- else if $guardedPostgresHook }}
         - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON
           value: {{ toRawJson $authorityReleasePreflight | quote }}
         {{- end }}

@@ -13,6 +13,7 @@ import serve_resource_action_test_fixtures as authority_fixtures
 import test_serve_resource_action_down_execution_config as down_fixtures
 import test_serve_resource_action_launch_execution_config as launch_fixtures
 
+from sky.serve import resource_action_authority as authority
 from sky.serve import resource_action_provider_preflight as preflight
 from sky.serve import resource_actions as actions
 from sky.server.requests import registry as request_registry
@@ -321,20 +322,26 @@ def _mutate_callable_field(value: dict, field: str) -> None:
         'cancellation_policy': lambda: row.update(
             {'cancellation_policy': 'cooperative'}),
         'aliases': lambda: row.update({'aliases': ['old-name']}),
-        'encoder.mode': lambda: row['result_codec']['encoder'].update(
-            {'mode': 'registered'}),
+        'encoder.mode': lambda: row['result_codec']['encoder'].update({
+            'mode': ('default' if row['result_codec']['encoder']['mode'] ==
+                     'registered' else 'registered')
+        }),
         'encoder.module': lambda: row['result_codec']['encoder'].update(
             {'module': 'crossed.encoder'}),
         'encoder.qualname': lambda: row['result_codec']['encoder'].update(
             {'qualname': 'crossed'}),
-        'decoder.mode': lambda: row['result_codec']['decoder'].update(
-            {'mode': 'registered'}),
+        'decoder.mode': lambda: row['result_codec']['decoder'].update({
+            'mode': ('default' if row['result_codec']['decoder']['mode'] ==
+                     'registered' else 'registered')
+        }),
         'decoder.module': lambda: row['result_codec']['decoder'].update(
             {'module': 'crossed.decoder'}),
         'decoder.qualname': lambda: row['result_codec']['decoder'].update(
             {'qualname': 'crossed'}),
-        'strict_return_value': lambda: row['result_codec'].update(
-            {'strict_return_value': True}),
+        'strict_return_value': lambda: row['result_codec'].update({
+            'strict_return_value': not row['result_codec']['strict_return_value'
+                                                          ]
+        }),
     }
     mutations[field]()
 
@@ -405,8 +412,9 @@ def test_callable_inventory_rejects_extra_runtime_authority_handler(
         preflight.project_provider_authority_worker_callable_inventory_v1()
 
 
+@pytest.mark.parametrize('manifest_version', (1, 2))
 def test_static_loader_validates_complete_installed_graph(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch, manifest_version: int) -> None:
     source_path = pathlib.Path(
         'sky/serve/resource_action_provider_preflight.py')
     manifest = authority_fixtures.authority_manifest_value()
@@ -434,19 +442,50 @@ def test_static_loader_validates_complete_installed_graph(
         qualification)
     manifest['image']['qualification_artifact']['sha256'] = hashlib.sha256(
         qualification).hexdigest()
-    typed = actions.ProviderAuthorityWorkerCohortManifestV1.from_value(manifest)
+    if manifest_version == 1:
+        typed = actions.ProviderAuthorityWorkerCohortManifestV1.from_value(
+            manifest)
+    else:
+        manifest['version'] = 2
+        manifest['claim_contract'] = 'frozen_action_cohort_join_v2'
+        typed = authority.ProviderAuthorityWorkerCohortManifestV2.from_value(
+            manifest)
     fixed_contents = {
         preflight._MANIFEST_PATH: typed.canonical_bytes,
         preflight._QUALIFICATION_PATH: qualification,
     }
+    reads: dict[str, int] = {}
 
     def _read(path: str, *, name: str, maximum_bytes: int) -> bytes:
         del name
+        reads[path] = reads.get(path, 0) + 1
         contents = fixed_contents[path]
         assert len(contents) <= maximum_bytes
         return contents
 
     monkeypatch.setattr(preflight, '_read_fixed_regular_file', _read)
     monkeypatch.setattr(preflight.sky, '__commit__', source_commit)
-    loaded = preflight.load_provider_authority_worker_static_evidence_v1()
+    loaded = preflight.load_provider_authority_worker_static_evidence()
+    assert type(loaded) is type(typed)
     assert loaded.canonical_bytes == typed.canonical_bytes
+    assert reads[preflight._MANIFEST_PATH] == 1
+
+
+@pytest.mark.parametrize('invalid_version', (True, 2.0, 3, '2'))
+def test_static_loader_dispatch_rejects_nonexact_manifest_version(
+        monkeypatch: pytest.MonkeyPatch, invalid_version: object) -> None:
+    value = authority_fixtures.authority_manifest_value()
+    value['version'] = invalid_version
+    contents = (json.dumps(value, sort_keys=True, separators=(
+        ',', ':')).encode('utf-8') if type(invalid_version) is float else
+                actions.canonical_json_bytes(value))
+
+    def _read(path: str, *, name: str, maximum_bytes: int) -> bytes:
+        del path, name
+        assert len(contents) <= maximum_bytes
+        return contents
+
+    monkeypatch.setattr(preflight, '_read_fixed_regular_file', _read)
+    with pytest.raises(preflight.ProviderAuthorityStaticEvidenceError,
+                       match='version|floating-point'):
+        preflight.load_provider_authority_worker_static_evidence()

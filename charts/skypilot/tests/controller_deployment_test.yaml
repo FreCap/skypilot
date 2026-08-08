@@ -279,6 +279,33 @@ tests:
           content:
             name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
 
+  - it: should suppress private authority and hold Serve037 during V1 deselect
+    release:
+      upgrade: true
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: deselect
+      resourceActions.authorityWorker.activeCohort: ""
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+            value: "037"
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-resource-action-authority-manifest
+
   - it: should reserve the authority purpose env while enabled
     values:
       - fixtures/resource-action-authority-values.yaml

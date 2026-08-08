@@ -1,6 +1,8 @@
 {{- $resourceActions := .Values.resourceActions | default (dict) -}}
 {{- $authority := get $resourceActions "authorityWorker" | default (dict) -}}
 {{- if (get $authority "enabled") -}}
+{{- $authorityV1RetirementPhase := .Values.databaseMigration.authorityV1RetirementPhase | default "none" -}}
+{{- $authorityV1Deselect := eq $authorityV1RetirementPhase "deselect" -}}
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $namespace := .Release.Namespace -}}
 {{- $releaseScopeLabel := trunc 63 (sha256sum (printf "%s\n%s" $namespace $fullName)) -}}
@@ -103,6 +105,13 @@
 {{- $name := printf "%s-authority-%s" $fullName $id -}}
 {{- if not (regexMatch "^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$" $id) -}}
 {{- fail (printf "resourceActions.authorityWorker cohort id %q must be a DNS label of at most 42 characters" $id) -}}
+{{- end -}}
+{{- $manifestContract := get $cohort "manifestContract" -}}
+{{- $hasManifestContract := hasKey $cohort "manifestContract" -}}
+{{- if and $authorityV1Deselect $hasManifestContract -}}
+{{- fail (printf "resourceActions.authorityWorker cohort %q manifestContract must be absent during authority V1 deselect" $id) -}}
+{{- else if and (not $authorityV1Deselect) (or (not $hasManifestContract) (not (kindIs "string" $manifestContract)) (ne $manifestContract "provider_authority_worker_cohort_v2")) -}}
+{{- fail (printf "resourceActions.authorityWorker cohort %q manifestContract must equal provider_authority_worker_cohort_v2" $id) -}}
 {{- end -}}
 {{- if or (gt (len $name) 63) (gt (len (printf "%s-manifest" $name)) 63) (gt (len (printf "%s-qualification" $name)) 63) -}}
 {{- fail (printf "resourceActions.authorityWorker cohort %q produces a resource name longer than 63 characters" $id) -}}
@@ -221,7 +230,9 @@
 {{- $activeMatches = add1 $activeMatches -}}
 {{- end -}}
 {{- end -}}
-{{- if and $hasCohorts (ne (int $activeMatches) 1) -}}
+{{- if and $authorityV1Deselect (not (empty $activeCohort)) -}}
+{{- fail "authority V1 deselect requires resourceActions.authorityWorker.activeCohort to be empty" -}}
+{{- else if and $hasCohorts (not $authorityV1Deselect) (ne (int $activeMatches) 1) -}}
 {{- fail "resourceActions.authorityWorker.activeCohort must name exactly one cohort" -}}
 {{- end -}}
 {{- $tombstoneIds := dict -}}
@@ -344,7 +355,13 @@
 {{- $expectedTemplateSha256 := sha256sum (toRawJson $placeholderTemplate) -}}
 {{- $podTemplateBinding := dict "version" 1 "contract" "authority_worker_pod_template_v1" "projector_artifact_sha256" (get $podTemplateContract "sha256") "release_inputs" $releaseInputs "expected_template_sha256" $expectedTemplateSha256 "manifest_hash_annotation_json_pointer" "/metadata/annotations/skypilot.co~1resource-action-manifest-sha256" "manifest_hash_placeholder" "$MANIFEST_SHA256" -}}
 {{- $imageQualification := dict "requested_reference" $image "oci_manifest_digest" $manifestDigest "oci_config_digest" (get $cohort "ociConfigDigest") "qualification_artifact" $qualificationArtifact -}}
-{{- $manifest := dict "version" 1 "cohort_id" $cohortId "namespace" $namespace "deployment_name" $name "service_account_name" $name "container_name" "skypilot-authority-worker" "image" $imageQualification "pod_template_contract" $podTemplateContract "pod_template_binding" $podTemplateBinding "artifact_inventory" $artifactInventory "callable_inventory" $callableInventory "claim_contract" "frozen_action_cohort_join_v1" "handler_allowlist" (list "serve_shadow_candidate_launch" "serve_shadow_candidate_down" "serve_resource_action_launch" "serve_resource_action_down") -}}
+{{- $renderedManifestVersion := 2 -}}
+{{- $claimContract := "frozen_action_cohort_join_v2" -}}
+{{- if $authorityV1Deselect -}}
+{{- $renderedManifestVersion = 1 -}}
+{{- $claimContract = "frozen_action_cohort_join_v1" -}}
+{{- end -}}
+{{- $manifest := dict "version" $renderedManifestVersion "cohort_id" $cohortId "namespace" $namespace "deployment_name" $name "service_account_name" $name "container_name" "skypilot-authority-worker" "image" $imageQualification "pod_template_contract" $podTemplateContract "pod_template_binding" $podTemplateBinding "artifact_inventory" $artifactInventory "callable_inventory" $callableInventory "claim_contract" $claimContract "handler_allowlist" (list "serve_shadow_candidate_launch" "serve_shadow_candidate_down" "serve_resource_action_launch" "serve_resource_action_down") -}}
 {{- $manifestJson := toRawJson $manifest -}}
 {{- if gt (len $manifestJson) 65536 -}}
 {{- fail (printf "resourceActions.authorityWorker cohort %q canonical manifest exceeds 65536 bytes" $id) -}}
@@ -420,7 +437,14 @@ metadata:
 spec:
   replicas: 2
   strategy:
+  {{- if $authorityV1Deselect }}
     type: Recreate
+  {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  {{- end }}
   selector:
     matchLabels:
       skypilot.co/role: resource-action-authority

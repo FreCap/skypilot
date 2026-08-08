@@ -481,8 +481,8 @@ class DefaultAuthorityWorkerLiveProjector:
                                           deployment_snapshot)
 
 
-class CanonicalAuthorityWorkerTemplateValidator:
-    """Exact Deployment/ReplicaSet/Pod projections for the v1 cohort."""
+class CanonicalAuthorityWorkerTemplateProjectionValidator:
+    """Exact live projections for one manifest-bound shared V1 leaf."""
 
     def __init__(self, serializer: Callable[[Any], Any]) -> None:
         if not callable(serializer):
@@ -512,15 +512,19 @@ class CanonicalAuthorityWorkerTemplateValidator:
 
     def __call__(
         self,
-        manifest: actions.ProviderAuthorityWorkerCohortManifestV1,
+        release_inputs: actions.
+        ProviderAuthorityWorkerPodTemplateReleaseInputsV1,
+        manifest_sha256: str,
         objects: KubernetesAuthorityWorkerObjects,
     ) -> None:
+        if type(release_inputs) is not (
+                actions.ProviderAuthorityWorkerPodTemplateReleaseInputsV1):
+            raise TypeError('release_inputs has an invalid type.')
         # pylint: disable=import-outside-toplevel
         from sky.serve import resource_action_provider_preflight
         expected = (resource_action_provider_preflight.
                     materialize_provider_authority_worker_pod_template_v1(
-                        manifest.pod_template_binding.release_inputs,
-                        manifest.sha256).canonical_value())
+                        release_inputs, manifest_sha256).canonical_value())
         deployment = self._serialized_object(objects.deployment,
                                              name='Deployment')
         try:
@@ -587,6 +591,25 @@ class CanonicalAuthorityWorkerTemplateValidator:
                 != actions.canonical_json_bytes(expected)):
             raise BootstrapInvariantViolation(
                 'Live Pod differs from the accepted ReplicaSet template.')
+
+
+class CanonicalAuthorityWorkerTemplateValidator:
+    """Exact Deployment/ReplicaSet/Pod projections for a V1 manifest."""
+
+    def __init__(self, serializer: Callable[[Any], Any]) -> None:
+        self._projection_validator = (
+            CanonicalAuthorityWorkerTemplateProjectionValidator(serializer))
+
+    def __call__(
+        self,
+        manifest: actions.ProviderAuthorityWorkerCohortManifestV1,
+        objects: KubernetesAuthorityWorkerObjects,
+    ) -> None:
+        if type(manifest
+               ) is not actions.ProviderAuthorityWorkerCohortManifestV1:
+            raise TypeError('manifest must be an exact V1 manifest.')
+        self._projection_validator(manifest.pod_template_binding.release_inputs,
+                                   manifest.sha256, objects)
 
 
 class ReadOnlyKubernetesAuthorityWorkerObserver:

@@ -74,6 +74,141 @@ tests:
           path: metadata.labels["skypilot.co/helm-revision"]
           value: "0"
 
+  - it: should run accepted V1 cleanup only after the deselecting upgrade
+    release:
+      upgrade: true
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: deselect
+      resourceActions.authorityWorker.activeCohort: ""
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: post-upgrade
+      - equal:
+          path: metadata.annotations["helm.sh/hook-weight"]
+          value: "10"
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - python
+            - -m
+            - sky.server.requests.authority_worker_retirement
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: verify
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+            value: "037"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACCEPTED_V1_CLEANUP_ONLY
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+            value: '["p2a-v1"]'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_DESELECTED_SUFFIXES_JSON
+            value: '["p2a-v1"]'
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON
+
+  - it: should validate the tombstone ledger before removing V1 objects
+    release:
+      upgrade: true
+    values:
+      - fixtures/resource-action-authority-values.yaml
+      - fixtures/resource-action-authority-tombstone-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: tombstone
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: pre-install,pre-upgrade
+      - equal:
+          path: metadata.annotations["helm.sh/hook-weight"]
+          value: "-10"
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - python
+            - -m
+            - sky.server.database_migrations
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: upgrade
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+            value: "037"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RELEASE_PREFLIGHT_JSON
+            value: '{"enabled":true,"helm_full_name":"release-name","helm_release_name":"RELEASE-NAME","installation_id":"01234567-89ab-cdef-0123-456789abcdef","live_manifest_files":[],"namespace":"NAMESPACE","tombstone_suffixes":["p2a-v1"],"version":1}'
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ACCEPTED_V1_CLEANUP_ONLY
+
+  - it: should reject accepted V1 retirement during install
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: deselect
+      resourceActions.authorityWorker.activeCohort: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: authority V1 retirement phases are valid only during Helm upgrade
+
+  - it: should reject a retirement phase when the migration job is disabled
+    release:
+      upgrade: true
+    set:
+      databaseMigration.enabled: false
+      databaseMigration.authorityV1RetirementPhase: deselect
+    asserts:
+      - failedTemplate:
+          errorMessage: authority V1 retirement phases require databaseMigration.enabled=true
+
+  - it: should reject deselect while a cohort is still selected
+    release:
+      upgrade: true
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: deselect
+    asserts:
+      - failedTemplate:
+          errorMessage: authority V1 retirement phases require resourceActions.authorityWorker.activeCohort to be empty
+
+  - it: should reject tombstone while a live cohort remains rendered
+    release:
+      upgrade: true
+    values:
+      - fixtures/resource-action-authority-values.yaml
+    set:
+      databaseMigration.authorityV1RetirementPhase: tombstone
+      resourceActions.authorityWorker.activeCohort: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: authority V1 tombstone requires the live cohort inventory to be empty
+
   - it: should reject chart-managed database secrets in HA mode
     set:
       apiService.highAvailability.enabled: true

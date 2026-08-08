@@ -298,6 +298,7 @@ def test_authority_role_is_preflight_only(monkeypatch):
         side_effect=AssertionError('background loop started'))
     capture_env = mock.Mock(side_effect=AssertionError('claim env captured'))
     evaluator = mock.Mock()
+    evaluator_v2 = mock.Mock()
     accepted_callbacks = []
     health_kwargs = {}
 
@@ -340,6 +341,9 @@ def test_authority_role_is_preflight_only(monkeypatch):
     monkeypatch.setattr(
         'sky.serve.resource_action_provider_preflight.InitialProviderPreflightEvaluator',
         evaluator_type)
+    build_evaluator_v2 = mock.Mock(return_value=evaluator_v2)
+    monkeypatch.setattr(runtime, '_build_authority_preflight_evaluator_v2',
+                        build_evaluator_v2)
     monkeypatch.setattr(
         'sky.server.requests.authority_worker_bootstrap.AuthorityWorkerPodIdentity.from_environment',
         lambda: pod_identity)
@@ -368,12 +372,15 @@ def test_authority_role_is_preflight_only(monkeypatch):
     health_server.start.assert_called_once_with()
     health_server.stop.assert_called_once_with()
     evaluator_type.assert_called_once_with(accepted_callbacks[0])
-    assert accepted_callbacks[0]() is coordinator.accepted_manifest.return_value
+    build_evaluator_v2.assert_called_once_with(pod_identity.uid)
+    # A non-V1 coordinator result cannot cross into the frozen V1 evaluator.
+    assert accepted_callbacks[0]() is None
     preflight_type.assert_called_once_with('127.0.0.1',
                                            46583,
                                            'test-authority-preflight.ns.svc',
                                            evaluator,
-                                           on_transport_invalid=mock.ANY)
+                                           on_transport_invalid=mock.ANY,
+                                           evaluator_v2=evaluator_v2)
     assert callable(preflight_type.call_args.kwargs['on_transport_invalid'])
     assert events == [
         'health-start', 'preflight-start', 'manifest-load', 'coordinator-build',
@@ -404,6 +411,8 @@ def test_authority_role_unwinds_bound_listeners_if_bootstrap_build_fails(
     monkeypatch.setattr(
         runtime, '_load_authority_static_manifest',
         lambda: events.append('manifest-load') or mock.sentinel.manifest)
+    monkeypatch.setattr(runtime, '_build_authority_preflight_evaluator_v2',
+                        lambda worker_instance_id: mock.Mock())
 
     def fail_build(*args):
         del args
@@ -1134,6 +1143,41 @@ def test_api_background_uses_release_scoped_retirement_singleton(monkeypatch):
     background.start.assert_called_once_with()
 
 
+def test_api_background_runs_explicit_retirement_only_verifier(monkeypatch):
+    background = mock.Mock()
+    singleton_coroutine = mock.sentinel.singleton_coroutine
+    scope = SimpleNamespace(singleton_name=(
+        'resource-action-authority-retirement:installation:release-digest'))
+    from_environment = mock.Mock(return_value=scope)
+    run_singleton = mock.Mock(return_value=singleton_coroutine)
+    monkeypatch.delenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED,
+                       raising=False)
+    monkeypatch.delenv(
+        serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
+        raising=False)
+    monkeypatch.setenv(
+        runtime.authority_worker_retirement.RETIREMENT_VERIFIER_ENABLED_ENV_VAR,
+        'true')
+    monkeypatch.setattr(runtime, '_BackgroundLoop', lambda: background)
+    monkeypatch.setattr(runtime, '_uses_postgres_requests', lambda: True)
+    monkeypatch.setattr(
+        runtime.authority_worker_retirement.AuthorityWorkerRetirementScope,
+        'from_environment', from_environment)
+    monkeypatch.setattr(runtime.request_postgres, 'run_distributed_singleton',
+                        run_singleton)
+
+    result = runtime._start_background_loop(  # pylint: disable=protected-access
+        'api')
+
+    assert result is background
+    from_environment.assert_called_once_with()
+    run_singleton.assert_called_once_with(
+        'skypilot:api-server-runtime:v1:' + scope.singleton_name,
+        runtime.authority_worker_retirement.retirement_verifier_daemon)
+    background.create_task.assert_called_once_with(singleton_coroutine)
+    background.start.assert_called_once_with()
+
+
 def test_api_background_ignores_legacy_authority_envs_while_disabled(
         monkeypatch):
     background = mock.Mock()
@@ -1141,6 +1185,9 @@ def test_api_background_ignores_legacy_authority_envs_while_disabled(
                        raising=False)
     monkeypatch.delenv(
         serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
+        raising=False)
+    monkeypatch.delenv(
+        runtime.authority_worker_retirement.RETIREMENT_VERIFIER_ENABLED_ENV_VAR,
         raising=False)
     monkeypatch.setenv(
         runtime.authority_worker_retirement.INSTALLATION_ID_ENV_VAR,

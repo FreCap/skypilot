@@ -357,11 +357,24 @@ controllerService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: kubernetes.io/hostname
 
-# Dedicated preflight-only authority cohorts for private Serve resource
-# actions. This surface stays dark until an immutable image has been built and
-# its separately reviewed OCI qualification artifact is packaged by the chart.
+# Dedicated Serve038 authority cohorts for private Serve resource actions.
+# Kubernetes readiness remains on /bootstrapz while runtime /readyz and queue
+# claims stay unavailable until V2 membership has been accepted. This surface
+# stays dark until an immutable image with exact Serve038 capability has been
+# built and its separately reviewed OCI qualification artifact is packaged.
 resourceActions:
   # @schema additionalProperties: false
+  # @schema oneOf: [{"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"const":""},"byteSize":{"const":0},"sha256":{"const":""}}},{"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"minLength":1},"byteSize":{"minimum":1},"sha256":{"minLength":64}}}]
+  qualificationPolicy:
+    # The final M4 policy cannot be populated until its merge commit, immutable
+    # role image digests, and qualified cohort exist.  The exact empty triple
+    # renders no trust file and keeps every API007 proof unavailable.
+    # @schema type: string; pattern: ^$|^charts/skypilot/files/resource-action-qualification-policies/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*\.json$
+    repoPath: ""
+    # @schema type: integer; minimum: 0; maximum: 65536
+    byteSize: 0
+    # @schema type: string; pattern: ^$|^[0-9a-f]{64}$
+    sha256: ""
   authorityWorker:
     # @schema type: [boolean]
     enabled: false
@@ -373,12 +386,19 @@ resourceActions:
     # cohorts remain listed until all of their frozen work is released.
     # @schema type: string; maxLength: 42
     activeCohort: ""
-    # Each cohort requires a <=42-character DNS-label suffix, exactly two
-    # replicas, a manifest-digest-pinned image and distinct OCI config digest,
-    # one chart-packaged qualification ref, and three installed-package refs.
+    # Each fresh cohort requires
+    # manifestContract: provider_authority_worker_cohort_v2, a <=42-character
+    # DNS-label suffix, exactly two replicas, a
+    # manifest-digest-pinned image and distinct OCI config digest, one
+    # chart-packaged qualification ref, and three installed-package refs. Old
+    # cohort values without manifestContract must fail rather than be
+    # reinterpreted as V2 during --reuse-values upgrades. The explicit V1
+    # deselect retirement phase accepts only an absent manifestContract (the
+    # shipped old values shape) and renders the frozen V1 manifest/Recreate
+    # workload until removal is authorized.
     # @schema type: array; item: object
-    # @schema itemProperties: {"id":{"type":"string","minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"},"replicas":{"type":"integer","const":2},"image":{"type":"string","minLength":1,"pattern":"^.+@sha256:[0-9a-f]{64}$"},"imagePullPolicy":{"type":"string","const":"Always"},"ociConfigDigest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"qualificationArtifact":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","minLength":1,"maxLength":253,"pattern":"^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"},"byteSize":{"type":"integer","minimum":1,"maximum":65536},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"podTemplateContract":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_provider_preflight.py"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"artifactInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"callableInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
-    # @schema allOf: [{"type":"array","items":{"properties":{"id":{},"replicas":{},"image":{},"imagePullPolicy":{},"ociConfigDigest":{},"qualificationArtifact":{},"podTemplateContract":{},"artifactInventory":{},"callableInventory":{}},"additionalProperties":false,"required":["id","replicas","image","imagePullPolicy","ociConfigDigest","qualificationArtifact","podTemplateContract","artifactInventory","callableInventory"]}}]
+    # @schema itemProperties: {"manifestContract":{"allOf":[{"type":"string"},{"const":"provider_authority_worker_cohort_v2"}]},"id":{"type":"string","minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"},"replicas":{"type":"integer","const":2},"image":{"type":"string","minLength":1,"pattern":"^.+@sha256:[0-9a-f]{64}$"},"imagePullPolicy":{"type":"string","const":"Always"},"ociConfigDigest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"qualificationArtifact":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","minLength":1,"maxLength":253,"pattern":"^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"},"byteSize":{"type":"integer","minimum":1,"maximum":65536},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"podTemplateContract":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_provider_preflight.py"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"artifactInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"callableInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
+    # @schema allOf: [{"type":"array","items":{"properties":{"manifestContract":{},"id":{},"replicas":{},"image":{},"imagePullPolicy":{},"ociConfigDigest":{},"qualificationArtifact":{},"podTemplateContract":{},"artifactInventory":{},"callableInventory":{}},"additionalProperties":false,"required":["id","replicas","image","imagePullPolicy","ociConfigDigest","qualificationArtifact","podTemplateContract","artifactInventory","callableInventory"]}}]
     cohorts: []
     # Cohort IDs whose removed Deployment/ServiceAccount names remain visible
     # to the surviving API retirement verifier.  After the last cohort is
@@ -389,8 +409,8 @@ resourceActions:
     retirementTombstones: []
     # @schema type: [integer]; minimum: 1; maximum: 65535
     healthPort: 46581
-    # The future authenticated preflight endpoint.  The routing slice exposes
-    # no mutation service and does not treat this Service as activation proof.
+    # The authenticated preflight endpoint. The Service is not activation or
+    # claim-readiness proof; requests remain unavailable until V2 acceptance.
     # @schema type: [integer]; minimum: 1; maximum: 65535; const: 46583
     preflightPort: 46583
     # @schema additionalProperties: false
@@ -451,6 +471,24 @@ requestStore:
 databaseMigration:
   # @schema type: [boolean]
   enabled: true
+  # Exact pre-Serve038 accepted-V1 retirement protocol. Keep "none" for new
+  # installs. For an existing P2a V1 cohort, use these exact, separate Helm
+  # upgrades (and --reuse-values for an existing release):
+  #   1. phase="deselect", authorityWorker.enabled=true, activeCohort="",
+  #      cohorts=<unchanged old cohorts>, retirementTombstones=<unchanged>.
+  #      The post-upgrade verify-only hook advances every accepted V1 row to
+  #      REMOVAL_AUTHORIZED while all central workloads stay at Serve037.
+  #   2. phase="tombstone", authorityWorker.enabled=true, activeCohort="",
+  #      cohorts=[], retirementTombstones=<all authorized old cohort IDs>.
+  #      The pre-upgrade hook fences that exact inventory before Helm deletes
+  #      each old Deployment and ServiceAccount. Wait until the surviving API
+  #      verifier reports every V1 row RETIRED.
+  #   3. phase="none", authorityWorker.enabled=false, installationId="",
+  #      activeCohort="", cohorts=[], retirementTombstones=[]. Only after the
+  #      RETIRED proof may this normal upgrade apply Serve038.
+  # Never combine or skip phases; each non-none phase suppresses Serve038 DDL.
+  # @schema enum: [none, deselect, tombstone]
+  authorityV1RetirementPhase: none
   # Allow the migration Job to initialize a new, isolated, empty PostgreSQL
   # schema. Leave false for every existing database and staged upgrade.
   # @schema type: [boolean]

@@ -193,6 +193,77 @@ while namespace + Helm release name is the durable release anchor.
 {{- end -}}
 
 {{/*
+Validate and resolve the optional immutable API-role qualification policy.
+An empty exact triple is the only unconfigured state; any partial or drifted
+reference fails before Helm emits a workload.  A missing key is the sole
+backward-compatible old-release state and resolves to that exact empty triple;
+an explicit null or non-object remains invalid.
+*/}}
+{{- define "skypilot.resourceActionQualificationPolicy" -}}
+{{- $resourceActions := dict -}}
+{{- if hasKey .Values "resourceActions" -}}
+{{- $resourceActions = get .Values "resourceActions" -}}
+{{- if not (kindIs "map" $resourceActions) -}}
+{{- fail "resourceActions must be an object" -}}
+{{- end -}}
+{{- end -}}
+{{- $policy := dict "repoPath" "" "byteSize" 0 "sha256" "" -}}
+{{- if hasKey $resourceActions "qualificationPolicy" -}}
+{{- $policy = get $resourceActions "qualificationPolicy" -}}
+{{- if not (kindIs "map" $policy) -}}
+{{- fail "resourceActions.qualificationPolicy must be an object" -}}
+{{- end -}}
+{{- end -}}
+{{- if or (ne (len $policy) 3) (not (hasKey $policy "repoPath")) (not (hasKey $policy "byteSize")) (not (hasKey $policy "sha256")) -}}
+{{- fail "resourceActions.qualificationPolicy must contain exactly repoPath, byteSize, and sha256" -}}
+{{- end -}}
+{{- $repoPath := get $policy "repoPath" -}}
+{{- $byteSize := get $policy "byteSize" -}}
+{{- $sha256 := get $policy "sha256" -}}
+{{- if not (kindIs "string" $repoPath) -}}
+{{- fail "resourceActions.qualificationPolicy.repoPath must be text" -}}
+{{- end -}}
+{{- if not (kindIs "string" $sha256) -}}
+{{- fail "resourceActions.qualificationPolicy.sha256 must be text" -}}
+{{- end -}}
+{{- $byteSizeKind := kindOf $byteSize -}}
+{{- if not (or (eq $byteSizeKind "int") (eq $byteSizeKind "int64") (eq $byteSizeKind "float64")) -}}
+{{- fail "resourceActions.qualificationPolicy.byteSize must be an integer" -}}
+{{- end -}}
+{{- if ne (float64 $byteSize) (floor (float64 $byteSize)) -}}
+{{- fail "resourceActions.qualificationPolicy.byteSize must be an integer" -}}
+{{- end -}}
+{{- $configured := or (ne $repoPath "") (ne (int $byteSize) 0) (ne $sha256 "") -}}
+{{- if not $configured -}}
+{{- toJson (dict "configured" false) -}}
+{{- else -}}
+{{- if not (regexMatch "^charts/skypilot/files/resource-action-qualification-policies/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*\\.json$" $repoPath) -}}
+{{- fail "resourceActions.qualificationPolicy.repoPath must name a normalized JSON file under charts/skypilot/files/resource-action-qualification-policies/" -}}
+{{- end -}}
+{{- if or (lt (int $byteSize) 1) (gt (int $byteSize) 65536) -}}
+{{- fail "resourceActions.qualificationPolicy.byteSize must be between 1 and 65536" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9a-f]{64}$" $sha256) -}}
+{{- fail "resourceActions.qualificationPolicy.sha256 must be lowercase SHA-256 hex" -}}
+{{- end -}}
+{{- $contents := .Files.Get (trimPrefix "charts/skypilot/" $repoPath) -}}
+{{- if empty $contents -}}
+{{- fail "resourceActions.qualificationPolicy is not packaged by this chart" -}}
+{{- end -}}
+{{- if ne (len $contents) (int $byteSize) -}}
+{{- fail "resourceActions.qualificationPolicy.byteSize does not match packaged bytes" -}}
+{{- end -}}
+{{- if ne (sha256sum $contents) $sha256 -}}
+{{- fail "resourceActions.qualificationPolicy.sha256 does not match packaged bytes" -}}
+{{- end -}}
+{{- $fullName := include "skypilot.fullname" . -}}
+{{- $identity := printf "%s\n%s\n%s" .Release.Namespace $fullName $sha256 -}}
+{{- $configMapName := printf "skypilot-ra-policy-%s" (sha256sum $identity | trunc 40) -}}
+{{- toJson (dict "configured" true "repoPath" $repoPath "byteSize" (int $byteSize) "sha256" $sha256 "configMapName" $configMapName) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "skypilot.serviceAccountName" -}}

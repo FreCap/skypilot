@@ -31,6 +31,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from sky.serve import auth_tokens
 from sky.serve import constants
+from sky.serve import resource_action_preflight_v2
 from sky.serve import resource_actions
 
 _MAX_REQUEST_LINE_BYTES = 2_048
@@ -42,6 +43,10 @@ _MAX_TLS_FILE_BYTES = 65_536
 _WORKER_COUNT = 8
 _LISTEN_BACKLOG = 16
 _REQUEST_DEADLINE_SECONDS = 5.0
+# Reserve enough of the one absolute request deadline to serialize and flush
+# the fixed V2 unavailable envelope after a slow trust read.  The evaluator
+# receives no fresh budget after TLS or request parsing consumes time.
+_V2_RESPONSE_RESERVE_SECONDS = 0.25
 _TLS_POLL_SECONDS = 0.5
 _CERTIFICATE_BLOCK_RE = re.compile(
     br'-----BEGIN CERTIFICATE-----\r?\n.*?\r?\n-----END CERTIFICATE-----\r?\n?',
@@ -382,7 +387,10 @@ class _BufferedSocket:
 
 
 def _parse_canonical_request(
-        body: bytes) -> resource_actions.ProviderAuthorityPreflightRequestV1:
+    body: bytes,
+    protocol_version: int = 1,
+) -> (resource_actions.ProviderAuthorityPreflightRequestV1 |
+      resource_action_preflight_v2.ProviderAuthorityPreflightRequestV2):
 
     def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -400,8 +408,17 @@ def _parse_canonical_request(
                            object_pairs_hook=_object,
                            parse_float=_forbid_float,
                            parse_constant=_forbid_float)
-        request = (resource_actions.ProviderAuthorityPreflightRequestV1.
-                   from_value(value))
+        request: (
+            resource_actions.ProviderAuthorityPreflightRequestV1 |
+            resource_action_preflight_v2.ProviderAuthorityPreflightRequestV2)
+        if protocol_version == 1:
+            request = (resource_actions.ProviderAuthorityPreflightRequestV1.
+                       from_value(value))
+        elif protocol_version == 2:
+            request = (resource_action_preflight_v2.
+                       ProviderAuthorityPreflightRequestV2.from_value(value))
+        else:
+            raise ValueError('unsupported preflight protocol version')
         if request.canonical_bytes != body:
             raise ValueError('request body is not canonical')
         return request
@@ -423,6 +440,10 @@ class AuthorityPreflightServer:
             resource_actions.ProviderAuthorityPreflightResponseV1 | None],
         *,
         on_transport_invalid: Callable[[], None],
+        evaluator_v2: Callable[
+            [resource_action_preflight_v2.ProviderAuthorityPreflightRequestV2],
+            resource_action_preflight_v2.ProviderAuthorityPreflightResponseV2 |
+            None] | None = None,
         tls_directory: str = constants.RESOURCE_ACTION_PREFLIGHT_TLS_DIRECTORY,
     ) -> None:
         if type(host) is not str or not host:
@@ -432,21 +453,33 @@ class AuthorityPreflightServer:
             raise ValueError('authority preflight port is invalid.')
         if type(service_dns) is not str or not service_dns:
             raise ValueError('authority preflight Service DNS is invalid.')
-        if not callable(evaluator) or not callable(on_transport_invalid):
+        if (not callable(evaluator) or not callable(on_transport_invalid) or
+            (evaluator_v2 is not None and not callable(evaluator_v2))):
             raise TypeError('authority preflight callbacks must be callable.')
         self._host = host
         self._requested_port = port
         self._service_dns = service_dns
         self._evaluator = evaluator
+        self._evaluator_v2 = evaluator_v2
         self._on_transport_invalid = on_transport_invalid
         self._tls_directory = tls_directory
         self._listener: socket.socket | None = None
         self._bound_port = port
+        # One server object owns one transport generation.  In particular, a
+        # daemon V2 trust read that outlives stop() must not retain a semaphore
+        # slot across an apparent in-process restart.  Production recovery
+        # constructs a fresh server object (and normally a fresh process).
+        self._started_once = False
         self._stop_event = threading.Event()
         self._accept_thread: threading.Thread | None = None
         self._watch_thread: threading.Thread | None = None
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._slots = threading.BoundedSemaphore(_WORKER_COUNT)
+        # V2 trust evaluation is a mutation-free, zero-queue single
+        # flight.  A driver/network blackhole may leave at most one isolated
+        # daemon evaluation behind the transport deadline; its result is
+        # permanently discarded and every concurrent request fails closed.
+        self._v2_evaluation_slot = threading.BoundedSemaphore(1)
         self._future_lock = threading.Lock()
         self._futures: set[concurrent.futures.Future[None]] = set()
         self._connection_lock = threading.Lock()
@@ -461,8 +494,9 @@ class AuthorityPreflightServer:
         return self._bound_port
 
     def start(self) -> None:
-        if self._listener is not None:
-            raise RuntimeError('authority preflight server is already started.')
+        if self._started_once:
+            raise RuntimeError('authority preflight server is one-shot.')
+        self._started_once = True
         self._stop_event.clear()
         self._refresh_tls_context()
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -608,6 +642,54 @@ class AuthorityPreflightServer:
         with self._future_lock:
             self._futures.discard(future)
 
+    def _evaluate_v2_until_deadline(
+        self,
+        request: resource_action_preflight_v2.
+        ProviderAuthorityPreflightRequestV2,
+        deadline: float,
+    ) -> resource_action_preflight_v2.ProviderAuthorityPreflightResponseV2 | None:
+        """Run at most one mutation-free evaluator inside the deadline."""
+
+        evaluator = self._evaluator_v2
+        remaining = (deadline - _V2_RESPONSE_RESERVE_SECONDS - time.monotonic())
+        if (evaluator is None or remaining <= 0 or
+                not self._v2_evaluation_slot.acquire(blocking=False)):
+            return None
+
+        completed = threading.Event()
+        responses: list[resource_action_preflight_v2.
+                        ProviderAuthorityPreflightResponseV2 | None] = []
+        errors: list[Exception] = []
+
+        def evaluate() -> None:
+            try:
+                responses.append(evaluator(request))
+            except Exception as e:  # pylint: disable=broad-except
+                errors.append(e)
+            finally:
+                completed.set()
+                self._v2_evaluation_slot.release()
+
+        worker = threading.Thread(target=evaluate,
+                                  name='authority-preflight-v2-evaluator',
+                                  daemon=True)
+        try:
+            worker.start()
+        except RuntimeError:
+            self._v2_evaluation_slot.release()
+            return None
+        remaining = (deadline - _V2_RESPONSE_RESERVE_SECONDS - time.monotonic())
+        if remaining <= 0 or not completed.wait(remaining):
+            # The daemon may still finish its isolated mutation-free transaction.
+            # This request owns no shared result cell, so late completion can
+            # neither send bytes nor authorize a later request.
+            return None
+        if errors:
+            raise errors[0]
+        if len(responses) != 1:
+            return None
+        return responses[0]
+
     def _serve_connection(self, connection: socket.socket) -> None:
         tls_connection: ssl.SSLSocket | None = None
         deadline = time.monotonic() + _REQUEST_DEADLINE_SECONDS
@@ -647,6 +729,7 @@ class AuthorityPreflightServer:
 
     def _handle_http(self, connection: ssl.SSLSocket, deadline: float) -> None:
         reader = _BufferedSocket(connection, deadline)
+        protocol_version = 1
         try:
             try:
                 request_line = reader.readline(_MAX_REQUEST_LINE_BYTES)
@@ -661,11 +744,18 @@ class AuthorityPreflightServer:
                     'ascii').split(' ')
             except (UnicodeDecodeError, ValueError) as e:
                 raise _HTTPFailure(400) from e
+            # Once the request line names the exact V2 endpoint, every closed
+            # failure must use the V2 error envelope, including failures that
+            # precede header/body parsing.  Unknown targets deliberately retain
+            # the historical V1/default envelope.
+            if target == constants.RESOURCE_ACTION_PREFLIGHT_PATH_V2:
+                protocol_version = 2
             if version != 'HTTP/1.1':
                 raise _HTTPFailure(400)
             if method != 'POST':
                 raise _HTTPFailure(405)
-            if target != constants.RESOURCE_ACTION_PREFLIGHT_PATH:
+            if target not in (constants.RESOURCE_ACTION_PREFLIGHT_PATH_V1,
+                              constants.RESOURCE_ACTION_PREFLIGHT_PATH_V2):
                 raise _HTTPFailure(404)
 
             headers: dict[str, str] = {}
@@ -746,37 +836,79 @@ class AuthorityPreflightServer:
                 raise _HTTPFailure(400)
             if connection.pending() > 0:
                 raise _HTTPFailure(400)
-            request = _parse_canonical_request(body)
+            request = _parse_canonical_request(body, protocol_version)
             if time.monotonic() >= deadline:
                 raise _HTTPFailure(408)
-            response = self._evaluator(request)
-            if time.monotonic() >= deadline:
-                raise _HTTPFailure(408)
-            if response is None:
-                raise _HTTPFailure(503)
-            if type(response) not in (
-                    resource_actions.ProviderLaunchAuthorityPreflightResponseV1,
-                    resource_actions.ProviderDownAuthorityPreflightResponseV1):
-                raise _HTTPFailure(503)
-            response.validate_request(request)
-            self._send_response(connection, 200, response.canonical_bytes,
-                                deadline)
+            if protocol_version == 1:
+                if type(request) is not (
+                        resource_actions.ProviderAuthorityPreflightRequestV1):
+                    raise _HTTPFailure(400)
+                # Preserve the byte-frozen V1 evaluator behavior: exceptions
+                # still unwind to _serve_connection's existing 503 edge.
+                response_v1 = self._evaluator(request)
+                if time.monotonic() >= deadline:
+                    raise _HTTPFailure(408)
+                if response_v1 is None or type(response_v1) not in (
+                        resource_actions.
+                        ProviderLaunchAuthorityPreflightResponseV1,
+                        resource_actions.
+                        ProviderDownAuthorityPreflightResponseV1):
+                    raise _HTTPFailure(503)
+                response_v1.validate_request(request)
+                response_body = response_v1.canonical_bytes
+            else:
+                if type(request) is not (resource_action_preflight_v2.
+                                         ProviderAuthorityPreflightRequestV2):
+                    raise _HTTPFailure(400)
+                if self._evaluator_v2 is None:
+                    raise _HTTPFailure(503)
+                try:
+                    response_v2 = self._evaluate_v2_until_deadline(
+                        request, deadline)
+                except Exception as e:  # pylint: disable=broad-except
+                    raise _HTTPFailure(503) from e
+                if time.monotonic() >= deadline:
+                    raise _HTTPFailure(408)
+                if response_v2 is None or type(response_v2) not in (
+                        resource_action_preflight_v2.
+                        ProviderLaunchAuthorityPreflightResponseV2,
+                        resource_action_preflight_v2.
+                        ProviderDownAuthorityPreflightResponseV2):
+                    raise _HTTPFailure(503)
+                try:
+                    response_v2.validate_request(request)
+                except (TypeError, ValueError) as e:
+                    raise _HTTPFailure(503) from e
+                response_body = response_v2.canonical_bytes
+            self._send_response(connection,
+                                200,
+                                response_body,
+                                deadline,
+                                protocol_version=protocol_version)
         except _HTTPFailure as failure:
-            self._send_error(connection, failure.status, deadline)
+            self._send_error(connection,
+                             failure.status,
+                             deadline,
+                             protocol_version=protocol_version)
 
     @staticmethod
-    def _send_error(connection: ssl.SSLSocket, status: int,
-                    deadline: float) -> None:
+    def _send_error(connection: ssl.SSLSocket,
+                    status: int,
+                    deadline: float,
+                    *,
+                    protocol_version: int = 1) -> None:
         reason, code = _ERRORS[status]
         body = resource_actions.canonical_json_bytes({
-            'version': 1,
+            'version': protocol_version,
             'code': code,
         })
-        AuthorityPreflightServer._send_response(connection,
-                                                status,
-                                                body,
-                                                deadline,
-                                                reason=reason)
+        AuthorityPreflightServer._send_response(
+            connection,
+            status,
+            body,
+            deadline,
+            reason=reason,
+            protocol_version=protocol_version)
 
     @staticmethod
     def _send_response(connection: ssl.SSLSocket,
@@ -784,12 +916,13 @@ class AuthorityPreflightServer:
                        body: bytes,
                        deadline: float,
                        *,
-                       reason: str = 'OK') -> None:
+                       reason: str = 'OK',
+                       protocol_version: int = 1) -> None:
         if len(body) > _MAX_BODY_BYTES:
             status = 503
             reason, code = _ERRORS[status]
             body = resource_actions.canonical_json_bytes({
-                'version': 1,
+                'version': protocol_version,
                 'code': code,
             })
         headers = [

@@ -6,6 +6,7 @@ repository_root=$(cd "$chart_dir/../.." && pwd)
 temporary_dir=$(mktemp -d)
 trap 'rm -rf "$temporary_dir"' EXIT
 cp -R "$chart_dir" "$temporary_dir/chart"
+rm -f "$temporary_dir/chart/values.schema.json"
 mkdir -p "$temporary_dir/chart/files/resource-action-qualifications"
 
 manifest_one=1111111111111111111111111111111111111111111111111111111111111111
@@ -30,7 +31,7 @@ artifact_inventory_sha=$(sha256sum "$repository_root/$artifact_inventory_path" |
 callable_inventory_size=$(wc -c < "$repository_root/$callable_inventory_path")
 callable_inventory_sha=$(sha256sum "$repository_root/$callable_inventory_path" | cut -d' ' -f1)
 
-common_args=(
+v1_retirement_args=(
   ra-test
   "$temporary_dir/chart"
   --namespace skypilot-system
@@ -84,6 +85,12 @@ common_args=(
   --set-string resourceActions.authorityWorker.cohorts[1].callableInventory.sha256="$callable_inventory_sha"
 )
 
+common_args=(
+  "${v1_retirement_args[@]}"
+  --set-string resourceActions.authorityWorker.cohorts[0].manifestContract=provider_authority_worker_cohort_v2
+  --set-string resourceActions.authorityWorker.cohorts[1].manifestContract=provider_authority_worker_cohort_v2
+)
+
 authority_base_args=(
   ra-test
   "$temporary_dir/chart"
@@ -112,6 +119,18 @@ render() {
   helm template "${common_args[@]}" \
     --show-only templates/resource-action-authority-workers.yaml \
     --set resourceActions.authorityWorker.activeCohort="$active_cohort" \
+    > "$output"
+}
+
+render_v1_retirement() {
+  local output=$1
+  shift
+  helm template "${v1_retirement_args[@]}" \
+    --is-upgrade \
+    --show-only templates/resource-action-authority-workers.yaml \
+    --set databaseMigration.authorityV1RetirementPhase=deselect \
+    --set resourceActions.authorityWorker.activeCohort= \
+    "$@" \
     > "$output"
 }
 
@@ -248,8 +267,39 @@ expect_failure() {
   fi
 }
 
+expect_contract_failure() {
+  local expected=$1
+  shift
+  local output
+  if output=$(helm template "${v1_retirement_args[@]}" \
+      --show-only templates/resource-action-authority-workers.yaml \
+      --set resourceActions.authorityWorker.activeCohort=p2a-v1 \
+      "$@" 2>&1); then
+    printf 'Expected Helm contract validation to fail for: %s\n' "$*" >&2
+    exit 1
+  fi
+  if [[ $output != *"$expected"* ]]; then
+    printf 'Expected contract error containing %q, got:\n%s\n' \
+      "$expected" "$output" >&2
+    exit 1
+  fi
+}
+
 render p2a-v1 "$temporary_dir/active-v1.yaml"
 render p2a-v2 "$temporary_dir/active-v2.yaml"
+render_v1_retirement "$temporary_dir/v1-retirement.yaml"
+if v1_contract_output=$(render_v1_retirement \
+    "$temporary_dir/invalid-v1-contract.yaml" \
+    --set-string resourceActions.authorityWorker.cohorts[0].manifestContract=provider_authority_worker_cohort_v2 \
+    2>&1); then
+  printf 'Expected V1 deselect with a manifestContract to fail\n' >&2
+  exit 1
+fi
+if [[ $v1_contract_output != *'manifestContract must be absent during authority V1 deselect'* ]]; then
+  printf 'Unexpected V1 deselect contract error:\n%s\n' \
+    "$v1_contract_output" >&2
+  exit 1
+fi
 render_controller p2a-v1 "$temporary_dir/controller-v1.yaml"
 render_controller p2a-v2 "$temporary_dir/controller-v2.yaml"
 render_api p2a-v1 "$temporary_dir/active-api.yaml"
@@ -273,6 +323,34 @@ render_tombstone_only templates/api-deployment.yaml \
 expect_failure \
   'resourceActions.authorityWorker.activeCohort must name exactly one cohort' \
   --set resourceActions.authorityWorker.activeCohort=missing
+expect_contract_failure \
+  'manifestContract must equal provider_authority_worker_cohort_v2' \
+  --set-json resourceActions.authorityWorker.cohorts[0].manifestContract=1
+expect_contract_failure \
+  'manifestContract must equal provider_authority_worker_cohort_v2' \
+  --set-json resourceActions.authorityWorker.cohorts[0].manifestContract=2
+expect_contract_failure \
+  'manifestContract must equal provider_authority_worker_cohort_v2' \
+  --set-json resourceActions.authorityWorker.cohorts[0].manifestContract=2.0
+expect_contract_failure \
+  'manifestContract must equal provider_authority_worker_cohort_v2' \
+  --set-json resourceActions.authorityWorker.cohorts[0].manifestContract=null
+expect_contract_failure \
+  'manifestContract must equal provider_authority_worker_cohort_v2' \
+  --set-string resourceActions.authorityWorker.cohorts[0].manifestContract=2
+expect_contract_failure \
+  'manifestContract must equal provider_authority_worker_cohort_v2' \
+  --set-string resourceActions.authorityWorker.cohorts[0].manifestContract=arbitrary
+if old_reuse_output=$(helm template "${v1_retirement_args[@]}" \
+    --show-only templates/resource-action-authority-workers.yaml \
+    --set resourceActions.authorityWorker.activeCohort=p2a-v1 2>&1); then
+  printf 'Expected old reused V1 cohort values to fail outside deselect\n' >&2
+  exit 1
+fi
+if [[ $old_reuse_output != *'manifestContract must equal provider_authority_worker_cohort_v2'* ]]; then
+  printf 'Unexpected old reused V1 cohort error:\n%s\n' "$old_reuse_output" >&2
+  exit 1
+fi
 expect_failure \
   'qualification artifact sha256 does not match packaged bytes' \
   --set-string resourceActions.authorityWorker.cohorts[0].qualificationArtifact.sha256=0000000000000000000000000000000000000000000000000000000000000000
@@ -317,7 +395,8 @@ fi
   "$temporary_dir/chart-managed-migration.yaml" \
   "$temporary_dir/disabled-api-compat.yaml" \
   "$temporary_dir/disabled-controller-compat.yaml" \
-  "$temporary_dir/renamed-full-name.yaml" <<'PY'
+  "$temporary_dir/renamed-full-name.yaml" \
+  "$temporary_dir/v1-retirement.yaml" <<'PY'
 import base64
 import copy
 import hashlib
@@ -327,12 +406,14 @@ import re
 import sys
 
 try:
+    from sky.serve import resource_action_authority
     from sky.serve import resource_action_provider_preflight
     from sky.serve import resource_actions
 except ModuleNotFoundError:
     # The chart-only workflow installs Helm but not SkyPilot's Python
     # dependencies.  Developer environments with SkyPilot installed also run
     # the typed contract and canonical projector below.
+    resource_action_authority = None
     resource_action_provider_preflight = None
     resource_actions = None
 
@@ -369,6 +450,7 @@ chart_managed_migration = documents(sys.argv[15])
 disabled_api_compat = documents(sys.argv[16])
 disabled_controller_compat = documents(sys.argv[17])
 renamed_full_name = documents(sys.argv[18])
+v1_retirement = documents(sys.argv[19])
 qualification_paths = {
     'p2a-v1': Path(sys.argv[3]),
     'p2a-v2': Path(sys.argv[4]),
@@ -407,6 +489,8 @@ expected_names |= {
 }
 assert set(active_one) == expected_names, set(active_one) ^ expected_names
 assert set(active_two) == expected_names, set(active_two) ^ expected_names
+assert set(v1_retirement) == expected_names, (
+    set(v1_retirement) ^ expected_names)
 for key in expected_names - {('Service', 'ra-test-authority-preflight')}:
     assert active_one[key] == active_two[key], f'active selection changed {key}'
 assert active_one[('Service', 'ra-test-authority-preflight')] != active_two[
@@ -575,6 +659,14 @@ def canonical_bytes(value):
                       sort_keys=True,
                       separators=(',', ':'),
                       ensure_ascii=False).encode()
+
+
+def assert_contract_rejects(parser, value):
+    try:
+        parser(value)
+    except (TypeError, ValueError):
+        return
+    raise AssertionError(f'{parser} accepted a crossed manifest contract')
 
 
 def projected_template(inputs):
@@ -852,6 +944,8 @@ for suffix in ('p2a-v1', 'p2a-v2'):
     manifest = json.loads(manifest_bytes)
     qualification = json.loads(qualification_bytes)
     assert canonical_bytes(manifest) == manifest_bytes
+    assert manifest['version'] == 2
+    assert manifest['claim_contract'] == 'frozen_action_cohort_join_v2'
     assert qualification_bytes.endswith(b'\n')
     assert not qualification_bytes.endswith(b'\n\n')
     assert canonical_bytes(qualification) + b'\n' == qualification_bytes
@@ -881,6 +975,7 @@ for suffix in ('p2a-v1', 'p2a-v2'):
     assert artifact_ref['source'] == 'helm_chart_configmap_v1'
     binding = manifest['pod_template_binding']
     assert set(binding) == binding_keys
+    assert binding['version'] == 1
     assert binding['contract'] == 'authority_worker_pod_template_v1'
     assert binding['projector_artifact_sha256'] == manifest[
         'pod_template_contract']['sha256']
@@ -892,6 +987,7 @@ for suffix in ('p2a-v1', 'p2a-v2'):
     assert manifest_bytes.count(b'$MANIFEST_SHA256') == 1
     inputs = binding['release_inputs']
     assert set(inputs) == release_input_keys
+    assert inputs['version'] == 1
     assert inputs['literal_env'] == literal_env
     assert inputs['secret_env'] == [{
         'name': 'SKYPILOT_DB_CONNECTION_URI',
@@ -908,11 +1004,14 @@ for suffix in ('p2a-v1', 'p2a-v2'):
     expected_template = projected_template(inputs)
     assert hashlib.sha256(canonical_bytes(expected_template)).hexdigest() == (
         binding['expected_template_sha256'])
-    if resource_actions is not None:
+    if resource_actions is not None and resource_action_authority is not None:
         typed_manifest = (
-            resource_actions.ProviderAuthorityWorkerCohortManifestV1.
+            resource_action_authority.ProviderAuthorityWorkerCohortManifestV2.
             from_value(manifest))
         assert typed_manifest.canonical_bytes == manifest_bytes
+        assert_contract_rejects(
+            resource_actions.ProviderAuthorityWorkerCohortManifestV1.from_value,
+            manifest)
         actual_projection = (
             resource_action_provider_preflight.
             project_provider_authority_worker_pod_template_v1(
@@ -926,7 +1025,14 @@ for suffix in ('p2a-v1', 'p2a-v2'):
     assert re.search(
         r'skypilot\.co/resource-action-manifest-sha256: '
         + manifest_sha + r'$', deployment, re.MULTILINE)
-    assert 'type: Recreate' in deployment
+    assert ('strategy:\n    type: RollingUpdate\n    rollingUpdate:\n'
+            '      maxSurge: 0\n      maxUnavailable: 1' in deployment)
+    assert 'type: Recreate' not in deployment
+    assert 'maxSurge: "0"' not in deployment
+    assert 'maxUnavailable: "1"' not in deployment
+    assert 'maxSurge: 0%' not in deployment
+    assert 'maxUnavailable: 1%' not in deployment
+    assert re.search(r'(?m)^  replicas: 2$', deployment)
     assert 'path: /livez' in deployment
     assert deployment.count('path: /bootstrapz') == 2
     assert '/readyz' not in deployment
@@ -955,6 +1061,37 @@ for suffix in ('p2a-v1', 'p2a-v2'):
     assert deployment.count('tolerationSeconds: 300') == 2
     assert 'key: node.kubernetes.io/not-ready' in deployment
     assert 'key: node.kubernetes.io/unreachable' in deployment
+
+for suffix in ('p2a-v1', 'p2a-v2'):
+    manifest_document = v1_retirement[
+        ('ConfigMap', f'ra-test-authority-{suffix}-manifest')]
+    manifest_encoded = re.search(
+        r'(?m)^  manifest\.json: "([A-Za-z0-9+/=]+)"$',
+        manifest_document).group(1)
+    manifest_bytes = base64.b64decode(manifest_encoded, validate=True)
+    manifest = json.loads(manifest_bytes)
+    assert canonical_bytes(manifest) == manifest_bytes
+    assert manifest['version'] == 1
+    assert manifest['claim_contract'] == 'frozen_action_cohort_join_v1'
+    assert manifest['pod_template_binding']['version'] == 1
+    assert manifest['pod_template_binding']['release_inputs']['version'] == 1
+    deployment = v1_retirement[
+        ('Deployment', f'ra-test-authority-{suffix}')]
+    assert 'strategy:\n    type: Recreate' in deployment
+    assert 'type: RollingUpdate' not in deployment
+    assert 'rollingUpdate:' not in deployment
+    if resource_actions is not None and resource_action_authority is not None:
+        typed_manifest = (
+            resource_actions.ProviderAuthorityWorkerCohortManifestV1.from_value(
+                manifest))
+        assert typed_manifest.canonical_bytes == manifest_bytes
+        assert_contract_rejects(
+            resource_action_authority.ProviderAuthorityWorkerCohortManifestV2.
+            from_value, manifest)
+
+v1_retirement_service = v1_retirement[
+    ('Service', 'ra-test-authority-preflight')]
+assert 'skypilot.co/authority-cohort: ""' in v1_retirement_service
 
 service_one = active_one[('Service', 'ra-test-authority-preflight')]
 service_two = active_two[('Service', 'ra-test-authority-preflight')]

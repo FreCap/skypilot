@@ -1,0 +1,15 @@
+{{- $qualificationPolicy := include "skypilot.resourceActionQualificationPolicy" . | fromJson -}}
+{{- if (get $qualificationPolicy "configured" | default false) }}
+{{- $repoPath := get $qualificationPolicy "repoPath" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ get $qualificationPolicy "configMapName" }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    skypilot.co/resource-action-qualification-policy-byte-size: {{ get $qualificationPolicy "byteSize" | quote }}
+    skypilot.co/resource-action-qualification-policy-sha256: {{ get $qualificationPolicy "sha256" | quote }}
+immutable: true
+binaryData:
+  qualification-policy.json: {{ .Files.Get (trimPrefix "charts/skypilot/" $repoPath) | b64enc | quote }}
+{{- end }}

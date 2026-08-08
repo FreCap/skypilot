@@ -16,6 +16,7 @@ import stat
 from typing import Any
 
 import sky
+from sky.serve import resource_action_authority
 from sky.serve import resource_actions
 from sky.server import constants as server_constants
 from sky.server.requests import registry as request_registry
@@ -793,6 +794,59 @@ def _validate_qualification_artifact(
             'image.')
 
 
+def _validate_qualification_artifact_v2(
+    manifest: resource_action_authority.ProviderAuthorityWorkerCohortManifestV2,
+) -> None:
+    """Validate the shared qualification leaf without reinterpreting V1."""
+
+    reference = manifest.image.qualification_artifact
+    if reference.mount_path != _QUALIFICATION_PATH:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Qualification artifact does not use the fixed mount path.')
+    contents = _read_fixed_regular_file(_QUALIFICATION_PATH,
+                                        name='authority qualification artifact',
+                                        maximum_bytes=_MAX_STATIC_JSON_BYTES)
+    if (len(contents) != reference.byte_size or
+            hashlib.sha256(contents).hexdigest() != reference.sha256):
+        raise ProviderAuthorityStaticEvidenceError(
+            'Qualification artifact content address differs from the '
+            'manifest reference.')
+    if (not contents.endswith(b'\n') or contents.endswith(b'\n\n') or
+            b'\r' in contents):
+        raise ProviderAuthorityStaticEvidenceError(
+            'Qualification artifact requires exactly one final LF.')
+    value = _json_without_duplicates(contents[:-1],
+                                     name='authority qualification artifact')
+    if type(value) is not dict or set(value) != _QUALIFICATION_KEYS:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Qualification artifact has unknown or missing fields.')
+    if value['version'] != 1 or type(value['version']) is not int:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Qualification artifact version is unsupported.')
+    source_commit = value['source_commit']
+    if (type(source_commit) is not str or len(source_commit) != 40 or any(
+            character not in '0123456789abcdef' for character in source_commit)
+            or type(sky.__commit__) is not str or len(sky.__commit__) != 40 or
+            any(character not in '0123456789abcdef'
+                for character in sky.__commit__)):
+        raise ProviderAuthorityStaticEvidenceError(
+            'Qualification source commit and running release commit must be '
+            '40 lowercase hexadecimal characters.')
+    expected = {
+        'requested_reference': manifest.image.requested_reference,
+        'oci_manifest_digest': manifest.image.oci_manifest_digest,
+        'oci_config_digest': manifest.image.oci_config_digest,
+        'source_commit': sky.__commit__,
+        'platform': 'linux/amd64',
+    }
+    if any(
+            type(value[key]) is not str or value[key] != expected_value
+            for key, expected_value in expected.items()):
+        raise ProviderAuthorityStaticEvidenceError(
+            'Qualification artifact does not bind the running qualified '
+            'image.')
+
+
 def load_provider_authority_worker_static_evidence_v1(
 ) -> resource_actions.ProviderAuthorityWorkerCohortManifestV1:
     """Load and validate the complete fixed static authority evidence graph."""
@@ -803,6 +857,16 @@ def load_provider_authority_worker_static_evidence_v1(
         maximum_bytes=_MAX_STATIC_JSON_BYTES)
     manifest_value = _json_without_duplicates(manifest_contents,
                                               name='authority cohort manifest')
+    return _validate_provider_authority_worker_static_evidence_v1(
+        manifest_contents, manifest_value)
+
+
+def _validate_provider_authority_worker_static_evidence_v1(
+    manifest_contents: bytes,
+    manifest_value: Any,
+) -> resource_actions.ProviderAuthorityWorkerCohortManifestV1:
+    """Validate already-read V1 manifest bytes and their exact JSON value."""
+
     try:
         manifest = (resource_actions.ProviderAuthorityWorkerCohortManifestV1.
                     from_value(manifest_value))
@@ -846,6 +910,96 @@ def load_provider_authority_worker_static_evidence_v1(
     return manifest
 
 
+def _validate_provider_authority_worker_static_evidence_v2(
+    manifest_contents: bytes,
+    manifest_value: Any,
+) -> resource_action_authority.ProviderAuthorityWorkerCohortManifestV2:
+    try:
+        manifest = (
+            resource_action_authority.ProviderAuthorityWorkerCohortManifestV2.
+            from_value(manifest_value))
+    except (TypeError, ValueError) as e:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority cohort V2 manifest contract is invalid.') from e
+    if manifest.canonical_bytes != manifest_contents:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority cohort V2 manifest bytes are not canonical.')
+    if manifest.pod_template_contract.repo_path != (
+            _POD_TEMPLATE_CONTRACT_REPO_PATH):
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority Pod-template contract names an unsupported artifact.')
+    if manifest.artifact_inventory.repo_path != (
+            _RENDERER_ARTIFACT_INVENTORY_REPO_PATH):
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority renderer inventory names an unsupported artifact.')
+    if manifest.callable_inventory.repo_path != _CALLABLE_INVENTORY_REPO_PATH:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority callable inventory names an unsupported artifact.')
+    installed = (manifest.pod_template_contract, manifest.artifact_inventory,
+                 manifest.callable_inventory)
+    if len({reference.repo_path for reference in installed}) != len(installed):
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority installed artifact roles must be distinct.')
+    _read_installed_artifact(manifest.pod_template_contract)
+    renderer_inventory_contents = _read_installed_artifact(
+        manifest.artifact_inventory)
+    callable_inventory_contents = _read_installed_artifact(
+        manifest.callable_inventory)
+    validate_provider_authority_renderer_artifact_inventory_v1(
+        renderer_inventory_contents)
+    validate_provider_authority_callable_inventory_v1(
+        callable_inventory_contents)
+    _validate_qualification_artifact_v2(manifest)
+    projected = project_provider_authority_worker_pod_template_v1(
+        manifest.pod_template_binding.release_inputs)
+    if projected.sha256 != manifest.pod_template_binding.expected_template_sha256:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority Pod-template projection hash differs from its binding.')
+    return manifest
+
+
+def load_provider_authority_worker_static_evidence_v2(
+) -> resource_action_authority.ProviderAuthorityWorkerCohortManifestV2:
+    """Load the exact additive Serve035 static authority evidence graph."""
+
+    manifest_contents = _read_fixed_regular_file(
+        _MANIFEST_PATH,
+        name='authority cohort manifest',
+        maximum_bytes=_MAX_STATIC_JSON_BYTES)
+    manifest_value = _json_without_duplicates(manifest_contents,
+                                              name='authority cohort manifest')
+    return _validate_provider_authority_worker_static_evidence_v2(
+        manifest_contents, manifest_value)
+
+
+def load_provider_authority_worker_static_evidence(
+) -> (resource_actions.ProviderAuthorityWorkerCohortManifestV1 |
+      resource_action_authority.ProviderAuthorityWorkerCohortManifestV2):
+    """Dispatch only the exact numeric V1 or V2 static manifest contract."""
+
+    manifest_contents = _read_fixed_regular_file(
+        _MANIFEST_PATH,
+        name='authority cohort manifest',
+        maximum_bytes=_MAX_STATIC_JSON_BYTES)
+    manifest_value = _json_without_duplicates(manifest_contents,
+                                              name='authority cohort manifest')
+    if type(manifest_value) is not dict:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority cohort manifest must be an exact JSON object.')
+    version = manifest_value.get('version')
+    if type(version) is not int:
+        raise ProviderAuthorityStaticEvidenceError(
+            'Authority cohort manifest version must be an integer.')
+    if version == 1:
+        return _validate_provider_authority_worker_static_evidence_v1(
+            manifest_contents, manifest_value)
+    if version == 2:
+        return _validate_provider_authority_worker_static_evidence_v2(
+            manifest_contents, manifest_value)
+    raise ProviderAuthorityStaticEvidenceError(
+        'Authority cohort manifest version is unsupported.')
+
+
 class InitialProviderPreflightEvaluator:
     """P2a evaluator: unavailable before acceptance, typed NR afterwards."""
 
@@ -884,7 +1038,9 @@ class InitialProviderPreflightEvaluator:
 __all__ = [
     'InitialProviderPreflightEvaluator',
     'ProviderAuthorityStaticEvidenceError',
+    'load_provider_authority_worker_static_evidence',
     'load_provider_authority_worker_static_evidence_v1',
+    'load_provider_authority_worker_static_evidence_v2',
     'materialize_provider_authority_worker_pod_template_v1',
     'project_provider_authority_worker_callable_inventory_v1',
     'project_provider_authority_worker_pod_template_v1',

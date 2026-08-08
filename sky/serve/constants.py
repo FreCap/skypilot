@@ -165,6 +165,12 @@ RESOURCE_ACTION_PREFLIGHT_TLS_DIRECTORY = (
     '/etc/skypilot/resource-action-authority/tls')
 RESOURCE_ACTION_PREFLIGHT_PATH = (
     '/internal/resource-actions/v1/kubernetes/preflight')
+# Serve034's V1 path is a byte-frozen retirement-only baseline.  Serve035 live
+# preparation uses a disjoint route and parser; keep the concise historical
+# spelling above for existing callers.
+RESOURCE_ACTION_PREFLIGHT_PATH_V1 = RESOURCE_ACTION_PREFLIGHT_PATH
+RESOURCE_ACTION_PREFLIGHT_PATH_V2 = (
+    '/internal/resource-actions/v2/kubernetes/preflight')
 RESOURCE_ACTION_PREFLIGHT_PORT = 46583
 RESOURCE_ACTION_PREFLIGHT_SERVICE_SUFFIX = 'authority-preflight'
 
